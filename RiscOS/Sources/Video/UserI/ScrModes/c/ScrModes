@@ -1,0 +1,1800 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* ScrModes.c */
+
+/*
+ * ScreenModes module main code.
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "newswis.h"
+#include "errors.h"
+#include "Global/RISCOS.h"
+
+/* Locally defined but actually global values */
+#include "services.h"
+#include "monitors.h"
+
+#include "machtypes.h"
+#include "modex.h"
+
+#ifndef DODEBUG
+#define DODEBUG 1
+#endif
+
+#define MESSAGE_FILE    "Resources:$.Resources.ScreenMode.Messages"
+
+/*
+ * Tweak to force the keyword table to be stored in the code area, by
+ * making it all into a single char array including embedded NULs to
+ * terminate individual entries.  We trust the compiler to spot the
+ * multiple (2) source instances of this string constant and arrange to
+ * use a single copy of it.
+ */
+#define keywordset \
+ "x_res\0         " \
+ "y_res\0         " \
+ "h_timings\0     " \
+ "v_timings\0     " \
+ "pixel_rate\0    " \
+ "sync_pol\0      " \
+ "external_clock\0" \
+ "mode_name\0     " \
+ "file_format\0   " \
+ "monitor_title\0 " \
+ "dpms_state\0    " \
+ "lcd_support\0   " \
+ "interlaced\0    " \
+ "output_format\0 " \
+ "startmode\0     " \
+ "endmode"
+#define MAXKEYWORDLEN 14
+#define keyword(n) (keywordset + ((n) * (MAXKEYWORDLEN+1)))
+
+
+/*
+ * Must keep this consistent with keywordset above: order has to match
+ * exactly.
+ */
+enum keycode
+{
+    /*
+     * First in the set are those keywords which may be encountered
+     * when reading an individual mode definition (i.e. between
+     * "startmode", and "endmode").  These values are kept together in
+     * the enumeration to make it easier to form a bitmap of seen
+     * keywords in parse_mode() below.  At the moment, every keyword
+     * must be seen exactly once in each definition.
+     */
+    k_x_res = 0,
+    k_y_res,
+    k_h_timings,
+    k_v_timings,
+    k_pixel_rate,
+    k_sync_pol,
+    k_external_clock,
+    k_mode_name,
+#define last_mode_key k_mode_name  /* last in *enumeration* - order in file not fixed! */
+
+    k_file_format,
+    k_monitor_title,
+    k_dpms_state,
+    k_lcd_support,
+    k_interlaced,
+    k_output_format,
+    k_startmode,
+    k_endmode,
+
+    /* Now specials which do not correspond to actual file keywords */
+    k_nokey,                            /* identifer not recog. as keyword */
+    k_eof                               /* end of file */
+};
+
+#if DODEBUG
+static int dodebug = 1;
+#define debug if (!dodebug) {} else
+#else
+#define debug if (1) {} else
+#endif
+
+/*
+ * Record of video controller type, determined at initialisation:
+ * codes used here match those values returned in r0 bits 31:24 by a
+ * call to OS_ReadSysInfo 2, as implemented in RISC OS for Medusa and
+ * (presumably all) subsequent versions.  For a new video controller
+ * type (beyond VIDC1=0 and VIDC20=1), add the new code value
+ * definition here, before V_UNKNOWN, and update all code which uses
+ * it.  If an unknown controller code is ever seen, the hardware will
+ * be assumed to be able to support any set of video timings given in
+ * the mode file, without restriction or modification.
+ */
+static enum vidctype { V_VIDC1=0, V_VIDC20=1, V_UNKNOWN } vidc_type;
+
+/*
+ * Pointer to (root block of) current monitor definition structure.
+ * This becomes valid (non NULL) on successful completion of a
+ * *loadmodefile command.  The memory space it consumes is thereafter
+ * released on either (a) shutdown of the module or (b) successful
+ * completion of another *loadmodefile command.
+ */
+static MonitorDescriptionRef current_monitor = NULL; /* not defined to start with */
+
+/*
+ * The initial VIDC20s cannot cope with modes whose bandwidth is above
+ * 155 MB/s (rather than 160 MB/s as designed) but we don't want to put
+ * this limit into the kernel, so on these chips we want to take what
+ * the kernel passes us as the available bandwidth and limit it to 155.
+ * To this end we provide a *-command VIDCBandwidthLimit to set the limit.
+ * The units are bytes/second.
+ * The default value (zero) means don't limit it.
+ */
+
+static uns32 bandwidth_limit = 0;       /* by default don't limit it */
+
+/*
+ * Keep a copy of the current monitor type at the time of the first
+ * successful *LoadModeFile, to restore on exit.
+ */
+
+static int old_monitortype = -1;       /* -1 means we haven't loaded a file yet */
+
+/*
+ * Construct an error block from the given ScreenModes module-specific
+ * error code and the list of up to 3 arguments.  To ensure easy
+ * internationalisability, this is done using text from our Messages
+ * file, via MessageTrans_Lookup.  Note that all errors from this
+ * module cause the whole process to stop (i.e. there should only be
+ * one error generated for any *loadmodefile command) so don't worry
+ * about efficiency; e.g. we could keep the file open and the handle
+ * lying around, but there really isn't any point.
+ */
+static _kernel_oserror *error (int error, const char *arg0, const char *arg1, const char *arg2)
+{
+    /* Where the final returned message is constructed */
+    static _kernel_oserror theerror;
+    /* Handle for MessageTrans. */
+    int file_data[4];
+    _kernel_swi_regs r;
+    _kernel_oserror *res;
+    char token[8];
+
+    /* Open the Messages file */
+    r.r[0] = (int)file_data;
+    r.r[1] = (int)MESSAGE_FILE;
+    r.r[2] = 0;
+    if ((res = _kernel_swi(MessageTrans_OpenFile, &r, &r)) != NULL)
+        return res;
+
+    sprintf (token, "E%02d", error);
+
+    r.r[0] = (int)file_data;
+    r.r[1] = (int)token;
+    r.r[2] = (int)theerror.errmess;
+    r.r[3] = 252;
+    r.r[4] = (int)arg0;                 /* for %0 */
+    r.r[5] = (int)arg1;                 /* for %1 */
+    r.r[6] = (int)arg2;                 /* for %2 */
+    r.r[7] = 0;                         /* not expecting %3, so don't substitute */
+    res = _kernel_swi (MessageTrans_Lookup, &r, &r);
+    /* Always close the messages file, ignoring possible but most unlikely errors */
+    r.r[0] = (int)file_data;
+    (void)_kernel_swi (MessageTrans_CloseFile, &r, &r);
+    /* Check for error from the lookup */
+    if (res)
+        return res;                     /* lookup failed */
+    /* Construct the rest of the error block, i.e. the error number */
+    theerror.errnum = ERROR_BASE + error;
+    return &theerror;
+}
+
+static void free_monitordescription (MonitorDescriptionRef description)
+{
+    ModeDescriptionRef md;
+    md = description->modelist;
+    while (md)
+    {
+        ModeDescriptionRef td = md;
+        md = md->next;
+        free (td);
+    }
+    free (description);
+}
+
+static void release_currentmonitor ()
+{
+    if (current_monitor)
+    {
+        debug printf ("releasing previous monitor description\n");
+        free_monitordescription (current_monitor);
+    }
+}
+
+static int matchtext (char *text, const char *ref)
+{
+    while (tolower (*text) == *ref)
+    {
+        if (*text == '\0')
+            return 1;
+        ++text; ++ref;
+    }
+    return 0;
+}
+
+#define using_stdio 1
+
+#if using_stdio
+static FILE *thefile;
+#else                                   /* in-memory file */
+static struct { char *base, *next, *lim; } thefile;
+#endif
+static const char *thefilename;         /* only valid during processing */
+static int lineno;
+
+static _kernel_oserror *open_modefile (const char *filename)
+{
+    _kernel_oserror *res;
+#if using_stdio
+    FILE *f = fopen (filename, "r");
+    if (f != NULL)
+        res = NULL;                     /* all OK */
+    else
+    {
+        res = _kernel_last_oserror ();
+        if (res == NULL)
+        {
+            _kernel_swi_regs regs;
+            /* Couldn't open file but only C library knows why: let's find out. */
+            regs.r[0] = 0x4f;           /* go try opening it */
+            regs.r[1] = (int) filename;  regs.r[2] = 0;
+            res = _kernel_swi (OS_Find, &regs, &regs);
+            if (res == NULL)
+            {
+                /*
+                 * Hmmm, fopen failed but we *can* open it: give up!
+                 * First re-close this file handle.
+                 */
+                int fh = regs.r[0];
+                regs.r[0] = 0;  regs.r[1] = fh;
+                (void) _kernel_swi (OS_Find, &regs, &regs);
+                res = error (ERR_OPENFAIL, filename, 0, 0);
+            }
+        }
+    }
+    thefile = f;
+#else
+#error only stdio supported for now!
+#endif
+    lineno = 1;
+    thefilename = filename;
+    return res;
+}
+
+static int nextc ()
+{
+    int c;
+#if using_stdio
+    c = getc (thefile);
+#else
+    if (thefile.ptr < thefile.lim)
+        c = *thefile.ptr++;
+    else
+        c = EOF;
+#endif
+    if (c == '\n')
+        ++lineno;
+    return c;
+}
+
+static void pushback (int c)
+{
+    if (c != EOF)
+    {
+#if using_stdio
+        ungetc (c, thefile);
+#else
+        if (thefile.ptr > thefile.base && thefile.ptr[-1] == c)
+        {
+            --thefile.ptr;
+        }
+#endif
+        if (c == '\n')
+            --lineno;
+    }
+}
+
+static void close_modefile ()
+{
+#if using_stdio
+    fclose (thefile);
+#else
+    free (thefile.base);
+#endif
+}
+
+static _kernel_oserror *synerr0 (int code)
+{
+    char linebuff[10+1];
+    sprintf (linebuff, "%u", lineno);
+    return error (code, thefilename, linebuff, 0);
+}
+
+static _kernel_oserror *synerrC (int errcode, int thechar)
+{
+    char linebuff[10+1], charbuff[1+1];
+    sprintf (linebuff, "%u", lineno);
+    charbuff[0] = thechar; charbuff[1] = '\0';
+    return error (errcode, thefilename, linebuff, charbuff);
+}
+
+static _kernel_oserror *synerrK (int errcode, enum keycode keycode)
+{
+    char linebuff[10+1];
+    sprintf (linebuff, "%u", lineno);
+    return error (errcode, thefilename, linebuff, keyword(keycode));
+}
+
+/*
+ * Semantic errors are not directly associated with a single line, so
+ * no line number is shown.  The distinction between syntatic errors
+ * and semantic ones is a little fine at times...
+ */
+static _kernel_oserror *semerr0 (int code)
+{
+    return error (code, thefilename, 0, 0);
+}
+
+static _kernel_oserror *semerrS (int code, char *thestring)
+{
+    return error (code, thefilename, thestring, 0);
+}
+
+static int skip_space ()
+{
+    int c;
+    while ((c = nextc()) != '\n' && isspace (c))
+        ;
+    return c;
+}
+
+static int skip_comment_or_blank ()
+{
+    int c;
+    while ((c = skip_space ()) == '\n' || c == '#')
+    {
+        if (c == '#')
+        {
+            /* Comment - extends to end of line */
+            /* TMD 25-Nov-93 - Fix bug MED-01177
+               Wasn't checking for EOF here, so if comment line
+               ended in EOF, it looped indefinitely
+             */
+            do
+                c = nextc ();
+            while (c != '\n' && c != EOF);
+        }
+    }
+    return c;
+}
+
+
+static enum keycode read_keyword ()
+{
+    char buff[MAXKEYWORDLEN+1+1];
+    int i, c;
+    enum keycode k;
+
+    c = skip_comment_or_blank ();
+    i = 0;
+    if (c == EOF)
+        return k_eof;
+    while (isalpha (c) || c == '_')
+    {
+        if (i < MAXKEYWORDLEN+1)        /* allow one extra char, to catch junk at end */
+            buff[i++] = c;
+        c = nextc ();
+    }
+    pushback (c);                       /* backstep over terminating char */
+    buff[i] = '\0';                     /* terminate it */
+    k = (enum keycode) 0;
+    while (k < k_nokey && !matchtext (buff, keyword(k)))
+        k = (enum keycode) (k + 1);
+    return k;
+}
+
+static _kernel_oserror *skip_char (int ch)
+{
+    int c;
+    while ((c = nextc ()) != '\n' && isspace (c))
+        ;
+    if (c == ch)
+        return NULL;
+    if (c == EOF)
+        return synerr0 (ERR_EOF);
+    pushback (c);                       /* in case of '\n', to get lineno right */
+    return synerrC (ERR_EXPCHAR, ch);
+}
+
+static _kernel_oserror *check_eol (int eofok)
+{
+    int c = skip_space ();
+    if (c == '\n' || (eofok && c == EOF))
+        return NULL;
+    if (c == EOF)
+        return synerr0 (ERR_EOF);
+    return synerr0 (ERR_EXTRAINPUT);
+}
+
+/*
+ * Read text (starting with the next non-space character) up to the
+ * end of the current line. EOF is not acceptable to terminate it.
+ * Trailing spaces are removed.  Text longer than the available buffer
+ * size is (for now) just truncated.
+ *
+ * TMD 13-Dec-93: Allow zero length lines if blankerror=-1,
+ * because blank mode names are now OK.
+ */
+static _kernel_oserror *read_text (char *buff, int size, int blankerror)
+{
+    int c, i, excess;
+    i = 0;  excess = 0;
+    /* Skip leading white-space */
+    c = skip_space ();
+    if (c == '\n' && blankerror != -1)  /* blank field - complain if necessary */
+    {
+        pushback (c);                   /* to get line number correct! */
+        return synerr0 (blankerror);
+    }
+    while (c != EOF && c != '\n')
+    {
+        if (i < size-1)
+            buff[i++] = c;
+        else
+        {
+            /* Should we complain, or issue a warning? Do nowt for now. */
+            if (!isspace(c))
+            {
+                ++excess;
+                debug
+                    if (excess == 1)
+                        printf ("excess chars ignored on text at line %d\n", lineno);
+            }
+        }
+        c = nextc ();
+    }
+    if (c == EOF)
+        return synerr0 (ERR_EOF);       /* EOF not allowed */
+    /* Remove trailing white-space */
+    while (i > 0 && isspace (buff[i-1]))
+        --i;
+    /* Terminate the string */
+    buff[i] = '\0';
+    return NULL;
+}
+
+static _kernel_oserror *read_u32 (uns32 *var)
+{
+    int c;
+    uns32 acc;
+    c = skip_space ();
+    if (!isdigit (c))
+        return synerr0 (ERR_EXPNUM);
+    acc = c - '0';
+    while (isdigit (c = nextc()))
+    {
+        int digit = c - '0';
+        if (acc > 0xFFFFFFFF/10 ||
+            (acc == 0xFFFFFFFF/10 && digit > 0xFFFFFFFF%10))
+            return synerr0 (ERR_VALUEOVF);
+        acc = acc * 10 + digit;
+    }
+    pushback (c);                       /* leave terminating char waiting to be read */
+    *var = acc;
+    return NULL;
+}
+
+static int end_of_num_char (int c)
+{
+    return (c == '\x00' || c == '\x0A' || c == '\x0D' || c == ' ');
+}
+
+static _kernel_oserror *sread_u32 (uns32 *var, char **sptr)
+{
+    int c;
+    uns32 acc = 0;
+    char *s2 = *sptr;
+    while (!end_of_num_char (c = (int)*s2))
+    {
+        if (isdigit (c))
+        {
+            int digit = c - '0';
+            if (acc > 0xFFFFFFFF/10 ||
+                (acc == 0xFFFFFFFF/10 && digit > 0xFFFFFFFF%10))
+                return synerr0 (ERR_VALUEOVF2);
+            acc = acc * 10 + digit;
+            s2++;
+        }
+        else
+        {
+            return synerr0 (ERR_EXPNUM2);
+        }
+    }
+    if (s2 == *sptr)    /* no digits */
+        return synerr0 (ERR_EXPNUM2);
+
+    *var = acc;
+    *sptr = s2;
+    return NULL;
+}
+
+static _kernel_oserror *read_one_u32 (uns32 *var, uns32 fault_zero)
+{
+    _kernel_oserror *res = read_u32 (var);
+    if (res)
+        return res;
+    if (fault_zero && *var == 0)
+        return synerr0 (ERR_INVALIDPAR);
+    return check_eol (0);
+}
+
+static _kernel_oserror *check_keyword (enum keycode code, int colon)
+{
+    enum keycode kc;
+    kc = read_keyword ();
+    if (kc == k_eof)                    /* we never explicitly look for k_eof */
+        return synerr0 (ERR_EOF);
+    if (kc != code)
+        return synerrK (ERR_EXPKEY, code);
+    if (colon)
+        return skip_char (':');
+    else
+        return NULL;
+}
+
+static _kernel_oserror *parse_mode (ModeDefinition *mode)
+{
+    uns32 keyseen;
+    assert (last_mode_key <= 32);
+    keyseen = 0;
+    mode->interlaced = 0; /* Assume mode is not interlaced, unless we see the keyword */
+    mode->external_clock = -1;
+    for (;;)
+    {
+        enum keycode kc = read_keyword ();
+        uns32 param, missed, ok_to_miss;
+        _kernel_oserror *res;
+        if (kc <= last_mode_key)
+        {
+            if (keyseen & (1 << kc))
+                return synerrK (ERR_REPKEY, kc);
+            res = skip_char (':');
+            if (res)
+                return res;
+            keyseen |= 1 << kc;
+        }
+        switch (kc)
+        {
+          case k_eof:
+            return synerr0 (ERR_EOF);
+
+          case k_endmode:
+            /* Work out which, if any, of the entries have not been supplied */
+            missed = ~(~(uns32)0 << (last_mode_key+1)) - keyseen;
+            /*
+             * In format 1, we normally insist that x_res = hdisp and
+             * y_res = vdisp so x_res and y_res are in fact optional.
+             * However if the mode is interlaced, then x_res and y_res are compulsory.
+             * We insist that all other keywords do occur.
+             */
+            ok_to_miss = mode->interlaced ? 0 : (1 << k_x_res) | (1 << k_y_res);
+            ok_to_miss |= (1 << k_interlaced) | (1 << k_external_clock);
+            if (missed & ~ok_to_miss)
+            {
+                /*
+                 * If some other keyword(s) not seen, complain.  If
+                 * mode_name is one of them, must identify by line
+                 * number so treat it as a syntactic error, else as
+                 * semantic, providing debugging info in terms of the
+                 * mode name.
+                 */
+                if (missed & (1 << k_mode_name))
+                    return synerr0 (ERR_NOMODENAME);
+                else
+                    return semerrS (ERR_INCOMPLETE, mode->name);
+            }
+            /* If xres and/or yres missing, use the xdisp and/or ydisp values */
+            if (!(keyseen & (1 << k_x_res))) mode->xres = mode->hpar[FR_DISP];
+            if (!(keyseen & (1 << k_y_res))) mode->yres = mode->vpar[FR_DISP];
+
+	    /* xres must equal xdisp, and yres must equal ydisp (or ydisp*2 for interlaced modes) */
+            if (mode->xres != mode->hpar[FR_DISP] || mode->yres != mode->vpar[FR_DISP] * (mode->interlaced+1))
+                return semerrS (ERR_INCONSISTENT, mode->name);
+            return check_eol (1);
+
+          case k_nokey:
+            return synerr0 (ERR_UNKNOWNPAR);
+
+          default:
+            /* Known keyword but out of place */
+            return synerrK (ERR_WRONGCONTEXT, kc);
+
+          case k_x_res:
+            res = read_one_u32 (&mode->xres, 1);
+            if (res)
+                return res;
+            break;
+
+          case k_y_res:
+            res = read_one_u32 (&mode->yres, 1);
+            if (res)
+                return res;
+            break;
+
+          case k_pixel_rate:
+            res = read_one_u32 (&mode->pixel_khz, 1);
+            if (res)
+                return res;
+            break;
+
+          case k_sync_pol:
+            res = read_one_u32 (&param, 0);
+            if (res)
+                return res;
+            if (param > 3)      /* must fit in (currently) 2 bits */
+                return synerr0 (ERR_VALUEOVF);
+            mode->syncpol = param;
+            break;
+
+          case k_interlaced:
+            mode->interlaced = 1; /* It is an interlaced mode */
+            res = check_eol (0);
+            if (res)
+                return res;
+            break;
+
+          case k_external_clock:
+            res = read_one_u32 (&mode->external_clock, 0);
+            if (res)
+                return res;
+            break;
+
+          case k_mode_name:
+            /* TMD 13-Dec-93: We must allow blank mode names now -
+             * they mean a mode is not shown in DisplayManager menu.
+             * Passing in -1 as the error number for read_text means don't
+             * fault blank lines.
+             */
+            res = read_text (mode->name, sizeof(mode->name), -1);
+            if (res)
+                return res;
+            break;
+
+          case k_h_timings:
+          case k_v_timings:
+            {
+                int pn;
+                uns16 *par = kc == k_h_timings ? mode->hpar : mode->vpar;
+                for (pn = 0; pn < FR__COUNT; ++pn)
+                {
+                    uns32 param;
+                    res = read_u32 (&param);
+                    if (res)
+                        return res;
+                    if (param >= 0x10000)       /* must fit in 16 bits (unsigned) */
+                        return synerr0 (ERR_VALUEOVF);
+                    par[pn] = param;
+                    /* Check for following comma or end of line */
+                    if (pn < FR__COUNT-1)
+                        res = skip_char (',');
+                }
+                if (par[FR_DISP] == 0)
+                    return synerr0 (ERR_INVALIDPAR);
+                /*
+                 * Apply vidc-specific checks: VIDC1 and VIDC20 both
+                 * require an even number of pixels in a line.
+                 */
+                switch (vidc_type)
+                {
+                  case V_VIDC1:
+                  case V_VIDC20:
+                    if (kc == k_h_timings && par[FR_DISP] % 2 != 0)
+                        return synerr0 (ERR_INVALIDPAR);
+                    break;
+                  default:
+                    break;
+                }
+                res = check_eol (0);
+                if (res)
+                    return res;
+
+            }
+            break;
+        }
+    }
+}
+
+static void compute_modedescription (ModeDescriptionRef md)
+{
+    uns32 vtot, htot;
+    int pn;
+    ModeDefinition *mp = &md->definition; /* for terseness! */
+    for (htot = 0, vtot = 0, pn = 0; pn < FR__COUNT; ++pn)
+    {
+        htot += mp->hpar[pn];
+        vtot += mp->vpar[pn];
+    }
+    md->line_hz = mp->pixel_khz * 1000 / htot;  /* compute line frequency in Hz */
+    md->frame_mhz = md->line_hz * 1000 / vtot; /* frame frequency in milliHz, high-prec */
+    if (mp->interlaced) md->frame_mhz /= 2; /* if interlaced, one frame is 2 fields */
+    md->frame_hz = (md->frame_mhz + 500) / 1000; /* & low-prec for user integer Hz matching */
+}
+
+static _kernel_oserror *parse_modelist (MonitorDescriptionRef monitor, enum keycode kc)
+{
+    for (;;)
+    {
+        if (kc == k_startmode)
+        {
+            ModeDescriptionRef mp;
+#if 0
+            ModeDescriptionRef rp;
+#endif
+            _kernel_oserror *res;
+            res = check_eol (0);
+            if (res)
+                return res;
+            mp = (ModeDescriptionRef) malloc (sizeof(ModeDescription));
+            if (mp == NULL)
+                return error (ERR_NOSPACE, 0, 0, 0);
+            /*
+             * Chain the new (as yet un-filled-in) mode on as the head
+             * of the existing list, so the space will get released
+             * properly on error.
+             */
+            mp->next = monitor->modelist;
+            monitor->modelist = mp;
+            /* Go parse the definition, filling in the record fields */
+            res = parse_mode (&mp->definition);
+            if (res)
+                return res;                     /* failed */
+            /* fill in defaults */
+            if (mp->definition.external_clock == -1)
+                mp->definition.external_clock = monitor->external_clock;
+            /* derive frame and line rates */
+            compute_modedescription (mp);
+#if 0
+            /* Check for uniqueness of mode name */
+            rp = mp->next;
+            while (rp)
+            {
+                if (strcmp (rp->definition.name, mp->definition.name) == 0)
+                    return semerrS (ERR_DUPMODENAME, mp->definition.name);
+                rp = rp->next;
+            }
+#endif
+        }
+        else if (kc == k_eof)
+        {
+            /* OK provided there is at least one mode! */
+            if (monitor->modelist != NULL)
+                return NULL;            /* ALL DONE */
+            return semerr0 (ERR_NOMODES);
+        }
+        else
+        {
+            return synerrK (ERR_EXPKEY, k_startmode);
+        }
+        kc = read_keyword ();               /* read next startmode, hopefully */
+    }
+}
+
+static _kernel_oserror *parse_modefile (MonitorDescriptionRef *description)
+{
+    uns32 ffmt;
+    _kernel_oserror *res;
+    MonitorDescriptionRef md;
+    enum keycode kc;
+
+    res = check_keyword (k_file_format, 1);
+    if (res)
+        return res;
+    res = read_one_u32 (&ffmt, 0);
+    if (res)
+        return res;
+    if (ffmt != 1)
+        return synerr0 (ERR_UNKNOWNFMT);
+
+    res = check_keyword (k_monitor_title, 1);
+    if (res)
+        return res;
+    /* OK, commit to reading a monitor description - go allocate space */
+    md = (MonitorDescriptionRef) malloc (sizeof(MonitorDescription));
+    if (md == NULL)
+        return error (ERR_NOSPACE, 0, 0, 0);
+    /*
+     * From here on, need to release memory on error, so do most of
+     * the rest as a subroutine.
+     */
+    md->modelist = NULL;                /* to start with */
+    res = read_text (md->name, sizeof(md->name), ERR_BLANKMONTITLE);
+
+    /*
+     * Now check for optional DPMS_state keyword
+     */
+    if (res == NULL)
+    {
+        md->dpms_state = -1;                     /* indicates field not present */
+        kc = read_keyword ();
+        if (kc == k_dpms_state)
+        {
+            res = skip_char (':');
+            if (res == NULL)
+                res = read_one_u32 (&md->dpms_state, 0);    /* read DPMS_state value */
+            if (res == NULL) kc = read_keyword ();          /* then read next keyword */
+        }
+    }
+
+    /*
+     * Now check for optional LCD_support keyword
+     */
+    if (res == NULL)
+    {
+        md->lcd_support = 0;                                /* Indicates CRT as default */
+        if (kc == k_lcd_support)
+        {
+            debug printf("Got the lcdsupport keyword\n");
+            res = skip_char (':');
+            if (res == NULL) {
+                res = read_one_u32 (&md->lcd_support, 0);    /* read LCD_support value */
+                if(md->lcd_support != 0) md->dpms_state = -1;    /* LCD and DPMS are mutually exclusive */
+                debug printf("Read the value as %d\n",md->lcd_support);
+            }
+            if (res == NULL) kc = read_keyword ();          /* then read next keyword */
+        }
+    }
+
+    /*
+     * Now check for optional output_format keyword
+     */
+    if (res == NULL)
+    {
+        md->output_format = -1;                                /* indicates field not present */
+        if (kc == k_output_format)
+        {
+            res = skip_char (':');
+            if (res == NULL) {
+                res = read_one_u32 (&md->output_format, 0);    /* read output_format value */
+            }
+            if (res == NULL) kc = read_keyword ();          /* then read next keyword */
+        }
+    }
+
+    /*
+     * Now check for optional external_clock keyword
+     */
+    if (res == NULL)
+    {
+        md->external_clock = -1;                            /* indicates field not present */
+        if (kc == k_external_clock)
+        {
+            res = skip_char (':');
+            if (res == NULL)
+                res = read_one_u32 (&md->external_clock, 0);/* read external_clock value */
+            if (res == NULL) kc = read_keyword ();          /* then read next keyword */
+        }
+    }
+
+    if (res == NULL) {
+        debug printf("Going to read the modes now...\n");
+        res = parse_modelist (md, kc);          /* pass in read keyword token */
+    }
+
+    if (res)
+    {
+        free_monitordescription (md);
+        md = NULL;
+    }
+    *description = md;
+    return res;
+}
+
+/*
+ * For efficiency in handling the Service_ModeExtension service call,
+ * we keep the list of supported modes in order.  The keys used for
+ * comparison of modes are (in order of use):
+ *   (1) increasing x resolution
+ *   (2) increasing y resolution
+ *   (3) decreasing frame rate
+ *   (4) increasing peak datarate at a given depth, i.e. pixelrate
+ */
+static int modes_inorder (ModeDescriptionRef m1, ModeDescriptionRef m2)
+{
+    if (m1->definition.xres < m2->definition.xres)
+        return 1;
+    if (m1->definition.xres > m2->definition.xres)
+        return 0;
+    if (m1->definition.yres < m2->definition.yres)
+        return 1;
+    if (m1->definition.yres > m2->definition.yres)
+        return 0;
+    if (m1->frame_mhz > m2->frame_mhz)
+        return 1;
+    if (m1->frame_mhz < m2->frame_mhz)
+        return 0;
+    if (m1->definition.pixel_khz < m2->definition.pixel_khz)
+        return 1;
+    if (m1->definition.pixel_khz > m2->definition.pixel_khz)
+        return 0;
+    return 1;                           /* arbitrary here - modes seem the same! */
+}
+
+static void sort_modelist (ModeDescriptionRef *list)
+{
+    ModeDescriptionRef prev, this, next;
+    int swapped;
+    do
+    {
+        prev = NULL;                    /* marks being at start of list */
+        this = *list;                   /* not NULL */
+        next = this->next;              /* might be NULL, for 1-entry list */
+        swapped = 0;
+        while (next)
+        {
+            if (!modes_inorder (this, next))
+            {
+                ModeDescriptionRef t;
+                /* Move whatever is pointing at this to point at next */
+                if (prev == NULL)
+                    *list = next;       /* swap at start of list */
+                else
+                    prev->next = next;
+                /* The new successor to this record is what was after the next one */
+                this->next = next->next;
+                /* The new successor to what was the next record is now this record */
+                next->next = this;
+                /* Swap our local this and next pointers */
+                t = this;  this = next;  next = t;
+                swapped = 1;
+            }
+            /* Step all the pointers on by one in the (perhaps re-ordered) list */
+            prev = this;
+            this = next;
+            next = next->next;
+        }
+    } while (swapped);
+}
+
+static _kernel_oserror *set_monitortype (int monitortype)
+{
+    _kernel_swi_regs regs;
+    regs.r[0] = 3;
+    regs.r[1] = monitortype;
+    return _kernel_swi (OS_ScreenMode, &regs, &regs);
+}
+
+static int read_monitortype ()
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *res;
+    regs.r[0] = 1;
+    res = _kernel_swi (OS_ReadSysInfo, &regs, &regs);
+    if (res) return -1; else return regs.r[1];
+}
+
+static _kernel_oserror *restore_monitortype ()
+{
+    int temp = old_monitortype;
+    if (temp != -1)
+    {
+        old_monitortype = -1;
+        return set_monitortype (temp);
+    }
+    else
+    {
+        return NULL;
+    }
+}
+
+static void inform_modefilechanged ()
+{
+    _kernel_swi_regs regs;
+    regs.r[1] = Service_ModeFileChanged;
+    (void)_kernel_swi (OS_ServiceCall, &regs, &regs);
+}
+
+#if DODEBUG
+static void show_monitor (MonitorDescriptionRef monitor)
+{
+    ModeDescriptionRef mode;
+    printf ("Monitor title: \"%s\"\n", monitor->name);
+    for (mode = monitor->modelist; mode; mode = mode->next)
+    {
+        ModeDefinition *dp = &mode->definition;
+        uns32 pixrate = dp->pixel_khz;
+        uns32 pixels = dp->xres * dp->yres;
+        int log2bpp;
+        printf ("%p: Mode name \"%s\"\n", mode, mode->definition.name);
+        printf ("  Resolution %u x %u\n", dp->xres, dp->yres);
+        printf ("  Line rate %u.%03u kHz, Frame rate %d.%03d Hz\n",
+                mode->line_hz / 1000, mode->line_hz % 1000,
+                mode->frame_mhz / 1000, mode->frame_mhz % 1000);
+        printf ("  Pixel rate %u kHz, Sync type %u\n", dp->pixel_khz, dp->syncpol);
+        printf ("  Line timings\n"
+                "    sync %u b-porch %u l-border %u display %u r-border %u f-porch %u\n",
+                dp->hpar[FR_SYNC], dp->hpar[FR_BPCH], dp->hpar[FR_BDR1],
+                dp->hpar[FR_DISP], dp->hpar[FR_BDR2], dp->hpar[FR_FPCH]);
+        printf ("  Frame timings\n"
+                "    sync %u b-porch %u t-border %u display %u b-border %u f-porch %u\n",
+                dp->vpar[FR_SYNC], dp->vpar[FR_BPCH], dp->vpar[FR_BDR1],
+                dp->vpar[FR_DISP], dp->vpar[FR_BDR2], dp->vpar[FR_FPCH]);
+        if (dp->interlaced) printf("  Interlaced\n");
+        for (log2bpp = 0; log2bpp <= 5; ++log2bpp)
+        {
+            uns bits = 1 << log2bpp;
+            uns32 drate, dsize;
+            if (bits < 8)
+            {
+                uns shift = 3 - log2bpp;
+                uns round = (1 << shift) - 1;
+                drate = (pixrate + round) >> shift;
+                dsize = (pixels + round) >> shift;
+            }
+            else
+            {
+                uns shift = log2bpp - 3;
+                drate = pixrate << shift;
+                dsize = pixels << shift;
+            }
+            printf ("  %2u bpp: bandwidth %6u000 bytes/sec, data size %7u bytes\n",
+                    bits, drate, dsize);
+        }
+        printf ("\n");
+    }
+}
+#endif
+
+static _kernel_oserror *loadmodefile (char *file)
+{
+    _kernel_oserror *res;
+
+    res = open_modefile (file);
+    if (res != NULL)
+        debug printf ("failed to open modefile\n");
+    else
+    {
+        MonitorDescriptionRef new_monitor;
+        debug printf ("file opened OK\n");
+        res = parse_modefile (&new_monitor);
+        debug printf ("closing file\n");
+        close_modefile ();
+        if (res != NULL)
+            debug printf ("failed to parse mode file\n");
+        else
+        {
+            debug printf ("monitor description parsed OK\n");
+            sort_modelist (&new_monitor->modelist);
+#if DODEBUG
+            debug show_monitor (new_monitor);
+#endif
+            /* If we haven't got a file loaded at present, then
+             * read current monitortype, to restore on module shutdown
+             */
+            if (old_monitortype == -1) old_monitortype = read_monitortype ();
+
+            /* Now tell kernel to use monitor type 7 (File) */
+            res = set_monitortype (MONITOR_FILE);
+            if (res != NULL)
+            {
+                _kernel_oserror *res2;
+                debug printf ("setting of monitor type to type `FILE' failed\n");
+                res2 = restore_monitortype (); /* restore old value */
+                debug
+                    if (res2 != NULL)
+                        printf ("couldn't reset monitor type to CMOS default!\n");
+            }
+            else
+            {
+                char *path,*dot;
+
+                path = malloc((size_t)strlen(file)+32);
+                strcpy(path,"IconSprites \0");
+                dot = strrchr(file, '.');
+                if (dot != NULL)
+                   {
+                   strcat(path,file);         /* Grab the path */
+                   dot = 1 + strrchr(path, '.');
+                   *dot = '\0';               /* Slice off the leafname */
+                   }
+                strcat(path, "!Sprites\0");
+                _kernel_oscli(path);          /* Have a go at *IconSprites !Sprites */
+                free(path);
+
+                release_currentmonitor ();
+                current_monitor = new_monitor;
+                inform_modefilechanged ();
+            }
+        }
+    }
+    return res;
+}
+
+static _kernel_oserror *vidcbandwidthlimit (char *numstring)
+{
+    uns32 limit0, limit1, limit2, vram;
+    _kernel_swi_regs r;
+    _kernel_oserror *res;
+
+    res = sread_u32 (&limit0, &numstring);      /* read number for no VRAM*/
+    if (res) return res;                        /* if error return it */
+
+    while (*numstring == ' ') numstring++;      /* skip spaces after 1st number */
+
+    res = sread_u32 (&limit1, &numstring);      /* read number for 1M VRAM*/
+    if (res) return res;                        /* if error return it */
+
+    while (*numstring == ' ') numstring++;      /* skip spaces after 2nd number */
+
+    res = sread_u32 (&limit2, &numstring);      /* read number for 2M VRAM*/
+    if (res) return res;                        /* if error return it */
+
+    r.r[0] = 0x208;                                     /* reason code for 'read amount of VRAM' */
+    res = _kernel_swi (OS_Memory, &r, &r);              /* returns r1 = number of pages, r2 = page size */
+    if (res) return res;
+
+    vram = r.r[1] * r.r[2];                     /* vram = total amount of VRAM in bytes */
+    bandwidth_limit = (vram >= 2*1024*1024) ? limit2 : (vram >= 1024*1024) ? limit1 : limit0;
+
+    return NULL;                                /* exit OK */
+}
+
+
+/*
+ * Test for whether a given mode definition is usable within the
+ * specified data rate and video memory size bounds, at a given pixel
+ * depth.  Limitations of the current video controller chip (if known)
+ * are also factored in to the test.  For example, with VIDC20 all
+ * modes must have a multiple of 32 bits in a line, so modes with
+ * horizontal dimensions not a multiple of 32 cannot be displayed in
+ * the lowest depth mode(s).
+ */
+static int mode_valid (ModeDescriptionRef mp, int depth,
+                       uns32 maxdatarate, uns32 maxdatasize)
+{
+    uns32 pixrate = mp->definition.pixel_khz;
+    uns32 mx = mp->definition.xres;
+    uns32 my = mp->definition.yres;
+    uns32 pixels = mx * my;
+    uns32 datarate, datasize;
+    /*
+     * TMD 03-Apr-96: For interlaced modes, the line length must be a
+     * multiple of 32 bytes, ie 256 bits
+     */
+    uns32 bit_multiple = mp->definition.interlaced ? 256 : 32;
+
+    /* Convert from pixels to bytes: method varies according to depth */
+
+    if((depth > 2) && (current_monitor->lcd_support == 1)) return 0;         /** Eek! 4bpp is max for b/w panels! **/
+
+    if (depth < 3)
+    {
+        uns shift = 3 - depth;
+        uns round = (1 << shift) - 1;
+        datarate = (pixrate + round) >> shift;
+        datasize = (pixels + round) >> shift;
+    }
+    else
+    {
+        uns shift = depth - 3;
+        datarate = pixrate << shift;
+        datasize = pixels << shift;
+    }
+
+    /* Check global data rate/size limits */
+    if (datarate > maxdatarate || datasize > maxdatasize)
+        return 0;
+
+    /* Apply video-controller-specific checks */
+    /*
+     * For both VIDC1 and VIDC20, we must ensure that data for one
+     * line is a whole number of 32-bit words (VIDC1 data sheet
+     * actually says 128 bits, but it does work for e.g. mode 29 which
+     * is 32 MOD 128).  This check can cut out lower depths for
+     * certain unusually-dimensioned modes.
+     *
+     */
+    switch (vidc_type)
+    {
+      case V_VIDC1:
+        if ((mx << depth) % bit_multiple != 0)
+            return 0;
+        break;
+
+      case V_VIDC20:
+        if ((mx << depth) % bit_multiple != 0)
+            return 0;
+        break;
+
+      default:
+        {
+        _kernel_swi_regs r;
+        r.r[4] = 8;
+        r.r[9] = GraphicsV;
+        _kernel_swi(OS_CallAVector, &r, &r);
+        if ((r.r[4] == 0) && ((r.r[1] & (1<<depth)) == 0))
+           return 0;                    /* had a definitive answer from GraphicsV that this bpp is forbidden */
+        break;                          /* can't be sure,let everything through */
+        }
+    }
+    return 1;
+}
+
+
+static ModeDescriptionRef find_by_xy (ModeDescriptionRef mp,
+                                      uns32 xres, uns32 yres, int *count)
+{
+    while (mp && mp->definition.xres < xres)
+        mp = mp->next;
+    while (mp && mp->definition.xres == xres && mp->definition.yres < yres)
+        mp = mp->next;
+    if (mp && mp->definition.xres == xres && mp->definition.yres == yres)
+    {
+        int entries;
+        ModeDescriptionRef head = mp;
+        entries = 0;
+        do
+        {
+            ++entries;
+            mp = mp->next;
+        } while (mp && mp->definition.xres == xres &&
+                 mp->definition.yres == yres);
+        *count = entries;
+        return head;
+    }
+    else
+        return NULL;
+}
+
+static int restrict_bandwidth (int os_limit)
+{
+    /* Return as the limit the minimum of (os_limit, bandwidth_limit),
+     * where bandwidth_limit is set up by the command *VIDCBandwidthLimit
+     * (but zero means no limit)
+     */
+
+/*    if (bandwidth_limit == 0 || os_limit < bandwidth_limit)
+        return os_limit;
+    else
+--Commented out by WT 1-8-95 so that 'Turbo' Krytens can be tried (they have
+a higher bandwidth & it is inconvenient to reblow ROMs every time. Whether this
+becomes a permanent change or not remains to be seen.
+*/
+      if (bandwidth_limit == 0) return os_limit;
+      else return bandwidth_limit;
+}
+
+static void service_modeextension (_kernel_swi_regs *regs)
+{
+    /*
+     * Static allocation of a single VIDCList, for return from
+     * Service_ModeExtension in the case that we have a mode
+     * satisfying the requirements.  The data in this block is
+     * overwritten by the next Service_ModeExtension call which we
+     * also satisfy.  NB. Since we currently have no mechanism whereby
+     * additional fields can be specified (e.g. in the ModeInfo file)
+     * to be returned in a video control parameters list at the end of
+     * the main block, there is no need for this block to be variable
+     * length.  If that were ever added, the space would need to be
+     * claimed either by assuming some maximum possible VCP list size
+     * and keeping it static, or allocating the right size
+     * dynamically; the latter case would imply keeping a file-scope
+     * static pointer so that the space can be released as required
+     * when module_shutdown is called.
+     *
+     * TMD 02-Nov-93 - A video control parameters list is now appended
+     * if the file includes the DPMS_state keyword. However since this
+     * is only 1 pair of words, I have allocated it statically.
+     * If no list is necessary, the 1st word holds -1.
+     * If a list is necessary, the 1st word holds DPMS_INDEX, the 2nd
+     * holds the dpms value, and the 3rd word holds -1.
+     *
+     * WT 19-Jan-95 - The parameters list is extended to cater for LCD
+     * panels, both single and dual panel, as defined in the LCD_support
+     * field of the mode definition file. So, now 6 words are statically
+     * allocated.
+     */
+    static VIDCList thevidclist;
+
+    ModeSelectorRef sel;
+    ModeDescriptionRef mp;
+    uns32 dataratelimit, datasizelimit;
+    int nmodes;
+    int ctrllistpos = 0;
+
+    /*
+     * Check for being passed a mode selector as opposed to a mode
+     * number - we only handle the former.
+     */
+    if (!IS_MODE_SEL_PTR (regs->r[2]))
+        return;
+
+    /*
+     * Check for suitable monitor type being requested - we handle
+     * don't-care case as well as explicit file-specified monitor
+     * type, but don't touch other specific monitor class codes.
+     */
+    if (regs->r[3] != -1 && regs->r[3] != MONITOR_FILE)
+        return;                         /* pass service on */
+
+    /*
+     * Address the mode selector (R2 on entry has been found to be a
+     * pointer), and check for known format (bit 0 set, bits 7..1
+     * clear).
+     */
+    sel = MODESEL(regs->r[2]);
+    if (sel->bit0 != 1 || sel->format != 0)
+        return;                         /* pass service on */
+
+    /* Pick up data size limit from args to service call */
+    datasizelimit = regs->r[5]; /* data size is measured in bytes */
+
+    /*
+     * Current Screen Mode selection API FuncSpec (0197,290/FS, Issue
+     * D) says data rate figure in R4 is in bytes/sec.  Since Medusa
+     * h/ware can do up to 170,000,000 bytes/sec, and that number is a
+     * factor of only 12 times smaller than the max number in a 32-bit
+     * signed integer, it would seem more future-proof and consistent
+     * (cf. pixel rate specs which use kHz not Hz) to use 1000's of
+     * bytes/sec, but for now convert to preferred units as used internally.
+     */
+    dataratelimit = restrict_bandwidth (regs->r[4]) / 1000;
+
+    /*
+     * Scan all available modes, looking for a match.  First find the
+     * subset of all known modes which have the right resolution.
+     * They are contiguous on the master list.  We track where to stop
+     * by knowing how many of them there are (find_by_xy counts up)
+     * rather than by rechecking the pointer and x/y fields every
+     * time.
+     */
+    mp = find_by_xy (current_monitor->modelist, sel->xresol, sel->yresol, &nmodes);
+    if (!mp)
+        return;                         /* no match */
+    do
+    {
+        /* Test whether this mode can satisfy the requirements */
+        if ((sel->framerate == -1 || sel->framerate == mp->frame_hz) &&
+             mode_valid (mp, sel->depth, dataratelimit, datasizelimit))
+        {
+            VIDCListRef vp = &thevidclist; /* use the local static structure */
+            int fn;
+            /* OK, fill in the fields */
+            vp->format = 3;
+            vp->depth = sel->depth;
+            for (fn = 0; fn < FR__COUNT; ++fn)
+            {
+                vp->hpar[fn] = mp->definition.hpar[fn];
+                vp->vpar[fn] = mp->definition.vpar[fn];
+            }
+            vp->pixelrate = mp->definition.pixel_khz;
+            vp->syncpol = mp->definition.syncpol;
+
+            if (current_monitor->dpms_state != -1) {
+                vp->vcparam[ctrllistpos].index = DPMS_INDEX;
+                vp->vcparam[ctrllistpos].value = current_monitor->dpms_state;
+                ctrllistpos++;
+            }
+
+            if (current_monitor->lcd_support != 0) {
+                debug printf("I'm an LCD panel & I'm going to tell the Kernel!\n");
+                vp->vcparam[ctrllistpos].index = LCDMODE_INDEX;
+                vp->vcparam[ctrllistpos].value = LCDMODE_VALUE;
+                ctrllistpos++;
+                if (current_monitor->lcd_support != 3) {
+                    vp->vcparam[ctrllistpos].index = LCDDUAL_INDEX;
+                    vp->vcparam[ctrllistpos].value = LCDDUAL_VALUE;
+                    ctrllistpos++;
+                }
+                vp->vcparam[ctrllistpos].index = LCDOFF0_INDEX;
+                vp->vcparam[ctrllistpos].value = LCDOFF0_VALUE;
+                    ctrllistpos++;
+                vp->vcparam[ctrllistpos].index = LCDOFF1_INDEX;
+                vp->vcparam[ctrllistpos].value = LCDOFF1_VALUE;
+                    ctrllistpos++;
+                vp->vcparam[ctrllistpos].index = DACCTRL_INDEX;
+                vp->vcparam[ctrllistpos].value = DACCTRL_VALUE;
+                    ctrllistpos++;
+            }
+
+            if (mp->definition.external_clock != -1) {
+                vp->vcparam[ctrllistpos].index = HCLK_INDEX;
+                vp->vcparam[ctrllistpos].value = mp->definition.external_clock;
+                ctrllistpos++;
+            }
+
+            if (mp->definition.interlaced) {
+                vp->vcparam[ctrllistpos].index = INTERLACED_INDEX;
+                vp->vcparam[ctrllistpos].value = 1;
+                ctrllistpos++;
+            }
+
+            if (current_monitor->output_format != -1) {
+                vp->vcparam[ctrllistpos].index = OPFORMAT_INDEX;
+                vp->vcparam[ctrllistpos].value = current_monitor->output_format;
+                ctrllistpos++;
+            }
+
+            vp->vcparam[ctrllistpos].index = -1;      /* List terminator */
+
+            /* Now modify the register set to reflect servicing the call */
+            regs->r[1] = 0;             /* Service_Serviced */
+            regs->r[3] = (int)vp;       /* return pointer to vidc list */
+            regs->r[4] = 0;             /* marks no workspace list (mode selector given) */
+            return;
+        }
+        mp = mp->next;
+    } while (--nmodes);
+}
+
+static void service_enumeratescreenmodes (_kernel_swi_regs *regs)
+{
+    ModeDescriptionRef mp;
+    uns32 dataratelimit, datasizelimit;
+    int depth;                          /* logarithmic: 0 = 1bpp .. 5 = 32bpp */
+    /*
+     * See comments re. data-rate spec in handle_modeextension.
+     */
+    dataratelimit = restrict_bandwidth (regs->r[4]);
+    dataratelimit /= 1000;      /* convert to our preferred, internally used, units */
+    datasizelimit = regs->r[5]; /* data size is measured in bytes */
+
+    /* Scan all available modes at all available pixel depths */
+    mp = current_monitor->modelist;
+    depth = 0;
+
+    for (;;)
+    {
+        if (!mode_valid (mp, depth, dataratelimit, datasizelimit))
+        {
+            /*
+             * TMD 03-Nov-93: Fix bug MED-00833
+             * Code used to set depth to 5 here, assuming that if the mode
+             * was invalid at a low depth, it would be invalid at all higher
+             * depths. This is a wrong assumption when a mode can fail because
+             * the length of the line is not a suitable multiple.
+             */
+        }
+        else
+        {
+            /* OK, it fits; what to do with it?  Follow algorithm from F.S. */
+            if (regs->r[2] > 0)
+            {
+                /* skipping (in a partial enumeration) - nowt to do */
+            }
+            else
+            {
+                int nlen = strlen (mp->definition.name);
+                int entrysize = 24 + ((nlen + 1 + 3) & ~3);
+                if (regs->r[6] != 0)
+                {
+                    /* Enumeration case - filling in block */
+                    if (regs->r[7] >= entrysize)
+                    {
+                        ModeInfoBlockRef ip = (ModeInfoBlockRef)regs->r[6];
+                        int i;
+
+                        /* Copy the mode information into the supplied data buffer */
+                        ip->blocksize = entrysize;
+                        ip->format = 0;  ip->flags = 0;  ip->bit0 = 1;
+                        ip->xresol = mp->definition.xres;
+                        ip->yresol = mp->definition.yres;
+                        ip->depth = depth; /* log2 (bits/pixel) */
+                        ip->framerate = mp->frame_hz; /* integer Hz value used here */
+
+                        /* Copy name + 1 terminating null into block */
+                        strcpy (ip->name, mp->definition.name);
+                        /* Pad name field out with 0's to N*4 */
+                        for (i = nlen+1; (i & 3) != 0; ++i)
+                            ip->name[i] = 0;
+                        /* Step buffer pointer past this new entry */
+                        regs->r[6] += entrysize;
+                    }
+                    else
+                    {
+                        regs->r[1] = 0; /* Service_Serviced */
+                        return;
+                    }
+                }
+                /* Update remaining size of user data area */
+                regs->r[7] -= entrysize;
+            }
+            /* count down matching modes in calling r2 */
+            --regs->r[2];
+        }
+
+        /* Move on to next mode, if there are any left */
+        if (depth < 5)
+            ++depth;                    /* next deeper mode of current def'n */
+        else
+        {
+            mp = mp->next;              /* next mode in list */
+            if (mp == NULL)
+                return;                 /* no more modes from this module */
+            depth = 0;                  /* start with min. depth */
+        }
+    }
+}
+
+static int mode_available(uns32 xres, uns32 yres, int depth, int framerate)
+{
+    ModeDescriptionRef mp;
+    int nmodes;
+
+    mp = find_by_xy( current_monitor->modelist, xres, yres, &nmodes);
+    if (!mp)
+        return 0;
+    do
+    {
+        if ((framerate == -1 || framerate == mp->frame_hz) &&
+            mode_valid (mp, depth, 0xFFFFFFFF, 0xFFFFFFFF))
+        {
+            return 1;
+        }
+        mp = mp->next;
+    } while (--nmodes);
+
+    return 0;
+}
+
+static void service_modetranslation (_kernel_swi_regs *regs)
+{
+    unsigned int flags;
+    int depth;
+
+    static const char pal[4]  = {  0,  8, 12, 15 };
+    static const char ntsc[4] = { 44, 45, 46, 46 };
+    static const char vga[4]  = { 25, 26, 27, 28 };
+
+    /* We do monitor type 7 only */
+    if (regs->r[3] != 7 || !current_monitor)
+        return;
+
+    /*
+     * Someone has asked for an old-style mode number, but we
+     * must have refused it.
+     *
+     * If we don't handle this, the Kernel will select one of
+     * modes 25, 26, 27 or 28. This would be fine, except
+     * we may not have mode 25, due to interlacing problems, or
+     * we may have only non-interlaced modes.
+     *
+     * Note we're not told the bandwidth and memory limits.
+     * Could deal with this by issuing OS_CheckModeValid for
+     * each mode, but that adds reentrancy problems :) The
+     * selection of modes above are within the limits of even
+     * an A310, so we assume they won't be too big/fast.
+     */
+
+    /*
+     * What depth are they looking for? If the mode is
+     * unknown, use 1bpp (as the Kernel does).
+     */
+    if (_swix(OS_ReadModeVariable, _INR(0,1)|_OUT(2)|_OUT(_FLAGS),
+              regs->r[2], 9, &depth, &flags) || (flags & _C))
+        depth = 0;
+
+    /*
+     * Clamp depth to 8bpp to restrict ourselves to old-style
+     * modes.
+     */
+    if (depth > 3)
+        depth = 3;
+
+  retry_with_4bpp:
+
+    /*
+     * Check if 640x480xdepth @ 60Hz is available. If so, allow
+     * kernel to do normal.
+     */
+     if (mode_available(640, 480, depth, 60))
+     {
+         regs->r[1] = 0;                /* Service_Serviced */
+         regs->r[2] = vga[depth];       /* substitute mode */
+         return;
+     }
+
+     /*
+      * We don't have a standard VGA mode. Let's try a PAL TV
+      * mode.
+      */
+     if (mode_available(640, 256, depth, 50))
+     {
+         regs->r[1] = 0;                /* Service_Serviced */
+         regs->r[2] = pal[depth];       /* substitute mode */
+         return;
+     }
+
+     /*
+      * Alright then. How about a NTSC TV mode?
+      */
+     if (mode_available(640, 200, depth, 60))
+     {
+         regs->r[1] = 0;                /* Service_Serviced */
+         regs->r[2] = ntsc[depth];      /* substitute mode */
+         return;
+     }
+
+     /*
+      * Check if 640x480xdepth @ any rate is available.
+      */
+     if (mode_available(640, 480, depth, -1))
+     {
+         regs->r[1] = 0;                /* Service_Serviced */
+         regs->r[2] = vga[depth];       /* substitute mode */
+         return;
+     }
+
+     /*
+      * Still getting nowhere? Maybe we can't do 1bpp or 8bpp for
+      * various reasons. Try again with 4bpp.
+      */
+     if (depth != 2)
+     {
+         depth = 2;
+         goto retry_with_4bpp;
+     }
+
+     /* I give up. Let someone else worry about it. */
+     return;
+}
+
+static void module_shutdown ()
+{
+    (void) restore_monitortype (); /* restore old value */
+    release_currentmonitor ();
+}
+
+static int we_are_preferred (void *pw)
+{
+    _kernel_swi_regs sregs;
+    sregs.r[0] = 18;
+    sregs.r[1] = (int)"ScreenModes";
+    (void)_kernel_swi (OS_Module, &sregs, &sregs);
+    return (sregs.r[4] == *(int *)pw);
+}
+
+
+/* EXPORTED */
+_kernel_oserror *ScreenModes_init (char *cmd_tail, int podule_base, void *pw)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *res;
+    enum vidctype vcode;
+
+    /* Determine Video Controller type for this machine. */
+    regs.r[0] = 2;
+    res = _kernel_swi (OS_ReadSysInfo, &regs, &regs);
+    if (res != NULL)
+        return res;                     /* ought never to happen! */
+    vcode = (enum vidctype) ((regs.r[0] >> 24) & 0xFF);
+    switch (vcode)
+    {
+      case V_VIDC1:
+      case V_VIDC20:
+        /*
+         * Add new known video controller type codes as additional
+         * cases here, if ever there are any more!
+         */
+        vidc_type = vcode;
+        break;
+      default:
+        /* What hardware is this?! */
+        vidc_type = V_UNKNOWN;
+        break;
+    }
+
+    /*
+     * Arrange to free the space claimed for the current monitor
+     * description (if any) and revert to the configured monitor type,
+     * when the module is shut down.  It is extremely unlikely that
+     * the atexit call will fail, and even if it does, it just means
+     * we will leave some memory allocated when we are shut down
+     * (which is a pretty rare event in itself). Not resetting the
+     * monitor type would be slightly more problematic, but we don't
+     * worry here.
+     */
+    (void) atexit (module_shutdown);
+    return NULL;
+}
+
+
+/* EXPORTED */
+void ScreenModes_servicecall (int servicecallno, _kernel_swi_regs *regs, void *pw)
+{
+    if (current_monitor == NULL)
+        return;                         /* nothing loaded */
+
+    /* Ignore service calls if we are not the current preferred instantiation */
+    if (!we_are_preferred (pw)) return;
+
+    if (servicecallno == Service_ModeExtension)
+        service_modeextension (regs);
+    else if (servicecallno == Service_EnumerateScreenModes)
+        service_enumeratescreenmodes (regs);
+    else if (servicecallno == Service_ModeTranslation)
+        service_modetranslation (regs);
+}
+
+
+/* EXPORTED */
+_kernel_oserror *ScreenModes_command (char *arg_string, int argc, int cmd_no, void *pw)
+{
+    _kernel_oserror *result;
+
+    switch (cmd_no)
+    {
+        case 0: result = loadmodefile (arg_string);
+                break;
+
+        case 1: result = vidcbandwidthlimit (arg_string);
+                break;
+
+        default: result = NULL;         /* eh? */
+    }
+    return result;
+}
+
+/* EXPORTED */
+_kernel_oserror *ScreenModes_swihandler (int swi_no, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_oserror *result;
+
+    switch (swi_no)
+    {
+        case 0:
+            switch (r->r[0])      /* In ScreenModes_ReadInfo, r0 on entry is reason code */
+            {
+                case 0:         /* Return pointer to monitor name */
+                    if (current_monitor)
+                    {
+                        r->r[0] = (int) &current_monitor->name;
+                        result = NULL;
+                    }
+                    else
+                    {
+                        /* No monitor description file loaded */
+                        result = error (ERR_NOMODEFILE, 0, 0, 0);
+                    }
+                    break;
+
+                default:        /* Unknown ScreenModes_ReadInfo call */
+                    result = error (ERR_BADREADINFO, 0, 0, 0);
+            }
+            break;
+
+        default:                /* Unknown ScreenModes SWI */
+            result = error (ERR_UNKNOWNSWI, 0, 0, 0);
+    }
+    return result;
+}
+
+
+/* EOF ScrModes.c */

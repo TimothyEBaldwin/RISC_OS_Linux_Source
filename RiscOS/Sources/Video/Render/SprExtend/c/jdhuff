@@ -1,0 +1,393 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * jdhuff.c
+ *
+ * Copyright (C) 1991, 1992, Thomas G. Lane.
+ * This file is part of the Independent JPEG Group's software.
+ * For conditions of distribution and use, see the accompanying README file.
+ *
+ * This file contains Huffman entropy decoding routines.
+ * These routines are invoked via the methods entropy_decode
+ * and entropy_decoder_init/term.
+
+ * Not only hacked for use deep within RISC OS, but bits of release 4 transplanted in too.
+ */
+#undef FILE_
+#define FILE_ (10000)
+
+#include "jinclude.h"
+
+#ifndef assert
+  /* Stolen from c.PutScaled */
+  #define assert(x, y) do_assert(__LINE__, x, y, 0)
+  static void do_assert(int line, BOOL arg, int error, char *describe)
+  {
+    if (arg == 0)
+    {
+      tracef("ASSERTION FAILED (line %i): %s\n" _ line _ describe);
+      exit(error);
+    }
+  }
+#endif
+
+LOCAL int
+huff_DECODE_buildshortcut (decompress_info_ptr cinfo, HUFF_TBL * htbl); /* forward reference */
+
+LOCAL void
+fix_huff_tbl (decompress_info_ptr cinfo, HUFF_TBL * htbl)
+/* Compute derived values for a Huffman table */
+{
+  int p, i, l, si;
+  char huffsize[257];
+  UINT16 huffcode[257];
+  UINT16 code;
+
+  /* Figure C.1: make table of Huffman code length for each symbol */
+  /* Note that this is in code-length order. */
+
+  p = 0;
+  for (l = 1; l <= 16; l++) {
+    for (i = 1; i <= (int) htbl->bits[l]; i++)
+      huffsize[p++] = (char) l;
+  }
+  huffsize[p] = 0;
+
+  /* Figure C.2: generate the codes themselves */
+  /* Note that this is in code-length order. */
+
+  code = 0;
+  si = huffsize[0];
+  p = 0;
+  while (huffsize[p]) {
+    while (((int) huffsize[p]) == si) {
+      huffcode[p++] = code;
+      code++;
+    }
+    code <<= 1;
+    si++;
+  }
+
+  /* We don't bother to fill in the encoding tables ehufco[] and ehufsi[], */
+  /* since they are not used for decoding. */
+
+  /* Figure F.15: generate decoding tables */
+
+  p = 0;
+  for (l = 1; l <= 16; l++) {
+    if (htbl->bits[l]) {
+      htbl->valptr[l] = p;      /* huffval[] index of 1st sym of code len l */
+      htbl->valptr[l] -= huffcode[p]; /* subtract value in old 'mincode' table, for speed later */
+      /* htbl->mincode[l] = huffcode[p]; */ /* minimum code of length l */
+      p += htbl->bits[l];
+      htbl->maxcode[l] = huffcode[p-1]; /* maximum code of length l */
+    } else {
+      htbl->maxcode[l] = -1;
+    }
+  }
+  htbl->maxcode[17] = 0xFFFFF /*0xFFFFFL*/; /* ensures huff_DECODE terminates */
+
+  /* Now we build the shortcut table. Using the above, reading a huffman code
+  proceeds by reading bits one at a time, and looking up the result in a table
+  to see if it is big enough yet. The shortcut table reads the next 8 bits
+  of input, and uses this to index a table that says what to do. This table
+  is constructed by trying all 256 possibles. */
+  {
+    int i; /* index into shortcut table */
+    int h; /* the code you read */
+
+    for (i = 0; i < 256; i++) /* for each element of shortcut table */
+    {
+      cinfo->bits_left = 32;
+      cinfo->get_buffer = i << 24; /* fake the input bits */
+      h = huff_DECODE_buildshortcut(cinfo, htbl); /* the C-coded decoding doesn't use the shortcut table - we haven't built it yet! */
+      if (cinfo->bits_left < 24) /* code longer than 8 bits */
+        htbl->shortcut[i] = -1;
+      else
+      {
+        assert(h >= 0, ERROR_FATAL);
+        htbl->shortcut[i] = ((32 - cinfo->bits_left) << 24) | h; /* remember size and value */
+      }
+    }
+    cinfo->bits_left = 0;
+    cinfo->get_buffer = 0;
+  }
+}
+
+/* Extract the next N bits from the input stream (N <= 15) */
+
+LOCAL int
+get_bits (decompress_info_ptr cinfo, int nbits)
+{
+  int result;
+
+  while (nbits > cinfo->bits_left) {
+    int c = JGETC(cinfo);
+
+    cinfo->get_buffer <<= 8;
+    cinfo->get_buffer |= c;
+    cinfo->bits_left += 8;
+    /* If it's 0xFF, check and discard stuffed zero byte */
+    if (c == 0xff) {
+      c = JGETC(cinfo);  /* Byte stuffing */
+      if (c != 0)
+        ERREXIT1(cinfo->emethods,
+                 "Unexpected marker 0x%02x in compressed data", c);
+    }
+  }
+
+  cinfo->bits_left -= nbits;
+  result = ((int) (cinfo->get_buffer >> cinfo->bits_left)) & ((1 << nbits) - 1);
+  return result;
+}
+
+/* Macro to make things go at some speed! */
+
+#define get_bit(cinfo)       (cinfo->bits_left ? \
+                             ((int) (cinfo->get_buffer >> (--cinfo->bits_left))) & 1 : \
+                             get_bits(cinfo, 1))
+
+/* Figure F.16: extract next coded symbol from input stream */
+
+/* Altered version of huff_DECODE for use in constructing the shortcut table */
+LOCAL int
+huff_DECODE_buildshortcut (decompress_info_ptr cinfo, HUFF_TBL * htbl)
+{
+  int l, p;
+  INT32 code;
+
+  code = get_bit(cinfo);
+  l = 1;
+  while (code > htbl->maxcode[l] && l <= 8) {
+    code = (code << 1) + get_bit(cinfo);
+    l++;
+  }
+  if (l > 8) return -1;
+  p = (int) (htbl->valptr[l] + (code /* - htbl->mincode[l] */));
+  return (int) htbl->huffval[p];
+}
+
+#ifndef ASMHUFF
+
+LOCAL int
+huff_DECODE (decompress_info_ptr cinfo, HUFF_TBL * htbl)
+{
+  int l, p;
+  INT32 code;
+
+  code = get_bit(cinfo);
+  l = 1;
+  while (code > htbl->maxcode[l]) {
+    code = (code << 1) + get_bit(cinfo);
+    l++;
+  }
+
+  /* With garbage input we may reach the sentinel value l = 17. */
+
+  if (l > 16) {
+    ERREXIT(cinfo->emethods, "Corrupted data in JPEG file");
+  }
+
+  p = (int) (htbl->valptr[l] + (code /* - htbl->mincode[l] */));
+/*
+  tracef("Decoded huffman value=%i next_byte=0x%x bits_left=%i get_buf=0x%x.\n"
+  _ htbl->huffval[p] _ (int)cinfo->next_input_byte _ cinfo->bits_left _ cinfo->get_buffer);
+*/
+  return (int) htbl->huffval[p];
+}
+
+/* Figure F.12: extend sign bit */
+
+/* NB: on some compilers this will only work for s > 0 */
+
+#define huff_EXTEND(x, s)       ((x) < (1 << ((s)-1)) ? \
+                                 (x) + (-1 << (s)) + 1 : \
+                                 (x))
+
+
+/* Decode a single block's worth of coefficients */
+
+/* ZAG[i] is the natural-order position of the i'th element of zigzag order.
+ * If the incoming data is corrupted, huff_decode_mcu could attempt to
+ * reference values beyond the end of the array.  To avoid a wild store,
+ * we put some extra zeroes after the real entries.
+ */
+
+#if 0
+
+static const short ZAG[DCTSIZE2+16] = {
+  0,  1,  8, 16,  9,  2,  3, 10,
+ 17, 24, 32, 25, 18, 11,  4,  5,
+ 12, 19, 26, 33, 40, 48, 41, 34,
+ 27, 20, 13,  6,  7, 14, 21, 28,
+ 35, 42, 49, 56, 57, 50, 43, 36,
+ 29, 22, 15, 23, 30, 37, 44, 51,
+ 58, 59, 52, 45, 38, 31, 39, 46,
+ 53, 60, 61, 54, 47, 55, 62, 63,
+  0,  0,  0,  0,  0,  0,  0,  0, /* extra entries in case k>63 below */
+  0,  0,  0,  0,  0,  0,  0,  0
+};
+
+/* 2-digit ones in decimal: */
+#define ZAG (\
+"\x00\x01\x08\x16\x09\x02\x03\x10" \
+"\x17\x24\x32\x25\x18\x11\x04\x05" \
+"\x12\x19\x26\x33\x40\x48\x41\x34" \
+"\x27\x20\x13\x06\x07\x14\x21\x28" \
+"\x35\x42\x49\x56\x57\x50\x43\x36" \
+"\x29\x22\x15\x23\x30\x37\x44\x51" \
+"\x58\x59\x52\x45\x38\x31\x39\x46" \
+"\x53\x60\x61\x54\x47\x55\x62\x63" \
+"\x00\x00\x00\x00\x00\x00\x00\x00" \
+"\x00\x00\x00\x00\x00\x00\x00\x00")
+
+#else
+
+#define ZAG (\
+"\x00\x01\x08\x10\x09\x02\x03\x0a" \
+"\x11\x18\x20\x19\x12\x0b\x04\x05" \
+"\x0c\x13\x1a\x21\x28\x30\x29\x22" \
+"\x1b\x14\x0d\x06\x07\x0e\x15\x1c" \
+"\x23\x2a\x31\x38\x39\x32\x2b\x24" \
+"\x1d\x16\x0f\x17\x1e\x25\x2c\x33" \
+"\x3a\x3b\x34\x2d\x26\x1f\x27\x2e" \
+"\x35\x3c\x3d\x36\x2f\x37\x3e\x3f" \
+"\x00\x00\x00\x00\x00\x00\x00\x00" \
+"\x00\x00\x00\x00\x00\x00\x00\x00")
+
+#endif
+
+LOCAL void
+decode_one_block (decompress_info_ptr cinfo, JBLOCK block, HUFF_TBL *dctbl, HUFF_TBL *actbl, QUANT_TBL_PTR quanttbl, int *last_dc_val)
+{
+  int s, k, r, n;
+
+  /* zero out the coefficient block */
+
+  MEMZERO((void *) block, SIZEOF(JBLOCK));
+
+  /* Section F.2.2.1: decode the DC coefficient difference */
+
+  s = huff_DECODE(cinfo, dctbl);
+  if (s) {
+    r = get_bits(cinfo, s);
+    s = huff_EXTEND(r, s);
+  }
+  /* Convert DC difference to actual value, update last_dc_val */
+  s += *last_dc_val;
+  *last_dc_val = (JCOEF) s;
+  /* Descale and output the DC coefficient (assumes ZAG[0] = 0) */
+  block[0] = (JCOEF) (((JCOEF) s) * quanttbl[0]);
+
+  /* Section F.2.2.2: decode the AC coefficients */
+
+  for (k = 1; k < DCTSIZE2; k++) {
+    r = huff_DECODE(cinfo, actbl);
+
+    s = r & 15;
+    n = r >> 4;
+
+    if (s) {
+      k += n;
+      r = get_bits(cinfo, s);
+      s = huff_EXTEND(r, s);
+      /* Descale coefficient and output in natural (dezigzagged) order */
+      block[ZAG[k]] = (JCOEF) (((JCOEF) s) * quanttbl[k]);
+    } else {
+      if (n != 15)
+        break;
+      k += 15;
+    }
+  }
+}
+
+LOCAL void
+skip_one_block (decompress_info_ptr cinfo, HUFF_TBL *dctbl, HUFF_TBL *actbl, int *last_dc_val)
+/* Like decode_one_block in its effect on *last_dc_val and the source of the input stream,
+but no block of coefficients need be produced. */
+{
+  int s, k, r, n;
+
+  /* Section F.2.2.1: decode the DC coefficient difference */
+
+  s = huff_DECODE(cinfo, dctbl);
+  if (s) {
+    r = get_bits(cinfo, s);
+    s = huff_EXTEND(r, s);
+  }
+  /* Convert DC difference to actual value, update last_dc_val */
+  s += *last_dc_val;
+  *last_dc_val = (JCOEF) s;
+
+  /* Section F.2.2.2: decode the AC coefficients */
+
+  for (k = 1; k < DCTSIZE2; k++) {
+    r = huff_DECODE(cinfo, actbl);
+
+    s = r & 15;
+    n = r >> 4;
+
+    if (s) {
+      k += n;
+      r = get_bits(cinfo, s);
+    } else {
+      if (n != 15)
+        break;
+      k += 15;
+    }
+  }
+}
+
+LOCAL void
+huff_decode_blocks(decompress_info_ptr cinfo, JBLOCK block,
+                   HUFF_TBL *dctbl, HUFF_TBL *actbl, QUANT_TBL_PTR quanttbl,
+                   int *last_dc_val, int nblocks)
+{
+  while (nblocks > 0)
+  {
+    decode_one_block(cinfo,block,dctbl,actbl,quanttbl,last_dc_val);
+    nblocks--;
+  }
+}
+
+extern void
+huff_skip_blocks (decompress_info_ptr cinfo, JBLOCK block,
+                  HUFF_TBL *dctbl, HUFF_TBL *actbl,
+                  QUANT_TBL_PTR quanttbl, int *last_dc_val, int nblocks)
+{
+  block=block; /* unused */
+  quanttbl=quanttbl; /* unused */
+  while (nblocks > 0)
+  {
+    skip_one_block(cinfo,dctbl,actbl,last_dc_val);
+    nblocks--;
+  }
+}
+
+#endif
+
+/*
+ * Initialize for a Huffman-compressed scan.
+ * This is invoked after reading the SOS marker.
+ */
+
+METHODDEF void
+huff_decoder_init (decompress_info_ptr cinfo)
+{
+  /* Initialize static variables */
+/*  dcinfo = cinfo; */
+  cinfo->bits_left = 0;
+
+}

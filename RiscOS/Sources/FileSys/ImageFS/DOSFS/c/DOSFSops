@@ -1,0 +1,4947 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*> c.DOSFSops <*/
+/*-------------------------------------------------------------------------*/
+/* DOSFS filing system image operations         Copyright (c) 1990 JGSmith */
+/*-------------------------------------------------------------------------*/
+/* These functions provide the Filing System interface for the image. The
+ * image is controlled by FileSwitch. We are given a FileSwitch handle to
+ * a buffered file. This is mapped at a lower level onto the actual device.
+ * All "pathname" requests should be accompanied by a FileSwitch handle. The
+ * "pathname" is relative to the ROOT of the image filesystem.
+ *
+ * This code does NOT need to deal with disc naming or drive numbering. All
+ * pathnames are relative to the ROOT of the image filesystem whose
+ * FileSwitch handle is passed to "DOSFS_image_open".
+ */
+/*-------------------------------------------------------------------------*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
+#include <ctype.h>
+#include "kernel.h"
+#include "swis.h"
+#include "debuglib/debuglib.h"
+
+#include "h.ASCII"
+#include "h.debug"
+#include "h.DOSFS"
+#include "h.DOSFSctl"
+#include "h.DOSshape"
+#include "h.FSerrors"
+#include "h.wcompare"
+#include "h.DOSnaming"
+#include "h.DOSFSops"
+#include "h.MultiFS"
+#include "h.TIMEconv"
+#include "h.DOSmapping"
+#include "h.ADFSshape"
+#include "h.Statics"
+
+#define MimeMap_Translate       0x50B00
+#define MMM_TYPE_RISCOS         0
+#define MMM_TYPE_RISCOS_STRING  1
+#define MMM_TYPE_MIME           2
+#define MMM_TYPE_DOT_EXTN       3
+
+#define ReadOnlyMapsLocked 1
+ /* JRS 9/3/92 map DOS ReadOnly bit to RISC OS Locked bit only.
+  * This is to fix problem with FilerAction setting access 0 to force-delete.
+  * This would get translated into DOS ReadOnly, which would then translate
+  * back into Locked and not Write, so the file would end up being locked
+  * by setting access 0, which was not the intention.
+  */
+
+static DOS_direntry *findDIRentry(char *wcname,DIR_info *cdir,int dir_size,int *index);
+static DOS_direntry *findemptyDIRentry(DOS_direntry *directory,int dir_size);
+static int extend_dir(DIR_info **cdir,DOS_direntry **dentry,DOSdisc *ihand,DIR_info **pdir);
+
+/* returns NULL if short and long names are identical, else NZ */
+int  shorten_lfn(char * longfname, char * shortname, char * shortnamebuff, DIR_info * cdir)
+{
+ // char * longfname : pointer to a null terminated file name
+ // char * shortnamebuff : pointer to a 13 byte buffer to store newly created short file name
+ // DIR_info * cdir : pointer the dir info structure for the target directory
+ int i, j, o, retval, dotseen=0;
+ char * extension,c;
+ /* check if already a valid short file name */
+ memset(shortnamebuff,' ',12);shortnamebuff[12]=0;
+ dprintf(("","shorten_lfn: start with -%s-\n",longfname));
+ for(i=0,j=0;(i<=12)&&(j<=12);i++,j++)
+ {
+   c=longfname[i];
+   if(c=='.')
+   {
+     if(!dotseen)
+     {
+       dotseen=i+1;
+       while(j<8)
+       {
+        shortnamebuff[j++]=' ';  // spacefill to 8
+       }
+     }
+     if(i>8) break ; // too many chars
+   }
+ dprintf(("","shorten_lfn: check -%x-%c- toupper(c) -%c-\n",c,c,toupper(c)));
+   if(c && ((c=='.')||((c==toupper(c)) && (c!=' '))))
+   { /* copy over */
+     shortnamebuff[j]=c;
+ dprintf(("","shorten_lfn: copied -%c-\n",c));
+   }
+   else
+   {
+     dprintf(("","shorten_lfn: %d %d %d\n",c,strlen(shortnamebuff),strlen(longfname)));
+     if(!c && /*strlen(shortnamebuff)==strlen(longfname) && */((!dotseen && (i<9)) || dotseen))
+     { /* end of string .. and identical */
+       dprintf(("","shorten_lfn: its a valid DOS SFN\n"));
+       retval= 0;
+       goto slnfn1;
+     }
+     break;
+   }
+ }
+
+
+
+ memset(shortnamebuff,'_',8);
+ memset(&shortnamebuff[8],' ',4);
+ shortnamebuff[12]=NULL;
+ for(i=0,o=0;o<6;i++)
+ {
+  if(longfname[i]==NULL)
+  {
+   o=6;
+   continue;
+  }
+  if(longfname[i]==' ') continue;
+  if(longfname[i]=='.')
+  {
+   if( &(longfname[i]) == strrchr(longfname,'.') )
+   {//If we are currently at the last 'dot' terminator in the filename...
+    o=6;      //Ensuring we
+    continue; //Drop out of the loop
+   }else
+   {
+    i++;
+    continue;
+   }
+  }
+  if(longfname[i] == ('+' || ',' || ';' || '=' || '[' || ']' || '.'))
+  {
+   shortnamebuff[o] = '_';
+  }else
+  {
+   shortnamebuff[o] = toupper(longfname[i]);
+  }
+  o++;
+ }
+
+ dprintf(("","shorten_lfn: strchr(longfname,'.') = %p, c='%c'\n",strchr(longfname,'.'),*strchr(longfname,'.')));
+ //We now have collected the first 6 characters of the short file name.
+ if(extension=strrchr(longfname,'.'), extension != NULL) //There is a dot extension
+ {//char * 'extension' points to the dot extension
+  for(i=0,o=8;o<12;i++)
+  {
+   if(extension[i]==NULL)
+   {
+    o=12; //Break out of loop
+    continue;
+   }
+   if(extension[i]==' ') continue;
+   if(extension[i] == ('+' || ',' || ';' || '=' || '[' || ']'))
+   {
+    shortnamebuff[o] = '_';
+   }else
+   {
+    shortnamebuff[o] = toupper(extension[i]);
+   }
+   o++;
+  }
+ }
+ shortnamebuff[6]='~';
+ shortnamebuff[7]='1';
+ shortnamebuff[12]=0;
+ if(shortnamebuff[9]==' ') shortnamebuff[8]='\0';
+
+ dprintf(("","Here file name is '%s'\n",shortnamebuff));
+
+ DOS_direntry * fentry;
+ int index;
+
+ for(i=1;i<99;i++)
+ {
+  shortnamebuff[7]='0'+(i%10);
+  if((i / 10) > 0)
+  {
+   shortnamebuff[6]='0'+(i/10);
+   shortnamebuff[5]='~';
+  }
+  index=0;
+  fentry=findDIRentry(shortnamebuff,cdir,cdir->dir_size,&index);
+  if(fentry==NULL)
+  {
+   i=99;
+   continue;
+  }
+ }
+
+
+ dprintf(("","shorten_lfn: Started with lfn \"%s\"\n",longfname));
+ dprintf(("","shorten_lfn: Created short name \"%s\", char[8]= %x, char[9]= %x, char[10]= %x, char[11]= %x, char[12]= %x, char[13]= %x\n",shortnamebuff,shortnamebuff[8],shortnamebuff[9],shortnamebuff[10],shortnamebuff[11],shortnamebuff[12],shortnamebuff[13]));
+ retval=1;
+slnfn1:
+  memset(shortname,' ',11);
+  memcpy(shortname,shortnamebuff,8);
+  memcpy(&shortname[8],&shortnamebuff[9],3);
+  if(shortnamebuff[8]=='.') i=8;
+  else i=0;
+  for(;i<11;i++)
+  {
+   if(shortnamebuff[i] == ' ')
+   {
+    shortnamebuff[i]=0;
+    i=11;
+    continue;
+   }
+  }
+ return retval;
+}
+
+
+void MakeLFNEntries(DOS_direntry * lfn[],int numreq,char* leafname,char* shortname);
+void MakeLFNEntries(DOS_direntry * lfn[],int numreq,char* leafname,char* shortname)
+{
+   int lfnnum,i;
+   DOS_lfnentry * lfnentry;
+   int charnum=0;
+   int nullreached=0;
+   for(i=(numreq-2),lfnnum=0;i>=0;i--,lfnnum++)
+   {//create the long file name structures
+    lfnentry = (DOS_lfnentry*)lfn[i];
+    lfnentry->FILE_Ordinal =  ((lfnnum&0x3F)+1);
+    if(i==0) lfnentry->FILE_Ordinal |= 0x40; // Last entry
+    lfnentry->FILE_attribute = 0x0F;
+    lfnentry->FILE_uchar0_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar0    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar1_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar1    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar2_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar2    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar3_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar3    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar4_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar4    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar5_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar5    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar6_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar6    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar7_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar7    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar8_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar8    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar9_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar9    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar10_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar10    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar11_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar11    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_uchar12_hi = (nullreached)?0xFF:0;
+    lfnentry->FILE_uchar12    = (nullreached)?0xFF:leafname[charnum];
+    if(leafname[charnum]==NULL) nullreached=1;
+    charnum++;
+    lfnentry->FILE_checksum = lfnchecksum(shortname);
+   }
+}
+
+//This function claims creates an array of contiguous *DOS_direntry used for LFNs
+int get_dir_entry_array(DOS_direntry *lfn[], DOSdisc *ihand, int numreq, DIR_info **cdir, DIR_info **pdir, DOS_direntry ** preserve);
+int get_dir_entry_array(DOS_direntry *lfn[], DOSdisc *ihand, int numreq, DIR_info **cdir, DIR_info **pdir, DOS_direntry ** preserve)
+{
+ int i;
+ int tempp;
+ int index=0;
+ DOS_direntry * dir = (DOS_direntry*)DI_Base(*cdir);
+
+ for(i=0;i<numreq;i++)
+ {
+  tempp = (int)findemptyDIRentry((DOS_direntry*)((int)dir+(index*32)),
+                                 (*cdir)->dir_size-(index*32));
+  if(tempp==NULL)
+  {//There are no free entrys left
+   dprintf(("","get_dir_entry_array: extending directory\n"));
+   if (extend_dir(cdir,(DOS_direntry**)&tempp,ihand,pdir) < 0)
+   {
+     return(-1); /* error already defined */
+   }
+   i=-1; index=0; // restart in new directory
+   dir = (DOS_direntry*)DI_Base(*cdir);
+  }
+  else
+  {
+   lfn[i] = (DOS_direntry*)(index=((int)tempp-(int)dir)/32);    // index fudge
+   index ++;      // next after found..
+   dprintf(("","get_dir_entry_array: i = %d, diff = %d\n",
+                           i,((int)lfn[i]-(int)lfn[i-1])));
+   if( (i != 0) && (((int)lfn[i]-(int)lfn[i-1]) != 1))
+   {
+    dprintf(("","get_dir_entry_array: packing directory %p\n",cdir));
+    packdir(*cdir, preserve);
+    i=-1;
+    index=0;
+   }
+  }
+ }
+
+ for(i=0;i<numreq;i++)
+ {
+  lfn[i] = (DOS_direntry*)((int)dir + ((int)(lfn[i])*32));
+ }
+ return 0;
+}
+
+/*-------------------------------------------------------------------------*/
+/* Provide facilities for directory cacheing.                              */
+/*-------------------------------------------------------------------------*/
+#define CACHED_DIRS 5
+
+static DIR_info *dir_cache[CACHED_DIRS] = { NULL };
+static int      next_cache_entry = 0;
+
+static void realloc_dir_cache(DIR_info *oldstruct, DIR_info *newstruct)
+{
+  int index;
+  for (index = 0; index < CACHED_DIRS; index++)
+    if (dir_cache[index] == oldstruct) {
+      dir_cache[index] = newstruct;
+      break;
+    }
+  /* We don't free the directory name as that is still used by the new directory. */
+  free(oldstruct);
+}
+
+static void free_dir_cache(char *dirname, DOSdisc *ihand)
+{
+  int index;
+  int namelen = strlen(dirname);
+  int i;
+  for (index = 0; index < CACHED_DIRS; index++)
+    if (dir_cache[index] != NULL && dir_cache[index]->ihand == ihand) {
+      if (!dir_flag_is_set(dir_cache[index], dir_LOCKED)
+          && (namelen == 0 || strncmp(dir_cache[index]->dir_name, dirname, namelen) == 0)) {
+        char c = *(dir_cache[index]->dir_name + namelen);
+        if (c == dir_sep || c == '\0') {
+          dprintf(("","free_dir_cache: freeing '%s'\n", dir_cache[index]->dir_name));
+          for(i=0;i<(((dir_cache[index])->dir_size)/(sizeof(DOS_direntry)));i++)
+          {
+           if( (dir_cache[index])->lfnp[i] != NULL) free( (dir_cache[index])->lfnp[i] );
+          }
+          free(dir_cache[index]->dir_name);
+          free(dir_cache[index]);
+          dir_cache[index] = NULL;
+        }
+      }
+    }
+}
+
+static void flush_dir_cache(DOSdisc *ihand)
+{
+  int index;
+  for (index = 0; index < CACHED_DIRS; index++)
+    if (dir_cache[index] != NULL && !dir_flag_is_set(dir_cache[index], dir_LOCKED)
+        && (dir_cache[index]->ihand == ihand || ihand == 0)) {
+      free(dir_cache[index]->dir_name);
+      free(dir_cache[index]);
+      dir_cache[index] = NULL;
+    }
+  dprintf(("","flush_dir_cache: directory cache flushed\n"));
+}
+
+/* Find the DIR_info structure in the cache which matches the path name as
+ * closely as possible.  If an exact match is not found then the nearest
+ * direct ancestor of the directory is returned and nameleft is set to
+ * point to the remainder of the path name.  If no match is found at all
+ * then NULL is returned.
+ */
+static DIR_info *match_cached_dir(char *dirpathname, char **nameleft, DOSdisc *ihand)
+{
+  int match = -1;
+  int maxmatch = 0;
+  int index;
+
+  dprintf(("","match_cached_dir: dirpathname = \"%s\"\n",dirpathname));
+  for (index = 0; index < CACHED_DIRS; index++)
+  {
+    dprintf(("","match_cached_dir: index = %d, dir_cache[index] = %p\n",index,dir_cache[index]));
+    if (dir_cache[index] != NULL && dir_cache[index]->ihand == ihand)
+    {
+      int len = strlen(dir_cache[index]->dir_name);
+      dprintf(("","match_cached_dir: dir_name = \"%s\"\n",dir_cache[index]->dir_name));
+      if (len == 0 || strncmp(dirpathname, dir_cache[index]->dir_name, len) == 0)
+      {
+        char c = *(dirpathname + len);
+        dprintf(("","match_cached_dir: char[0] = %02x string = %s \n",c,c?(dirpathname + len):""));
+        if (c == '\0')
+        {
+          dprintf(("","match_cached_dir: exactly matched '%s'\n", dirpathname));
+          *nameleft = NULL;
+          return dir_cache[index];
+        }
+        if ((len == 0 || c == dir_sep) && len >= maxmatch)
+        {
+          match = index;
+          maxmatch = len;
+        }
+      }
+    }
+  }
+  *nameleft = dirpathname + maxmatch;
+
+  if (match < 0)
+    return NULL;
+  dprintf(("","match_cached_dir: matched '%s' with '%s' left, match = %d\n", dir_cache[match]->dir_name, *nameleft,match));
+  return dir_cache[match];
+}
+
+/* Cache the directory in the next cache slot.
+ */
+static DIR_info *cache_dir(DIR_info *dirstruct)
+{
+  int i;
+
+  dprintf(("","cache_dir: finding a free cache entry ..\n"));
+  /* Try to find a free cache entry. */
+  for (i = 0; i < CACHED_DIRS; i++)
+    if (dir_cache[i] == NULL) {
+      dir_cache[i] = dirstruct;
+      return dirstruct;
+    }
+
+  /* Otherwise try to find one which isn't locked. */
+  i = next_cache_entry;
+  while (dir_flag_is_set(dir_cache[next_cache_entry], dir_LOCKED)) {
+   if (++next_cache_entry == CACHED_DIRS)
+     next_cache_entry = 0;
+   if (next_cache_entry == i)
+    break;
+  }
+
+  free(dir_cache[next_cache_entry]->dir_name);
+  free(dir_cache[next_cache_entry]);
+
+  /* Cache the directory and return it. */
+  dir_cache[next_cache_entry] = dirstruct;
+  if (++next_cache_entry == CACHED_DIRS)
+    next_cache_entry = 0;
+  dprintf(("","cache_dir: done\n"));
+  return dirstruct;
+}
+
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/* simple buffer zero function */
+//static void bzero(char *addr,int nbytes)
+//{
+// for (; (nbytes > 0); nbytes--)
+//  *addr++ = 0x00 ;
+// return ;
+//}
+
+/*-------------------------------------------------------------------------*/
+
+/* Return mode of access if the given file is open (else return -1). */
+static int find_open_file(char *fname, DOS_direntry *dentry, DOSdisc *ihand)
+{
+  FILEhand *cptr;
+
+  int dcluster = get_FILE_cluster(dentry,ihand);
+
+  for (cptr = FILE_list; cptr != NULL; cptr = cptr->next)
+    if (cptr->ihand == ihand) {
+      if (dcluster == 0) {
+        if (wild_card_compare(cptr->fname, fname, ROwcmult, ROwcsing))
+          return cptr->opentype;
+      } else
+        if (dcluster == cptr->startCLUSTER)
+          return cptr->opentype;
+    }
+
+  dprintf(("","find_open_file: file \"%s\" not open\n",fname));
+  return -1;
+}
+
+/*-------------------------------------------------------------------------*/
+
+static int update_imageID(DOSdisc *ihand)
+{
+ /* At the moment we just calculate a simple additive checksum from the FAT.
+  */
+ word              cval = 0x00000000 ; /* image ID value */
+ int               loop ;
+ char             *FATbuffer ;
+ _kernel_swi_regs  rset ;
+ _kernel_oserror  *rerror ;
+
+ /* Flush the output using OS_Args 255. */
+ rset.r[0] = 255;
+ rset.r[1] = (word)ihand->disc_fhand;
+ if ((rerror = _kernel_swi(OS_Args, &rset, &rset)) != NULL) {
+  dprintf(("","update_imageID: error from OS_Args 255: (&%08X) \"%s\"\n",rerror->errnum,rerror->errmess));
+  return_errorX(int,rerror);
+ }
+
+ FATbuffer = (char *)&(ihand->disc_FAT) ;
+
+ for (loop = 0; (loop < ihand->disc_FATsize); loop++)
+  cval = cval + FATbuffer[loop] ;
+
+ dprintf(("","update_imageID: sending 0x%x\n", cval));
+ rset.r[0] = 8 ; /* update image ID */
+ rset.r[1] = (word)ihand->disc_fhand;
+ rset.r[2] = cval ; /* and the newly calculated value */
+ if ((rerror = _kernel_swi(OS_Args,&rset,&rset)) != NULL)
+  {
+   dprintf(("","update_imageID: error from OS_Args 8: (&%08X) \"%s\"\n",rerror->errnum,rerror->errmess));
+   return_errorX(int,rerror) ;
+  }
+ ihand->disc_flags &= ~disc_UPDATEID ; /* we have given FileSwitch a new image ID */
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+static int DOS_image_RW(int op,word sec,int off,byte *ma,word nbytes,DOSdisc *ihand)
+{
+ word              discaddress ;
+ _kernel_swi_regs  reglist ;
+ _kernel_oserror  *rerror ;
+
+ dprintf(("","DOS_image_RW: %c sec: %x ma: &%08X nbytes: &%08X ihand: &%08X\n",((op == Rdata) ? 'R' : 'W'),sec,(int)ma,nbytes,(word)ihand));
+
+ /* read or write a block from the specified image file */
+ /* NOTE: the "disc_winioffset" value SHOULD be 0x00000000 for floppies */
+ discaddress = ((sec - 1) * DOSsecsize) + ihand->disc_winioffset + off ;
+
+ dprintf(("","DOS_image_RW: handle = &%08X, disc address = &%08X\n",ihand->disc_fhand,discaddress));
+
+ /* transfer the bytes */
+ reglist.r[0] = ((op == Rdata) ? osgbpb_rptr : osgbpb_wptr) ;
+ reglist.r[1] = ihand->disc_fhand ; /* FileSwitch handle */
+ reglist.r[2] = (word)ma ;
+ reglist.r[3] = nbytes ;
+ reglist.r[4] = discaddress ;
+ reglist.r[5] = NULL ;
+ reglist.r[6] = NULL ;
+
+ if ((rerror = _kernel_swi(OS_GBPB,&reglist,&reglist)) != NULL)
+  {
+   dprintf(("","DOS_image_RW: (&%08X) \"%s\"\n",rerror->errnum,rerror->errmess));
+   return_errorX(int,rerror) ;
+  }
+
+ dprintf(("","DOS_image_RW: transfer complete, &%08X bytes left\n",reglist.r[3]));
+
+ if (reglist.r[3] != 0)
+  {
+   return_error0(int,((op == Rdata) ? err_readfailed : err_writefailed)) ;
+  }
+
+ /* If this call has written data to the image (op == Wdata) and the new image
+  * ID flag is set then we must generate a new disc ID and tell FileSwitch
+  * about it.
+  *     OS_Args
+  *             r0 = 8
+  *             r1 = image file handle
+  *             r2 = new image identity
+  */
+ if ((op == Wdata) && (ihand->disc_flags & disc_UPDATEID))
+  return(update_imageID(ihand)) ;
+
+ return(0) ;
+}
+
+static void map_FILE_ROStype(DOS_direntry *dentry,char* dosext,time5byte *le)
+{
+ _kernel_swi_regs rset ;
+ int value = -1;
+
+ /* Try to determine whether this really is a ROS filetype */
+ if (((dentry->FILE_reserved[1] & 0xF0) == 0) || ((dentry->FILE_reserved[1] & 0xF0) == 0xF0))
+  {
+  value = get_FILE_ROStype(dentry);
+  /* DOSFS's capable of *SETTYPE &000 also set the top 4 bits */
+  if ((value == 0) && ((dentry->FILE_reserved[1] & 0xF0) != 0xF0)) value = -1;
+//  dprintf(("","filetype lookup,found in spare bytes 0x%X3\n", value));
+  }
+ /* No filetype in the spare bytes,so have a look through DOSmap */
+ if (value == -1)
+  {
+  mapentry *cmap ;
+  for (cmap = maplist; (cmap); cmap = cmap->next)
+   if (strcmp(dosext, cmap->dosext)==0)
+    {
+    value = cmap->ROtype;
+    dprintf(("","filetype lookup,found in dosmap 0x%X3\n", value));
+    break; /* the for loop */
+    }
+  }
+ /* Found neither a filetype nor an override mapping,try MimeMap */
+ if (value == -1)
+  {
+  rset.r[0] = MMM_TYPE_DOT_EXTN;
+  rset.r[1] = (int)dosext;
+  rset.r[2] = MMM_TYPE_RISCOS;
+  if (_kernel_swi(MimeMap_Translate, &rset, &rset) == NULL)
+   {
+   value = rset.r[3];
+   dprintf(("","filetype lookup,found in mimemap 0x%X3\n", value));
+   }
+  }
+ /* Give up,just set it as 'DOStype' */
+ if (value == -1)
+ {
+   dprintf(("","filetype lookup -%s- not found.. default to DOS\n",dosext ));
+   value = DOStype;
+ }
+ le->hi = (le->hi & ~ADFStypemask) | (value << ADFStypeshift) ;
+ return;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static void read_loadexec(DOS_direntry *dentry,char *dosext,time5byte *le)
+{
+ MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),le) ;
+ map_FILE_ROStype(dentry,dosext,le);
+ return ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static void update_loadexec(DOS_direntry *dentry,word ld,word ex)
+{
+ time5byte     updateTIME ; /* local time described in passed addresses */
+ int           cROStype = ((ld & ADFStypemask) >> ADFStypeshift) ;
+
+ dprintf(("","update_loadexec: dentry = &%08X, ld = &%08X, ex = &%08X\n",(word)dentry,ld,ex));
+
+ if (cROStype == DOStype)
+  {
+   erase_ROStype(dentry) ; /* remove any possible RISC OS file-type */
+  }
+ else
+  {
+   put_FILE_ROStype(dentry,cROStype) ;
+  }
+
+ /* update the timestamp */
+ updateTIME.lo = ex ;
+ updateTIME.hi = (ld & 0xFF) ;
+ put_FILE_time(dentry->FILE_time,dentry->FILE_timeHI,RISCOStoTIME(&updateTIME));
+ put_FILE_date(dentry->FILE_date,dentry->FILE_dateHI,RISCOStoDATE(&updateTIME));
+
+ return ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int getnextCLUSTER(int cluster,DOSdisc *ihand)
+{
+ int   nextcluster ;
+ word  bitaddress ;
+ word  byteaddress ;
+ word  shift ;
+ word  datavalue ;
+// byte *FAT_base_address = (byte *) ( (int)(&(ihand->disc_FAT)) + ((ihand->disc_RESVDsec-1)*ihand->disc_secsize) );
+ byte *FAT_base_address = (byte *) &ihand->disc_FAT;
+
+
+ bitaddress = (ihand->disc_FATentry * cluster) ;
+ byteaddress = (((bitaddress & 0xFFFFFFF8) >> 3) + (word)FAT_base_address) ;
+ shift = (bitaddress & 0x00000007) ;
+ datavalue = loadWORD((char *)byteaddress) ;
+ dprintf(("","Base address %x (cl:%x)\n",(int)FAT_base_address,cluster));
+ dprintf(("","Loaded from address %x\n",(int)byteaddress));
+ dprintf(("","Datavalue = %x\n",datavalue));
+ nextcluster = (int)((datavalue >> shift) & FAT_entry_mask(ihand)) ;
+ dprintf(("","getnextCLUSTER %d -> %d\n", cluster, nextcluster));
+
+ return(nextcluster) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int writenextCLUSTER(int cluster,int nextcluster,DOSdisc *ihand)
+{
+ word  bitaddress ;
+ word  byteaddress ;
+ word  shift ;
+ word  datavalue ;
+// byte *FAT_base_address = (byte *) ( (int)(&(ihand->disc_FAT)) + ((ihand->disc_RESVDsec-1)*ihand->disc_secsize) );
+ byte *FAT_base_address = (byte *) &ihand->disc_FAT;
+
+ dprintf(("","writenextCLUSTER: cluster = &%03X, nextcluster = &%03X\n",cluster,nextcluster));
+
+ bitaddress = (ihand->disc_FATentry * cluster) ;
+ byteaddress = (((bitaddress & 0xFFFFFFF8) >> 3) + (word)FAT_base_address) ;
+ shift = (bitaddress & 0x00000007) ;
+ datavalue = loadWORD((char *)byteaddress) ;
+ datavalue &= ~(FAT_entry_mask(ihand) << shift) ;
+ datavalue |= ((nextcluster & FAT_entry_mask(ihand)) << shift) ;
+ writeWORD((char *)byteaddress,datavalue) ;
+
+ ihand->disc_FATmodified = -1 ; /* the FAT has been updated */
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/* MACROs used to perform sector-to-CLUSTER mappings */
+
+#define CLUSTERtoSECTOR(c,i) (( ((c) - CLUSTER_first(i)) * secsalloc(i)) + (i)->disc_startsec)
+#define SECTORtoCLUSTER(s,i) ((((s) - (i)->disc_startsec) / secsalloc(i)) + CLUSTER_first(i))
+
+//#define CLUSTERtoSECTOR(c,i) (( ((c) - CLUSTER_first(i)) * secsalloc(i)) + (i)->disc_startsec+1)
+//#define SECTORtoCLUSTER(s,i) ((((s) - (i)->disc_startsec+1) / secsalloc(i)) + CLUSTER_first(i))
+
+/*---------------------------------------------------------------------------*/
+/* findCLUSTERtype:
+ * This steps through the FAT looking for a CLUSTER of the specified type.
+ *      index         contains the starting point in the FAT
+ *      FATlimit      defines the number of CLUSTERs contained in the FAT
+ * The last FAT entry looked at is returned in "index". If there are no such
+ * CLUSTERs then (-1) is returned.
+ */
+static int findCLUSTERtype(DOSdisc *ihand,int *index,int type)
+{
+ int          cluster = -1 ;
+ word         bitaddress ;
+ word         byteaddress ;
+ word         shift ;
+ word         datavalue ;
+ byte        *FAT_base_address = (byte *) &ihand->disc_FAT;
+ /* JRS 2/3/92 Added CLUSTER_first(ihand) */
+ int          FATlimit = CLUSTER_first(ihand) + ihand->disc_FATentries;
+
+ while (*index < FATlimit)
+  {
+   bitaddress = (ihand->disc_FATentry * (*index)) ;
+   byteaddress = (((bitaddress & 0xFFFFFFF8) >> 3) + (word)FAT_base_address) ;
+   shift = (bitaddress & 0x00000007) ;
+   datavalue = loadWORD((char *)byteaddress) ;
+   cluster = (int)((datavalue >> shift) & FAT_entry_mask(ihand)) ;
+//   dprintf(("","findCLUSTERtype: cluster = %x *index = %x byteaddress = %x dv = %x\n",cluster,*index,byteaddress,datavalue));
+   if (cluster == type)
+    return(*index) ;
+
+   /* increment onto the next cluster entry */
+   (*index)++ ;
+  }
+
+ /* no more CLUSTERs */
+ dprintf(("","No more free clusters.. *index is %x type = %x fatlimit:%x fatbase:%p\n",*index,type,FATlimit,FAT_base_address));
+ return(-1) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int countfreeclusters(DOSdisc *ihand)
+{
+ int numCLUSTERs = 0 ;
+ int clusterINDEX = CLUSTER_first(ihand) ;
+
+ /* returns the number of available clusters */
+
+ dprintf(("","CountFreeClusters: ihand = %p, index=%x\n",ihand,clusterINDEX));
+ while (findCLUSTERtype(ihand,&clusterINDEX,CLUSTER_unused(ihand)) != -1)
+  {
+   numCLUSTERs++ ;
+   clusterINDEX++ ; /* step over the CLUSTER we have just found */
+  }
+ dprintf(("","CountFreeClusters: numClusters = %x\n",numCLUSTERs));
+ return(numCLUSTERs) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int freeclusters(int startCLUSTER,DOSdisc *ihand)
+{
+ int lastCLUSTER = startCLUSTER ;
+ int nextCLUSTER ;
+ int count = 0;
+
+ /* Free the cluster chain addresses by "startcluster" and mark "startcluster"
+  * as the end of a chain.
+  */
+ dprintf(("","freeclusters: starting at cluster &%03X\n",startCLUSTER));
+
+ /* Check that there are indeed CLUSTERs to be free'd */
+ if ((startCLUSTER == 0) || (startCLUSTER >= CLUSTER_end(ihand)))
+  return(0) ; /* NO CLUSTERs to be released */
+
+ do
+  {
+   nextCLUSTER = getnextCLUSTER(lastCLUSTER,ihand) ;
+   dprintf(("","freeclusters: lastCLUSTER = &%03X, nextCLUSTER = &%03X\n",lastCLUSTER,nextCLUSTER));
+   writenextCLUSTER(lastCLUSTER,CLUSTER_unused(ihand),ihand) ;
+   lastCLUSTER = nextCLUSTER ;
+   if ( (count > ihand->disc_FATentries) || (nextCLUSTER < CLUSTER_first(ihand)) )
+     /* JRS 6/3/92 Added test to terminate infinite loop if loop in (bad) FAT */
+     { global_error0(err_clusterchain) ; break ; }
+   count++;
+  } while (nextCLUSTER < CLUSTER_end(ihand));
+
+ ihand->disc_freeclusters += count;
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+/* Build free clusters into a chain and return the start cluster. */
+static int claimfreeclusters(int required, DOSdisc *ihand)
+{
+  int index = CLUSTER_first(ihand);
+  int first, last;
+
+  if (required <= 0)
+    return 0;
+ dprintf(("","claimfreeclusters: need: &%03X index:%x\n",required,index));
+
+  /* Make sure there are enough free clusters. */
+  if (required > ihand->disc_freeclusters)
+    return_error0(int, err_discfull);
+
+  ihand->disc_freeclusters -= required;
+
+  first = last = findCLUSTERtype(ihand, &index, CLUSTER_unused(ihand));
+  while (--required) {
+    int next;
+    index++;  /* Skip the one we just found. */
+    next = findCLUSTERtype(ihand, &index, CLUSTER_unused(ihand));
+    writenextCLUSTER(last, next, ihand);
+    last = next;
+  }
+  /* Terminate the chain. */
+  writenextCLUSTER(last, CLUSTER_rend(ihand), ihand);
+
+  return first;
+}
+
+/*---------------------------------------------------------------------------*/
+
+/* Adjust the length of the given cluster chain and return the start cluster. */
+static int adjustusedchain(int start, int required, DOSdisc *ihand)
+{
+  int next, cluster;
+
+  /* If we are chopping to 0 length then this is really a free. */
+  if (required <= 0) {
+    freeclusters(start, ihand);
+    return 0;
+  }
+
+  /* If start is 0 then no space has been allocated for the file yet. */
+  if (start == 0)
+    return claimfreeclusters(required, ihand);
+
+  /* Follow the current chain until either we don't need any more (we need to chop)
+   * or it is exhausted (we need to extend).
+   */
+  next = start;
+  do {
+    cluster = next;
+    next = getnextCLUSTER(cluster, ihand);
+    if (next < CLUSTER_first(ihand)) /* JRS 9/3/92 */
+      return_error0(int,err_clusterchain) ;
+  } while ( (--required) && (next < CLUSTER_end(ihand)) );
+
+  /* The chain may be of the correct length anyway, hence we check both exit conditions. */
+  if (required) {
+    int extra;
+    /* We need to extend the chain. */
+    if ((extra = claimfreeclusters(required, ihand)) < 0)
+      return -1;
+    /* Tag onto the end of the existing chain. */
+    writenextCLUSTER(cluster, extra, ihand);
+  } else if (next < CLUSTER_end(ihand)) {
+    /* We need to chop the chain. */
+    freeclusters(next, ihand);
+    /* Terminate the chopped chain. */
+    writenextCLUSTER(cluster, CLUSTER_rend(ihand), ihand);
+  }
+
+  return start;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int clusterinchain(int cluster, int object, DOSdisc *ihand)
+{
+  int count = 0;
+  do {
+    if (cluster == object)
+      return 1;
+    cluster = getnextCLUSTER(cluster, ihand);
+    if ( (++count > ihand->disc_FATentries) || (cluster < CLUSTER_first(ihand)) )
+      /* JRS 6/3/92 Added test to terminate loop in bad FAT */
+      { global_error0(err_clusterchain) ; return 0 ; }
+  } while (cluster < CLUSTER_end(ihand)) ;
+  return 0;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int clusterfromoffset(int cluster, word *offset, DOSdisc *ihand)
+{
+  int count = 0;
+  int clustersize = secsalloc(ihand) * DOSsecsize;
+  do {
+    if (*offset < clustersize)
+      return cluster;
+    cluster = getnextCLUSTER(cluster, ihand);
+    (*offset) -= clustersize;
+    if ( (++count > ihand->disc_FATentries) || (cluster < CLUSTER_first(ihand)) )
+      /* JRS 6/3/92 Added test to terminate loop in bad FAT */
+      return_error0(int,err_clusterchain) ;
+  } while (cluster < CLUSTER_end(ihand));
+  return_error0(int, err_EOF);
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int DOS_FAT_RW(int op, DOSdisc *ihand)
+{
+  int loop, sec, copies = 0;
+  int numFATs = ihand->disc_boot.BOOT_num_fats;
+
+  dprintf(("","DOS_FAT_RW: op=%c\n",op==Rdata ? 'R' : 'W'));
+  dprintf(("","DOS_FAT_RW: disc_RESVDsec = %x\n",ihand->disc_RESVDsec));
+  dprintf(("","DOS_FAT_RW: base of fat = sector 0x%x\n",ihand->disc_RESVDsec+1));
+  for (loop = 0, sec = ihand->disc_RESVDsec+1; loop < numFATs; loop++, sec += ihand->disc_FATsecs) {
+//  for (loop = 0, sec = DOS_FAT_sector; loop < numFATs; loop++, sec += sizeinsec) {
+    if (op == Wdata) ihand->disc_flags |= disc_UPDATEID;  /* JRS 13/4/92 added to prevent ambiguous disc name error */
+    dprintf(("","DOS_FAT_RW: op = %c, copy = %d\n",(op == Rdata ? 'R' : 'W'), loop));
+    if (DOS_image_RW(op, sec, 0, (byte *)&(ihand->disc_FAT), ihand->disc_FATsize, ihand) == 0) {
+      copies++;
+      if (op == Rdata)
+        break;
+    }
+  }
+
+  if (copies == 0) {
+    dprintf(("","DOS_FAT_RW: operation failed\n"));
+    return -1;
+  }
+
+  ihand->disc_FATmodified = 0;
+
+  if (op == Rdata)
+    ihand->disc_freeclusters = countfreeclusters(ihand);
+
+  return 0;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int ensure_FATs(DOSdisc *ihand)
+{
+ if (ihand->disc_FATmodified)
+  return DOS_FAT_RW(Wdata, ihand);
+
+ return(0) ;
+}
+
+
+/*-------------------------------------------------------------------------*/
+/* DOS_cluster_RW:
+ *  load/save the specified (possibly partial) cluster to/from the given memory address
+ *    returns  n : next cluster
+ *    returns  0 : no more clusters (cluster 0 never holds data)
+ *    returns -1 : failed to load any data
+ *  NB. len MUST always be <= the cluster size (in bytes)
+ */
+
+static int DOS_cluster_RW(int op,int cluster,int coff,char *memaddr,int len,DOSdisc *ihand)
+{
+ int           nextcluster = -1 ;
+ int           startsector = CLUSTERtoSECTOR(cluster,ihand) ;
+
+ dprintf(("","DOS_cluster_RW: cluster= %x\n",cluster));
+ dprintf(("","DOS_cluster_RW: startsector = %x\n",startsector));
+ dprintf(("","DOS_cluster_RW: sector = %x\n",startsector+(coff>>log2DOSsecsize)));
+
+ if (DOS_image_RW(op,startsector+(coff>>log2DOSsecsize),coff&(DOSsecsize-1),(byte *)memaddr,len,ihand) < 0)
+  return(-1) ;
+
+ nextcluster = getnextCLUSTER(cluster,ihand) ;
+ if ( (nextcluster >= CLUSTER_end(ihand)) || (nextcluster < CLUSTER_first(ihand)) )
+  return(0) ;
+
+ return(nextcluster) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/* DOS_multiple_RW:
+ *  load/save as many consecutive CLUSTERs as possible, starting at the specified
+ *  cluster, to/from the given memory address.
+ *  returns  n : next cluster
+ *  returns  0 : no more clusters (cluster 0 never holds data)
+ *  returns -1 : failed to load all the data
+ */
+
+static int DOS_multiple_RW(int op,int cluster,int coff,char *ma,int limit,word *ta,DOSdisc *ihand)
+{
+ int count = 0;
+ int           nextcluster = cluster ;
+ int           startsector = CLUSTERtoSECTOR(cluster,ihand) ;
+ int           allocsize = (secsalloc(ihand) * DOSsecsize) ;
+
+ dprintf(("","DOS_multiple_RW: Op = %c, cluster = %03x, coff = %x length = %x,allocs:%x\n",(op==Rdata)?'R':'W',cluster,coff,limit,allocsize));
+
+ *ta = 0 ;      /* number of bytes we are going to transfer */
+ /* "limit" is the extent of the maximum amount of data we should transfer */
+ limit += coff;
+ do
+  {
+   *ta += allocsize ;   /* this CLUSTER will be included */
+   cluster = nextcluster ;
+   nextcluster = getnextCLUSTER(cluster,ihand) ;
+   if ( (++count > ihand->disc_FATentries) || (nextcluster < CLUSTER_first(ihand)) )
+   {
+ dprintf(("","DOS_multiple_RW: failed %x %x %x %x \n",count,ihand->disc_FATentries,nextcluster , CLUSTER_first(ihand)));
+     /* JRS 6/3/92 Added test to terminate loop in bad FAT */
+     return_error0(int,err_clusterchain) ;
+   }
+   if (nextcluster >= CLUSTER_end(ihand))
+    {
+     nextcluster = 0 ; /* end of cluster chain */
+     if (*ta < limit)
+      {
+       dprintf(("","DOS_multiple_RW: end of CLUSTER chain reached (&%08X) before limit &%08X)\n",*ta,limit));
+       return_error0(int,err_clusterchain) ;   /* not all of the file loaded */
+      }
+    }
+  } while ((*ta < limit) && (nextcluster == cluster + 1)) ;
+
+ /* transfer the data */
+ if (*ta > limit)
+  *ta = limit;
+ *ta-=coff;
+ dprintf(("","DOS_multiple_RW: ss:%x sec:%x offset:%x\n",startsector+(coff>>log2DOSsecsize),startsector,coff&(DOSsecsize-1)));
+ if (DOS_image_RW(op,startsector+(coff>>log2DOSsecsize),coff&(DOSsecsize-1),(byte *)ma,*ta,ihand) < 0)
+ {
+ dprintf(("","DOS_multiple_RW: DOS_image_RW failed \n"));
+  return(-1) ;
+ }
+ /* "*ta" is updated to hold the number of bytes actually transferred */
+ return(nextcluster) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static DOS_direntry *getnextDIRentry(DOS_direntry *directory,int dir_size,int *index)
+{
+ DOS_direntry *dentry ;
+ int           entries = (dir_size / sizeof(DOS_direntry)) ;
+
+// dprintf(("","getnextDIRentry: entered with : DOS_direntry * directory = %p\n",directory));
+// dprintf(("","getnextDIRentry:              : dir_size = %x\n",dir_size));
+// dprintf(("","getnextDIRentry:              : index = %d\n",*index));
+ /* return the directory entry pointer (or NULL if directory end)
+  * NOTE: the index is also set to (-1) if we have reached the end
+  */
+ if (*index == -1)
+  return(NULL) ;
+
+ if (*index >= entries)
+  {
+//   dprintf(("","getnextDIRentry: Last entry reached, returning -1\n"));
+   /* End of directory already reached (no last file marker present?) */
+   *index = -1 ;
+   return(NULL) ;
+  }
+
+ dentry = &directory[*index] ;
+
+// dprintf(("","getnextDIRentry: & FILE_status = %p, FILE_status = %x\n",dentry,dentry->FILE_status));
+
+ if (dentry->FILE_status == FILE_lastentry)
+  {
+   *index = -1 ;
+   return(NULL) ;
+  }
+
+ /* if this entry has been deleted (or is a directory) then step over it */
+ if ((dentry->FILE_status == FILE_deleted) || (dentry->FILE_status == FILE_directory))
+  {
+   *index += 1 ;
+   return(getnextDIRentry(directory,dir_size,index)) ;
+  }
+
+ /* increment the index counter onto the next directory entry */
+ *index += 1 ;
+
+ return(dentry) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static char *buildFILEname(DOS_direntry * dentry,char *name)
+{
+ char *cptr = (char *)&(dentry->FILE_status);
+ int   index ;
+ int   loop ;
+ dprintf(("","buildFILEname: dentry:%p\n",dentry));
+
+ /* "dentry" should contain a valid filename */
+ /* copy prefix characters (or upto a space) into the filename buffer */
+ for (index=0; ((cptr[index] > ' ') && (index < namsize)); index++)
+  name[index] = cptr[index] ;
+
+ /* copy suffix characters (or upto a space) into the filename buffer */
+ for (loop=0; ((dentry->FILE_extension[loop] > ' ') && (loop < extsize)); loop++)
+  {
+   if (loop == 0) /* the first character of the extension */
+    name[index++] = file_sep ; /* then place in the file_seperator */
+   name[index++] = dentry->FILE_extension[loop] ;
+  }
+
+ /* terminate the name */
+ name[index] = NULL ;
+ dprintf(("","buildFILEname: got:%s\n",name));
+
+ return(name) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static DOS_direntry *findemptyDIRentry(DOS_direntry *directory,int dir_size)
+{
+ DOS_direntry *dentry ;
+ int           index ;
+ int           entries = (dir_size / sizeof(DOS_direntry)) ;
+
+ /* return the first available directory entry pointer (or NULL if
+  * there are no free directory entries)
+  */
+ for (index=0; (index < entries); index++)
+  {
+   dentry = &directory[index] ;
+
+   /* if this entry has been deleted then we can use it */
+   if (dentry->FILE_status == FILE_deleted)
+    return(dentry) ;
+
+   /* if this entry is the last then use it and clear the following */
+   if (dentry->FILE_status == FILE_lastentry)
+    {
+     /* mark the successive entry as the last */
+     if (++index < entries)
+      directory[index].FILE_status = FILE_lastentry ;
+     return(dentry) ;
+    }
+  }
+
+ /* we could NOT find a free entry in this directory */
+ return(NULL) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/* findDIRentry:
+ * find the first object that matches the given wildcarded text
+ */
+
+static DOS_direntry *findDIRentry(char *wcname,DIR_info *cdir,int dir_size,int *index)
+{
+ DOS_direntry *dir = (DOS_direntry*)DI_Base(cdir);
+ DOS_direntry *dentry = NULL ;
+ char         *cfile = NULL ;
+ char         *nbuff = malloc(257) ; //CBC: stupidly large
+ int oldindex;
+ if (nbuff == NULL)
+  /* JRS changed 5/3/92 to trap out of memory error. Ideally all callers should test
+   * this out of memory case, but there is not time to modify, and at least if gives a valid error
+   * before doing something invalid! */
+  { global_errorT(err_heapexhausted, tok_heapexhausted, 0, 0); return NULL; }
+
+// dprintf(("","findDIRentry: wcname = \"%s\"\n",wcname));
+// dprintf(("","findDIRentry: DIR_info = %p\n",cdir));
+// dprintf(("","findDIRentry: dir_size = %x\n",dir_size));
+// dprintf(("","findDIRentry: index = %d\n",*index));
+
+ for (;;)
+  {
+   oldindex = *index;
+   dentry = getnextDIRentry(dir,dir_size,index) ;
+//   dprintf(("","findDIRentry: dentry = %p\n",dentry));
+   if (dentry == NULL)
+    break ;
+
+   if ((dentry->FILE_attribute & FILE_volume) != 0) continue ;
+   //CBC:
+//   dprintf(("","findDIRentry: dentry = %p\n",dentry));
+//   dprintf(("","findDIRentry: nbuff = %p\n",nbuff));
+//   dprintf(("","findDIRentry: cdir = %p\n",cdir));
+//   dprintf(("","findDIRentry: index = %d\n",*index));
+   dprintf(("","findDIRentry: cdir->lfnp[*index-1] = %p idx:%d oidx:%d -%s-\n",cdir->lfnp[*index-1],*index,oldindex,cdir->lfnp[*index-1]));
+   cfile = ((cdir->lfnp[oldindex])!=NULL)?(cdir->lfnp[oldindex]):buildFILEname(dentry,nbuff);
+   dprintf(("","findDIRentry: this file name is \"%s\"\n",cfile));
+
+   if (namematch(wcname,cfile) == TRUE)
+   {
+    goto matchfound;
+   }
+   else if((strlen(wcname) == 12) || (strlen(wcname) == 8))
+   {
+    cfile=buildFILEname(dentry,nbuff);
+    dprintf(("","findDIRentry: this shortfile name is \"%s\"\n",cfile));
+    if (namematch(wcname,cfile) == TRUE)
+     goto matchfound;
+   }
+
+  }
+matchfound:
+  dprintf(("","findDIRentry: EndOfLoop, match was \"%s\" -<>- \"%s\" dentry:%p\n",wcname,(cfile)?(cfile):0,dentry));
+
+ if (dentry)
+  strcpy(wcname, cfile);
+
+ free(nbuff) ;
+
+ /* will either be NULL (index set to -1), or a valid directory entry */
+ return(dentry) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static DOS_direntry *findSUBDIR(char *wcname,DIR_info *cdir,int dir_size,int *index)
+{
+ DOS_direntry *dentry = NULL ;
+ DOS_direntry *dir = (DOS_direntry*)DI_Base(cdir);;
+ char         *nbuff = malloc(DOSnamesize) ;
+ char         *cfile;
+ int oldindex;
+
+ if (nbuff == NULL)
+  {
+   *index = -1 ;
+   return(NULL) ;
+  }
+
+ do
+  {
+   oldindex=*index;
+   dentry = getnextDIRentry(dir,dir_size,index) ;
+   cfile = ((cdir->lfnp[oldindex])!=NULL)?(cdir->lfnp[oldindex]):buildFILEname(dentry,nbuff);
+//   cfile = buildFILEname(dentry,nbuff);
+  } while ((dentry != NULL) && (((dentry->FILE_attribute & FILE_subdir) == 0) || (namematch(wcname,cfile) != TRUE))) ;
+
+ if (dentry)
+  strcpy(wcname, cfile);
+
+ free(nbuff) ;
+
+ /* will either be NULL (index set to -1), or a valid directory entry */
+ return(dentry) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int DOS_object_RW(int op,int startcluster,char *ma,word bytelength,DOSdisc *ihand)
+{
+ word allocsize = secsalloc(ihand) * DOSsecsize;
+ word tamount ;
+ int  nextcluster = startcluster ;
+
+ dprintf(("","DOS_object_RW: op = %c, startCLUSTER = &%03X, ma = &%08X, bytelength = &%08X, ihand = &%08X\n",(op == Rdata ? 'R' : 'W'),startcluster,(word)ma,bytelength,(word)ihand));
+
+ /* load whole clusters directly into memory */
+ while ((bytelength != 0) && (nextcluster > 0))
+  {
+   if (bytelength < allocsize)
+    {
+     tamount = bytelength ;
+     dprintf(("","DOS_object_RW: Calling Cluster_RW\n"));
+     nextcluster = DOS_cluster_RW(op,nextcluster,0,ma,bytelength,ihand) ;
+    }
+   else
+   {
+    dprintf(("","DOS_object_RW: Calling Multiple_RW\n"));
+    nextcluster = DOS_multiple_RW(op,nextcluster,0,ma,bytelength,&tamount,ihand) ;
+   }
+   /* cluster op failure */
+   if (nextcluster == -1)
+    return(-1) ;       /* assumes error message already defined */
+
+   bytelength -= tamount ;
+   ma += tamount ;
+  }
+   dprintf(("","DOS_object_RW: nextcluster = &%03X, bytelength = &%08X\n",nextcluster,bytelength));
+
+ if ((nextcluster != 0) || (bytelength != 0))
+  {
+   dprintf(("","DOS_object_RW: FAILURE (nextcluster = &%03X, bytelength = &%08X)\n",nextcluster,bytelength));
+   return_error0(int,err_clusterchain) ; /* the CLUSTER chain is bad */
+  }
+
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int ensure_directory(DIR_info *dir)
+{
+ if (dir_flag_is_set(dir, dir_MODIFIED))
+  {
+   dprintf(("","ensure_directory: directory &%08X to be saved\n",(int)dir));
+
+   if (dir->dir_root != 0) /* ROOT directory is a special case */
+    {
+   dprintf(("","ensure_directory: root.. dirsec %x\n",dir->dir_sector));
+     if (DOS_image_RW(Wdata,dir->dir_sector,0,(byte *)DI_Base(dir),dir->dir_size,dir->ihand) < 0)
+      return(-1) ; /* error already defined */
+    }
+   else
+    {
+   dprintf(("","ensure_directory: nonroot,dirsec %x\n",dir->dir_sector));
+   dprintf(("","ensure_directory:ssec %x secsalloc:%x \n",(dir->ihand)->disc_startsec,secsalloc(dir->ihand)));
+     if (DOS_object_RW(Wdata,SECTORtoCLUSTER(dir->dir_sector,dir->ihand),
+                             (char *)DI_Base(dir),(word)dir->dir_size,
+                             dir->ihand) < 0)
+      return(-1) ; /* error already defined */
+    }
+
+   unset_dir_flags(dir, dir_MODIFIED) ; /* directory has been written successfully */
+  }
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+//Calculates the LFN checksum of an 11 bytes dos filename
+byte lfnchecksum(char * filename)
+{
+ byte checksum=0;
+ byte lsb;
+ int i;
+ for(i=0;i<11;i++)
+ {
+  lsb = (checksum&0x1); //Save the lsb
+  checksum = checksum >> 1; // Shift the byte
+  lsb = lsb << 7; // Turn saved lsb into msb
+  checksum |= lsb;
+  checksum += filename[i];
+ }
+
+ return checksum;
+}
+
+/* Set up a DIR_info struct for the given directory and cache it. */
+static DIR_info *read_cache_dir(
+  char *dirname,
+  int is_root,
+  word sector,
+  word size, // Size of all dir entrys in bytes, = num entrys * 32
+  word parsec,
+  word parindex,
+  word parsize,
+  DOSdisc *ihand
+) {
+  dprintf(("","read_cache_dir: at start; sector = %x, isroot = %d\n",sector,is_root));
+  //CBC: also allocate memory for a char* for each entry, + ((( size/sizeof(DOS_direntry) ) * sizeof(char*)) - sizeof(char*))
+  DIR_info *dirstruct = (DIR_info *)malloc(DI_Size(size));
+  if (dirstruct == NULL) {
+   flush_dir_cache(0);   /* Flush every unlocked directory from the cache - we're desperate!! */
+   //CBC: also allocate memory for a char* for each entry, + ((( size/sizeof(DOS_direntry) ) * sizeof(char*)) - sizeof(char*))
+   dirstruct = (DIR_info *)malloc(DI_Size(size));
+   if (dirstruct == NULL)
+    return_errorT(DIR_info *, err_heapexhausted, tok_heapexhausted, 0, 0);
+  }
+  dprintf(("","read_cache_dir: allocated ram size = %x\n",DI_Size(size)));
+  dprintf(("","read_cache_dir: allocated ram address = %08X\n",(int)dirstruct));
+  dirstruct->ihand = ihand;
+  if ((dirstruct->dir_name = malloc(strlen(dirname) + 1)) == NULL) {
+    free(dirstruct);
+    return_errorT(DIR_info *,err_heapexhausted, tok_heapexhausted, 0, 0);
+  }
+  strcpy(dirstruct->dir_name, dirname);
+  dirstruct->dir_root = is_root;
+  dirstruct->dir_sector = sector;
+  dirstruct->dir_size = size;
+  dirstruct->dir_parentsec = parsec;
+  dirstruct->dir_parentindex = parindex;
+  dirstruct->dir_parentsize = parsize;
+  dirstruct->dir_flags = 0;
+  dirstruct->dir_entryoffset = DI_Offset(size);
+  //CBC: somewhere round here I need to read out the long file names + extend and shift the filenames
+
+  dprintf(("","read_cache_dir: infoblock\n"));
+  dprintf(("","read_cache_dir: dir info base = %p\n",dirstruct));
+  dprintf(("","read_cache_dir: lfn entry base = %p\n",dirstruct->lfnp));
+  dprintf(("","read_cache_dir: dir entry original base = %p\n",dirstruct->dir_entries));
+  dprintf(("","read_cache_dir: dir entry offset = %x\n",dirstruct->dir_entryoffset));
+  dprintf(("","read_cache_dir: Dir entry base = %x\n",(DI_Base(dirstruct))));
+  dprintf(("","read_cache_dir: dir size = %x startsec = %x\n",dirstruct->dir_size,ihand->disc_startsec));
+
+  if (is_root)
+  {
+    if(ihand->disc_FATentry != 32)
+    {
+      if (DOS_image_RW(Rdata, sector, 0, (byte *)(DI_Base(dirstruct)) , size, ihand) < 0)
+      {
+        free(dirstruct->dir_name);
+        free(dirstruct);
+        dprintf(("","read_cache_dir: imager fails:1\n"));
+        return (DIR_info *)-1;
+      }
+    }
+    else
+    {
+     if (DOS_object_RW(Rdata,ihand->disc_RootCluster,(char *)(DI_Base(dirstruct)), size, ihand) < 0)
+      {
+        free(dirstruct->dir_name);
+        free(dirstruct);
+        dprintf(("","read_cache_dir: imager fails:2\n"));
+        return (DIR_info *)-1;
+      }
+    }
+  }
+  else
+  {
+    if (DOS_object_RW(Rdata,SECTORtoCLUSTER(sector, ihand),(char *)(DI_Base(dirstruct)), size, ihand) < 0)
+    {
+      free(dirstruct->dir_name);
+      free(dirstruct);
+      dprintf(("","read_cache_dir: imager fails:3\n"));
+      return (DIR_info *)-1;
+    }
+  }
+
+  // NULL the lfn pointer store
+  int i,j;
+  for(i=0;i<((dirstruct->dir_size)/sizeof(DOS_direntry));i++) dirstruct->lfnp[i] = NULL;
+  dprintf(("","read_cache_dir: last lfnp NULLed:%p \n", &dirstruct->lfnp[i-1]));
+
+//CBC: Get long file names where appropriate
+  DOS_direntry * fentry = (DOS_direntry*)(DI_Base(dirstruct));
+  DOS_lfnentry * lfnentry;
+  int lfnnum=0;
+  dprintf(("","_read lfns: starting lfn search, &dentry[] = %x\n",(int)(fentry+0)));
+  i=1;
+  while((fentry+i)->FILE_status != 0)// There are still directory entrys I have not looked at
+  {
+   if(((fentry+(i-1))->FILE_attribute == 0xF) &&
+      ((fentry+i)->FILE_attribute != 0xF) && //Its file with a LFN entry before it
+      (fentry+i)->FILE_status != 0xE5 &&
+      (fentry+(i-1))->FILE_status != 0xE5 ) //And neither entrys are marked as deleted
+   {
+    lfnentry = (DOS_lfnentry*)(fentry+(i-1));
+    lfnnum=1;
+    dprintf(("","_read lfns: lfn entry\n"));
+    while(lfnentry->FILE_attribute == 0xF &&
+          (lfnentry->FILE_Ordinal & 0x40) != 0x40)//Not last in chain
+    {
+     dprintf(("","_read lfns: extended lfn"));
+     lfnentry--;
+     lfnnum++;
+    }
+    if(lfnentry->FILE_checksum != lfnchecksum((char*)&((fentry+i)->FILE_status)))
+    {
+      dprintf(("","_read lfns: extended lfn but no cksum match \n"));
+      dprintf(("","_read lfns: sfentry: %p \n",fentry+i));
+    // We'd better delete backwards the duff entries..
+    // leave till later to write out
+      j=i;
+      while(--j>=0)
+      {
+        if((fentry+j)->FILE_attribute==0xF)
+        {
+      dprintf(("","_read lfns: Nullinf: %p \n",fentry+j));
+         (fentry+j)->FILE_status = 0xE5;
+        }
+        else j=0;
+      }
+      break;
+    }
+
+    dirstruct->lfnp[i] = calloc( ((((int)(fentry+i)-(int)lfnentry)/sizeof(DOS_direntry)) * 13)+1, sizeof(char));
+    dprintf(("","_read lfns: Creating a long filename buffer: size = %d, address = %p\n",(((int)(fentry+i)-(int)lfnentry)/sizeof(DOS_direntry))*13,dirstruct->lfnp[i]));
+    dprintf(("","_read lfns: Index = %d, Address = %p\n",i,&(dirstruct->lfnp[i])));
+    char * offset=dirstruct->lfnp[i];
+    dprintf(("","_read lfns: offsetadd = %p, at = %p dirinfo:%p cacoffset:%x\n",offset,(dirstruct->lfnp[i]),dirstruct,offsetof(DIR_info,lfnp)));
+
+
+    for(lfnentry=(DOS_lfnentry*)(fentry+(i-1));lfnnum>0;lfnnum--,lfnentry--)
+    {
+     *offset=lfnentry->FILE_uchar0;
+     offset++;
+     *offset=lfnentry->FILE_uchar1;
+     offset++;
+     *offset=lfnentry->FILE_uchar2;
+     offset++;
+     *offset=lfnentry->FILE_uchar3;
+     offset++;
+     *offset=lfnentry->FILE_uchar4;
+     offset++;
+     *offset=lfnentry->FILE_uchar5;
+     offset++;
+     *offset=lfnentry->FILE_uchar6;
+     offset++;
+     *offset=lfnentry->FILE_uchar7;
+     offset++;
+     *offset=lfnentry->FILE_uchar8;
+     offset++;
+     *offset=lfnentry->FILE_uchar9;
+     offset++;
+     *offset=lfnentry->FILE_uchar10;
+     offset++;
+     *offset=lfnentry->FILE_uchar11;
+     offset++;
+     *offset=lfnentry->FILE_uchar12;
+     offset++;
+    }
+   }
+   i++;
+  }
+
+
+  dprintf(("","read_cache_dir: read & cached '%s' into dirstruct %p \n", dirname,dirstruct));
+  return cache_dir(dirstruct);
+}
+
+/*---------------------------------------------------------------------------*/
+/* NOTE: The ROOT directory size is fixed (detailed in BOOT BLOCK).
+ *       Sub-directories are special files and hence can grow like files
+ *       (when buffering directories we can load the complete "FILE" into
+ *       a suitably sized DIR_info buffer).
+ */
+
+static DIR_info *loadDIR(char *dirpathname,DOSdisc *ihand)
+{
+ DIR_info     *dirstruct = NULL ;             /* directory description */
+ DOS_direntry *dentry ;                       /* directory entry structure */
+ int           index = 0 ;                    /* general directory index */
+ char         *tptr ;                         /* temporary pointer */
+ char          c ;                            /* character */
+ char         *fullname;
+
+ dprintf(("","loadDIR: \"%s\" ihand = &%08X\n",((dirpathname == NULL) ? "" : dirpathname),(word)ihand));
+
+ /* If the disc may have been changed then flush the directory cache. */
+ if (ihand->disc_flags & disc_CHANGED) {
+  flush_dir_cache(ihand);
+  ihand->disc_flags &= ~disc_CHANGED;
+ }
+
+ if (dirpathname == NULL)
+  dirpathname = "";
+ fullname = dirpathname;
+ /* Look in the cache for the directory.  If only the nearest ancestor is found then
+  * dirpathname is set to point to the remainder of the path name.
+  */
+ dirstruct = match_cached_dir(fullname, &dirpathname, ihand);
+ if (dirpathname == NULL)    /* If none of the path name remains then we've got an exact match. */
+ {
+  dprintf(("","loadDIR: dir loaded successfully at %p\n",dirstruct));
+  return dirstruct;
+ }
+ dprintf(("","loadDIR: dirstruct == %p\n",dirstruct));
+ if (dirstruct == NULL)
+ {
+  /* Have to descend from the root directory. */
+  dprintf(("","loadDIR: dirstruct == NULL\n"));
+
+  int DIRsize;
+  /* calculate the ROOT directory size in bytes */
+  if(ihand->disc_FATentry == 32)
+  {
+   int numclusters=0;
+   int nextcluster=2;
+   do
+   {
+    nextcluster=getnextCLUSTER(nextcluster, ihand);
+    numclusters++;
+   }while(nextcluster < CLUSTER_end(ihand));
+   DIRsize = secsalloc(ihand) * DOSsecsize * numclusters;
+  }else
+  {
+   DIRsize = (ihand->disc_ROOTsize * DOSsecsize) ;
+  }
+
+  int numFATs = ihand->disc_boot.BOOT_num_fats ; /* number of FAT copies */
+  dprintf(("","numFATS = %x\nFATsize = %x\nRESVDsec = %x\n",numFATs,ihand->disc_FATsecs,ihand->disc_RESVDsec));
+  dirstruct = read_cache_dir("", -1,
+                             (numFATs * ihand->disc_FATsecs) + ihand->disc_RESVDsec + 1,
+                             DIRsize, 0, 0, 0, ihand);
+ }
+
+ /* actually step down through the directory structure */
+ while (*dirpathname)
+  {
+   while (*dirpathname == dir_sep)    /* step over directory seperators */
+    dirpathname++ ;
+
+   tptr = dirpathname ;                  /* start of this directory entry */
+
+   /* step over object looking for terminator */
+   while ((*tptr != dir_sep) && (*tptr != '\0'))
+    tptr++ ;
+
+   /* SMC_DIR_CACHE: the following moved before writing '\0' to dirpathname */
+   if (tptr == dirpathname)
+    /* if we haven't moved then we assume "\" means "\." and the last
+     * directory we loaded is the desired directory
+     */
+    break ;
+
+   c = *tptr ;                /* remember character */
+   *tptr = '\0' ;             /* and ensure we have a valid terminator */
+
+   /* We must only search for entries that have the "FILE_subdir" flag
+    * set.
+    * Note: Sub-directories can have file extensions.
+    *       Sub-directories are FILEs.
+    */
+   dprintf(("","hunting for = \"%s\"\n",dirpathname));
+   /* look for "dirpathname" at this directory level */
+   index = 0 ;
+   if ((dentry = findSUBDIR(dirpathname,dirstruct,dirstruct->dir_size,&index)) != NULL)
+    {
+     int count = 0;
+     DIR_info *olddir = dirstruct ;                 /* remember the old directory */
+     word      sizedir = 0;
+     int       next = get_FILE_cluster(dentry,ihand);
+     word      allocsize = secsalloc(ihand) * DOSsecsize;
+   dprintf(("","next = \"%x\"\n",next));
+
+     while (next < CLUSTER_end(ihand)) {
+      sizedir += allocsize;
+      next = getnextCLUSTER(next, ihand);
+      if ( (++count > ihand->disc_FATentries) || (next < CLUSTER_first(ihand)) )
+        /* JRS 6/3/92 Added test to terminate loop in bad FAT */
+        return_error0(DIR_info *,err_clusterchain) ;
+     }
+
+     dirstruct = read_cache_dir(fullname, 0, CLUSTERtoSECTOR(get_FILE_cluster(dentry,ihand), ihand),
+                                sizedir, olddir->dir_sector, index - 1, olddir->dir_size, ihand);
+
+     if (c == '\0')           /* if last terminator was NULL */
+      break ;                 /* we have successfully scanned the tree */
+
+     *tptr = c ;              /* replace character */
+     dirpathname = tptr ;     /* and update the path pointer */
+
+     continue ;               /* and continue down the path */
+    }
+   else
+    {
+     return_errorT(DIR_info *,err_objectnotfound,tok_objectnotfound,dirpathname,0) ;
+    }
+  }
+
+ dprintf(("","loadDIR: dir load succesfully at %p\n",dirstruct));
+ /* we have successfully found and loaded the last entry */
+ return(dirstruct) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int extend_dir(DIR_info **cdir,DOS_direntry **dentry,DOSdisc *ihand,DIR_info **pdir)
+{
+ int       startCLUSTER ;   /* start of existing CLUSTER chain */
+ DIR_info *newdir ;         /* reference to new directory buffer */
+ int       newsize;
+ int       CLUSTERsize = cluster_size(&(ihand->disc_boot)) ;
+ char     *cptr;
+
+ dprintf(("","extend_dir: directory needs extending = %s\n",(*cdir)->dir_name));
+
+ *pdir = NULL ; /* ensure we do not have a parent directory reference */
+
+ /* If the directory is the ROOT directory or has no parent then it cannot be extended */
+ if ((*cdir)->dir_root != 0 || (*cdir)->dir_parentsec == 0)
+  {
+   return_error0(int,err_dirfull) ;
+  }
+
+ /* Load the parent directory for updating (cdir should be locked at a higher level). */
+ dprintf(("","extend_dir: loading parent directory\n"));
+ cptr = strrchr((*cdir)->dir_name, dir_sep);
+ if (cptr == NULL)
+  *pdir = loadDIR("", ihand);
+ else {
+  int index = cptr - (*cdir)->dir_name;
+  if ((cptr = malloc(index + 1)) == NULL)
+   return_errorT(int, err_heapexhausted, tok_heapexhausted, 0, 0);
+  strncpy(cptr, (*cdir)->dir_name, index);
+  cptr[index] = '\0';
+  *pdir = loadDIR(cptr, ihand);
+  free(cptr);
+ }
+ if ((int)*pdir < 0)
+  return -1;
+
+ dprintf(("","extend_dir: Old Dir address = %p\n",(*cdir)));
+ dprintf(("","extend_dir: old directory size = &%08X\n",(*cdir)->dir_size));
+ newsize = (*cdir)->dir_size + CLUSTERsize ;
+ dprintf(("","extend_dir: new directory size = &%08X\n",newsize));
+
+ /* Copy the current directory "(*cdir)" into a new (larger) buffer
+  * (adding the new CLUSTER).
+  */
+
+ //CBC: Need to obtain 4 more bytes of memory (for lfn pointer) for each 32 bytes of newsize; looks a bit ugly
+// newdir = (DIR_info *)malloc(sizeof(DIR_info) + (newsize-sizeof(DOS_direntry)) + (CLUSTERsize/32)*sizeof(char*));
+ newdir = (DIR_info *)malloc(sizeof(DIR_info) + (newsize-sizeof(DOS_direntry)) + (((newsize/32)*sizeof(char*))-sizeof(char*)));
+ if (newdir == NULL)
+  {
+   *pdir = NULL ;
+   return_errorT(int,err_heapexhausted, tok_heapexhausted, 0, 0) ;
+  }
+ dprintf(("","extend_dir: new dir address = %p, size %x\n",newdir,sizeof(DIR_info) + (newsize-sizeof(DOS_direntry)) + (((newsize/32)*sizeof(char*))-sizeof(char*))));
+ //CBC: Need to move the LFN pointers as well as the direntrys. Again, ugly.
+ memmove((char *)newdir, (char *)(*cdir),(int)DI_Base((*cdir)) - (int)(*cdir));
+
+ //CBC: Extend the length of the LFN pointer array
+ newdir->dir_entryoffset = DI_Offset(newsize);
+
+ //Copy up the dir entrys
+ memmove((char*)DI_Base(newdir),(char*)DI_Base((*cdir)),(*cdir)->dir_size);
+
+ //CBC: Point to the next free direntry
+ *dentry = (DOS_direntry *)((int)DI_Base(newdir)+(*cdir)->dir_size);
+// bzero((char *)*dentry, CLUSTERsize) ;
+ memset((char *)*dentry, 0, CLUSTERsize); // Memset() is a faster zeroing routine than 'bzero()'
+ (*dentry)->FILE_status = FILE_lastentry ;
+
+ int lfn_zero_end = newsize/sizeof(DOS_direntry);
+ int lfn_zero_loop= ((*cdir)->dir_size)/sizeof(DOS_direntry);
+ for(;lfn_zero_loop<lfn_zero_end;lfn_zero_loop++)
+ { // Very important, this loop.
+  newdir->lfnp[lfn_zero_loop] = NULL;
+ }
+
+ /* JRS 27/3/92 recognising that dentry[0] is about to be used, we should make a
+  * new end-of-directory entry. However, the bzero above acheives this as a
+  * side-effect since FILE_lastentry=0. */
+
+ /* We've done the main bits that could go wrong so claim the space from the FAT. */
+ dprintf(("","extend_dir: (*cdir)->dir_sector = %x\n",(*cdir)->dir_sector));
+ dprintf(("","extend_dir: ihand = %p\n",ihand));
+ startCLUSTER = SECTORtoCLUSTER((*cdir)->dir_sector,ihand);
+ dprintf(("","extend_dir: Directory start cluster = &%03X\n",startCLUSTER));
+
+ if ((startCLUSTER = adjustusedchain(startCLUSTER, newsize / CLUSTERsize, ihand)) < 0) {
+   free(newdir);
+   *pdir = NULL;
+   return -1;
+ }
+
+ /* and update the directory pointer */
+ realloc_dir_cache(*cdir, newdir);
+ *cdir = newdir ;
+ (*cdir)->dir_size = newsize;
+ set_dir_flags(*cdir, dir_MODIFIED) ; /* directory has been updated */
+
+ /* update the relevant directory entry in the parent */
+ ( (DOS_direntry*) DI_Base((*pdir))
+   /*(int)&(*pdir)->dir_entries +  (int)((*pdir)->dir_entryoffset)*/
+ )
+ [(*cdir)->dir_parentindex].FILE_size = newsize;
+
+ dprintf(("","extend_dir: Dir address  = %p\n",(*cdir)));
+ dprintf(("","extend_dir: Dir lnfpbase = %p\n",(*cdir)->lfnp));
+ dprintf(("","extend_dir: Dir dirbase  = %x\n",DI_Base((*cdir))));
+ dprintf(("","extend_dir: directory size = &%08X\n",(*cdir)->dir_size));
+
+ set_dir_flags(*pdir, dir_MODIFIED);
+
+ /* and return to the caller */
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+
+//Compress' a directory structure by removing deleted entries
+void packdir(DIR_info * cdir, DOS_direntry ** preserve)
+{
+ dprintf(("","packdir: cdir = %p, preserve = %p\n",cdir, *preserve));
+ int ip,op;
+ int ipend = (cdir->dir_size/32);
+ DOS_direntry * dir = (DOS_direntry*)DI_Base(cdir);
+ for(ip=0,op=0;ip<ipend;ip++,op++)
+ {
+//  if( (dir+ip)->FILE_status == 0xE5)
+//  {//This is a deleted entry
+//   ip++;
+   while ( (ip<ipend)
+       &&  ((dir+ip)->FILE_status == 0xE5)) ip++;
+//  }else
+  if((dir+ip)->FILE_status == 0x00) ip=ipend;
+//  {//If there are no more dir entrys it is pointless to continue the loop
+//   ip=ipend;
+//   continue; //Break the loop
+//  }
+  if((ip != op) && (ip<ipend))
+  {//If we need to move entrys in the dir
+   if( (dir+ip) == *preserve) *preserve = (dir+op);
+   dprintf(("","packdir: ip = %d, op = %d\n",ip,op));
+   memmove(dir+op,dir+ip,sizeof(DOS_direntry));
+   (dir+ip)->FILE_status = 0xE5;
+   cdir->lfnp[op] = cdir->lfnp[ip];
+   cdir->lfnp[ip] = NULL;
+  }
+ }
+ dprintf(("","packdir @ exit: cdir = %p, preserve = %p\n",cdir, *preserve));
+}
+
+
+
+static int saveFILE(char *fname,char *leafname,word ld,word ex,char *bs,word len,DIR_info **cdir,DOS_direntry **dentry,int fzero,DOSdisc *ihand)
+{
+ /* in: fname    : full path name
+  *     leafname : NULL terminated filename
+  *     ld       : load address
+  *     ex       : exec address
+  *     bs       : base address
+  *     len      : length of data
+  *     cdir     : current directory (where file is to be placed)
+  *     fzero    : TRUE if we are to zero the data CLUSTERs
+  *     ihand    : filesystem image handle
+  */
+ int           CLUSTERsize ;
+ int           CLUSTERs_required ;
+ int           loop ;
+ int           startCLUSTER ; /* cluster where the file starts */
+ time5byte     saveTIME ;     /* local time save started at */
+ DIR_info     *pdir = NULL ;  /* parent directory */
+ DOS_direntry *lfn[20];
+ int          numreq=0;
+ int          not_sfn;
+ char         shortname[13];
+ shortname[11]=0;
+ shortname[12]=0;
+
+ if ((int)len < 0)
+   return_error0(int, err_discfull);
+
+ localTIME(&saveTIME) ;
+
+ dprintf(("","saveFILE: \"%s\" len &%08X (*cdir = &%08X)\n",leafname,len,(int)(*cdir)));
+
+ /* calculate the number of complete clusters required to hold the object */
+ CLUSTERsize = cluster_size(&(ihand->disc_boot)) ;
+ CLUSTERs_required = ((len + (CLUSTERsize - 1)) / CLUSTERsize) ;
+
+ dprintf(("","saveFILE: CLUSTERs_required = %d\n",CLUSTERs_required));
+
+ /* check to see if the file already exists */
+ /* start at the beginning of the directory */
+ loop = 0 ;
+ if ((*dentry = findDIRentry(leafname,*cdir,(*cdir)->dir_size,&loop))!=NULL)
+  {
+   dprintf(("","saveFILE: file already exists\n"));
+
+   /* Make sure that the file is not open. */
+   if (find_open_file(fname, *dentry, ihand) >= 0)
+    return_error1(int, err_fileopen, fname);
+
+   /* Make sure the file isn't locked. */
+   if (((*dentry)->FILE_attribute & FILE_readonly) != 0)
+    return_error1(int, err_filelocked, fname);
+
+   startCLUSTER = get_FILE_cluster(*dentry,ihand) ;
+
+   if ((startCLUSTER = adjustusedchain(startCLUSTER, CLUSTERs_required, ihand)) < 0)
+     return -1;
+  }
+ else
+  {
+   dprintf(("","saveFILE: file does NOT exist\n"));
+
+   numreq = (strlen(leafname)/13) + 2;
+   dprintf(("","saveFILE: numreq = %d\n",numreq));
+
+   if(get_dir_entry_array(lfn, ihand, numreq, cdir, &pdir,NULL) <0) return -1;
+   dprintf(("","saveFILE: p1 size =%x \n",(*cdir)->dir_size));
+
+   if ((startCLUSTER = claimfreeclusters(CLUSTERs_required, ihand)) < 0) return -1;
+
+
+  char shorttemp[14];
+
+  not_sfn=shorten_lfn(leafname,shortname,shorttemp,*cdir);
+   (*dentry) = not_sfn?lfn[numreq-1]:lfn[0];
+   dprintf(("","saveFILE: p2 .. *dentry = %p\n",(*dentry)));
+
+  dprintf(("","saveFILE: long filename = %s\n",leafname));
+  dprintf(("","saveFILE: short tempory filename = %s\n",shorttemp));
+  dprintf(("","saveFILE: short filename = \'%c%c%c%c%c%c%c%c\' ext=\'%c%c%c\'\n",shortname[0],shortname[1],shortname[2],shortname[3],shortname[4],shortname[5],shortname[6],shortname[7],shortname[8],shortname[9],shortname[10]));
+  if(not_sfn) MakeLFNEntries(&lfn[0],numreq,leafname,shortname);
+
+/* write the information into the directory entry
+   *
+   * This requires the filename to be split into name and extension fields
+   * We fill the name with SPACEs first (the string terminator (NULL) is
+   * placed in the attributes field)
+   *
+   * NOTE: these should be done in this order due to the fact that the
+   *       text building function terminates each string with a NUL
+   */
+ set_dir_flags(*cdir, dir_MODIFIED) ; /* directory updated */
+// sprintf((char *)&((*dentry)->FILE_status),"           ") ;
+ memcpy((char *)&((*dentry)->FILE_status),&shortname[0],8);
+ memcpy((char *)&((*dentry)->FILE_extension),&shortname[8],3);
+ /* mark the file as suitable for archiving */
+ (*dentry)->FILE_attribute = FILE_archive ;
+// bzero((char *)&((*dentry)->FILE_reserved),spare1) ; /* ZERO "spare1" bytes */
+ memset((char *)&((*dentry)->FILE_reserved),0,spare1) ; /* ZERO "spare1" bytes */
+ char * longfileholder = NULL;
+ if(not_sfn)
+ {
+   longfileholder = malloc(strlen(leafname)+1);
+   if (longfileholder == NULL)
+   {
+    return_errorT(int,err_heapexhausted, tok_heapexhausted, 0, 0);
+   }
+   strcpy(longfileholder,leafname);
+ }
+ int diroffset = (int)  ((int)(*dentry)-(int)DI_Base(*cdir)) / sizeof(DOS_direntry);
+ (*cdir)->lfnp[diroffset] = longfileholder;
+ dprintf(("","**************************************HERE: index (diroffset) = %d, pointer = %p, actual = %p lnfp=%p\n",diroffset,(*cdir)->lfnp[diroffset], longfileholder,&((*cdir)->lfnp[diroffset])));
+ dprintf(("","saveFILE: &((*cdir)->lfnp[diroffset]) = %p\n",&((*cdir)->lfnp[diroffset])));
+ dprintf(("","saveFILE: CBC dir = %x\n",DI_Base(*cdir)));
+
+// int index=0;
+// if(findDIRentry(shorttemp,*cdir,(*cdir)->dir_size,&index))
+// {
+//  (*cdir)->lfnp[index] = longfileholder;
+// }
+// dprintf(("","**************************************HERE: index = %d, pointer = %p, actual = %p\n",index,(*cdir)->lfnp[index], longfileholder));
+  }
+ set_dir_flags(*cdir, dir_MODIFIED) ; /* directory updated */
+
+
+ DOS_newdirentry * mentry = (DOS_newdirentry*)(*dentry);
+ mentry->FILE_CrtTimeTenth = 0;
+ mentry->FILE_NTRes = 0;
+ put_FILE_time(mentry->FILE_time,mentry->FILE_timeHI,RISCOStoTIME(&saveTIME)) ;
+ put_FILE_time(mentry->FILE_CrtTime,mentry->FILE_CrtTimeHi,RISCOStoTIME(&saveTIME)) ;
+ put_FILE_date(mentry->FILE_date,mentry->FILE_dateHI,RISCOStoDATE(&saveTIME)) ;
+ put_FILE_date(mentry->FILE_CrtDate,mentry->FILE_CrtDateHi,RISCOStoDATE(&saveTIME)) ;
+ put_FILE_date(mentry->FILE_LstAccDate,mentry->FILE_LstAccDateHi,RISCOStoDATE(&saveTIME)) ;
+ mentry->FILE_NTRes = 0;
+
+
+ dprintf(("","saveFILE: NTRes = %x\n",mentry->FILE_NTRes));
+
+ dprintf(("","saveFILE: startCLUSTER = &%03X\n",startCLUSTER));
+
+ put_FILE_cluster((*dentry),startCLUSTER,ihand) ;
+ (*dentry)->FILE_size = len ;
+
+ dprintf(("","saveFILE: NTRes = %x\n",mentry->FILE_NTRes));
+
+ /* copy the data from memory into the allocated clusters */
+ /* use "saveOBJECT" to perform this */
+ if (fzero == 0 && len)
+  {
+   if (DOS_object_RW(Wdata,startCLUSTER,bs,len,ihand) != 0)
+    {
+     dprintf(("","saveFILE: \"saveOBJECT\" call failed\n"));
+     return -1;
+    }
+  }
+
+ dprintf(("","saveFILE: NTRes = %x\n",mentry->FILE_NTRes));
+ /* Update the load and exec addresses */
+ update_loadexec(*dentry, ld, ex);
+   dprintf(("","saveFILE: p3\n"));
+
+ if (pdir != NULL) {
+  if (ensure_directory(pdir)!= 0) {
+   dprintf(("","saveFILE: ensure_dir failed\n"));
+   return -1;
+  }
+ }
+
+ /* now ensure all the directory information and FATs onto the disc */
+ if ((ensure_directory(*cdir)!= 0) || (ensure_FATs(ihand) != 0))
+ {
+   dprintf(("","saveFILE: ensure_dir || ensure_FATs failed\n"));
+  return(-1) ; /* error already defined */
+ }
+ dprintf(("","saveFILE: NTRes = %x\n",mentry->FILE_NTRes));
+ /* and we have a nice return */
+ return(0) ;
+}
+
+
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/* attributes: */
+
+static word DOStoRISCOSattributes(DOS_direntry *dentry)
+{
+ word aval = 0x00000000 ;
+ int   loop ;
+
+ /* produce RISC OS type attributes for the given DOS directory entry */
+
+ /* all objects start read/write */
+ if ((dentry->FILE_attribute & FILE_subdir) == 0)
+  aval |= (ownerread | ownerwrite) ;
+
+ for (loop=0; (loop < 8); loop++)
+  {
+   if ((dentry->FILE_attribute & (1 << loop)) != 0)
+    {
+     switch (1 << loop)
+      {
+       case FILE_readonly :
+#if !ReadOnlyMapsLocked /* JRS 9/3/92 map DOS ReadOnly bit to RISC OS Locked bit only */
+                            aval &= ~ownerwrite ;
+#endif
+                            aval |= objectlocked ;
+                            break ;
+
+/* JRS: 4/3/92 This conflicts with NetFS use of these bits */
+       case FILE_hidden   : if ((dentry->FILE_attribute & NetFSattributebits)==0)
+                             aval |= objecthidden ;
+                            break ;
+
+       case FILE_system   : if ((dentry->FILE_attribute & NetFSattributebits)==0)
+                             aval |= objectsystem ;
+                            break ;
+
+       case FILE_archive  : if ((dentry->FILE_attribute & NetFSattributebits)==0)
+                             aval |= objectupdated ;
+                            break ;
+
+       default            : break ;     /* no action on undefined flags */
+      }
+    }
+  }
+
+ return(aval) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static unsigned char RISCOStoDOSattributes(word ROSattr)
+{
+ byte aval = 0x00 ;
+
+ /* produce DOS type attributes for the given RISC OS attribute flags */
+
+ /* NOT owner write then set the readonly flag */
+#if ReadOnlyMapsLocked /* JRS 9/3/92 map DOS ReadOnly bit to RISC OS Locked bit only */
+ if (ROSattr & objectlocked)
+#else
+ if ((ROSattr & ownerwrite) == 0 || (ROSattr & objectlocked) != 0)
+#endif
+  aval |= FILE_readonly ;
+
+ /* JRS: 4/3/92 HORRIBLE! This conficts with NetFS use of these bits
+  * Check if the NetFS bits are zero, and assume they are ours if so */
+ if ((ROSattr & NetFSattributebits & ~extraDOSattributebits) == 0)
+  {
+  /* check for the special flags we have placed in the ADFS unused area */
+  if ((ROSattr & objecthidden) != 0)
+   aval |= FILE_hidden ;
+
+  if ((ROSattr & objectsystem) != 0)
+   aval |= FILE_system ;
+
+  if ((ROSattr & objectupdated) != 0)
+   aval |= FILE_archive ;
+  }
+
+ return(aval) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/* resolvePATH: from a given object resolve the actual directory referenced  */
+/*              lname is set to point to the leafname part of pname and      */
+/*                pname is 0 terminated before the leafname                  */
+
+static int resolvePATH(char *pname,DIR_info **ndir,char **lname,DOSdisc *ihand)
+{
+ char *cptr = &pname[strlen(pname)] ;
+
+ dprintf(("","DOSFS: resolvePATH: \"%s\"\n",pname));
+
+ /* step backwards looking for directory seperator or beginning */
+ for (; ((*cptr != dir_sep) && (cptr != pname)); cptr--) ;
+
+ if (cptr == pname)
+  {
+   dprintf(("","DOSFS: resolvePATH: (cptr == pname)\n"));
+   if (*cptr != dir_sep) {
+    char c1 = '\0', c2;
+    do {
+     c2 = *cptr;
+     *cptr++ = c1;
+     c1 = c2;
+    } while (c1 != '\0');
+   }
+   *cptr = '\0';
+   *lname = pname + 1;
+  }
+ else
+  {
+   dprintf(("","DOSFS: resolvePATH: we must resolve the path to the directory\n"));
+   *cptr++ = '\0';
+   *lname = cptr ;
+  }
+
+ *ndir = loadDIR(pname, ihand) ;
+ if ((int)(*ndir) == -1)
+  return(-1) ; /* error already defined */
+
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/* restorePATH: return a pointer to a restored path split by resolvePATH     */
+
+static char *restorePATH(char *pname, char *lname)
+{
+  if (--lname == pname)
+    return ++lname;
+  *lname = dir_sep;
+  return pname;
+}
+
+/*---------------------------------------------------------------------------*/
+
+typedef enum {
+              wdi_NONE,    /* should never be used */
+              wdi_LOAD,    /* update the load exec with the value given */
+              wdi_EXEC,    /* update the exec address with the value given */
+              wdi_ATTR,    /* update the attributes with the value given */
+              wdi_FLEN,    /* update the filelength with the value given */
+              wdi_SCLUSTER /* start CLUSTER of the file image */
+             } wdi_flags ;
+
+static int write_dirinfo(char *fname,word bitmap,word loadaddr,word execaddr,word attr,word filelen,int startCLUSTER,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;       /* directory where "leafname" resides */
+ char         *DOSname ;    /* pathname of referenced file */
+ char         *leafname ;   /* pointer into "DOSname" of leaf filename */
+ int           loop ;       /* general counter */
+ DOS_direntry *dentry ;     /* directory entry structure pointer */
+
+ dprintf(("","write_dirinfo: bitmap &%08X, ld &%08X, ex &%08X, attr &%08X, flen &%08X, sC = &%03X\n",bitmap,loadaddr,execaddr,attr,filelen,startCLUSTER));
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  return -1;
+ }
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ dprintf(("","write_dirinfo: looking for leafname \"%s\"\n",leafname));
+ if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) != NULL)
+  {
+   time5byte le ;
+   char      dosext[8] = {0,0,0,0,0,0,0,0} ;
+
+   /* If changing length or start cluster then make sure that the file is not open. */
+   if (bitmap & ((1 << wdi_FLEN) | (1 << wdi_SCLUSTER))) {
+     if (find_open_file(fname, dentry, ihand) >= 0) {
+       free(DOSname);
+       return_error1(int, err_fileopen, fname);
+     }
+   }
+
+   if (buildFILEname(dentry,DOSname) != NULL)
+    (void)after(dosext,DOSname,file_sep,1) ;
+
+   read_loadexec(dentry,dosext,&le) ;
+
+   /* We read the current load and exec addresses, so that they can be
+    * written together, but changed seperately (if required).
+    */
+   if (bitmap & (1 << wdi_LOAD))
+    le.hi = loadaddr ;
+
+   if (bitmap & (1 << wdi_EXEC))
+    le.lo = execaddr ;
+
+   update_loadexec(dentry,le.hi,le.lo) ;    /* and update the load/exec info */
+
+   /* preserve directory bit over attr change (should possibly do archive) */
+   if (bitmap & (1 << wdi_ATTR)) {
+    if ((dentry->FILE_attribute & FILE_subdir) != 0) {
+     if ((attr & objectlocked) == 0)
+      attr |= ownerwrite;
+     dentry->FILE_attribute = RISCOStoDOSattributes(attr) | FILE_subdir;
+    } else
+     dentry->FILE_attribute = RISCOStoDOSattributes(attr) ;
+   }
+
+   if (bitmap & (1 << wdi_FLEN))
+    dentry->FILE_size = filelen ;           /* update the length */
+
+   if (bitmap & (1 << wdi_SCLUSTER))
+    put_FILE_cluster(dentry,startCLUSTER,ihand) ; /* update the starting CLUSTER */
+
+   set_dir_flags(cdir, dir_MODIFIED) ; /* directory entry had been updated */
+
+   if (ensure_directory(cdir)!= 0)
+    {
+     flush_dir_cache(ihand);
+     free(DOSname) ;
+     return(-1) ; /* error already defined */
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   free(DOSname) ;
+   return_errorT(int,err_objectnotfound,tok_objectnotfound,fname,0) ;
+  }
+
+ free(DOSname) ;
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+static FS_dir_block *read_dir(int rtype,char *fname,word dest,word num,word off,word blen,DOSdisc *ihand)
+{
+ /* in:
+  *     rtype : leafnames (0) or full information (-1)
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     dest  : destination memory address for data
+  *     num   : number of objects to read
+  *     off   : offset into directory
+  *     blen  : "dest" buffer length
+  *     ihand : filesystem image handle
+  */
+ char          *DOSname = NULL ;     /* converted pathname */
+ DIR_info      *cdir = NULL ;        /* pointer to the loaded directory */
+ FS_entry_info *entries = (FS_entry_info *)dest ;
+ int            numread = 0 ;
+ DOS_direntry  *dentry ;
+// char          *nbuff = (char *)malloc(DOSnamesize) ;
+ char          *nbuff = (char *)malloc(256) ;
+ int            loop ;               /* general counter */
+
+ dprintf(("","read_dir: rtype = %d, ihand = &%08X\n",rtype,(int)ihand));
+ dprintf(("","read_dir: \"%s\" (dest = &%08X) num = %d, off = %d, blen = %d\n",((fname == "") ? "NULLptr" : fname),dest,num,off,blen));
+
+ /* out:
+  *     dblock.objects_read = number of records read
+  *     dblock.next_offset  = offset of next item to be read (-1 if end)
+  */
+ /* default return state */
+ dblock.objects_read = 0 ;      /* no records read */
+ dblock.next_offset = -1 ;      /* next entry is end of directory */
+
+ if (nbuff == NULL) /* check name buffer allocation */
+  return_errorT(FS_dir_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ /* parse the name and load the relevant directory */
+ /* the "(DOSdisc *)ihand" structure references the cached information */
+ /* a NULL path refers to the ROOT of the filesystem */
+ /* always return ACORN style names (truncated if necessary) */
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  {
+   free(nbuff) ;
+   return_errorT(FS_dir_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  free(nbuff);
+  return (FS_dir_block *)-1;
+ }
+
+ /* load the desired directory */
+ cdir = loadDIR(DOSname, ihand) ;
+ if ((int)cdir == -1)
+  {
+   dprintf(("","read_dir: no directory loaded\n"));
+   free(DOSname) ;
+   free(nbuff) ;
+   return((FS_dir_block *)-1) ; /* error message already defined */
+  }
+
+ /* start reading entries from the requested offset */
+ int oldindex;
+ loop = off ;
+ do
+  {
+   dprintf(("","read_dir: loop = %d\n",loop));
+   oldindex=loop;
+   if ((dentry = getnextDIRentry((DOS_direntry *)DI_Base(cdir),cdir->dir_size,&loop)) != NULL)
+    {
+     dprintf(("","read_dir: returned *dentry = %p\n",dentry));
+    /* "getnextDIRentry" returns all FILE types:
+      * This includes volume labels and hidden and system files. At the
+      * moment we only stop volume labels from being returned.
+      */
+     if ((dentry->FILE_attribute & FILE_volume) == 0)
+      {
+       /* we have a listable directory entry */
+       char *cfile ;
+       word  entrysize ;
+       //CBC:
+       cfile = cdir->lfnp[oldindex]?(cdir->lfnp[oldindex]):buildFILEname(dentry,nbuff);
+       dprintf(("","read_dir: lfnp = %p act:%p holds:%s\n",
+                              &cdir->lfnp[loop],
+                              cdir->lfnp[loop],
+                              cdir->lfnp[loop]?cdir->lfnp[loop]:"nuttin"));
+       dprintf(("","read_dir: cdir = %p\n",cdir));
+       dprintf(("","read_dir: cfile = %s %x %x\n",cfile,&cdir->lfnp[oldindex],oldindex));
+
+       if (cfile)
+        {
+         char dosext[8] = {0,0,0,0,0,0,0,0} ; /* ensure zero start */
+
+         /* check to see if we have an ".ext" -> RISC OS filetype mapping */
+         (void)after(dosext,cfile,file_sep,1) ;
+
+         if ((int)convertDOStoRISCOS(cfile, DOSname) < 0) {
+          dprintf(("","read_dir: *PANIC* convertDOStoRISCOS() died; exiting\n"));
+          free(DOSname) ; /* release converted pathname buffer */
+          free(nbuff) ;   /* release converted name buffer */
+          return (FS_dir_block *)-1;
+         }
+         cfile = DOSname ;
+
+         /* calculate the size of this entry (word-aligned) */
+         if (rtype)
+          {
+           entrysize = strlen(cfile) + (sizeof(FS_entry_info) - 3) ;
+           entrysize = wordalign(entrysize) ;
+          }
+         else
+          entrysize = strlen(cfile) + 1 ; /* include terminating NULL */
+
+         if (((word)entries + entrysize) <= ((word)dest + blen))
+          {
+           time5byte le ;
+
+           if (rtype)
+            MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+           /* check if the file has RISC OS information in its spare bytes */
+           if (rtype)
+            {
+             /* Try to find the filetype */
+             map_FILE_ROStype(dentry,dosext,&le);
+
+             /* RISC OS required information */
+             entries->loadaddr = le.hi ;
+             entries->execaddr = le.lo ;
+             entries->flength = dentry->FILE_size ;
+             entries->attributes = DOStoRISCOSattributes(dentry) ;
+             entries->type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+            }
+           dprintf(("","read_dir: file name = %s\n",cfile));
+           /* copy the filename into the destination structure */
+           if (rtype)
+            strcpy(entries->fname,cfile) ;
+           else
+            strcpy((char *)entries,cfile) ;
+
+           /* and update the reference information */
+           entries = (FS_entry_info *)((word)entries + entrysize) ;
+           numread++ ;        /* count this entry */
+          }
+         else
+          {
+           loop-- ; /* we need to re-do this entry on the next call */
+       dprintf(("","read_dir: redo the loop\n"));
+           break ;
+          }
+        }
+       else
+        {
+ dprintf(("","read_dir: NULL dentry returned\n"));
+         free(DOSname) ; /* release converted pathname buffer */
+         free(nbuff) ;   /* release converted name buffer */
+         return_error0(FS_dir_block *,err_namereadfailed) ;
+        }
+      }
+    }
+  } while ((numread < num) && ((dentry != NULL) && (loop >= 0))) ;
+ dprintf(("","read_dir: loop done\n"));
+
+ if (numread > 0) {
+  dblock.objects_read = numread ;
+  dblock.next_offset = loop ;
+ }
+
+ free(DOSname) ;        /* release converted pathname buffer */
+ free(nbuff) ;          /* release converted name buffer */
+
+ dprintf(("","read_dir: dblock.objects_read = %d, dblock.next_offset = %d\n",dblock.objects_read,dblock.next_offset));
+ return(&dblock) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/* findDIRtype:
+ * look for the first object with the given attributes flags set
+ */
+
+DOS_direntry *findDIRtype(byte mask,byte ftype,DOS_direntry *directory,int dir_size,int *index)
+{
+ DOS_direntry *dentry = NULL ;
+
+// dprintf(("","findDIRtype: mask &%02X, ftype &%02X, directory = &%08X, index = %d\n",mask,ftype,(int)directory,*index));
+
+ do
+  {
+   dentry = getnextDIRentry(directory,dir_size,index) ;
+  } while ((dentry != NULL) && ((dentry->FILE_attribute & mask) != ftype)) ;
+
+// dprintf(("","findDIRtype: FILE_attribute = &%02X\n",dentry->FILE_attribute));
+
+ /* will either be NULL (index set to -1), or a valid directory entry */
+ return(dentry) ;
+}
+
+#ifdef NO_FAT32
+ _kernel_oserror noFAT32support = {0,"Sorry, FAT32 support not yet implemented"};
+#endif
+
+/*-------------------------------------------------------------------------*/
+/*-- IMAGE OPEN/CLOSE functions -------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+DOSdisc *DOSFS_image_open(word fshand,word buffsize)
+{
+ /* in:
+  *     fshand   : FileSwitch handle for new image file
+  *     buffsize : buffer size (0 = not known)
+  */
+ DOS_bootsector   *dboot = NULL ;   /* cached disc boot block */
+ DOS_partition    *DOSpart = NULL ; /* winchester partition information */
+ byte             *pentry ;         /* wini partition description pointer */
+ word              winioffset = 0 ; /* partition start within wini images */
+ word              winisize = 0 ;   /* winchester media size */
+ DOSdisc          *ddisc = NULL ;   /* cached disc description */
+ byte              numFATs ;        /* number of FATs in the image */
+ word              FATsize ;        /* size of FAT in bytes */
+ word              FATentries ;     /* number of entries in FAT */
+ word              numRESVD ;       /* number of reserved (unused) sectors */
+ word              ROOTsize ;       /* size of ROOT directory in sectors */
+ int               loop ;           /* general counter */
+ word              discaddress = 0x00000000 ;
+ _kernel_swi_regs  reglist ;        /* for SWI calls */
+ _kernel_oserror  *rerror ;         /* for standard RISC OS error structures */
+
+ dprintf(("","\n\nDOSFS_image_open: fshand = &%08X, buffsize = &%08X\n",fshand,buffsize));
+ /* We can assume that FileSwitch has only called us with files of the correct
+  * type (ie. we need perform no 12bit filetype identification on the passed
+  * FileSwitch handle).
+  */
+
+ /* Construct an internal file handle structure that contains the FileSwitch
+  * handle, plus any other useful information. We will return the pointer to
+  * this structure as the image handle.
+  *
+  * We need to distinguish between DOS and Atari floppies and DOS winchesters
+  * (Winchesters use the "disc_winioffset" word, for floppies this needs to
+  * be initialised to 0x00000000).
+  */
+
+ /* CACHE the "disc" information */
+ if ((dboot = (DOS_bootsector *)malloc(sizeof(DOS_bootsector))) == NULL)
+  {
+   dprintf(("","DOSFS_image_open: unable to allocate memory for BOOT sector\n"));
+   return_errorT(DOSdisc *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+
+ dprintf(("","DOSFS_image_open: dboot = &%08X\n",(int)dboot));
+
+ /* At the moment there is no simple way of differentaiting between winchester
+  * partitions and those of floppy images. MS-DOS manages by the explicit
+  * drive hardware differences. We are accessing the disc images via the same
+  * file interface.
+  * The following code performs a few simple checks to differentiate between
+  * the image types.
+  */
+
+ /* read the BOOT BLOCK from the image */
+ /* This code RELIES on (DOS_BOOT_sector == DOS_PARTITION_sector) */
+ discaddress = (DOS_BOOT_sector - 1) * DOSsecsize ;
+ reglist.r[0] = osgbpb_rptr ;   /* read operation */
+ reglist.r[1] = fshand ;        /* FileSwitch handle */
+ reglist.r[2] = (word)dboot ;   /* destination address */
+ reglist.r[3] = DOSsecsize ;    /* fixed in MS-DOS */
+ reglist.r[4] = discaddress ;   /* offset within FileSwitch file */
+ reglist.r[5] = NULL ;
+ reglist.r[6] = NULL ;
+ if ((rerror = _kernel_swi(OS_GBPB,&reglist,&reglist)) != NULL)
+  {
+   free(dboot) ;
+   return_errorX(DOSdisc *,rerror) ;    /* error already defined */
+  }
+
+ /* If this doesn't look like a BOOT block then try a partition. */
+#ifdef PCMCIATRUE
+ if (sector_size(dboot) != DOSsecsize) {
+#else
+ if (sector_size(dboot) != DOSsecsize || dboot->BOOT_num_fats != 2) {
+#endif
+  dprintf(("","DOSFS_image_open: not a BOOT block, could be a partition.\n"));
+  DOSpart = (DOS_partition *)dboot ;
+
+  /* Look for the partition with the "boot_ind" set to "bootable" */
+  pentry = (byte *)&(DOSpart->p0_boot_ind) ;
+  for (loop=0; (loop < 4); loop++) {
+   if (pentry[0] == bootable)
+    break ;
+   pentry += sizeof(partition_entry) ;
+  }
+  dprintf(("","DOSFS_image_open: partition %d may be bootable.\n",loop));
+
+  if (loop == 4) {
+   /* No bootable partition found - try to validify one of the partitions as
+    * non-bootable, otherwise this can't be a valid DOS partition.
+    */
+   dprintf(("","DOSFS_image_open: not a bootable partition.\n"));
+   pentry = (byte *)&(DOSpart->p0_boot_ind);
+   for (loop = 0; loop < 4; loop++) {
+#ifdef OLD_PARTITION_TEST
+    if (pentry[4] == partition_DOS || pentry[4] == partition_DR || pentry[4] == partition_NCR)
+     break;
+#else
+    if (pentry[2] != 0) /* If start sector != 0 then we have found a possible partition table entry. */
+     break;
+#endif
+    pentry += sizeof(partition_entry);
+   }
+  }
+
+  if (loop != 4) {
+   dprintf(("","DOSFS_image_open: partition type %d\n",pentry[4]));
+
+   /* The following sector number, should be equivalent to that used to
+    * construct the "disc_winioffset" variable.
+    * DOS BOOT sector = WiniSector(pentry[3],pentry[1],pentry[2])
+    */
+   winioffset = ((pentry[8] | (pentry[9] << 8) | (pentry[10] << 16) | (pentry[11] << 24)) * DOSsecsize) ;
+   dprintf(("","DOSFS_image_open: winioffset = &%08X\n",winioffset));
+
+   /* Our system can now cope with winchester partitions with more than 0xFFFF
+    * sectors
+    */
+   winisize = (pentry[12] | (pentry[13] << 8) | (pentry[14] << 16) | (pentry[15] << 24)) ;
+
+   /* We could add the following check: (winisize <= "size of FileSwitch file")
+    * to further check the validity of the partition information. If the
+    * calculated offset is outside the image file then the following BOOT
+    * BLOCK load will fail and give the user a "funny" error message, rather
+    * than a specific DOSFS one.
+    */
+
+   discaddress = ((DOS_BOOT_sector - 1) * DOSsecsize) + winioffset ;
+   reglist.r[0] = osgbpb_rptr ;
+   reglist.r[1] = fshand ;
+   reglist.r[2] = (word)dboot ;
+   reglist.r[3] = DOSsecsize ;
+   reglist.r[4] = discaddress ;
+   reglist.r[5] = NULL ;
+   reglist.r[6] = NULL ;
+   if ((rerror = _kernel_swi(OS_GBPB,&reglist,&reglist)) != NULL)
+    {
+     free(dboot) ;
+     return_errorX(DOSdisc *,rerror) ;
+    }
+
+   /* I am not sure if all MS-DOS BOOT BLOCKs contain a similar signature to
+    * that provided in winchester PARTITION BLOCKs. MS-DOS 3.31 seems to do
+    * so, and this may form another validation check on the destination BOOT
+    * BLOCK. **** research into this ****
+    */
+
+#ifdef PCMCIATRUE
+   /*if ((sector_size(dboot) != DOSsecsize) || (DOSFS_max_sect(dboot) != winisize))*/
+   if (sector_size(dboot) != DOSsecsize)
+#else
+   if ((sector_size(dboot) != DOSsecsize) || (dboot->BOOT_num_fats != 2) || (DOSFS_max_sect(dboot) != winisize))
+#endif
+    {
+     dprintf(("","DOSFS_image_open: invalid partition BOOT block\n"));
+     free(dboot) ;
+     return_error0(DOSdisc *,err_notDOSimage) ;
+    }
+  } else {
+   dprintf(("","DOSFS_image_open: image is not a DOS partition (could be 320K or 160K format)\n"));
+   /* Could still be a DOS 320K or 160K format as they do not need a valid boot block,
+    * fake the info in the boot block (if it's not one of these then catch it later). */
+   dboot->BOOT_secsize = 0x00;
+   dboot->BOOT_secsizeHI = 0x02;
+   dboot->BOOT_reserved = 0x01;
+   dboot->BOOT_reservedHI = 0x00;
+   dboot->BOOT_num_fats = 0x02;
+   dboot->BOOT_magic = 0x00;
+   dboot->BOOT_FAT_size = 0x01;
+   dboot->BOOT_FAT_sizeHI = 0x00;
+   dboot->BOOT_secstrack = 0x08;
+   dboot->BOOT_secstrackHI = 0x00;
+   dboot->hidden = 0x00;
+   dboot->hidden1 = 0x00;
+  }
+ }
+
+ /* number of File Allocation Tables */
+ numFATs = dboot->BOOT_num_fats ;
+ /* bytesize of a FAT */
+// FATsize = (dboot->BOOT_FAT_size | (dboot->BOOT_FAT_sizeHI << 8)) * DOSsecsize ;
+ /* number of reserved (unusable) sectors */
+ numRESVD = (dboot->BOOT_reserved | (dboot->BOOT_reservedHI << 8)) ;
+
+ //CBC
+ dprintf(("","DOSFS_image_open: DOSsecsize = %x\n",DOSsecsize));
+ dprintf(("","DOSFS_image_open: numFATs    = %d\n",numFATs));
+ dprintf(("","DOSFS_image_open: numRESVD   = %d\n",numRESVD));
+
+ dprintf(("","DOSFS_image_open: cluster size = %x\n",dboot->BOOT_secalloc));
+ dprintf(("","DOSFS_image_open: Sector size = %d\n",((dboot->BOOT_secsize)|(dboot->BOOT_secsizeHI<<8))));
+ dprintf(("","DOSFS_image_open: cluster size = %d\n",dboot->BOOT_secalloc * ((dboot->BOOT_secsize)|(dboot->BOOT_secsizeHI<<8))));
+
+ int RootDirSectors = (((dboot->BOOT_root_dir|(dboot->BOOT_root_dirHI << 8))*32) + ((dboot->BOOT_secsize|(dboot->BOOT_secsizeHI << 8))-1)  / (dboot->BOOT_secsize|(dboot->BOOT_secsizeHI << 8)) );
+ dprintf(("","DOSFS_image_open: RootDirSectors = %d\n",RootDirSectors));
+ int TotSec=0, DataSec=0, CountOfClusters=0;
+ if( (dboot->BOOT_FAT_size|(dboot->BOOT_FAT_sizeHI<<8)) != 0)
+ {
+  FATsize = (dboot->BOOT_FAT_size|(dboot->BOOT_FAT_sizeHI<<8));
+ }else
+ {
+  FATsize = (dboot->BOOT_extra.fat32.FAT_sz0 | (dboot->BOOT_extra.fat32.FAT_sz1<<8) | (dboot->BOOT_extra.fat32.FAT_sz2<<16) | (dboot->BOOT_extra.fat32.FAT_sz3<<24) );
+ }
+ if( (dboot->BOOT_max_sect|(dboot->BOOT_max_sectHI<<8)) != 0)
+ {
+  TotSec = (dboot->BOOT_max_sect|(dboot->BOOT_max_sectHI<<8));
+ }else
+ {
+  TotSec = (dboot->big_sect | (dboot->big_sect1<<8) | (dboot->big_sect2<<16) | (dboot->big_sect3<<24) );
+ }
+ DataSec= TotSec - ( (dboot->BOOT_reserved|(dboot->BOOT_reservedHI<<8)) + (numFATs*FATsize) + RootDirSectors);
+ dprintf(("","DOSFS_image_open: FATsize = %x\n",FATsize));
+ dprintf(("","DOSFS_image_open: TotSec = %x\n",TotSec));
+ CountOfClusters = DataSec / dboot->BOOT_secalloc;
+ dprintf(("","DOSFS_image_open: CountOfClusters = %x\n",CountOfClusters));
+
+ /* allocate a DOS disc description structure large enough to hold a FAT
+  * copy. Note: the disc description structure already includes a single "FAT"
+  * sector.
+  */
+ if ((ddisc = (DOSdisc *)malloc(sizeof(DOSdisc) + ((FATsize*DOSsecsize) - sizeof(fFAT_sector)))) == NULL)
+  {
+   dprintf(("","DOSFS_image_open: unable to allocate memory for disc description\n"));
+   free(dboot) ;
+   return_errorT(DOSdisc *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+ dprintf(("","DOSFS_image_open: ddisc = &%08X\n",(int)ddisc));
+
+ if(RootDirSectors != 0)
+ {
+  if(CountOfClusters < 4085)
+  {
+   dprintf(("","DOSFS_image_open: Volume is FAT12\n"));
+   ddisc->disc_FATentry = 12;
+  }else if(CountOfClusters < 65525)
+  {
+   dprintf(("","DOSFS_image_open: Volume is FAT16\n"));
+   ddisc->disc_FATentry = 16;
+  }else
+  {
+   dprintf(("","DOSFS_image_open: Volume is FAT32\n"));
+   ddisc->disc_FATentry = 32;
+#  ifdef NO_FAT32
+   return_errorX(DOSdisc *,&noFAT32support) ;    /* error for diagnostics */
+#  endif
+  }
+ }else
+ {
+   dprintf(("","DOSFS_image_open: Volume is FAT32\n"));
+   ddisc->disc_FATentry = 32;
+#  ifdef NO_FAT32
+   return_errorX(DOSdisc *,&noFAT32support) ;    /* error for diagnostics */
+#  endif
+ }
+   ddisc->disc_RootCluster=(ddisc->disc_FATentry == 32)?(dboot->BOOT_extra.fat32.RootClus0 | (dboot->BOOT_extra.fat32.RootClus1<<8) | (dboot->BOOT_extra.fat32.RootClus2<<16) | (dboot->BOOT_extra.fat32.RootClus3<<24) ):0;
+
+ dprintf(("","DOSFS_image_open: No. of root entries = %x F32 cl:%x\n",(dboot->BOOT_root_dir | (dboot->BOOT_root_dirHI << 8)),ddisc->disc_RootCluster));
+
+
+
+ /* remember the FileSwitch handle */
+ ddisc->disc_fhand = fshand ;           /* FileSwitch handle of image file */
+ ddisc->disc_winioffset = winioffset ;  /* offset into image */
+
+ ddisc->disc_FATsecs = FATsize ;            /* remember how many sectors the FAT is */
+ ddisc->disc_FATsize = FATsize * DOSsecsize;/* remember how big the FAT is */
+ ddisc->disc_secsize = DOSsecsize;
+ ddisc->disc_RESVDsec = numRESVD;
+
+ /* Copy the boot block into the disc description. */
+ ddisc->disc_boot = *dboot ;           /* copy the disc boot sector */
+
+ /* release the copy we originally allocated */
+ free(dboot) ;
+ /* but keep the pointer around for short-hand work */
+ dboot = &(ddisc->disc_boot) ;
+
+ ddisc->disc_FATentries = 0; /* Stop DOS_FAT_RW attempting to count the free clusters. */
+
+ if (DOS_FAT_RW(Rdata, ddisc) < 0)
+  {
+   dprintf(("","DOSFS_image_open: unable to load DOS FAT sector(s)\n"));
+   free(ddisc) ;
+   /* error message should already be defined */
+   return_error0(DOSdisc *, err_fatloadfailed);
+  }
+
+ /* If the magic ID in the boot block is 0x00 then this is a 320K or 160K format
+  * which needs some info to be filled in depending on the first byte of the FAT.
+  */
+ if (dboot->BOOT_magic == 0x00) {
+  dboot->BOOT_magic = *((char *)&(ddisc->disc_FAT));
+  if (dboot->BOOT_magic == 0xFE) {
+   dboot->BOOT_secalloc = 0x01;
+   dboot->BOOT_root_dir = 0x40;
+   dboot->BOOT_root_dirHI = 0x00;
+   dboot->BOOT_max_sect = 0x40;
+   dboot->BOOT_max_sectHI = 0x01;
+   dboot->BOOT_heads = 0x01;
+   dboot->BOOT_headsHI = 0x00;
+  } else if (dboot->BOOT_magic == 0xFF) {
+   dboot->BOOT_secalloc = 0x02;
+   dboot->BOOT_root_dir = 0x70;
+   dboot->BOOT_root_dirHI = 0x00;
+   dboot->BOOT_max_sect = 0x80;
+   dboot->BOOT_max_sectHI = 0x02;
+   dboot->BOOT_heads = 0x02;
+   dboot->BOOT_headsHI = 0x00;
+  } else {
+   dprintf(("","DOSFS_image_open: not a valid DOS image\n"));
+   free(ddisc);
+   return_error0(DOSdisc *, err_notDOSimage);
+  }
+ }
+
+ /* size of the ROOT directory in sectors */
+ ROOTsize = (((dboot->BOOT_root_dir | (dboot->BOOT_root_dirHI << 8)) * sizeof(DOS_direntry))+(DOSsecsize-1)) / DOSsecsize ;
+ ddisc->disc_ROOTsize = ROOTsize ;      /* in sectors */
+ dprintf(("","DOSFS_image_open: ROOTsize   = &%08X\n",ROOTsize));
+
+ /* place remaining information into the disc description record */
+// ROOTsize = RootDirSectors;
+// ddisc->disc_ROOTsize = RootDirSectors ;      /* in sectors */
+ /* the start of the user allocatable sectors */
+// ddisc->disc_startsec =  (numRESVD + (numFATs * (FATsize/DOSsecsize))) + ROOTsize;
+ dprintf(("","DOSFS_image_open: numFATs = %x, FATsize = %x, DOSsecsize = %x, ROOTsize = %x\n",numFATs,FATsize,DOSsecsize,ROOTsize));
+ ddisc->disc_startsec =  numRESVD + (numFATs * FATsize) + ROOTsize +1; /* ensure '1 based' sector count (as used later!) */
+ dprintf(("","DOSFS_image_open: Data Start Sector (2nd cluster) = %x\n",ddisc->disc_startsec));
+
+ dprintf(("","DOSFS_image_open: disc_ROOTsize = %d\n",ROOTsize));
+ dprintf(("","DOSFS_image_open: disc_startsec = %d\n",ddisc->disc_startsec));
+
+
+ dprintf(("","DOSFS_image_open: Size of fat entry = %d\n",ddisc->disc_FATentry));
+ /* calculate the number of available cluster entries */
+ /* clarification needed here:
+  * DOSFS_max_sect returns the total number of sectors on the disc
+  * disc_startsec is the 1-based index of the first sector on the disc used for file storage.
+  * Thus the number of sectors available for file storage is (total sectors - (startsec-1))
+  * JRS changed 2/3/92 ddisc->disc_startsec to (ddisc->disc_startsec-1)
+  */
+ FATentries = (DOSFS_max_sect(dboot) - (ddisc->disc_startsec-1)) / dboot->BOOT_secalloc ;
+// FATentries = (DOSFS_max_sect(dboot) - (ddisc->disc_startsec)) / dboot->BOOT_secalloc ;
+ dprintf(("","DOSFS_image_open: FATentries = %x (%d)\n",FATentries,FATentries));
+
+ ddisc->disc_FATentries = FATentries ; /* number of cluster entries */
+
+ /* DOS_FAT_RW will not have filled in the disc_freeclusters field so we must do that here. */
+ ddisc->disc_freeclusters = countfreeclusters(ddisc);
+
+ /* We have successfully loaded all the information we need */
+ ddisc->disc_flags = disc_UPDATEID ; /* next update should generate new disc ID */
+
+ dprintf(("","DOSFS_image_open: ddisc = &%08X\n",(int)ddisc));
+
+ dprintf(("","DOSFS_image_open: disc_FAT = %x\n",(int)&ddisc->disc_FAT));
+ /* out:
+  *     return   : image filesystem handle for FileSwitch file
+  */
+
+
+ return(ddisc) ;
+ UNUSED(buffsize) ; /* for the moment */
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_image_close(DOSdisc *ihand)
+{
+ /* in:
+  *     ihand : image filesystem handle for FileSwitch file
+  */
+
+ dprintf(("","\n\nDOSFS_image_close: ihand = &%08X\n",(word)ihand));
+
+ /* All files opened onto this image should have been closed. This call
+  * should just ensure any buffered data and then release the resources
+  * attached to the image.
+  */
+
+
+ /* Flush the directory cache. */
+ flush_dir_cache(ihand);
+
+ /* If we just cache the FAT copies (and do not write-back during normal
+  * operation) then we should write all the FAT copies to the image at
+  * this point. At the moment we always ensure the FAT copies.
+  */
+ ensure_FATs(ihand);
+
+ free(ihand) ;
+
+ /* out:
+  *     no conditions
+  */
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+/* Extend or truncate the given file to the required length. */
+static int DOSFS_ensure_exact(FILEhand *fhand,int ensure)
+{
+ int  CLUSTERsize ;         /* CLUSTER size in bytes */
+ int  CLUSTERs_required ;   /* CLUSTERs required by the ensure operation */
+ int  startCLUSTER ;        /* first CLUSTER allocated to file */
+ int  newfilelen = ensure ; /* file length after truncation */
+
+ dprintf(("","DOSFS_ensure_exact: fhand &%08X (fext &%08X)\n",(int)fhand,ensure));
+
+ CLUSTERsize = cluster_size(&(fhand->ihand->disc_boot)) ;
+ ensure = ((ensure + (CLUSTERsize - 1)) & ~(CLUSTERsize - 1)) ;
+ CLUSTERs_required = (ensure / CLUSTERsize) ;
+
+ startCLUSTER = fhand->startCLUSTER ;
+ if ((startCLUSTER = adjustusedchain(startCLUSTER, CLUSTERs_required, fhand->ihand)) < 0)
+   return -1;
+
+ if (ensure_FATs(fhand->ihand) != 0) {
+  /* We've messed up the FAT so re-load it. */
+  DOS_FAT_RW(Rdata, fhand->ihand);
+  return -1; /* error already defined */
+ }
+
+ fhand->startCLUSTER = startCLUSTER ;
+ fhand->filelen = newfilelen ;
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*-- IMAGE manipulation functions -----------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+FS_open_block *DOSFS_open_file(word op,char *fname,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;           /* directory where the leafname resides */
+ char         *DOSname ;        /* full DOS pathname */
+ char         *leafname ;       /* pointer to the leafname of "DOSname" */
+ char         *roname ;         /* original RISC OS name given */
+ int           loop ;           /* general index variable */
+ int           createfile = 0 ; /* non-zero if we need to create the file */
+ DOS_direntry *dentry ;         /* directory entry pointer */
+ FILEhand     *fdesc ;          /* file descriptor for open file */
+ time5byte     le ;             /* for load/exec address information */
+ char          dosext[8] ;         /* DOS/RISC OS filetype extension */
+ int           CLUSTERsize ;    /* CLUSTER size (in bytes) for this image */
+
+ dprintf(("","\n\nDOSFS_open_file: op = %d, fname = \"%s\", ihand = &%08X\n",op,fname,(word)ihand));
+ CLUSTERsize = cluster_size(&(ihand->disc_boot)) ;
+
+ /* in:
+  *     op    : type of open to perform
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ihand : filesystem handle onto the image
+  *
+  * op = 0 -> then open for reading             (error if file doesn't exist)
+  * op = 1 -> then open for writing             (create file)
+  * op = 2 -> then open for reading and writing (error if file doesn't exist)
+  *
+  * out:
+  *     fblock.information = access flags -> bit 31 WRITE; bit 30 READ
+  *     fblock.inhand      = internal filesystem handle for this file
+  *     fblock.buffsize    = buffer size of 2^n (n = 6..10))
+  *     fblock.fileext     = file length
+  *     fblock.falloc      = file allocation (buffer multiple)
+  *
+  * If the returned internal filesystem handle is 0, then the file open
+  * failed.
+  *
+  * NOTE: The current version of FileSwitch seems to perform a CREATE
+  *       operation before performing the open_file. This means that the
+  *       create code in this function is probably redundant. However, it
+  *       is worth keeping it for the moment.
+  */
+
+ /* create a open file descriptor (even though we may fail later) */
+ if ((fdesc = (FILEhand *)malloc(sizeof(FILEhand))) == NULL)
+  return_errorT(FS_open_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ /* default return information */
+ fblock.inhand = fdesc ;        /* internal file handle */
+ fblock.buffsize = 0 ;
+ fblock.fileext = 0 ;
+ fblock.falloc = 0 ;
+
+ /* default file descriptor information */
+ fdesc->ihand = ihand ;       /* handle onto the image */
+ fdesc->opentype = op ;       /* type of open operation */
+ fdesc->loadaddr = 0 ;        /* current object load address */
+ fdesc->execaddr = 0 ;        /* current object exec address */
+ fdesc->startCLUSTER = -1 ;   /* this object has no data */
+ fdesc->currentCLUSTER = -1 ; /* nor any current data */
+ fdesc->filelen = 0 ;         /* current object length */
+ fdesc->indexptr = 0 ;        /* sequential pointer */
+ fdesc->modified = 0 ;        /* buffer unmodified */
+ fdesc->filebuff = NULL ;     /* no data buffer */
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  {
+   free(fdesc) ;
+   return_errorT(FS_open_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+ if ((roname = (char *)malloc(strlen(fname) + 1)) == NULL)
+  {
+   free(DOSname) ;
+   free(fdesc) ;
+   return_errorT(FS_open_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+ strcpy(roname,fname) ;     /* take a copy of the original filename */
+ fdesc->fname = roname ;    /* and reference it in the file handle structure */
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(roname);
+  free(DOSname);
+  free(fdesc);
+  return (FS_open_block *)-1;
+ }
+
+ /* load the desired directory (also returns the leafname) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(roname) ;
+   free(DOSname) ;
+   free(fdesc) ;
+   return((FS_open_block *)-1) ; /* error already defined */
+  }
+
+ /* if creating then check that "leafname" does NOT contain wildcards */
+ if ((op == 1) && (leafname != NULL))
+  {
+   if (checknotwildcarded(leafname, DOSwcmult, DOSwcsing) != NULL)
+    {
+     free(roname) ;
+     free(DOSname) ;
+     free(fdesc) ;
+     return_error1(FS_open_block *,err_wildcardedname,fname) ;
+    }
+  }
+
+ /* search the loaded directory */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) != NULL)
+  {
+   int mode;
+   dprintf(("","DOSFS_open_file: object exists\n"));
+
+   /* Check that the file is not open but allow multiple read only opens. */
+   if ((mode = find_open_file(fname, dentry, ihand)) >= 0 && (mode + op) > 0) {
+    free(roname);
+    free(DOSname);
+    free(fdesc);
+    return_error1(FS_open_block *, err_fileopen, leafname);
+   }
+
+   if (!(dentry->FILE_attribute & FILE_subdir) && (op > 0) && (dentry->FILE_attribute & FILE_readonly) != 0) {
+    free(roname);
+    free(DOSname);
+    free(fdesc);
+    return_error1(FS_open_block *, err_filelocked, leafname);
+   }
+
+   /* get the MSDOS extension characters */
+   (void)after(dosext,leafname,file_sep,1) ;
+
+   /* if "op == 1" then we must delete any old copy of the file first */
+   if (op == 1)
+    {
+     dprintf(("","DOSFS_open_file: delete existing file\n"));
+     if ((dentry->FILE_attribute & FILE_subdir) != 0)
+      {
+       free(roname) ;
+       free(DOSname) ;
+       free(fdesc) ;
+       return_errorT(FS_open_block *,err_notfile,tok_notfile,fname,0) ;
+      }
+
+     set_dir_flags(cdir, dir_MODIFIED) ;
+     dentry->FILE_status = FILE_deleted ;
+     freeclusters(get_FILE_cluster(dentry,ihand),ihand) ;
+     createfile = -1 ; /* we need to create a new file */
+    }
+  }
+ else
+  {
+   dprintf(("","DOSFS_open_file: object does not exist\n"));
+   if (op != 1)
+    {
+     free(roname) ;
+     free(DOSname) ;
+     free(fdesc) ;
+     return_errorT(FS_open_block *,err_objectnotfound,tok_objectnotfound,fname,0) ;
+    }
+
+   dprintf(("","DOSFS_open_file: create operation specified\n"));
+   createfile = -1 ;    /* create option specified */
+  }
+
+ if (createfile != 0)
+  {
+   set_dir_flags(cdir, dir_LOCKED);
+   /* generate a directory entry for the file */
+   if (saveFILE(fname,leafname,0,0,NULL,0,&cdir,&dentry,1,ihand) < 0)
+    {
+     /* failed to save the file */
+     dprintf(("","DOSFS_open_file: failed to save empty file\n"));
+     unset_dir_flags(cdir, dir_LOCKED);
+     DOS_FAT_RW(Rdata, ihand);
+     free_dir_cache(DOSname, ihand);
+     free(roname) ;
+     free(DOSname) ;
+     free(fdesc) ;
+     /* the error message should already be defined */
+     return((FS_open_block *)-1) ;
+    }
+   unset_dir_flags(cdir, dir_LOCKED);
+
+   /* get the directory entry for this newly created file */
+   loop = 0 ;
+   if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) == NULL)
+    {
+     dprintf(("","DOSFS_open_file: failed to find newly created file\n"));
+     free(roname) ;
+     free(DOSname) ;
+     free(fdesc) ;
+     return_errorT(FS_open_block *,err_objectnotfound,tok_objectnotfound,fname,0) ;
+    }
+   /* "dentry" for the newly created file */
+   if ((ensure_directory(cdir)!= 0) || (ensure_FATs(ihand) != 0))
+    {
+     free(roname) ;
+     free(DOSname) ;
+     free(fdesc) ;
+     return((FS_open_block *)-1) ; /* error already defined */
+    }
+  }
+
+ if ((dentry->FILE_attribute & FILE_subdir) == 1)
+  fblock.information = ((1 << 30) | (1 << 29)) ; /* object is directory */
+ else
+  fblock.information = ((1 << 30) | ((op != 0) ? ((unsigned)1 << 31) : 0)) ;
+
+ dprintf(("","DOSFS_open_file: fdesc (before)     = &%08X\n",(int)fdesc));
+ dprintf(("","DOSFS_open_file: FILE_list (before) = &%08X\n",(int)FILE_list));
+ fdesc->next = FILE_list ;    /* reference the current open file list */
+ FILE_list = fdesc ;          /* place our handle at the head of the list */
+ dprintf(("","DOSFS_open_file: FILE_list (after)  = &%08X\n",(int)FILE_list));
+
+ /* convert the MSDOS timestamp to a RISC OS 5byte value */
+ read_loadexec(dentry,dosext,&le);
+
+ fdesc->loadaddr = le.hi ; /* load address */
+ fdesc->execaddr = le.lo ; /* exec address */
+
+ fdesc->startCLUSTER = get_FILE_cluster(dentry,ihand) ;
+ fdesc->filelen = dentry->FILE_size ;
+ fdesc->indexptr = 0 ;          /* read/write pointer within file */
+ fdesc->currentCLUSTER = -1 ;   /* number of currently buffered CLUSTER */
+ fdesc->modified = 0 ;          /* wether CLUSTER has been modified */
+ fdesc->filebuff = NULL ;       /* CLUSTER buffer pointer */
+
+ /* "dentry" references the directory entry */
+ fblock.inhand = fdesc ;
+ fblock.buffsize = 0x00000100 ;       /* 256 bytes of buffer */
+ fblock.fileext = dentry->FILE_size ;
+ fblock.falloc = ((dentry->FILE_size + (CLUSTERsize - 1)) & -CLUSTERsize) ;
+
+ free(DOSname) ;        /* release the translated name buffer */
+
+ dprintf(("","DOSFS_open_file: fhand &%08X (len &%08X ptr &%08X)\n",(int)fdesc,fdesc->filelen,fdesc->indexptr));
+
+ return(&fblock) ;      /* and return the open information */
+}
+
+/*-------------------------------------------------------------------------*/
+
+/* Read or write bytes from the offset into the specified file. */
+static int DOS_bytes_RW(int op, char *memaddr, word bytes, word foff, FILEhand *fhand)
+{
+  int clustercount = 0;
+  DOSdisc *ihand = fhand->ihand;
+  int clustersize, nextcluster;
+  word size;
+  int zero = 0;
+  int result = 0;
+
+  dprintf(("","DOS_bytes_RW: op = %c, memaddr = &%08X, bytes = %d, foff = %d, fhand = &%08X\n", (op == Rdata ? 'R' : 'W'), (int)memaddr, bytes, foff, (int)fhand));
+
+  if (bytes == 0)
+    return 0;
+
+  if (op == Wzero) {
+    zero = 1;
+    op = Wdata;
+  }
+
+  /* Check if the request is outside the file. */
+  if (foff + bytes > fhand->filelen) {
+    if (op == Rdata) {
+      /* If reading then generate an error for an offset outside the file but just
+       * truncate the request if the requested number of bytes is too large.
+       */
+      if (foff > fhand->filelen) {
+        return_error0(int, err_EOF);
+      } else
+        bytes = fhand->filelen - foff;
+    } else {
+      /* If writing then extend the file. */
+      if (DOSFS_ensure(fhand, foff + bytes) < (foff + bytes))
+        return -1;
+    }
+  }
+
+  /* Determine which cluster the operation is to start in (on exit foff will contain
+   * the offset within that cluster).
+   */
+  if ((nextcluster = clusterfromoffset(fhand->startCLUSTER, &foff, ihand)) < 0)
+    return -1;
+
+  /* If the operation is to write zeros then allocate a suitable block of memory and zero it. */
+  clustersize = secsalloc(ihand) * DOSsecsize;
+  if (zero) {
+    char *cp;
+    size = (bytes < clustersize ? bytes : clustersize);
+    if ((cp = memaddr = (char *)malloc(size)) == NULL)
+      return_errorT(int, err_heapexhausted, tok_heapexhausted, 0, 0);
+    while (size--)
+      *(cp++) = '\0';
+  }
+
+  while (bytes > 0) {
+    if (nextcluster >= CLUSTER_end(ihand))
+    {
+      global_error0(err_EOF);
+      result = -1;
+      break;
+    }
+    dprintf(("","DOS_bytes_RW: cluster offset = %d, bytes left = %d\n",foff,bytes));
+
+    /* Terminate loops in bad FAT. */
+    if ( (++clustercount > ihand->disc_FATentries) || (nextcluster < CLUSTER_first(ihand)) )
+    {
+      global_error0(err_clusterchain);
+      result = -1;
+      break;
+    }
+
+    if (bytes > clustersize-foff) {
+      /* Try to read/write as much as possible straight to/from memory using a cluster multiple op. */
+      size = (zero ? clustersize-foff : bytes);
+      dprintf(("","DOS_bytes_RW: trying %d bytes starting at cluster %d\n",size,nextcluster));
+      if ((nextcluster = DOS_multiple_RW(op, nextcluster, foff, memaddr, size, &size, ihand)) < 0)
+      {
+        result = -1;
+        break;
+      }
+    } else {
+      /* Do the last partial cluster. */
+      size = bytes;
+      dprintf(("","DOS_bytes_RW: transferring %d bytes in cluster %d\n",size,nextcluster));
+      if ((nextcluster = DOS_cluster_RW(op, nextcluster, foff, memaddr, size, ihand)) < 0)
+      {
+        result = -1;
+        break;
+      }
+    }
+    foff = 0;         /* if we go round again then must have stopped at cluster boundary */
+
+    if (!zero)
+      memaddr += size;
+    bytes -= size;
+  }
+
+  if (zero) free(memaddr);
+
+  return result;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_get_bytes(FILEhand *fhand,char *ma,word bytes,word foff)
+{
+  return DOS_bytes_RW(Rdata, ma, bytes, foff, fhand);
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_put_bytes(FILEhand *fhand,char *ma,word bytes,word foff,char dummy)
+{
+  return DOS_bytes_RW(Wdata, ma, bytes, foff, fhand);
+  UNUSED(dummy) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_write_zeros(FILEhand *fhand,word foff,word bytes)
+{
+  return DOS_bytes_RW(Wzero, 0, bytes, foff, fhand);
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_close_file(FILEhand *fhand,word loadaddr,word execaddr)
+{
+ /* in:
+  *     fhand    : internal filesystem handle for this file
+  *     loadaddr : new load address for the file
+  *     execaddr : new exec address for the file
+  */
+ FILEhand *cptr = NULL ;
+ FILEhand *last = NULL ;
+
+ dprintf(("","\n\nDOSFS_close_file: fhand = &%08X, load = &%08X, exec = &%08X\n",(word)fhand,loadaddr,execaddr));
+
+ /* NOTEs
+  * -----
+  * If this file was opened with a create operation (OPENOUT) then we should
+  * set the closed length to that of the current file pointer. This may
+  * involve releasing allocated CLUSTERs aswell as updating the directory
+  * information.
+  */
+
+ /* Search for the file descriptor that we are going to remove */
+ last = NULL ;
+ for (cptr = FILE_list; (cptr != NULL); cptr = cptr->next)
+  {
+   dprintf(("","DOSFS_close_file: cptr &%08X ; last &%08X\n",(int)cptr,(int)last));
+   if (cptr == fhand)
+    {
+     dprintf(("","DOSFS_close_file: handle found (filebuff = &%08X, modified = %d)\n",(int)fhand->filebuff,fhand->modified));
+
+     /* remove this structure from the list */
+     dprintf(("","DOSFS_close_file: removing handle from active list (last = &%08X)\n",(int)last));
+     if (last == NULL)
+      FILE_list = fhand->next ;
+     else
+      last->next = fhand->next ;
+
+     /* if file opened for writing then flush the buffer if modified */
+     if (fhand->filebuff != NULL)
+      {
+       if (fhand->modified != 0)
+        {
+         dprintf(("","DOSFS_close_file: flushing cached cluster %d to disk\n",fhand->currentCLUSTER));
+         DOS_cluster_RW(Wdata,fhand->currentCLUSTER,0,fhand->filebuff,(secsalloc(fhand->ihand) * DOSsecsize),fhand->ihand) ;
+         fhand->modified = 0 ;
+        }
+       free(fhand->filebuff) ;
+       fhand->filebuff = NULL ;
+      }
+
+     if (fhand->opentype != 0)
+      {
+       dprintf(("","DOSFS_close_file: index &%08X (length &%08X)\n",fhand->indexptr,fhand->filelen));
+
+       /* update the directory information */
+       if (fhand->fname != NULL) /* should never be NULL */
+        {
+         word bitmap = 0x00000000 ;
+         _kernel_swi_regs  rset ;
+         _kernel_oserror  *rerror ;
+
+         dprintf(("","DOSFS_close_file: filename \"%s\"\n",fhand->fname));
+
+         /* update the directory entry load and exec addresses */
+         if ((loadaddr & ADFStimestamp) == ADFStimestamp)
+          bitmap |= ((1 << wdi_LOAD) | (1 << wdi_EXEC)) ;
+
+         /* (re)write the file length aswell */
+         bitmap |= (1 << wdi_FLEN) ;
+
+         /* and write the startCLUSTER (in-case this is was an empty file) */
+         bitmap |= (1 << wdi_SCLUSTER) ;
+
+         write_dirinfo(fhand->fname,bitmap,loadaddr,execaddr,NULL,fhand->filelen,fhand->startCLUSTER,fhand->ihand) ;
+
+         /* Flush the output using OS_Args 255. */
+         rset.r[0] = 255;
+         rset.r[1] = (word)((fhand->ihand)->disc_fhand);
+         if ((rerror = _kernel_swi(OS_Args, &rset, &rset)) != NULL) {
+          dprintf(("","update_imageID: error from OS_Args 255: (&%08X) \"%s\"\n",rerror->errnum,rerror->errmess));
+          return_errorX(int,rerror);
+         }
+        }
+      }
+
+     /* release the filename buffer if allocated */
+     if (fhand->fname != NULL)
+      {
+       dprintf(("","DOSFS_close_file: releasing filename buffer at &%08X\n",(int)fhand->fname));
+       free(fhand->fname) ;
+       fhand->fname = NULL ; /* ensure accesses will fail */
+      }
+
+     /* Check that we have released all allocated, attached memory buffers */
+     dprintf(("","DOSFS_close_file: releasing file handle structure &%08X\n",(int)fhand));
+     free(fhand) ;
+     return(0) ; /* return to the caller */
+    }
+   last = cptr ;
+  }
+
+ dprintf(("","DOSFS_close_file: file handle not recognised (generate error?)\n"));
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_write_extent(FILEhand *fhand,word fext)
+{
+ /* in: fhand : internal filesystem handle for this file
+  *     fext  : new file extent
+  *
+  * Set the extent of a file (usually prior to it being closed).
+  */
+
+ /* modify the current file pointer for the given open file */
+ dprintf(("","\n\nDOSFS_write_extent: fhand = &%08X, fext = &%08X\n",(int)fhand,fext));
+
+ /* We will fall straight through if the extent is identical to the current
+  * file length.
+  */
+ if (fext > fhand->filelen)
+  {
+   word indexptr = fhand->indexptr ; /* preserve our position over ensure */
+   if (DOSFS_write_zeros(fhand,fhand->filelen,(fext - fhand->filelen)) < 0)
+    return((int)-1) ; /* error already defined */
+   fhand->indexptr = indexptr ; /* restore file position */
+  }
+ else
+  if (fext < fhand->filelen)
+   {
+    /* truncate the file to the desired length */
+    if (DOSFS_ensure_exact(fhand,fext) < 0)
+     return((int)-1) ; /* error already defined */
+    fhand->indexptr = fext ; /* new file position */
+   }
+
+ dprintf(("","DOSFS_write_extent: fhand &%08X (len &%08X ptr &%08X)\n",(int)fhand,fhand->filelen,fhand->indexptr));
+ /* out:
+  *     no conditions
+  */
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOSFS_alloc(FILEhand *fhand)
+{
+ int CLUSTERsize ;
+
+ /* in: fhand : internal filesystem handle for the file
+  */
+
+ dprintf(("","\n\nDOSFS_alloc: fhand = &%08X\n",(int)fhand));
+
+ CLUSTERsize = cluster_size(&(fhand->ihand->disc_boot)) ;
+
+ /* return the disc space allocated to the file */
+ /* out:
+  *     return : space allocated to the file (rounded up the next allocation
+  *              unit)
+  */
+ dprintf(("","DOSFS_alloc: fhand &%08X (len &%08X ptr &%08X)\n",(int)fhand,fhand->filelen,fhand->indexptr));
+ return((fhand->filelen + (CLUSTERsize - 1)) & -CLUSTERsize) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_datestamp *DOSFS_flush(FILEhand *fhand)
+{
+ /* in: fhand : internal filesystem handle for the file
+  *
+  * Flush any buffered data to the media.
+  */
+
+ dprintf(("","\n\nDOSFS_flush: fhand = &%08X\n",(int)fhand));
+
+ /* flush the file buffer if modified */
+ if ((fhand->filebuff != NULL) && (fhand->modified))
+  {
+   dprintf(("","DOSFS_flush: buffer needs to be written to the file\n"));
+   DOS_cluster_RW(Wdata,fhand->currentCLUSTER,0,fhand->filebuff,(secsalloc(fhand->ihand) * DOSsecsize),fhand->ihand) ;
+   fhand->modified = 0 ; /* clear the modified flag */
+  }
+
+ /* The load/exec addresses returned are those currently in the directory
+  * entry for the file.
+  */
+ tstamp.loadaddr = fhand->loadaddr ;
+ tstamp.execaddr = fhand->execaddr ;
+
+ dprintf(("","DOSFS_flush: fhand &%08X (len &%08X ptr &%08X)\n",(int)fhand,fhand->filelen,fhand->indexptr));
+ /* out:
+  *     tstamp.loadaddr = desired load address for the file
+  *     tstamp.execaddr = desired exec address for the file
+  */
+ return(&tstamp) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOSFS_ensure(FILEhand *fhand,word ensure)
+{
+ /* in:
+  *     fhand  : internal filesystem handle for the file
+  *     ensure : size of file to ensure
+  *
+  * Ensure the file can be extended to at least the given size. The extra
+  * space need NOT be zeroed.
+  */
+
+ dprintf(("","\n\nDOSFS_ensure: fhand = &%08X, ensure = &%08X\n",(int)fhand,ensure));
+
+ /* Set the file length to at least the desired value "ensure". */
+ if (fhand->filelen < ensure) {
+   if (DOSFS_ensure_exact(fhand, ensure) < 0)
+     return -1;
+ }
+
+ dprintf(("","DOSFS_ensure: fhand &%08X (len &%08X ptr &%08X)\n",(int)fhand,fhand->filelen,fhand->indexptr));
+ /* out:
+  *     return : size of file actually ensured
+  */
+ return(fhand->filelen) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_datestamp *DOSFS_read_datestamp(FILEhand *fhand)
+{
+ /* in: fhand : internal filesystem handle for the file
+  *
+  * Return the current load and exec addresses for this file.
+  */
+
+ dprintf(("","\n\nDOSFS_read_datestamp: fhand = &%08X\n",(int)fhand));
+
+ /* The load/exec addresses returned are those currently in the directory
+  * entry for the file.
+  */
+ tstamp.loadaddr = fhand->loadaddr ;
+ tstamp.execaddr = fhand->execaddr ;
+
+ dprintf(("","DOSFS_read_datestamp: fhand &%08X (len &%08X ptr &%08X)\n",(int)fhand,fhand->filelen,fhand->indexptr));
+ /* out:
+  *     tstamp.loadaddr = desired load address for the file
+  *     tstamp.execaddr = desired exec address for the file
+  */
+ return(&tstamp) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+char *DOSFS_save_file(char *fn,word ld,word ex,char *bs,char *end,DOSdisc *ih)
+{
+ DIR_info     *cdir ;     /* directory where the leafname resides */
+ char         *DOSname ;  /* full DOS pathname */
+ char         *leafname ; /* pointer to the leafname of "DOSname" */
+ DOS_direntry *dentry ;   /* directory entry structure pointer */
+
+ /* in:
+  *     fn  : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ld  : new load address for the file
+  *     ex  : new exec address for the file
+  *     bs  : base address of data in memory
+  *     end : end address of data in memory (plus one)
+  *     ih  : filesystem image handle
+  */
+
+ dprintf(("","\n\nDOSFS_save_file: \"%s\"\n",fn));
+
+ /* convert "fn" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(char *,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ if ((int)convertRISCOStoLFN(fn, DOSname) < 0) {
+  free(DOSname);
+  return (char *)-1;
+ }
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ih) < 0)
+  {
+   free(DOSname) ;
+   return((char *)-1) ; /* error already defined */
+  }
+
+ dprintf(("","DOSFS_save_file: cdir = &%08X, cdir->ihand = &%08X\n",(int)cdir,(int)(cdir->ihand)));
+
+ set_dir_flags(cdir, dir_LOCKED);
+
+ /* create the directory entry and save the file */
+ if (saveFILE(fn,leafname,ld,ex,(char *)bs,(word)(end - bs),&cdir,&dentry,0,ih) < 0)
+  {
+   unset_dir_flags(cdir, dir_LOCKED);
+   DOS_FAT_RW(Rdata, ih);
+   free_dir_cache(DOSname, ih);
+   free(DOSname) ;
+   return((char *)-1) ; /* error already defined */
+  }
+ unset_dir_flags(cdir, dir_LOCKED);
+
+ /* Do this before freeing DOSname. */
+ sprintf(tline,"%s",leafname) ;
+
+ free(DOSname) ; /* and the pathname buffer */
+
+ /* out:
+  *     Returns the leafname for any "*OPT 1 n" setting
+  */
+ return(tline) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_write_cat(char *fname,word ld,word ex,word attr,DOSdisc *ihand)
+{
+ int state ;
+
+ /* in:
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ld    : new load address for the file
+  *     ex    : new exec address for the file
+  *     attr  : new attributes for the file
+  *     ihand : filesystem image handle
+  *
+  * If the object does not exist, DO NOT return an error. If the object is
+  * a directory, and the filesystem does NOT support directory attributes and
+  * information, then return an error.
+  */
+
+ dprintf(("","\n\nDOSFS_write_cat: \"%s\"\n",fname));
+
+ /* out:
+  *     no conditions
+  */
+ state = write_dirinfo(fname,((1 << wdi_LOAD) | (1 << wdi_EXEC) | (1 << wdi_ATTR)),ld,ex,attr,NULL,NULL,ihand) ;
+ if ((state == -1) && ((_syserr->errnum & err_mask) == err_objectnotfound))
+  state = 0 ; /* ignore "file not found" error */
+
+ return(state) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_cat_entry *DOSFS_read_cat(char *fname,DOSdisc *ihand)
+{
+ /* in:
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ihand : filesystem image handle
+  */
+ int           loop ;               /* general loop counter */
+ char         *DOSname = NULL ;     /* converted pathname */
+ char         *leafname = NULL ;    /* leafname of loaded directory */
+ DIR_info     *cdir = NULL ;        /* pointer to the loaded directory */
+ DOS_direntry *dentry ;             /* directory entry pointer */
+ int           temp;
+ char          fnametemp[255];
+
+ fnametemp[0]='\0';
+ strcpy(fnametemp,fname);
+
+ dprintf(("","\n\nDOSFS_read_cat: \"%s\"\n",((fname == NULL) ? "" : fname)));
+
+ /* defaults */
+ fcat.type = no_object ;
+ fcat.loadaddr = 0x00000000 ;
+ fcat.execaddr = 0x00000000 ;
+ fcat.filelen  = 0x00000000 ;
+ fcat.fileattr = 0x00000000 ;
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(255)) == NULL)
+  {
+   return_errorT(FS_cat_entry *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+  if ((int)convertRISCOStoLFN(fname, DOSname) < 0)
+  {
+   free(DOSname);
+   return &fcat;    /* Just return file not found. */
+  }
+
+ /* load the desired directory (also returns the leafname) */
+ if(temp=resolvePATH(DOSname,&cdir,&leafname,ihand), temp < 0)
+ {
+//  if ((int)convertRISCOStoLFN(fnametemp, DOSname) < 0)
+//  {
+   free(DOSname);
+   return &fcat;    /* Just return file not found. */
+//  }
+//  temp=resolvePATH(DOSname,&cdir,&leafname,ihand);
+ }
+ dprintf(("","DOSFS_read_cat: leafname = \"%s\"\n",leafname));
+ if (1==1) {
+
+   /* search the directory */
+   loop = 0 ;
+   if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) != NULL)
+    {
+     time5byte le ;
+     char      dosext[8] = {0,0,0,0,0,0,0,0} ;
+
+     dprintf(("","DOSFS_read_cat: file found\n"));
+
+     if (buildFILEname(dentry,DOSname) != NULL)
+      (void)after(dosext,DOSname,file_sep,1) ;
+
+     read_loadexec(dentry,dosext,&le) ; /* get the load/exec information */
+
+     fcat.type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+
+     /* construct suitable RISC OS fields */
+     fcat.loadaddr = le.hi ;
+     fcat.execaddr = le.lo ;
+     fcat.filelen  = dentry->FILE_size ;
+     fcat.fileattr = DOStoRISCOSattributes(dentry) ;
+    }
+
+ }
+
+ free(DOSname) ;
+
+ /* out:
+  *     fcat.type     = object type (0 = not found; 1 = file; 2 = directory)
+  *     fcat.loadaddr = load address
+  *     fcat.execaddr = exec address
+  *     fcat.filelen  = length in bytes
+  *     fcat.fileattr = attributes
+  */
+ return(&fcat) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_cat_entry *DOSFS_delete(char *fname,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;     /* directory where the leafname resides */
+ char         *DOSname ;  /* full DOS pathname */
+ char         *leafname ; /* pointer to the leafname of "DOSname" */
+ DOS_direntry *dentry ;   /* directory entry structure pointer */
+ int           loop ;     /* general index counter */
+ int           value = 0;    /* general work variable */
+
+ /* in:
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ihand : filesystem image handle
+  *
+  * Delete the object. Do not generate an error if the file does NOT exist.
+  */
+
+ dprintf(("","\n\nDOSFS_delete: \"%s\"\n",fname));
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(FS_cat_entry *,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  return (FS_cat_entry *)-1;
+ }
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(DOSname) ;
+   return((FS_cat_entry *)-1) ; /* error already defined */
+  }
+
+ /* delete the directory entry */
+ dprintf(("","DOSFS_delete: leafname = \"%s\"\n",leafname));
+
+ /* search the directory (we do not complain if the file is not found) */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) != NULL)
+  {
+   time5byte le ;
+   char      dosext[8] = {0,0,0,0,0,0,0,0} ;
+
+   dprintf(("","DOSFS_delete: file found\n"));
+
+   /* Make sure that the file is not open. */
+   if (find_open_file(fname, dentry, ihand) >= 0) {
+    free(DOSname);
+    return_error1(FS_cat_entry *, err_fileopen, fname);
+   }
+
+   if ((dentry->FILE_attribute & FILE_readonly) != 0) {
+    free(DOSname);
+    return_error1(FS_cat_entry *, err_filelocked, fname);
+   }
+
+   if ((dentry->FILE_attribute & FILE_subdir) != 0)
+    {
+     /* check that the directory is empty */
+     DIR_info *subdir ;
+     char     *subleafname ;
+
+     dprintf(("","DOSFS_delete: attempt to delete directory\n"));
+     dprintf(("","DOSFS_delete: DOSname  = \"%s\"\n",DOSname));
+     dprintf(("","DOSFS_delete: leafname = \"%s\"\n",leafname));
+
+     /* At the moment "resolvePATH" has special code to deal with the
+      * single entry in ROOT. We need to simulate that here.
+      */
+     /* We want to load the directory that is currently our leafname */
+     {
+      char *s = leafname, *d = DOSname + strlen(DOSname);
+      if (d != DOSname)
+       *d++ = '\\';
+      do {
+       *d++ = *s;
+      } while (*s++ != '\0');
+     }
+     strcat(DOSname, "\\*.*");
+
+     dprintf(("","DOSFS_delete: DOSname  = \"%s\"\n",DOSname));
+
+     set_dir_flags(cdir, dir_LOCKED);
+     /* load the desired directory, returning the leafname "*.*" */
+     if (resolvePATH(DOSname,&subdir,&subleafname,ihand) < 0)
+      {
+       unset_dir_flags(cdir, dir_LOCKED);
+       free(DOSname) ;
+       return((FS_cat_entry *)-1) ; /* error already defined */
+      }
+     unset_dir_flags(cdir, dir_LOCKED);
+
+     loop = 0 ;
+     dprintf(("","DOSFS_delete: subleafname = \"%s\"\n",subleafname));
+     if (findDIRentry(subleafname,subdir,subdir->dir_size,&loop) != NULL)
+      {
+       dprintf(("","DOSFS_delete: attempt to delete non-empty directory\n"));
+       free(DOSname) ;
+       return_error1(FS_cat_entry *,err_notempty,fname) ;
+      }
+
+     /* Remove this directory and any of its children from the directory cache. */
+     free_dir_cache(DOSname, ihand);
+    }
+
+   /* We have found the file directory entry, so remove the directory entry
+    * and then release the cluster chain associated with the object.
+    * RISC OS expects a description of the object deleted to be returned.
+    */
+   (void)buildFILEname(dentry,DOSname) ;
+   (void)after(dosext,DOSname,file_sep,1) ;
+
+   /* construct return information */
+   read_loadexec(dentry,dosext,&le);
+
+   {
+     byte status = dentry->FILE_status;
+     dentry->FILE_status = FILE_deleted;
+     int diroffset = (int)((((int)dentry)-(DI_Base(cdir))) / sizeof(DOS_direntry));
+     dprintf(("","DOSFS_delete: diroffset = %x\n",diroffset));
+     if(cdir->lfnp[diroffset] != NULL)
+     {
+      dprintf(("","DOSFS_delete: removing lfn\n"));
+      free(cdir->lfnp[diroffset]);
+      cdir->lfnp[diroffset] = NULL;
+      DOS_lfnentry *lfndir = ((DOS_lfnentry*)dentry) - 1 ;
+      while(lfndir->FILE_attribute == 0xF)
+      {
+       lfndir->FILE_Ordinal = 0xE5;
+       lfndir--;
+       if((lfndir->FILE_Ordinal&0x40) == 0) break;
+      }
+
+     }
+     set_dir_flags(cdir, dir_MODIFIED);
+     if (value = ensure_directory(cdir), value == 0)
+     {
+       freeclusters(get_FILE_cluster(dentry,ihand), ihand);
+       if ((value = ensure_FATs(ihand)) == 0) {
+         /* construct the return information */
+         fcat.type     = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_dir) ;
+         fcat.loadaddr = le.hi ;
+         fcat.execaddr = le.lo ;
+         fcat.filelen  = dentry->FILE_size ;
+         fcat.fileattr = DOStoRISCOSattributes(dentry) ;
+       }
+     } else {
+       /* If the directory ensure (write) fails eg. because disc is write-protected then
+        * we don't free the clusters and don't delete the file.
+        */
+       flush_dir_cache(ihand);
+       dentry->FILE_status = status;
+       unset_dir_flags(cdir, dir_MODIFIED);
+     }
+   }
+  }
+
+ free(DOSname) ;
+
+ dprintf(("","DOSFS_delete: completed OK\n"));
+ /* out:
+  *     fcat.type     = object type (0 = not found; 1 = file; 2 = directory)
+  *     fcat.loadaddr = load address
+  *     fcat.execaddr = exec address
+  *     fcat.filelen  = length in bytes
+  *     fcat.fileattr = attributes
+  */
+ if (value)
+  return((FS_cat_entry *)-1);
+ return(&fcat) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_create(char *fname,word ld,word ex,char *base,char *end,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;     /* directory where the leafname resides */
+ char         *DOSname ;  /* full DOS pathname */
+ char         *leafname ; /* pointer to the leafname of "DOSname" */
+ DOS_direntry *dentry ;   /* directory entry structure pointer */
+ word          length = ((word)end - (word)base) ;
+
+ /* in:
+  *     fname  : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ld     : load address to give new file
+  *     ex     : exec address to give new file
+  *     base   : base address in memory
+  *     end    : end address in memory (used with "base" to derive length)
+  *     ihand  : filesystem image handle
+  *
+  * If a file of the specified name already exists, then delete it. An error
+  * should be returned if the file cannot be deleted. The new file should
+  * have the same attributes as the old file if one existed, otherwise a
+  * suitable default value.
+  */
+
+ dprintf(("","\n\nDOSFS_create: base &%08X, end &%08X\n",(word)base,(word)end));
+ dprintf(("","DOSFS_create: \"%s\" length &%08X (ld: &%08X ex: &%08X)\n",fname,length,ld,ex));
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  return -1;
+ }
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+
+ dprintf(("","DOSFS_create: cdir = &%08X, cdir->ihand = &%08X\n",(int)cdir,(int)(cdir->ihand)));
+
+ set_dir_flags(cdir, dir_LOCKED);
+
+ /* create the directory entry (using the "saveFILE" primitive) */
+ if (saveFILE(fname,leafname,ld,ex,NULL,length,&cdir,&dentry,1,ihand) < 0)
+  {
+   unset_dir_flags(cdir, dir_LOCKED);
+   DOS_FAT_RW(Rdata, ihand);
+   free_dir_cache(DOSname, ihand);
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+ unset_dir_flags(cdir, dir_LOCKED);
+
+ free(DOSname) ; /* and the pathname buffer */
+
+ /* out:
+  *     no conditions
+  */
+ return(NULL) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_create_dir(char *fname,word ld,word ex,word size,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;              /* directory where the leafname resides */
+ char         *DOSname ;           /* full DOS pathname */
+ char         *leafname ;          /* pointer to the leafname of "DOSname" */
+ DOS_direntry *dentry ;            /* directory entry structure pointer */
+ DIR_info     *pdir = NULL ;       /* parent directory (if required) */
+ char         *memaddr ;           /* memory buffer for new directory image */
+ int           CLUSTERsize ;       /* size of a CLUSTER in bytes */
+ int           CLUSTERs_required ; /* number of CLUSTERs required for dir */
+ int           loop ;              /* general index counter */
+ int           startCLUSTER ;      /* CLUSTER where the directory starts */
+ time5byte     saveTIME ;          /* time the directory was created */
+ int           ROOTcluster ;       /* CLUSTER for the ROOT of the filesystem */
+ int           not_sfn;            /* flag not a valid short name */
+
+ /* in:
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ld    : load address to give directory
+  *     ex    : exec address to give directory
+  *     size  : number of directory entries required
+  *     ihand : filesystem image handle
+  *
+  * If the directory already exists, then try renaming it (the case of certain
+  * letters in the name may have changed). Do not return an error if the
+  * rename fails.
+  */
+
+ dprintf(("","\n\nDOSFS_create_dir: \"%s\"\n",fname));
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  return -1;
+ }
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+
+ /* create the directory entry */
+ dprintf(("","DOSFS_create_dir: \"%s\" in dir &%08X\n",leafname,(word)cdir));
+
+ /* directories are initially given 1 cluster (is this the same as MS-DOS?) */
+ CLUSTERsize = cluster_size(&(ihand->disc_boot)) ;
+ CLUSTERs_required = 1 ;
+
+ /* If "cdir->dir_root == -1" then the parent DIR is the ROOT directory.
+  * The ROOT directory does not live in the normal disc data area (i.e. cluster
+  * area). This means that it cannot be allocated a CLUSTER number. It also
+  * means that the ROOT directory CANNOT be extended.
+  */
+ if (cdir->dir_root == -1)
+  ROOTcluster = 0 ; /* ROOT directory has CLUSTER 0 (for convenience) */
+ else
+  ROOTcluster = SECTORtoCLUSTER(cdir->dir_sector,ihand) ;
+
+ dprintf(("","DOSFS_create_dir: parent directory type = %d\n",cdir->dir_root));
+ dprintf(("","DOSFS_create_dir: parent directory sector = %d\n",cdir->dir_sector));
+ dprintf(("","DOSFS_create_dir: CLUSTERsize = &%08X\n",CLUSTERsize));
+ dprintf(("","DOSFS_create_dir: parent directory cluster = &%03X\n",ROOTcluster));
+
+ /* allocate memory buffer for the new directory */
+ if ((memaddr = (char *)calloc(1, CLUSTERs_required * CLUSTERsize)) == NULL)
+  {
+   free(DOSname) ;
+   return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+
+ /* check to see if the directory already exists */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) != NULL)
+  {
+   /* object already exists */
+   free(DOSname) ;
+   free(memaddr) ;
+   if ((dentry->FILE_status != FILE_directory) && ((dentry->FILE_attribute & FILE_subdir) == 0))
+    {
+     /* object already exists as a file */
+     return_errorT(int,err_badtypes,"TypsBad",NULL,NULL) ;
+    }
+   /* object exists as a directory, do not generate an error */
+   /* Since MS-DOS is only upper-case we don't need to worry about preserving
+    * the case of the name given on entry.
+    */
+   return(0) ;
+  }
+
+ dprintf(("","DOSFS_create_dir: does NOT already exist\n"));
+
+ int numreq;
+ DOS_direntry * lfn[20];
+
+ numreq = (strlen(leafname)/13) + 2;
+ dprintf(("","createDIR: numreq = %d\n",numreq));
+
+ if(get_dir_entry_array(lfn, ihand, numreq, &cdir, &pdir,NULL)
+ <0) return -1;
+
+ /* "dentry" = pointer to the directory entry to create */
+
+ if ((startCLUSTER = claimfreeclusters(CLUSTERs_required, ihand)) < 0) {
+   free(DOSname);
+   free(memaddr);
+   return -1;
+ }
+
+ int myi;
+ for(myi=0;myi<numreq;myi++)
+  dprintf(("","createDIR: Entry %d is at address %0x\n",myi+1,(int)lfn[myi]));
+
+//Create 8.3 filename from leafname
+ char shortname[14];
+ char shorttemp[14];
+
+ not_sfn=shorten_lfn(leafname,shortname,shorttemp,cdir);
+  dentry = not_sfn?lfn[numreq-1]:lfn[0];
+
+ dprintf(("","saveDIR: long filename = %s\n",leafname));
+ dprintf(("","saveDIR: short filename = %c%c%c%c%c%c%c%c, ext = %c%c%c\n",shortname[0],shortname[1],shortname[2],shortname[3],shortname[4],shortname[5],shortname[6],shortname[7],shortname[8],shortname[9],shortname[10]));
+
+ if(not_sfn) MakeLFNEntries(lfn,numreq,leafname,shortname);
+
+ /* write the information into the directory entry
+  *
+  * This requires the filename to be split into name and extension fields
+  * We fill the name with SPACEs first (the string terminator (NULL) is
+  * placed in the attributes field)
+  *
+  * NOTE: these should be done in this order due to the fact that the
+  *       text building function terminates each string with a NULL
+  */
+ sprintf((char *)&(dentry->FILE_status),"           ") ;
+ memcpy((char *)&((dentry)->FILE_status),&shortname[0],8);
+ memcpy((char *)&((dentry)->FILE_extension),&shortname[8],3);
+ /* mark the object as a directory */
+ dentry->FILE_attribute = FILE_subdir; /* JRS removed (| FILE_archive) here 6/3/92 */
+// bzero((char *)&(dentry->FILE_reserved),spare1) ; /* ZERO "spare1" bytes */
+ memset((char *)&(dentry->FILE_reserved),0,spare1) ; /* ZERO "spare1" bytes */
+ /* use the passed load/exec addresses */
+ saveTIME.lo = ex ;
+ saveTIME.hi = (ld & 0xFF) ;
+ put_FILE_time(dentry->FILE_time,dentry->FILE_timeHI,RISCOStoTIME(&saveTIME)) ;
+ put_FILE_date(dentry->FILE_date,dentry->FILE_dateHI,RISCOStoDATE(&saveTIME)) ;
+ put_FILE_cluster(dentry,startCLUSTER,ihand) ;
+
+ char * longfileholder = malloc(strlen(leafname)+1);
+ if (longfileholder == NULL)
+ {
+  return_errorT(int,err_heapexhausted, tok_heapexhausted, 0, 0);
+ }
+ strcpy(longfileholder,leafname);
+// int diroffset = ((int)((int)(dentry)-((int)(&((cdir)->dir_entries[0]))+((cdir)->dir_entryoffset))) / sizeof(DOS_direntry)) + 1;
+// (cdir)->lfnp[diroffset] = longfileholder;
+
+ int diroffset = ((int)((int)(dentry)-(DI_Base(cdir))) / sizeof(DOS_direntry));
+ (cdir)->lfnp[diroffset] = longfileholder;
+ dprintf(("","**************************************HERE: index = %d, pointer = %p, actual = %p\n",diroffset,(cdir)->lfnp[diroffset], longfileholder));
+
+// int index=0;
+// char * longfileholder = malloc(strlen(leafname)+1);
+// if (longfileholder == NULL)
+//  return_errorT(int,err_heapexhausted, tok_heapexhausted, 0, 0);
+// strcpy(longfileholder,leafname);
+// if(findDIRentry(shorttemp,cdir,(cdir)->dir_size,&index))
+// {
+//  cdir->lfnp[index] = longfileholder;
+// }
+// dprintf(("","**************************************HERE: index = %d, pointer = %p, actual = %p\n",index,cdir->lfnp[index], longfileholder));
+
+ dentry->FILE_size = 0; /* JRS 6/3/92 DOS directories have size set to 0. Removed: (CLUSTERs_required * CLUSTERsize) ;*/
+ dprintf(("","DOSFS_create_dir: dir size written = &%08X\n",dentry->FILE_size));
+
+ set_dir_flags(cdir, dir_MODIFIED) ; /* directory has been updated */
+
+ /* construct a default directory */
+ {
+  DOS_direntry *direntries ;
+
+  for (loop=0; (loop < (CLUSTERs_required * CLUSTERsize)); loop++)
+   memaddr[loop] = NULL ;
+
+  /* make "." */
+  direntries = (DOS_direntry *)&(memaddr[0]) ;
+  sprintf((char *)&(direntries->FILE_status),".          ") ;
+  direntries->FILE_attribute = FILE_subdir ;
+//  bzero((char *)&(direntries->FILE_reserved),spare1) ; /* ZERO spare1 bytes */
+  memset((char *)&(direntries->FILE_reserved),0,spare1) ; /* ZERO spare1 bytes */
+  put_FILE_time(direntries->FILE_time,direntries->FILE_timeHI,RISCOStoTIME(&saveTIME)) ;
+  put_FILE_date(direntries->FILE_date,direntries->FILE_dateHI,RISCOStoDATE(&saveTIME)) ;
+  put_FILE_cluster(direntries,startCLUSTER,ihand) ;
+  direntries->FILE_size = 0x00000000 ;      /* special directory */
+
+  /* make ".." */
+  direntries = (DOS_direntry *)&(memaddr[1 * sizeof(DOS_direntry)]) ;
+  sprintf((char *)&(direntries->FILE_status),"..         ") ;
+  direntries->FILE_attribute = FILE_subdir ;
+//  bzero((char *)&(direntries->FILE_reserved),spare1) ; /* ZERO spare1 bytes */
+  memset((char *)&(direntries->FILE_reserved),0,spare1) ; /* ZERO spare1 bytes */
+  put_FILE_time(direntries->FILE_time,direntries->FILE_timeHI,RISCOStoTIME(&saveTIME)) ;
+  put_FILE_date(direntries->FILE_date,direntries->FILE_dateHI,RISCOStoDATE(&saveTIME)) ;
+  put_FILE_cluster(direntries,ROOTcluster,ihand) ;
+  direntries->FILE_size = 0x00000000 ;      /* special directory */
+ }
+
+ /* copy the data from memory into the allocated clusters */
+ /* use "saveOBJECT" to perform this */
+ if (DOS_object_RW(Wdata,startCLUSTER,memaddr,(CLUSTERs_required * CLUSTERsize),ihand) != 0)
+  {
+   DOS_FAT_RW(Rdata, ihand);
+   flush_dir_cache(ihand);
+   free(DOSname) ;
+   free(memaddr) ;
+   return -1;
+  }
+
+ free(DOSname) ;
+ free(memaddr) ;
+
+ if (pdir != NULL) {
+  if (ensure_directory(pdir) != 0) {
+   return -1;
+  }
+ }
+
+ if ((ensure_directory(cdir) != 0) || (ensure_FATs(ihand) != 0))
+  {
+   return(-1) ; /* error already defined */
+  }
+
+ /* out:
+  *     no conditions
+  */
+ return(0) ;
+ UNUSED(size) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOSFS_read_block_size(char *fname,DOSdisc *ihand)
+{
+ int CLUSTERsize = cluster_size(&(ihand->disc_boot)) ;
+ dprintf(("","DOSFS_read_block_size: \"%s\"; ihand = &%08X\n",fname,(word)ihand));
+ return(CLUSTERsize) ;
+ UNUSED(fname) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+
+word DOSFS_rename(char *oldname,char *newname,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;     /* directory where the original leafname resides */
+ DIR_info     *ndir ;     /* directory where the new leafname resides */
+ char         *DOSname ;  /* full DOS pathname */
+ char         *leafname ; /* pointer to the leafname of "DOSname" */
+ DOS_direntry *dentry ;   /* directory entry structure pointer */
+ DOS_direntry *found ;    /* directory entry structure pointer */
+ int           loop ;     /* general index counter */
+ int           not_sfn;   /* flag not a valid short name */
+
+ /* in:
+  *     oldname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     newname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     ihand   : filesystem image handle
+  *
+  * The rename should fail only if the objects are on different image files
+  * (Which should not happen with this system).
+  */
+
+ dprintf(("","\n\nDOSFS_rename: \"%s\" --> \"%s\"\n",oldname,newname));
+
+ /* convert "oldname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+ if ((int)convertRISCOStoLFN(oldname, DOSname) < 0) {
+  free(DOSname);
+  return (word)-1;
+ }
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+
+ dprintf(("","DOSFS_rename: original leafname = \"%s\"\n",leafname));
+ char oldleafname[256];
+ strcpy(oldleafname,leafname);
+ dprintf(("","DOSFS_rename: saved leafname = \"%s\"\n",oldleafname));
+
+ /* search the directory for the original entry */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) == NULL)
+  {
+   free(DOSname) ;
+   return_errorT(word,err_objectnotfound,tok_objectnotfound,oldname,0) ;
+  }
+ found = dentry ; /* pointer to "oldname" in directory */
+
+
+ /* check that no wildcard characters exist in the original leafname */
+ if (checknotwildcarded(leafname, DOSwcmult, DOSwcsing) != 0)
+  {
+   free(DOSname) ;
+   return_error1(word,err_wildcardedname,oldname) ;
+  }
+
+  /* If the object to be renamed is a directory then we must ensure that there is
+   * no copy of it in the cache so that DOSFS doesn't think that it still exists.
+   */
+ if (found->FILE_attribute & FILE_subdir) {
+   /* Reconstruct the full pathname of the directory being renamed. */
+   dprintf(("","DOSFS_rename: removing \"%s\" from the directory cache\n",leafname));
+   free_dir_cache(restorePATH(DOSname,leafname), ihand);
+ } else {
+  /* Its a file, so check if it's open. */
+  if (find_open_file(oldname, found, ihand) >= 0) {
+   free(DOSname);
+   return_error1(int, err_fileopen, oldname);
+  }
+ }
+
+ if ((int)convertRISCOStoLFN(newname, DOSname) < 0) {
+  free(DOSname);
+  return (word)-1;
+ }
+
+ set_dir_flags(cdir, dir_LOCKED);
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&ndir,&leafname,ihand) < 0)
+  {
+   unset_dir_flags(cdir, dir_LOCKED);
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+ unset_dir_flags(cdir, dir_LOCKED);
+
+ dprintf(("","DOSFS_rename: new leafname = \"%s\"\n",leafname));
+ if (checknotwildcarded(leafname, DOSwcmult, DOSwcsing) != 0)
+  {
+   free(DOSname) ;
+   return_error1(word,err_wildcardedname,newname) ;
+  }
+
+ /* check to see if we already have a file with the destination name */
+ loop = 0 ;
+ if ((dentry = findDIRentry(leafname,ndir,ndir->dir_size,&loop)) != NULL)
+  {
+   /* new name already exists in the destination directory */
+   free(DOSname) ;
+   return_error0(word,err_alreadyexists) ;
+  }
+
+
+//Obtain the correct amount of empty directory entries
+  int numreq = (strlen(leafname)/13) + 2;
+  DOS_direntry * lfn[20];
+  DIR_info     *pdir = NULL ;       /* parent directory (not required) */
+
+  dprintf(("","renameOBJECT: numreq = %d\n",numreq));
+
+ if(get_dir_entry_array(lfn, ihand, numreq, &ndir, &pdir,&found)
+ <0) return -1;
+
+  char shorttemp[14];
+  char shortname[14];
+
+  not_sfn=shorten_lfn(leafname,shortname,shorttemp,ndir);
+  dentry = not_sfn?lfn[numreq-1]:lfn[0];
+
+  dprintf(("","renameOBJECT: long filename = %s\n",leafname));
+  dprintf(("","renameOBJECT: short tempory filename = %s\n",shorttemp));
+  dprintf(("","renameOBJECT: short filename = \'%c%c%c%c%c%c%c%c\' ext=\'%c%c%c\'\n",shortname[0],shortname[1],shortname[2],shortname[3],shortname[4],shortname[5],shortname[6],shortname[7],shortname[8],shortname[9],shortname[10]));
+  dprintf(("","renameOBJECT: into dentry = %p\n",dentry));
+
+ if(not_sfn)MakeLFNEntries(lfn,numreq,leafname,shortname);
+
+
+ sprintf((char *)&(dentry->FILE_status),"           ") ;
+ memcpy((char *)&(dentry->FILE_status),&shortname[0],8);
+ memcpy((char *)&(dentry->FILE_extension),&shortname[8],3);
+ /* copy spare bytes (either JGS info or DRDOS5.0 info) */
+ for (loop = 0; (loop < spare1); loop++)
+      dentry->FILE_reserved[loop] = found->FILE_reserved[loop] ;
+ /* copy file description */
+ dentry->FILE_attribute =  found->FILE_attribute;
+ dentry->FILE_time = found->FILE_time ;
+ dentry->FILE_timeHI = found->FILE_timeHI ;
+ dentry->FILE_date = found->FILE_date ;
+ dentry->FILE_dateHI = found->FILE_dateHI ;
+ dentry->FILE_cluster = found->FILE_cluster ;
+ dentry->FILE_clusterHI = found->FILE_clusterHI ;
+ dentry->FILE_size = found->FILE_size ;
+ set_dir_flags(ndir, dir_MODIFIED) ; /* new directory updated */
+
+ char * longfileholder = malloc(strlen(leafname)+1);
+ if (longfileholder == NULL)
+  return_errorT(int,err_heapexhausted, tok_heapexhausted, 0, 0);
+ strcpy(longfileholder,leafname);
+ int diroffset = ((int)((int)(dentry)-(DI_Base(ndir))) / sizeof(DOS_direntry));
+ (ndir)->lfnp[diroffset] = longfileholder;
+
+ dprintf(("","**************************************HERE: index = %d, pointer = %p, actual = %p\n",diroffset,cdir->lfnp[diroffset], longfileholder));
+
+  int cdirp = (int)DI_Base(cdir);
+  dprintf(("","renameOBJECT: cdirp = %x, found = %x\n",(int)cdirp,(int)found));
+  /* ditch original lfnp if there */
+  loop= ((int)((int)(found)-(DI_Base(cdir))) / sizeof(DOS_direntry));
+  if(cdir->lfnp[loop])
+  {
+    free(cdir->lfnp[loop]);
+    cdir->lfnp[loop]=NULL;
+  }
+
+  found->FILE_status = 0xE5;
+  found--;
+  while( ((int)found >= cdirp) && (found->FILE_attribute == 0xF) )
+  {
+  dprintf(("","renameOBJECT: cdirp = %x, nfound = %x\n",(int)cdirp,(int)found));
+   found->FILE_status = 0xE5;
+   found--;
+  }
+
+ set_dir_flags(cdir, dir_MODIFIED) ; /* directory updated */
+ free(DOSname) ;
+
+ if ((ensure_directory(cdir)!= 0) || (ensure_directory(ndir)!= 0))
+  {
+   flush_dir_cache(ihand);
+   return(-1) ; /* error already defined */
+  }
+
+ /* out:
+  *     return  : rename status
+  */
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_dir_block *DOSFS_read_dir(char *fname,word dest,word num,word off,word blen,DOSdisc *ihand)
+{
+ /* in:
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     dest  : destination memory address for data
+  *     num   : number of objects to read
+  *     off   : offset into directory
+  *     blen  : "dest" buffer length
+  *     ihand : filesystem image handle
+  */
+
+dprintf(("","\n\nDOSFS_read_dir: \"%s\" (dest = &%08X) %d %d %d\n",((fname == "") ? "NULLptr" : fname),dest,num,off,blen));
+
+ /* out:
+  *     dblock.objects_read = number of records read
+  *     dblock.next_offset  = offset of next item to be read (-1 if end)
+  */
+ return(read_dir(0,fname,dest,num,off,blen,ihand)) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_dir_block *DOSFS_read_dir_info(char *fname,word dest,word num,word off,word blen,DOSdisc *ihand)
+{
+ /* in:
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     dest  : destination memory address for data
+  *     num   : number of objects to read
+  *     off   : offset into directory
+  *     blen  : "dest" buffer length
+  *     ihand : filesystem image handle
+  */
+ dprintf(("","\n\nDOSFS_read_dir_info: \"%s\" (dest = &%08X) %d %d %d\n",((fname == "") ? "NULLptr" : fname),dest,num,off,blen));
+
+ /* out:
+  *     dblock.objects_read = number of records read
+  *     dblock.next_offset  = offset of next item to be read (-1 if end)
+  */
+ return(read_dir(-1,fname,dest,num,off,blen,ihand)) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_defect_list(char *fname,word buffer,word blen,DOSdisc *ihand)
+{
+ int             limit ;                         /* end of list */
+ int             index;
+
+ dprintf(("","DOSFS_defect_list: buffer &%08X (blen &%08X) ihand &%08X\n",buffer,blen,(int)ihand));
+
+ /* Fill the supplied buffer with the byte offsets of the defects
+  * within the image. The list should be terminated with 0x20000000.
+  * It is an error for the specified filename to not be a ROOT object.
+  *
+  * We should search the FAT for CLUSTER_bad values that are NOT part
+  * of a file chain. The offset we return is true byte offset within
+  * the image, ie. we count previous bad CLUSTERs as data.
+  */
+
+ /* At the moment I ignore the "fname" given. */
+
+ /* Scan the FAT returning information about BAD CLUSTERs */
+ /* We must not overflow the buffer... should we return an error instead? */
+ limit = (blen / sizeof(int)) - 1 ;
+
+ index = CLUSTER_first(ihand);
+ do {
+   int secs;
+   word addr;
+   int cluster = findCLUSTERtype(ihand, &index, CLUSTER_bad(ihand));
+   if (cluster < 0)
+     break;
+   secs = secsalloc(ihand);
+   addr = ((cluster - CLUSTER_first(ihand)) * secs + ihand->disc_startsec - 1) *
+          DOSsecsize + ihand->disc_winioffset;
+   if ((limit -= secs) < 0)
+     secs += limit;
+   while (secs--) {
+     *((word *)buffer) = addr;
+     dprintf(("","DOSFS_defect_list: found &%08X\n", addr));
+     addr += DOSsecsize;
+     buffer += sizeof(int) ;
+   }
+   index++;
+ } while (limit > 0);
+
+ /* We left enough room (in the calculation above) for the terminator */
+ /* NOTE: At the moment we do not generate an error if there are more
+  *       BAD CLUSTERs than will fit into the passed buffer.
+  */
+ *((word *)buffer) = 0x20000000 ; /* terminate the list */
+ return(0) ;
+ UNUSED(fname) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_add_defect(char *fname,word offset,DOSdisc *ihand)
+{
+ int CLUSTER ;
+ int nextCLUSTER ;
+
+ dprintf(("","DOSFS_add_defect: \"%s\" &%08X\n",fname,offset));
+
+ /* It is an error for the specified filename to not be a ROOT object
+  * an error should be returned if the defect cannot be mapped out.
+  *
+  * if the CLUSTER is part of a file chain then we cannot map it out
+  * if it is CLUSTER_bad then it is already mapped out
+  * if it is >= CLUSTER_resvd then we cannot map it out
+  *
+  * it can only be mapped out if it is CLUSTER_unused
+  *
+  * All we do to map the CLUSTER out is update the FAT. The FAT will then
+  * be un-usable by DOS filing systems.
+  */
+
+ /* Convert byte "offset" to CLUSTER address */
+ CLUSTER = ((offset - ihand->disc_winioffset) / DOSsecsize - ihand->disc_startsec + 1) /
+           secsalloc(ihand) + CLUSTER_first(ihand);
+
+ /* Load the FAT entry at the given CLUSTER */
+ nextCLUSTER = getnextCLUSTER(CLUSTER,ihand) ;
+ if (nextCLUSTER < CLUSTER_first(ihand)) /* JRS 9/3/92 ensure within FAT */
+   return_error0(int,err_clusterchain) ;
+ /* If it is CLUSTER_bad then it is already mapped out */
+ if (nextCLUSTER != CLUSTER_bad(ihand))
+  {
+   /* Otherwise check if the CLUSTER is being used */
+   if (nextCLUSTER == CLUSTER_unused(ihand))
+    {
+     writenextCLUSTER(CLUSTER,CLUSTER_bad(ihand),ihand) ;
+     if (ensure_FATs(ihand) < 0)
+      return((int)-1) ; /* error already defined */
+     (ihand->disc_freeclusters)--;
+    }
+   else
+    return_error0(int,err_clusterinuse) ;
+  }
+
+ return(0) ;
+ UNUSED(fname);
+}
+
+/*-------------------------------------------------------------------------*/
+
+word DOSFS_read_boot_option(char *fname,DOSdisc *ihand)
+{
+ dprintf(("","DOSFS_read_boot_option: \"%s\" always returning 0\n",fname));
+ return(0) ;
+ UNUSED(fname) ;
+ UNUSED(ihand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_write_boot_option(char *fname,word newoption,DOSdisc *ihand)
+{
+ dprintf(("","DOSFS_write_boot_option: \"%s\" &%02X\n",fname,newoption));
+ return_error0(int,err_nobootoption) ;
+ UNUSED(fname) ;
+ UNUSED(newoption) ;
+ UNUSED(ihand) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_used_space_map(char *buffer,word blen,DOSdisc *ihand)
+{
+ int          loop;
+ fFAT_sector *dFAT = &(ihand->disc_FAT);
+ word         dval;
+ word         mask;
+ int         *bufp = (int *)((int)buffer & 0xFFFFFFFC);    /* Points to aligned buffer word. */
+ int          offset = ((int)buffer & 0x3) << 3;           /* Initial offset into aligned buffer word. */
+ int          secalloc = secsalloc(ihand);
+
+ dprintf(("","DOSFS_used_space_map: buffer &%08X (blen &%08X) ihand &%08X\n",(word)buffer,blen,(word)ihand));
+
+ /* Set all bits and the zero those which correspond to unused sectors.
+  * This ensures that things like the FATs and the root directory are copied.
+  */
+ for (loop = 0; (loop < blen); loop++)
+  *buffer++ = 0xFF;
+ /* buffer now points to the first byte past the end. */
+
+ /* Create a mask with as many bits set as there are sectors in a cluster. */
+ mask = (1 << secalloc) - 1;
+
+ /* Point to the word which contains the 1st bit corresponding to the 1st cluster. */
+ offset += ihand->disc_startsec - 1; /* JRS 22/4/92 added -1 since startsec is 1-based, though 0-based is expected for buffer */
+ bufp += offset >> 5;
+ offset &= 0x1F;
+
+ /* Set bits word by word. */
+ dval = *bufp;
+ for (loop = CLUSTER_first(ihand); loop < ihand->disc_FATentries; loop++) {
+  word bitaddress = (ihand->disc_FATentry * loop) ;
+  word byteaddress = ((bitaddress >> 3) + (word)dFAT) ;
+  word shift = (bitaddress & 0x00000007) ;
+  word datavalue = loadWORD((char *)byteaddress) ;
+  int  cluster = (int)((datavalue >> shift) & FAT_entry_mask(ihand)) ;
+
+  if (cluster == CLUSTER_unused(ihand))
+   dval &= ~(mask << offset);
+
+  offset += secalloc;
+  if (offset >= 32) {
+   *bufp++ = dval;
+   dval = *bufp;
+   offset &= 0x1F;
+   if (cluster == CLUSTER_unused(ihand))
+    dval &= ~(mask >> (secalloc - offset));
+  }
+
+  /* Make sure we don't write past the end of the buffer. */
+  if (((int)bufp + (offset >> 3)) >= (int)buffer)
+   break;
+ }
+ *bufp = dval;
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+FS_free_space *DOSFS_read_free_space(DOSdisc *ihand)
+{
+ word            unitsize ;                      /* CLUSTER size */
+ DOS_bootsector *DOSboot = &(ihand->disc_boot) ; /* short-hand */
+
+ dprintf(("","DOSFS_read_free_space: ihand = &%08X\n",(word)ihand));
+
+ /* Return the free space information for the given image. */
+ unitsize = cluster_size(DOSboot) ;
+
+ fspace.freespace = ihand->disc_freeclusters;
+ fspace.freespace *= unitsize ;
+ fspace.largestobject = fspace.freespace ;
+ fspace.discsize = DOSFS_max_sect(DOSboot) * DOSsecsize ;
+
+ dprintf(("","DOSFS_read_free_space: returning %d\n", fspace.freespace));
+ return(&fspace) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_namedisc(char *newname,DOSdisc *ihand)
+{
+ int           numFATs = ihand->disc_boot.BOOT_num_fats ;
+ int           FATsize = ihand->disc_FATsize ;
+ int           ROOTsize = (ihand->disc_ROOTsize * DOSsecsize) ;
+ DOS_direntry *rootdir = NULL ;
+ DIR_info *dirstruct;
+
+ dprintf(("","DOSFS_namedisc: \"%s\" (ihand = &%08X)\n",((newname == NULL)?"<NULL>":newname),(int)ihand));
+
+ /* Name the referenced image "newname". Under MS-DOS this involves updating
+  * the volume entry in the ROOT directory (or creating a new one).
+  */
+
+  {
+   int           index ;
+   DOS_direntry *dentry ;
+   char         *namebuff = NULL ;
+   time5byte     nameTIME ;
+   int           rootsec = ((((numFATs * FATsize) + DOSsecsize) / DOSsecsize) + 1) ;
+
+   /* Load the ROOT directory */
+   if ((int)(dirstruct = loadDIR("", ihand)) < 0)
+    return -1;
+   rootdir = dirstruct->dir_entries;
+
+   /* Search for a volume entry */
+   index = 0 ;
+   if ((dentry = findDIRtype((byte)FILE_win95,(byte)FILE_volume,rootdir,ROOTsize,&index)) == NULL)
+    dentry = findemptyDIRentry(rootdir,ROOTsize) ;
+
+   if (dentry == NULL)
+    {
+     /* There are no free slots in the ROOT directory */
+     return_error0(int,err_discfull) ;
+    }
+
+   /* zero the directory entry before placing our information */
+   for (index = 0; (index < sizeof(DOS_direntry)); index++)
+    ((char *)dentry)[index] = '\0' ;
+
+   /* write the given discname into the "dentry" */
+   namebuff = (char *)&(dentry->FILE_status) ;
+   /* copy upto the first space or NULL character */
+   for (index = 0; (index < (namsize + extsize)); index++)
+    if (*newname && (*newname != ' '))
+     *namebuff++ = *newname++ ;
+    else
+     break ; /* the for loop */
+
+   /* pad upto the limit with spaces */
+   for (; (index < (namsize + extsize)); index++)
+    *namebuff++ = ' ' ;
+
+   /* mark the directory entry as a "volume" */
+   dentry->FILE_attribute = (FILE_volume | FILE_archive) ;
+   localTIME(&nameTIME) ;
+   put_FILE_time(dentry->FILE_time,dentry->FILE_timeHI,RISCOStoTIME(&nameTIME)) ;
+   put_FILE_date(dentry->FILE_date,dentry->FILE_dateHI,RISCOStoDATE(&nameTIME)) ;
+   put_FILE_cluster(dentry,0x00000000,ihand) ;
+   dentry->FILE_size = 0x00000000 ; /* labels have no size */
+
+   /* Save the (modified) ROOT directory */
+   if (DOS_image_RW(Wdata,rootsec,0,(byte *)rootdir,ROOTsize,ihand) < 0)
+    {
+     free_dir_cache("", ihand);
+     return((int)-1) ; /* error already defined */
+    }
+  }
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_stampimage(int type,DOSdisc *ihand)
+{
+ dprintf(("","DOSFS_stampimage: type %d (ihand = &%08X)\n",type,(int)ihand));
+
+ /* type = 0    stamp image on next update
+  * type = 1    stamp image now
+  *
+  * This call should either update the images unique identification number
+  * (ie. the value returned in the DiscID field of the disc record on an
+  * IdentifyDisc call) immediately or as part of the next image update.
+  * This is then used by FileCore to keep track of discs when it performs
+  * IdentifyDisc calls. When the identity has been updated we should perform
+  * an "OS_Args 8" (OSArgs_ImageStampIs) to inform FileCore of the new ID.
+  *     OS_Args
+  *             r0 = 8
+  *             r1 = image file handle
+  *             r2 = new image identity
+  */
+ if (type == 0) /* stamp image on next update */
+  ihand->disc_flags = disc_UPDATEID | disc_CHANGED ;
+ else
+  return(update_imageID(ihand)) ; /* update image ID immediately */
+
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/* Read (and scan) directories recursively until we find an object with
+ * offCLUSTER contained within it.  namebuff should contain the pathname
+ * to start searching from (usually the null string "");
+ */
+static int findCLUSTER(int offCLUSTER,char *namebuff,int blen,DOSdisc *ihand)
+{
+ char          *DOSname = NULL ; /* current path position */
+ DIR_info      *cdir = NULL ;    /* pointer to the loaded directory */
+ int            loop ;           /* general index counter */
+ DOS_direntry  *dentry ;         /* directory entry structure pointer */
+ char          *nbuff = (char *)malloc(DOSnamesize) ;
+ int           leafind;
+
+ dprintf(("","findCLUSTER: offCLUSTER &%03X, namebuff \"%s\", blen &%08X\n",offCLUSTER,namebuff,blen));
+
+ if (nbuff == NULL) /* failed to allocation name buffer */
+  return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ leafind = strlen(namebuff);
+
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  {
+   free(nbuff) ;
+   return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+
+ if ((int)convertRISCOStoLFN(namebuff,DOSname) < 0)
+  {
+   free(DOSname) ;
+   free(nbuff) ;
+   return(-1) ; /* error already defined */
+  }
+
+ /* load the desired directory */
+ cdir = loadDIR(DOSname, ihand) ;
+ if ((int)cdir == -1)
+  {
+   dprintf(("","findCLUSTER: no directory loaded\n"));
+   free(DOSname) ;
+   free(nbuff) ;
+   return(-1) ; /* error message already defined */
+  }
+
+ /* scan entries from the beginning of this directory */
+ loop = 0 ;
+ do
+  {
+   if ((dentry = getnextDIRentry((DOS_direntry *)DI_Base(cdir),cdir->dir_size,&loop)) != NULL)
+    {
+     /* "getnextDIRentry" returns all FILE types: This includes volume labels
+      * and hidden and system files. We must scan the allocated CLUSTER chain
+      * of every object, recursing into directory objects.
+      */
+     if ((dentry->FILE_attribute & FILE_volume) == 0)
+      {
+       /* we have a useable directory entry */
+       char *cfile ;
+       if ((cfile = buildFILEname(dentry,nbuff)) != NULL)
+        {
+         int startCLUSTER ;
+         if ((int)convertDOStoRISCOS(cfile,DOSname) < 0)
+          {
+           free(DOSname) ; /* release converted pathname buffer */
+           free(nbuff) ;   /* release single level name buffer */
+           return(-1) ;    /* error already defined */
+          }
+         cfile = DOSname ; /* RISC OS name for this object */
+         if ((leafind + strlen(cfile) + 1) > blen) {
+           /* pathname too long for buffer */
+           free(DOSname) ; /* release name buffer */
+           free(nbuff) ;   /* release single level name buffer */
+           return_errorT(int,err_buftoosmall,tok_buftoosmall,0,0) ;
+         }
+         sprintf(namebuff + leafind,".%s",cfile) ;
+         if ((startCLUSTER = get_FILE_cluster(dentry,ihand)) != 0x000)
+          {
+           if (clusterinchain(startCLUSTER, offCLUSTER, ihand))
+            {
+             free(DOSname) ; /* release name buffer */
+             free(nbuff) ;   /* release single level name buffer */
+             return(1) ;     /* CLUSTER has been found */
+            }
+          }
+         if ((dentry->FILE_attribute & FILE_subdir) != 0)
+          {
+           int state ;
+           if (((state = findCLUSTER(offCLUSTER,namebuff,blen,ihand)) == 1) || (state < 0))
+            {
+             free(DOSname) ; /* release name buffer */
+             free(nbuff) ;   /* release single level name buffer */
+             if (state < 0)
+              return(-1) ;   /* error already defined */
+             return(1) ;     /* CLUSTER has been found */
+            }
+          }
+        }
+       else
+        {
+         free(DOSname) ; /* release converted pathname buffer */
+         free(nbuff) ;   /* release single level name buffer */
+         return_error0(int,err_namereadfailed) ;
+        }
+      }
+      *(namebuff + leafind) = '\0';
+    }
+  } while ((dentry != NULL) && (loop >= 0)) ;
+
+ free(DOSname) ; /* release converted pathname buffer */
+ free(nbuff) ;   /* release single level name buffer */
+ return(0) ; /* CLUSTER not found */
+}
+
+/*-------------------------------------------------------------------------*/
+
+int DOSFS_objectatoffset(int offset,char *buffer,int blen,DOSdisc *ihand)
+{
+ int allocsize = (secsalloc(ihand) * DOSsecsize) ; /* size of a CLUSTER */
+ int offCLUSTER ;  /* CLUSTER in which the given offset lies */
+ int nextCLUSTER ; /* CLUSTER referenced by offset CLUSTER (offCLUSTER) */
+ int state ;
+
+ dprintf(("","DOSFS_objectatoffset: offset &%08X, buffer &%08X (len &%08X) (ihand = &%08X)\n",offset,(int)buffer,blen,(int)ihand));
+
+ /* Return the type of the object found at the given image offset. If the
+  * object has a suitable path, then it should be returned in passed
+  * buffer (with a leading directory seperator "." character).
+  *
+  * type 0 - offset is free, defect or beyond the end of the image
+  *      1 - offset is allocated but not a file/directory (eg. FAT)
+  *      2 - offset is in single object
+  *      3 - offset is in multiple objects
+  *
+  * Return codes 2 and 3 should place the object name into the buffer.
+  */
+
+ /* For DOS discs we can easily spot the system areas of the image, and
+  * areas that have NOT yet been allocated. However, to find the name of
+  * an object we will have to scan every directory until we find an
+  * object whose chain contains the CLUSTER at the given offset.
+  */
+
+ /* CLUSTER align (downwards) the passed offset */
+ offCLUSTER = (offset / allocsize) ;
+ dprintf(("","DOSFS_objectatoffset: offCLUSTER = &%03X\n",offCLUSTER));
+
+ if (CLUSTERtoSECTOR(offCLUSTER,ihand) < ihand->disc_startsec)
+  {
+   dprintf(("","DOSFS_objectatoffset: CLUSTER in system area (returning 1)\n"));
+   return(1) ; /* CLUSTER is in the system area */
+  }
+
+ nextCLUSTER = getnextCLUSTER(offCLUSTER,ihand) ;
+ if (nextCLUSTER < CLUSTER_first(ihand))  /* JRS 9/3/92 ensure within FAT */
+   return_error0(int,err_clusterchain) ;
+
+ if ((nextCLUSTER == CLUSTER_unused(ihand)) || (nextCLUSTER == CLUSTER_bad(ihand)))
+  {
+   dprintf(("","DOSFS_objectatoffset: CLUSTER in free or bad (returning 0)\n"));
+   return(0) ; /* CLUSTER is free or bad */
+  }
+
+ /* Under DOSFS a CLUSTER can only be used by one object. Therefore we never
+  * return reason code 3 (offset used by multiple objects). If we reach here
+  * we must place the object name into the passed buffer and return reason
+  * code 2.
+  */
+ /* We need to scan from the root directory all file (and directory) chains,
+  * until we find a file which contains a reference to "offCLUSTER".
+  */
+ *buffer = '\0';    /* Start from root directory. */
+ if ((state = findCLUSTER(offCLUSTER,buffer,blen,ihand)) == 0)
+  {
+   dprintf(("","DOSFS_objectatoffset: CLUSTER could not be found in a chain\n"));
+   return(0) ; /* We could NOT find the CLUSTER in any chain */
+  }
+ if (state < 0)
+  return(-1) ; /* error already defined */
+
+ /* The above "findCLUSTER" call will have filled the buffer suitably */
+ return(2) ; /* CLUSTER is in use */
+}
+
+/*-------------------------------------------------------------------------*/
+/* Return the maximum number of sectors given a disc's boot block.
+ */
+word DOSFS_max_sect(DOS_bootsector *bb)
+{
+        word max_sect = (bb->BOOT_max_sectHI << 8) | (bb->BOOT_max_sect);
+
+        dprintf(("","DOSFS_max_sect: boot block at &%08X, max_sect = %d\n",(int)bb,max_sect));
+
+        if (max_sect != 0) return max_sect;
+
+        return (bb->big_sect3 << 24) | (bb->big_sect2 << 16)
+                | (bb->big_sect1 << 8) | bb->big_sect;
+}
+
+/*-------------------------------------------------------------------------*/
+/*> EOF c.DOSFSops <*/

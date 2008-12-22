@@ -1,0 +1,554 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > $.Source.VduPointer
+
+; mjs Sep 2000
+;
+; kernel/HAL split
+; display pointer updating is no longer VIDC/IOMD specific
+;
+
+; *****************************************************************************
+;
+;       DoPointerStuff - Entry point for OSWORD nn
+;
+; in:   R1 -> control block
+;       [R1, #0] : Reason code
+;
+;       Reason code 0 - Define pointer size, shape and active point
+;
+;       [R1, #1] : Shape number (1..4)
+;       [R1, #2] : Width (w) in bytes (0..8)
+;       [R1, #3] : Height (h) in pixels (0..32)
+;       [R1, #4] : ActiveX in pixels from left (0..w*4-1)
+;       [R1, #5] : ActiveY in pixels from top (0..h-1)
+;       [R1, #6..9] : Pointer (P) to data
+;       [P, #0..w*h-1] : Data bytes in rows from top to bottom,
+;       left to right in each row.
+;
+;       Reason code 1 - Define mouse coordinate bounding box
+;
+;       [R1, #1..2] : left      ; all treated as
+;       [R1, #3..4] : bottom    ; signed 16-bit values,
+;       [R1, #5..6] : right     ; relative to screen origin at the time
+;       [R1, #7..8] : top       ; the command is issued
+;
+;       If (left > right) or (bottom > top) then the command is ignored
+;       An infinite box can be obtained by setting
+;       left=&8000, right=&7FFF, bottom=&8000, top=&7FFF
+;
+;       If the current mouse position is outside the box, it is moved to
+;       the nearest point inside the box
+;
+;       The mouse buffer is NOT flushed - any buffered coords will be moved
+;       inside the bounding box when they are read.
+;
+;       Reason code 2 - Define mouse multipliers
+;
+;       [R1, #1] : X multiplier         ; both treated as
+;       [R1, #2] : Y multiplier         ; signed 8-bit values
+;
+;       Reason code 3 - Set mouse position
+;
+;       [R1, #1..2] : X position        ; both treated as
+;       [R1, #3..4] : Y position        ; signed 16-bit values
+;       The mouse buffer is flushed
+;
+;       Reason code 4 - Read mouse position (not buffered)
+;
+;       out: [R1, #1..2] : X position   ; both treated as
+;            [R1, #3..4] : Y position   ; signed 16-bit values
+;
+;       Reason code 5 - Set pointer position
+;
+;       [R1, #1..2] : X position        ; both treated as
+;       [R1, #3..4] : Y position        ; signed 16-bit values
+;
+;       Reason code 6 - Read pointer position
+;
+;       out: [R1, #1..2] : X position   ; both treated as
+;            [R1, #3..4] : Y position   ; signed 16-bit values
+;
+
+DoPointerStuff ROUT
+        LDRB    R0, [R1, #0]
+
+        CMP     R0, #7
+
+        LDRCC   PC, [PC, R0, LSL #2]
+        MOV     PC, R14                 ; ***** WHY NO ERROR????????
+        DCD     DoDefinePointer
+        DCD     DoMouseBox
+        DCD     SetMouseMult
+        DCD     SetMousePosn
+        DCD     ReadMousePosn
+        DCD     SetPointerPosn
+        DCD     ReadPointerPosn
+
+; *****************************************************************************
+
+DoDefinePointer
+
+        ; We allow interrupts during time we copy shape, but we copy into a
+        ; holding descriptor, so shape will never be displayed (whether its the
+        ; current one, or becomes the current one with an OSByte 6A) until the
+        ; vsync after we have a complete definition.
+        ;
+        ; We have two holding buffers, so that we can always choose a holding
+        ; buffer that is not currently being used for display by the HAL,
+        ; despite multiple definitions between vsyncs. This all assumes we
+        ; are never re-entered, but the documentation for OS_Word 21,0 says
+        ; re-entrancy undefined anyway - should really say not re-entrant.
+
+        Push    "R1-R7, R14"
+
+        ; interrupts still off for critical choosing of buffer
+        ;
+        ADD     R6, WsPtr, #PointerShapesH
+        MOV     R7, #0                          ; try holding shape 1
+        LDR     R14, [R6, R7, LSL #2]           ; R14 -> shape
+        LDR     R2, [R14, #PointerBuffLA]       ; shape buffer we propose to use
+        LDR     R0, [WsPtr, #PointerShapeLA]    ; shape buffer owned by HAL
+        TEQ     R0, R2                          ; identical?
+        MOVEQ   R7, #1                          ; alright then, holding shape 2
+        LDREQ   R14, [R6, R7, LSL #2]           ; R14 -> shape
+
+        ; now R7 = holding shape index (0,1), R14 -> shape, not owned by HAL
+
+        CLRPSR  I_bit, R0                       ; re-enable interrupts
+
+        LDRB    R6, [R1, #1]                    ; shape number we're defining
+        SUB     R6, R6, #1
+        CMP     R6, #4                          ; now in range 0..3 ?
+        BCS     %FT90                           ; bad shape number
+
+        LDRB    R0, [R1, #2]                    ; R0 = width (bytes)
+        LDRB    R2, [R1, #3]                    ; R2 = height
+        LDRB    R3, [R1, #4]                    ; R3 = ActiveX
+        LDRB    R4, [R1, #5]                    ; R4 = ActiveY
+
+        CMP     R2, #0                          ; C=1 if EQ
+        STREQB  R2, [R14, #PointerWidth]
+        STREQB  R2, [R14, #PointerHeight]
+        BEQ     %FT80                           ; empty shape (off)
+
+        CMP     R0, #0                          ; C=1 if EQ
+        STREQB  R0, [R14, #PointerWidth]
+        STREQB  R0, [R14, #PointerHeight]
+        CMPNE   R0, #8+1
+        BCS     %FT90                           ; bad width
+
+        CMP     R2, #32+1                       ; C=1 => bad height
+        CMPCC   R3, R0, LSL #2                  ; ActiveX >= (width * 4) ?
+        CMPCC   R4, R2                          ; ActiveY >= height
+
+        BCS     %FT90                           ; bad definition
+
+        STRB    R0, [R14, #PointerWidth ]       ; actual width in bytes, before padding to constant 8
+        STRB    R2, [R14, #PointerHeight]
+        STRB    R3, [R14, #PointerActiveX]
+        STRB    R4, [R14, #PointerActiveY]
+
+        ADD     R4, R1, #6
+        LDW     R1, R4, R3, R5                  ; load word from
+                                                ; unknown alignment
+; Now R1 -> user's data
+
+        LDR     R3, [R14, #PointerBuffLA]       ; R3 -> buffer to receive shape
+20
+        ADD     R4, R3, R0                      ; terminating R3 for this row
+30
+        LDRB    R5, [R1], #1
+40
+        STRB    R5, [R3], #1                    ; store to buffer
+        CMP     R3, R4                          ; still within user data
+        BCC     %BT30                           ; for this row ?
+
+; now fill up rest of row
+
+        MOV     R5, #0
+        TST     R3, #7                          ; are we on a multiple of 8
+        BNE     %BT40                           ; no, then store 0
+
+        SUBS    R2, R2, #1                      ; done all rows ?
+        BNE     %BT20                           ; no, then loop
+
+80
+        ; we now have a completely defined shape in a holding buffer
+        ;
+        PHPSEI  R0                              ; disable interrupts for critical shape logic
+        ADD     R3, WsPtr, #PointerShapes
+        ADD     R4, WsPtr, #PointerShapesH
+        LDR     R1, [R3, R6, LSL #2]            ; swap the holding shape (R7=0,1) into
+        LDR     R2, [R4, R7, LSL #2]            ; the shape we've just defined (R6 = 0..3)
+        STR     R2, [R3, R6, LSL #2]
+        STR     R1, [R4, R7, LSL #2]
+        PLP     R0                              ; restore interrupts
+90
+        Pull    "R1-R7,PC"
+
+
+; *****************************************************************************
+;
+;       SetMouseRectangle - Called on mode change to set appropriate mouse
+;                           rectangle and mouse position
+;
+; in:   WsPtr -> VDWS
+;
+
+SetMouseRectangle ROUT
+        Push    R14
+
+        ASSERT  DisplayYWindLimit = DisplayXWindLimit +4
+        ASSERT  DisplayXEigFactor = DisplayXWindLimit +8
+        ASSERT  DisplayYEigFactor = DisplayXWindLimit +12
+
+        ADD     R2, WsPtr, #DisplayXWindLimit
+        LDMIA   R2, {R2-R5}
+
+        ADD     R2, R2, #1              ; XWindLimit+1
+        MOV     R2, R2, LSL R4          ; (XWindLimit+1) << XEigFactor
+        SUB     R4, R2, #1              ; ((XWindLimit+1) << XEigFactor)-1
+        MOV     R2, R2, LSR #1          ; centre x of window
+
+        ADD     R3, R3, #1              ; YWindLimit+1
+        MOV     R3, R3, LSL R5          ; (YWindLimit+1) << YEigFactor
+        SUB     R5, R3, #1              ; ((YWindLimit+1) << YEigFactor)-1
+        MOV     R3, R3, LSR #1          ; centre y of window
+
+        BL      SetMousePosnRegs
+
+        MOV     R2, #0                  ; left = 0
+        MOV     R3, #0                  ; bottom = 0
+
+        Push    "R1-R6"
+        B       DoMouseBoxRegs
+
+
+DoMouseBox ROUT
+        Push    "R1-R6, R14"
+
+        LDRB    R2, [R1, #1]            ; R2 = left
+        LDRB    R0, [R1, #2]
+        ORR     R2, R2, R0, LSL #8
+
+        LDRB    R3, [R1, #3]            ; R3 = bottom
+        LDRB    R0, [R1, #4]
+        ORR     R3, R3, R0, LSL #8
+
+        LDRB    R4, [R1, #5]            ; R4 = right
+        LDRB    R0, [R1, #6]
+        ORR     R4, R4, R0, LSL #8
+
+        LDRB    R5, [R1, #7]            ; R5 = top
+        LDRB    R0, [R1, #8]
+        ORR     R5, R5, R0, LSL #8
+
+DoMouseBoxRegs
+
+; now add on graphics origin
+
+        LDR     R0, [WsPtr, #OrgX]
+        ADD     R2, R2, R0
+        ADD     R4, R4, R0
+        LDR     R0, [WsPtr, #OrgY]
+        ADD     R3, R3, R0
+        ADD     R5, R5, R0
+
+; now sign extend all coords
+
+        MOV     R2, R2, LSL #16
+        MOV     R2, R2, ASR #16
+        MOV     R3, R3, LSL #16
+        MOV     R3, R3, ASR #16
+        MOV     R4, R4, LSL #16
+        MOV     R4, R4, ASR #16
+        MOV     R5, R5, LSL #16
+        MOV     R5, R5, ASR #16
+
+; now check right >= left and top >= bottom
+
+        CMP     R4, R2
+        CMPGE   R5, R3
+        BLT     %FT10                   ; bad definition
+
+; everything seems OK, so disable IRQs while we update vars
+
+        MRS     R14, CPSR
+        ORR     R0, R14, #I32_bit
+        MSR     CPSR_c, R0
+
+        Push    R11
+        MOV     R11, #KeyWorkSpace
+
+        ADR     R0, MouseBounds
+        STMIA   R0, {R2-R5}
+
+; check mouse position is within box
+
+        LDR     R0, MouseX
+        CMP     R0, R2                  ; if X < left
+        STRLT   R2, MouseX              ; then X := left
+        CMP     R4, R0                  ; if right < X
+        STRLT   R4, MouseX              ; then X := right
+
+        LDR     R0, MouseY
+        CMP     R0, R3                  ; if Y < bottom
+        STRLT   R3, MouseY              ; then Y := bottom
+        CMP     R5, R0                  ; if top < Y
+        STRLT   R5, MouseY              ; then Y := top
+
+        Pull    R11
+
+        MSR     CPSR_c, R14             ; restore old IRQ state
+10
+        Pull    "R1-R6, PC"
+
+; *****************************************************************************
+;
+;       UpdatePointer - Called on vsync to update pointer position
+;
+; in:   WsPtr (R12) -> VduDriverWorkSpace
+;
+UpdatePointer ROUT
+
+        LDRB    R5, [WsPtr, #PointerShapeNumber]
+
+        TST     R5, #&80                   ; pointer unlinked if bit 7 set
+
+        LDREQ   R6, MouseX
+        STREQ   R6, [WsPtr, #PointerX]
+        LDREQ   R6, MouseY
+        STREQ   R6, [WsPtr, #PointerY]
+
+        ANDS    R5, R5, #&7F                 ; clear bit 7 and set Z if 0 ie off
+        BNE     %FT20
+
+10
+        MOV     R0, #0                       ; flags = 0 (pointer off)
+        MOV     R1, #0                       ; x = 0
+        MOV     R2, #0                       ; y = 0
+        MOV     R3, #0                       ; shape descriptor = NULL
+        STR     R3, [WsPtr, #PointerShapeLA] ; NULL passed as last buffer address
+        B       %FT40
+
+20
+        ADD     R3, WsPtr, #PointerShapes-4
+        LDR     R3, [R3, R5, LSL #2]         ; R3 -> current shape block (R5 = shape 1..4)
+
+        LDRB    R0, [R3, #PointerHeight]     ; height of 0 switches pointer off
+        TEQ     R0, #0
+        BEQ     %BT10
+
+        MOV     R0, #1                       ; R0 = flags, set pointer on (bit 0 = 1)
+
+        LDR     R1, [WsPtr, #PointerShapeLA] ; last shape buffer given to HAL
+        LDR     R4, [R3, #PointerBuffLA]     ; shape buffer we're about to give
+        TEQ     R1, R4                       ; same as last time?
+        STRNE   R4, [WsPtr, #PointerShapeLA] ; update
+        ORRNE   R0, R0, #2                   ; flag new shape (bit 1 = 1)
+
+        LDR     R1, [WsPtr, #PointerX]
+        LDR     R4, [WsPtr, #PointerXEigFactor]
+        MOV     R1, R1, ASR R4                     ; R1 = pointer x, pixels
+        LDRB    R4, [R3, #PointerActiveX]
+        SUB     R1, R1, R4                         ; R1 = pointer x, adjusted for active point
+
+        LDR     R2, [WsPtr, #PointerY]
+        LDR     R4, [WsPtr, #DisplayYEigFactor]
+        LDR     R5, [WsPtr, #DisplayYWindLimit]    ; R5 = display height -1
+        SUB     R2, R5, R2, ASR R4                 ; R2 = pointer y, pixels, inverted
+        LDRB    R4, [R3, #PointerActiveY]
+        SUB     R2, R2, R4                         ; R2 = pointer y, adjusted for active point
+
+        ; and its up to the HAL to handle clipping according to h/w capabilities
+40
+ [ UseGraphicsV
+        Push    "LR"
+        MOV     R4, #GraphicsV_UpdatePointer
+        BL      CallGraphicsV
+        Pull    "PC"
+ |
+        Push    "R9, R12, LR"
+        mjsAddressHAL
+        mjsCallHAL     HAL_Video_UpdatePointer
+        Pull    "R9, R12, PC"
+ ]
+
+
+        LTORG
+
+; *****************************************************************************
+
+SetMouseMult ROUT
+        Push    "R11,R14"
+        MOV     R11, #KeyWorkSpace
+
+        LDRB    R0, [R1, #1]
+        MOV     R0, R0, ASL #24         ; sign extend to 32 bits
+        MOV     R0, R0, ASR #24
+        STR     R0, MouseXMult
+
+        LDRB    R0, [R1, #2]
+        MOV     R0, R0, ASL #24         ; sign extend to 32 bits
+        MOV     R0, R0, ASR #24
+        STR     R0, MouseYMult
+
+        Pull    "R11,PC"
+
+; *****************************************************************************
+;
+;       GetCoordPair - get pair of 2-byte coords from R1+1..R1+4
+;       adds on graphics origin and sign extends to 32 bits
+;       and puts X into R2, Y into R3
+;
+
+GetCoordPair ROUT
+        LDRB    R0, [R1, #1]            ; get X coordinate
+        LDRB    R2, [R1, #2]
+        ORR     R0, R0, R2, LSL #8
+
+        LDR     R2, [WsPtr, #OrgX]      ; add on origin
+        ADD     R0, R0, R2
+
+        MOV     R0, R0, ASL #16         ; sign extend 16 to 32
+        MOV     R2, R0, ASR #16
+
+        LDRB    R0, [R1, #3]            ; get Y coordinate
+        LDRB    R3, [R1, #4]
+        ORR     R0, R0, R3, LSL #8
+
+        LDR     R3, [WsPtr, #OrgY]      ; add on origin
+        ADD     R0, R0, R3
+
+        MOV     R0, R0, ASL #16         ; sign extend 16 to 32
+        MOV     R3, R0, ASR #16
+
+        MOV     PC, R14
+
+; *****************************************************************************
+
+SetMousePosn ROUT
+        Push    "R2, R3, R11, R14"
+        MOV     R11, #KeyWorkSpace
+
+        BL      GetCoordPair
+
+; now check point is within bounding box
+
+        LDR     R0, MouseBoundLCol
+        CMP     R2, R0
+        LDRGE   R0, MouseBoundRCol
+        CMPGE   R0, R2
+        LDRGE   R0, MouseBoundBRow
+        CMPGE   R3, R0
+        LDRGE   R0, MouseBoundTRow
+        CMPGE   R0, R3
+
+        BLGE    SetMousePosnRegs
+
+        Pull    "R2, R3, R11, PC"
+
+SetMousePosnRegs
+        MOV     R11, #KeyWorkSpace
+        STR     R2, MouseX
+        STR     R3, MouseY
+        B       FlushMouse
+
+; *****************************************************************************
+;
+;       StoreCoordPair - Stores X,Y coords in R2,R3 in R1+1..R1+4
+;       subtracts graphics origin
+
+StoreCoordPair ROUT
+
+        LDR     R0, [WsPtr, #OrgX]      ; subtract off origin
+        SUB     R2, R2, R0
+
+        STRB    R2, [R1, #1]            ; store lo-byte of X
+        MOV     R2, R2, LSR #8
+        STRB    R2, [R1, #2]            ; store hi-byte of X
+
+        LDR     R0, [WsPtr, #OrgY]      ; subtract off origin
+        SUB     R3, R3, R0
+
+        STRB    R3, [R1, #3]            ; store lo-byte of Y
+        MOV     R3, R3, LSR #8
+        STRB    R3, [R1, #4]            ; store hi-byte of Y
+
+        MOV     PC, R14
+
+; *****************************************************************************
+
+ReadMousePosn ROUT
+ [ AssemblePointerV :LAND: {TRUE}
+        Push    "r0-r3, r9-r11, lr"
+        BL      PollPointer             ; update mouse position on a read
+        LDR     r1, [sp, #1*4]          ; reload pointer to buffer
+        MOV     R11, #KeyWorkSpace
+
+        LDR     R2, MouseX              ; get mouse X
+        LDR     R3, MouseY              ; get mouse Y
+        BL      StoreCoordPair
+        Pull    "r0-r3, r9-r11, pc"
+
+ |
+        Push    "R2, R3, R11, R14"
+        MOV     R11, #KeyWorkSpace
+
+        LDR     R2, MouseX              ; get mouse X
+        LDR     R3, MouseY              ; get mouse Y
+        BL      StoreCoordPair
+
+        Pull    "R2, R3, R11, PC"
+ ]
+
+; *****************************************************************************
+
+SetPointerPosn ROUT
+        Push    "R2, R3, R14"
+
+        BL      GetCoordPair
+
+        STR     R2, [WsPtr, #PointerX]
+        STR     R3, [WsPtr, #PointerY]
+
+        Pull    "R2, R3, PC"
+
+; *****************************************************************************
+
+ReadPointerPosn ROUT
+        Push    "R2, R3, R14"
+
+        LDR     R2, [WsPtr, #PointerX]
+        LDR     R3, [WsPtr, #PointerY]
+        BL      StoreCoordPair
+
+        Pull    "R2, R3, PC"
+
+; *****************************************************************************
+;
+;       FlushMouse - Flush mouse buffer
+;
+; out:  All registers preserved
+
+FlushMouse ROUT
+        Push    "R0-R2, R14"
+        MOV     R0, #21
+        MOV     R1, #Buff_Mouse
+        SWI     XOS_Byte
+        Pull    "R0-R2, PC"
+
+        END

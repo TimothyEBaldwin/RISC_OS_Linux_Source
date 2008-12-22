@@ -1,0 +1,440 @@
+/* Copyright 1999 Element 14 Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ *  DHCP (module.c)
+ *
+ * Copyright (C) Element 14 Ltd. 1999
+ *
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/Services.h"
+#include "Global/RISCOS.h"
+
+#include "VersionNum"
+#include "DHCPhdr.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/dcistructs.h"
+#include "net/if.h"
+#include "protocols/dhcp.h"
+#include "netinet/in.h"
+
+#include "dhcp.h"
+#include "interfaces.h"
+#include "sockets.h"
+#include "module.h"
+#include "packets.h"
+#include "dhcperrors.h"
+#include "dhcpinform.h"
+
+extern void usermode_donothing(void);
+
+/* ========== Callback code ========== */
+
+/* Callback management.  We need to arrange to be called back in the foreground when
+ * our timer fires.
+ */
+static volatile int callbackflag = 0;
+static volatile int callafterflag = 0;
+
+_kernel_oserror *callback_handler(_kernel_swi_regs *r, void *private_word)
+{
+	(void) r;
+
+	if (callbackflag != 0) {
+		callbackflag = 0;
+		interfaces_timer_fired(private_word);
+	}
+	return 0;
+}
+
+static void setcallback(void *private_word)
+{
+	if (callbackflag == 0) {
+		if (_swix(OS_AddCallBack, _INR(0,1), callback, private_word) == NULL) {
+			callbackflag = 1;
+		}
+	}
+}
+
+_kernel_oserror *callafter_handler(_kernel_swi_regs *r, void *private_word)
+{
+	(void) r;
+	setcallback(private_word);
+	callafterflag = 0;
+	return NULL;
+}
+
+void module_reschedule(int delay, void *private_word)
+{
+	if (callafterflag != 0) {
+		/* Delete existing timeout in favour of a new one */
+		_swix(OS_RemoveTickerEvent, _INR(0,1), callafter, private_word);
+	}
+	callafterflag = 1;
+	if (_swix(OS_CallAfter, _INR(0,2), delay, callafter, private_word)) {
+		callafterflag = 0;
+	}
+}
+
+#define SOCKET_ASYNC_EVENT  1
+int dhcp_event_handler(_kernel_swi_regs *r, void *private_word)
+{
+	if (r->r[1] == SOCKET_ASYNC_EVENT) {
+		/* sockets module will decide whether to swallow the event or not */
+		return sockets_data_arrived(r->r[2], private_word);
+	}
+	return 1; /* Pass event on */
+}
+
+static void module_disable_internet_event(void)
+{
+	(void) _swix(OS_Byte, _INR(0,1), 13, Event_Internet); /* disable event */
+}
+
+static void module_enable_internet_event(void)
+{
+	(void) _swix(OS_Byte, _INR(0,1), 14, Event_Internet); /* enable event */
+}
+
+static void module_clearsystemhooks(void *private_word)
+{
+	if (callafterflag != 0) {
+		(void) _swix(OS_RemoveTickerEvent, _INR(0,1), callafter, private_word);
+		callafterflag = 0;
+	}
+	if (callbackflag != 0) {
+		(void) _swix(OS_RemoveCallBack, _INR(0,1), callback, private_word);
+		callbackflag = 0;
+	}
+
+	module_disable_internet_event();
+	(void) _swix(OS_Release, _INR(0,2), EventV, dhcp_event, private_word);
+}
+
+static _kernel_oserror *module_initsystemhooks(void *private_word)
+{
+	_kernel_oserror *e;
+
+	callafterflag = 0;
+	callbackflag = 0;
+
+	e = _swix(OS_Claim, _INR(0,2), EventV, dhcp_event, private_word);
+	if (e == NULL) {
+		module_enable_internet_event();
+	}
+
+	/* CallAfter and CallBack will be set as and when required, no need to set anything
+	 * up right here right now.
+	 */
+
+	return e;
+}
+
+/* End callafter/callback management */
+
+_kernel_oserror *dhcp_swi(int swi_number, _kernel_swi_regs *r, void *private_word)
+{
+	_kernel_oserror *e = NULL;
+
+	sockets_ensure_init();
+
+	switch (swi_number) {
+		case DHCP_Version - DHCP_00:
+			r->r[0] = Module_VersionNumber;
+			break;
+		case DHCP_GetState - DHCP_00:
+			e = dhcp_swi_getstate(r);
+			break;
+		case DHCP_GetOption - DHCP_00:
+			e = dhcp_swi_getoption(r);
+			break;
+		case DHCP_Execute - DHCP_00:
+			e = dhcp_swi_execute(r, private_word);
+			break;
+		case DHCP_SetOption - DHCP_00:
+			e = dhcp_swi_setoption(r);
+			break;
+		case DHCP_Inform - DHCP_00:
+			e = dhcp_swi_inform(r);
+			break;
+		default:
+			return error_BAD_SWI;
+	}
+
+	return e;
+}
+
+_kernel_oserror *dhcp_finalise(int fatal, int podule, void *private_word)
+{
+	(void) fatal;
+	(void) podule;
+
+	dhcpinform_discard();
+	interfaces_discard();
+	sockets_discard();
+	module_clearsystemhooks(private_word);
+
+	return NULL;
+}
+
+_kernel_oserror *dhcp_initialise(const char *cmd_tail, int podule_base, void *private_word)
+{
+	_kernel_oserror *e;
+
+	(void) cmd_tail;
+	(void) podule_base;
+
+	srand(interfaces_current_time());
+
+	e = module_initsystemhooks(private_word);
+	if (e == NULL) {
+		interfaces_init();
+		sockets_init();
+		dhcpinform_init();
+	}
+
+	return e;
+}
+
+void dhcp_service(int service_number, _kernel_swi_regs *r, void *private_word)
+{
+        if (service_number == Service_DCIProtocolStatus) {
+                const char *protocol_module = (char *) r->r[4];
+                if (strcmp("Internet", protocol_module) != 0) return;
+                if (r->r[2] == 1) {
+                        dhcp_finalise(0, 0, private_word);
+                }
+                else if (r->r[2] == 0) {
+                        if (sockets_init_ok()) {
+                                dhcp_finalise(0, 0, private_word);
+                        }
+                        dhcp_initialise(0, 0, private_word);
+                }
+
+                return;
+        }
+        if (service_number == Service_DCIDriverStatus) {
+                if (r->r[2] == 0) { /* Driver starting */
+                        Dib *dib = (Dib *) r->r[0];
+                        dhcp_interface *di;
+                        char name[100];
+                        sprintf(name, "%s%u", dib->dib_name, dib->dib_unit);
+                        trace(("Interface %s starting (dib=%p)\n", name, (void *) dib));
+                        di = interfaces_find(name);
+                        if (di) di->dib = dib;
+                }
+                return;
+        }
+	/* Only Service_InternetStatus will arrive here */
+	switch (r->r[0]) {
+		case InternetStatus_DynamicBootStart:
+			sockets_ensure_init();
+			if (dhcp_prepare_request((dhcp_start_params *) r, private_word)) {
+				r->r[1] = Service_Serviced;
+			}
+			break;
+
+		case InternetStatus_AddressChanged:
+			interfaces_address_changed();
+			break;
+
+		case InternetStatus_DuplicateIPAddress:
+			if (interfaces_address_clash((Dib *) r->r[3], (u_long) r->r[4])) {
+				r->r[1] = Service_Serviced;
+				interfaces_reschedule(private_word);
+			}
+			break;
+
+		default:
+			break;
+	}
+
+}
+
+static _kernel_oserror *dhcp_command_args_parse(const char *arg_string, char *iname, int *flags)
+{
+	union {
+		const char *args[4];
+		char buffer[36];
+	} ra_buf;
+	const char *const ra_pattern = "e/s,b=block/s,w/s,/a";
+	_kernel_oserror *e;
+
+	e = _swix(OS_ReadArgs, _INR(0,3), ra_pattern, arg_string, &ra_buf, sizeof(ra_buf));
+	if (e == NULL) {
+		if (ra_buf.args[0]) *flags |= decf_SET_ERROR;
+		if (ra_buf.args[1]) *flags |= decf_BLOCK;
+		if (ra_buf.args[2]) *flags |= decf_WAIT;
+		(void) strncpy(iname, ra_buf.args[3], IFNAMSIZ);
+		iname[IFNAMSIZ] = '\0';
+		iname[strcspn(iname, "\r\n\t ")] = '\0';
+	}
+	return e;
+}
+
+static _kernel_oserror *dhcp_check_escape_key(void)
+{
+	int esc_flags;
+	_swix(OS_ReadEscapeState, _OUT(_FLAGS), &esc_flags);
+	if (esc_flags & _C) {
+	        struct {
+	                int code;
+	                char msg[7];
+	        } eblock;
+		_swix(OS_Byte, _IN(0), 126);
+		trace(("DHCP:Escape pressed\n"));
+		eblock.code = 17;
+		strcpy(eblock.msg, "Escape");
+        	return _swix(MessageTrans_ErrorLookup, _INR(0,7), &eblock, 0, 0, 0, 0, 0, 0, 0);
+	}
+	return NULL;
+}
+
+static _kernel_oserror *dhcp_cmd_execute(const char *arg_string, void *private_word)
+{
+	_kernel_oserror *e;
+	char ifname[IFNAMSIZ + 1];
+	int flags = 0;
+	int oldescapestate;
+
+	e = dhcp_command_args_parse(arg_string, ifname, &flags);
+
+        /* Polling escape will only work if escape is enabled */
+        _swix(OS_Byte, _INR(0,2) | _OUT(1), 229, 0, 0, &oldescapestate);
+
+	while (e == NULL) {
+		dhcp_swi_execute_regs exec_args;
+		exec_args.flags = dse_IMMEDIATE_START;
+		exec_args.if_name = ifname;
+		e = dhcp_swi_execute((_kernel_swi_regs *) &exec_args, private_word);
+		if (e == NULL) {
+		        flags &= ~decf_WAIT;
+		}
+		if (e != NULL) {
+		        if ((flags & decf_WAIT) == 0) break;
+		        if (e->errnum != dhcperror_BASE + error_NO_SUCH_INTERFACE) break;
+		        /* The interface wasn't there.  Hmm.  We'll *try* a nasty nasty hack */
+		        usermode_donothing();
+		}
+		else if (exec_args.out_status == dhcpstate_BOUND) {
+			trace(("DHCP: %s is now bound - *DHCPExecute exiting\n", ifname));
+			break;
+		}
+
+		e = dhcp_check_escape_key();
+		if (e == NULL && (flags & (decf_BLOCK|decf_WAIT))) {
+			usermode_donothing();
+			continue;
+		}
+		break;
+	}
+
+        /* Restore escape state */
+        _swix(OS_Byte, _INR(0,2), 229, oldescapestate, 0);
+
+	if (e != NULL) {
+		if (flags & decf_SET_ERROR) {
+			_kernel_setenv(SYSVAR_ERROR, e->errmess);
+			return NULL;
+		}
+	}
+
+	return e;
+}
+
+_kernel_oserror *dhcp_command(const char *arg_string, int argc, int cmd_no, void *private_word)
+{
+        (void) argc;
+
+	switch (cmd_no) {
+		case CMD_DHCPInfo:
+			_swix(OS_Write0, _IN(0),
+				Module_Title " " Module_MajorVersion " "
+				Module_MinorVersion " (" Module_Date ")");
+			_swix(OS_NewLine, 0);
+			interfaces_print_information(NULL);
+			break;
+
+		case CMD_DHCPExecute:
+			return dhcp_cmd_execute(arg_string, private_word);
+
+		default:
+			break;
+	}
+
+	return NULL;
+}
+
+void module_notify_dynamic_boot_start(dhcp_interface *di)
+{
+	(void) _swix(OS_ServiceCall, _INR(0,6), InternetStatus_DynamicBootStart,
+		Service_InternetStatus, di->di_name, di->dib, &di->di_dhcp, sizeof(di->di_dhcp),
+		dhcp_find_option(&di->di_dhcp, OPTION_END) - &di->di_dhcp.op);
+}
+
+/* Send around a service call announcing the arrival of the offer.
+ * Returns zero if the service call was claimed, indicating that something
+ * didn't like the offer and that we should not accept it.
+ */
+int module_notify_dhcp_offer(dhcp_interface *di, DHCP *d)
+{
+	int claimed;
+	(void) _swix(OS_ServiceCall, _INR(0,5)|_OUT(1), InternetStatus_DynamicBootOffer,
+		Service_InternetStatus, di->di_name, di->dib, d, sizeof(*d), &claimed);
+	return claimed;
+}
+
+/* Send around a service call announcing the intention to send a
+ * DHCPREQUEST message.
+ */
+void module_notify_dhcp_request(dhcp_interface *di)
+{
+	(void) _swix(OS_ServiceCall, _INR(0,7), InternetStatus_DynamicBootRequest,
+		Service_InternetStatus, di->di_name, di->dib, &di->di_dhcp, sizeof(di->di_dhcp),
+		&di->offer, sizeof(di->offer));
+}
+
+/* This routine is used to cause the SIOCGWHOIAMB ioctl to idle */
+void module_idle(enum moduleidle_reason mir)
+{
+	/* This is the blocking semaphore */
+	static volatile int semaphore = 0;
+
+	/* This is set if we are currently threaded */
+	static volatile int threaded = 0;
+
+	if (mir == mir_IDLE) {
+		if (!threaded) {
+			semaphore = 1;
+			while (semaphore != 0) usermode_donothing();
+		}
+	}
+	else if (mir == mir_THREAD) {
+		threaded = 1;
+	}
+	else if (mir == mir_UNTHREAD) {
+		threaded = 0;
+	}
+	else if (mir == mir_WAKEUP) {
+		semaphore = 0;
+	}
+}

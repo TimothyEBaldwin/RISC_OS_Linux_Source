@@ -1,0 +1,37 @@
+# Copyright 1996 Acorn Computers Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Makefile for ITable
+#
+# ***********************************
+# ***    C h a n g e   L i s t    ***
+# ***********************************
+# Date         Name         Description
+# ----         ----         -----------
+# 05Dec95      diz          Created
+# [ changes - see source control logs or s.itable ]
+# 14 Aug 2000  jrf          Removed requirement for resources
+#
+
+COMPONENT = ITable
+HEADER1   = ITable
+RESOURCES = no
+
+ROM_LIBS  = ${ASMUTILS}
+
+include StdTools
+include ModuleLibs
+include AAsmModule
+
+# Dynamic dependencies:

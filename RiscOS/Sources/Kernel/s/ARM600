@@ -1,0 +1,3573 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > ARM600
+
+        GBLL    DebugAborts
+DebugAborts SETL {FALSE}
+
+
+; MMU interface file - ARM600 version
+
+; Created by TMD 15-Jul-92
+; Comments updated by TMD 04-Aug-93
+
+;24-01-96 MJS  now effectively codes for ARM 6 onwards (6,7,8,A, where A = StrongARM)
+;              but ARM8 not properly supported (not needed for RO 3.70)
+;07-10-96 MJS  proper support for ARM810 added
+
+
+; Workspace needed for ARM600 work is as follows:
+;
+; * Level 2 page tables for a contiguous logical area starting at zero
+;     This consists of:
+;       a) a fixed size bit covering 0 to 192M (currently)
+;       b) a variable size bit covering the free pool - 192M to 192M + (memsize rounded up to 4M)
+;     Note that the 192M value is sufficient to cover all the fixed size areas at present.
+;     As more areas switch to new world, this limit will come down and down, but free pool must always
+;      start at the end of the fixed areas.
+;     (Level 2 for areas outside this region are allocated dynamically afterwards)
+;
+; * Level 1 page table (16K, stored in the middle of L2PT, where the I/O + ROM would be if it wasn't section mapped)
+;
+; * Undefined32 mode stack (8K)
+;
+; * Abort32 mode stack (8K)
+;
+; * Soft CAM map (variable size = memsize/4K*8, rounded up to 4K)
+;
+; In order to make the memory models for MEMC1 and IOMD harmonious, the MEMC1 system is considered as a section of
+; video RAM starting at &02000000 size 480K, and an area of "non-video RAM" starting at &02078000, size (totalRAM-480K)
+; IOMD has 1 area of video RAM and up to 4 areas of non-video RAM.
+;
+; (Note: when OS is soft-loaded, a 2 Mbyte chunk of DRAM is removed from the RAM map, therefore the model allows for
+;  1 area of video RAM and up to 5 areas of non-video RAM)
+;
+; The fixed system pages (which include those described above) start at the base of the first bank of non-video RAM
+; (on IOMD we allow this to be in any of the 4 RAM sites, ie you don't have to have RAM in any particular SIMM site)
+; Consequently the base of the fixed system pages is not known at assembly time, so has to be passed in a register
+; to the generic code.
+;
+; amg 7/12/96 Renaissance, import changes below from Spinner tree, but this is fundamentally the
+; 3.70 file.
+
+; 17-Jun-96     BAR     Change speed settings for the second bank of ROM space.
+; 09-Jul-96     BAR     Improve IOMD ID vsn code - two places.
+;                       Change ROM Speed settings for 7500FE and non-7500FE parts.
+; 25-Jul-96     BAR     Correct bug in video bandwidth code, wrong label used.
+; 16-Aug-96     JRH     Programming of 2nd ROM bank (IOMD ROMCR1 register):
+;                               reinstated ExtROMSupport code, added CanLiveOnROMCard code
+;                       MemInitTable:
+;                               If ExtROMSupport: added assertion that ImageSize <= 4096
+;                               and maps 4MB of each ROM bank.
+;                               Otherwise: always maps 8MB of ROM space independant of ImageSize
+
+
+
+; Fixed page allocation is as follows
+
+        ^       0
+ [ :LNOT: HAL
+DRAMOffset_CursorChunk  #       32*1024         ; ie on MEMC1 this is the last 32K of DAG-addressable memory
+DRAMOffset_PageZero     #       32*1024         ; 32K at location zero
+DRAMOffset_SystemHeap   #       32*1024         ; system heap/svc stack
+ [ No26bitCode
+DRAMOffset_AbortStack   #        8*1024
+ ]
+        AlignSpace      16*1024                 ; L1PT (and hence L2PT) must be 16K-aligned
+DRAMOffset_L2PT         #       0               ; static L2PT (variable size, with embedded L1PT)
+DRAMOffset_L1PT         *       DRAMOffset_L2PT + 48*1024
+ ]
+
+; Undefined stack memory (size 8K) starts immediately after end of L2PT (which is variable size)
+; Soft CAM map (variable size) starts immediately after end of UndStack
+
+StaticPagesSize         *       @
+
+; Logical addresses are as follows
+
+ [ :LNOT: HAL
+L2PT                    *       &02C00000       ; size 256K
+L1PT                    *       &02C0C000       ; in the middle of L2PT, where the mapping for 03000000 to 03FFFFFF would be
+ ]
+
+FixedAreasL2Size        *       96*1024        ; amount of L2 to cover fixed areas, excluding free pool
+
+UndStackSoftCamChunk    *       &01E00000
+UndStackSize            *       8*1024
+CamEntriesForVicky      *       UndStackSoftCamChunk + UndStackSize
+ [ :LNOT: HAL
+UNDSTK                  *       CamEntriesForVicky ; points to end of stack
+CAMspace                *       &02000000-CamEntriesForVicky
+ [ No26bitCode
+AbtStack                *       &02000000
+AbtStackSize            *       8*1024
+ABTSTK                  *       AbtStack + AbtStackSize
+ ]
+PhysSpace               *       &80000000       ; Map of MEMC/IOMD physical space (64M/512M in size)
+ ]
+
+
+; - address for virtual area for StrongARM data cache cleaning (32k, for two 16k areas)
+; - the two areas are used in strict rotation for each full clean, so that we can do a full
+;   clean (and not flush) with interrupts on
+; - the address must be aligned such that EOR with 16*1024 flipflops between the two addresses
+ARMA_Cleaners_address  * &01F10000
+
+
+ [ :LNOT: HAL
+;note that we use the R bit if supported (not 610), so that we can write protect ROM space
+;fully (user and supervisor)
+;
+  [ :LNOT: CacheOff
+ARM_default_MMU_CR_table
+;
+;ARM 6              SBLDPWCAM
+         DCD  2_0000001111101
+;
+;ARM 7            FRSB1DPWCAM
+         DCD  2_0011001111101
+;
+;ARM 8           Z0RSB111WCAM
+         DCD  2_0101001111101
+;
+;ARM 9 ??
+         DCD  0
+;
+;StrongARM      I00RSB111WCAM
+         DCD  2_1001001111101
+;
+  |
+ARM_default_MMU_CR_table      ; if CacheOff true, same as cacheoff table
+  ]
+;
+ARM_cacheoff_MMU_CR_table
+;
+;ARM 6              SBLDPWCAM
+         DCD  2_0000001110001
+;
+;ARM 7            FRSB1DPWCAM
+         DCD  2_0011001110001
+;
+;ARM 8           Z0RSB111WCAM
+         DCD  2_0001001110001
+;
+;ARM 9 ??
+         DCD  0
+;
+;StrongARM      I00RSB111WCAM
+         DCD  2_0001001110001
+;
+
+ ]  ; HAL
+
+OneMByte                EQU     (1024*1024)
+SixteenMByte            EQU     (1024*1024 * 16)
+
+        KEEP
+
+; *****************************************************************************
+
+; mjs Oct 2000 kernel/HAL split
+; SetDAG stuff is no more, routines like SetVinit now call equivalent HAL
+; routine
+
+; **************** CAM manipulation utility routines ***********************************
+
+; **************************************************************************************
+;
+;       BangCamUpdate - Update CAM, MMU for page move, coping with page currently mapped in
+;
+; mjs Oct 2000
+; reworked to use generic ARM ops (vectored to appropriate routines during boot)
+;
+; First look in the CamEntries table to find the logical address L this physical page is
+; currently allocated to. Then check in the Level 2 page tables to see if page L is currently
+; at page R2. If it is, then map page L to be inaccessible, otherwise leave page L alone.
+; Then map logical page R3 to physical page R2.
+;
+; in:   r2 = physical page number
+;       r3 = logical address (2nd copy if doubly mapped area)
+;       r9 = offset from 1st to 2nd copy of doubly mapped area (either source or dest, but not both)
+;       r11 = PPL + CB bits
+;
+; out:  r0, r1, r4, r6 corrupted
+;       r2, r3, r5, r7-r12 preserved
+;
+; NB Use of stack is allowed in this routine
+
+BangCamUpdate ROUT
+        TST     r11, #DynAreaFlags_DoublyMapped ; if moving page to doubly mapped area
+        SUBNE   r3, r3, r9                      ; then CAM soft copy holds ptr to 1st copy
+
+        MOV     r1, #0
+        LDR     r1, [r1, #CamEntriesPointer]
+        ADD     r1, r1, r2, LSL #3              ; point at cam entry (logaddr, PPL)
+        LDMIA   r1, {r0, r6}                    ; r0 = current logaddress, r6 = current PPL
+        STMIA   r1, {r3, r11}                   ; store new address, PPL
+        Push    "r0, r6"                        ; save old logical address, PPL
+        MOV     r1, #PhysRamTable               ; go through phys RAM table
+        MOV     r6, r2                          ; make copy of r2 (since that must be preserved)
+10
+        LDMIA   r1!, {r0, r4}                   ; load next address, size
+        SUBS    r6, r6, r4, LSR #12             ; subtract off that many pages
+        BCS     %BT10                           ; if more than that, go onto next bank
+
+        ADD     r6, r6, r4, LSR #12             ; put back the ones which were too many
+        ADD     r0, r0, r6, LSL #12             ; move on address by the number of pages left
+        LDMFD   r13, {r6}                       ; reload old logical address
+
+; now we have r6 = old logical address, r2 = physical page number, r0 = physical address
+
+        TEQ     r6, r3                          ; TMD 19-Jan-94: if old logaddr = new logaddr, then
+        BEQ     %FT20                           ; don't remove page from where it is, to avoid window
+                                                ; where page is nowhere.
+        LDR     r1, =L2PT
+        ADD     r6, r1, r6, LSR #10             ; r6 -> L2PT entry for old log.addr
+        MOV     r4, r6, LSR #12                 ; r4 = word offset into L2 for address r6
+        LDR     r4, [r1, r4, LSL #2]            ; r4 = L2PT entry for L2PT entry for old log.addr
+        TST     r4, #3                          ; if page not there
+        BEQ     %FT20                           ; then no point in trying to remove it
+
+        LDR     r4, [r6]                        ; r4 = L2PT entry for old log.addr
+        MOV     r4, r4, LSR #12                 ; r4 = physical address for old log.addr
+        TEQ     r4, r0, LSR #12                 ; if equal to physical address of page being moved
+        BNE     %FT20                           ; if not there, then just put in new page
+
+        Push    "r0, r3, r11, r14"              ; save phys.addr, new log.addr, new PPL, lr
+        ADD     r3, sp, #4*4
+        LDMIA   r3, {r3, r11}                   ; reload old logical address, old PPL
+        MOV     r0, #0                          ; cause translation fault
+        BL      BangL2PT                        ; map page out
+        Pull    "r0, r3, r11, r14"
+20
+        ADD     sp, sp, #8                      ; junk old logical address, PPL
+        B       BangCamAltEntry                 ; and branch into BangCam code
+
+; **************************************************************************************
+;
+;       BangCam - Update CAM, MMU for page move, assuming page currently mapped out
+;
+; This routine maps a physical page to a given logical address
+; It is assumed that the physical page is currently not mapped anywhere else
+;
+; in:   r2 = physical page number
+;       r3 = logical address (2nd copy if doubly mapped)
+;       r9 = offset from 1st to 2nd copy of doubly mapped area (either source or dest, but not both)
+;       r11 = PPL
+;
+; out:  r0, r1, r4, r6 corrupted
+;       r2, r3, r5, r7-r12 preserved
+;
+; NB Can't use stack - there might not be one!
+;
+; NB Also - the physical page number MUST be in range.
+
+; This routine must work in 32-bit mode
+
+BangCam ROUT
+        TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
+        SUBNE   r3, r3, r9              ; then move ptr to 1st copy
+
+        MOV     r1, #PhysRamTable       ; go through phys RAM table
+        MOV     r6, r2                  ; make copy of r2 (since that must be preserved)
+10
+        LDMIA   r1!, {r0, r4}           ; load next address, size
+        SUBS    r6, r6, r4, LSR #12     ; subtract off that many pages
+        BCS     %BT10                   ; if more than that, go onto next bank
+
+        ADD     r6, r6, r4, LSR #12     ; put back the ones which were too many
+        ADD     r0, r0, r6, LSL #12     ; move on address by the number of pages left
+BangCamAltEntry
+        LDR     r4, =DuffEntry          ; check for requests to map a page to nowhere
+        ADR     r1, PPLTrans
+        TEQ     r4, r3                  ; don't actually map anything to nowhere
+        MOVEQ   pc, lr
+        AND     r4, r11, #3             ; first use PPL bits
+        LDR     r1, [r1, r4, LSL #2]    ; get PPL bits and SmallPage indicator
+
+ [ {FALSE}
+        TST     r11, #DynAreaFlags_NotCacheable
+        TSTEQ   r11, #PageFlags_TempUncacheableBits
+        ORREQ   r1, r1, #L2_C           ; if cacheable (area bit CLEAR + temp count zero), then OR in C bit
+        TST     r11, #DynAreaFlags_NotBufferable
+        ORREQ   r1, r1, #L2_B           ; if bufferable (area bit CLEAR), then OR in B bit
+
+        ORR     r0, r0, r1
+ |
+        ASSERT  DynAreaFlags_CPBits = 7 :SHL: 12
+        ASSERT  DynAreaFlags_NotCacheable = 1 :SHL: 5
+        ASSERT  DynAreaFlags_NotBufferable = 1 :SHL: 4
+
+        ORR     r0, r0, r1
+
+        MOV     r6, #ZeroPage
+        LDR     r6, [r6, #MMU_PCBTrans]
+        AND     r4, r11, #DynAreaFlags_CPBits
+        AND     r1, r11, #DynAreaFlags_NotCacheable + DynAreaFlags_NotBufferable
+        TST     r11, #PageFlags_TempUncacheableBits
+        ORRNE   r1, r1, #DynAreaFlags_NotCacheable      ; if temp uncache, set NC bit, ignore P
+        ORREQ   r1, r1, r4, LSR #6                      ; else use NC, NB and P bits
+        LDRB    r1, [r6, r1, LSR #4]                    ; convert to X, C and B bits for this CPU
+        ORR     r0, r0, r1
+ ]
+
+        LDR     r1, =L2PT               ; point to level 2 page tables
+
+        ;fall through to BangL2PT
+
+;internal entry point for updating L2PT entry
+;
+; entry: r0 = new L2PT value, r1 -> L2PT, r3 = logical address (4k aligned), r11 = PPL
+;
+; exit: r0,r1,r4,r6 corrupted
+;
+BangL2PT                                        ; internal entry point used only by BangCamUpdate
+        Push    "lr"
+        MOV     r6, r0
+
+        TST     r11, #DynAreaFlags_DoublyMapped
+        BNE     BangL2PT_sledgehammer           ;if doubly mapped, don't try to be clever
+
+        ;we sort out cache coherency _before_ remapping, because some ARMs might insist on
+        ;that order (write back cache doing write backs to logical addresses)
+        ;we need to worry about cache only if mapping out a cacheable page
+        ;
+        TEQ     r6, #0                          ;EQ if mapping out
+        TSTEQ   r11, #DynAreaFlags_NotCacheable ;EQ if also cacheable (overcautious for temp uncache+illegal PCB combos)
+        MOV     r0, r3                          ;MMU page entry address
+        ADR     lr, %FT20
+        MOV     r4, #0
+        ARMop   MMU_ChangingEntry, EQ, tailcall, r4
+        ARMop   MMU_ChangingUncachedEntry, NE, tailcall, r4
+
+20      STR     r6, [r1, r3, LSR #10]           ;update L2PT entry
+
+        Pull    "pc"
+
+BangL2PT_sledgehammer
+
+        ;sledgehammer is super cautious and does cache/TLB coherency on a global basis
+        ;should only be used for awkward cases
+        ;
+        TEQ     r6, #0                          ;EQ if mapping out
+        TSTEQ   r11, #DynAreaFlags_NotCacheable ;EQ if also cacheable (overcautious for temp uncache+illegal PCB combos)
+        ADR     lr, %FT30
+        MOV     r4, #0
+        ARMop   MMU_Changing, EQ, tailcall, r4
+        ARMop   MMU_ChangingUncached, NE, tailcall, r4
+
+30      STR     r6, [r1, r3, LSR #10]!          ; update level 2 page table (and update pointer so we can use bank-to-bank offset
+        TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
+        STRNE   r6, [r1, r9, LSR #10]           ; then store entry for 2nd copy as well
+        ADDNE   r3, r3, r9                      ; and point logical address back at 2nd copy
+
+        Pull    "pc"
+
+
+PPLTransL1
+        &       (AP_Full * L1_APMult) + L1_Section        ; R any W any
+        &       (AP_Read * L1_APMult) + L1_Section        ; R any W sup
+        &       (AP_None * L1_APMult) + L1_Section        ; R sup W sup
+        &       (AP_ROM  * L1_APMult) + L1_Section        ; R any W none
+
+PPLTrans
+        &       (AP_Full * L2_APMult) + L2_SmallPage      ; R any W any
+        &       (AP_Read * L2_APMult) + L2_SmallPage      ; R any W sup
+        &       (AP_None * L2_APMult) + L2_SmallPage      ; R sup W sup
+        &       (AP_ROM  * L2_APMult) + L2_SmallPage      ; R any W none
+
+PPLTransX
+        &       (AP_Full * L2X_APMult) + L2_ExtPage       ; R any W any
+        &       (AP_Read * L2X_APMult) + L2_ExtPage       ; R any W sup
+        &       (AP_None * L2X_APMult) + L2_ExtPage       ; R sup W sup
+        &       (AP_ROM  * L2X_APMult) + L2_ExtPage       ; R any W none
+
+PageSizes
+        &       4*1024                  ; 0 is 4K
+        &       8*1024                  ; 4 is 8K
+        &       16*1024                 ; 8 is 16
+        &       32*1024                 ; C is 32
+
+PageShifts
+        =       12, 13, 0, 14           ; 1 2 3 4
+        =       0,  0,  0, 15           ; 5 6 7 8
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_UpdateMEMC: Read/write MEMC1 control register
+
+SSETMEMC ROUT
+
+        AND     r10, r0, r1
+        MOV     r12, #0
+        WritePSRc SVC_mode+I_bit+F_bit, r0
+        LDR     r0, [r12, #MEMC_CR_SoftCopy] ; return old value
+        BIC     r11, r0, r1
+        ORR     r11, r11, R10
+        BIC     r11, r11, #&FF000000
+        BIC     r11, r11, #&00F00000
+        ORR     r11, r11, #MEMCADR
+        STR     r11, [r12, #MEMC_CR_SoftCopy]
+
+; mjs Oct 2000 kernel/HAL split
+;
+; The kernel itself should now never call this SWI, but grudgingly has
+; to maintain at least bit 10 of soft copy
+;
+; Here, we only mimic action of bit 10 to control video/cursor DMA (eg. for ADFS)
+; The whole OS_UpdateMEMC thing would ideally be withdrawn as archaic, but
+; unfortunately has not even been deprecated up to now
+
+; for reference, the bits of the MEMC1 control register are:
+;
+; bits 0,1 => unused
+; bits 2,3 => page size, irrelevant since always 4K
+; bits 4,5 => low ROM access time (mostly irrelevant but set it up anyway)
+; bits 6,7 => hi  ROM access time (definitely irrelevant but set it up anyway)
+; bits 8,9 => DRAM refresh control
+; bit 10   => Video/cursor DMA enable
+; bit 11   => Sound DMA enable
+; bit 12   => OS mode
+
+ [ UseGraphicsV
+        Push  "r0,r1,r4, r14"
+        TST   r11, #(1 :SHL: 10)
+        MOVEQ r0, #1             ; blank (video DMA disable)
+        MOVNE r0, #0             ; unblank (video DMA enable)
+        MOV   r1, #0             ; no funny business with DPMS
+        MOV   r4, #GraphicsV_SetBlank
+        BL    CallGraphicsV
+        Pull  "r0,r1,r4, r14"
+ |
+        Push  "r0-r3, r9, r14"   ; can corrupt r12
+        TST   r11, #(1 :SHL: 10)
+        MOVEQ r0, #1             ; blank (video DMA disable)
+        MOVNE r0, #0             ; unblank (video DMA enable)
+        MOV   r1, #0             ; no funny business with DPMS
+        MOV     r0, #0
+        MOV     r1
+        mjsAddressHAL
+        mjsCallHAL    HAL_Video_SetBlank
+        Pull  "r0-r3, r9, r14"
+ ]
+
+        WritePSRc SVC_mode+I_bit, r11
+        ExitSWIHandler
+
+  [ :LNOT: HAL
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       ClearPhysRAM - Routine to clear "all" memory
+;
+; While this routine is running, keyboard IRQs may happen. For this reason
+; it avoids LogRAM 0..31 (where hardware IRQ vector is) and PhysRAM
+; 0..31 where the IRQ workspace is.
+;
+; We also have to avoid the L2PT (inc L1PT) and the PhysRamTable.
+; The latter is also used to tell us which areas of memory we should clear.
+
+; We don't have to worry about trampling on the ROM image as it's
+; already been excluded from PhysRamTable.
+
+; This routine must work in 32-bit mode.
+
+; in:   r7 = memory speed
+;       r8 = page size
+;       r9 = MEMC control register
+;       r13 = total RAM size
+;
+; None of the above are actually used by this routine
+;
+; out:  r7-r9, r13 preserved
+;
+
+     GBLL ClearPhysRAMspeedup
+ClearPhysRAMspeedup SETL {TRUE}
+
+ClearPhysRAM ROUT
+
+      [ EmulatorSupport
+        ARM_on_emulator r0
+        BEQ     CPR_skipped
+      ]
+
+;StrongARM - We will make the logical representation of physical space for RAM temporarily bufferable
+;            (on any ARM). This is small boost for ARM 6,7,8 but a big speed benefit for StrongARM (which
+;            won't burst write in non bufferable areas).
+
+        LDR     r0,  =L1PT
+        LDR     r12, =PhysRamTable
+        ADD     r4, r12, #PhysRamTableEnd-PhysRamTable  ; r4 -> end of table
+02
+        LDMIA   r12!, {r10, r11}                        ; load next address, size
+        SUB     r11,r11,#&100000                        ; 1 Mb will be done on first L1PT update
+        ORR     r10, r10, #PhysSpace                    ; point to logical representation of physical space
+        ADD     r1,r0,r10,LSR #(20-2)                   ; L1PT address for same
+;MJS bug fix (since 3.70) for memory fragments not necessarily 1Mb aligned (eg 2 Mb Kryten)
+        BIC     r1,r1,#3
+;
+04
+        LDR     r2,[r1]
+        ORR     r2,r2,#4                                ; bufferable bit
+        STR     r2,[r1],#4
+        SUBS    r11,r11,#&100000                        ; another 1 Mb done
+        BPL     %BT04
+        TEQ     r12, r4                                 ; have we done all areas?
+        BNE     %BT02
+
+;now let us do the clear
+  [ ClearPhysRAMspeedup
+        MOV     r0,#ZeroPage+InitClearRamWs             ;we can preserve r7-r9,r13 at logical address 52..67
+        STMIA   r0,{r7-r9,r13}
+        MOV     r7,  #0
+        MOV     r8,  #0
+        MOV     r9,  #0
+        MOV     r13, #0
+  ]
+        MOV     r0, #0
+        MOV     r1, #0
+        MOV     r2, #0
+        MOV     r3, #0
+        LDR     r12, =PhysRamTable                      ; point to 5 lots of (physaddr,size)
+        ADR     r6, RamSkipTable
+        ADD     r4, r12, #PhysRamTableEnd-PhysRamTable  ; r4 -> end of table
+10
+        LDR     r5, [r6], #4                            ; load first skip offset
+
+        LDMIA   r12!, {r10, r11}                        ; load next address, size
+
+        ORR     r10, r10, #PhysSpace                    ; point to logical representation of physical space
+        ADD     r11, r11, r10                           ; r11 -> end address of this area
+15
+        ADD     r5, r5, r10                             ; r5 -> skip address if any
+20
+        TEQ     r10, r11                                ; test for end of this area?
+        BEQ     %FT30
+        TEQ     r10, r5                                 ; test for the start of a skipped region
+  [ ClearPhysRAMspeedup
+        STMNEIA r10!, {r0-r3,r7-r9,r13}
+  |
+        STMNEIA r10!, {r0-r3}
+  ]
+        BNE     %BT20
+
+        LDR     r5, [r6], #4                            ; load skip amount
+        CMP     r5, #0                                  ; if negative, then it's an offset from start of skipped bit
+        LDRLT   r5, [r10, r5]                           ; to address of word holding skip amount
+        ADD     r10, r10, r5                            ; and skip it
+        LDR     r5, [r6], #4                            ; load next skip offset (NB relative to end of last skip)
+        B       %BT15
+
+30
+        TEQ     r12, r4                                 ; have we done all areas?
+        BNE     %BT10
+
+  [ ClearPhysRAMspeedup
+        MOV     r0, #ZeroPage+InitClearRamWs
+        LDMIA   r0, {r7-r9,r13}                         ;restore
+
+        MOV     r0, #ZeroPage+InitUsedStart             ;clear our speed up workspace
+        ASSERT  InitUsedStart < InitUsedEnd
+        ASSERT  InitUsedEnd < InitClearRamWs
+        GBLA    finalclear
+finalclear      SETA InitUsedStart
+        WHILE   finalclear < InitWsEnd
+        STMIA   r0!,{r1-r3}
+finalclear      SETA finalclear + 12
+        WEND
+  ]
+
+;StrongARM - now let us remove bufferable status of logical representation of physical space (perhaps we could
+;            leave it? not sure at the mo.)
+
+        LDR     r0,  =L1PT
+        LDR     r12, =PhysRamTable
+        ADD     r4, r12, #PhysRamTableEnd-PhysRamTable  ; r4 -> end of table
+32
+        LDMIA   r12!, {r10, r11}                        ; load next address, size
+        SUB     r11,r11,#&100000                        ; 1 Mb will be done on first L1PT update
+        ORR     r10, r10, #PhysSpace                    ; point to logical representation of physical space
+        ADD     r1,r0,r10,LSR #(20-2)                   ; L1PT address for same
+;MJS bug fix (since 3.70) for memory fragments not necessarily 1Mb aligned (eg 2 Mb Kryten)
+        BIC     r1,r1,#3
+;
+34
+        LDR     r2,[r1]
+        BIC     r2,r2,#4                                ; bufferable bit
+        STR     r2,[r1],#4
+        SUBS    r11,r11,#&100000                        ; another 1 Mb done
+        BPL     %BT34
+        TEQ     r12, r4                                 ; have we done all areas?
+        BNE     %BT32
+
+CPR_skipped
+
+        LDR     r0, =OsbyteVars + :INDEX: LastBREAK
+
+        MOV     r1, #&80
+        STRB    r1, [r0]                                ; flag the fact that RAM cleared
+
+        ARM_number r0
+        SUB     r0,r0,#6
+        ADRL    r1,ARM_default_MMU_CR_table
+        LDR     r1,[r1,r0,LSL #2]
+        MOV     r0, #0
+        STR     r1, [r0, #MMUControlSoftCopy]           ; set up MMU soft copy
+
+        MOV     pc, lr
+
+        LTORG
+
+        GBLA    lastaddr
+lastaddr SETA   0
+        GBLA    lastregion
+lastregion SETA 0
+
+        MACRO
+        MakeSkipTable $region, $addr, $size
+ [ ($region)<>lastregion
+        &       -1
+lastaddr SETA   0
+ ]
+        &       ($addr)-lastaddr, $size
+lastaddr SETA   ($addr)+($size)
+lastregion SETA $region
+        MEND
+
+        MACRO
+        EndSkipTables
+        WHILE   lastregion < (PhysRamTableEnd-PhysRamTable)/8
+        &       -1
+lastregion SETA   lastregion +1
+        WEND
+        MEND
+
+; Note (TMD 04-Aug-93): Special bodge put in here to allow variable size skip for L2PT.
+; If skip size field is negative, then it's an offset from the start of this skipped bit to a word holding
+; the size of the skip. This relies on the L2PTSize being in page zero, which is at a lower physical address than
+; the L2 itself. Also assumes that there are no more skips in the 1st DRAM chunk after the L2PT, since the offset
+; to the next skip is relative to the end of the previous one, which isn't known at assembly time!
+
+; Tim says "Yuk, yuk, yuk!!"
+
+RamSkipTable
+        MakeSkipTable   1, DRAMOffset_PageZero + 0, InitWsEnd - ZeroPage  ; skip 1st n bytes of LogRAM, so IRQs work!
+        MakeSkipTable   1, DRAMOffset_PageZero + SkippedTables, SkippedTablesEnd-SkippedTables
+        MakeSkipTable   1, DRAMOffset_L2PT, DRAMOffset_PageZero + L2PTSize - DRAMOffset_L2PT
+        EndSkipTables
+
+        ASSERT  DRAMOffset_PageZero + L2PTSize < DRAMOffset_L2PT
+
+ ]  ; :LNOT: HAL
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       InitMEMC - Initialise memory controller
+;
+; in:   r1 = 0 if reset, 1 if break
+
+InitMEMC ROUT
+
+; Note: On IOMD, all accesses go to ROM until the first write cycle.
+
+        MOV     r12, #IOMD_Base
+
+; amg: drop in FE-aware routine, leave old one here for reference
+
+  [ MorrisSupport
+; Perform a dummy write to IOMD (some harmless register) to get it out of ROM force mode.
+; Reads from IOMD will return garbage before this has happened. If we're actually running out
+; of 32-bit wide ROMs on MORRIS, a write will already have happened, to get ROMCR0 from
+; 16 to 32-bit wide mode, but we can't yet determine for sure (by reading it back), so do it
+; anyway.
+
+        STRB    r12, [r12, #IOMD_DMAREQ]              ; writes to DMAREQ are ignored
+
+        LDRB    r2,[r12,#IOMD_ID1]      ; load r2 with IOMD ID high byte
+        LDRB    r0,[r12,#IOMD_ID0]      ; load r0 with IOMD ID low byte
+        ORR     r0,r0,r2, LSL #8        ; Or r0 and r2 - shifted left 8, put in r0
+        LDR     r2,=IOMD_7500           ; get Ref IOMD ID code for IOMD in a 7500
+        CMPS    r0,r2                   ; check for IOMD ID Code for IOMD in a 7500
+        BEQ     init7500cpu             ; If equal, got to init7500cpu
+
+        LDRNE   r2,=IOMD_7500FE         ; If not, get ID code for IOMD in a 7500FE
+        CMPNES  r0,r2                   ; If not, check for IOMD ID Code for IOMD in a 7500FE
+        BNE     MedusaInit              ; NOT MORRIS assume Medusa hardware
+
+
+init7500FEcpu
+; Here bceause its an ARM7500 'FE' variant
+; Program the CPU, Memory and IO clock prescalers
+; Set the prescalers to :-
+
+  [ RO371Timings
+;       CPUCLK divide by 1
+;       MEMCLK divide by 2
+;       IOCLK  divide by 2
+;
+        MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkHalf + IOMD_CLKCTL_IOclkHalf
+  |
+;       CPUCLK divide by 2 unless FECPUSpeedNormal set
+;       MEMCLK divide by 1
+;       IOCLK  divide by 1
+;
+   [ FECPUSpeedNormal
+     [ FEIOSpeedHalf
+        MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkHalf
+     |
+        MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkNormal
+     ]
+   |
+     [ FEIOSpeedHalf
+        MOV     r0, #IOMD_CLKCTL_CpuclkHalf + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkHalf
+     |
+        MOV     r0, #IOMD_CLKCTL_CpuclkHalf + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkNormal
+     ]
+   ]
+  ]
+        STRB    r0, [r12, #IOMD_CLKCTL] ; initialise all the prescalers.
+;
+; Set ROM speed, take care to preserve 16-bit mode bit...
+;
+; According to BSiddle on the 15-May-96, Omega will use burst mode roms: use 93nS burst, 156nS initial.
+; According to TDobson on the 09-Jul-96, Omega will handle ROMS up to 120nS and 70nS.
+; Thus the ROM speed should be initilised to :-
+; Half Speed or H bit, clear, which is ON ! : Half the delays, thus DOUBLE all clock ticks.
+; Non-Sequental delay : 10 Ticks : Half speed on, so select 5 ticks (5*2)
+; Burst delay         :  8 Ticks : Half speed on, so select 4 ticks (4*2)
+; Remember the Memory clock on Omega is faster than on previous products.
+; The fast flash devices used for Omega testing should be able to cope even
+; though they aren't burst devices.
+        LDRB    r0, [r12, #IOMD_ROMCR0]         ; Get contents of ROMCR0 in to r0
+        AND     r0, r0, #&40                    ; clear all but the 16-bit mode flag
+  [ RO371Timings
+        ORR     r0, r0, #IOMD_ROMCR_HalfSpeed + IOMD_ROMCR_NSTicks_5 + IOMD_ROMCR_BTicks_3
+  |
+    [ ROMSpeedNormal
+        ORR     r0, r0, #IOMD_ROMCR_Normal :OR: IOMD_ROMCR_NSTicks_$ROMSpeedNSTicks :OR: IOMD_ROMCR_BTicks_$ROMSpeedBurstTicks
+    |
+        ORR     r0, r0, #IOMD_ROMCR_HalfSpeed :OR: IOMD_ROMCR_NSTicks_$ROMSpeedNSTicks :OR: IOMD_ROMCR_BTicks_$ROMSpeedBurstTicks
+    ]
+  ]
+        STRB    r0, [r12, #IOMD_ROMCR0]         ; Prog. the reg.s
+
+; Program the 2nd ROM bank
+  [ ExtROMSupport
+
+;   Unless we're actually running from the 2nd ROM bank (CanLiveOnROMCard), we don't know how fast
+;   the extension ROM in the 2nd bank goes, so program it for a slow default speed
+    [ CanLiveOnROMCard
+        TST     pc, #PhysExtROM                 ; are we running out of the 2nd ROM bank? Program the 2nd bank the same as the 1st if so
+        STRNE   r0, [r12, #IOMD_ROMCR1]
+    ]
+    [ ExtROMis16bit
+     [ ROMSpeedNormal
+        MOV     r0, #IOMD_ROMCR_Normal :OR: IOMD_ROMCR_16bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     |
+        MOV     r0, #IOMD_ROMCR_HalfSpeed :OR: IOMD_ROMCR_16bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     ]
+    |
+     [ ROMSpeedNormal
+        MOV     r0, #IOMD_ROMCR_Normal :OR: IOMD_ROMCR_32bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     |
+        MOV     r0, #IOMD_ROMCR_HalfSpeed :OR: IOMD_ROMCR_32bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     ]
+    ]
+    [ CanLiveOnROMCard
+        STREQB  r0, [r12, #IOMD_ROMCR1]
+    |
+        STRB    r0, [r12, #IOMD_ROMCR1]
+    ]
+
+  |;ExtROMSupport
+
+    [ CanLiveOnROMCard
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; Program the 2nd bank the same as the 1st
+    |
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; 2nd bank unused: program it the same anyway
+    ]
+
+  ];ExtROMSupport
+
+; Now program ASTCR to add wait states, since MEMCLK is fast relative to IOCLK
+
+        MOV     r0, #IOMD_ASTCR_WaitStates
+        STRB    r0, [r12, #IOMD_ASTCR]
+
+        B       init7500cpu_common              ; branch to common init code.
+;
+
+init7500cpu
+; Here because its an ARM7500 variant - NON 'FE' device.
+; Program the CPU, Memory and IO clock prescalers
+; Set the prescalers to :-
+;       CPUCLK divide by 1
+;       MEMCLK divide by 1
+;       IOCLK  divide by 1
+;
+        MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkNormal
+        STRB    r0, [r12, #IOMD_CLKCTL] ; initialise all prescalers to div1
+;
+; Set ROM speed, take care to preserve 16-bit mode bit...
+;
+; According to RJKing on 6/5/94, Kryten will use burst mode roms: use 93nS burst, 156nS initial.
+; According to BSiddle on 09-Jul-96 - Omenga will need to set the burst speed to 4 ticks from 3 ticks.
+; Thus the ROM speed should be initilised to :-
+; Half Speed or H bit, Set, which is OFF ! : Don't half the delays.
+; Non-Sequental delay :  5 Ticks : Half speed off, so select 5 ticks
+; Burst delay         :  4 Ticks : Half speed off, so select 4 ticks
+; The fast EPROMS used for Kryten testing should be able to cope even though
+; they aren't burst devices
+
+        LDRB    r0, [r12, #IOMD_ROMCR0]          ; Get contents of ROMCR0 in to r0
+        AND     r0, r0, #&40                    ; clear all but the 16-bit mode flag
+  [ RO371Timings
+        ORR     r0, r0, #IOMD_ROMCR_Normal + IOMD_ROMCR_NSTicks_5 + IOMD_ROMCR_BTicks_3
+  |
+    [ ROMSpeedNormal
+        ORR     r0, r0, #IOMD_ROMCR_Normal :OR: IOMD_ROMCR_NSTicks_$ROMSpeedNSTicks :OR: IOMD_ROMCR_BTicks_$ROMSpeedBurstTicks
+    |
+        ORR     r0, r0, #IOMD_ROMCR_HalfSpeed :OR: IOMD_ROMCR_NSTicks_$ROMSpeedNSTicks :OR: IOMD_ROMCR_BTicks_$ROMSpeedBurstTicks
+    ]
+  ]
+        STRB    r0, [r12, #IOMD_ROMCR0]          ; Prog. the reg.s
+
+; Program the 2nd ROM bank
+  [ ExtROMSupport
+
+;   Unless we're actually running from the 2nd ROM bank (CanLiveOnROMCard), we don't know how fast
+;   the extension ROM in the 2nd bank goes, so program it for a slow default speed
+    [ CanLiveOnROMCard
+        TST     pc, #PhysExtROM                 ; are we running out of the 2nd ROM bank? Program the 2nd bank the same as the 1st if so
+        STRNE   r0, [r12, #IOMD_ROMCR1]
+    ]
+    [ ExtROMis16bit
+     [ ROMSpeedNormal
+        MOV     r0, #IOMD_ROMCR_Normal :OR: IOMD_ROMCR_16bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     |
+        MOV     r0, #IOMD_ROMCR_HalfSpeed :OR: IOMD_ROMCR_16bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     ]
+    |
+     [ ROMSpeedNormal
+        MOV     r0, #IOMD_ROMCR_Normal :OR: IOMD_ROMCR_32bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     |
+        MOV     r0, #IOMD_ROMCR_HalfSpeed :OR: IOMD_ROMCR_32bit :OR: IOMD_ROMCR_NSTicks_7 :OR: IOMD_ROMCR_BurstOff
+     ]
+    ]
+    [ CanLiveOnROMCard
+        STREQB  r0, [r12, #IOMD_ROMCR1]
+    |
+        STRB    r0, [r12, #IOMD_ROMCR1]
+    ]
+
+  |;ExtROMSupport
+
+    [ CanLiveOnROMCard
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; Program the 2nd bank the same as the 1st
+    |
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; 2nd bank unused: program it the same anyway
+    ]
+
+  ];ExtROMSupport
+
+; Now program ASTCR to *NOT* add wait states, since MEMCLK is slow relative to IOCLK
+
+        MOV     r0, #IOMD_ASTCR_Minimal
+        STRB    r0, [r12, #IOMD_ASTCR]
+
+;
+;
+init7500cpu_common
+; Common setup requirments for BOTH 7500 and 7500FE.
+;
+; MORRIS doesn't support VRAM. Kryten has same DRAM speed as Medusa
+;
+        MOV     r0, #IOMD_VREFCR_REF_16                         ; select 16µs refresh
+        STRB    r0, [r12, #IOMD_VREFCR]
+
+        MOV     r0, #IOMD_IOTCR_Network_TypeA :OR: IOMD_IOTCR_Combo_TypeB :OR: IOMD_IOTCR_Sound_TypeB :OR: IOMD_IOTCR_Sound_Word
+        STRB    r0, [r12, #IOMD_IOTCR]
+
+        ; MOV     r0, #0                        ; Podule manager will set ECTCR to TypeA cycles
+        ; STRB    r0, [r12, #IOMD_ECTCR]
+
+   [ Japanese16BitSound :LAND: STB
+        MOV     r0, #2_10
+        STRB    r0, [r12, #IOMD_VIDMUX]
+   ]
+        B       CommonInit
+
+MedusaInit
+  ] ; MorrisSupport
+
+; amg renaissance ->  [ MorrisSupport
+; amg renaissance -> ; Perform a dummy write to IOMD (some harmless register) to get it out of ROM force mode.
+; amg renaissance -> ; Reads from IOMD will return garbage before this has happened. If we're actually running out
+; amg renaissance -> ; of 32-bit wide ROMs on MORRIS, a write will already have happened, to get ROMCR0 from
+; amg renaissance -> ; 16 to 32-bit wide mode, but we can't yet determine for sure (by reading it back), so do it
+; amg renaissance -> ; anyway.
+; amg renaissance ->
+; amg renaissance ->         STRB    r12, [r12, #IOMD_DMAREQ]              ; writes to DMAREQ are ignored
+; amg renaissance ->
+; amg renaissance ->         LDRB    r0, [r12, #IOMD_ID0]
+; amg renaissance ->         CMP     r0, #&98
+; amg renaissance ->         LDRB    r0, [r12, #IOMD_ID1]
+; amg renaissance ->         CMPEQ   r0, #&5B
+; amg renaissance ->        ;MOVEQ   r3, #xxxx
+; amg renaissance ->         BNE     MedusaInit                            ; NOT MORRIS assume Medusa hardware
+; amg renaissance -> ;
+; amg renaissance -> ; MORRIS contains IOMD equivalant circuitry. Due to lack of VRAM, presence of 16/32 bit support
+; amg renaissance -> ; and a different ROM speed register, we program it slightly differently.
+; amg renaissance -> ;
+; amg renaissance ->
+; amg renaissance -> ;
+; amg renaissance -> ; PSwindell wants all prescalers set to divide by 1
+; amg renaissance -> ;
+; amg renaissance ->         MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkNormal
+; amg renaissance ->         STRB    r0, [r12, #IOMD_CLKCTL] ; initialise all prescalers to div1
+; amg renaissance ->
+; amg renaissance -> ;
+; amg renaissance -> ; Set ROM speed, take care to preserve 16-bit mode bit...
+; amg renaissance -> ;
+; amg renaissance -> ; According to RJKing on 6/5/94, Kryten will use burst mode roms: use 93nS burst, 156nS initial.
+; amg renaissance -> ;
+; amg renaissance -> ; We assume that the extension ROMs are the same access time and width as the main OS ROMS.
+; amg renaissance -> ;
+; amg renaissance ->         LDRB    r0, [r12, #IOMD_ROMCR0]
+; amg renaissance ->         AND     r0, r0, #&40            ; clear all but 16-bit mode bit, giving us the slowest ROMs possible
+; amg renaissance ->  [ :LNOT: AutoSpeedROMS
+; amg renaissance ->   [ NormalSpeedROMS
+; amg renaissance ->    ;Normal code
+; amg renaissance ->         ORR     r0, r0, #IOMD_ROMCR_Normal + IOMD_ROMCR_156 + IOMD_ROMCR_Burst93
+; amg renaissance ->                                                                 ; initialise ROM speed to 156.25nS, 93.75nS burst
+; amg renaissance ->         ; the fast EPROMS used for Kryten testing should be able to cope even though they aren't
+; amg renaissance ->         ; burst devices
+; amg renaissance ->   |
+; amg renaissance ->    ;Slow ROM access for PSwindells test EPROMS. Paul requested 156nS (or slower), burst off.
+; amg renaissance ->         ORR     r0, r0, #IOMD_ROMCR_Normal + IOMD_ROMCR_187 + IOMD_ROMCR_BurstOff
+; amg renaissance ->
+; amg renaissance ->         ! 0, "*** WARNING *** Slow ROM version ment for PSwindell"
+; amg renaissance ->   ]
+; amg renaissance ->  ]
+; amg renaissance ->         STRB    r0, [r12, #IOMD_ROMCR0]
+; amg renaissance ->         STRB    r0, [r12, #IOMD_ROMCR1]         ; and do the same for extension ROMs (just in case)
+; amg renaissance -> ;
+; amg renaissance -> ; MORRIS doesn't support VRAM. Kryten has same DRAM speed as Medusa
+; amg renaissance -> ;
+; amg renaissance ->         MOV     r0, #IOMD_VREFCR_REF_16                         ; select 16µs refresh
+; amg renaissance ->         STRB    r0, [r12, #IOMD_VREFCR]
+; amg renaissance ->
+; amg renaissance ->         MOV     r0, #IOMD_IOTCR_Network_TypeA :OR: IOMD_IOTCR_Combo_TypeB :OR: IOMD_IOTCR_Sound_TypeB :OR: IOMD_IOTCR_Sound_Word
+; amg renaissance ->         STRB    r0, [r12, #IOMD_IOTCR]
+; amg renaissance ->
+; amg renaissance ->         MOV     r0, #0                          ; Podule manager wants TypeA setting by default for all podules
+; amg renaissance ->         STRB    r0, [r12, #IOMD_ECTCR]
+; amg renaissance ->
+; amg renaissance ->  [ Select16BitSound
+; amg renaissance -> ; All MORRIS based machines have 16bit 'Japanese' format sound DAC's
+; amg renaissance ->         MOV     r0, #2_10
+; amg renaissance ->         STRB    r0, [r12, #IOMD_VIDMUX]
+; amg renaissance ->  ]
+; amg renaissance ->         B       CommonInit
+; amg renaissance ->
+; amg renaissance -> MedusaInit
+; amg renaissance ->  ]
+
+
+  [ RO371Timings
+        MOV     r0, #&12    ; 5-3 cycle ROM access
+  |
+
+  [ RISCPCBurstMode
+   [ 1 = 1
+        ReadCop r0, CR_ID
+        BIC     r0, r0, #&F     ;ignore 4 bit revision field
+        LDR     r2, =&41007100                                  ;Test for early 710's
+        CMP     r0, r2                                          ;
+        MOVEQ   r0, #IOMD_ROMCR_156 + IOMD_ROMCR_BurstOff       ;cos they can't work in burst mode!
+        MOVNE   r0, #IOMD_ROMCR_156 + IOMD_ROMCR_Burst93        ;610's 710A's and beyond can
+        ! 0, "*** WARNING *** Burst mode enabled on RISC PC iff processor can cope"
+   |
+        MOV     r0, #IOMD_ROMCR_156 + IOMD_ROMCR_Burst93
+        ! 0, "*** WARNING *** Burst mode enabled on RISC PC"
+   ]
+  |
+        MOV     r0, #IOMD_ROMCR_156 + IOMD_ROMCR_BurstOff       ; initialise ROM speed to 156.25ns (changed from 187ns 21-Jan-94)
+  ]
+
+  ] ;RO371Timings conditional
+
+        STRB    r0, [r12, #IOMD_ROMCR0]
+ [ STB
+  [ :LNOT: ExtROMis16bit
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; and do the same for extension ROMs (just in case)
+  |
+        MOV     r0, #IOMD_ROMCR_16bit + IOMD_ROMCR_Normal + IOMD_ROMCR_156 + IOMD_ROMCR_BurstOff
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; 16bit 156.25nS noburst (Lowest common denominator)
+  ]
+ |
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; and do the same for extension ROMs (just in case)
+ ]
+        MOV     r0, #IOMD_VREFCR_VRAM_256Kx64 :OR: IOMD_VREFCR_REF_16   ; select 16µs refresh, assume 2 banks of VRAM
+        STRB    r0, [r12, #IOMD_VREFCR]
+
+        MOV     r0, #IOMD_IOTCR_Network_TypeA :OR: IOMD_IOTCR_Combo_TypeB :OR: IOMD_IOTCR_Sound_TypeB :OR: IOMD_IOTCR_Sound_Word
+        STRB    r0, [r12, #IOMD_IOTCR]
+
+        ; MOV     r0, #0                        ; Podule manager will set ECTCR to TypeA cycles
+        ; STRB    r0, [r12, #IOMD_ECTCR]
+
+CommonInit
+; On breaks (ie software resets) we have to turn the MMU off.
+; This is slightly tricky if we've been soft-loaded!
+
+        TEQ     r1, #0                  ; r1 = 0 if reset, 1 if break
+        BEQ     %FT03                   ; [it's a reset]
+
+        SetMode SVC32_mode, r0          ; select 32-bit mode (we know we're in 32-bit config)
+        B       %FT05
+03
+
+; It's a reset, so select 32-bit config, MMU off
+
+ [ LateAborts
+        MOV     r2, #MMUC_P :OR: MMUC_D :OR: MMUC_L ; select 32-bit config, MMU off, late aborts
+ |
+        MOV     r2, #MMUC_P :OR: MMUC_D ; select 32-bit config, MMU off
+ ]
+        SetCop  r2, CR_Control
+        SetMode SVC32_mode, r1, r0      ; and re-select 32-bit mode (this time it'll work)
+        AND     r0, r0, #&1F            ; check original mode
+        TEQ     r0, #SVC26_mode         ; if we were in a 26-bit mode,
+        BICEQ   lr, lr, #&FC000003      ; then knock off 26-bit style PSR bits from link register
+                                        ; don't knock them off otherwise, since we may be soft-loaded above 64M
+        MOV     pc, lr                  ; and exit
+
+; It's a Break
+
+; The MMU is on and we want it off: whether we're executing out of ROM or RAM, we
+; have to jump to the physical location of our image, which means paging it in at its
+; own physical address.
+
+; On MEMC1 systems it's possible that the L1/L2 logical address is the same as the image's physical
+; address, which causes a headache, so we'd best use the physical mapping of the page tables (this
+; can't clash as IOMD only goes up to 2000 0000 and our physical mapping is above that).
+
+05
+ [ HAL
+        ! 0, "Sort out Break"
+ |
+        MOV     r0, #0
+        LDR     r0, [r0, #DRAMPhysAddrA]        ; get address of 1st DRAM bank
+        LDR     r1, =PhysSpace + DRAMOffset_L1PT ; offset to start of L1
+        ADD     r0, r0, r1                      ; r0 -> L1 in physical mapped logical space
+
+        LDR     r1, [r0, #ROM :SHR: (20-2)]     ; load L1 entry for 1st Mbyte of ROM
+        MOV     r1, r1, LSR #20                 ; knock off other bits
+        LDR     r2, =(AP_None * L1_APMult) + L1_Section
+                                                ; (svc-only access) + ~ucb + section mapped
+        ORR     r2, r2, r1, LSL #20             ; merge in address
+        STR     r2, [r0, r1, LSL #2]!           ; store in L1PT for 1st Mbyte
+        ADD     r2, r2, #1 :SHL: 20             ; move on to 2nd Mbyte
+        STR     r2, [r0, #4]                    ; and store in next entry
+
+        ARM_flush_cacheandTLB r0
+
+        MOV     r0, r1, LSL #20
+        SUB     r0, r0, #ROM                    ; form RAM-ROM offset
+        ADD     pc, pc, r0                      ; jump to RAM code (when we get onto IOMD, we'll have to be in 32-bit mode)
+        NOP                                     ; this instruction will be skipped
+
+ ]   ; HAL
+
+; we're now in RAM, so it's safe to turn the MMU off, but leave us in 32-bit config (and 32-bit mode)
+
+ [ :LNOT:No26bitCode
+        BIC     lr, lr, #&FC000003              ; knock out PSR bits from return address
+                                                ; (we know we were in 32-bit config, 26-bit mode on entry)
+ ]
+        ADD     lr, lr, r0                      ; and add on offset - NB this may now be above 64MB (on IOMD)
+
+;mjs - the MMU off values are ok for all ARMs; some will ignore P,D,L bits
+ [ LateAborts
+        MOV     r0, #MMUC_P :OR: MMUC_D :OR: MMUC_L ; turn MMU off, but leave us in 32-bit config, late aborts
+ |
+        MOV     r0, #MMUC_P :OR: MMUC_D         ; turn MMU off, but leave us in 32-bit config
+ ]
+        ARM_write_control r0
+
+        MOV     pc, lr                          ; return to caller, but in physical address space
+
+        LTORG
+; -> MemSize
+
+; (non-destructive) algorithm to determine MEMC RAM configuration
+;
+; Dave Flynn and Alasdair Thomas
+; 17-March-87
+;
+; Spooling checkered by NRaine and SSwales !
+; 8MByte check bodged in by APT
+;
+; NOTE: Routines MemSize and TimeCPU are called by the power-on test software,
+; so their specifications MUST not change.
+;
+; Set MEMC for 32-k page then analyse signature of possible
+; external RAM configurations...
+; The configurations are:
+;
+; Ram Size    Page Size    Configuration    (Phys RAM) Signature
+;--------------------------------------------------------------------
+;  16MByte      32k        4*32*1Mx1         A13,A20,A21,A22,A23,A23.5 distinct
+;  16MByte      32k        16*8*256kx4       A13,A20,A21,A22,A23,A23.5 distinct
+;
+;  12MByte      32k        3*32*1Mx1         A13,A20,A21,A22,A23 OK, A23.5 fail
+;  12MByte      32k        12*8*256kx4       A13,A20,A21,A22,A23 OK, A23.5 fail
+;
+;   8MByte      32k        2*32*1Mx1         A13,A20,A21,A22 distinct, A23 fail
+;   8MByte      32k         8*8*256kx4       A13,A20,A21,A22 distinct, A23 fail
+;
+;   4Mbyte      32k          32*1Mx1         A13,A21,A20 distinct, A22,A23 fail
+;   4Mbyte      32k         4*8*256kx4       A13,A21,A20 distinct, A22,A23 fail
+;
+;   2Mbyte      32k    expandable 2*8*256kx4 A13,A20 distinct, A21 fails
+;   2Mbyte ???  16k      fixed 2*8*256kx4    A13,A21 distinct, A20 fails
+;
+;   1Mbyte       8k          32*256kx1       A13,A20 fail, A19,A18,A12 distinct
+;   1Mbyte       8k           8*256kx1       A13,A20 fail, A19,A18,A12 distinct
+;   1Mbyte       8k          4*8*64kx4       A13,A20 fail, A19,A18,A12 distinct
+;
+; 512Kbyte       8k    expandable 2*8*64kx4  A13,A20,A19 fail, A12,A18 distinct
+; 512Kbyte       4k      fixed 2*8*64kx4     A13,A20,A12 fail, A19,A18 distinct
+;
+; 256Kbyte       4K           8*64kx4        A13,A20,A12,A18 fail, A21,A19 ok
+; 256Kbyte       4K          32*64kx1        A13,A20,A12,A18 fail, A21,A19 ok
+;
+
+; MemSize routine... enter with 32K pagesize set
+; R0 returns page size
+; R1 returns memory size
+; R2 returns value set in MEMC
+; Can corrupt R3-R14
+
+; Note that on a soft-loaded system, the 1st word of the image may be
+; temporarily overwritten, but this is just the reset branch so it's OK.
+
+; MMU is always off at this point, so we must use the physical address of PhysRAM
+; Also we are entered in 32-bit config, 32-bit mode,
+; but we exit in 32-bit config, 26-bit mode
+
+ [ MorrisSupport
+funnypatterns
+        &       &66CC9933   ; 0110 1100 1001 0011
+        &       &CC993366   ; 1100 1001 0011 0110
+ ]
+
+MemSize ROUT
+        MOV     r13, lr                                 ;save in a register, cos we've got no stack
+
+        MOV     r12, #IOMD_Base
+
+ [ MorrisSupport
+;
+        LDRB    r0, [r12, #IOMD_ID0]    ; load r1 with IOMD ID high byte
+        LDRB    r1, [r12, #IOMD_ID1]    ; load r0 with IOMD ID low byte
+        ORR     r0,r0,r1,LSL#8          ; Or r0 and r1, shifted left 8, put in r0
+        LDR     r1,=IOMD_Original       ; get Ref IOMD ID code - original
+        CMP     r0,r1                   ; check for IOMD ID Code - original
+        BEQ     MemSizeIOMD             ; Not ID Code - original,
+                                        ;    therefore jump to Medusa hardware code
+                                        ;    else fall through to Morris code.
+;
+; MemSize for Morris
+;
+  [ RO371Timings
+        MOV     r11, #&70     ;all 4 banks assumed 32 bit - EDO and timing bits set in case 7500FE (don't care bits otherwise)
+  |
+        MOV     r11, #IOMD_DRAMWID_DRAM_32bit * &0F     ;set all 4 banks to be 32bit initially
+        LDR     r1, =IOMD_7500FE
+        TEQ     r0, r1                                  ; are we on FE part?
+        ORREQ   r11, r11, #IOMD_DRAMWID_EDO_Enable :OR: IOMD_DRAMWID_RASCAS_3 :OR: IOMD_DRAMWID_RASPre_3
+                                                        ; if so, then enable EDO and slower RASCAS and RASPre times
+        ! 0,"7500FE support expects EDO memory in s.ARM600"
+  ]
+        MOV     r14, #IOMD_Base
+        STRB    r11, [r14, #IOMD_DRAMWID]
+        MOV     r10, #0                                 ;indicate no RAM found yet
+        MOV     r9, #IOMD_DRAMWID_DRAM_16bit            ;bit to OR into DRAMWID to set 16bit
+        MOV     r0, #DRAM0PhysRam
+;
+; r0    DRAM address
+; r9    IOMD_DRAMWID_DRAM_16bit for current DRAM bank
+; r11   current IOMD_DRAMWID register contents
+;
+ExamineDRAMBank                                         ;examine first/next DRAM bank
+;
+        LDMIA   r0, {r1, r2}                            ;Preserve the two locations that we widdle on
+
+        ADR     r3, funnypatterns                       ;We write different values to two locations
+        LDMIA   r3, {r3, r4}                            ; incase bus capacitance holds our value
+        STMIA   r0, {r3, r4}
+        LDMIA   r0, {r5, r6}                            ;Reread test locations
+        EORS    r5, r5, r3                              ;Both locations should read correctly
+        EOR     r6, r6, r4                              ; if memory is 32bits wide
+       ;TEQ     r5, #0
+        TEQEQ   r6, #0
+        BEQ     %FT05                                   ;32bit wide memory
+
+        TST     r5, #&00FF                              ;If the bottom 16bits of each location
+        TSTEQ   r5, #&FF00                              ; are correct, the memory is 16bits wide
+        TSTEQ   r6, #&00FF
+        TSTEQ   r6, #&FF00
+        ADDNE   r0, r0, #DRAM1PhysRam-DRAM0PhysRam      ; move onto next bank
+        BNE     NoRamInBank                             ;No memory in this bank
+
+        ORR     r11, r11, r9                            ;Bank is 16bits wide
+05
+        STMIA   r0, {r1, r2}                            ;Restore the two locations we widdled on
+                                                        ;Must do BEFORE poking the DRAMWID register
+        MOV     r14, #IOMD_Base                         ;
+        STRB    r11, [r14, #IOMD_DRAMWID]               ;
+
+        BL      Add_DRAM_bank
+
+NoRamInBank
+        MOV     r9, r9, LSL #1                          ; shunt up position in DRAMWID
+        CMP     r9, #&0010                              ; if more banks to do
+        BLT     ExamineDRAMBank                         ; then loop
+
+        MOV     r6, #0                                  ; No VRAM
+        MOV     r0, #0
+        MOV     r14, #IOMD_Base
+
+        LDRB    r4, [r14, #IOMD_ID0]
+        LDRB    r7, [r14, #IOMD_ID1]
+        ORR     r4, r4, r7, LSL #8
+        LDR     r7, =IOMD_7500FE                        ; if FE part, then assume EDO DRAM
+        TEQ     r4, r7
+        LDREQ   r2, =80000000                           ; so allow 80E6 bytes/s
+ [ STB
+        LDRNE   r2, =44000000                           ; else only allow 44E6 bytes/s
+ |
+        LDRNE   r2, =46500000                           ; if no VRAM, then 46.5E6 bytes/sec bandwidth
+ ]
+        MOV     r1, #IOMD_VIDCR_DRAMMode :OR: &10       ; if no VRAM, then turn on DRAM mode, and set increment to &10
+
+        B       Allocate_DRAM
+
+MemSizeIOMD
+ ]
+
+; Right, let's find out where our memory is
+
+
+MemSizeIOMD_notSA
+
+        MOV     r11, #IOMD_DRAMCR_DRAM_Large * &55      ; set all banks to be large initially
+        MOV     r14, #IOMD_Base
+        STRB    r11, [r14, #IOMD_DRAMCR]
+
+        MOV     r10, #0                                 ; indicate no RAM found yet
+        MOV     r9, #IOMD_DRAMCR_DRAM_Small             ; bit to OR into DRAMCR
+        MOV     r0, #DRAM0PhysRam
+10
+        ADD     r1, r0, #A10                            ; this should be OK for both configurations
+        BL      DistinctAddresses
+        ADDNE   r0, r0, #DRAM1PhysRam-DRAM0PhysRam      ; move onto next bank
+        BNE     %FT15                                   ; [no RAM in this bank at all]
+
+        ADD     r1, r0, #A11                            ; test for 256K DRAM
+        BL      DistinctAddresses
+        ORRNE   r11, r11, r9                            ; it is, so select small multiplexing
+        MOVNE   r14, #IOMD_Base
+        STRNEB  r11, [r14, #IOMD_DRAMCR]                ; store new value of DRAMCR, so we can use memory immediately
+
+        BL      Add_DRAM_bank
+
+; Now, we have to find a bank of DRAM, so we've got somewhere to store our results!
+15
+        MOV     r9, r9, LSL #2                          ; shunt up position in DRAMCR
+        CMP     r9, #&100                               ; if more banks to do
+        BCC     %BT10                                   ; then loop
+
+; Now, we check out the VRAM.
+; Don't bother checking for more than 2M of VRAM, because we don't know what the 1/2 SAM length is for larger sizes
+
+        MOV     r2, #IOMD_VREFCR_VRAM_256Kx64 :OR: IOMD_VREFCR_REF_16 ; assume 2 banks of VRAM by default
+        STRB    r2, [r12, #IOMD_VREFCR]
+
+        MOV     r0, #VideoPhysRam                       ; point at VRAM
+        ADD     r1, r0, #A2                             ; test A2
+        BL      DistinctAddresses
+        MOVEQ   r6, #2                                  ; we've got 2M of VRAM
+        BEQ     %FT20
+
+        MOV     r2, #IOMD_VREFCR_VRAM_256Kx32 :OR: IOMD_VREFCR_REF_16
+        STRB    r2, [r12, #IOMD_VREFCR]
+        ADD     r1, r0, #A2                             ; check for any VRAM at all
+        BL      DistinctAddresses
+        MOVEQ   r6, #1                                  ; we've got 1M of VRAM
+        MOVNE   r6, #0                                  ; no VRAM
+20
+ [ IgnoreVRAM
+        MOV     r6, #0                                  ; pretend there's no VRAM
+ ]
+        CMP     r6, #1
+        MOVCC   r1, #IOMD_VIDCR_DRAMMode :OR: &10       ; if no VRAM, then turn on DRAM mode, and set increment to &10
+        MOVEQ   r1, #SAMLength/2/256                    ; if 1M VRAM, then use VRAM mode, and set increment for 1/2 SAM
+        MOVHI   r1, #SAMLength/2/256*2                  ; if 2M VRAM, then use VRAM mode, and set increment for 2*1/2 SAM
+        LDRCC   r2, =46500000                           ; if no VRAM, then 46.5E6 bytes/sec bandwidth
+        LDREQ   r2, =80000000                           ; if 1M VRAM, then 80E6   ---------""--------
+        LDRHI   r2, =160000000                          ; if 2M VRAM, then 160E6  ---------""--------
+        MOVCC   r0, #0                                  ; Clear VRAM base if there is no VRAM
+
+; Allocate_DRAM
+;   r0  = Video base if r6!=0
+;   r1  = Value for IOMD VIDCR
+;   r2  = Bandwidth limit
+;   r6  = VRAM size in Mb
+;   r10 = End of DRAM list
+Allocate_DRAM
+
+NoDRAMPanic
+        TST     r10, r10
+        BEQ     NoDRAMPanic                             ; Stop here if there is no DRAM (we could use VRAM I suppose...)
+
+        MOV     r7, r6, LSL #20                         ; r7 = size of video memory
+        LDR     r8, [r10]                               ; r8 = the number of DRAM blocks.
+        SUB     r11, r10, r8, LSL #3                    ; Jump back to the start of the list
+
+        LDMIA   r11!, {r4, r5}                          ; Get a block from the list. (r4,r5) = (base,size)
+        CMP     r6, #0                                  ; Did we find any VRAM?
+        BNE     %FT30                                   ; Skip this bit if we did.
+        MOV     r0, r4                                  ; Allocate this block as video memory
+        MOV     r7, r5
+        CMP     r10, r11                                ; Was this the only block?  If so, leave 1M
+        SUBEQS  r7, r7, #1024*1024
+        MOVCC   r7, r5, ASR #1                          ; If that overflowed, take half the bank.
+        CMP     r7, #8*1024*1024
+        MOVCS   r7, #8*1024*1024                        ; Limit allocation to 8M - the size of the logical space
+
+        ADD     r4, r4, r7                              ; Adjust the DRAM block base...
+        SUBS    r5, r5, r7                              ; ... and the size.
+        LDMEQIA r11!, {r4, r5}                          ; Fetch the next block if we claimed it all.
+
+30      ADD     r12, r4, #DRAMOffset_PageZero           ; Use the first block for kernel workspace.
+        ADD     r3, r12, #DRAMPhysAddrA                 ; Set the table address as well
+
+        CMP     r8, #5
+        ADDCS   r10, r11, #3:SHL:3                      ; Limit to 4 blocks of DRAM (3 + this one)
+
+35      STMIA   r3!, {r4, r5}                           ; Put the DRAM block into the table
+        TEQ     r10, r11
+        LDMNEIA r11!, {r4, r5}                          ; Get the next block if there is one.
+        BNE     %BT35
+
+; Now go back and put the VRAM information in, and also program VIDCR and VIDCUR
+
+ [ :LNOT:HAL
+        STRB    r6, [r12, #VRAMWidth]                   ; store width of VRAM (0,1 or 2)
+        MOV     r14, #IOMD_Base
+        STRB    r1, [r14, #IOMD_VIDCR]
+        STR     r0, [r14, #IOMD_VIDCUR]                 ; set up VIDCUR to start of video RAM
+        STR     r0, [r14, #IOMD_VIDSTART]               ; do same for VIDSTART
+        STR     r0, [r14, #IOMD_VIDINIT]                ; and for VIDINIT
+                                                        ; so we don't get a mess when we turn video DMA on later
+        STR     r2, [r12, #VideoBandwidth]              ; store video bandwidth
+
+        ADD     r4, r0, #1024*1024-4096                 ; add on a bit to form VIDEND (will be on mult. of SAM)
+        STR     r4, [r14, #IOMD_VIDEND]                 ; yes I know it's a bit of a bodge
+
+        MOV     r4, r6, LSL #20                         ; convert amount of VRAM to bytes
+        STR     r4, [r12, #VRAMSize]                    ; and store
+  ]
+
+        ADD     r2, r12, #VideoPhysAddr                 ; r2 -> Start of PhysRamTable
+        STMIA   r2, {r0, r7}                            ; store video memory block
+MemSizeTotalRAM
+; Now we have to work out the total RAM size
+
+        MOV     r1, #0
+        MOV     r7, r2
+40
+        LDMIA   r7!, {r4, r5}                           ; get address, size
+        ADD     r1, r1, r5                              ; add on size
+        TEQ     r7, r3
+        BNE     %BT40
+
+        MOV     r0, #Page4K                             ; something to put in MEMC CR soft copy
+                                                        ; (it's probably irrelevant)
+        ADRL    r4, ROM
+
+; r0 = Page size
+; r1 = Total memory size (bytes)
+; r2 = PhysRamTable
+; r3 = After last used entry in PhysRamTable
+; r4 = Address of ROM
+
+; now store zeros to fill out table
+
+55
+        ADD     r5, r2, #PhysRamTableEnd-PhysRamTable
+        MOV     r6, #0
+        MOV     r7, #0
+57
+        CMP     r3, r5
+        STMCCIA r3!, {r6, r7}
+        BCC     %BT57
+
+ [ :LNOT: HAL
+; Now set up L1 + L2
+; - first work out how big static L2 needs to be
+; - then zero L1 + L2 (L1 is actually inside L2)
+
+        MOV     r3, r1, LSR #22                 ; r3 = memsize / 4M
+        TEQ     r1, r3, LSL #22                 ; if any remainder
+        ADDNE   r3, r3, #1                      ; then round up (r3 is now how many pages of L2 needed for free pool)
+        MOV     r3, r3, LSL #12                 ; convert to bytes
+        ADD     r3, r3, #FixedAreasL2Size       ; add on size of L2 for other fixed areas
+        STR     r3, [r2, #L2PTSize-PhysRamTable] ; save away for future reference
+
+        LDR     r2, [r2, #DRAMPhysAddrA-PhysRamTable]   ; get address of 1st DRAM bank
+        LDR     r5, =DRAMOffset_L2PT
+        ADD     r2, r2, r5                              ; make r2 -> L2PT
+        MOV     r5, #0                          ; value to initialise L1 and L2 to (translation faults)
+        MOV     r6, r5
+        MOV     r7, r5
+        MOV     r8, r5
+        MOV     r9, r5
+        MOV     r10, r5
+        MOV     r11, r5
+        MOV     r12, r5
+        ADD     r2, r2, r3                      ; start at end and work back
+60
+        STMDB   r2!, {r5-r12}
+        SUBS    r3, r3, #8*4
+        BNE     %BT60
+
+; r2 ends up pointing at L2
+
+        ADD     r3, r2, #DRAMOffset_L1PT-DRAMOffset_L2PT        ; r3 -> L1Phys
+
+; now initialise all the L1 for the area covered by the static L2, as if it were all page mapped
+; - the section mapped stuff will be overwritten when we go thru MemInitTable shortly
+
+        ORR     r5, r2, #L1_Page + L1_U         ; take phys base of L2, and or in other bits to form an L1 entry
+        LDR     r6, =L2PTSize+DRAMOffset_PageZero-DRAMOffset_L2PT
+        LDR     r10, [r2, r6]                   ; r10 = size of L2 (used after this loop, too)
+        ADD     r6, r5, r10                     ; r6 = value in r5 when we've finished
+        MOV     r7, r3                          ; r7 -> where we're storing L1 entries
+61
+        STR     r5, [r7], #4                    ; store L1 entry
+        ADD     r5, r5, #1024                   ; advance L2 pointer
+        TEQ     r5, r6
+        BNE     %BT61
+
+; now go through memory initialisation table, setting up entries
+
+        ADR     r5, MemInitTable
+65
+        LDMIA   r5!, {r6-r8}                    ; load size, logaddr, indicator
+        TEQ     r6, #0                          ; if size field is zero
+        BEQ     %FT90                           ; then we've finished going through table
+
+        TST     r8, #1                          ; if bit 0 of indicator is set, then it's page mapped
+        BNE     %FT75
+
+        TST     r8, #2                          ; is it abort?
+        BNE     %FT68                           ; [no]
+
+; it's a section abort (r8=0)
+
+66
+        STR     r8, [r3, r7, LSR #20-2]         ; store zero in L1 table
+        ADD     r7, r7, #&00100000              ; increment logical address by 1M
+        SUBS    r6, r6, #&00100000              ; and decrement size by 1M
+        BNE     %BT66                           ; loop until done
+        B       %BT65
+
+
+68
+; it's section mapped
+
+        TST     r8, #ROMbit                     ; is it a ROM image offset
+        ADDNE   r8, r8, r4                      ; if so, then add in image offset
+        BICNE   r8, r8, #ROMbit                 ; and knock out the dodgy bit
+
+        TST     r8, #Vidbit                     ; is it a video memory offset
+        LDRNE   r9, =VideoPhysAddr+DRAMOffset_PageZero-DRAMOffset_L2PT
+        LDRNE   r9, [r2, r9]                    ; get physical address of video RAM
+        ADDNE   r8, r8, r9                      ; add on offset
+        BICNE   r8, r8, #Vidbit                 ; and knock out the dodgy bit
+70
+        STR     r8, [r3, r7, LSR #20-2]         ; store entry in L1 table (assumes bits 18, 19 are clear!)
+        ADD     r7, r7, #&00100000              ; increment logical address by 1M
+        ADD     r8, r8, #&00100000              ; and physical address by 1M
+        SUBS    r6, r6, #&00100000              ; and decrement size by 1M
+        BNE     %BT70                           ; if we've not finished then loop
+        B       %BT65                           ; else go back to main loop
+
+; explicit L2 setup
+
+75
+        CMP     r6, #-1                         ; if size <> -1
+        BNE     %FT80                           ; then normal
+
+; size = -1 => this is the chunk with the soft CAM map in it,
+; so we must work out a suitable size (and store it in SoftCamMapSize)
+; we also have to work out the correct offset in the DRAM bank, since this is
+; after variable size L2PT
+
+        MOV     r6, r1, LSR #24-3               ; number of pages for cam map
+        CMP     r1, r6, LSL #24-3               ; if bits dropped off
+        ADDNE   r6, r6, #1                      ; then need one more page
+        MOV     r6, r6, LSL #12
+        LDR     r9, =DRAMOffset_PageZero-DRAMOffset_L2PT+SoftCamMapSize
+        STR     r6, [r2, r9]                    ; store size used
+        ADD     r6, r6, #UndStackSize           ; chunk also includes undstack
+        ADD     r9, r10, #DRAMOffset_L2PT       ; undstack/cammap starts at offset L2PT + L2PTSize
+        ORR     r8, r8, r9                      ; OR in other misc bits from table
+80
+        LDR     r9, =DRAMOffset_PageZero-DRAMOffset_L2PT+DRAMPhysAddrA
+                                                ; offset from L2 to word containing physical address of 1st DRAM bank
+        LDR     r9, [r2, r9]                    ; r9 = address of 1st DRAM bank
+        ADD     r8, r8, r9                      ; convert offset to address
+        EOR     r8, r8, #L2_SmallPage :EOR: 1   ; make bottom 2 bits correct for L2
+        ADD     r9, r2, r7, LSR #10             ; r9 -> L2 for this page
+85
+        STR     r8, [r9], #4                    ; store entry in L2
+        ADD     r8, r8, #4*1024                 ; advance physical page address
+        SUBS    r6, r6, #4*1024                 ; one less page to do
+        BNE     %BT85
+        B       %BT65
+
+; L1 is now set up correctly, and L2 has the correct CB bits, but no accessible pages
+; Put in the L2 entries for the logical area we are going to access the L2 (and L1) at
+; r10 still holds L2PT size
+
+90
+        ADD     r5, r2, #(L2PT :SHR: 10)        ; r5 -> start of L2PT for L2 logical address
+        LDR     r6, =(AP_None * L2_APMult) + L2_SmallPage ; r6 = other gubbins to put in L2 entries (not C or B)
+        ORR     r6, r6, r2                      ; OR in physical address of L2
+        MOV     r7, r10                         ; amount to put in (L2PTSize)
+95
+        STR     r6, [r5], #4                    ; store entry
+        ADD     r6, r6, #4096                   ; move onto next page
+        SUBS    r7, r7, #4096                   ; one less page to do
+        BNE     %BT95                           ; loop until done
+
+; But before we turn on, we have to temporarily make the addresses we are currently executing out of
+; into a section mapped area straight through, so we don't crash before we can jump up into ROM area
+
+        ASSERT ((CritStart :EOR: CritEnd) :AND: &FFF00000)=0    ; make sure start and end are in the same MB chunk
+
+        ADR     r5, CritStart                   ; point at critical region start
+        MOV     r5, r5, LSR #20                 ; divide by 1MB
+        LDR     r6, [r3, r5, LSL #2]            ; get current L1 entry to put back later
+        MOV     r7, r5, LSL #20                 ; r7 = physical address of base of section
+        ORR     r7, r7, #(AP_None * L1_APMult)
+        ORR     r7, r7, #L1_Section
+        STR     r7, [r3, r5, LSL #2]            ; store replacement entry in L1 (not U,C or B)
+
+        ARM_MMU_transbase r3                    ; set up MMU pointer to L1
+        ADD     r3, r3, #PhysSpace              ; when we put L1 entry back later, we need to use the copy in PhysSpace area
+
+        MOV     r7, #1
+        ARM_MMU_domain r7                       ; only use domain 0
+
+        ARM_flush_cacheandTLB r7                ; flush cache + TLB just in case
+
+        ARM_number r2                           ;should be 6,7,8 or &A
+        SUB     r2,r2,#6                        ; r2 := 0..4 for ARM 6,7,8,(9),&A
+        ADRL    r7,ARM_default_MMU_CR_table
+        LDR     r7,[r7,r2,LSL #2]               ;get appropriate default value for MMU control reg
+
+CritStart
+        ARM_write_control r7
+
+; now we can jump into the ROM space (if we're not already there)
+
+        RSB     r4, r4, #ROM                    ; make offset from current address to ROM
+        ADD     pc, pc, r4                      ; jump up into ROM area
+        NOP                                     ; this instruction will be skipped
+
+; now put back the L1 entry we messed up
+
+        STR     r6, [r3, r5, LSL #2]
+CritEnd                                         ; 2 words after we go up into ROM
+        ARM_flush_TLB r2                        ; flush TLB (no need to flush cache, as there's nothing in it)
+
+        SetMode UND32_mode, r7
+        LDR     r13_undef, =UNDSTK              ; set up undefined mode stack pointer
+
+ [ No26bitCode
+        SetMode ABT32_mode, r7
+        LDR     r13_abort, =ABTSTK              ; set up abort mode stack pointer
+
+        SetMode SVC32_mode, r7                  ; RISC OS is 32 bit now. yay!
+ |
+        SetMode SVC26_mode, r7                  ; switch into 26-bit mode
+ ]
+        ADD     r13, r13, r4                    ; adjust return address
+
+        LDR     r2, ResetMemC_Value
+        BIC     r2, r2, #&C
+        ORR     r2, r2, r0
+        MOV     r0, #4*1024                     ; r0 = true page size (now split off
+                                                ; from MEMC control register)
+        MOV     pc, r13
+
+ ] ; :LNOT: HAL
+
+; add_dram_bank
+;   Entry: r10 -> workspace (initially 0)
+;          r0  =  bank address
+;   Exit:  r10 -> workspace (allocated if 0 on entry)
+;          r0  =  next bank address
+;          r9, r11, r13 preserved
+;   Probe a DRAM bank, and add any DRAM found to the workspace
+Add_DRAM_bank
+        ROUT
+        MOV     r12, lr                 ; r12 = return address
+        EOR     r1, r0, #A16            ; Check there is some RAM in the bank
+        BL      DistinctAddresses
+        ADDNE   r0, r0, #DRAM1PhysRam-DRAM0PhysRam
+        MOVNE   pc, r12                 ; Return if no RAM in the bank
+
+        ; Only some address lines are decoded by the SIMM.  For example, a 4M SIMM may be split
+        ; into 2 banks, with A2-A20 decoded on each, or A2-A19,A21 decoded.  First we need to
+        ; find out which address lines are decoded, and which are ignored.
+        MOV     r6, #DRAM1PhysRam-DRAM0PhysRam
+        MOV     r7, #A17
+        SUB     r6, r6, #1              ; Get address lines which select address within bank.
+
+        ; Loop through the address lines, finding out which are decoded.  We clear the bits in r6
+        ; which correspond to non-decoded address lines.
+        ; r6 = address line mask
+        ; r7 = current address line
+10      EOR     r1, r0, r7              ; Toggle the address line
+        BL      DistinctAddresses       ; Check if address line has any effect.
+        BICNE   r6, r6, r7              ; Clear the bit if the address line fails.
+        MOV     r7, r7, LSL #1          ; Move onto the next address line.
+        TST     r6, r7                  ; Have we reached the limit?
+        BNE     %BT10                   ; Repeat if not.
+
+        ; r6 = decoded address lines in bank. (ie in A0-A25)
+        ; r7 = The size of the DRAM bank
+        ; Since the DRAM bank may not be contiguous, we now split the bank up into contiguous
+        ; blocks.  We make these as large as possible to save work.  Here we set r8 to the
+        ; size of the smallest contiguous block(s) of RAM.  (There will also be some contiguous
+        ; blocks which are twice this size in some cases.)
+        ADD     r8, r6, #A17
+        BIC     r8, r8, r6              ; r8 = First clear bit in r6 from A17 up.
+
+        RSB     r4, r8, #0              ; r4 = All bits at or above r8 set since r8 is a power of 2.
+
+        RSB     r7, r7, #0              ; r7 = address bits which select the bank since r7 was a
+                                        ;      power of 2.
+        ORR     r3, r7, r6              ; r3 = All decoded address lines.
+        AND     r7, r4, r3              ; r7 = All decoded bits at or above r8.
+
+; Make sure that the dram bank may not be contained within the image.  The code below fails
+; to work correctly if a dram bank is contained within an OS image.  Currently this would
+; require an image larger than 64M.
+                ASSERT  OSROM_ImageSize*1024 <= DRAM1PhysRam-DRAM0PhysRam
+
+15      MOV     r1, r0                  ; r1 = Address of start of block (inclusive).
+        ADD     r2, r1, r8              ; r2 = End of the block (exclusive).
+
+        ; Move the end of the block if the OS image begins in this block.
+        ADRL    r4, ROM                 ; r4 = Start of the OS image (which may be in RAM).
+        EOR     r5, r4, r1              ; r5 = Difference between image and memory block.
+        TST     r5, r7                  ; Check if the image begins in this block of RAM.
+        ANDEQ   r2, r4, r3              ; Set end of block to start of image.
+
+        ; Move the start of the block if the OS image ends in this block.
+        ADD     r4, r4, #OSROM_ImageSize*1024
+        SUB     r4, r4, #1              ; r4 = Last byte of the OS image.
+        EOR     r5, r4, r1              ; r5 = Difference between end of image and block.
+        TST     r5, r7                  ; Check if the image ends in this block of RAM.
+        ANDEQ   r5, r4, r3              ; r5 = Address of last byte of the image within this block.
+        ADDEQ   r1, r5, #1              ; Set start of block to the byte after the image.
+
+        ; If the image is contained in the block, we will have swapped the start and end
+        ; addresses.  This means that the block is split into two parts.  The bit below
+        ; the image and the bit above the image.
+        CMP     r1, r2
+        BLS     %FT20                   ; If start <= end, then block is not fragmented.
+        CMP     r2, r0                  ; Check the size of the fragment before the image.
+        MOV     r0, r1                  ; Store old start address
+        AND     r1, r1, r7              ; Get the start of the block
+        BLNE    Allocate_DRAM_fragment  ; Allocate it if it's non-zero.
+        MOV     r1, r0                  ; Restore the old start of fragment
+        AND     r0, r0, r7              ; Get the start of the block again.
+        ADD     r2, r0, r8              ; End of next fragment is the end of the block.
+
+        CMP     r1, r2                  ; Compare start and (modified) end.
+20      BLNE    Allocate_DRAM_fragment
+
+        ; Now move onto the next block.  We add the non-decoded address lines to cause the
+        ; carry to be propagated across them.  Then we mask them out.
+        MVN     r4, r7                  ; Add the non-connected address lines to ...
+        ADD     r4, r4, r0              ; ... the block address ...
+        ADD     r4, r4, r8              ; ... and the block size.
+;       EOR     r5, r0, r4              ; Compare with old address
+        AND     r0, r4, r7              ; Leave only the decoded lines set.
+;       BIC     r5, r5, r6              ; Clear decoded lines within the bank.
+;       TST     r5, r7                  ; Check only the bank lines.
+;       BEQ     %BT15                   ; Repeat for next block.
+
+        TST     r0, r6
+        BNE     %BT15
+
+        MOV     pc, r12                 ; Done for this bank.
+
+; Allocate_DRAM_block
+;   Entry:
+;     r1 = block start (inclusive)
+;     r2 = block end (exclusive)
+;     r3 = All decoded address lines
+;     r7 = All decoded bits at or above r8
+;     r8 = Size of largest contiguous block
+;     block length is assumed to be at least the size of the static data - ie. 160k
+;     The maximum block list size is then 4k, which fits easily into the cursor chunk
+;   Exit:
+;     r10 updated
+;     r0, r3, r6-r9, r11-r13 preserved
+;     r10 points to a word containing the number of blocks stored.
+;     The pairs of words before
+Allocate_DRAM_fragment
+        ROUT
+        CMP     r10, #0
+        BEQ     %FT20
+
+        ; We are not dealing with the first block since r10 != 0.  Make an attempt to merge this block
+        ; with the previous block.
+        LDMDB   r10, {r4, r5}           ; Get details of the previous block
+        ADD     r5, r4, r5              ; Get the end address
+        EOR     r5, r5, r1              ; Compare with the current block start address...
+        TST     r5, r3                  ; ... but only check the decoded bits.
+        EOR     r5, r5, r1              ; Restore the previous block end address.
+        BNE     %FT10                   ; We can't merge it after the previous block
+
+        ; r4 = previous start
+        ; r5 = previous end
+        ; The block is just after the previous block.  That means the start address is unchanged, but
+        ; the length is increased.
+        SUB     r5, r5, r4              ; Calculate the previous block length.
+        SUB     r2, r2, r1              ; Find the length of the new block.
+        ; r2 = length of block
+        ADD     r5, r5, r2              ; Add it to the previous length.
+        STR     r5, [r10, #-4]          ; Update the block size in memory.
+        MOV     pc, lr
+
+        ; The block is not just after the previous block, but it may be just before.  This may be the
+        ; case if we are softloaded.
+10      SUB     r4, r4, #1              ; Compare the address before the previous block start ...
+        SUB     r2, r2, #1              ; ... with the address of the last byte in this block ...
+        EOR     r4, r4, r2
+        TST     r4, r3                  ; ... but check only the decoded bits.
+        ADD     r2, r2, #1              ; Restore the end address.
+        BNE     %FT20                   ; Skip if we cannot merge the block.
+
+        ; The block is just before the previous block.  The start address and length both change.
+        LDR     r4, [r10, #-8]          ; Get the previous block start again.
+
+        SUB     r2, r2, r1              ; Calculate the current block size.
+        SUB     r4, r4, r2              ; Subtract from the previous block start address.
+        SUB     r5, r5, r4              ; Calculate the new length=end-start
+        STMDB   r10, {r4, r5}           ; Update the block info in memory.
+        MOV     pc, lr
+
+        ; We now have a region which does not merge with a previous region.  We move it up to the
+        ; highest address we can in the hope that this block will merge with the next block.
+20      SUB     r2, r2, r1              ; Calculate the block size
+        MVN     r4, r3                  ; Get the non-decoded address lines.
+        ORR     r1, r4, r1              ; Set the non-decoded address bit in the start address.
+
+30      CMP     r10, #0                 ; If the workspace has not been allocated...
+        MOVEQ   r10, r1                 ; ... use this block.
+        MOVEQ   r4, #0                  ; Initialise the counter.
+
+        ; The block/fragment to be added is between r1 and r1+r2.
+        LDRNE   r4, [r10]               ; Get the old counter if there was one.
+        STMIA   r10!, {r1, r2}          ; Store address and size.
+        ADD     r4, r4, #1              ; Increment the counter.
+        STR     r4, [r10]               ; Store the counter.
+
+        MOV     pc, lr                  ; We've done with this block now.
+
+
+
+; Memory map initialisation table
+; Consists of word triplets (size,logaddr,type)
+; where size    is size in bytes of area (size=0 terminates list)
+;       logaddr is the base logical address of area
+;       type is one of 5 formats:
+;       a) a standard section-mapped L1 entry (physical address gets incremented for each MB in size)
+;       b) like a section-mapped L1 entry, but with bit 12 set (address field holds base offset from "ROM" image)
+;       c) like a section-mapped L1 entry, but with bit 13 set (address field holds base offset from start of video RAM)
+;       d) like a page-mapped L1 entry, which indicates a page-mapped area to fill in
+;          the L2 for. In this case the other bits are as follows:-
+;               Bits 3,2   - CB respectively
+;               Bits (11,10),(9,8),(7,6),(5,4) - access privileges
+;               Bits 31-12 - offset in 1st DRAM bank to start of these pages (in units of pages)
+;          If the size field contains -1, then it is the SoftCAMMap, and the appropriate size should be worked out,
+;           and stored in SoftCamMapSize. Also, since the size of the L2 is variable the offset into the DRAM bank
+;           of the SoftCamMap is unknown at assembly time, so the offset bits in table are zero.
+;       e) zero - indicating that this area should abort (only necessary for section mapped bits in 48M-64M, cause they
+;           have no level 2, therefore section must abort) - used for VIDC1 emulation area.
+;       Note in case d), the L1 is not actually touched (it should have already been set up to point to the right L2)
+;
+
+ROMbit  *       1 :SHL: 12
+Vidbit  *       1 :SHL: 13
+PSS     *       PhysSpaceSize           :SHR: 20  ; Number of megabytes in physical space (used in table generation)
+
+        MACRO
+        MemInitSection  $size, $U, $C, $B, $logaddr, $ap, $physaddr
+        &       ($size)*&00100000
+        &       $logaddr
+        &       (($U)*L1_U):OR:(($C)*L1_C):OR:(($B)*L1_B):OR:(($ap)*L1_APMult):OR:$physaddr:OR:L1_Section
+        MEND
+
+        MACRO
+        MemInitROMs     $size, $U, $C, $B, $logaddr, $ap
+        &       ($size)*&00100000
+        &       $logaddr
+        &       (($U)*L1_U):OR:(($C)*L1_C):OR:(($B)*L1_B):OR:(($ap)*L1_APMult):OR:ROMbit:OR:L1_Section
+        MEND
+
+        MACRO
+        MemInitVideo    $size, $U, $C, $B, $logaddr, $ap
+        &       ($size)*&00100000
+        &       $logaddr
+        &       (($U)*L1_U):OR:(($C)*L1_C):OR:(($B)*L1_B):OR:(($ap)*L1_APMult):OR:Vidbit:OR:L1_Section
+        MEND
+
+        MACRO
+        MemInitAbort    $size, $logaddr
+        &       ($size)*&00100000
+        &       $logaddr
+        &       0
+        MEND
+
+        MACRO
+        MemInitPagesL2  $size, $C, $B, $logaddr, $ap, $dramoffset
+        &       ($size)
+        &       $logaddr
+        &       (($C)*L1_C):OR:(($B)*L1_B):OR:(($ap)*L2_APMult):OR:$dramoffset:OR:L1_Page
+        MEND
+
+MemInitTable    ;       sz, U, C, B, logaddr,   (ap,     (physaddr))
+        MemInitSection   4, 1, 0, 0, &03000000, AP_None, &03000000      ; I/O
+
+        MemInitAbort     1,          &03400000                          ; VIDC1 emulation zone
+        MemInitSection   1, 1, 0, 0, &03500000, AP_None, &03400000      ; VIDC20 space
+        MemInitSection   2, 1, 0, 0, &03600000, AP_None, &03600000      ; LAGs
+
+ [ OSROM_ImageSize >= 8192
+        ; We will map in the whole ROM, but only the first 8M will fall in the 26-bit
+        ; address space, and be available for modules.
+        MemInitROMs      (OSROM_ImageSize / 1024), 1, 1, 1, &03800000, AP_Read
+ |
+  [ STB
+   [ ExtROMSupport                                                      ; System build option
+        ASSERT (OSROM_ImageSize <= 4096)                                ; No room for extension ROMs with an 8MB OS image
+        MemInitROMs      4, 1, 1, 1, &03800000, AP_Read                 ; ROM
+        MemInitSection   4, 1, 1, 1, &03C00000, AP_Read, &01000000      ; Extension ROM
+   |
+        MemInitROMs      8, 1, 1, 1, &03800000, AP_Read                 ; ROM (1st or 2nd bank)
+   ]
+  |
+        [ OSROM_ImageSize = 4096
+        MemInitROMs      4, 1, 1, 1, &03800000, AP_Read                 ; ROM
+        MemInitROMs      4, 1, 1, 1, &03C00000, AP_Read                 ; ROM
+        |
+        MemInitROMs      2, 1, 1, 1, &03800000, AP_Read                 ; ROM
+        MemInitROMs      2, 1, 1, 1, &03A00000, AP_Read                 ; ROM
+        MemInitROMs      2, 1, 1, 1, &03C00000, AP_Read                 ; ROM
+        MemInitROMs      2, 1, 1, 1, &03E00000, AP_Read                 ; ROM
+        ]
+  ]
+ ]
+
+ [ :LNOT: HAL
+        MemInitSection PSS, 1, 0, 0, PhysSpace, AP_None, &00000000      ; map of physical space
+ ]
+
+ [ ShadowROM
+        MemInitROMs      2, 1, 1, 1, &FF800000, AP_Read                 ; ROM
+        MemInitROMs      2, 1, 1, 1, &FFA00000, AP_Read                 ; ROM
+        MemInitROMs      2, 1, 1, 1, &FFC00000, AP_Read                 ; ROM
+        MemInitROMs      2, 1, 1, 1, &FFE00000, AP_Read                 ; ROM
+ ]
+
+; Now explicit initialisation of L2 for static pages
+
+ [ :LNOT: HAL
+        MemInitPagesL2  &8000, 0, 0, CursorChunkAddress, AP_Read, DRAMOffset_CursorChunk  ;but see L1L2PTenhancements
+        MemInitPagesL2  &8000, 1, 1, &00000000, AP_Full, DRAMOffset_PageZero
+        MemInitPagesL2  &8000, 1, 1, SysHeapChunkAddress, AP_Full, DRAMOffset_SystemHeap
+
+  [ StrongARM
+;StrongARM requires 2*16k of private logical space (used for absolutely nothing else), which is
+;readable and cacheable, for data cache cleaning purposes. We want to map the space to
+;start of ROM bank 1 (physical target), so that IOMD timings can be poked for maximum read speed
+;(only requirement of physical space is that it is readable without h/w abort). Here, though,
+;we have to conform to format for MemInitPagesL2, so we just point to some convenient RAM,
+;and fix things up later (see L1L2PTenhancements)
+;
+        MemInitPagesL2  &8000, 1, 1, ARMA_Cleaners_address, AP_Read, DRAMOffset_PageZero
+  ]
+  [ No26bitCode
+        MemInitPagesL2  AbtStackSize, 1, 1, AbtStack, AP_Read, DRAMOffset_AbortStack
+  ]
+
+        MemInitPagesL2     -1, 1, 1, UndStackSoftCamChunk, AP_Full, 0   ; variable offset and size
+
+ ] ; :LNOT HAL
+
+        &       0, 0, 0                                                 ; terminate table
+
+        LTORG
+
+; DistinctAddresses routine...
+; r0,r1 are the addresses to check
+; uses r2-5
+; writes interleaved patterns (to prevent dynamic storage...)
+; checks writing every bit low and high...
+; return Z-flag set if distinct
+
+; This routine must work in 32-bit mode
+
+DistinctAddresses ROUT
+        LDR     r2, [r0] ; preserve
+        LDR     r3, [r1]
+        LDR     r4, Pattern
+        STR     r4, [r0] ; mark first
+        MOV     r5, r4, ROR #16
+        STR     r5, [r1] ; mark second
+        LDR     r5, [r0]
+        CMP     r5, r4 ; check first
+        BNE     %10    ; exit with Z clear
+        LDR     r5, [r1] ; check second
+        CMP     r5, r4, ROR #16 ; clear Z if not same
+        BNE     %10
+; now check inverse bit writes
+        STR     r4, [r1] ; mark second
+        MOV     r5, r4, ROR #16
+        STR     r5, [r0] ; mark first
+        LDR     r5, [r1]
+        CMP     r5, r4 ; check second
+        BNE     %10   ; exit with Z clear
+        LDR     r5, [r0] ; check first
+        CMP     r5, r4, ROR #16 ; clear Z if not same
+10      STR     r3, [r1] ; restore
+        STR     r2, [r0]
+        MOV     pc, lr                  ; Z flag is already set up, and other flags don't matter
+
+Pattern
+        &       &AAFF5500 ; shiftable bit check pattern
+
+; init state with masked out page size
+
+ResetMemC_Value
+        & &E010C :OR: MEMCADR       ; slugged ROMs + flyback refresh only + 32K page
+
+; Constants
+;
+A0      *       1 :SHL: 00
+A1      *       1 :SHL: 01
+A2      *       1 :SHL: 02
+A3      *       1 :SHL: 03
+A4      *       1 :SHL: 04
+A5      *       1 :SHL: 05
+A6      *       1 :SHL: 06
+A7      *       1 :SHL: 07
+A8      *       1 :SHL: 08
+A9      *       1 :SHL: 09
+A10     *       1 :SHL: 10
+A11     *       1 :SHL: 11
+A12     *       1 :SHL: 12
+A13     *       1 :SHL: 13
+A14     *       1 :SHL: 14
+A15     *       1 :SHL: 15
+A16     *       1 :SHL: 16
+A17     *       1 :SHL: 17
+A18     *       1 :SHL: 18
+A19     *       1 :SHL: 19
+A20     *       1 :SHL: 20
+A21     *       1 :SHL: 21
+A22     *       1 :SHL: 22
+A23     *       1 :SHL: 23
+A24     *       1 :SHL: 24
+A25     *       1 :SHL: 25
+A26     *       1 :SHL: 26
+A27     *       1 :SHL: 27
+A28     *       1 :SHL: 28
+A29     *       1 :SHL: 29
+A30     *       1 :SHL: 30
+A31     *       1 :SHL: 31
+
+Page32K * &C ; in MEMC control reg patterns...
+Page16K * &8
+Page8K  * &4
+Page4K  * &0
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r0=0 -> Coming from the Test routine - no fancy business!
+;       r1-r6 trashable
+;       [[[ r9 = Current MEMC CR (true MEMC value, not fudged to look like 4K page size) ]]]
+
+; Out   [[[ r9 MEMC value with slowest ROM speed, correct pagesize ]]]
+;       r7 processor speed in kHz, bit 16 => can do STM to I/O (ie MEMC1a, MEMC2), bit 17 => MEMC2
+
+; This routine must work in 32-bit mode, and should not use any memory!!!!
+
+  [ RO371Timings
+
+TimeCPU ROUT         ;does not actually measure anything - assumes timings (and EDO for 7500FE) according to IOMD id
+
+        MOV     r2, #IOC                ; Address of the IO controller  (IOMD)
+
+        LDRB    r7, [r2, #IOMD_ID0]     ; Is
+        CMP     r7, #&E7                ; It
+        LDRB    r7, [r2, #IOMD_ID1]     ; A
+        CMPEQ   r7, #&D4                ; Risc PC ?
+        BEQ     timecpuriscpc
+        CMP     r7, #&AA                ; assume 7500 or 7500FE
+        BEQ     timecpu7500FE
+;7500 then
+        MOV     r7, #&32                      ; 5-3 cycle ROM access
+        STRB    r7, [r2, #IOMD_ROMCR0]
+        STRB    r7, [r2, #IOMD_ROMCR1]
+        MOV     r7, #&07                      ; clock dividers: /1 for I/O, /1 for CPU, /1 for memory
+        STRB    r7, [r2, #IOMD_CLKCTL]
+        LDR     r7, =(1 :SHL: 16) :OR: 16000  ; assumed 16MHz RAM (32 MHz bus)
+        MOV     pc, lr
+
+timecpu7500FE
+;set memory to 32MHz for early boot (avoid probs with POST and with power-on key detection)
+        MOV     r7, #&12                      ; 5-3 cycle ROM access, half speed (ie. 10-6)
+        STRB    r7, [r2, #IOMD_ROMCR0]
+        STRB    r7, [r2, #IOMD_ROMCR1]
+        MOV     r7, #&70                      ; EDO RAM, 32 bit wide, conservative RAS and CAS timing
+        STRB    r7, [r2, #IOMD_DRAMWID]       ; DRAM control reg. (more than just width on FE)
+        MOV     r7, #&04                      ; clock dividers: /1 for CPU, /2 for memory, /2 for I/O
+        STRB    r7, [r2, #IOMD_CLKCTL]
+        LDR     r7, =(1 :SHL: 16) :OR: 32000  ; assumed 32MHz RAM (64 MHz bus), even though /2 at the moment
+        MOV     pc, lr
+
+timecpuriscpc
+        MOV     r7, #&12                      ; 5-3 cycle ROM access
+        STR     r7, [r2, #IOMD_ROMCR0]
+        STR     r7, [r2, #IOMD_ROMCR1]
+        LDR     r7, =(1 :SHL: 16) :OR: 16000  ; assumed 16MHz RAM (32 MHz bus)
+        MOV     pc, lr
+
+ [ :LNOT: HAL
+;used by NewReset, after main kernel boot
+;sets full 64MHz memory if on 7500FE
+;preserves registers _and_ flags
+;
+finalmemoryspeed ROUT
+        EntryS  r0
+        MOV     lr, #IOC
+        LDRB    r0, [lr, #IOMD_ID0]     ; Is
+        CMP     r0, #&E7                ; It
+        LDRB    r0, [lr, #IOMD_ID1]     ; A
+        CMPEQ   r0, #&D4                ; Risc PC ?
+        BEQ     fmspeed_done
+        CMP     r0, #&AA                ; EQ if 7500FE
+        MOVEQ   r0, #&80
+        STREQB  r0, [lr, #&CC]          ; ASTCR register: set i/o asynchronous timing for fast memory clock
+        MOVEQ   r0, #&06                ; clock dividers: /1 for CPU, /1 for memory, /2 for I/O
+        STREQB  r0, [lr, #IOMD_CLKCTL]
+fmspeed_done
+        EXITS                           ; ***KJB - flag preservation necessary?
+ ]
+
+  | ; else if not RO371Timings
+
+ncpuloops * 1024 ; don't go longer than 4ms without refresh !
+nmulloops * 128
+
+TimeCPU ROUT            ;ONLY WORKS FOR IOMD(L) machines - this shouldn't be a problem though
+ [ :LNOT: AutoSpeedROMS
+        LDR     r7, =(1 :SHL: 16) :OR: 16000    ; indicate 16MHz RAM
+ |
+
+   [ {TRUE}
+;don't do timing for Risc PC
+;
+;MJS bug fix (since 3.70) - setup r3 properly, and don't corrupt r0 you fool
+;
+        MOV     r3, #IOC                ; Address of the IO controller
+        LDRB    r7, [r3, #IOMD_ID0]     ; Is
+        CMP     r7, #&E7                ; It
+        LDRB    r7, [r3, #IOMD_ID1]     ; A
+        CMPEQ   r7, #&D4                ; Medusa?
+        MOVEQ   r7,#&3e00               ;for non-Morris force 16MHz timing, assumed Risc PC
+        ORREQ   r7,r7,#&80
+        ORREQ   r7,r7,#&10000           ;and note we're on IOMD
+        MOVEQ   pc,lr
+  ]
+
+; Time CPU/Memory speed
+        LDR     r1, =&7FFE              ; 32K @ 2MHz = ~16ms limit
+        MOV     r3, #IOC                ; Address of the IO controller
+
+        CMP     r0, #0
+        LDREQ   r7, =(1 :SHL: 16) :OR: 16000    ; indicate 16MHz RAM - a little lie :-)
+        MOVEQ   pc, lr                          ; Quick, leg it while they're not looking!
+
+        ;Turn off the CPU cache
+
+        ; note that this old style code wont compile properly if HAL (no table)
+        ARM_number r4
+        SUB     r4,r4,#6
+        ADRL    r2,ARM_cacheoff_MMU_CR_table
+        LDR     r2,[r2,r4,LSL #2]                 ;get appropriate cache-off value for MMU control reg
+        ARM_write_control r2
+
+        ;And don't forget to flush afterwards :-)
+        ;SetCop r0, CR_IDCFlush
+        ;SetCop  r0, CR_TLBFlush
+
+        ;Turn off DMA/refreshes, but keep the reg contents for future restoration
+        LDRB    r4, [r3, #IOMD_VREFCR]  ;Refresh
+        LDRB    r5, [r3, #IOMD_SD0CR]   ;Sound
+        LDRB    r6, [r3, #IOMD_VIDCR]   ;Video
+        MOV     r2, #0
+        STRB    r2, [r3, #IOMD_VREFCR]  ;Refresh off
+        STRB    r2, [r3, #IOMD_SD0CR]   ;Sound off
+        STRB    r2, [r3, #IOMD_VIDCR]   ;Video off
+
+        MOV     r2, r1, LSR #8
+        STRB    r1, [r3, #Timer1LL]
+        STRB    r2, [r3, #Timer1LH]
+        LDR     r2, =ncpuloops
+        STRB    r2, [r3, #Timer1GO]     ; start the timer NOW
+        B       %FT10                   ; Looks superfluous, but is required
+                                        ; to get ncpuloops pipeline breaks
+10
+        SUBS    r2, r2, #1              ; 1S
+        BNE     %BT10                   ; 1N + 2S
+
+        STRB    r2, [r3, #Timer1LR]     ; latch count NOW
+        LDRB    r2, [r3, #Timer1CL]
+        LDRB    r7, [r3, #Timer1CH]
+        ADD     r2, r2, r7, LSL #8      ; count after looping is ...
+
+        SUB     r2, r1, r2              ; decrements !
+        MOV     r7, r2, LSR #1          ; IOC clock decrements at 2MHz, so we now have ticks in 1MHz
+
+        ;Put DMA/refreshes back to what they were
+        STRB    r4, [r3, #IOMD_VREFCR]  ;Refresh back
+        STRB    r5, [r3, #IOMD_SD0CR]   ;Sound back
+        STRB    r6, [r3, #IOMD_VIDCR]   ;Video back
+
+        ;And don't forget to flush first
+        ;SetCop r0, CR_IDCFlush
+        ;SetCop r0, CR_TLBFlush
+
+        ;Turn on the CPU cache
+
+        ;note that this old style code wont compile properly if HAL (no table)
+        ARM_number r4
+        SUB     r4,r4,#6
+        ADRL    r2,ARM_default_MMU_CR_table
+        LDR     r2,[r2,r4,LSL #2]                 ;get appropriate default value for MMU control reg
+        ARM_write_control r2
+
+        MOV     r2, r7
+; In ROM - each cpu loop took 4R cycles @ [MEMCLK cycles+1]/f*500ns/cycle
+
+ [ MorrisSupport
+        LDRB    r0, [r3, #IOMD_ID0]     ; Is
+        CMP     r0, #&E7                ; It
+        LDRB    r0, [r3, #IOMD_ID1]     ; A
+        CMPEQ   r0, #&D4                ; Medusa?
+        LDRNE   r0, =(4*15*500*ncpuloops)               ;Morris timing values [reordered to prevent miscalculation
+                                                        ;due to Aasm integering mid-calculation] (30720000)
+        LDREQ   r0, =(4*(8*500/1000)*ncpuloops*1000)    ;RiscPC/IOMD timing values      (16384000)
+        DivRem  r7, r0, r2, r1          ; r2 preserved,   R7=memory speed in kHz (MEMCLK/2)
+ |
+        LDR     r0, =(4*(8*500/1000)*ncpuloops*1000)    ;RiscPC/IOMD timing values      (16384000)
+        DivRem  r7, r0, r2, r1          ; r2 preserved,   R7=memory speed in kHz (MEMCLK/2)
+ ]
+
+        ;Set the ROM speeds appropriately here, including Burst/NoBurst
+        MOV     r4, #SystemROMspeed     ;
+        MUL     r0, r7, r4              ; r0 = number of cycles/ROM access *500000
+        LDR     r1, =500000
+        DivRem  r2, r0, r1, r4          ; r2 = divisor, r0 = remainder, r4 is trashed
+        CMP     r0, #0
+        ADDGT   r2, r2, #1              ; Always round _UPWARDS_
+        CMP     r2, #14
+        MOVGT   r2, #14                 ; Top out at 14 cycles
+
+        MOV     r5, #BurstROMspeed      ;
+        MUL     r0, r7, r5              ; r0 = number of cycles/ROM burst access *500000
+        DivRem  r3, r0, r1, r4          ; r3 = divisor, r0 = remainder, r4 is trashed
+        CMP     r0, #0
+        ADDGT   r3, r3, #1              ; Always round _upwards_
+        CMP     r3, #4
+        MOVGT   r3, #4                  ; Top out at 4 cycles
+
+  [ :LNOT: NormalSpeedROMS
+    ;limit speeds to 4 cycles minimum (125 ns) - eg. for StrongARM with EPROM
+    CMP   r2,#4
+    MOVLT r2,#4
+    CMP   r3,#4
+    MOVLT r3,#4
+    ! 0, "*** WARNING Autospeed ROM speed limited to 4 cycles (125 ns) minimum ***"
+  ]
+        ;So we have R2=cycles for normal access, R3=cycles for burst access
+        ;Load the iomd reg into R1, clear the bits we're messing with
+        MOV     r4, #IOC
+        LDRB    r1, [r4, #IOMD_ROMCR0]  ; Read ROMCR0
+        AND     r1, r1, #2_11000000     ; Only preserve bits 6 & 7
+
+        ADR     r0, MemClkTable
+        LDRB    r5, [r0, r2]            ; Grab the relevant byte
+        ORR     r1, r1, r5
+
+        ADR     r0, BurstTable
+        LDRB    r5, [r0, r3]            ; Grab the relevant info
+        ORR     r1, r1, r5
+
+        STRB    r1, [r4, #IOMD_ROMCR0]  ; Write ROMCR0
+        STRB    r1, [r4, #IOMD_ROMCR1]  ; Write ROMCR1
+
+        ORR     r7, r7, #1 :SHL: 16     ; Note MEMC1a presence (we're on IOMD)
+  ]
+timecpu_sodthefancytimingstuff
+        MOV     pc, lr
+
+  ] ;RO371Timings conditional
+
+        LTORG
+
+MemClkTable
+        DCB     2_100101                ; 0 cycles (set to min which is 2)
+        DCB     2_100101                ; 1 cycle (set to min. which is 2)
+        DCB     2_100101                ; 2 cycles
+        DCB     2_100100                ; 3 cycles
+        DCB     2_100011                ; 4 cycles
+        DCB     2_100010                ; 5 cycles
+        DCB     2_100001                ; 6 cycles
+        DCB     2_100000                ; 7 cycles
+        DCB     2_000011                ; 8 cycles (2x4)
+        DCB     2_000010                ; 9 cycles (same as 10)
+        DCB     2_000010                ; 10 cycles (2x5)
+        DCB     2_000001                ; 11 cycles (same as 12)
+        DCB     2_000001                ; 12 cycles (2x6)
+        DCB     2_000000                ; 13 cycles (same as 14)
+        DCB     2_000000                ; 14 cycles (2x7)
+
+        ALIGN
+BurstTable
+        DCB     2_000000                ; 0 cycles (no burst)
+        DCB     2_011000                ; 1 cycle
+        DCB     2_011000                ; 2 cycles
+        DCB     2_010000                ; 3 cycles
+        DCB     2_001000                ; 4 cycles
+
+        ALIGN
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       SWI OS_MMUControl
+;
+; in:   r0 = 0 (reason code 0, for modify control register)
+;       r1 = EOR mask
+;       r2 = AND mask
+;
+;       new control = ((old control AND r2) EOR r1)
+;
+; out:  r1 = old value
+;       r2 = new value
+;
+; in:   r0 bits 1 to 28 = 0, bit 0 = 1  (reason code 1, for flush request)
+;          r0 bit 31 set if cache(s) to be flushed
+;          r0 bit 30 set if TLB(s) to be flushed
+;          r0 bit 29 set if flush of entry only (else whole flush)
+;          r0 bit 28 set if write buffer to be flushed (implied by bit 31)
+;       r1 = entry specifier, if r0 bit 29 set
+;       (currently, flushing by entry is ignored, and just does full flush)
+;
+
+        ^       0
+MMUCReason_ModifyControl        # 1    ; reason code 0
+MMUCReason_Flush                # 1    ; reason code 1
+MMUCReason_Unknown              # 0
+
+MMUControlSWI   Entry
+        BL      MMUControlSub
+        PullEnv
+        ORRVS   lr, lr, #V_bit
+        ExitSWIHandler
+
+MMUControlSub
+        Push    lr
+        AND     lr,r0,#&FF
+        CMP     lr, #MMUCReason_Unknown
+        ADDCC   pc, pc, lr, LSL #2
+        B       MMUControl_Unknown
+        B       MMUControl_ModifyControl
+        B       MMUControl_Flush
+
+MMUControl_Unknown
+        ADRL    r0, ErrorBlock_HeapBadReason
+ [ International
+        BL      TranslateError
+ ]
+        Pull    lr
+        SETV
+        MOV     pc, lr
+
+
+MMUControl_ModifyControl ROUT
+        Push    "r3,r4,r5"
+        CMP     r1,#0
+        CMPEQ   r2,#&FFFFFFFF
+        BEQ     MMUC_modcon_readonly
+        MOV     r3,#0
+        LDRB    r5,[r3, #ProcessorArch]
+        PHPSEI  r4                      ; disable IRQs while we modify soft copy (and possibly switch caches off/on)
+
+        CMP     r5,#ARMv4
+        LDRLO   lr, [r3, #MMUControlSoftCopy]
+        ARM_read_control lr,HS
+;        MOVHS   lr,lr,LSL #19
+;        MOVHS   lr,lr,LSR #19           ; if ARMv4 or later, we can read control reg. - trust this more than soft copy
+        AND     r2, r2, lr
+        EOR     r2, r2, r1
+        MOV     r1, lr
+        LDR     r5, [r3, #ProcessorFlags]
+        TST     r5, #CPUFlag_SplitCache
+        BEQ     %FT05
+ [ {FALSE}
+        TST     r2,#MMUC_C              ; if split caches, then I bit mirrors C bit
+        ORRNE   r2,r2,#MMUC_I
+        BICEQ   r2,r2,#MMUC_I
+ ]
+05
+        STR     r2, [r3, #MMUControlSoftCopy]
+        BIC     lr, r2, r1              ; lr = bits going from 0->1
+        TST     lr, #MMUC_C             ; if cache turning on then flush cache before we do it
+        TSTEQ   lr, #MMUC_I
+        BEQ     %FT10
+
+        Push    "r0"
+        MOV     r0, #0
+        ARMop   Cache_InvalidateAll,,,r0
+        Pull    "r0"
+10
+        BIC     lr, r1, r2              ; lr = bits going from 1->0
+        TST     lr, #MMUC_C             ; if cache turning off then clean data cache first
+        BEQ     %FT15
+        Push    "r0"
+        MOV     r0, #0
+        ARMop   Cache_CleanAll,,,r0
+        Pull    "r0"
+15
+        ARM_write_control r2
+        BIC     lr, r1, r2              ; lr = bits going from 1->0
+        TST     lr, #MMUC_C             ; if cache turning off then flush cache afterwards
+        TSTNE   lr, #MMUC_I
+        BEQ     %FT20
+        Push    "r0"
+        MOV     r0, #0
+        ARMop   Cache_InvalidateAll,,,r0
+        Pull    "r0"
+20
+        PLP     r4                      ; restore IRQ state
+        Pull    "r3,r4,r5,pc"
+
+MMUC_modcon_readonly
+        MOV     r3, #0
+        LDRB    r5, [r3, #ProcessorArch]
+        CMP     r5, #ARMv4
+        LDRLO   lr, [r3, #MMUControlSoftCopy]
+        ARM_read_control lr,HS
+;        MOVHS   lr,lr,LSL #19
+;        MOVHS   lr,lr,LSR #19           ; if ARMv4 or later, we can read control reg. - trust this more than soft copy
+        STRHS   lr, [r3, #MMUControlSoftCopy]
+        MOV     r1, lr
+        MOV     r2, lr
+        Pull    "r3,r4,r5,pc"
+
+MMUControl_Flush
+       MOVS     r10, r0
+       MOV      r12, #0
+       ARMop    Cache_CleanInvalidateAll,MI,,r12
+       TST      r10,#&40000000
+       ARMop    TLB_InvalidateAll,NE,,r12
+       TST      r10,#&10000000
+       ARMop    WriteBuffer_Drain,NE,,r12
+       ADDS     r0,r10,#0
+       Pull     "pc"
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       Exception veneers
+
+ [ :LNOT:No26bitCode
+; Undefined instruction trap pre-veneer
+; in:   r13_undef -> a FD stack
+;       r14_undef -> undefined instruction +4
+;       psr_undef = PSR at time of undef'd instruction
+
+UndPreVeneer    ROUT
+
+        Push    "r0-r7,r14"             ; push r0-r7 on undef stack, and make room for return address
+        MOV     r0, r13_undef
+
+; for the time being just merge lr and psr
+
+        MRS     r1, SPSR                                ; r1 = saved PSR
+        AND     r2, r1, #&F0000003                      ; get saved NZCV and 26 bit modes
+        ORR     lr_undef, lr_undef, r2
+        AND     r2, r1, #I32_bit + F32_bit              ; extract I and F from new place
+        ORR     r1, lr_undef, r2, LSL #IF32_26Shift     ; r1 = combined lr and psr
+
+        MRS     r2, CPSR                ; now switch into SVC26
+        BIC     r3, r2, #&1F
+        ORR     r3, r3, #SVC26_mode
+        MSR     SPSR_cxsf, r3           ; set SPSR_undef to be CPSR but with SVC26
+        MSR     CPSR_c, r3              ; and select this mode now
+
+        MOV     lr_svc, r1              ; lr_svc = PC + PSR from exception
+
+        MSR     CPSR_c, r2              ; go back into undef mode
+
+        LDR     r1, =UndHan             ; work out address of undefined instruction handler
+        LDR     r1, [r1]
+        STR     r1, [r0, #8*4]          ; and store it as return address
+        Pull    "r0-r7, pc",,^          ; exit to handler, restoring sp_undef and entering SVC26 mode
+ ]
+
+ [ No26bitCode :LAND: ChocolateAMB
+;  Instruction fetch abort pre-veneer, just to field possible lazy AMB aborts
+;
+PAbPreVeneer    ROUT
+        Push    "r0-r7, lr"               ; wahey, we have an abort stack
+        SUB     r0, lr_abort, #4          ; aborting address
+        MOV     r2, #1
+        BL      AMB_LazyFixUp             ; can trash r0-r7, returns NE status if claimed and fixed up
+        Pull    "r0-r7, lr", NE           ; restore regs and
+        SUBNES  pc, lr_abort, #4          ; restart aborting instruction if fixed up
+        LDR     lr, [sp, #8*4]            ; (not a lazy abort) restore lr
+        LDR     r0, =PAbHan               ; we want to jump to PAb handler, in abort mode
+        LDR     r0, [r0]
+        STR     r0, [sp, #8*4]
+        Pull    "r0-r7, pc"
+ ]
+
+ [ :LNOT:No26bitCode
+; Instruction fetch abort pre-veneer
+
+PAbPreVeneer    ROUT
+
+        LDR     r13_abort, =PreVeneerRegDump
+        STMIA   r13_abort, {r0-r7}
+        MOV     r0, r13_abort
+
+; for the time being just merge lr and psr
+
+        MRS     r1, SPSR                                ; r1 = saved PSR
+
+        LDR     r2, =Abort32_dumparea
+        STMIA   r2, {r1,lr_abort}                       ;dump 32-bit PSR, fault address (PC)
+        STR     lr_abort,[r2,#2*4]                      ;dump 32-bit PC
+
+        AND     r2, r1, #&F0000003                      ; get saved NZCV and 26 bit modes
+        ORR     lr_abort, lr_abort, r2
+        AND     r2, r1, #I32_bit + F32_bit              ; extract I and F from new place
+        ORR     r1, lr_abort, r2, LSL #IF32_26Shift     ; r1 = combined lr and psr
+
+        MRS     r2, CPSR                ; now switch into SVC26
+        BIC     r2, r2, #&1F
+        ORR     r2, r2, #SVC26_mode
+        MSR     CPSR_c, r2
+
+        MOV     lr_svc, r1              ; lr_svc = PC + PSR from exception
+        LDR     r1, =PAbHan
+        LDR     r1, [r1]
+        STR     r1, [r0, #8*4]
+        LDMIA   r0, {r0-r7, pc}         ; jump to prefetch abort handler
+ ]
+
+; Preliminary layout of abort indirection nodes
+
+        ^       0
+AI_Link #       4
+AI_Low  #       4
+AI_High #       4
+AI_WS   #       4
+AI_Addr #       4
+
+        EXPORT DAbPreVeneer
+
+DAbPreVeneer    ROUT
+
+ [ No26bitCode
+        SUB     r13_abort, r13_abort, #17*4     ; we use stacks, dontcherknow
+ |
+        LDR     r13_abort, =PreVeneerRegDump
+ ]
+        STMIA   r13_abort, {r0-r7}              ; save unbanked registers anyway
+        STR     lr_abort, [r13_abort, #15*4]    ; save old PC, ie instruction address
+
+  [ ChocolateAMB
+        ARM_read_FAR r0                         ; aborting address
+        MOV     r2, #0
+        BL      AMB_LazyFixUp                   ; can trash r0-r7, returns NE status if claimed and fixed up
+        LDR     lr_abort, [r13_abort, #15*4]    ; restore lr_abort
+        LDMIA   r13_abort, {r0-r7}              ; restore regs
+        ADDNE   r13_abort, r13_abort, #17*4     ; if fixed up, restore r13_abort
+        SUBNES  pc, lr_abort, #8                ; and restart aborting instruction
+  ]
+
+        MRS     r0, SPSR                        ; r0 = PSR when we aborted
+        MRS     r1, CPSR                        ; r1 = CPSR
+        ADD     r2, r13_abort, #8*4             ; r2 -> saved register bank for r8 onwards
+
+        LDR     r4, =Abort32_dumparea+3*4       ;use temp area (avoid overwriting main area for expected aborts)
+        ARM_read_FAR r3
+        STMIA   r4, {r0,r3,lr_abort}            ; dump 32-bit PSR, fault address, 32-bit PC
+
+        MOV     r4, lr_abort                    ; move address of aborting instruction into an unbanked register
+        BIC     r1, r1, #&1F                    ; knock out current mode bits
+        ANDS    r3, r0, #&1F                    ; extract old mode bits (and test for USR26_mode (=0))
+        TEQNE   r3, #USR32_mode                 ; if usr26 or usr32 then use ^ to store registers
+  [ SASTMhatbroken
+        STMEQIA r2!,{r8-r12}
+        STMEQIA r2 ,{r13,r14}^
+        SUBEQ   r2, r2, #5*4
+  |
+        STMEQIA r2, {r8-r14}^
+  ]
+        BEQ     %FT05
+
+        ORR     r3, r3, r1                      ; and put in user's
+        MSR     CPSR_c, r3                      ; switch to user's mode
+
+        STMIA   r2, {r8-r14}                    ; save the banked registers
+
+        MRS     r5, SPSR                        ; get the SPSR for the aborter's mode
+        STR     r5, [r2, #8*4]                  ; and store away in the spare slot on the end
+                                                ; (this is needed for LDM with PC and ^)
+  [ No26bitCode
+        ORR     r1, r1, #ABT32_mode
+        MSR     CPSR_c, r1                      ; back to abort mode for the rest of this
+05
+        Push    "r0"                            ; save SPSR_abort
+  |
+05
+        ORR     r1, r1, #SVC26_mode             ; then switch to SVC for the rest of this
+        MSR     CPSR_c, r1
+        Push    "r0, lr_svc"                    ; save SPSR_abort and lr_svc
+  ]
+
+  [ SASTMhatbroken
+        SUB     sp, sp, #3*4
+        STMIA   sp, {r13,r14}^                  ; save USR bank in case STM ^, and also so we can corrupt them
+        NOP
+        STMDB   sp!, {r8-r12}
+  |
+        SUB     sp, sp, #8*4                    ; make room for r8_usr to r14_usr and PC
+        STMIA   sp, {r8-r15}^                   ; save USR bank in case STM ^, and also so we can corrupt them
+  ]
+
+        SUB     r11, r2, #8*4                   ; r11 -> register bank
+        STR     r4, [sp, #7*4]                  ; store aborter's PC in user register bank
+
+        TST     r0, #T32_bit                    ; were they in Thumb mode? if so, give up now
+        BNE     %FT90
+
+;ARM 810 or StrongARM allow signed byte load or half-word load/stores - not supported at present
+;***KJB - need to think about LDRH family
+        LDR     r10, [r4, #-8]!                 ; r10 = actual instruction that aborted, and r4 points to it
+        AND     r9, r10, #&0E000000
+        TEQ     r9, #&08000000                  ; test for LDM/STM
+        BNE     %FT50                           ; if not LDM/STM, then it's an "easy" LDR/STR
+
+;        Write   "It's an LDM/STM"
+
+ [ DebugAborts
+        DLINE   "It's an LDM/STM"
+ ]
+
+; First count the number of transferred registers, and undo any writeback
+
+        MOV     r9, #0                          ; r9 = no. of registers in list
+        MOVS    r8, r10, LSL #16
+        BEQ     %FT20
+10
+        MOVS    r8, r8, LSL #1
+        ADDCS   r9, r9, #1
+        BNE     %BT10
+20
+        MOV     r8, r10, LSR #16
+        AND     r8, r8, #&0F                    ; base register number
+        LDR     r7, [r11, r8, LSL #2]           ; ------""----- value
+
+        TST     r10, #1 :SHL: 23                ; test up/down
+        MOVNE   r1, r9                          ; if up, r1 = +ve no. of regs
+        RSBEQ   r1, r9, #0                      ; if down, r1 = -ve no. of regs
+
+;initially assume writeback
+;we want r6 = base reg value before assumed writeback (r7 is base reg value after abort)
+;writeback will have been performed for ARMs with CPUFlag_BaseRestored clear
+;
+        MOV     r6, #0
+        LDR     r6, [r6, #ProcessorFlags]
+        TST     r6, #CPUFlag_BaseRestored
+        MOVNE   r6, r7
+        SUBEQ   r6, r7, r1, ASL #2
+
+;now we want r6 to be the base register value before the abort, so we will discard
+;our adjusted value and take r7, if the instruction in fact had no writeback
+;
+        TST     r10, #1 :SHL: 21                ; test if write-back bit set
+        TEQNE   r8, #15                         ; (if base is PC then write-back not allowed)
+        MOVEQ   r6, r7                          ; if not wb, reg after abort is correct
+
+        MOV     r1, sp                          ; r1 -> end of stack frame, and start of user-mode register bank
+        SUB     sp, sp, r9, LSL #2              ; make stack frame for registers
+        TST     r10, #1 :SHL: 20                ; if its an STM, we have to load up the stack frame
+        BNE     %FT30                           ; but if it's an LDM, we call trap routine first
+
+        STR     r6, [r11, r8, LSL #2]           ; store original base in register list, to be overwritten after 1st transfer
+
+; now go through registers, storing them into frame
+
+        MOV     r5, sp                          ; pointer to position in stack frame
+        MOV     lr, r10, LSL #16                ; extract bottom 16 bits
+        MOVS    lr, lr, LSR #16                 ; ie bitmask of which registers r0-r15 stored
+        BEQ     %FT30                           ; this shouldn't happen (it's illegal)
+
+        MOV     r3, r11                         ; current pointer into register bank
+21
+        TST     r10, #1 :SHL: 22                ; is it STM with ^
+        ANDNE   lr, lr, #&FF                    ; if so then extract bottom 8 bits (r0-r7 on 1st pass, r8-r15 on 2nd)
+22
+        MOVS    lr, lr, LSR #1                  ; shift bit into carry
+        LDRCS   r2, [r3], #4                    ; if set bit then transfer word from register bank
+        STRCS   r2, [r5], #4                    ; into stack frame
+        STRCS   r7, [r11, r8, LSL #2]           ; and after 1st transfer, store updated base into register bank
+        ADDCC   r3, r3, #4                      ; else just increment register bank pointer
+        BNE     %BT22                           ; if more bits to do, then loop
+
+        TEQ     r5, r1                          ; have we done all registers?
+        MOVNE   lr, r10, LSR #8                 ; no, then must have been doing STM with ^, and have some user-bank regs to store
+        MOVNE   r3, r1                          ; so point r3 at user-mode register bank
+        BNE     %BT21                           ; and go back into loop
+
+30
+
+; now work out address of 1st transfer
+
+        ANDS    r5, r10, #(3 :SHL: 23)          ; bit 24 set => pre, bit 23 set => inc
+        SUBEQ   r2, r6, r9, LSL #2              ; if post-dec, then 1st address = initial-nregs*4+4
+        ADDEQ   r2, r2, #4
+        BEQ     %FT32
+
+        CMP     r5, #2 :SHL: 23
+        MOVCC   r2, r6                          ; CC => post-inc, so 1st address = initial
+        SUBEQ   r2, r6, r9, LSL #2              ; EQ => pre-dec,  so 1st address = initial-nregs*4
+        ADDHI   r2, r6, #4                      ; HI => pre-inc,  so 1st address = initial+4
+32
+        ANDS    r0, r10, #1 :SHL: 20            ; r0 = 0 => STM
+        MOVNE   r0, #1                          ;    = 1 => LDM
+        LDR     r1, [r1, #8*4]                  ; get SPSR_abort
+        TST     r1, #&F                         ; test if transfer took place in USR mode
+        ORRNE   r0, r0, #2                      ; if not then set bit 1 of flags word in r0
+        MOV     r1, sp                          ; block to transfer from/into
+        BIC     r2, r2, #3                      ; LDM/STM always present word-aligned address
+        MOV     r3, r9, LSL #2                  ; length of transfer in bytes, and r4 still points to aborting instruction
+        BL      ProcessTransfer
+        ADDVS   sp, sp, r9, LSL #2              ; if invalid transfer then junk stack frame
+        BVS     %FT90                           ; and generate an exception
+
+; we transferred successfully, so now check if LDM and load up register bank from block
+
+        TST     r10, #1 :SHL: 20
+        ADDEQ   sp, sp, r9, LSL #2              ; it's an STM, so junk stack frame and tidy up
+        BEQ     %FT70
+
+; now go through registers, loading them from frame
+
+        ADD     r1, sp, r9, LSL #2              ; r1 -> end of stack frame, and start of user-mode bank registers
+        MOV     r5, sp                          ; pointer to position in stack frame
+        MOV     r4, r10, LSL #16                ; extract bottom 16 bits
+        MOVS    r4, r4, LSR #16                 ; ie bitmask of which registers r0-r15 stored
+        BEQ     %FT40                           ; this shouldn't happen (it's illegal)
+
+        SUB     r3, r1, #8*4                    ; r3 -> notional start of user bank, if it began at r0 (it actually starts at r8)
+        MOV     r0, #0                          ; assume no user registers by default
+        TST     r10, #1 :SHL: 15                ; is PC in list
+        BNE     %FT34                           ; then can't be LDM of user bank
+        TST     r10, #1 :SHL: 22                ; is it LDM with ^
+        BEQ     %FT34                           ; no, then use main bank for all registers
+        LDR     r2, [r1, #8*4]                  ; get SPSR
+        ANDS    r2, r2, #15                     ; get bottom 4 bits of mode (EQ => USR26 or USR32)
+        BEQ     %FT34                           ; if USR mode then use main bank for all
+        TEQ     r2, #FIQ26_mode                 ; if FIQ mode then put r8-r14 in user bank
+        LDREQ   lr, =&7F00                      ; then put r8-r14 in user bank
+        LDRNE   lr, =&6000                      ; else put r13,r14 in user bank
+        AND     r0, r4, lr                      ; r0 = mask of registers to put into user bank
+        BIC     r4, r4, lr                      ; r4 = mask of registers to put into main bank
+        MOV     lr, #0
+34
+        MOVS    r4, r4, LSR #1                  ; shift bit into carry
+        LDRCS   r2, [r5], #4                    ; if set bit then transfer word from stack frame
+        STRCS   r2, [r11, lr, LSL #2]           ; into main register bank
+        MOVS    r0, r0, LSR #1                  ; shift bit into carry
+        LDRCS   r2, [r5], #4                    ; if set bit then transfer word from stack frame
+        STRCS   r2, [r3, lr, LSL #2]            ; into user register bank
+        ADD     lr, lr, #1
+        ORRS    r6, r0, r4                      ; have we finished both banks?
+        BNE     %BT34                           ; no, then loop
+
+; If LDM with PC in list, then add 4 to it, so the exit procedure is the same as if PC not loaded
+; Also, if it was an LDM with PC and ^, then we have to update the stacked SPSR
+
+40
+        MOV     sp, r1                          ; junk frame
+
+        TST     r10, #1 :SHL: 15                ; check PC in list
+        ADDNE   r2, r2, #4                      ; since PC is last, r2 will still hold the value loaded
+        STRNE   r2, [r11, #15*4]                ; store back into main register bank
+        TSTNE   r10, #1 :SHL: 22                ; now check LDM ^
+        BEQ     %FT70                           ; [not LDM with PC in list]
+
+        LDR     r9, [sp, #8*4]                  ; get SPSR_abort
+        AND     r8, r9, #&1F                    ; r8 = aborter's mode
+        TEQ     r8, #USR32_mode                 ; if in USR32
+        BEQ     %FT70                           ; then the ^ has no effect (actually uses CPSR)
+        TST     r8, #&1C                        ; if 32-bit mode
+        LDRNE   r7, [r11, #16*4]                ; then use SPSR for the aborter's mode else use updated r15 in r2 (26-bit format)
+        ANDEQ   r7, r2, #&F0000003              ; flag and mode bits in same place
+        ANDEQ   r2, r2, #&0C000000              ; but I and F have to move to bits 7 and 6
+        ORREQ   r7, r7, r2, LSR #(26-6)
+
+; r7 is now desired PSR (in 32-bit format) to update to
+; now check which bits can actually be updated
+
+        TEQ     r8, #USR26_mode
+        BICEQ   r9, r9, #&F0000000              ; if USR26 then we can only update NZCV
+        ANDEQ   r7, r7, #&F0000000
+        ORREQ   r9, r9, r7
+        MOVNE   r9, r7                          ; else can update all bits
+        STR     r9, [sp, #8*4]                  ; store back updated SPSR_abort (to become CPSR)
+        B       %FT70                           ; now tidy up
+
+50
+
+; it's an LDR/STR - first work out offset
+
+ [ DebugAborts
+        DLINE   "It's an LDR/STR"
+ ]
+
+        TST     r10, #1 :SHL: 25                ; if immediate
+        MOVEQ   r9, r10, LSL #(31-11)           ; then extract bottom 12 bits
+        MOVEQ   r9, r9, LSR #(31-11)
+        BEQ     %FT60
+
+        AND     r8, r10, #&0F                   ; register to shift
+        LDR     r9, [r11, r8, LSL #2]           ; get actual value of register
+
+        MOV     r8, r10, LSR #7                 ; extract shift amount
+        ANDS    r8, r8, #&1F                    ; (bits 7..11)
+        MOVEQ   r8, #32                         ; if zero then make 32
+
+        ANDS    r7, r10, #&60
+        ANDEQ   r8, r8, #&1F                    ; LSL 0 is really zero
+        MOVEQ   r9, r9, LSL r8
+        TEQ     r7, #&20
+        MOVEQ   r9, r9, LSR r8
+        TEQ     r7, #&40
+        MOVEQ   r9, r9, ASR r8
+        TEQ     r7, #&60
+        MOVEQ   r9, r9, ROR r8                  ; if 32 then we haven't spoilt it!
+        TEQEQ   r8, #32                         ; if ROR #32 then really RRX
+        BNE     %FT60
+        LDR     r7, [sp, #8*4]                  ; get SPSR
+        AND     r7, r7, #C_bit
+        CMP     r7, #1                          ; set carry from original user
+        MOV     r9, r9, RRX
+60
+        TST     r10, #1 :SHL: 23                ; test for up/down
+        RSBEQ   r9, r9, #0                      ; if down then negate
+
+;;;assume ARM 6 configured for LateAbort - others cannot be configured
+;;;so, at run time, ARM 6 or 7 means late, ARM 8 or StrongARM means early
+;;;
+;;; [ LateAborts
+;;;        TST     r10, #1 :SHL: 21                ; if write-back
+;;;        MOVNE   r8, #0                          ; then no post-inc
+;;;        RSBEQ   r8, r9, #0                      ; else post-inc = - pre-inc
+;;;        ADD     r0, r8, r9                      ; amount to subtract off base register for correction
+
+;;;        TST     r10, #1 :SHL: 24                ; however, if we're doing post-increment
+;;;        MOVEQ   r8, r9                          ; then post-inc = what was pre-inc
+;;;        MOVEQ   r0, r9                          ; and adjustment is what was added on
+;;;        RSB     r9, r8, #0                      ; and pre-inc = -post-inc
+;;; |
+;;;        TST     r10, #1 :SHL: 21                ; if write-back
+;;;        MOVNE   r8, #0                          ; then no post-inc
+;;;        RSBEQ   r8, r9, #0                      ; else post-inc = - pre-inc
+
+;;;        TST     r10, #1 :SHL: 24                ; however, if we're doing post-increment
+;;;        MOVEQ   r8, r9                          ; then post-inc = what was pre-inc
+;;;        MOVEQ   r9, #0                          ; and pre-inc = 0
+;;; ]
+
+        MOV     r8, #0
+        LDR     r8, [r8, #ProcessorFlags]
+        TST     r8, #CPUFlag_BaseRestored
+        BNE     %FT62
+;not base restored
+        TST     r10, #1 :SHL: 21                ; if write-back
+        MOVNE   r8, #0                          ; then no post-inc
+        RSBEQ   r8, r9, #0                      ; else post-inc = - pre-inc
+        ADD     r0, r8, r9                      ; amount to subtract off base register for correction
+
+        TST     r10, #1 :SHL: 24                ; however, if we're doing post-increment
+        MOVEQ   r8, r9                          ; then post-inc = what was pre-inc
+        MOVEQ   r0, r9                          ; and adjustment is what was added on
+        RSB     r9, r8, #0                      ; and pre-inc = -post-inc
+        B       %FT63
+62
+;base restored
+        TST     r10, #1 :SHL: 21                ; if write-back
+        MOVNE   r8, #0                          ; then no post-inc
+        RSBEQ   r8, r9, #0                      ; else post-inc = - pre-inc
+
+        TST     r10, #1 :SHL: 24                ; however, if we're doing post-increment
+        MOVEQ   r8, r9                          ; then post-inc = what was pre-inc
+        MOVEQ   r9, #0                          ; and pre-inc = 0
+
+63
+        MOV     r7, r10, LSL #31-19
+        MOV     r7, r7, LSR #28                 ; r7 = base register number
+        LDR     r6, [r11, r7, LSL #2]           ; r6 = base register value
+
+;;; [ LateAborts
+;;;        SUB     r0, r6, r0                      ; compute adjusted base register
+;;;        STR     r0, [r11, r7, LSL #2]           ; and store back in case we decide to abort after all
+;;; ]
+
+        MOV     r1, #0
+        LDR     r1, [r1, #ProcessorFlags]
+        TST     r1, #CPUFlag_BaseRestored
+        SUBEQ   r0, r6, r0                      ; compute adjusted base register (if not base restored)
+        STREQ   r0, [r11, r7, LSL #2]           ; and store back in case we decide to abort after all
+
+; no need to clear PSR bits out of R15, because PSR is separate
+
+        ADD     r9, r9, r6                      ; r2 = offset+base = illegal address
+
+ [ DebugAborts
+        DREG    r9, "Aborting address = "
+        DREG    r8, "Post-increment = "
+        DREG    r4, "Instruction where abort happened = "
+ ]
+
+        ANDS    r0, r10, #1 :SHL: 20            ; if an LDR then bit 20 set
+        MOVNE   r0, #1                          ; so make 1
+        SUBNE   sp, sp, #4                      ; then just create 1 word stack frame
+        BNE     %FT65
+
+        MOV     r5, r10, LSR #12                ; else it's an STR (r0 = 0)
+        AND     r5, r5, #&0F                    ; r5 = source register number
+        LDR     r5, [r11, r5, LSL #2]           ; r5 = value of source register
+ [ DebugAborts
+        DREG    r5, "Data value to store = "
+ ]
+        Push    "r5"                            ; create stack frame with this value in it
+65
+        LDR     r1, [sp, #(1+8)*4]              ; get SPSR_abort
+        TST     r1, #&F                         ; test if transfer took place in USR mode
+        ORRNE   r0, r0, #2                      ; if not then set bit 1 of flags word in r0
+
+        MOV     r1, sp                          ; r1 -> data block
+        TST     r10, #1 :SHL: 22                ; if byte transfer
+        MOVNE   r3, #1                          ; then length of transfer = 1
+        MOVNE   r2, r9                          ; and use unmolested address
+        MOVEQ   r3, #4                          ; else length = 4
+        BICEQ   r2, r9, #3                      ; and mask out bottom 2 bits of address
+
+        BL      ProcessTransfer
+        ADDVS   sp, sp, #4                      ; if illegal transfer, junk stack frame
+        BVS     %FT90                           ; and cause exception
+
+        ADD     r6, r9, r8                      ; update base register with offset
+        STR     r6, [r11, r7, LSL #2]           ; and store back (NB if LDR and dest=base, the load overwrites the updated base)
+
+        TST     r10, #1 :SHL: 20                ; if it's STR (not LDR)
+        ADDEQ   sp, sp, #4                      ; then junk stack frame
+        BEQ     %FT70                           ; and tidy up
+
+        Pull    "r6"                            ; LDR/LDRB, so get value to load into register
+        TST     r10, #1 :SHL: 22                ; if LDRB
+        ANDNE   r6, r6, #&FF                    ; then put zero in top 3 bytes of word
+        ANDEQ   r9, r9, #3                      ; else rotate word to correct position - r9 = bottom 2 bits of address
+        MOVEQ   r9, r9, LSL #3                  ; multiply by 8 to get rotation factor
+        MOVEQ   r6, r6, ROR r9                  ; rotate to correct position in register
+
+        MOV     r5, r10, LSR #12                ; test for LDR PC
+        AND     r5, r5, #&0F                    ; r5 = dest register number
+        TEQ     r5, #15                         ; if PC
+        ADDEQ   r6, r6, #4                      ; then adjust for abort exit
+        STR     r6, [r11, r5, LSL #2]           ; store into register bank
+
+70
+
+; Tidy up routine, common to LDR/STR and LDM/STM
+
+        ADD     r2, r11, #8*4                   ; point r2 at 2nd half of main register bank
+        LDMIA   sp, {r8-r14}^                   ; reload user bank registers
+        NOP                                     ; don't access banked registers after LDM^
+        ADD     sp, sp, #8*4                    ; junk user bank stack frame
+
+ [ No26bitCode
+        Pull    "r0"                            ; r0 = (possibly updated) SPSR_abort
+        MRS     r1, CPSR
+ |
+        Pull    "r0, lr"                        ; r0 = (possibly updated) SPSR_abort, restore lr_svc
+
+        SetMode ABT32_mode, r1                  ; leaves r1 = current PSR
+ ]
+
+        MRS     r6, SPSR                        ; get original SPSR, with aborter's original mode
+        AND     r7, r6, #&0F
+        TEQ     r7, #USR26_mode                 ; also matches USR32
+        LDMEQIA r2, {r8-r14}^                   ; if user mode then just use ^ to reload registers
+        NOP
+        BEQ     %FT80
+
+        ORR     r6, r6, #I32_bit                ; use aborter's flags and mode but set I
+        BIC     r6, r6, #T32_bit                ; and don't set Thumb bit
+        MSR     CPSR_c, r6                      ; switch to aborter's mode
+        LDMIA   r2, {r8-r14}                    ; reload banked registers
+        MSR     CPSR_c, r1                      ; switch back to ABT32
+
+80
+        LDR     lr_abort, [r13_abort, #15*4]    ; get PC to return to
+        MSR     SPSR_cxsf, r0                   ; set up new SPSR (may have changed for LDM {PC}^)
+
+        LDMIA   r13_abort, {r0-r7}              ; reload r0-r7
+ [ No26bitCode
+        ADD     r13_abort, r13_abort, #17*4     ; we use stacks, dontcherknow
+ ]
+        SUBS    pc, lr_abort, #4                ; go back 8 to adjust for PC being 2 words out,
+                                                ; then forward 4 to skip instruction we've just executed
+
+; Call normal exception handler
+
+90
+
+; copy temp area to real area (we believe this is an unexpected data abort now)
+
+        LDR     r0, =Abort32_dumparea
+        LDR     r1, [r0,#3*4]
+        STR     r1, [r0]
+        LDR     r1, [r0,#4*4]
+        STR     r1, [r0,#4]
+        LDR     r1, [r0,#5*4]
+        STR     r1, [r0,#2*4]
+
+ [ No26bitCode
+        MOV     r0, #0                                  ; we're going to call abort handler
+        STR     r0, [r0, #CDASemaphore]                 ; so allow recovery if we were in CDA
+
+        LDR     r0, =DAbHan
+        LDR     r0, [r0]                                ; get address of data abort handler
+ [ DebugAborts
+        DREG    r0, "Handler address = "
+ ]
+
+        ADD     r2, r11, #8*4                   ; point r2 at 2nd half of main register bank
+        LDMIA   sp, {r8-r14}^                   ; reload user bank registers
+        NOP                                     ; don't access banked registers after LDM^
+        ADD     sp, sp, #9*4                    ; junk user bank stack frame + saved SPSR
+
+        MRS     r1, CPSR
+
+        MRS     r6, SPSR                        ; get original SPSR, with aborter's original mode
+        AND     r7, r6, #&0F
+        TEQ     r7, #USR26_mode                 ; also matches USR32
+        LDMEQIA r2, {r8-r14}^                   ; if user mode then just use ^ to reload registers
+        NOP
+        BEQ     %FT80
+
+        ORR     r6, r6, #I32_bit                ; use aborter's flags and mode but set I
+        BIC     r6, r6, #T32_bit                ; and don't set Thumb
+        MSR     CPSR_c, r6                      ; switch to aborter's mode
+        LDMIA   r2, {r8-r14}                    ; reload banked registers
+        MSR     CPSR_c, r1                      ; switch back to ABT32
+
+80
+        STR     r0, [r13_abort, #16*4]          ; save handler address at top of stack
+        LDR     lr_abort, [r13_abort, #15*4]    ; get abort address back in R14
+
+        LDMIA   r13_abort, {r0-r7}              ; reload r0-r7
+        ADD     r13_abort, r13_abort, #16*4     ; we use stacks, dontcherknow
+
+        Pull    pc
+
+ |
+; for the time being just merge lr and psr
+
+        LDR     r0, [sp, #8*4]                          ; r0 = original SPSR (can't have been modified)
+
+        LDR     lr, [r11, #15*4]                        ; get PC of aborter
+        AND     r1, r0, #&F0000000                      ; get saved NZCV
+        ORR     lr, lr, r1
+        AND     r1, r0, #I32_bit + F32_bit              ; extract I and F from new place
+        ORR     lr, lr, r1, LSL #IF32_26Shift           ; and merge
+        AND     r1, r0, #3                              ; get old mode bits (have to assume a 26-bit mode!)
+        ORR     lr, lr, r1                              ; lr = combined lr and psr
+        STR     lr, [sp, #9*4]                          ; overwrite stacked lr_svc
+        TEQ     r1, #SVC26_mode                         ; if aborter was in SVC mode
+        STREQ   lr, [r11, #14*4]                        ; then also overwrite r14 in aborter's register bank
+
+        BIC     r0, r0, #&1F                            ; clear mode bits in SPSR
+        ORR     r0, r0, #SVC26_mode :OR: I32_bit        ; and force SVC26 with I set
+ [ DebugAborts
+        DLINE   "Going to call data abort handler"
+        DREG    lr, "lr_svc will be "
+        DREG    r0, "PSR going to exit with = "
+ ]
+        STR     r0, [sp, #8*4]                          ; overwrite stacked SPSR
+ ]
+
+        MOV     r0, #0                                  ; we're going to call abort handler
+        STR     r0, [r0, #CDASemaphore]                 ; so allow recovery if we were in CDA
+
+        LDR     r0, =DAbHan
+        LDR     r0, [r0]                                ; get address of data abort handler
+ [ DebugAborts
+        DREG    r0, "Handler address = "
+ ]
+        ADD     r0, r0, #4                              ; add on 4 to adjust for abort exit
+        STR     r0, [r11, #15*4]                        ; and store in pc in register bank
+        B       %BT70                                   ; then junk to normal tidy-up routine
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       ProcessTransfer - Process an abort transfer
+;
+; in:   r0 = flags
+;               bit 0 = 0 => Store to memory
+;                       1 => Load from memory
+;               bit 1 = 0 => Transfer executed in user mode
+;                       1 => Transfer executed in non-user mode
+;       r1 = block of data to transfer from/into
+;       r2 = illegal address
+;       r3 = length of transfer in bytes
+;       r4 -> instruction which aborted
+;       SVC26/32 mode
+;
+; out:  V=0 => transfer accomplished
+;       V=1 => transfer not accomplished
+;       All registers preserved
+;
+
+SectionSizeShift *      20
+SectionSize     *       1 :SHL: SectionSizeShift
+
+LargePageSizeShift *    16
+LargePageSize   *       1 :SHL: LargePageSizeShift
+
+SmallPageSizeShift *    12
+SmallPageSize   *       1 :SHL: SmallPageSizeShift
+
+ProcessTransfer Entry "r1-r7,r12"
+
+ [ DebugAborts
+        DLINE   "ProcessTransfer entered"
+        DREG    r2, "Illegal address = "
+        DREG    r3, "Length of transfer = "
+        DREG    r4, "Abort happened at address "
+        DREG    r0, "Flags = "
+        DLINE   "Data = ",cc
+
+        MOV     r5, r3
+        MOV     r6, r1
+01
+        LDR     r7, [r6], #4
+        DREG    r7," ",cc
+        SUBS    r5, r5, #4
+        BHI     %BT01
+        DLINE   ""
+ ]
+
+
+; First identify if start address should have aborted
+
+10
+        LDR     r7, =L1PT
+        MOV     lr, r2, LSR #SectionSizeShift           ; r2 as a multiple of 1Mb
+        EOR     r5, r2, lr, LSL #SectionSizeShift       ; r5 = offset within section
+        SUB     r5, r2, r5                              ; r5 -> start of section containing r2
+        ADD     r5, r5, #SectionSize                    ; r5 -> start of section after r2
+
+        LDR     lr, [r7, lr, LSL #2]                    ; get L1PT entry
+        ANDS    r7, lr, #3                              ; 00 => trans.fault, 01 => page, 10 => section, 11 => reserved (fault)
+        TEQNE   r7, #3
+        BEQ     Fault
+        TEQ     r7, #1
+        BEQ     CheckPage
+
+; it's section mapped - check section access privileges
+
+15
+        ANDS    r7, lr, #3 :SHL: 10                     ; extract ap
+        BEQ     Fault                                   ; 00 => no access for anyone (at the moment)
+        TST     r0, #2                                  ; test for non-usr access
+        BNE     %FT20                                   ; if non-usr then OK to access here
+        CMP     r7, #2 :SHL: 10
+        BCC     Fault                                   ; 01 => no usr access
+        BHI     %FT20                                   ; 11 => full user access, so OK
+        TST     r0, #1
+        BEQ     Fault                                   ; 10 => usr read-only, so stores not allowed
+
+; access OK, so copy up to end of section/sub-page
+
+20
+;ARM 8 and StrongARM will abort for vector reads (as well as writes) in 26bit mode, so we must
+;handle vector reads properly as well now
+;In fact, StrongARM does not abort (optional in architecture 4), but ARM 8 does - MJS 08-10-96
+  [ {FALSE}
+        TST     r0, #1                                  ; if load from memory
+        BNE     %FT60                                   ; then skip
+  ]
+
+; it's a store to memory (may be a vector write), or a read from memory (may be a vector read)
+; do it in words if >= 4 bytes, so word writes to VIDC work for example
+
+25
+        CMP     r2, #&1C                                ; if in abort area (but allow any access to &1C)
+  [ OnlyKernelCanAccessHardwareVectors
+        BHS     %FT22
+        CMP     r4, #ROM                                ; and executing outside the kernel
+        BLO     %FT23
+        ADRL    lr, EndOfKernel
+        CMP     r4, lr
+        BLO     %FT22
+23
+        MOV     r5, #&20                                ; then set end-of-section = 32
+        B       Fault                                   ; and check user list
+22
+  |
+        CMPCC   r4, #ROM                                ; and executing out of RAM
+        MOVCC   r5, #&20                                ; then set end-of-section = 32
+        BCC     Fault                                   ; and check user list
+  ]
+
+  [ :LNOT:No26bitCode
+        SetMode SVC32_mode, lr                          ; go into SVC32 so we can poke or peek vector area
+  ]
+
+        TST     r0, #1                                  ; test for peek/poke
+        BEQ     %FT30
+26
+;peeking
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BEQ     %FT50                                   ; if so then exit if finished else go back to outer loop
+        SUBS    r3, r3, #4                              ; have we got at least a word to do?
+        LDRCS   lr, [r2], #4                            ; if so then copy word
+        STRCS   lr, [r1], #4
+        BHI     %BT26                                   ; and if not all done then loop
+        BEQ     %FT50                                   ; if all done then switch back to SVC26 and exit
+
+        ADDS    r3, r3, #4
+27
+        LDRB    lr, [r2], #1                            ; read byte from register bank
+        STRB    lr, [r1], #1                            ; and store to memory
+        SUBS    r3, r3, #1                              ; decrement byte count
+        BEQ     %FT50                                   ; if finished then switch back to SVC26 and exit
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BNE     %BT27                                   ; no, then loop
+        B       %FT50
+
+30
+;poking
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BEQ     %FT50                                   ; if so then exit if finished else go back to outer loop
+        SUBS    r3, r3, #4                              ; have we got at least a word to do?
+        LDRCS   lr, [r1], #4                            ; if so then copy word
+        STRCS   lr, [r2], #4
+        BHI     %BT30                                   ; and if not all done then loop
+        BEQ     %FT50                                   ; if all done then switch back to SVC26 and exit
+
+        ADDS    r3, r3, #4
+40
+        LDRB    lr, [r1], #1                            ; read byte from register bank
+        STRB    lr, [r2], #1                            ; and store to memory
+        SUBS    r3, r3, #1                              ; decrement byte count
+        BEQ     %FT50                                   ; if finished then switch back to SVC26 and exit
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BNE     %BT40                                   ; no, then loop
+
+50
+  [ :LNOT:No26bitCode
+        SetMode SVC26_mode, lr
+  ]
+        CMP     r3, #0
+        BNE     %BT10
+        EXIT                                            ; exit (VC from CMP)
+
+  [ {FALSE}
+; it's a load from memory
+60
+        LDRB    lr, [r2], #1                            ; read byte from memory
+        STRB    lr, [r1], #1                            ; and store to memory bank
+        SUBS    r3, r3, #1                              ; decrement byte count
+        EXIT    EQ                                      ; if finished then exit (VC from SUBS)
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BNE     %BT60                                   ; no, then loop
+        B       %BT10                                   ; yes, then go back to start
+  ]
+
+; it's page mapped, so check L2PT
+; lr = L1 table entry
+; We use the logical copy of physical space here, in order to access the entry pointed to by the L1 entry
+
+CheckPage
+        MOV     r5, r2, LSR #SmallPageSizeShift         ; r2 as a multiple of 4K
+        MOV     r5, r5, LSL #SmallPageSizeShift
+        ADD     r5, r5, #SmallPageSize                  ; if translation fault, then it applies to small page
+
+        MOV     lr, lr, LSR #10                         ; remove domain and U bits
+        MOV     lr, lr, LSL #10
+ [ HAL
+        SUB     sp, sp, #4
+        Push    "r0-r3,r12"
+        MOV     r0, #0
+        MOV     r1, lr
+        ADD     r2, sp, #5*4
+        BL      RISCOS_AccessPhysicalAddress
+        MOV     lr, r0
+        Pull    "r0-r3,r12"
+ |
+        ORR     lr, lr, #PhysSpace                      ; now physical address is converted to a logical one (in physspace)
+ ]
+        AND     r7, r2, #&000FF000                      ; extract bits which are to form L2 offset
+
+        LDR     lr, [lr, r7, LSR #10]                   ; lr = L2PT entry
+ [ HAL
+        Push    "r0-r3,r12,lr"
+        LDR     r0, [sp, #6*4]
+        BL      RISCOS_ReleasePhysicalAddress
+        Pull    "r0-r3,r12,lr"
+        ADD     sp, sp, #4
+ ]
+        ANDS    r7, lr, #3                              ; 00 => trans.fault, 01 => large page
+                                                        ; 10 => small page, 11 => reserved (fault)
+        TEQNE   r7, #3
+        BEQ     Fault
+        TEQ     r7, #2                          ; if small page
+        MOVEQ   r7, #SmallPageSizeShift-2       ; then sub-page size = 1<<10
+        MOVNE   r7, #LargePageSizeShift-2       ; else sub-page size = 1<<14
+
+        MOV     r5, r2, LSR r7                  ; round down to start of sub-page
+        MOV     r5, r5, LSL r7
+        MOV     r6, #1
+        ADD     r5, r5, r6, LSL r7              ; then move on to start of next sub-page
+
+        MOV     r7, r2, LSR r7                  ; put sub-page number in bits 1,2
+        AND     r7, r7, #3                      ; and junk other bits
+        RSB     r7, r7, #3                      ; invert sub-page ordering
+        MOV     r7, r7, LSL #1                  ; and double it
+        MOV     lr, lr, LSL r7                  ; then shift up access privileges so that correct ones appear in bits 10,11
+        B       %BT15                           ; re-use code to check access privileges
+
+Fault
+        SUB     r5, r5, r2                      ; r5 = number of bytes we can do in this section/page/sub-page
+        Push    "r3"                            ; save number of bytes to do
+        CMP     r3, r5                          ; if more bytes than there are in this block
+        MOVHI   r3, r5
+
+; Now scan list of user abort addresses
+
+        MOV     r6, #0
+        LDR     r6, [r6, #AbortIndirection]
+        TEQ     r6, #0
+        BEQ     %FT85                           ; address not in any abort node
+75
+        LDR     r5, [r6, #AI_Low]
+        CMP     r2, r5
+        BCC     %FT80
+        LDR     r5, [r6, #AI_High]
+        CMP     r2, r5
+        BCS     %FT80
+
+        Push    "r3"                            ; save number of bytes we can do in this section/page/sub-page
+        SUB     r5, r5, r2                      ; number of bytes we can do for this node
+        CMP     r3, r5                          ; if bigger than the size of this node
+        MOVHI   r3, r5                          ; then restrict number of bytes
+
+        ADD     r5, r6, #AI_WS
+        MOV     lr, pc
+        LDMIA   r5, {r12, pc}
+
+; returns to here
+
+        ADDVS   sp, sp, #8                      ; if user abort failed, then junk both pushed r3's
+        EXIT    VS                              ; and exit
+
+        ADD     r1, r1, r3                      ; advance register block
+        ADD     r2, r2, r3                      ; and illegal address pointer
+
+        LDR     r5, [sp, #4]                    ; subtract amount done from stacked total amount to do
+        SUBS    r5, r5, r3
+        STR     r5, [sp, #4]                    ; and store back
+
+        Pull    "r5"
+        SUBS    r3, r5, r3                      ; is there more to do in this section/page/sub-page?
+        BEQ     %FT90                           ; no then skip
+80
+        LDR     r6, [r6, #AI_Link]              ; else try next node
+        TEQ     r6, #0
+        BNE     %BT75
+85
+        ADD     sp, sp, #4                      ; junk pushed r3
+        SETV                                    ; indicate access invalid
+        EXIT                                    ; and exit
+
+90
+        Pull    "r3"                            ; restore total amount left to do
+        TEQ     r3, #0
+        BNE     %BT10                           ; yes, then loop
+        EXIT                                    ; no, then exit (V=0 from SUBS)
+
+
+;some tricks to improve performance, looking at MMU level 1 and level 2 page tables
+L1L2PTenhancements ROUT
+        Push    "r0-r5,lr"
+
+        ;mjs change for Ursula:
+        ;improved kernel workspace protection
+        ; - user access to bottom 3k restricted to read only (things like Clib tmpnam counter prevent
+        ;   going further)
+        ; - Java VM will probably require bottom 1k restricted to no user access (so that VM can avoid
+        ;   all run-time checks for null pointers), but this currently makes various things like ShareFS
+        ;   go pop-bang, so not done yet (see TRUE/FALSE choice below)
+        ;
+        MOV     r0,#L2PT                ;L2PT address for page at 0
+        LDR     r1,[r0]
+        BIC     r1,r1,#&FF0             ;clear current AP bits for all four 1k sub-pages (S0 to S3)
+     [ {FALSE}                          ;this would be good for Java VM:
+        ORR     r1,r1,#&E90             ;S0=user none, S1=user read, S2=user read, S3=user read/write
+     |                                  ;this makes less current things go pop-bang:
+        ORR     r1,r1,#&EA0             ;S0=user read, S1=user read, S2=user read, S3=user read/write
+     ]
+        STR     r1,[r0]
+
+;if the MMU control reg (soft copy) has R bit set (bit 9), then adjust the L1 entries for ROM
+;space to give full write protection (user and supervisor)
+        MOV     r0,#0
+        LDR     r1,[r0,#MMUControlSoftCopy]
+        TST     r1,#&200
+        BEQ     L1L2PTe_WPROMdone              ;ARM 610 has no R bit, for example
+        LDR     r0,=L1PT
+        ADD     r0,r0,#ROM :SHR: (20-2)        ;address of first L1PT entry for ROM space
+  [ OSROM_ImageSize > 8192
+        MOV     r1,#OSROM_ImageSize / 1024
+  |
+        MOV     r1,#8                          ;8 entries (8 Mbytes)
+  ]
+L1L2PTe_WPROMloop
+        LDR     r2,[r0]
+        BIC     r2,r2,#&C00                    ;set AP (access permission) bits to 00
+        STR     r2,[r0],#4
+        SUBS    r1,r1,#1
+        BNE     L1L2PTe_WPROMloop
+L1L2PTe_WPROMdone
+
+   [ :LNOT: (CanLiveOnROMCard :LOR: ROMCardSupport :LOR: ExtROMSupport)
+
+;go for best available memory speed for data cache cleaner area (StrongARM)
+        LDR     r0,=L2PT :OR: (ARMA_Cleaners_address :SHR: 10)  ;address of 1st L2PT word for cleaner area
+        LDR     r1,[r0]
+        MOV     r1,r1,LSL #20
+        MOV     r1,r1,LSR #20                   ;zap physical address field
+        ORR     r1,r1,#&01000000                ; = physical address of start of ROM bank 1
+        MOV     r2,#8                           ;8 L2PT entries to fiddle
+00
+        STR     r1,[r0],#4
+        SUBS    r2,r2,#1
+        BNE     %BT00
+        MOV     r0,#IOC
+        MOV     r1,#5
+        STRB    r1,[r0, #IOMD_ROMCR1]           ;ROM bank 1 speed = fastest (62.5 ns)
+    ]
+
+;make first 5 pages of cursor chunk cacheable and bufferable - this is rather handy, 'coz things
+;like the SWI dispatcher, IRQ dispatcher are here. May be a slight worry over cursor data
+;being write-back cached (StrongARM) - should strictly clean,drain write buffer or whatever for shape change.
+        LDR     r0,=L2PT :OR: (CursorChunkAddress :SHR: 10)  ;address of 1st L2PT word for CursorChunk
+        MOV     R2,#5                           ;5 entries to adjust
+01
+        LDR     r1,[r0]
+        ORR     r1,r1,#&C                       ;make page cacheable and bufferable
+        STR     r1,[r0],#4
+        SUBS    r2,r2,#1
+        BNE     %BT01
+
+;make other 3 pages of chunk bufferable
+        MOV     R2,#3
+02
+        LDR     r1,[r0]
+        ORR     r1,r1,#&4                       ;make page bufferable
+        STR     r1,[r0],#4
+        SUBS    r2,r2,#1
+        BNE     %BT02
+
+;try to rescue some pages from the L2PT itself, in the AppSpace region - ie. AppSpace max size can really
+;be total RAM size, if that is less than 28 Mb, and for every 4Mb less that is we can rescue a 4k page
+;and return it to the free pool - handy on a 2Mb Kryten for instance!
+
+        LDR     r0,=MaxCamEntry
+        LDR     r0,[r0]
+        ADD     r0,r0,#1+255+768                ; = no. of 4k RAM pages in machine + 255 + 3*256
+        MOV     r0,r0,LSR #8                    ; = no. of Mbytes in machine rounded up + 3
+        BIC     r0,r0,#3                        ; round up to next 4 Mb
+        CMP     r0,#28                          ; if 28Mb or more, no pages to be rescued from L2PT AppSpace
+        BHS     %FT09
+        LDR     r1,=AppSpaceDANode
+        MOV     r2,r0,LSL #20
+        STR     r2,[r1,#DANode_MaxSize]         ; update AppSpace max size
+        MOV     r0,r0,LSR #2                    ; no. of L2PT AppSpace pages which cannot be rescued
+        MOV     r1,#L2PT
+        ADD     r4, r1, #L1PT-L2PT
+        ADD     r4, r4, r0, LSL #4              ;the L1PT entry to blank out (4 L1 entries per L2 entry)
+        ADD     r1,r1,#(L2PT :SHR: (12-2))      ;the L2PT of the L2PT (and first 7 entries are for App Space)
+        ADD     r1,r1,r0,LSL #2                 ;first entry for rescue
+        LDR     r3,=FreePoolDANode
+        LDR     r2,[r3,#DANode_Base]
+        LDR     r5,[r3,#DANode_Size]            ; FreePool size so far
+        ADD     r2,r2,r5                        ; r2 -> next logical address for a rescued page
+
+        SUB     sp,sp,#16                       ; room for 1 page block entry + terminator
+        MOV     r3,sp
+05
+        Push    "r0"
+        LDR     r0,[r1],#4                      ; pick up the L2PT entry
+        BIC     r0,r0,#&0FF
+        BIC     r0,r0,#&F00                     ; mask to leave physical address only
+        STR     r0,[r3,#8]                      ; store physical address in word 2 of page block entry
+
+        Push    "r1-r2"
+        MOV     r0,#&0C00
+        MOV     r1,r3
+        MOV     r2,#1
+        SWI     XOS_Memory                      ; fill in page number, given physical address
+
+        MOV     r0,#2                           ; means inaccessible in user mode (destined for FreePool)
+        STR     r0,[r3,#8]
+        MOV     r0,#-1
+        STR     r0,[r3,#12]                     ; terminator
+        Pull    "r1-r2"
+
+        STR     r2,[r3,#4]                      ; new logical address for page
+        MOV     r0,r3
+        SWI     XOS_SetMemMapEntries
+
+        MOV     r0, #0                          ; Blank out the L1PT entries for the page table we just removed
+        STR     r0, [r4], #4
+        STR     r0, [r4], #4
+        STR     r0, [r4], #4
+        STR     r0, [r4], #4
+
+        Pull    "r0"
+        ADD     r2,r2,#4096
+        ADD     r5,r5,#4096                     ; next page
+        ADD     r0,r0,#1
+        CMP     r0,#7                           ;7 entries in total for full 28Mb AppSpace
+        BNE     %BT05
+        ADD     sp,sp,#16                       ;drop the workspace
+
+        LDR     r0,=FreePoolDANode
+        STR     r5,[r0,#DANode_Size]            ;update FreePoolSize
+
+09
+        Pull    "r0-r5,pc"
+
+
+;
+; ---------------- XOS_SynchroniseCodeAreas implementation ---------------
+;
+
+;this SWI effectively implements IMB and IMBrange (Instruction Memory Barrier)
+;for newer ARMs
+
+;entry:
+;   R0 = flags
+;        bit 0 set ->  R1,R2 specify virtual address range to synchronise
+;                      R1 = start address (word aligned, inclusive)
+;                      R2 = end address (word aligned, inclusive)
+;        bit 0 clear   synchronise entire virtual space
+;        bits 1..31    reserved
+;
+;exit:
+;   R0-R2 preserved
+;
+SyncCodeAreasSWI ROUT
+        Push    "lr"
+        BL      SyncCodeAreas
+        Pull    "lr"                    ; no error return possible
+        B       SLVK
+
+SyncCodeAreas
+        TST     R0,#1                   ; range variant of SWI?
+        BEQ     SyncCodeAreasFull
+
+SyncCodeAreasRange
+        Push    "r0-r2, lr"
+        MOV     r0, r1
+        ADD     r1, r2, #4                 ;exclusive end address
+        MOV     r2, #0
+        LDRB    lr, [r2, #DCache_LineLen]
+        SUB     lr, lr, #1
+        ADD     r1, r1, lr                 ;rounding up end address
+        MVN     lr, lr
+        AND     r0, r0, lr                 ;cache line aligned
+        AND     r1, r1, lr                 ;cache line aligned
+        ARMop   IMB_Range,,,r2
+        Pull    "r0-r2, pc"
+
+SyncCodeAreasFull
+        Push    "r0, lr"
+        MOV     r0, #0
+        ARMop   IMB_Full,,,r0
+        Pull    "r0, pc"
+
+        LTORG
+
+ [ DebugAborts
+        InsertDebugRoutines
+ ]
+        END

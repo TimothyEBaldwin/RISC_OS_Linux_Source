@@ -1,0 +1,961 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; Error diffusion for 8bpp JPEG output
+
+;   01-Nov-93 WRS started
+;   04-Nov-93 WRS it works!
+
+; This code implements error diffusion for JPEG output when plotting at 8bpp.
+; It does it only for the unscaled case, a shame but necessary in order to
+; get acceptable speed. It's specialised to 8bpp because for 16bpp an
+; ordered dither is good enough, and for 4bpp or less you just don't get
+; a good picture - stick to ordered dither. For 8bpp it can make all the
+; difference, and is worth doing.
+
+; The diffusion happens within the JPEG band buffer, rather than onto
+; the destination image. The data will then be copied again to get it onto
+; the screen.
+
+; Performance target - an extra 100 ticks/pixel is the outer limit. Beyond
+; that it's really not acceptable - you're better off with an off-line
+; conversion tool like ChangeFSI.
+
+; We only diffuse errors within an MCU, in order to retain the clipping
+; property. Experiments with ChangeFSI indicated that this is scarcely
+; noticable.
+
+; for each pixel the basic algorithm is:
+
+;         get error shuffled in from left as r,g,b
+;         get value required of this pixel
+;           unpack it
+;           add it to r,g,b
+;         pack up r,g,b as 16bpp value
+;         look it up in 32K table (ie choose closest 8bit pixel)
+;         save that byte (we have chosen this pixel now)
+;         look up true rgb of that byte
+;           unpack it
+;           subtract it from r,g,b (leftover error)
+;         fetch next line, prev pixel
+;           unpack it
+;           add 5/16 of r,g,b to it
+;           pack it up
+;           save it
+;         fetch next line, pixel below
+;           unpack it
+;           add 3/16 of r,g,b to it
+;           pack it up
+;           save it
+;         fetch next line, next pixel
+;           unpack its
+;           add 1/16 of r,g,b to it
+;           pack it up
+;           save it
+;         remember 7/16 of r,g,b in r,g,b
+;         loop
+
+; This is the basic algorithm used by ChangeFSI. The sending of different
+; bits of error in different directions ensures that you don't get localised
+; stripes or other undesirable effects.
+
+; At the start and end of the line, use different fractions - never throw
+; any error away.
+
+; As stated above the problem becomes that all that adding of values
+; (which happens for each gun) has to be carefully clamped, so that
+; no colour value goes below 0 or above 255. This takes ages. So,
+; the colour values are represtented by a new format within a word that
+; gives 10 bits for each colour value. This allows errors to be added
+; to or subtracted from the gun values without any clamping checks, these
+; are only performed once at the end when the whole value of a pixel
+; is unpacked. Within the 10-bit fields the gun values are kept to 9 bits
+; of accuracy, and I tend to truncate colour values everywhere rather than
+; rounding. This is not as accurate as ChangeFSI, but speed is more
+; important here.
+
+; Potential desirable code variants:
+;   for 4bpp
+;   no 32K table - got to do 16->8 algorithmically (on RO3)
+;   arbitrary dest palette - need palette ptr on stack?
+;   faster version for monochrome (could be combined with the 4bpp one?)
+; Dynamic code generation is obviously desirable here, but we can get
+; by without it.
+
+; registers:
+d_inptr RN      0           ; -> this pixel
+d_count RN      1           ; = number of pixels still to do
+d_outptr RN     2           ; -> where to save pixels
+d_table RN      3           ; = 16->8 conversion table
+
+d_r     RN      7
+d_g     RN      8
+d_b     RN      9
+d_nextline RN  10           ; -> line above inptr, two pixels ahead
+d_nlprevpix RN  4           ; = [nextline,#-4]
+d_nlpix RN      5           ; = [nextline]
+d_nlnpix RN     6           ; = [nextline,#4]
+d_palette RN    11          ; = &101010 - useful in some of the expansion calculations.
+d_t1    RN      12
+d_t2    RN      14
+
+; The palette, which converts 8bit pixels back to their true RGB values,
+; could be located PC-relative.
+; >>> not so good for arbitrary palette... How about LDR from SP?
+; Probably necessary, I guess. Any cheaper way of saving a register?
+;   inptr,d_nextline,d_count,outptr -> ?
+; dynamic assembly would let outptr be a constant from inptr.
+
+; The expanded format for a colour value:
+;   9 bits for each gun
+;   128 added to each such value
+; The accumulated errors in a pixel can never add up to -128 or +128,
+; so this can never overflow/underflow the 0..511 range. To get the
+; real value back subtract 128 again, being careful about underflow
+; or a result greater than 255.
+
+; There's enough space in the word to allow 10 bits per gun. We don't
+; do this because it takes more cycles to split it up - hope the
+; quality's good enough!
+
+; to get the next pixel:
+;        MOV     d_t1,[d_inptr],#4           ; get this pixel
+
+        MACRO
+        ClipAbove
+        ; common tail for AddUnspacedPixelToRGB, AddSpacedPixelToRGB
+        CMP     d_r,#255
+        MOVGT   d_r,#255
+        CMP     d_g,#255
+        MOVGT   d_g,#255
+        CMP     d_b,#255
+        MOVGT   d_b,#255
+        MEND
+
+        MACRO
+        MakePixelGrey $r,$temp
+;        BIC     $temp.,$r.,#&100
+        AND     $temp.,$r.,#&ff
+        ADD     $temp.,$temp.,$r.,LSR #16
+        BIC     $r.,$r.,#&80
+        BIC     $r.,$r.,#&10000
+        ADD     $temp.,$temp.,$r.,LSR #7
+        MOV     $temp.,$temp.,LSL #22
+        MOV     $r.,$temp.,LSR #24
+;        MOV     $temp.,$temp.,LSR #24
+;        ORR     $temp.,$temp.,$temp.,LSL #8
+;        ORR     $r.,$temp.,$temp.,LSL #8
+        MEND
+
+; to add a regular 32-bit pixel in d_t1 to R,G,B, and clamp output values:
+        MACRO
+        AddUnspacedPixelToRGB
+        AND     d_t2,d_t1,#255               ; get red
+        ADDS    d_r,d_r,d_t2
+        MOVLT   d_r,#0
+        AND     d_t2,d_t1,#&ff00
+        ADDS    d_g,d_g,d_t2,LSR #8
+        MOVLT   d_g,#0
+        AND     d_t2,d_t1,#&ff0000
+        ADDS    d_b,d_b,d_t2,LSR #16
+        MOVLT   d_b,#0
+        ClipAbove
+        MEND
+
+; to add a 'spaced out' pixel in d_t1 to R,G,B, and clamp output values:
+        MACRO
+        AddSpacedPixelToRGB
+;        ADD     d_t2,d_t1,d_t1,LSR #20
+;        BIC     d_t1,d_t1,#&200
+;        ADD     d_t2,d_t2,d_t1,LSR #9
+;        MOV     d_t2,d_t2,LSL #20
+;        MOV     d_t2,d_t2,LSR #22
+;
+;        ADD     d_r,d_r,d_t2
+;        SUBS    d_r,d_r,#&180
+;        MOVLT   d_r,#0
+;        ADD     d_g,d_g,d_t2
+;        SUBS    d_g,d_g,#&180
+;        MOVLT   d_g,#0
+;        ADD     d_b,d_b,d_t2
+;        SUBS    d_b,d_b,#&180
+;        MOVLT   d_b,#0
+;        ClipAbove
+
+        MOV     d_t2,d_t1,LSL #22            ; get red, in top 9 bits
+        ADD     d_r,d_r,d_t2,LSR #22
+        SUBS    d_r,d_r,#&180
+        MOVLT   d_r,#0
+        MOV     d_t2,d_t1,LSL #12            ; get green
+        ADD     d_g,d_g,d_t2,LSR #22
+        SUBS    d_g,d_g,#&180
+        MOVLT   d_g,#0
+        ADD     d_b,d_b,d_t1,LSR #20        ; add in blue
+        SUBS    d_b,d_b,#&180
+        MOVLT   d_b,#0
+        ClipAbove
+        MEND
+
+;        MACRO
+;        Convert5bitRGBTo16bit
+;        ; common tail for Convert[Spaced]RGBTo16bit
+;        CMP     d_r,#31
+;        MOVGT   d_r,#31
+;        CMP     d_g,#31
+;        MOVGT   d_g,#31
+;        CMP     d_b,#31
+;        MOVGT   d_b,#31
+;        ORR     d_t1,d_r,d_g,LSL #5
+;        ORR     d_t1,d_t1,d_b,LSL #10
+;        MEND
+
+; to convert R,G,B to a 16 bit value (for a table lookup):
+; Truncating version, seems little different to rounding one
+        MACRO
+        ConvertRGBTo16bit
+        MOVS    d_t2,d_r,ASR #3                ; get red
+        MOVS    d_t1,d_g,ASR #3                ; get green
+        ORR     d_t1,d_t2,d_t1,LSL #5
+        MOVS    d_t2,d_b,ASR #3                ; get blue
+        ORR     d_t1,d_t1,d_t2,LSL #10         ; combine blue with red,green
+        ; d_t1 contains a 15bit RGB value
+        MEND
+; Rounding version:
+;        MACRO
+;        ConvertRGBTo16bit
+;        ADD     d_t2,d_r,#4                   ; could make >255! Frig constants in ClipAbove to 251 if using this.
+;        MOV     d_t1,d_t2,ASR #3
+;        CMP     d_g,#250
+;        ADD     d_t2,d_g,#4
+;        MOV     d_t2,d_t2,ASR #3
+;        ORR     d_t1,d_t1,d_t2,LSL #5
+;        ADD     d_t2,d_b,#4
+;        MOV     d_t2,d_t2,ASR #3
+;        ORR     d_t1,d_t1,d_t2,LSL #10
+;        MEND
+
+;        MACRO
+;        ConvertRGBMinus128To16bit
+;        ; Use this one after adding in a spaced pixel.
+;        MOV     d_t1,#16
+;;       RSBS    d_r,d_t1,d_r,LSR #3
+;        MOVLT   d_r,#0
+;        RSBS    d_g,d_t1,d_g,LSR #3
+;        MOVLT   d_g,#0
+;        RSBS    d_b,d_t1,d_b,LSR #3
+;        MOVLT   d_b,#0
+;        Convert5bitRGBTo16bit
+;        ; d_t1 contains a 15bit RGB value
+;        MEND
+
+        MACRO
+        DoTableLookup
+        CMP     d_table,#0
+        LDRNEB  d_t1,[d_table,d_t1]
+        BNE     %ft1
+
+        ; Algorithmic colour conversion. Lifted from what c.PutScaled can generate dynamically,
+        ; which just goes to show I should be generating this dynamically in a more general way...
+        ; 'd_table' is used as a temporary variable, and reset to 0 at the end.
+
+        ; Creating bggrbrtt from 0bbbbbgg gggrrrrr
+        ; Making the tint - the average of the lo 3 bits of RGB isn't a bad approximation. We make this
+        ; by adding them all up, multiplying by 3, and dividing by 8. We involve the lo bits in the approximation
+        ; as well, in case they produce a useful carry.
+        AND     d_t2,d_t1,#&1C00                 ; bottom 3 bits of B
+        MOV     d_table,d_t2,LSR #10             ; at bottom of temp2
+        AND     d_t2,d_t1,#&E0                   ; bottom 3 bits of G
+        ADD     d_table,d_table,d_t2,LSR #5      ; add to bottom B bits
+        AND     d_t2,d_t1,#&07                   ; bottom 3 bits of R
+        ADD     d_table,d_table,d_t2             ; add to bottom B+G bits
+        ADD     d_table,d_table,d_table,LSL #2   ; (lo R+G+B)*5    (< 128)
+
+        ; The hi bits are just done by extracting from the 16bpp value. This takes ages!
+        MOV     d_t2,#0                          ; building result pixel for hi bits
+
+        ; Top bits of B */
+        TST     d_t1,#&4000                      ; test top bit of B
+        ORRNE   d_t2,d_t2,#128                   ; bit 7 = top bit of B
+        TST     d_t1,#&2000                      ; test next bit of B
+        ORRNE   d_t2,d_t2,#8                     ; bit 3 = next bit of B
+
+        ; Top bits of G */
+        TST     d_t1,#&200                       ; test top bit of G
+        ORRNE   d_t2,d_t2,#64                    ; bit 6 = top bit of G
+        TST     d_t1,#&100                       ; test next bit of G
+        ORRNE   d_t2,d_t2,#32                    ; bit 5 = next bit of G
+
+        ; Top bits of R */
+        TST     d_t1,#&10                        ; test top bit of R
+        ORRNE   d_t2,d_t2,#16                    ; bit 4 = top bit of R
+        TST     d_t1,#&08                        ; test next bit of R
+        ORRNE   d_t2,d_t2,#4                     ; bit 2 = next bit of R
+
+        ORR     d_t1,d_t2,d_table,LSR #5         ; combine hi bits and tint
+        MOV     d_table,#0                       ; reset our temporary variable
+
+1
+        MEND
+
+        MACRO
+        ConvertSpacedPixelPlusRGBTo8bit
+        AddSpacedPixelToRGB
+        ConvertRGBTo16bit
+        DoTableLookup
+        MEND
+
+        MACRO
+        ConvertPixelPlusRGBTo8bit
+        AddUnspacedPixelToRGB
+        ConvertRGBTo16bit
+        DoTableLookup
+        MEND
+
+; to save the byte
+        MACRO
+        Save8bitPixel
+        STRB    d_t1,[d_outptr],#1
+        MEND
+
+; to save the word
+        MACRO
+        Save24bitPixel
+        STR    d_t1,[d_outptr],#4
+        MEND
+
+        MACRO
+        GetTrueRGBof8bitPixel
+; to look up true rgb of that byte - as a 16bit pixel
+        LDR     d_t1,[d_palette,d_t1,LSL #2]     ; a table of 32-bit RGB values
+        MEND
+
+;         MACRO
+;         Subtract32bitFromRGB
+;         ; d_t1=32 bit pixel - subtract it from R,G,B
+;         AND     d_t2,d_t1,#255
+;         SUB     d_r,d_r,d_t2
+;         AND     d_t2,d_t1,#&ff00
+;         SUB     d_g,d_g,d_t2,LSR #8
+;         SUB     d_b,d_b,d_t1,LSR #16
+;         MEND
+
+;        start bbggrr00
+         MACRO
+         Subtract32bitFromRGB
+         ; d_t1=32 bit pixel - subtract it from R,G,B
+         AND     d_t2,d_t1,#&ff00
+         SUB     d_r,d_r,d_t2,LSR #8
+         AND     d_t2,d_t1,#&ff0000
+         SUB     d_g,d_g,d_t2,LSR #16
+         SUB     d_b,d_b,d_t1,LSR #24
+         MEND
+
+; about 42 cycles up to here for 'normal' case?
+
+; fetch next line, prev pixel - add 5/16 of r,g,b to it
+        MACRO
+        Add5_16ToNextLinePrevPix
+        ADD     d_t1,d_r,d_r,LSL #2                   ; d_r*5
+        ADD     d_nlprevpix,d_nlprevpix,d_t1,ASR #4   ; d_r*5>>4
+        ADD     d_t1,d_g,d_g,LSL #2                   ; d_g*5
+        MOV     d_t1,d_t1,ASR #4                      ; d_g*5>>4
+;        ADD     d_nlprevpix,d_nlprevpix,d_t1,LSL #9
+        ADD     d_nlprevpix,d_nlprevpix,d_t1,LSL #10
+        ADD     d_t1,d_b,d_b,LSL #2                   ; d_b*5
+        MOV     d_t1,d_t1,ASR #4                      ; d_b*5>>4
+;        ADD     d_nlprevpix,d_nlprevpix,d_t1,LSL #18
+        ADD     d_nlprevpix,d_nlprevpix,d_t1,LSL #20
+        MEND
+
+; fetch next line, prev pixel - add 8/16 of r,g,b to it
+        MACRO
+        Add8_16ToNextLinePrevPix
+        ADD     d_nlprevpix,d_nlprevpix,d_r,ASR #2
+        MOV     d_t1,d_g,ASR #1
+        ADD     d_nlprevpix,d_nlprevpix,d_t1,LSL #10
+        MOV     d_t1,d_g,ASR #1
+        ADD     d_nlprevpix,d_nlprevpix,d_t1,LSL #20
+        MEND
+
+        MACRO
+        Add3_16ToNextLinePix
+        ADD     d_t1,d_r,d_r,LSL #1                   ; d_r*3
+        ADD     d_nlpix,d_nlpix,d_t1,ASR #4           ; d_r*3>>4
+        ADD     d_t1,d_g,d_g,LSL #1                   ; d_g*3
+        MOV     d_t1,d_t1,ASR #4                      ; d_g*3>>4
+;        ADD     d_nlpix,d_nlpix,d_t1,LSL #9
+        ADD     d_nlpix,d_nlpix,d_t1,LSL #10
+        ADD     d_t1,d_b,d_b,LSL #1                   ; d_b*3
+        MOV     d_t1,d_t1,ASR #4                      ; d_b*3>>4
+;        ADD     d_nlpix,d_nlpix,d_t1,LSL #18
+        ADD     d_nlpix,d_nlpix,d_t1,LSL #20
+        MEND
+
+        MACRO
+        Add8_16ToNextLinePix
+        ; This is used at the start and end of lines in the middle of a block,
+        ; instead of throwing away the diagonal error we pump more of it up
+        ; vertically.
+        ADD     d_nlpix,d_nlpix,d_r,ASR #1            ; d_r>>1
+        MOV     d_t1,d_g,ASR #1                       ; d_g>>1
+;        ADD     d_nlpix,d_nlpix,d_t1,LSL #9
+        ADD     d_nlpix,d_nlpix,d_t1,LSL #10
+        MOV     d_t1,d_b,ASR #1                       ; d_b>>1
+;        ADD     d_nlpix,d_nlpix,d_t1,LSL #18
+        ADD     d_nlpix,d_nlpix,d_t1,LSL #20
+        MEND
+
+        MACRO
+        Add1_16ToNextLineNextPix
+        ADD     d_nlnpix,d_nlnpix,d_r,ASR #4          ; d_r>>4
+        MOV     d_t1,d_g,ASR #4                       ; d_g>>4
+;        ADD     d_nlnpix,d_nlnpix,d_t1,LSL #9
+        ADD     d_nlnpix,d_nlnpix,d_t1,LSL #10
+        MOV     d_t1,d_b,ASR #4                       ; d_b>>4
+;        ADD     d_nlnpix,d_nlnpix,d_t1,LSL #18
+        ADD     d_nlnpix,d_nlnpix,d_t1,LSL #20
+        MEND
+; 42+21 - 63 so far
+
+        MACRO
+        CutRGBby7_16
+        ; remember 7/16 of r,g,b in r,g,b
+        RSB     d_r,d_r,d_r,LSL #3
+        MOV     d_r,d_r,ASR #4
+        RSB     d_g,d_g,d_g,LSL #3
+        MOV     d_g,d_g,ASR #4
+        RSB     d_b,d_b,d_b,LSL #3
+        MOV     d_b,d_b,ASR #4
+        MEND
+
+        MACRO
+        CutRGBby12_16
+        ; remember 12/16 of r,g,b in r,g,b
+        MOV     d_t1,d_r,LSL #2
+        RSB     d_r,d_t1,d_r,LSL #4
+        MOV     d_r,d_r,ASR #4
+        MOV     d_t1,d_g,LSL #2
+        RSB     d_g,d_t1,d_g,LSL #4
+        MOV     d_g,d_g,ASR #4
+        MOV     d_t1,d_b,LSL #2
+        RSB     d_b,d_t1,d_b,LSL #4
+        MOV     d_b,d_b,ASR #4
+        MEND
+
+        MACRO
+        SpaceOutPixel $r,$temp
+        ; space out the RGB in a pixel to leave a bit between them,
+        ; and add 128 to each gun value
+        AND        $temp.,$r.,#&ff0000
+        ADD        $r.,$r.,$temp.                     ; shift b up one
+        ADD        $r.,$r.,$temp.,LSL #1              ; shift b up another 1
+        BIC        $temp.,$r.,#&ff
+        ADD        $r.,$r.,$temp.                     ; shift g,b up one
+        ADD        $r.,$r.,$temp.,LSL #1              ; shift g,b up another 1
+        ADD        $r.,$r.,#&180
+        ADD        $r.,$r.,#&180:SHL:10
+        ADD        $r.,$r.,#&180:SHL:20
+;        AND        $temp.,$r.,#&ff0000
+;        ADD        $r.,$r.,$temp.                     ; shift b up one
+;        BIC        $temp.,$r.,#&ff
+;        ADD        $r.,$r.,$temp.                     ; shift g,b up one
+;        ADD        $r.,$r.,#128
+;        ADD        $r.,$r.,#128:SHL:9
+;        ADD        $r.,$r.,#128:SHL:18
+        ; or, want an extra register to hold this whacky constant
+        MEND
+
+        MACRO
+        AdvanceLineAbove
+        ; advance to next pixel
+        STR     d_nlprevpix,[d_nextline,#-12]
+        MOV     d_nlprevpix,d_nlpix
+        MOV     d_nlpix,d_nlnpix
+        LDR     d_nlnpix,[d_nextline],#4
+        SpaceOutPixel d_nlnpix,d_t1
+        MEND
+; 80 so far? not bad!
+
+        MACRO
+        LineAboveStartup
+        ; given 'd_nextline' pointing at the start of the line above,
+        ; get nextline registers ready to traverse this line.
+        ; d_nlprevpix first set up by AdvanceLineAboveForFirstInLine.
+        LDR     d_nlpix,[d_nextline],#4
+        SpaceOutPixel d_nlpix,d_t1
+        LDR     d_nlnpix,[d_nextline],#4
+        SpaceOutPixel d_nlnpix,d_t1
+        MEND
+
+        MACRO
+        AdvanceLineAboveForFirstInLine
+        ; advance to next pixel - there is no next-line-prev-pixel yet,
+        MOV     d_nlprevpix,d_nlpix
+        MOV     d_nlpix,d_nlnpix
+        LDR     d_nlnpix,[d_nextline],#4
+        SpaceOutPixel d_nlnpix,d_t1
+        MEND
+
+        MACRO
+        AdvanceLineAboveForLastInLine
+        ; advance to next pixel
+        STR     d_nlprevpix,[d_nextline,#-12]
+        STR     d_nlpix,[d_nextline,#-8]
+        MEND
+
+; to advance to the next pixel:
+;        SUBS    d_count,d_count,#1
+;        BNE     dither_each_pixel
+
+; that's about it!
+; 23
+
+;About 85 cycles per pixel total?
+
+; --------------------------------------------------------------------------------------
+;
+; extern char *asm_get_table32k(int *palette_data/*void*/);
+;
+; --------------------------------------------------------------------------------------
+; Get the big table from ColourTrans. Return 0 if there's an error of any sort.
+       [ cfsi_jpeg
+XColourTrans_SelectTable * &40740 + (1:SHL:17)
+       ]
+
+asm_get_table32k
+        STMDB   sp!,{r4-r7,lr}                ; save work registers
+        MOV     r7, r0
+; We'll check for a recent ColourTrans. The one in RISC OS 3.10 seems to produce
+; an address exception if you make the SelectTable call below!
+        ADR     r0,asm_checkColourTrans
+        SWI     XOS_CLI                       ; *RMEnsure ColourTrans 1.25 Error no good
+        MOVVS   r0,#0                         ; error return - not new ColourTrans
+        LDMVSIA sp!,{r4-r7,pc}                ; so return with no table.
+
+; OK, a recent ColourTrans. Ask it for the 32K lookup table.
+        SUB     sp,sp,#12                     ; memory block for ColourTrans to put result in
+        MOV     r0,#6:SHL:27
+        ORR     r0,r0,#1                      ; new mode number for 32bpp
+        MOV     r1,#-1                        ; default input, output, palette, everything
+        MOV     r2,#-1
+        MOV     r3,r7
+        MOV     r4,sp                         ; pointer to buffer to put table in
+        MOV     r5,#0                         ; no special flags
+        MOV     r6,#0
+        MOV     r7,#0
+        SWI     XColourTrans_SelectTable
+        BVS     asm_get_table32k_fail         ; error return, no table about
+        LDR     r0,[sp]                       ; should be a guard word
+        LDR     r1,asm_table32k_guard         ; check first guard word
+        CMP     r0,r1
+        BNE     asm_get_table32k_fail
+        LDR     r0,[sp,#8]                    ; check second guard word
+        CMP     r0,r1
+        BNE     asm_get_table32k_fail
+        LDR     r0,[sp,#4]                    ; all is well - get the table pointer
+        ADD     sp,sp,#12                     ; discard stack workspace
+        LDMIA   sp!,{r4-r7,pc}                ; return
+
+asm_get_table32k_fail
+        MOV     r0,#0
+        ADD     sp,sp,#12
+        LDMIA   sp!,{r4-r7,pc}
+
+asm_table32k_guard
+        DCD     &2e4b3233                     ; "32K." guard word value
+
+asm_checkColourTrans
+        DCB     "RMEnsure ColourTrans 1.25 Error no good", 0 ; any error will do
+        ALIGN
+
+; --------------------------------------------------------------------------------------
+;
+; extern void asm_diffuse_line_to_8bpp(int *line, int linelength, char *output, char *table);
+;
+; --------------------------------------------------------------------------------------
+
+; The relatively simple case of right-only diffusion. Only a single line is
+; involved, no spaced-out pixels anywhere.
+
+;asm_diffuse_line_to_8bpp
+;; in: d_inptr, d_count, d_outptr, d_table already set up
+;
+;        STMDB   sp!,{r4-r12,lr}                       ; save all registers
+;        MOV     d_r,#0
+;        MOV     d_g,#0
+;        MOV     d_b,#0
+;        ADR     d_palette,standard_palette
+;
+;diffuse_line_loop
+;        LDR     d_t1,[d_inptr],#4                     ; get a pixel
+;        ConvertPixelPlusRGBTo8bit                     ; convert to 8-bit pixel in d_t1
+;        Save8bitPixel                                 ; save it at d_outptr
+;        GetTrueRGBof8bitPixel                         ; get as 32-bit value in d_t1
+;        Subtract32bitFromRGB                          ; subtract this from r,g,b
+;        SUBS    d_count,d_count,#1
+;        BNE     diffuse_line_loop                     ; and loop round - any error from this pixel is added to the next.
+;
+;        LDMIA   sp!,{r4-r12,pc}
+
+;standard_palette
+;        GET     s.stdpalette
+
+; --------------------------------------------------------------------------------------
+;
+; extern void asm_diffuse_to_8bpp(int *line, int linelength, char *output, char *table, int nlines, int linestep,
+;                                  int palette);
+;
+; --------------------------------------------------------------------------------------
+; pixels in
+;   line[0..linelength-1]..line[(nlines-1)*linestep..(nlines-1)*linestep+linelength-1]
+; should be converted into 8-bit pixels as best you can.
+; The output pixels should be placed at
+;   output[0..linelength-1]..output[(nlines-1)*linestep*sizeof(int)..(nlines-1)*linestep*sizeof(int)+linelength-1].
+
+; In particular, note that 'linestep' is a word offset.
+; table, if non-zero, is a 32K lookup table that converts 15bit RGB values to 8-bit pixels.
+; NB The palette built in to this code assumes that this is the default 8bpp palette.
+; You may trample on the input pixels if need be. In fact, (void*)output may equal (void*)line
+; initially, if you do things in the obvious order it won't matter.
+
+; linelength >= 3, nlines >= 3.
+
+asm_diffuse_to_8bpp
+; The first line is special because the input pixels are in un-spaced-out format.
+
+        STMDB   sp!,{r0-r12,lr}                       ; we need them all!
+        ; d_inptr,d_count,d_outptr,d_table already set up, and will need to get reloaded
+        LDR     d_nextline,[sp,#14*4+4]               ; get 'linestep' argument
+        ADD     d_nextline,d_inptr,d_nextline,LSL #2  ; construct pointer to line above d_inptr
+;        ADRL    d_palette,standard_palette
+        LDR     d_palette, [sp,#14*4+8]
+
+        MOV     d_r,#0
+        MOV     d_g,#0
+        MOV     d_b,#0
+        LineAboveStartup
+; Start processing the first pixel
+        LDR     d_t1,[d_inptr],#4                     ; get very first pixel
+        ConvertPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        ; 5/16ths of the error is thrown away
+        Add3_16ToNextLinePix
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAboveForFirstInLine
+        SUBS    d_count,d_count,#1
+        BEQ     dither_first_line_done               ; lines are just one pixel long
+; now the loop for most of the pixels in the first line
+        SUBS    d_count,d_count,#1
+        BEQ     dither_first_line_last_pixel          ; lines are just two pixels long
+dither_each_pixel_in_first_line
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAbove
+        SUBS    d_count,d_count,#1
+        BNE     dither_each_pixel_in_first_line
+; now the very last pixel in the line
+dither_first_line_last_pixel
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        ; 1/16+7/16 of error gets thrown away
+        AdvanceLineAboveForLastInLine
+dither_first_line_done
+
+; Now the loop for each line in the middle - pixels picked up will be spaced out ones.
+dither_each_line
+
+        LDMIA   sp,{r0-r3}                            ; d_inptr,d_count,d_outptr,d_table reset
+        LDR     d_nextline,[sp,#14*4+4]               ; get 'linestep' argument
+        ADD     d_inptr,d_inptr,d_nextline,LSL #2     ; construct pointer to line above d_inptr
+        ADD     d_outptr,d_outptr,d_nextline,LSL #2   ; construct pointer to line above d_outptr
+        ADD     d_nextline,d_inptr,d_nextline,LSL #2  ; and pointer to next line
+        STMIA   sp,{r0-r2}                            ; save back d_inptr and d_outptr
+
+        MOV     d_r,#0                                ; initial cumulative error is 0
+        MOV     d_g,#0
+        MOV     d_b,#0
+
+        LDR     d_t1,[sp,#14*4]                       ; get line count
+        SUBS    d_t1,d_t1,#1
+        CMP     d_t1,#1                               ; we didn't count for the first line, nor the last
+        BLE     dither_each_line_exit                 ; time to do very last line
+        STR     d_t1,[sp,#14*4]                       ; save for next time
+
+        SUB     d_count,d_count,#1                    ; number of pix in line excluding first and last
+        LineAboveStartup
+; Start processing the first pixel
+        LDR     d_t1,[d_inptr],#4                     ; get very first pixel
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add8_16ToNextLinePix                          ; 3/16 + 5/16 sent upwards, since NextLinePrevPix doesn't exit.
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAboveForFirstInLine
+        SUBS     d_count,d_count,#1
+        BEQ      dither_last_pixel                    ; line is two pixels long
+; now the loop for most of the pixels
+dither_each_pixel
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAbove
+        SUBS    d_count,d_count,#1
+        BNE     dither_each_pixel
+; now the very last pixel in the line
+dither_last_pixel
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        Add8_16ToNextLinePix                          ; 3/16 + 7/16 + 1/16 sent upwards, since no pixels to right of here.
+        AdvanceLineAboveForLastInLine
+
+        B       dither_each_line
+dither_each_line_exit
+
+; And the final line - all errors propogated to the right.
+; On the last line all pixels are treated the same.
+; Registers for the loop have already been set up, at the start of the main loop.
+dither_each_pixel_in_last_line
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save8bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        CutRGBby12_16
+        SUBS    d_count,d_count,#1
+        BNE     dither_each_pixel_in_last_line
+
+; Done, finished, finito.
+        LDMIA   sp!,{r0-r12,pc}
+
+
+; --------------------------------------------------------------------------------------
+;
+; extern void asm_diffuse_to_24bpp(int *line, int linelength, char *output, char *table, int nlines, int linestep,
+;                                  int palette);
+;
+; --------------------------------------------------------------------------------------
+; pixels in
+;   line[0..linelength-1]..line[(nlines-1)*linestep..(nlines-1)*linestep+linelength-1]
+
+; diffuse into 24bit values that are all contained within source palette.
+
+asm_diffuse_to_24bpp
+; The first line is special because the input pixels are in un-spaced-out format.
+
+        STMDB   sp!,{r0-r12,lr}                       ; we need them all!
+        ; d_inptr,d_count,d_outptr,d_table already set up, and will need to get reloaded
+        LDR     d_nextline,[sp,#14*4+4]               ; get 'linestep' argument
+        ADD     d_nextline,d_inptr,d_nextline,LSL #2  ; construct pointer to line above d_inptr
+;        ADRL    d_palette,standard_palette
+        LDR     d_palette, [sp,#14*4+8]
+
+        MOV     d_r,#0
+        MOV     d_g,#0
+        MOV     d_b,#0
+        LineAboveStartup
+; Start processing the first pixel
+        LDR     d_t1,[d_inptr],#4                     ; get very first pixel
+        ConvertPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        ; 5/16ths of the error is thrown away
+        Add3_16ToNextLinePix
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAboveForFirstInLine
+        SUBS    d_count,d_count,#1
+        BEQ     dither24_first_line_done               ; lines are just one pixel long
+; now the loop for most of the pixels in the first line
+        SUBS    d_count,d_count,#1
+        BEQ     dither24_first_line_last_pixel          ; lines are just two pixels long
+dither24_each_pixel_in_first_line
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAbove
+        SUBS    d_count,d_count,#1
+        BNE     dither24_each_pixel_in_first_line
+; now the very last pixel in the line
+dither24_first_line_last_pixel
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        ; 1/16+7/16 of error gets thrown away
+        AdvanceLineAboveForLastInLine
+dither24_first_line_done
+
+; Now the loop for each line in the middle - pixels picked up will be spaced out ones.
+dither24_each_line
+
+        LDMIA   sp,{r0-r3}                            ; d_inptr,d_count,d_outptr,d_table reset
+        LDR     d_nextline,[sp,#14*4+4]               ; get 'linestep' argument
+        ADD     d_inptr,d_inptr,d_nextline,LSL #2     ; construct pointer to line above d_inptr
+        ADD     d_outptr,d_outptr,d_nextline,LSL #2   ; construct pointer to line above d_outptr
+        ADD     d_nextline,d_inptr,d_nextline,LSL #2  ; and pointer to next line
+        STMIA   sp,{r0-r2}                            ; save back d_inptr and d_outptr
+
+        MOV     d_r,#0                                ; initial cumulative error is 0
+        MOV     d_g,#0
+        MOV     d_b,#0
+
+        LDR     d_t1,[sp,#14*4]                       ; get line count
+        SUBS    d_t1,d_t1,#1
+        CMP     d_t1,#1                               ; we didn't count for the first line, nor the last
+        BLE     dither24_each_line_exit                 ; time to do very last line
+        STR     d_t1,[sp,#14*4]                       ; save for next time
+
+        SUB     d_count,d_count,#1                    ; number of pix in line excluding first and last
+        LineAboveStartup
+; Start processing the first pixel
+        LDR     d_t1,[d_inptr],#4                     ; get very first pixel
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add8_16ToNextLinePix                          ; 3/16 + 5/16 sent upwards, since NextLinePrevPix doesn't exit.
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAboveForFirstInLine
+        SUBS     d_count,d_count,#1
+        BEQ      dither24_last_pixel                    ; line is two pixels long
+; now the loop for most of the pixels
+dither24_each_pixel
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        Add1_16ToNextLineNextPix
+        CutRGBby7_16
+        AdvanceLineAbove
+        SUBS    d_count,d_count,#1
+        BNE     dither24_each_pixel
+; now the very last pixel in the line
+dither24_last_pixel
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        Add5_16ToNextLinePrevPix
+        Add3_16ToNextLinePix
+        Add8_16ToNextLinePix                          ; 3/16 + 7/16 + 1/16 sent upwards, since no pixels to right of here.
+        AdvanceLineAboveForLastInLine
+
+        B       dither24_each_line
+dither24_each_line_exit
+
+; And the final line - all errors propogated to the right.
+; On the last line all pixels are treated the same.
+; Registers for the loop have already been set up, at the start of the main loop.
+dither24_each_pixel_in_last_line
+        LDR     d_t1,[d_inptr],#4                     ; get this pixel - not spaced out one
+        ConvertSpacedPixelPlusRGBTo8bit
+        Save24bitPixel
+        GetTrueRGBof8bitPixel
+        Subtract32bitFromRGB
+        CutRGBby12_16
+        SUBS    d_count,d_count,#1
+        BNE     dither24_each_pixel_in_last_line
+
+; Done, finished, finito.
+        LDMIA   sp!,{r0-r12,pc}
+
+
+;asm_convert_to_8bpp_grey
+;; In:
+;;  r0 = in pointer
+;;  r1 = words per line
+;;  r2 = out pointer
+;;  r3 = number of lines
+;
+;        STMDB   sp!,{r0-r12,lr}                       ; we need them all!
+;
+;        ; d_inptr,d_count,d_outptr,d_table already set up, and will need to get reloaded
+;        LDR     r4,[sp,#14*4]                        ; get 'linestep' argument
+;;        LDR     r5,[sp,#14*4]                          ; get line count
+;
+;        MOV     r6, r0
+;        MOV     r7, r2
+;togrey_nextline
+;        MOV     r0,r6
+;        MOV     r2,r7
+;        ADD     r6,r0,r4,LSL #2                        ; start of next line.
+;        ADD     r7,r2,r4,LSL #2                        ; start of next line.
+;        MOV     r5,#4
+;        MOV     r11,#0
+;        MOV     r8, r1                                 ;count
+;togrey_nextpixel
+;        LDR     r9, [r0],#4
+;        MakePixelGrey r9, r10
+;        AND     r9, r9, #&ff
+;        ORR     r11, r11, r9
+;        MOV     r11, r11, ROR #8
+;        SUBS    r5, r5, #1
+;        STREQ   r11, [r2],#4
+;        MOVEQ   r5, #4
+;        MOVEQ   r11, #0
+;        SUBS    r8, r8, #1
+;        BGT     togrey_nextpixel
+;        CMP     r5,#4
+;        MOVNE   r5,r5,LSL #3
+;        MOVNE   r11, r11, ROR r5
+;        SUBS    r3, r3, #1
+;        BGT     togrey_nextline
+;
+;
+;        LDMIA   sp!,{r0-r12,pc}
+
+        END

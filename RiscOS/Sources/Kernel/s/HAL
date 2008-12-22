@@ -1,0 +1,2180 @@
+; Copyright 2000 Pace Micro Technology plc
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GBLL    MinorL2PThack
+MinorL2PThack SETL {TRUE}
+
+; Fixed page allocation is as follows
+
+                        ^       0
+DRAMOffset_FirstFixed   #       0
+DRAMOffset_ScratchSpace #       16*1024
+DRAMOffset_PageZero     #       16*1024
+DRAMOffset_L1PT         #       16*1024         ; L1PT must be 16K-aligned
+DRAMOffset_LastFixed    #       0
+
+;        IMPORT  Init_ARMarch
+;        IMPORT  ARM_Analyse
+
+
+
+; void RISCOS_InitARM(unsigned int flags)
+;
+RISCOS_InitARM
+        MOV     a4, lr
+        ; Check if we're architecture 3. If so, don't read the control register.
+        BL      Init_ARMarch
+        MOVEQ   a1, #0
+        ARM_read_control a1, NE
+        ; Late abort (ARM6 only), 32-bit Data and Program space. No Write buffer (ARM920T
+        ; spec says W bit should be set, but I reckon they're bluffing).
+        ;
+        ; The F bit's tricky. (1 => CPCLK=FCLK, 0=>CPCLK=FCLK/2). The only chip using it was the
+        ; ARM700, it never really reached the customer, and it's always been programmed with
+        ; CPCLK=FCLK. Therefore we'll keep it that way, and ignore the layering violation.
+        ORR     a1, a1, #MMUC_F+MMUC_L+MMUC_D+MMUC_P
+        ; All of these bits should be off already, but just in case...
+        BIC     a1, a1, #MMUC_B+MMUC_W+MMUC_C+MMUC_A+MMUC_M
+        BIC     a1, a1, #MMUC_RR+MMUC_V+MMUC_I+MMUC_Z+MMUC_R+MMUC_S
+
+        ; Off we go.
+        ARM_write_control a1
+
+        ; In case it wasn't a hard reset
+        MOV     a2, #0
+        MCR     ARM_config_cp,0,a2,ARMv4_cache_reg,C7           ; invalidate I+D caches
+        MCREQ   ARM_config_cp,0,a2,ARMv3_TLBflush_reg,C0        ; flush TLBs
+        MCRNE   ARM_config_cp,0,a2,ARMv4_TLB_reg,C7             ; flush TLBs
+
+        ; We assume that ARMs with an I cache can have it enabled while the MMU is off.
+        [ :LNOT:CacheOff
+        ORRNE   a1, a1, #MMUC_I
+        ARM_write_control a1, NE                                ; whoosh
+        ]
+
+        ; Check if we are in a 26-bit mode.
+        MRS     a2, CPSR
+        ; Keep a soft copy of the CR in a banked register (R13_und)
+        MSR     CPSR_c, #F32_bit+I32_bit+UND32_mode
+        MOV     sp, a1
+        ; Switch into SVC32 mode (we may have been in SVC26 before).
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode
+
+        ; If we were in a 26-bit mode, the lr value given to us would have had PSR flags in.
+        TST     a2, #2_11100
+        MOVNE   pc, a4
+        BICEQ   pc, a4, #ARM_CC_Mask
+
+
+; void *RISCOS_AddRAM(unsigned int flags, void *start, void *end, uintptr_t sigbits, void *ref)
+;   Entry:
+;     flags   bit 0: video memory (currently only one block permitted)
+;             bit 1: video memory is not suitable for general use
+;             bits 8-11: speed indicator (arbitrary, higher => faster)
+;             other bits reserved (SBZ)
+;     start   = start address of RAM (inclusive) (no alignment requirements)
+;     end     = end address of RAM (exclusive) (no alignment requirements, but must be >= start)
+;     sigbits = significant address bit mask (1 => this bit of addr decoded, 0 => this bit ignored)
+;     ref     = reference handle (NULL for first call)
+
+; A table is built up at the head of the first block of memory.
+; The table consists of (addr, len, flags) pairs, terminated by a count of those pairs; ref points to that
+; counter.
+; Twelve bits of flags are stored at the bottom of the length word.
+
+        ROUT
+RISCOS_AddRAM
+        Push    "v1,v2,v3,v4,lr"
+        LDR     v4, [sp, #20]           ; Get ref
+
+        ; Round to pages. If we were extra sneaky we could not do this and chuck out incomplete
+        ; pages after concatanation, but it would be a weird HAL that gave us pages split across
+        ; calls.
+        ;
+        ADD     a2, a2, #4096           ; round start address up
+        SUB     a2, a2, #1
+        MOV     a2, a2, LSR #12
+        MOV     a2, a2, LSL #12
+        MOV     a3, a3, LSR #12         ; round end address down
+        MOV     a3, a3, LSL #12
+
+        CMP     a3, a2
+        BLS     %FT90                   ; check we aren't now null
+
+        CMP     v4, #0
+        BEQ     %FT20
+
+        ; We are not dealing with the first block since v4 != 0.  Make an attempt to merge this block
+        ; with the previous block.
+        LDMDB   v4, {v1, v2}            ; Get details of the previous block
+        MOV     v3, v2, LSL #20         ; Isolate flags
+        BIC     v2, v2, v3, LSR #20     ; And strip from length
+        ADD     v2, v1, v2              ; Get the end address
+        EOR     v2, v2, a2              ; Compare with the current block start address...
+        TST     v2, a4                  ; ... but only check the decoded bits.
+        EOR     v2, v2, a2              ; Restore the previous block end address.
+        TEQEQ   v3, a1, LSL #20         ; And are the page flags the same?
+        BNE     %FT10                   ; We can't merge it after the previous block
+
+        ; v1 = previous start
+        ; v2 = previous end
+        ; The block is just after the previous block.  That means the start address is unchanged, but
+        ; the length is increased.
+        SUB     v2, v2, v1              ; Calculate the previous block length.
+        SUB     a3, a3, a2              ; Find the length of the new block.
+        ; a3 = length of block
+        ADD     v2, v2, a3              ; Add it to the previous length.
+        ORR     v2, v2, v3, LSR #20     ; And put the flags back in.
+        STR     v2, [v4, #-4]           ; Update the block size in memory.
+        MOV     a1,v4
+        Pull    "v1,v2,v3,v4,pc"
+
+        ; The block is not just after the previous block, but it may be just before.  This may be the
+        ; case if we are softloaded.
+10      SUB     v1, v1, #1              ; Compare the address before the previous block start ...
+        SUB     a3, a3, #1              ; ... with the address of the last byte in this block ...
+        EOR     v1, v1, a3
+        TST     v1, a4                  ; ... but check only the decoded bits.
+        ADD     a3, a3, #1              ; Restore the end address.
+        TEQEQ   v3, a1, LSL #20         ; And are the page flags the same?
+        BNE     %FT20                   ; Skip if we cannot merge the block.
+
+        ; The block is just before the previous block.  The start address and length both change.
+        LDR     v1, [v4, #-8]           ; Get the previous block start again.
+
+        SUB     a3, a3, a2              ; Calculate the current block size.
+        SUB     v1, v1, a3              ; Subtract from the previous block start address.
+        SUB     v2, v2, v1              ; Calculate the new length=end-start
+        ORR     v2, v2, v3, LSR #20     ; And put the flags back in.
+        STMDB   v4, {v1, v2}            ; Update the block info in memory.
+        MOV     a1,v4
+        Pull    "v1,v2,v3,v4,pc"
+
+        ; We now have a region which does not merge with a previous region.  We move it up to the
+        ; highest address we can in the hope that this block will merge with the next block.
+20      SUB     a3, a3, a2              ; Calculate the block size
+        MOV     a1, a1, LSL #20
+        ORR     a3, a3, a1, LSR #20     ; Put the flags at the bottom
+        MVN     v1, a4                  ; Get the non-decoded address lines.
+        ORR     a2, v1, a2              ; Set the non-decoded address bit in the start address.
+
+30      CMP     v4, #0                  ; If the workspace has not been allocated...
+        MOVEQ   v4, a2                  ; ... use this block.
+        MOVEQ   v1, #0                  ; Initialise the counter.
+
+        ; The block/fragment to be added is between a2 and a2+a3.
+        LDRNE   v1, [v4]                ; Get the old counter if there was one.
+        STMIA   v4!, {a2, a3}           ; Store address and size.
+        ADD     v1, v1, #1              ; Increment the counter.
+        STR     v1, [v4]                ; Store the counter.
+
+90      MOV     a1,v4
+        Pull    "v1,v2,v3,v4,pc"        ; We've done with this block now.
+
+
+
+; Subtractv1v2fromRAMtable
+;
+; On entry: v1 = base of memory area
+;           v2 = size of memory area
+;           a4 = RAM table handle (ie pointer to terminator word containing number of entries)
+;
+; On exit:  a1-a3 preserved
+;           a4 and RAM table updated
+;           other registers corrupted
+Subtractv1v2fromRAMtable
+        ADD     v2, v1, v2              ; v2 = end address
+        MOV     v1, v1, LSR #12
+        MOV     v1, v1, LSL #12         ; round base down
+        ADD     v2, v2, #4096
+        SUB     v2, v2, #1
+        MOV     v2, v2, LSR #12
+        MOV     v2, v2, LSL #12         ; round end up
+
+        LDR     v5, [a4]
+        SUB     v8, a4, v5, LSL #3
+10      TEQ     v8, a4
+        MOVEQ   pc, lr
+        LDMIA   v8!, {v3, v4}
+        MOV     v6, v4, LSR #12
+        ADD     v6, v3, v6, LSL #12     ; v6 = end of RAM block
+        CMP     v2, v3                  ; if our end <= RAM block start
+        CMPHI   v6, v1                  ; or RAM block end <= our start
+        BLS     %BT10                   ; then no intersection
+
+        MOV     v4, v4, LSL #20         ; extract flags
+
+        CMP     v1, v3
+        BHI     not_bottom
+
+        ; our area is at the bottom
+        CMP     v2, v6
+        BHS     remove_block
+
+        SUB     v6, v6, v2              ; v6 = new size
+        ORR     v6, v6, v4, LSR #20     ; + flags
+        STMDB   v8, {v2, v6}            ; store new base (= our end) and size
+        B       %BT10
+
+        ; we've completely covered a block. Remove it.
+remove_block
+        MOV     v6, v8
+20      TEQ     v6, a4                  ; shuffle down subsequent blocks in table
+        LDMNEIA v6, {v3, v4}
+        STMNEDB v6, {v3, v4}
+        ADDNE   v6, v6, #8
+        BNE     %20
+        SUB     v5, v5, #1
+        SUB     a4, a4, #8
+        STR     v5, [a4]
+        SUB     v8, v8, #8
+        B       %BT10
+
+        ; our area is not at the bottom.
+not_bottom
+        CMP     v2, v6
+        BLO     split_block
+
+        ; our area is at the top
+        SUB     v6, v1, v3              ; v6 = new size
+        ORR     v6, v6, v4, LSR #20     ; + flags
+        STMDB   v8, {v3, v6}            ; store original base and new size
+        B       %BT10
+
+split_block
+        MOV     v6, a4
+30      TEQ     v6, v8                  ; shuffle up subsequent blocks in table
+        LDMNEDB v6, {v3, v4}
+        STMNEIA v6, {v3, v4}
+        SUBNE   v6, v6, #8
+        BNE     %BT30
+        ADD     v5, v5, #1
+        ADD     a4, a4, #8
+        STR     v5, [a4]
+
+        SUB     v7, v1, v3              ; v7 = size of first half
+        SUB     v6, v6, v2              ; v6 = size of second half
+        ORR     v7, v7, v4, LSR #20
+        ORR     v6, v6, v4, LSR #20     ; + flags
+        STMDB   v8, {v3, v7}
+        STMIA   v8!, {v2, v6}
+        B       %BT10
+
+
+;void RISCOS_Start(unsigned int flags, int *riscos_header, int *hal_header, void *ref)
+;
+
+; We don't return, so no need to obey ATPCS, except for parameter passing.
+; register usage:   v4 = location of VRAM
+;                   v6 = amount of VRAM
+
+        ROUT
+RISCOS_Start
+        TEQ     a4, #0
+01      BEQ     %BT01                           ; Stop here if no RAM
+
+        ; subtract the HAL and OS from the list of RAM areas
+        MOV     v1, a2
+        LDR     v2, [a2, #OSHdr_ImageSize]
+        BL      Subtractv1v2fromRAMtable
+        LDR     v1, [a3, #HALDesc_Start]
+        ADD     v1, a3, v1
+        LDR     v2, [a3, #HALDesc_Size]
+        BL      Subtractv1v2fromRAMtable
+
+        LDR     v5, [a4]                        ; v5 = the number of RAM blocks
+        SUB     v8, a4, v5, LSL #3              ; Jump back to the start of the list.
+
+        ; Search for some VRAM
+05      LDMIA   v8!, {v1, v2}                   ; Get a block from the list. (v1,v2)=(addr,size+flags)
+        TST     v2, #1                          ; Is it VRAM?
+        BNE     %FT20                           ; If so, deal with it below
+        TEQ     v8, a4                          ; Carry on until end of list or we find some.
+        BNE     %BT05
+
+        ; Extract some pseudo-VRAM from first RAM block
+        SUB     v8, a4, v5, LSL #3              ; Rewind again.
+        LDMIA   v8!, {v1, v2}
+        MOV     v2, v2, LSR #12                 ; Remove flags
+        MOV     v2, v2, LSL #12
+        MOV     v4, v1                          ; Allocate first block as video memory
+        MOV     v6, v2
+        TEQ     v8, a4                          ; Was this the only block? If so, leave 16M
+        SUBEQS  v6, v6, #16*1024*1024
+        MOVCC   v6, v2, LSR #1                  ; If that overflowed, take half the bank.
+        CMP     v6, #32*1024*1024
+        MOVHS   v6, #32*1024*1024               ; Limit allocation to 32M (arbitrary)
+
+        ADD     v1, v1, v6                      ; Adjust the RAM block base...
+        SUBS    v2, v2, v6                      ; ... and the size
+        LDMEQIA v8!, {v1, v2}                   ; Fetch the next block if we claimed it all
+        B       %FT30
+
+        ; Note real VRAM parameters
+20      MOV     v6, v2                          ; Remember the size and address
+        MOV     v4, v1                          ; of the VRAM
+22      TEQ     v8, a4                          ; if not at the end of the array
+        LDMNEIA v8, {v1, v2}                    ; pack the array tighter
+        STMNEDB v8, {v1, v2}
+        ADDNE   v8, v8, #8
+        BNE     %BT22
+25      SUB     v5, v5, #1                      ; decrease the counter
+        STR     v5, [a4, #-8]!                  ; and move the end marker down
+
+        SUB     v8, a4, v5, LSL #3              ; Rewind to start of list
+        LDMIA   v8!, {v1, v2}
+
+        ; Fill in the Kernel's permanent memory table
+30      ADD     ip, v1, #DRAMOffset_PageZero
+        ADD     v7, ip, #DRAMPhysAddrA
+
+        ADD     sp, v1, #DRAMOffset_ScratchSpace + ScratchSpaceSize
+
+        Push    "a1,a2,a3"                      ; Remember our arguments
+
+        CMP     v5, #DRAMPhysTableSize          ; Don't overflow our table
+        ADDHI   a4, v8, #DRAMPhysTableSize*8 - 8
+
+35      MOV     v2, v2, LSR #12
+        MOVS    v2, v2, LSL #12                 ; strip out flags
+        STMNEIA v7!, {v1, v2}                   ; if non-zero length, add it to real list
+        TEQ     v8, a4
+        LDMNEIA v8!, {v1, v2}
+        BNE     %BT35
+
+        ; Now go back and put the VRAM information in
+
+        STR     v6, [ip, #VRAMFlags]
+        MOV     v6, v6, LSR #12
+        MOV     v6, v6, LSL #12                 ; strip out flags
+        ADD     a3, ip, #VideoPhysAddr
+        STMIA   a3, {v4, v6}
+
+        ; Now we have to work out the total RAM size
+        MOV     a2, #0
+        MOV     v6, a3
+40
+        LDMIA   v6!, {v1, v2}                   ; get address, size
+        ADD     a2, a2, v2                      ; add on size
+        TEQ     v6, v7
+        BNE     %BT40
+
+
+; a2 = Total memory size (bytes)
+; a3 = PhysRamTable
+; v7 = After last used entry in PhysRamTable
+
+; now store zeros to fill out table
+
+55
+        ADD     v2, a3, #PhysRamTableEnd-PhysRamTable
+        MOV     v3, #0
+        MOV     v4, #0
+57
+        CMP     v7, v2
+        STMLOIA v7!, {v3, v4}
+        BLO     %BT57
+
+; Time to set up the L1PT. Just zero it out for now.
+
+        LDR     a3, [a3, #DRAMPhysAddrA-PhysRamTable]   ; get address of 1st RAM bank
+        ADD     a3, a3, #DRAMOffset_L1PT+16*1024        ; make a3 -> L1PT end
+        MOV     a4, #16*1024
+        MOV     v2, #0
+        MOV     v3, #0
+        MOV     v4, #0
+        MOV     v5, #0
+        MOV     v6, #0
+        MOV     v7, #0
+        MOV     v8, #0
+        MOV     ip, #0
+60
+        STMDB   a3!, {v2-v8,ip}                         ; start at end and work back
+        SUBS    a4, a4, #8*4
+        BNE     %BT60
+
+        ADD     v1, a3, #DRAMOffset_PageZero - DRAMOffset_L1PT
+        ADD     v2, a3, #DRAMOffset_LastFixed - DRAMOffset_L1PT
+        STR     a2, [v1, #RAMLIMIT]                     ; remember the RAM size
+        MOV     lr, a2, LSR #12
+        SUB     lr, lr, #1
+        STR     lr, [v1, #MaxCamEntry]
+        MOV     lr, a2, LSR #12-3+12
+        CMP     a2, lr, LSL #12-3+12
+        ADDNE   lr, lr, #1
+        MOV     lr, lr, LSL #12
+        STR     lr, [v1, #SoftCamMapSize]
+        STR     a3, [v1, #InitUsedStart]                ; store start of L1PT
+
+        ADD     v1, v1, #DRAMPhysAddrA
+        MOV     v3, a3
+
+; For the next batch of allocation routines, v1-v3 are treated as globals.
+; v1 -> current entry in PhysRamTable
+; v2 -> next address to allocate in v1 (may point at end of v1)
+; v3 -> L1PT (or 0 if MMU on - not yet)
+
+; Allocate the L2PT backing store for the logical L2PT space, to
+; prevent recursion.
+        LDR     a1, =L2PT
+        MOV     a2, #&00400000
+        LDR     a3, =(AP_None * L2X_APMult)
+        BL      AllocateL2PT
+
+; Allocate workspace for the HAL
+
+        ADD     a4, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
+        LDR     a3, [sp, #8]                            ; recover pushed HAL header
+        LDR     a1, =HALWorkspace
+        LDR     a2, =(AP_Read * L2X_APMult) + L2_C + L2_B
+        LDR     lr, [a3, #HALDesc_Workspace]            ; their workspace
+        LDR     ip, [a3, #HALDesc_NumEntries]           ; plus 1 word per entry
+        CMP     ip, #KnownHALEntries
+        MOVLO   ip, #KnownHALEntries
+        ADD     lr, lr, ip, LSL #2
+        MOV     a3, lr, LSR #12                         ; round workspace up to whole
+        MOV     a3, a3, LSL #12                         ; number of pages
+        CMP     a3, lr
+        ADDNE   a3, a3, #&1000
+        STR     a3, [a4, #HAL_WsSize]                   ; Make a note of allocated space
+        ADD     ip, a1, ip, LSL #2                      ; Their workspace starts
+        STR     ip, [a4, #HAL_Workspace]                ; after our table of entries
+        BL      Init_MapInRAM
+
+        LDR     a3, [sp, #8]                            ; recover pushed HAL header
+        LDR     lr, [a3, #HALDesc_Flags]
+        TST     lr, #HALFlag_NCNBWorkspace              ; do they want uncacheable
+        LDRNE   a1, =HALWorkspaceNCNB                   ; workspace?
+        LDRNE   a2, =(AP_None * L2X_APMult)
+        LDRNE   a3, =32*1024
+        BLNE    Init_MapInRAM
+
+; Bootstrap time. We want to get the MMU on ASAP. We also don't want to have to
+; clear up too much mess later. So what we'll do is map in the three fixed areas
+; (L1PT, scratch space and page zero), the CAM, ourselves, and the HAL,
+; then turn on the MMU. The CAM will be filled in once the MMU is on, by
+; reverse-engineering the page tables?
+
+        ; Map in page zero
+        ADD     a1, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
+        MOV     a2, #0
+ [ ECC
+        LDR     a3, =(AP_Read * L2X_APMult) + L2_C + L2_B + 1:SHL:31
+ |
+        LDR     a3, =(AP_Read * L2X_APMult) + L2_C + L2_B
+ ]
+        MOV     a4, #16*1024
+        BL      Init_MapIn
+
+        ; Map in scratch space
+        ADD     a1, v3, #DRAMOffset_ScratchSpace - DRAMOffset_L1PT
+        MOV     a2, #ScratchSpace
+  [ ECC
+        LDR     a3, =(AP_Read * L2X_APMult) + L2_C + L2_B + 1:SHL:31
+  |
+        LDR     a3, =(AP_Read * L2X_APMult) + L2_C + L2_B
+  ]
+        MOV     a4, #16*1024
+        BL      Init_MapIn
+
+        ; Map in L1PT
+        MOV     a1, v3
+        LDR     a2, =L1PT
+ [ ECC
+        LDR     a3, =(AP_None * L2X_APMult) + 1:SHL:31
+ |
+        LDR     a3, =(AP_None * L2X_APMult)
+ ]
+        MOV     a4, #16*1024
+        BL      Init_MapIn
+
+        ; Map in L1PT again in PhysicalAccess (see below)
+        MOV     a1, v3, LSR #20
+        MOV     a1, a1, LSL #20                 ; megabyte containing L1PT
+        LDR     a2, =PhysicalAccess
+ [ ECC
+        LDR     a3, =(AP_None * L2X_APMult) + 1:SHL:31
+ |
+        LDR     a3, =(AP_None * L2X_APMult)
+ ]
+        MOV     a4, #1024*1024
+        BL      Init_MapIn
+
+        ; Examine HAL and RISC OS locations
+        LDMFD   sp, {v4,v5,v6}                  ; v4 = flags, v5 = RO desc, v6 = HAL desc
+        LDR     lr, [v6, #HALDesc_Size]
+        LDR     v7, [v6, #HALDesc_Start]
+        ADD     v6, v6, v7                      ; (v6,v8)=(start,end) of HAL
+        ADD     v8, v6, lr
+
+        LDR     v7, [v5, #OSHdr_ImageSize]
+        ADD     v7, v5, v7                      ; (v5,v7)=(start,end) of RISC OS
+
+        TEQ     v8, v5                          ; check contiguity (as in a ROM image)
+        BNE     %FT70
+
+        ; HAL and RISC OS are contiguous. Yum.
+        MOV     a1, v6
+        LDR     a2, =RISCOS_Header
+        SUB     a2, a2, lr
+
+        SUB     ip, a2, a1                      ; change physical addresses passed in
+        LDMIB   sp, {a3, a4}                    ; into logical addresses
+        ADD     a3, a3, ip
+        ADD     a4, a4, ip
+        STMIB   sp, {a3, a4}
+
+        MOV     a3, #(AP_ROM * L2X_APMult) + L2_C + L2_B
+        SUB     a4, v7, v6
+        BL      Init_MapIn
+        MOV     a3, v6
+        B       %FT75
+
+70
+        ; HAL is separate. (We should cope with larger images)
+        LDR     a2, =ROM
+        MOV     a1, v6
+        SUB     ip, a2, a1                      ; change physical address passed in
+        LDR     a3, [sp, #8]                    ; into logical address
+        ADD     a3, a3, ip
+        STR     a3, [sp, #8]
+        SUB     a4, v8, v6
+        MOV     a3, #(AP_ROM * L2X_APMult) + L2_C + L2_B
+        BL      Init_MapIn
+
+        ; And now map in RISC OS
+        LDR     a2, =RISCOS_Header              ; Hmm - what if position independent?
+        MOV     a1, v5
+        SUB     ip, a2, a1                      ; change physical address passed in
+        LDR     a3, [sp, #4]                    ; into logical address
+        ADD     a3, a3, ip
+        STR     a3, [sp, #4]
+        SUB     a4, v7, v5
+        MOV     a3, #(AP_ROM * L2X_APMult) + L2_C + L2_B
+        BL      Init_MapIn
+        MOV     a3, v5
+75
+        ; We've now allocated all the pages we're going to before the MMU comes on.
+        ; Note the end address (for RAM clear)
+        ADD     a1, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
+        STR     v1, [a1, #InitUsedBlock]
+        STR     v2, [a1, #InitUsedEnd]
+        STR     a3, [a1, #ROMPhysAddr]
+
+        ; Note the HAL flags passed in.
+        LDR     a2, [sp, #0]
+        STR     a2, [a1, #HAL_StartFlags]
+
+        ; Set up a reset IRQ handler (used during RAM clear for keyboard
+        ; scan, and later for IIC CMOS access)
+        MSR     CPSR_c, #IRQ32_mode + I32_bit + F32_bit
+        LDR     sp_irq, =ScratchSpace + ScratchSpaceSize/2
+        MSR     CPSR_c, #SVC32_mode + I32_bit + F32_bit
+        LDR     a2, =Reset_IRQ_Handler
+        STR     a2, [a1, #InitIRQHandler]
+
+        ; Fill in some initial processor vectors. These will be used during ARM
+        ; analysis, once the MMU is on. We do it here before the data cache is
+        ; activated to save any IMB issues.
+        ADRL    a2, InitProcVecs
+        ADD     a3, a2, #InitProcVecsEnd - InitProcVecs
+76      LDR     a4, [a2], #4
+        CMP     a2, a3
+        STR     a4, [a1], #4
+        BLO     %BT76
+
+MMU_activation_zone
+
+; The time has come to activate the MMU. Steady now... Due to unpredictability of MMU
+; activation, need to ensure that mapped and unmapped addresses are equivalent. To
+; do this, we temporarily make the section containing virtual address MMUon_instr map
+; to the same physical address. In case the code crosses a section boundary, do the
+; next section as well.
+;
+; Also note, no RAM access until we've finished the operation, as we don't know it's
+; available, and we might lose it due to lack of cache cleaning.
+;
+        MOV     a1, #4_3333333333333333         ; All domain manager - in case MMU already on
+        ARM_MMU_domain a1                       ; (who knows what domains/permissions they are using)
+
+        ADR     a1, MMU_activation_zone
+        MOV     a1, a1, LSR #20                 ; a1 = megabyte number (stays there till end)
+        ADD     lr, v3, a1, LSL #2              ; lr -> L1PT entry
+        LDMIA   lr, {a2, a3}                    ; remember old mappings
+  [ ARM6support
+        LDR     ip, =(AP_None * L1_APMult) + L1_U + L1_Section
+  |
+        LDR     ip, =(AP_ROM * L1_APMult) + L1_U + L1_Section
+  ]
+        ORR     a4, ip, a1, LSL #20             ; not cacheable, as we don't want
+        ADD     v4, a4, #1024*1024              ; to fill the cache with rubbish
+        STMIA   lr, {a4, v4}
+
+        MOV     a4, a1
+        BL      Init_ARMarch                    ; corrupts a1 and ip
+
+        MOV     a1, a4
+        MSREQ   CPSR_c, #F32_bit+I32_bit+UND32_mode ; Recover the soft copy of the CR
+        MOVEQ   v5, sp
+        ARM_read_control v5, NE
+  [ CacheOff
+        ORR     v5, v5, #MMUC_M                 ; MMU on
+        ORR     v5, v5, #MMUC_R                 ; ROM mode enable
+  |
+        ORR     v5, v5, #MMUC_W+MMUC_C+MMUC_M   ; Write buffer, data cache, MMU on
+        ORR     v5, v5, #MMUC_R+MMUC_Z          ; ROM mode enable, branch predict enable
+  ]
+        ARM_MMU_transbase v3                    ; Always useful to tell it where L1PT is...
+
+        MOV     ip, #0
+        MCREQ   p15, 0, ip, c5, c0              ; MMU may already be on (but flat mapped)
+        MCRNE   p15, 0, ip, c8, c7              ; if HAL needed it (eg XScale with ECC)
+                                                ; so flush TLBs now
+MMUon_instr
+        ARM_write_control v5
+        MOVEQ   sp, v5
+        MSREQ   CPSR_c, #F32_bit+I32_bit+SVC32_mode
+
+        MOV     ip, #0                                          ; junk MMU-off contents of I-cache
+        MCR     ARM_config_cp,0,ip,ARMv4_cache_reg,C7           ; (works on ARMv3)
+
+        MOV     ip, #4_0000000000000001                         ; domain 0 client only
+        ARM_MMU_domain ip
+
+; MMU now on. Need to jump to logical copy of ourselves. Complication arises if our
+; physical address overlaps our logical address - in that case we need to map
+; in another disjoint copy of ourselves and branch to that first, then restore the
+; original two sections.
+        ADRL    a4, RISCOS_Header
+        LDR     ip, =RISCOS_Header
+        SUB     ip, ip, a4
+        ADR     a4, MMU_activation_zone
+        MOV     a4, a4, LSR #20
+        MOV     a4, a4, LSL #20                 ; a4 = base of scrambled region
+        ADD     v4, a4, #2*1024*1024            ; v4 = top of scrambled region
+        SUB     v4, v4, #1                      ;      (inclusive, in case wrapped to 0)
+        ADR     v5, MMUon_resume
+        ADD     v5, v5, ip                      ; v5 = virtual address of MMUon_resume
+        CMP     v5, a4
+        BLO     MMUon_nooverlap
+        CMP     v5, v4
+        BHI     MMUon_nooverlap
+
+        ASSERT  ROM > 3*1024*1024
+; Oh dear. We know the ROM lives high up, so we'll mangle 00100000-002FFFFF.
+; But as we're overlapping the ROM, we know we're not overlapping the page tables.
+        LDR     lr, =L1PT                       ; accessing the L1PT virtually now
+  [ ARM6support
+        LDR     ip, =(AP_None * L1_APMult) + L1_U + L1_Section
+  |
+        LDR     ip, =(AP_ROM * L1_APMult) + L1_U + L1_Section
+  ]
+        ORR     v6, a4, ip
+        ADD     ip, v6, #1024*1024
+        LDMIB   lr, {v7, v8}                    ; sections 1 and 2
+        STMIB   lr, {v6, ip}
+        RSB     ip, a4, #&00100000
+        ADD     pc, pc, ip
+        NOP
+MMUon_overlapresume                             ; now executing from 00100000
+        ADD     ip, lr, a4, LSR #18
+        STMIA   ip, {a2, a3}                    ; restore original set of mappings
+        BL      Init_PageTablesChanged
+
+        MOV     a2, v7                          ; arrange for code below
+        MOV     a3, v8                          ; to restore section 1+2 instead
+        MOV     a1, #1
+
+MMUon_nooverlap
+        ADRL    lr, RISCOS_Header
+        LDR     ip, =RISCOS_Header
+        SUB     ip, ip, lr
+        ADD     pc, pc, ip
+        NOP
+MMUon_resume
+; What if the logical address of the page tables is at the physical address of the code?
+; Then we have to access it via PhysicalAccess instead.
+        LDR     lr, =L1PT
+        CMP     lr, a4
+        BLO     MMUon_nol1ptoverlap
+        CMP     lr, v4
+        BHI     MMUon_nol1ptoverlap
+; PhysicalAccess points to the megabyte containing the L1PT. Find the L1PT within it.
+        LDR     lr, =PhysicalAccess
+        MOV     v6, v3, LSL #12
+        ORR     lr, lr, v6, LSR #12
+MMUon_nol1ptoverlap
+        ADD     lr, lr, a1, LSL #2
+        STMIA   lr, {a2, a3}
+        BL      Init_PageTablesChanged
+
+; The MMU is now on. Wahey. Let's get allocating.
+
+        LDR     sp, =ScratchSpace + ScratchSpaceSize - 4*3 ; 3 items already on stack :)
+
+        LDR     a1, =ZeroPage
+
+        ADD     lr, v3, #DRAMOffset_PageZero-DRAMOffset_L1PT   ; lr = PhysAddr of zero page
+        SUB     v1, v1, lr
+        ADD     v1, v1, a1                              ; turn v1 from PhysAddr to LogAddr
+
+        LDR     a2, [a1, #InitUsedBlock]                ; turn this from Phys to Log too
+        SUB     a2, a2, lr
+        ADD     a2, a2, a1
+        STR     a2, [a1, #InitUsedBlock]
+
+
+; Store the logical address of the HAL descriptor
+        LDR     a2, [sp, #8]
+        STR     a2, [a1, #HAL_Descriptor]
+
+        MOV     v3, #0                                  ; "MMU is on" signal
+
+        BL      ARM_Analyse
+
+        ChangedProcVecs a1
+
+        MOV     a1, #L1_Fault
+        BL      RISCOS_ReleasePhysicalAddress
+
+        ASSERT  ZeroPage = 0
+        LDR     a1, =HALWorkspace
+        MOV     a2, #0
+        LDR     a3, [a2, #HAL_WsSize]
+        BL      memset
+
+        MOV     a2, #ZeroPage
+        LDR     a1, =IOLimit
+        STR     a1, [a2, #IOAllocLimit]
+        LDR     a1, =IO
+        STR     a1, [a2, #IOAllocPtr]
+
+        BL      SetUpHALEntryTable
+
+; Initialise the HAL. Due to its memory claiming we need to get our v1 and v2 values
+; into workspace and out again around it.
+
+        MOV     a1, #ZeroPage
+        STR     v1, [a1, #InitUsedBlock]
+        STR     v2, [a1, #InitUsedEnd]
+
+        LDR     a1, =RISCOS_Header
+        LDR     a2, =HALWorkspaceNCNB
+        AddressHAL
+        CallHAL HAL_Init
+
+        MOV     a1, #ZeroPage
+        LDR     v1, [a1, #InitUsedBlock]
+        LDR     v2, [a1, #InitUsedEnd]
+
+; Start timer zero, at 100 ticks per second
+        MOV     a1, #0
+        CallHAL HAL_TimerGranularity
+
+        MOV     a2, a1
+        MOV     a1, #100
+        BL      __rt_udiv
+
+        MOV     a2, a1
+        MOV     a1, #0
+        CallHAL HAL_TimerSetPeriod
+
+        MOV     a1, #InitIRQWs
+        MOV     a2, #1
+        STRB    a2, [a1, #KbdScanActive]
+
+        CallHAL HAL_KbdScanSetup
+
+        MSR     CPSR_c, #F32_bit+SVC32_mode             ; enable IRQs for scan
+
+; Remember some stuff that's about to get zapped
+        LDR     v8, =ZeroPage
+        LDR     v4, [v8, #ROMPhysAddr]
+        LDR     v5, [v8, #RAMLIMIT]
+        LDR     v7, [v8, #MaxCamEntry]
+
+        MOV     a1, #0
+        LDR     a1, [a1, #HAL_StartFlags]
+        TST     a1, #OSStartFlag_RAMCleared
+; Clear the memory.
+        BLEQ    ClearPhysRAM
+
+; Put it back
+        STR     v4, [v8, #ROMPhysAddr]
+        STR     v5, [v8, #RAMLIMIT]
+        STR     v7, [v8, #MaxCamEntry]
+
+; Set v4 to XCB bits for default cacheable+bufferable
+        MOV     v5, #0
+        LDR     v4, [v5, #MMU_PCBTrans]
+        LDRB    v4, [v4, #0]
+; Set v5 to XCB bits for default bufferable
+        LDR     v5, [v5, #MMU_PCBTrans]
+        LDRB    v5, [v5, #XCB_NC]
+
+; Set up the data cache cleaner space if necessary (eg. for StrongARM core)
+        MOV     a1, #-1
+        CallHAL HAL_CleanerSpace
+        CMP     a1, #-1          ;-1 means none needed (HAL only knows this if for specific ARM core eg. system-on-chip)
+        BEQ     %FT20
+        LDR     a2, =DCacheCleanAddress
+        ORR     a3, v4, #AP_None * L2X_APMult             ; ideally, svc read only, user none but hey ho
+        ASSERT  DCacheCleanSize = 4*&10000                ; 64k of physical space used 4 times (allows large page mapping)
+        MOV     a4, #&10000
+        MOV     ip, #4
+        SUB     sp, sp, #5*4       ;room for a1-a4,ip
+10
+        STMIA   sp, {a1-a4, ip}
+        BL      Init_MapIn
+        LDMIA   sp, {a1-a4, ip}
+        SUBS    ip, ip, #1
+        ADD     a2, a2, #&10000
+        BNE     %BT10
+        ADD     sp, sp, #5*4
+
+20
+; Allocate the CAM
+        LDR     a3, [v8, #SoftCamMapSize]
+        ORR     a2, v4, #AP_None * L2X_APMult
+        LDR     a1, =CAM
+        BL      Init_MapInRAM
+
+; Allocate the supervisor stack
+        LDR     a1, =SVCStackAddress
+        ORR     a2, v4, #AP_Read * L2X_APMult
+        LDR     a3, =SVCStackSize
+        BL      Init_MapInRAM
+
+ [ HAL32
+; Allocate the interrupt stack
+        LDR     a1, =IRQStackAddress
+        ORR     a2, v4, #AP_None * L2X_APMult
+        LDR     a3, =IRQStackSize
+        BL      Init_MapInRAM
+ ]
+
+; Allocate the abort stack
+        LDR     a1, =ABTStackAddress
+        ORR     a2, v4, #AP_None * L2X_APMult
+        LDR     a3, =ABTStackSize
+        BL      Init_MapInRAM
+
+; Allocate the undefined stack
+        LDR     a1, =UNDStackAddress
+        ORR     a2, v4, #AP_None * L2X_APMult
+        LDR     a3, =UNDStackSize
+        BL      Init_MapInRAM
+
+; Allocate the system heap
+        LDR     a1, =SysHeapAddress
+        ORR     a2, v4, #AP_Full * L2X_APMult
+        LDR     a3, =32*1024
+        BL      Init_MapInRAM
+
+; Allocate the cursor/system/sound block - first the cached bit
+        LDR     a1, =CursorChunkAddress
+        ORR     a2, v4, #AP_Read * L2X_APMult           ; Should be AP_None?
+        LDR     a3, =SoundDMABuffers - CursorChunkAddress
+        BL      Init_MapInRAM
+; then the uncached bit
+        LDR     a1, =SoundDMABuffers
+        ORR     a2, v5, #AP_Read * L2X_APMult           ; Should be AP_None?
+        LDR     a3, =?SoundDMABuffers
+        BL      Init_MapInRAM
+
+ [ LongCommandLines
+        LDR     a1, =KbuffsBaseAddress
+        ORR     a2, v4, #AP_Read * L2X_APMult
+        LDR     a3, =(KbuffsSize + &FFF) :AND: &FFFFF000  ;(round to 4k)
+        BL      Init_MapInRAM
+ ]
+
+ [ MinorL2PThack
+; Allocate backing L2PT for the free pool
+        MOV     a1, #FreePoolAddress
+        LDR     a2, [v8, #RAMLIMIT]
+        ; Need to round this up to 4M boundary, as AllocateL2PT only does
+        ; individual (1M) sections, rather than 4 at a time, corresponding
+        ; to a L2PT page. The following space is available for dynamic areas,
+        ; and ChangeDyn.s will get upset if it sees only some out of a set of 4
+        ; section entries pointing to the L2PT page.
+        ASSERT  FreePoolAddress :MOD: (4*1024*1024) = 0
+        ADD     a2, a2, #4*1024*1024
+        SUB     a2, a2, #1
+        MOV     a2, a2, LSR #22
+        MOV     a2, a2, LSL #22
+        ORR     a3, v5, #AP_None * L2X_APMult
+        BL      AllocateL2PT
+; And for application space
+        MOV     a1, #0
+        MOV     a2, #AplWorkMaxSize             ; Not quite right, but the whole thing's wrong anyway
+        ORR     a3, v4, #AP_Full * L2X_APMult
+        BL      AllocateL2PT
+; And for the system heap. Sigh
+        LDR     a1, =SysHeapAddress
+        LDR     a2, =SysHeapMaxSize
+        ORR     a3, v4, #AP_Full * L2X_APMult
+        BL      AllocateL2PT
+ ]
+
+        LDR     a1, =ZeroPage
+        STR     v2, [a1, #InitUsedEnd]
+
+
+        MSR     CPSR_c, #F32_bit+I32_bit+IRQ32_mode
+        LDR     sp, =IRQSTK
+        MSR     CPSR_c, #F32_bit+I32_bit+ABT32_mode
+        LDR     sp, =ABTSTK
+        MSR     CPSR_c, #F32_bit+I32_bit+UND32_mode
+        LDR     sp, =UNDSTK
+        MSR     CPSR_c, #F32_bit+SVC2632
+        LDR     sp, =SVCSTK
+
+        LDR     ip, =CAM
+        STR     ip, [a1, #CamEntriesPointer]
+
+        BL      ConstructCAMfromPageTables
+
+        MOV     a1, #4096
+        STR     a1, [v8, #Page_Size]
+
+        BL      CountPageTablePages
+
+ [ {FALSE}
+        MOV     a1, #InitIRQWs
+        MOV     a2, #0
+        MOV     a3, #0
+        STMIA   a1!, {a2,a3}
+        STMIA   a1!, {a2,a3}
+ ]
+
+        B       Continue_after_HALInit
+
+        LTORG
+
+CountPageTablePages ROUT
+        MOV     a1, #ZeroPage
+        LDR     a2, =CAM
+        LDR     a3, [a1, #MaxCamEntry]
+        MOV     a1, #0
+        ADD     a3, a3, #1
+        ADD     a4, a2, a3, LSL #3
+10      LDR     ip, [a4, #-8]!
+        ASSERT  (L2PT :AND: &3FFFFF) = 0
+        MOV     ip, ip, LSR #22
+        TEQ     ip, #L2PT :SHR: 22
+        ADDEQ   a1, a1, #4096
+        TEQ     a4, a2
+        BNE     %BT10
+        MOV     a2, #0
+        STR     a1, [a2, #L2PTUsed]
+        MOV     pc, lr
+
+; int PhysAddrToPageNo(void *addr)
+;
+; Converts a physical address to the page number of the page containing it.
+; Returns -1 if address is not in RAM.
+
+PhysAddrToPageNo
+        MOV     a4, #0
+        LDR     ip, =ZeroPage + PhysRamTable
+10      LDMIA   ip!, {a2, a3}                   ; get phys addr, size
+        TEQ     a3, #0                          ; end of list? (size=0)
+        BEQ     %FT90                           ;   then it ain't RAM
+        SUB     a2, a1, a2                      ; a2 = amount into this bank
+        CMP     a2, a3                          ; if more than size
+        ADDHS   a4, a4, a3                      ;   increase counter by size of bank
+        BHS     %BT10                           ;   and move to next
+        ADD     a4, a4, a2                      ; add offset to counter
+        MOV     a1, a4, LSR #12                 ; convert counter to a page number
+        MOV     pc, lr
+
+90      MOV     a1, #-1
+        MOV     pc, lr
+
+
+; A routine to construct the soft CAM from the page tables. This is used
+; after a soft reset, and also on a hard reset as it's an easy way of
+; clearing up after the recursive page table allocaton.
+
+        ROUT
+ConstructCAMfromPageTables
+        Push    "v1-v8, lr"
+        MOV     a1, #ZeroPage
+        LDR     a2, [a1, #MaxCamEntry]
+        LDR     ip, [a1, #MMU_PCBTrans]
+        LDR     v1, =CAM                        ; v1 -> CAM (for whole routine)
+        ADD     a2, a2, #1
+        ADD     a2, v1, a2, LSL #3
+
+        LDR     a3, =DuffEntry                  ; Clear the whole CAM, from
+        MOV     a4, #AP_Duff                    ; the top down.
+10      STMDB   a2!, {a3, a4}
+        CMP     a2, v1
+        BHI     %BT10
+
+        MOV     v2, #0                          ; v2 = logical address
+        LDR     v3, =L1PT                       ; v3 -> L1PT (not used much)
+        LDR     v4, =L2PT                       ; v4 -> L2PT
+
+30      LDR     v5, [v3, v2, LSR #18]           ; lr = first level descriptor
+        ASSERT  L1_Fault = 0
+        AND     a1, v5, #2_11                   ; move to next section if not
+        TEQ     a1, #L1_Page                    ; a page table (we ignore section maps
+        BEQ     %FT40                           ; and we don't do fine tables)
+        ADDS    v2, v2, #&00100000
+        BCC     %BT30
+        Pull    "v1-v8, pc"
+
+40      LDR     v5, [v4, v2, LSR #10]           ; lr = second level descriptor
+        ASSERT  L2_Fault = 0
+        ANDS    v6, v5, #2_11                   ; move to next page if fault
+        BEQ     %FT80
+
+        TEQ     v6, #L2_SmallPage               ; convert small pages to extended pages
+        BNE     %FT50
+        MOV     lr, #0                          ; if we now know that CPU supports them
+        LDR     a1, [lr, #ProcessorFlags]
+        TST     a1, #CPUFlag_ExtendedPages
+        BEQ     %FT50
+
+        ASSERT  ZeroPage = 0
+        LDR     a1, [lr, #MMU_PCBTrans]         ; reprocess C and B bits as per XCB table
+        TST     v5, #L2_C                       ; (eg if C and B both set, replace with
+        ORREQ   lr, lr, #DynAreaFlags_NotCacheable ; default cacheable+bufferable XCB)
+        TST     v5, #L2_B
+        ORREQ   lr, lr, #DynAreaFlags_NotBufferable
+        LDRB    lr, [a1, lr, LSR #2]
+        EOR     v5, v5, #L2_ExtPage:EOR:L2_SmallPage
+        BIC     v5, v5, #2_111111000000         ; remove excess 3 AP fields
+        BIC     v5, v5, #2_000000001100         ; remove old C+B
+        BIC     a1, v5, #2_000000110011         ; remove all other bits for just address
+        ORR     v5, v5, lr                      ; put in new XCB
+        MOV     a2, #ZeroPage
+        ARMop   MMU_ChangingEntry,,,a2
+        STR     v5, [v4, v2, LSR #10]           ; update page table
+
+50      MOV     a1, v5, LSR #12
+        MOV     a1, a1, LSL #12                 ; a1 = address (flags stripped out),,,
+        TEQ     v6, #L2_LargePage
+        BICEQ   a1, a1, #&0000F000              ; large pages get bits 12-15
+        ANDEQ   lr, v2, #&0000F000              ; from the virtual address
+        ORREQ   a1, a1, lr
+
+        BL      PhysAddrToPageNo
+        CMP     a1, #-1
+        BEQ     %FT80
+
+        ADD     a2, v1, a1, LSL #3              ; a2 -> CAM entry
+
+        AND     a1, v5, #&30                    ; a1 = access permission
+        MOV     a1, a1, LSR #4
+        ; ARM access goes 0 => all R/O, 1 => user none, 2 => user R/O, 3  => user R/W
+        ; PPL access goes 0 => user R/W, 1 => user R/O, 2 => user none, (and let's say 3 all R/O)
+        RSB     v6, a1, #3                      ; v6 = PPL access
+        AND     a1, v5, #2_11                   ; a1 = page type
+        CMP     a1, #L2_SmallPage
+        ANDHI   a1, v5, #2_0000001111001100     ; Extended TEX and CB bits
+        ANDLS   a1, v5, #2_0000000000001100     ; Small/Large CB bits only
+        ANDLO   lr, v5, #2_1111000000000000     ; Large TEX bits
+        ORRLO   a1, a1, lr, LSR #6              ; Move Large TEX back to Extended TEX position
+        MOV     lr, #3                          ; lr = PCB value (funny loop to do NCNB first)
+60      LDRB    a3, [ip, lr]                    ; look in XCBTrans table
+        TEQ     a3, a1                          ; found a match for our XCB?
+        BEQ     %FT70
+        TST     lr, #2_11
+        SUBNE   lr, lr, #1                      ; loop goes 3,2,1,0,7,6,5,4,...,31,30,29,28
+        ADDEQ   lr, lr, #7
+        TEQ     lr, #35
+        BNE     %BT60
+70      AND     a1, lr, #2_00011
+        ORR     v6, v6, a1, LSL #4              ; extract NCNB bits
+        AND     a1, lr, #2_11100
+        ORR     v6, v6, a1, LSL #10             ; extract P bits
+        ORR     v6, v6, #PageFlags_Unavailable               ; ???? pages from scratch to cam only?
+        STMIA   a2, {v2, v6}                    ; store logical address, PPL
+
+80      ADD     v2, v2, #&00001000
+        TST     v2, #&000FF000
+        BNE     %BT40
+        TEQ     v2, #0                          ; yuck (could use C from ADDS but TST corrupts C
+        BNE     %BT30                           ; because of big constant)
+
+        Pull    "v1-v8, pc"
+
+
+
+; Allocate a physical page from DRAM
+;
+; On entry:
+;    v1 -> current entry in PhysRamTable
+;    v2 -> end of last used physical page
+; On exit:
+;    a1 -> next free page
+;    v1, v2 updated
+;
+; No out of memory check...
+
+Init_ClaimPhysicalPage
+        MOV     a1, v2
+        LDMIA   v1, {a2, a3}
+        ADD     a2, a2, a3                      ; ip = end of this bank
+        CMP     v2, a2                          ; advance v2 to next bank if
+        LDRHS   a1, [v1, #8]!                   ; this bank is fully used
+        ADD     v2, a1, #4096
+        MOV     pc, lr
+
+; Allocate and map in some RAM.
+;
+; On entry:
+;    a1 = logical address
+;    a2 = access permissions (see Init_MapIn)
+;    a3 = length
+;    v1 -> current entry in PhysRamTable
+;    v2 = next physical address
+;    v3 -> L1PT
+;
+; On exit:
+;    a1 -> physical address of start of RAM (deduce the rest from PhysRamTable)
+;
+; No out of memory check...
+Init_MapInRAM ROUT
+        Push    "v4-v8,lr"
+        MOV     v8, #-1
+        MOV     v5, a3                          ; v5 = amount of memory required
+        MOV     v6, a1                          ; v6 = logical address
+        MOV     v7, a2                          ; v7 = access permissions
+10      LDMIA   v1, {ip, v4}                    ; ip = addr of bank, v4 = len
+        SUB     ip, v2, ip                      ; ip = amount of bank used
+        SUBS    v4, v4, ip                      ; v4 = amount of bank left
+        LDREQ   v2, [v1, #8]!                   ; move to next bank if 0 left
+        BEQ     %BT10
+
+        CMP     v8, #-1                         ; is this the first bank?
+        MOVEQ   v8, v2                          ; remember it
+
+        CMP     v4, v5                          ; sufficient in this bank?
+        MOVHS   a4, v5
+        MOVLO   a4, v4                          ; a4 = amount to take
+
+        MOV     a1, v2                          ; set up parameters for MapIn call
+        MOV     a2, v6                          ; then move globals (in case MapIn
+ [ ECC
+        ORR     a3, v7, #1:SHL:31
+ |
+        MOV     a3, v7                          ; needs to allocate for L2PT)
+ ]
+        ADD     v2, v2, a4                      ; advance physaddr
+        SUB     v5, v5, a4                      ; decrease wanted
+        ADD     v6, v6, a4                      ; advance address pointer
+        BL      Init_MapIn                      ; map in the RAM
+        TEQ     v5, #0                          ; more memory still required?
+        BNE     %BT10
+
+        MOV     a1, v8
+        Pull    "v4-v8,pc"
+
+; Map a range of physical addresses to a range of logical addresses.
+;
+; On entry:
+;    a1 = physical address
+;    a2 = logical address
+;    a3 = access permissions + C + B bits (bits 11-2 of an extended descriptor)
+;           (also set bit 31 to indicate that P bit in L1PT should
+;            be set)
+;    a4 = area size
+;    v1 -> current entry in PhysRamTable
+;    v2 = last used physical address
+;    v3 -> L1PT (or 0 if MMU on)
+
+Init_MapIn ROUT
+        Push    "lr"
+        ORR     lr, a1, a2                      ; OR together, physaddr, logaddr
+        ORR     lr, lr, a4                      ; and size.
+        MOVS    ip, lr, LSL #12                 ; If all bottom 20 bits 0
+        BEQ     Init_MapIn_Sections             ; it's section mapped
+
+        MOVS    ip, lr, LSL #16                 ; If bottom 16 bits not all 0
+        ORRNE   a3, a3, #L2_ExtPage             ; then extended small pages (4K)
+        BNE     %FT10
+
+        ORR     a3, a3, #L2_LargePage           ; else large pages (64K)
+        AND     lr, a3, #L2_TEX                 ; extract TEX from ext page flags
+        AND     ip, a3, #L2X_AP                 ; extract AP from ext page flags
+        BIC     a3, a3, #L2_AP                  ; clear way for large page AP
+        ORR     ip, ip, ip, LSL #2              ; duplicate up AP to 4 sub-pages
+        ORR     ip, ip, ip, LSL #4
+        ORR     a3, a3, lr, LSL #6              ; replace TEX in large page position
+        ORR     a3, a3, ip                      ; replace quadrupled AP
+10
+        Push    "v4-v7"
+        MOV     v4, a1                          ; v4 = physaddr
+        MOV     v5, a2                          ; v5 = logaddr
+        MOV     v6, a3                          ; v6 = access permissions
+        MOV     v7, a4                          ; v7 = area size
+
+20      MOV     a1, v4
+        MOV     a2, v5
+        MOV     a3, v6
+        BL      Init_MapInPage                  ; Loop through mapping in each
+        ADD     v4, v4, #4096                   ; page in turn
+        ADD     v5, v5, #4096
+        SUBS    v7, v7, #4096
+        BNE     %BT20
+        Pull    "v4-v7,pc"
+
+Init_MapIn_Sections
+        MOVS    ip, v3                          ; is MMU on?
+        LDREQ   ip, =L1PT                       ; then use virtual address
+        AND     lr, a3, #4_033300               ; extract TEX and AP bits
+        BIC     a3, a3, #4_033300               ; and clear them (now P, Domain and U bits)
+        ORR     a3, a3, lr, LSL #6              ; put TEX and AP bits back in new position
+  [ ARM6support
+        ASSERT  AP_ROM = 0
+        TST     a3, #4_300000                   ; If ROM permission
+        ARM_6   lr,EQ                           ;   and ARM 6
+        ORREQ   a3, a3, #AP_Read * L1_APMult    ;     then make it Read permission, non-updateable
+        ORRNE   a3, a3, #L1_U
+        ORRS    a3, a3, #L1_Section             ; Add section indicator to permission
+  |
+        ORRS    a3, a3, #L1_U+L1_Section        ; Add section + U indicators to permission
+  ]
+        ORRMI   a3, a3, #L1_P
+        BICMI   a3, a3, #1:SHL:31
+        ORR     a1, a1, a3                      ; Merge with physical address
+        ADD     a2, ip, a2, LSR #18             ; a2 -> L1PT entry
+70      STR     a1, [a2], #4                    ; And store in L1PT
+        ADD     a1, a1, #1024*1024              ; Advance one megabyte
+        SUBS    a4, a4, #1024*1024              ; and loop
+        BNE     %BT70
+        Pull    "pc"
+
+
+; Map a logical page to a physical page, allocating L2PT as necessary.
+;
+; On entry:
+;    a1 = physical address
+;    a2 = logical address
+;    a3 = access permissions + C + B bits + size (all non-address bits, of appropriate type)
+;           (also set bit 31 to indicate that P bit in L1PT should be set)
+;    v1 -> current entry in PhysRamTable
+;    v2 = last used physical address
+;    v3 -> L1PT (or 0 if MMU on)
+; On exit:
+;    a1 = logical address
+;    a2-a4, ip corrupt
+;    v1, v2 updated
+;
+; ROM permission is caught if on an ARM 6 and turned into Read
+; Extended pages are caught if not available (or MMU off) and turned into Small
+
+Init_MapInPage
+        Push    "v4-v6, lr"
+        MOV     v4, a1                          ; v4 = physical address
+        MOV     v5, a2                          ; v5 = logical address
+        MOV     v6, a3                          ; v6 = access permissions
+        MOV     a1, v5
+        MOV     a2, #4096
+        BL      AllocateL2PT
+        TEQ     v3, #0                          ; if MMU on, access L2PT virtually...
+        LDREQ   a1, =L2PT                       ; a1 -> L2PT virtual address
+        MOVEQ   ip, v5                          ; index using whole address
+        BEQ     %FT40
+        MOV     ip, v5, LSR #20
+        LDR     a1, [v3, ip, LSL #2]            ; a1 = level one descriptor
+        MOV     a1, a1, LSR #10
+        MOV     a1, a1, LSL #10                 ; a1 -> L2PT tables for this section
+        AND     ip, v5, #&000FF000              ; extract L2 table index bits
+40      AND     lr, v6, #3
+        TEQ     lr, #L2_LargePage               ; strip out surplus address bits from
+        BICEQ   v6, v6, #&0000F000              ; large page descriptors
+        TEQ     lr, #L2_ExtPage
+        BNE     %FT50
+        TEQ     v3, #0                          ; if we've been given an extended page
+        BNE     %FT45                           ; must check that (a) the MMU is on
+        MOV     lr, #0
+        LDR     lr, [lr, #ProcessorFlags]       ; and (b) the CPU supports them
+        TST     lr, #CPUFlag_ExtendedPages
+        BNE     %FT50
+45      EOR     v6, v6, #L2_SmallPage :EOR: L2_ExtPage
+        AND     lr, v6, #L2X_AP                 ; convert the extended page descriptor
+        BIC     v6, v6, #L2_AP                  ; into a small page descriptor
+        ORR     lr, lr, lr, LSL #2              ; (losing the TEX bits in the
+        ORR     v6, v6, lr                      ; process, but they should have been 0)
+        ORR     v6, v6, lr, LSL #4
+50      ORR     lr, v4, v6                      ; lr = value for L2PT entry
+  [ ARM6support
+        ASSERT  AP_ROM = 0
+        TST     lr, #4_333300                   ; if ROM permission
+        ARM_6   a2,EQ                           ;   and ARM 6
+        ORREQ   lr, lr, #AP_Read * L2_APMult    ;     then make it Read permission
+  ]
+        STR     lr, [a1, ip, LSR #10]           ; update L2PT entry
+        MOV     a1, v5
+        Pull    "v4-v6, pc"
+
+
+
+; On entry:
+;    a1 = virtual address L2PT required for
+;    a2 = number of bytes of virtual space
+;    a3 = access permissions that will be placed in L2PT (bits 11-2 of Extended L2 descriptor)
+;           (also set bit 31 to indicate that P bit in L1PT should be set)
+;    v1 -> current entry in PhysRamTable
+;    v2 = last used physical address
+;    v3 -> L1PT (or 0 if MMU on)
+; On exit
+;    a1-a4,ip corrupt
+;    v1, v2 updated
+AllocateL2PT
+        Push    "a3,v4-v8,lr"
+        MOV     v8, a1, LSR #20                 ; round base address down to 1M
+        ADD     lr, a1, a2
+        MOV     v7, lr, LSR #20
+        TEQ     lr, v7, LSL #20
+        ADDNE   v7, v7, #1                      ; round end address up to 1M
+
+        MOVS    v6, v3
+        LDREQ   v6, =L1PT                       ; v6->L1PT (whole routine)
+
+05      LDR     v5, [v6, v8, LSL #2]            ; L1PT contains 1 word per M
+        TEQ     v5, #0                          ; if non-zero, the L2PT has
+                                                ; already been allocated
+ [ ARM6support
+        BEQ     %FT10
+
+        TST     v5, #L1_U                       ; if section is already updateable
+        BNE     %FT40                           ; leave it.
+        LDR     a3, [sp, #0]
+        TST     a3, #4_333300                   ; if they want anything other than
+        ORRNE   v5, v5, #L1_U                   ; ROM access, make the section
+        STRNE   v5, [v6, v8, LSL #2]            ; updateable.
+        B       %FT40
+10
+ |
+        BNE     %FT40
+ ]
+
+        BIC     lr, v8, #3                      ; round down to 4M - each page
+        ADD     lr, v6, lr, LSL #2              ; of L2PT maps to 4 sections
+        LDMIA   lr, {a3,a4,v5,ip}               ; check if any are page mapped
+        ASSERT  L1_Fault = 2_00 :LAND: L1_Page = 2_01 :LAND: L1_Section = 2_10
+        TST     a3, #1
+        TSTEQ   a4, #1
+        TSTEQ   v5, #1
+        TSTEQ   ip, #1
+        BEQ     %FT20                           ; nothing page mapped - claim a page
+
+        TST     a4, #1                          ; at least one of the sections is page mapped
+        SUBNE   a3, a4, #1*1024                 ; find out where it's pointing to and
+        TST     v5, #1                          ; derive the corresponding address for our
+        SUBNE   a3, v5, #2*1024                 ; section
+        TST     ip, #1
+        SUBNE   a3, ip, #3*1024
+
+        AND     lr, v8, #3
+        ORR     a3, a3, lr, LSL #10
+  [ ARM6support
+        ASSERT  AP_ROM = 0
+        ARM_6   lr                              ; if ARM 6
+        BNE     %FT15
+        LDR     lr, [sp, #0]                    ; do they want ROM access?
+        TST     lr, #4_000300
+        BICEQ   a3, a3, #L1_U                   ; set the updateable bit accordingly
+        ORRNE   a3, a3, #L1_U
+15
+  ]
+        STR     a3, [v6, v8, LSL #2]            ; fill in the L1PT entry
+        B       %FT40                           ; no more to do
+
+20      BL      Init_ClaimPhysicalPage          ; Claim a page to put L2PT in
+        MOV     v4, a1
+
+  [ ARM6support
+        ASSERT  AP_ROM = 0
+        ARM_6   lr                              ; if ARM 6
+        LDREQ   lr, [sp, #0]                    ; do they want ROM access?
+        TSTEQ   lr, #4_000300
+        ORREQ   a3, a1, #L1_Page                ; set the updateable bit accordingly
+        ORRNE   a3, a1, #L1_Page + L1_U
+  |
+        ORR     a3, a1, #L1_Page + L1_U
+  ]
+  [ ECC
+        ORR     a3, a3, #L1_P
+  ]
+        AND     lr, v8, #3
+        ORR     a3, a3, lr, LSL #10
+        STR     a3, [v6, v8, LSL #2]            ; fill in the L1PT
+
+; Need to zero the L2PT. Must do it before calling in MapInPage, as that may well
+; want to put something in the thing we are clearing. If the MMU is off, no problem,
+; but if the MMU is on, then the L2PT isn't accessible until we've called MapInPage.
+; Solution is to use the AccessPhysicalAddress call.
+
+        TEQ     v3, #0                          ; MMU on?
+        MOVNE   a1, v4                          ; if not, just access v4
+        MOVEQ   a1, #L1_B                       ; if so, map in v4
+        MOVEQ   a2, v4
+        MOVEQ   a3, #0
+        BLEQ    RISCOS_AccessPhysicalAddress
+
+        MOV     a2, #0
+        MOV     a3, #4*1024
+        BL      memset
+
+        MOV     a1, v4                          ; Map in the L2PT page itself
+        LDR     a2, =L2PT                       ; (can't recurse, because L2PT
+        ADD     a2, a2, v8, LSL #10             ; backing for L2PT is preallocated)
+        BIC     a2, a2, #&C00
+        LDR     a3, =(AP_None * L2X_APMult) + L2_ExtPage
+ [ ECC
+        ORR     a3, a3, #1:SHL:31
+ ]
+        BL      Init_MapInPage
+
+
+40      ADD     v8, v8, #1                      ; go back until all
+        CMP     v8, v7                          ; pages allocated
+        BLO     %BT05
+
+        Pull    "a3,v4-v8,pc"
+
+
+; void *RISCOS_AccessPhysicalAddress(unsigned int flags, void *addr, void **oldp)
+RISCOS_AccessPhysicalAddress
+ [ ECC
+        Push    "a1-a3,lr"
+        MOV     a1, a2
+        BL      PhysAddrToPageNo
+        CMP     a1, #-1
+        Pull    "a1-a3,lr"
+ ]
+        LDR     ip, =L1PT + (PhysicalAccess:SHR:18)     ; ip -> L1PT entry
+        LDR     a4, =(AP_None * L1_APMult) + L1_U + L1_Section
+        AND     a1, a1, #L1_B                           ; user can ask for bufferable
+ [ ECC
+        ORRNE   a1, a1, #L1_P
+ ]
+        ORR     a1, a4, a1                              ; a1 = flags for 2nd level descriptor
+        MOV     a4, a2, LSR #20                         ; rounded to section
+        ORR     a1, a1, a4, LSL #20                     ; a1 = complete descriptor
+        TEQ     a3, #0
+        LDRNE   a4, [ip]                                ; read old value (if necessary)
+        STR     a1, [ip]                                ; store new one
+        STRNE   a4, [a3]                                ; put old one in [oldp]
+
+        LDR     a1, =PhysicalAccess
+        MOV     a3, a2, LSL #12                         ; take bottom 20 bits of address
+        ORR     a3, a1, a3, LSR #12                     ; and make an offset within PhysicalAccess
+        Push    "a3,lr"
+        ARMop   TLB_InvalidateEntry                     ; sufficient, cause not cacheable
+        Pull    "a1,pc"
+
+; void RISCOS_ReleasePhysicalAddress(void *old)
+RISCOS_ReleasePhysicalAddress
+        LDR     ip, =L1PT + (PhysicalAccess:SHR:18)     ; ip -> L1PT entry
+        STR     a1, [ip]
+        LDR     a1, =PhysicalAccess
+        ARMop   TLB_InvalidateEntry,,tailcall           ; sufficient, cause not cacheable
+
+
+; void Init_PageTablesChanged(void)
+;
+; A TLB+cache invalidation that works on all known ARMs. Invalidate all I+D TLB is the _only_ TLB
+; op that works on ARM720T, ARM920T and SA110. Ditto invalidate all I+D cache.
+;
+; DOES NOT CLEAN THE DATA CACHE. This is a helpful simplification, but requires that don't use
+; this routine after we've started using normal RAM.
+;
+Init_PageTablesChanged
+        MOV     a3, lr
+        BL      Init_ARMarch
+        MOV     ip, #0
+        MCREQ   ARM_config_cp,0,ip,ARMv3_TLBflush_reg,C0
+        MCRNE   ARM_config_cp,0,ip,ARMv4_TLB_reg,C7
+        MCR     ARM_config_cp,0,ip,ARMv4_cache_reg,C7           ; works on ARMv3
+        MOV     pc, a3
+
+
+HAL_Write0
+        Push    "v1, lr"
+        MOV     v1, a1
+        LDRB    a1, [v1], #1
+        TEQ     a1, #0
+
+
+
+
+
+;++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       ClearPhysRAM - Routine to clear "all" memory
+;
+; While this routine is running, keyboard IRQs may happen. For this reason
+; it avoids the base of logical RAM (hardware IRQ vector and workspace).
+;
+; We also have to avoid the page tables and the PhysRamTable.
+; The latter is also used to tell us which areas of memory we should clear.
+
+; We don't have to worry about trampling on the ROM image as it's
+; already been excluded from PhysRamTable.
+
+; This routine must work in 32-bit mode.
+
+; in:   r7 = memory speed
+;       r8 = page size
+;       r9 = MEMC control register
+;       r13 = total RAM size
+;
+; None of the above are actually used by this routine
+;
+; out:  r7-r9, r13 preserved
+;
+
+ClearPhysRAM ROUT
+        MSR     CPSR_c, #F32_bit+FIQ32_mode             ; get some extra registers
+        MOV     r8, #0
+        MOV     r9, #0
+        MOV     r10, #0
+        MOV     r11, #0
+        MOV     r12, #0
+        MOV     r13, #0
+        MOV     r14, #0
+        MSR     CPSR_c, #F32_bit+SVC32_mode
+
+      [ EmulatorSupport
+        ARM_on_emulator r0
+        BEQ     CPR_skipped
+      ]
+
+;now let us do the clear
+        MOV     r0,#ZeroPage+InitClearRamWs             ;we can preserve r7-r9,r13 at logical address 52..67
+        STMIA   r0,{r4-r11,lr}
+        MOV     r8, #0
+        MOV     r9, #0
+        LDR     r7, =PhysRamTable                      ; point to 5 lots of (physaddr,size)
+        ADR     r6, RamSkipTable
+        ADD     r4, r7, #PhysRamTableEnd-PhysRamTable  ; r4 -> end of table
+10
+        LDR     r5, [r6], #4                            ; load first skip offset
+
+        LDMIA   r7, {r10, r11}                          ; load next address, size
+        TEQ     r11, #0
+        BEQ     %FT50
+15
+        ASSERT  ZeroPage=0
+        ADD     r11, r10, r11                           ; r11 = end address
+
+        ; Need to check for RAM we've already used
+        LDR     r0, [r8, #InitUsedStart]                ; check for intersection with used space
+        CMP     r0, r10
+        BLO     %FT18
+        CMP     r0, r11
+        BHS     %FT18
+
+        ;BKPT    0
+
+        LDR     r1, [r8, #InitUsedEnd]
+        TEQ     r0, r10                                 ; if at start of block, easy
+        BEQ     %FT17                                   ; just move start pointer forwards
+
+        MOV     r11, r0                                 ; else set end pointer to start address
+        B       %FT18                                   ; next time round, will be at start address
+
+
+16      LDR     r1, [r8, #InitUsedEnd]
+17      CMP     r1, r10                                 ; advance until we find block with end pointer in
+        CMPHS   r11, r1                                 ; intersection if r10 <= r1 <= r11
+        ADDLS   r7, r7, #8                              ; get next block if r1 = r11 or r1 outside [r10,r11]
+        LDRLS   r5, [r6], #4
+        LDMLSIA r7, {r10, r11}                          ; (if r1 = r11, will just move straight to next block)
+        ADDLS   r11, r10, r11
+        BLO     %BT17                                   ; check next block if r1 outside [r10,r11]
+        MOVHI   r10, r1                                 ; if r11 > r1, advance r10 to r1 (do partial block)
+
+
+18      MOV     r0, #L1_B                               ; map in the appropriate megabyte,
+        MOV     r1, r10                                 ; making it bufferable
+        MOV     r2, #0
+        BL      RISCOS_AccessPhysicalAddress
+        SUB     lr, r0, r10                             ; lr = offset from phys to log
+        ADD     r1, r11, lr
+
+        MOV     r2, r0, LSR #20
+        TEQ     r2, r1, LSR #20                         ; if end in different megabyte to start
+        MOVNE   r1, r2, LSL #20                         ; then stop at end of megabyte
+        ADDNE   r1, r1, #&00100000
+
+        MSR     CPSR_c, #F32_bit+FIQ32_mode             ; switch to our bank o'zeros
+        MOV     r2, #0
+
+19      ADD     r5, r5, r0
+
+20      TEQ     r0, r1                                  ; *this* is the speed critical bit - executed
+        TEQNE   r0, r5                                  ; 32768 times per outer loop
+        STMNEIA r0!, {r2,r8-r14}
+        BNE     %BT20
+
+        TEQ     r0, r1
+        BEQ     %FT30
+
+        LDR     r5, [r6], #4                            ; load skip amount
+        ADD     r0, r0, r5                              ; and skip it
+        LDR     r5, [r6], #4                            ; load next skip offset (NB relative to end of last skip)
+        B       %BT19
+
+30      MSR     CPSR_c, #F32_bit+SVC32_mode             ; back to supervisor mode
+        MOV     r10, r0
+        MOV     r11, r1
+        LDMIA   r7, {r0, r1}
+        SUB     r11, r11, lr                            ; turn r11 back into physical address
+        SUB     r5, r5, r0                              ; r5 back into offset
+        ADD     r0, r0, r1                              ; r0 = physical end address of block
+        TEQ     r0, r11                                 ; did we reach the real end?
+        MOVNE   r10, r11                                ; if not, carry on from where we stopped
+        SUBNE   r11, r0, r11                            ; (this also deals with avoiding InitUsed area)
+        BNE     %BT15
+
+40      ADD     r7, r7, #8
+        TEQ     r7, r4                                  ; have we done all areas?
+        BNE     %BT10
+
+50      MOV     r1, #0
+        MOV     r0, #ZeroPage+InitClearRamWs
+        LDMIA   r0, {r4-r11,r14}                        ;restore
+
+CPR_skipped
+
+        LDR     r0, =OsbyteVars + :INDEX: LastBREAK
+
+        MOV     r1, #&80
+        STRB    r1, [r0]                                ; flag the fact that RAM cleared
+
+        MSR     CPSR_c, #F32_bit + UND32_mode           ; retrieve the MMU control register
+        MOV     r0, #ZeroPage                           ; soft copy
+        STR     sp, [r0, #MMUControlSoftCopy]
+        MSR     CPSR_c, #F32_bit + SVC32_mode
+
+        MOV     pc, lr
+
+        LTORG
+
+        GBLA    lastaddr
+lastaddr SETA   0
+        GBLA    lastregion
+lastregion SETA 0
+
+        MACRO
+        MakeSkipTable $region, $addr, $size
+ [ ($region)<>lastregion
+        &       -1
+lastaddr SETA   0
+ ]
+        &       ($addr)-lastaddr, $size
+lastaddr SETA   ($addr)+($size)
+lastregion SETA $region
+        MEND
+
+        MACRO
+        EndSkipTables
+        WHILE   lastregion < (PhysRamTableEnd-PhysRamTable)/8
+        &       -1
+lastregion SETA   lastregion +1
+        WEND
+        MEND
+
+
+RamSkipTable
+        MakeSkipTable   1, DRAMOffset_PageZero + 0, InitWsEnd
+        MakeSkipTable   1, DRAMOffset_PageZero + SkippedTables, SkippedTablesEnd-SkippedTables
+        EndSkipTables
+
+
+InitProcVecs
+        BKPT    &C000                                   ; Reset
+        BKPT    &C004                                   ; Undefined Instruction
+        BKPT    &C008                                   ; SWI
+        BKPT    &C00C                                   ; Prefetch Abort
+        SUBS    pc, lr, #4                              ; ignore data aborts
+        BKPT    &C014                                   ; Address Exception
+        LDR     pc, InitProcVecs + InitIRQHandler       ; IRQ
+        BKPT    &C01C                                   ; FIQ
+InitProcVec_FIQ
+        DCD     0
+InitProcVecsEnd
+
+;
+; In:  a1 = flags  (L1_B,L1_C,L1_AP)
+;      a2 = physical address
+;      a3 = size
+; Out: a1 = assigned logical address, or 0 if failed (no room)
+;
+; Will detect and return I/O space already mapped appropriately, or map and return new space
+; For simplicity and speed of search, works on a section (1Mb) granularity
+;
+
+        ASSERT  L1_B = 1:SHL:2
+        ASSERT  L1_C = 1:SHL:3
+        ASSERT  L1_AP = 3:SHL:10
+MapInFlag_DoublyMapped * 1:SHL:20
+MapInFlag_APSpecified * 1:SHL:21
+
+RISCOS_MapInIO ROUT
+        Entry   "v1-v5,v7"
+        MOV     v7, #L1_B:OR:L1_C
+        ORR     v7, v7, #L1_AP                          ; v7 = user-specifiable flags
+        MOV     v5, a1                                  ; v5 = original flags
+        MOV     v4, a2                                  ; v4 = original requested address
+        ADD     a3, a2, a3                              ; a3 -> end (exclusive)
+        MOV     a2, a2, LSR #20
+        MOV     a2, a2, LSL #20                         ; round a2 down to a section boundary
+        SUB     v4, v4, a2                              ; v4 = offset of original within section-aligned area
+        MOV     lr, a3, LSR #20
+        TEQ     a3, lr, LSL #20
+        ADDNE   lr, lr, #1
+        MOV     a3, lr, LSL #20                         ; round a3 up to a section boundary
+
+        TST     v5, #MapInFlag_APSpecified
+        BICEQ   a1, a1, #L1_AP
+        ORREQ   a1, a1, #L1_APMult * AP_None
+
+        ANDS    v5, v5, #MapInFlag_DoublyMapped
+        SUBNE   v5, a3, a2                              ; v5 = offset of second mapping or 0
+
+        LDR     ip, =ZeroPage
+        LDR     a4, =L1PT
+        AND     a1, a1, v7                              ; only allow bufferable as flags option
+        LDR     v2, =IO                                 ; logical end (exclusive) of currently mapped IO
+        LDR     v1, [ip, #IOAllocPtr]                   ; logical start (inclusive)
+
+        SUB     v1, v1, #&100000
+10
+        ADD     v1, v1, #&100000                        ; next mapped IO section
+        CMP     v1, v2
+        BHS     %FT32                                   ; no more currently mapped IO
+        LDR     v3, [a4, v1, LSR #(20-2)]               ; L1PT entry (must be for mapped IO)
+        MOV     lr, v3, LSR #20                         ; physical address bits
+        CMP     lr, a2, LSR #20
+        BNE     %BT10                                   ; no address match
+        AND     lr, v3, v7
+        TEQ     lr, a1
+        BNE     %BT10                                   ; no flags match
+
+        TEQ     v5, #0                                  ; doubly mapped?
+        BEQ     %FT19
+
+        ADD     lr, v1, v5                              ; address of second copy
+        CMP     lr, v2
+        BHS     %FT32
+        LDR     v3, [a4, lr, LSR #(20-2)]
+        MOV     lr, v3, LSR #20                         ; physical address bits
+        CMP     lr, a2, LSR #20
+        BNE     %BT10                                   ; no address match
+        AND     lr, v3, v7
+        TEQ     lr, a1
+        BNE     %BT10                                   ; no flags match
+
+19
+;
+; alright, found start of requested IO already mapped, and with required flags
+;
+        Push    "a2, v1"
+20
+        ADD     a2, a2, #&100000
+        CMP     a2, a3
+        Pull    "a2, v1", HS
+        BHS     %FT40                                  ; its all there already!
+        ADD     v1, v1, #&100000                       ; next mapped IO section
+        CMP     v1, v2
+        BHS     %FT30                                  ; no more currently mapped IO
+        LDR     v3, [a4, v1, LSR #(20-2)]              ; L1PT entry
+        MOV     lr, v3, LSR #20                        ; physical address bits
+        CMP     lr, a2, LSR #20
+        BNE     %FT29                                  ; address match failed
+        AND     lr, v3, v7
+        TEQ     lr, a1
+        TEQEQ   v5, #0                                 ; doubly mapped?
+        BEQ     %BT20                                  ; address and flags match so far
+        ADD     lr, v1, v5                             ; where duplicate should be
+        CMP     lr, v2
+        BHS     %FT30                                  ; no more currently mapped IO
+        LDR     v3, [a4, lr, LSR #(20-2)]
+        MOV     lr, v3, LSR #20                        ; physical address bits
+        CMP     lr, a2, LSR #20
+        BNE     %FT29                                  ; address match failed
+        AND     lr, v3, v7
+        TEQ     lr, a1
+        BEQ     %BT20
+29
+        Pull    "a2, v1"
+        B       %BT10
+30
+        Pull    "a2, v1"
+;
+; request not currently mapped, only partially mapped, or mapped with wrong flags
+;
+32
+        MOV     ip, #ZeroPage
+        LDR     v2, [ip, #IOAllocPtr]
+        ADD     v1, v2, a2
+        SUB     v1, v1, a3                              ; attempt to allocate size of a3-a2
+        SUB     v1, v1, v5                              ; double if necessary
+        LDR     v3, [ip, #IOAllocLimit]                 ; can't extend down below limit
+        CMP     v1, v3
+        MOVLS   a1, #0
+        BLS     %FT90
+        STR     v1, [ip, #IOAllocPtr]
+        ORR     a2, a2, a1
+        ORR     a2, a2, #L1_Section                     ; first L1PT value
+34
+        STR     a2, [a4, v1, LSR #(20-2)]
+        TEQ     v5, #0
+        ADDNE   v2, v1, v5
+        STRNE   a2, [a4, v2, LSR #(20-2)]
+        ADD     a2, a2, #&100000
+        ADD     v1, v1, #&100000                        ; next section
+        CMP     a2, a3
+        BLO     %BT34
+        LDR     v1, [ip, #IOAllocPtr]
+40
+        ADD     a1, v1, v4                              ; logical address for request
+90
+        EXIT
+
+
+; void RISCOS_AddDevice(unsigned int flags, struct device *d)
+RISCOS_AddDevice
+        ADDS    a1, a2, #0      ; also clears V
+        B       HardwareDeviceAdd_Common
+
+; uint32_t RISCOS_LogToPhys(const void *log)
+RISCOS_LogToPhys
+        Push    "r4,r5,r8,r9,lr"
+        MOV     r4, a1
+        LDR     r8, =L2PT
+        BL      logical_to_physical
+        MOVCC   a1, r5
+        MOVCS   a1, #-1
+        Pull    "r4,r5,r8,r9,pc"
+
+; kernel_oserror *RISCOS_IICOpV(int ndesc, IICDesc *descs)
+RISCOS_IICOpV
+        Push    "lr"
+        BL      IIC_OpV
+        MOVVC   a1, #0
+        Pull    "pc"
+
+SetUpHALEntryTable ROUT
+        LDR     a1, =ZeroPage
+        LDR     a2, [a1, #HAL_Descriptor]
+        LDR     a3, [a1, #HAL_Workspace]
+        LDR     a4, [a2, #HALDesc_Entries]
+        LDR     ip, [a2, #HALDesc_NumEntries]
+        ADD     a4, a2, a4                              ; a4 -> entry table
+        MOV     a2, a4                                  ; a2 -> entry table (increments)
+10      SUBS    ip, ip, #1                              ; decrement counter
+        LDRCS   a1, [a2], #4
+        BCC     %FT20
+        TEQ     a1, #0
+        ADREQ   a1, NullHALEntry
+        ADDNE   a1, a4, a1                              ; convert offset to absolute
+        STR     a1, [a3, #-4]!                          ; store backwards below HAL workspace
+        B       %BT10
+20      LDR     a1, =ZeroPage                           ; pad table with NullHALEntries
+        LDR     a4, =HALWorkspace                       ; in case where HAL didn't supply enough
+        ADR     a1, NullHALEntry
+30      CMP     a3, a4
+        STRHI   a1, [a3, #-4]!
+        BHI     %BT30
+        MOV     pc, lr
+
+
+NullHALEntry
+        MOV     pc, lr
+
+; Can freely corrupt r10-r12 (v7,v8,ip).
+HardwareSWI
+        AND     ip, v5, #&FF
+        CMP     ip, #1
+        BLO     HardwareCall
+        BEQ     HardwareLookup
+        CMP     ip, #3
+        BLO     HardwareDeviceAdd
+        BEQ     HardwareDeviceRemove
+        CMP     ip, #5
+        BLO     HardwareDeviceEnumerate
+        BHS     HardwareBadReason
+
+HardwareCall
+        Push    "v1-v4,sb,lr"
+        ADD     v8, sb, #1                              ; v8 = entry no + 1
+        MOV     ip, #0
+        LDR     v7, [ip, #HAL_Descriptor]
+        AddressHAL ip                                   ; sb set up
+        LDR     v7, [v7, #HALDesc_NumEntries]           ; v7 = number of entries
+        CMP     v8, v7                                  ; entryno + 1 must be <= number of entries
+        BHI     HardwareBadEntry2
+        LDR     ip, [sb, -v8, LSL #2]
+        ADR     v7, NullHALEntry
+        TEQ     ip, v7
+        BEQ     HardwareBadEntry2
+        MOV     lr, pc
+        MOV     pc, ip
+        ADD     sp, sp, #4*4
+        Pull    "sb,lr"
+        ExitSWIHandler
+
+HardwareLookup
+        ADD     v8, sb, #1                              ; v8 = entry no + 1
+        MOV     ip, #0
+        LDR     v7, [ip, #HAL_Descriptor]
+        AddressHAL ip
+        LDR     v7, [v7, #HALDesc_NumEntries]
+        CMP     v8, v7                                  ; entryno + 1 must be <= number of entries
+        BHI     HardwareBadEntry
+        LDR     a1, [sb, -v8, LSL #2]
+        ADR     v7, NullHALEntry
+        TEQ     a1, v7
+        BEQ     HardwareBadEntry
+        MOV     a2, sb
+        ExitSWIHandler
+
+HardwareDeviceAdd
+        Push    "r1-r3,lr"
+        BL      HardwareDeviceAdd_Common
+        Pull    "r1-r3,lr"
+        B       SLVK_TestV
+
+HardwareDeviceRemove
+        Push    "r1-r3,lr"
+        BL      HardwareDeviceRemove_Common
+        Pull    "r1-r3,lr"
+        B       SLVK_TestV
+
+HardwareDeviceAdd_Common
+        Entry
+        BL      HardwareDeviceRemove_Common             ; first try to remove any device already at the same address
+        EXIT    VS
+        MOV     lr, #0
+        LDR     r1, [lr, #DeviceCount]
+        LDR     r2, [lr, #DeviceTable]
+        TEQ     r2, #0
+        BEQ     %FT80
+        ADD     r1, r1, #1                              ; increment DeviceCount
+        LDR     lr, [r2, #-4]                           ; word before heap block is length including length word
+        TEQ     r1, lr, LSR #2                          ; block already full?
+        BEQ     %FT81
+        MOV     lr, #0
+10      STR     r1, [lr, #DeviceCount]
+        ADD     lr, r2, r1, LSL #2
+        SUB     lr, lr, #4
+11      LDR     r1, [lr, #-4]!                          ; copy existing devices up, so new ones get enumerated first
+        STR     r1, [lr, #4]
+        CMP     lr, r2
+        BHI     %BT11
+        STR     r0, [r2]
+        MOV     r2, r0
+        MOV     r1, #Service_Hardware
+        MOV     r0, #0
+        BL      Issue_Service
+        ADDS    r0, r2, #0                              ; exit with V clear
+        EXIT
+
+80      ; Claim a system heap block for the device table
+        Push    "r0"
+        MOV     r3, #16
+        BL      ClaimSysHeapNode
+        ADDVS   sp, sp, #4
+        EXIT    VS
+        Pull    "r0"
+        MOV     lr, #0
+        MOV     r1, #1
+        STR     r2, [lr, #DeviceTable]
+        B       %BT10
+
+81      ; Extend the system heap block
+        Push    "r0"
+        MOV     r0, #HeapReason_ExtendBlock
+        MOV     r3, #16
+        BL      DoSysHeapOpWithExtension
+        ADDVS   sp, sp, #4
+        EXIT    VS
+        Pull    "r0"
+        MOV     lr, #0
+        LDR     r1, [lr, #DeviceCount]
+        STR     r2, [lr, #DeviceTable]
+        ADD     r1, r1, #1
+        B       %BT10
+
+HardwareDeviceRemove_Common
+        Entry   "r4"
+        MOV     lr, #0
+        LDR     r3, [lr, #DeviceCount]
+        LDR     r4, [lr, #DeviceTable]
+        TEQ     r3, #0
+        EXIT    EQ                                      ; no devices registered
+01      LDR     r2, [r4], #4
+        SUBS    r3, r3, #1
+        TEQNE   r2, r0
+        BNE     %BT01
+        TEQ     r2, r0
+        EXIT    NE                                      ; this device not registered
+        MOV     r0, #1
+        MOV     r1, #Service_Hardware
+        BL      Issue_Service
+        CMP     r1, #0                                  ; if service call claimed
+        CMPEQ   r1, #1:SHL:31                           ; then set V (r0 already points to error block)
+        EXIT    VS                                      ; and exit
+        MOV     r0, r2
+        SUBS    r3, r3, #1
+02      LDRCS   r2, [r4], #4                            ; copy down remaining devices
+        STRCS   r2, [r4, #-8]
+        SUBCSS  r3, r3, #1
+        BCS     %BT02
+        MOV     lr, #0
+        LDR     r3, [lr, #DeviceCount]
+        SUB     r3, r3, #1
+        STR     r3, [lr, #DeviceCount]
+        EXIT
+
+HardwareDeviceEnumerate
+        Push    "r3-r4,lr"
+        MOV     lr, #0
+        LDR     r2, [lr, #DeviceCount]
+        LDR     r3, [lr, #DeviceTable]
+        SUBS    r4, r2, r1
+        MOVLS   r1, #-1
+        BLS     %FT90                                   ; if r1 is out of range then exit
+        ADD     r3, r3, r1, LSL #2
+10      ADD     r1, r1, #1
+        LDR     r2, [r3], #4
+        LDR     lr, [r2, #HALDevice_Type]
+        EOR     lr, lr, r0
+        MOVS    lr, lr, LSL #16                         ; EQ if types match
+        SUBNES  r4, r4, #1
+        BNE     %BT10
+        TEQ     lr, #0
+        MOVNE   r1, #-1
+        BNE     %FT90
+        LDR     lr, [r2, #HALDevice_Version]
+        MOV     lr, lr, LSR #16
+        CMP     lr, r0, LSR #16                         ; newer than our client understands?
+        BHI     %BT10
+90
+        Pull    "r3-r4,lr"
+        ExitSWIHandler
+
+HardwareBadReason
+        ADR     r0, ErrorBlock_HardwareBadReason
+ [ International
+        Push    "lr"
+        BL      TranslateError
+        Pull    "lr"
+ ]
+        B       SLVK_SetV
+
+HardwareBadEntry2
+        ADD     sp, sp, #4*4
+        Pull    "sb,lr"
+HardwareBadEntry
+        ADR     r0, ErrorBlock_HardwareBadEntry
+ [ International
+        Push    "lr"
+        BL      TranslateError
+        Pull    "lr"
+ ]
+        B       SLVK_SetV
+
+        MakeErrorBlock HardwareBadReason
+        MakeErrorBlock HardwareBadEntry
+
+ [ DebugTerminal
+DebugTerminal_Rdch
+        Push    "a2-a4,sb,ip"
+        WritePSRc SVC_mode, r1
+        MOV     sb, ip
+20
+        CallHAL HAL_DebugRX
+        CMP     a1, #27
+        BNE     %FT25
+        LDR     a2, =OsbyteVars + :INDEX: RS423mode
+        LDRB    a2, [a2]
+        TEQ     a2, #0                  ; is RS423 raw data,or keyb emulator?
+        BNE     %FT25
+        MOV     a2, #0
+        LDRB    a1, [a2, #ESC_Status]
+        ORR     a1, a1, #&40
+        STRB    a1, [a2, #ESC_Status]   ; mark escape flag
+        MOV     a1, #27
+        SEC                             ; tell caller to look carefully at R0
+        Pull    "a2-a4,sb,ip,pc"
+25
+        CMP     a1, #-1
+        Pull    "a2-a4,sb,ip,pc",NE     ; claim it
+        MOV     R0, #0
+        LDRB    R14, [R0, #CallBack_Flag]
+        TST     R14, #CBack_VectorReq
+        BLNE    process_callback_chain
+        B       %BT20
+
+
+DebugTerminal_Wrch
+        Push    "a1-a4,sb,ip,lr"
+        MOV     sb, ip
+        CallHAL HAL_DebugTX
+        Pull    "a1-a4,sb,ip,pc"        ; don't claim it
+ ]
+
+ [ DebugHALTX
+DebugHALPrint
+        Push    "a1-a4,v1,sb,ip"
+        AddressHAL
+        MOV     v1, lr
+10      LDRB    a1, [v1], #1
+        TEQ     a1, #0
+        BEQ     %FT20
+        CallHAL HAL_DebugTX
+        B       %BT10
+20      MOV     a1, #13
+        CallHAL HAL_DebugTX
+        MOV     a1, #10
+        CallHAL HAL_DebugTX
+        ADD     v1, v1, #3
+        BIC     lr, v1, #3
+        Pull    "a1-a4,v1,sb,ip"
+        MOV     pc, lr
+ ]
+
+Reset_IRQ_Handler
+        SUB     lr, lr, #4
+        Push    "a1-a4,sb,ip,lr"
+        MRS     lr, SPSR
+        Push    "lr"
+        MOV     a1, #ZeroPage
+        AddressHAL a1
+        LDR     a2, [a1, #IICType]
+        TST     a2, #IICFlag_Background
+        MOVNE   ip, sb
+        BLNE    IICIRQ
+        MOV     a1, #InitIRQWs
+        LDRB    a1, [a1, #KbdScanActive]
+        TEQ     a1, #0
+        CallHAL HAL_KbdScanInterrupt,NE
+        Pull    "lr"
+        MSR     SPSR_cxsf, lr
+        Pull    "a1-a4,sb,ip,pc",,^
+
+        END
+

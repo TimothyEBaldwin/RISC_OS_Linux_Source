@@ -1,0 +1,386 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*    C.BUFLIB - Buffer management routines
+*
+*    28-02-93 INH Original
+*    18-12-95	  Split from Network.C
+*/
+
+/* Standard includes */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+/* RISCOS includes */
+
+#include "kernel.h"
+#include "os.h"
+#include "swis.h"
+
+
+/* Our includes */
+
+#include "stdtypes.h"
+#include "mbuf.h"
+#include "stats.h"
+#include "buflib.h"
+
+/* -------------- */
+
+#define SAVE_INT_STATE   \
+              int intstate = _kernel_irqs_disabled(); _kernel_irqs_off();
+
+#define RESTORE_INT_STATE \
+              if ( !intstate ) _kernel_irqs_on();
+
+/* MBuffer handling routines ******************************************** */
+
+static struct mbctl Net_Mbctl;  /* MBuf control struct */
+static bool Mbufs_Attached;     /* True if we've got an active mbuf
+       	    			   manager session */
+
+/* ------------------------------------ */
+
+void FreeBuf( BUFCHAIN pB )
+{
+  Net_Mbctl.free ( &Net_Mbctl, pB  );
+}
+
+/* ------------------------------------ */
+
+/* It is documented that NULL is a safe value to pass here */
+
+void FreeChain ( BUFCHAIN pB )
+{
+  Net_Mbctl.freem ( &Net_Mbctl, pB );
+}
+
+/* ----------------------------------- */
+
+/* AddChain can be used to allocate a chain of mbufs, or to add
+   some data to the start of an existing chain. A block of data
+   is defined by the pData and datalen parameters: if pRest is
+   NULL, a chain of buffers is allocated to contain the data.
+   Otherwise the data is added to the start of the chain
+   defined by pRest, allocating more buffers if necessary. The
+   resultant chain is returned as a result. NULL result means
+   we're out of buffers!
+*/
+
+BUFCHAIN AddChain ( BUFCHAIN pBin, void *pData, int datalen )
+{
+  struct mbuf *pBnew;
+  int n;
+
+  /* If we already have a chain there, try to copy as much
+     data at the start as possible
+  */
+
+  if ( pBin != NULL )
+  {
+    n = pBin->m_off - pBin->m_inioff; /* Amount of space at start */
+    /* Most common case - append to start of existing chain */
+    if ( n >= datalen )
+    {
+      pBin->m_off -= datalen;
+      pBin->m_len += datalen;
+      memcpy ( mtod(pBin, char*), pData, datalen );
+      return pBin;
+    }
+    else if ( n > 0 )
+    {
+      pBin->m_off -= n;
+      pBin->m_len += n;
+      /* Won't all fit in this buffer - copy some anyway */
+      memcpy ( mtod(pBin, char*), (BYTE *)pData+datalen-n, n );
+      datalen -= n;
+    }
+  }
+
+  /* We need to alloc some new mbufs to hold data */
+
+  /* Try to get a single mbuf & put the data at the end */
+
+  pBnew = Net_Mbctl.alloc_s(&Net_Mbctl, datalen, NULL);
+  if ( pBnew != NULL )
+  {
+    pBnew->m_len = datalen;
+    pBnew->m_off = pBnew->m_inioff + pBnew->m_inilen - datalen;
+    memcpy ( mtod(pBnew, char *), (BYTE *)pData, datalen );
+    pBnew->m_next = pBin;
+    return pBnew;
+  }
+
+  /* Give up trying to allocate efficiently at this point.
+     Just make a chain and tack it on.
+   */
+
+  pBnew = Net_Mbctl.alloc(&Net_Mbctl, datalen, pData);
+  if ( pBnew == NULL )  /* Bother! */
+  {
+    FreeChain ( pBin );
+    return NULL;
+  }
+
+  return Net_Mbctl.cat(&Net_Mbctl, pBnew, pBin);
+}
+
+/* ---------------------------------- */
+
+/* AddChainIndirect() behaves as above, but the data is not copied and
+    an indirect mbuf is tacked to the start of the mbuf chain.
+*/
+
+BUFCHAIN AddChainIndirect ( BUFCHAIN pRest, void *pData,
+                                           int datalen )
+{
+  BUFCHAIN pBnew;
+
+  pBnew = Net_Mbctl.alloc_u(&Net_Mbctl, datalen, pData);
+  /* We rely on alloc_u setting m_inioff and m_inilen to the
+     same as m_off and m_len (as documented), to stop further
+     AddChains from trampling on memory. Also rely on
+     it being a single allocation (as documented).
+  */
+
+  if ( pBnew == NULL ) /* Bother! */
+  {
+    FreeChain(pRest);
+    return NULL;
+  }
+
+  pBnew->m_next = pRest;
+  return pBnew;
+}
+
+/* ---------------------------------- */
+
+BUFCHAIN AllocBlankChain ( int datalen )
+{
+  return Net_Mbctl.alloc(&Net_Mbctl, datalen, NULL);
+}
+
+/* ---------------------------------- */
+
+/* This is used e.g. to generate a scatter list of all the
+   blocks in a buffer chain. It is called initially with
+   pGBP->pChain set to the buffer chain to be traced.
+   After each call, pGBP->pBlock and pGBP->BlockLen will
+   point to a block of memory from the buffer chain. It
+   will return non-zero for so long as pGBP->BlockLen is non
+   zero.
+*/
+
+int GetBlockPointer ( struct GBP_in_out *pGBP )
+{
+  do
+  {
+    if ( pGBP->pChain == NULL )
+    {
+      pGBP->BlockLen = 0;
+      return 0;
+    }
+    pGBP->pBlock = mtod(pGBP->pChain, BYTE *);
+    pGBP->BlockLen = pGBP->pChain->m_len;
+    pGBP->pChain = pGBP->pChain->m_next;
+  }
+    while ( pGBP->BlockLen == 0 );
+
+  return 1;
+}
+
+/* ---------------------------------- */
+
+/* ConcatChain adds two chains together */
+
+BUFCHAIN ConcatChain ( BUFCHAIN first, BUFCHAIN last )
+{
+  return Net_Mbctl.cat (&Net_Mbctl, first, last );
+}
+
+/* ---------------------------------- */
+
+/* GetData reads data off the start of an mbuf chain to a given
+   memory area. pDst and datalen define the memory area
+   concerned. pDst may be NULL to simply strip 'datalen' bytes
+   of data off the front.
+
+   Datalen must be > 0 for successful operation.
+*/
+
+BUFCHAIN GetData ( BUFCHAIN pB, void *pDst, int datalen )
+{
+  BUFCHAIN pB2;
+  int len_tst;
+
+  /* Check data is available: this will, in practise,
+     rarely need to look at more than one mbuf */
+
+  pB2 = pB;
+  len_tst = datalen;
+  while ( pB2 != NULL )
+  {
+    len_tst -= pB2->m_len;
+    if ( len_tst <= 0 )      /* We're there, dude */
+      return Net_Mbctl.trim (&Net_Mbctl, pB, datalen, pDst );
+
+    pB2 = pB2->m_next;
+  }
+
+  /* Out of data! */
+  FreeChain(pB);
+  return NULL;
+}
+
+/* ------------------------------- */
+
+int ChainLen ( BUFCHAIN pB )
+{
+  return Net_Mbctl.count_bytes(&Net_Mbctl, pB);
+}
+
+/* ------------------------------- */
+
+int GetAllData ( BUFCHAIN pB, BYTE *pDst )
+{
+  int n = Net_Mbctl.count_bytes(&Net_Mbctl, pB);
+  Net_Mbctl.trim (&Net_Mbctl, pB, n, pDst );
+  return n;
+}
+
+
+/* Queue handling routines *********************************** */
+
+/* Queues use the m_list field in an mbuf to link mbuf chains
+   together in a list. Each queue has a Last pointer (the last item
+   to be added) and a Head pointer (the next item to be removed).
+*/
+
+void QueueFlush ( BUFQUEUE *pQ )
+{
+  BUFCHAIN pB;
+
+  while ( pB = QueueGet(pQ), pB != NULL )
+    FreeChain (pB);
+}
+
+/* -------------------- */
+
+void QueueAdd ( BUFQUEUE *pQ, BUFCHAIN pB )
+{
+  SAVE_INT_STATE;
+
+  if ( pQ == NULL || pB == NULL )
+  {
+    STAT(STA_SERIOUS_BARF);
+  }
+  else
+  {
+    pB->m_list = NULL;
+
+    if ( pQ->Last == NULL )
+    {
+      pQ->Head=pQ->Last=pB;
+    }
+    else
+    {
+      pQ->Last->m_list = pB;
+      pQ->Last = pB;
+    }
+  }
+
+  RESTORE_INT_STATE;
+}
+
+/* ------------------------- */
+
+BUFCHAIN  QueueGet ( BUFQUEUE *pQ )
+{
+  BUFCHAIN pB;
+  SAVE_INT_STATE;
+
+  if ( pQ == NULL || pQ->Head == NULL )
+  {
+    pB = NULL;
+  }
+  else
+  {
+    pB = pQ->Head;
+    pQ->Head = pB->m_list;
+
+    if ( pQ->Head == NULL )
+      pQ->Last = NULL;
+  }
+
+  RESTORE_INT_STATE;
+  return pB;
+}
+
+/* ------------------------- */
+
+BUFCHAIN  QueuePeek ( BUFQUEUE *pQ )
+{
+  if ( pQ == NULL )
+    return NULL;
+  return pQ->Head;
+}
+
+
+/* Initialise routine ------------------------------- */
+
+err_t Buf_Init ( void )
+{
+  _kernel_swi_regs R;
+
+  Mbufs_Attached = false;
+
+  Net_Mbctl.mbcsize = sizeof(struct mbctl);
+  Net_Mbctl.mbcvers = MBUF_MANAGER_VERSION;
+  Net_Mbctl.flags   = 0;     /* Normal entry points */
+  Net_Mbctl.advminubs = 112; /* Advisory Minimum mbuf size; this
+                             is the DCI-2 value, and in fact allows
+                             most SMB packets to live in one mbuf */
+  Net_Mbctl.advmaxubs = 1280; /* Advisory max mbuf size; in fact we
+                             never really use the full 1500 bytes;
+                             block writes tend to do it in 1K chunks */
+  Net_Mbctl.mincontig = 0;    /* We don't use the 'make contiguous'
+                             routine at present; no need to specify a
+                             value here */
+  Net_Mbctl.spare1 = 0;
+
+  R.r[0] = (int) &Net_Mbctl;
+  if ( _kernel_swi ( Mbuf_OpenSession, &R, &R ) != NULL )
+    return EMBUFMODULE;
+
+  Mbufs_Attached = true;
+  return OK;
+}
+
+/* --------------------------- */
+
+void Buf_Shutdown(void)
+{
+  _kernel_swi_regs R;
+  if ( Mbufs_Attached )
+  {
+    R.r[0] = (int) &Net_Mbctl;
+    _kernel_swi ( Mbuf_CloseSession, &R, &R );
+  }
+  Mbufs_Attached = false;
+}
+

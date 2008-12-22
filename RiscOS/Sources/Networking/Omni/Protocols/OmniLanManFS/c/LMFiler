@@ -1,0 +1,531 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* *************************************************
+
+   C.LMFILER - Filer module for Lan Manager client
+
+   Version
+   25-03-94 INH First proper version
+   06-09-95     Doesn't keep putting '-' in user name field
+
+*********************************************** */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+
+#define ICONBAR (-2)
+
+#define MENUSIZE(a) ((a)*24+28)
+typedef struct { wimp_menuhdr hdr; wimp_menuitem item[1]; } wimp_menu;
+typedef struct { wimp_wind wind;   wimp_icon     icon[1]; } wimp_iwind;
+
+static wimp_t TaskHandle;
+static char *mod_name = "Lan Manager Filer";
+
+static wimp_menu  *iconmenu;
+
+static char work_buf[1200];
+
+static BOOL NoConnections = TRUE;
+
+/* --------------------------- */
+
+/* Definitions for our icons on the icon bar */
+
+#define MAX_DRIVES 4
+
+#define ICON_NAMELEN 8
+
+struct BarIconDef
+{
+  BOOL valid;
+  int  icon_id;
+  char name[ICON_NAMELEN+1];
+}
+  Bar_Icons[MAX_DRIVES];
+
+
+/* --------------------------- */
+
+static char *stripCR ( char *buf )
+{
+  char *res=buf;
+  while ( *buf > 32 ) buf++;
+  *buf=0;
+  return res;
+}
+
+static char *checkblank ( char *buf )
+{
+  if ( !isprint( buf[0] ) )
+    return "-";
+  else
+    return buf;
+}
+
+/*********************** INITIALISATION ******************************/
+
+static BOOL IconBarAdd(int drv, char *icname)
+/* Adds an instance of our icon to the icon bar, with the given name. */
+{
+  _kernel_swi_regs R;
+  wimp_icreate wi;      /* Wimp-CreateIcon structure */
+  int len;
+
+  strncpy(Bar_Icons[drv].name, icname, ICON_NAMELEN);
+  Bar_Icons[drv].name[ICON_NAMELEN] = 0;
+  len = strlen ( Bar_Icons[drv].name );
+
+  if ( drv < 0 || drv >= MAX_DRIVES ) return FALSE;
+
+  R.r[0] = 0x33000000; /* Priority */
+  R.r[1] = (int) &wi;
+  wi.w = ICONBAR;
+  wi.i.box.x0 = 0;
+  wi.i.box.x1 = (len<4) ? 68 : len*16;  /* X bounds */
+  wi.i.box.y0 = -16;
+  wi.i.box.y1 = 86;  /* Y bounds */
+
+  wi.i.flags = wimp_ITEXT | wimp_ISPRITE | wimp_INDIRECT |
+               wimp_IHCENTRE | 0 | 0 |
+               wimp_IBTYPE*wimp_BCLICKDEBOUNCE |
+               wimp_IFORECOL * 7 |
+               wimp_IBACKCOL * 1;
+
+  wi.i.data.indirecttext.buffer= Bar_Icons[drv].name;
+  wi.i.data.indirecttext.validstring="Slan_conn";
+  wi.i.data.indirecttext.bufflen=len + 1;
+
+  if ( _kernel_swi ( Wimp_CreateIcon, &R, &R ) != NULL )
+    return FALSE;
+
+  Bar_Icons[drv].icon_id = R.r[0];
+  Bar_Icons[drv].valid = TRUE;
+
+  return TRUE;
+}
+
+/* --------------------- */
+
+static void IconBarDel(int drv)
+/* Deletes this instance of our icon */
+{
+  if ( drv < 0 || drv >= MAX_DRIVES || !Bar_Icons[drv].valid)
+    return;
+
+  wimp_delete_icon ( ICONBAR, Bar_Icons[drv].icon_id );
+  Bar_Icons[drv].valid = FALSE;
+}
+
+/* ---------------------------- */
+
+static char indirect_buf[2000];
+static wimp_template wt;
+
+static wimp_iwind *LoadTemplate( char *name )
+{
+  wimp_iwind *res;
+  int size;
+  char searchname[12];
+
+  memset( searchname, 0, 12 );
+  strcpy( searchname, name );
+  wt.name = searchname;
+  wt.buf = (wimp_wind *)work_buf;
+  wt.font = (wimp_font_array *)(-1);
+  wt.index = 0;
+
+  wimpt_complain( wimp_load_template(&wt) );
+  if ( wt.index == 0 )
+  {
+    werr(TRUE, "Template '%s' not found", name);
+    return NULL;
+  }
+
+  size = wt.buf->nicons*sizeof(wimp_icon)+sizeof(wimp_wind);
+
+  res = (wimp_iwind *)malloc(size);
+  if ( res != NULL )
+    memcpy ( res, work_buf, size );
+  else
+    werr(FALSE, "Not enough memory for templates");
+
+  return res;
+}
+
+/* ---------------------------- */
+
+#define LOGON_SERVER    1
+#define LOGON_SHARENAME 3
+#define LOGON_USERNAME  5
+#define LOGON_PASSWORD  7
+
+
+static wimp_w hLogonWind;
+static wimp_w hAboutWind;
+static wimp_iwind *LogonWindow;
+static wimp_iwind *AboutWindow;
+
+static BOOL CreateWindows(void)
+{
+  if (wimpt_complain ( wimp_open_template("<LanMan$Dir>.Templates") )
+        != NULL)
+    return FALSE;
+
+  wt.work_free = indirect_buf;
+  wt.work_end  = indirect_buf + sizeof(indirect_buf) - 1;
+
+  LogonWindow = LoadTemplate("logon");
+  AboutWindow = LoadTemplate("proginfo");
+
+  wimp_close_template();
+
+  if ( LogonWindow == NULL || AboutWindow == NULL )
+    return FALSE;
+
+  /* Create & get window handles */
+
+  if (wimpt_complain ( wimp_create_wind ( &LogonWindow->wind, &hLogonWind ) )
+        != NULL)
+    return FALSE;
+
+  if (wimpt_complain ( wimp_create_wind ( &AboutWindow->wind, &hAboutWind ) )
+        != NULL)
+    return FALSE;
+
+  return TRUE;
+}
+
+/* ---------------------------- */
+
+#define ICON_MENU_ITEMS 3
+#define IconMenu_Logon  0
+#define IconMenu_Logoff 1
+#define IconMenu_Quit   2
+
+static void AddMenu ( wimp_menuitem *i, char *name, int flg )
+{
+  i->flags = flg;
+  i->submenu = (wimp_menuptr)-1;
+  i->iconflags =  wimp_ITEXT | wimp_IFORECOL*7 | wimp_IBACKCOL*0;
+  strcpy(i->data.text,name);
+}
+
+/* ---------------------------- */
+
+static BOOL IconMenuInit(void)
+{
+  iconmenu = (wimp_menu *)malloc(MENUSIZE(ICON_MENU_ITEMS));
+  if ( iconmenu == NULL )
+    return FALSE;
+
+  strcpy( iconmenu->hdr.title,"Lan Man");
+  iconmenu->hdr.tit_fcol=7;
+  iconmenu->hdr.tit_bcol=2;
+  iconmenu->hdr.work_fcol = 7;
+  iconmenu->hdr.work_bcol = 0;
+  iconmenu->hdr.width  = 160;
+  iconmenu->hdr.height = 44;
+  iconmenu->hdr.gap = 0;
+
+  AddMenu(iconmenu->item,   "Logon",  0 );
+   iconmenu->item[0].submenu = (wimp_menuptr) hLogonWind;
+
+  AddMenu(iconmenu->item+1, "Logoff", 0 );
+  AddMenu(iconmenu->item+2, "Quit",   wimp_MLAST );
+
+  return TRUE;
+}
+
+/* Initialise the program, returning TRUE if it was all OK. ************* */
+
+static BOOL Initialise(void)
+{
+  wimpt_init(mod_name);
+  TaskHandle = wimpt_task();
+
+  NoConnections = TRUE;
+  if ( !CreateWindows() ||
+       !IconBarAdd( 0, "Lan Man" ) ||
+       !IconMenuInit() )
+    return FALSE;
+
+
+  return TRUE;
+}
+
+
+
+/* ---------------------------------------- */
+
+#define GetItemText(hWnd,itm) ((hWnd)->icon[(itm)].data.indirecttext.buffer)
+
+static void DoLogon ( void )
+{
+  int drv_no;
+
+  if ( NoConnections )
+    drv_no = 0;
+  else
+  {
+    for ( drv_no=0; drv_no<MAX_DRIVES; drv_no++ )
+      if ( !Bar_Icons[drv_no].valid )
+        break;
+
+    if ( drv_no >= MAX_DRIVES )
+    {
+      werr ( FALSE, "A maximum of %d connections are allowed",
+               MAX_DRIVES );
+      return;
+    }
+  }
+
+
+  sprintf( work_buf, "CONNECT %d %s %s %s %s", drv_no,
+            stripCR(GetItemText(LogonWindow,LOGON_SERVER)),
+            stripCR(GetItemText(LogonWindow,LOGON_SHARENAME)),
+            checkblank(stripCR(GetItemText(LogonWindow,LOGON_USERNAME))),
+            stripCR(GetItemText(LogonWindow,LOGON_PASSWORD))   );
+
+  if( _kernel_oscli(work_buf)==_kernel_ERROR )
+  {
+     wimp_reporterror((os_error *)_kernel_last_oserror(),0, mod_name);
+     return;
+  }
+
+  if ( NoConnections )     /* Replace 'Lan Man' icon with named one */
+    IconBarDel ( drv_no );
+
+  IconBarAdd ( drv_no, GetItemText(LogonWindow, LOGON_SHARENAME) );
+  NoConnections = FALSE;
+}
+
+/* ---------------------------------------- */
+
+static void DoLogoff ( int drv_no )
+{
+  int i;
+  if ( NoConnections || drv_no < 0 || drv_no >= MAX_DRIVES )
+    return;
+
+  sprintf( work_buf, "Filer_CloseDir Lanman::%d.$", drv_no );
+  _kernel_oscli(work_buf);
+
+  sprintf( work_buf, "DISCONNECT %d", drv_no );
+  if(_kernel_oscli(work_buf)==_kernel_ERROR)
+     wimp_reporterror((os_error *)_kernel_last_oserror(),0, mod_name);
+
+  IconBarDel(drv_no);
+
+  for ( i=0; i<MAX_DRIVES; i++ )
+  {
+    if ( Bar_Icons[i].valid )
+      return;
+  }
+
+  /* No icons left - reattach 'Lan Man' icon */
+
+  NoConnections = TRUE;
+  IconBarAdd ( 0, "Lan Man" );
+}
+
+/* ---------------------------------------- */
+
+static void DoOpenDir( int drive )
+{
+
+  sprintf(work_buf, "Filer_OpenDir LanMan::%d.$", drive );
+  _kernel_oscli(work_buf);
+}
+
+/* ---------------------------------------- */
+
+static int LastMenuOpen;
+
+static BOOL IconClick ( int drv, int button, int x, int y )
+{
+  switch ( button )
+  {
+    case wimp_BMID:
+      LastMenuOpen = drv;
+      if ( NoConnections )
+      {
+        iconmenu->item[IconMenu_Quit].iconflags &= ~wimp_INOSELECT;
+        iconmenu->item[IconMenu_Logoff].iconflags |= wimp_INOSELECT;
+      }
+      else
+      {
+        iconmenu->item[IconMenu_Quit].iconflags |= wimp_INOSELECT;
+        iconmenu->item[IconMenu_Logoff].iconflags &= ~wimp_INOSELECT;
+      }
+
+      wimp_create_menu((wimp_menustr *)iconmenu, x-64,
+                      144+32*ICON_MENU_ITEMS);
+      break;
+
+    case wimp_BRIGHT:
+    case wimp_BLEFT:
+      if ( !NoConnections )
+        DoOpenDir(drv);
+      break;
+  }
+
+  return TRUE;
+}
+
+/* ---------------------------------------- */
+
+static BOOL IconMenu ( int drv, int sel )
+{
+  switch ( sel )
+  {
+    case IconMenu_Logon:  /* Starts logon dbox */
+      break;
+
+    case IconMenu_Logoff:
+      DoLogoff(drv);
+      break;
+
+    case IconMenu_Quit:
+      return FALSE;
+
+    default:
+      break;
+  }
+
+  return TRUE;
+}
+
+/* ---------------------------------------- */
+
+static int DrvFromIcon ( int icon )
+{
+  int dd;
+  for ( dd=0; dd<MAX_DRIVES; dd++ )
+  {
+    if ( Bar_Icons[dd].valid && icon == Bar_Icons[dd].icon_id )
+      return dd;
+  }
+  return -1;
+}
+
+/* ---------------------------------------- */
+
+static BOOL Process(void)
+{
+  os_error *err;
+  wimp_eventstr evt;
+  int drv;
+
+  err=wimp_poll(0,&evt);
+  if ( err != NULL )
+  {
+    wimp_reporterror ( err, 0, mod_name );
+    return FALSE;
+  }
+
+  switch ( evt.e )
+  {
+    case wimp_EBUT:
+      if (evt.data.but.m.w == ICONBAR )
+      {
+        drv = DrvFromIcon ( evt.data.but.m.i );
+        if ( drv >= 0 )
+          return IconClick ( drv,
+                           evt.data.but.m.bbits,
+                           evt.data.but.m.x,
+                           evt.data.but.m.y );
+      }
+      break;
+
+    case wimp_EMENU:
+      return IconMenu ( LastMenuOpen, evt.data.menu[0]);
+
+    case wimp_EKEY:
+      if ( evt.data.key.c.w == hLogonWind )  /* Logon dialog box */
+      {
+        if ( evt.data.key.chcode == 13 /* Enter */)
+        {
+          switch ( evt.data.key.c.i )
+          {
+            case LOGON_SERVER:
+              evt.data.key.c.i = LOGON_SHARENAME;
+              goto NextField;
+            case LOGON_SHARENAME:
+              evt.data.key.c.i = LOGON_USERNAME;
+              goto NextField;
+            case LOGON_USERNAME:
+              evt.data.key.c.i = LOGON_PASSWORD;
+            NextField:
+              evt.data.key.c.height = -1;
+              evt.data.key.c.index = 0;
+              wimp_set_caret_pos (&evt.data.key.c);
+              break;
+
+            case LOGON_PASSWORD:
+              DoLogon();
+              wimp_create_menu((wimp_menustr *)-1,0,0);
+              break;
+
+          }
+        }
+        else
+          wimp_processkey ( evt.data.key.chcode );
+      }
+      break;
+
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+      switch (evt.data.msg.hdr.action)
+      {
+        case wimp_MCLOSEDOWN:
+          return FALSE;
+      }
+      break;
+
+    default:
+      break;
+
+  }
+
+  return TRUE;
+}
+
+
+/******************* MAIN PROGRAM ********************************/
+
+/*--- Main entry point. ---*/
+int main()
+{
+  if (Initialise())
+  {
+    /* The main event loop */
+    while (Process());
+  }
+  else
+    werr ( FALSE, "Initialise failed");
+
+  return 0;
+}

@@ -1,0 +1,825 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > RTC
+
+; *********************************
+; ***    C h a n g e   L i s t  ***
+; *********************************
+
+; Date          Description
+; ----          -----------
+; 28-Sep-89     Started
+; 04-Oct-89     First working version
+; 05-Oct-89     Added trap for OS_Word 15
+; 27-Nov-89     Added GET <Hdr>.File, to make it assemble again
+;               (no change to object)
+; 27-Mar-91 ECN Internationalised
+; 21-May-93 TMD Applied "-1" correction to timer latch programming
+; 31-Jan-97 MJS Fix the bug that means CallEvery is requested twice
+;               (see SingleCallEveryFix)
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+	GET	Hdr:Machine.<Machine>
+        GET     Hdr:CMOS
+        GET     Hdr:ModHand
+        GET     Hdr:Services
+        GET     Hdr:Proc
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:IIC
+        GET     Hdr:ExtraLong
+        GET     Hdr:MsgTrans
+        GET     Hdr:HALEntries
+
+	GET	VersionASM
+
+        AREA    |RTCAdjust$$Code|, CODE, READONLY, PIC
+
+;Fix bug such that CallEvery is requested twice during start-up - once
+;on module init, once when ServiceReset is seen. This is a latent bug
+;since RO 3.1. It means that corrections are done on the very short
+;period between the double CallEvery's, and may inject very large time
+;rate variations (which then are not recorrected until the next main
+;period, currently 1 hour).
+        GBLL        SingleCallEveryFix
+SingleCallEveryFix  SETL {TRUE}
+
+TAB     *       9
+LF      *       10
+FF      *       12
+CR      *       13
+OsbyteReadCMOS * &A1
+OsbyteWriteCMOS * &A2
+OswordSetTime * &0F
+
+RTCPHI      * &a0
+RTCDAL      * &d0
+
+
+; Failure modes
+
+Failure_ReadCMOS * 1
+Failure_WriteIIC * 2
+Failure_ReadIIC  * 3
+Failure_Conversion * 4
+Failure_ReadIOCTime * 5
+Failure_ReadMonoTime * 6
+Failure_ErrorTooBig * 7
+Failure_NewLatchTooBig * 8
+
+
+; Module workspace allocation
+
+        ^ 0, R12
+LastLatchValue  # 4
+FailureMode     # 4
+LastError       # 4
+LastMonoTime    # 4
+CallBackPending # 4
+RTCCentiLo      # 4
+RTCCentiHi      # 4
+IOCCentiLo      # 4
+IOCCentiHi      # 4
+  [ SingleCallEveryFix
+NCorrections    # 4     ;no. of corrections made - just to aid test monitoring
+  ]
+MessageFile_Block # 16
+MessageFile_Open  # 4
+
+DefaultLatchValue # 4
+MinimumLatchValue # 4
+MaximumLatchValue # 4
+NoHal             # 1      ; NZ if no HAL
+RTCAddress        # 1
+sparealign        # 2
+RTC_WorkspaceSize * :INDEX: @
+
+
+; Time in centiseconds between recalibrations
+
+Period * 100*60*60                              ; one hour
+
+; Macro to convert from a BCD value to a binary one
+; reg = 16*hi + lo
+; we want reg = 10*hi + lo = reg-6*hi
+
+        MACRO
+        BCDToBinary     $reg, $temp
+        MOV     $temp, $reg, LSR #4             ; get hi nybble
+        ADD     $temp, $temp, $temp, LSL #1     ; hi * 3
+        SUB     $reg, $reg, $temp, LSL #1
+        MEND
+
+; **************** Module code starts here **********************
+
+Module_BaseAddr
+
+        DCD     0
+        DCD     RTC_Init    -Module_BaseAddr
+        DCD     RTC_Die     -Module_BaseAddr
+        DCD     RTC_Service -Module_BaseAddr
+        DCD     RTC_Title   -Module_BaseAddr
+        DCD     RTC_HelpStr -Module_BaseAddr
+        DCD     RTC_HC_Table-Module_BaseAddr
+        DCD     0 ; RTCSWI * Module_SWIChunkSize
+ [ :LNOT: No32bitCode
+        DCD     0 ; RTC_SWIHandler-Module_BaseAddr
+        DCD     0 ; RTC_SWINameTable-Module_BaseAddr
+        DCD     0 ; Code to manually decode swi name (not needed)
+        DCD     0 ; International messages
+        DCD     RTC_Flags   -Module_BaseAddr
+ ]
+
+RTC_Title
+        =       "RTCAdjust", 0
+
+RTC_HelpStr
+        =       "RTCAdjust"
+        =       TAB
+        =       "$Module_HelpVersion"
+        =       0
+        ALIGN
+
+
+; **************************************************************************
+
+RTC_HC_Table * Module_BaseAddr
+
+; **************************************************************************
+;
+;       RTC_Init - Initialisation entry
+;
+
+RTC_Init Entry
+        LDR     R2, [R12]       ; have we got workspace yet ?
+        TEQ     R2, #0
+        BNE     %FT05
+
+        MOV     R0, #ModHandReason_Claim
+        MOV     R3, #RTC_WorkspaceSize
+        SWI     XOS_Module
+        EXIT    VS
+
+; R2 -> workspace
+
+        STR     R2, [R12]       ; save address in my workspace pointer,
+                                ; so Tutu can free it for me when I die
+05
+        MOV     R12, R2
+        MOV     r0, #0
+        STR     r0, MessageFile_Open
+        BL      DoInit          ; can exit with VS
+        EXIT
+
+; **************************************************************************
+;
+;       RTC_Service - Service entry
+;
+
+;Ursula format
+;
+UServTab
+        DCD     0
+        DCD     UService - Module_BaseAddr
+        DCD     Service_Reset
+        DCD     0
+        DCD     UServTab - Module_BaseAddr
+RTC_Service ROUT
+        MOV     r0,r0
+        TEQ     R1, #Service_Reset
+        MOVNE   PC, R14
+UService
+        LDR     R12, [R12]
+        Push    "R0-R6,R14"
+        BL      DoInit
+        Pull    "R0-R6,PC"
+
+ [ :LNOT: No32bitCode
+RTC_Flags       DCD     1       ; 32-bit compatible
+ ]
+
+; **************************************************************************
+;
+;       RTC_Die - Die entry
+;
+
+RTC_Die Entry
+        LDR     R12, [R12]
+        PHPSEI  R5, R0                  ; disable IRQs round this bit
+
+        LDR     R0, CallBackPending
+        TEQ     R0, #0
+        BNE     %FT10
+
+        LDR     r0, MessageFile_Open
+        CMP     r0, #0
+        ADRNE   r0, MessageFile_Block
+        SWINE   XMessageTrans_CloseFile
+
+        ADR     R0, MyCallEvery         ; get me off the CallEvery
+        MOV     R1, R12
+        SWI     XOS_RemoveTickerEvent
+
+        PLP     R5                      ; restore IRQ status - it's safe!
+
+        BL      GetOffWordV
+
+        LDR     R3,  DefaultLatchValue  ; put back normal latch value
+        BL      ProgramLatch
+
+        CLRV
+        EXIT
+
+10
+        PLP     R5
+        ADR     R0, NotNowImBusy
+        BL      CopyError
+        EXIT
+
+NotNowImBusy
+        &       1
+        =       "M00", 0
+        ALIGN
+
+; **************************************************************************
+;
+;       DoInit - Set up variables on init/reset
+;
+
+DoInit  Entry   "R8-R9"
+        MOV     R0, #0
+        STR     R0, CallBackPending
+        STR     R0, FailureMode
+  [ SingleCallEveryFix
+        STR     R0, NCorrections
+  ]
+
+        BL      InitVars
+        EXIT    VS
+        ; locate the RTC
+        MOV     R8, #RTCDAL             ; DALLAS
+        SUB     R13, R13, #1*4          ; need 1 bytes rounded up
+        MOV     R1, R13
+        MOV     R2, #&01                ; CMOS address to start reading from
+        STRB    R2, [R1,#0]             ; and also length of block
+        MOV     R0, R8                  ; write CMOS address
+        SWI     XIIC_Control
+        BVC     %FT1                    ; OK.. then its DALLAS
+        MOV     R8, #RTCPHI             ; Phillips 256byte cmos
+        MOV     R0, R8                  ; write CMOS address
+        SWI     XIIC_Control
+        MOVVS   r8, #0                  ; no cmos RTC
+1       STRB    R8, RTCAddress
+        ADD     R13, R13, #1*4          ; recover 1 bytes rounded up
+
+        MOV     R8, #0
+        STRB    R8, NoHal         ; init flag as having HAL
+
+        MOV     R9, #EntryNo_HAL_TimerGranularity
+        SWI     XOS_Hardware
+        BVS     NotHal
+
+        MOV     R1, R0            ; preserve rate read
+        MOV     R9, #EntryNo_HAL_TimerMaxPeriod
+        SWI     XOS_Hardware
+        B       HalCheckDone
+NotHal
+        LDR     R1, =2000000      ; rate
+        MOV     R0, #65536        ; max
+        STRB    R0, NoHal         ; flag no HAL
+
+HalCheckDone
+;    if (_swix(OS_Hardware, _IN(0)|_INR(8,9)|_OUT(0),
+;                               0, 0, EntryNo_HAL_TimerGranularity,
+;                               &rate))
+;    {
+;        rate = 2000000;
+;        max = 65536;
+;        hal = false;
+;    }
+;    else
+;    {
+;        _swix(OS_Hardware, _IN(0)|_INR(8,9)|_OUT(0),
+;                           0, 0, EntryNo_HAL_TimerMaxPeriod,
+;                           &max);
+;        hal = true;
+;    }
+
+        MOV     R4, #100
+        ADD     R2, R1, R4, LSR #1; rate + 50
+        MOV     R6, R2            ; remember
+        MOV     R7, R4
+        DivRem  R3, R2, R4, lr    ;
+        STR     R3, LastLatchValue;     (rate+50) / 100
+        STR     R3, DefaultLatchValue;
+        DivRem  R2, R3, R7, lr    ;     DefaultLatchValue/100
+        LDR     R3, DefaultLatchValue;
+        SUB     R4, R3, R2
+        CMP     R4, #1
+        MOVLO   R4, #1
+        STR     R4, MinimumLatchValue
+        ADD     R4, R3, R2
+        CMP     R4, R0
+        MOVHI   R4, R0
+        STR     R4, MaximumLatchValue
+
+;    LastLatchValue = DefaultLatchValue = (rate+50) / 100;
+;    MinimumLatchValue = DefaultLatchValue - DefaultLatchValue/100;
+;    if (MinimumLatchValue < 1) MinimumLatchValue = 1;
+;    MaximumLatchValue = DefaultLatchValue + DefaultLatchValue/100;
+;    if (MaximumLatchValue > max) MaximumLatchValue = max;
+
+        MOV     R0, #WordV
+        ADR     R1, MyWordV
+        MOV     R2, R12
+        SWI     XOS_Claim
+        EXIT    VS
+
+  [ SingleCallEveryFix
+    ;remove previous request if any, in case this is the second
+    ;request on start-up (one from module init, one from Service_Reset)
+        ADR     R0, MyCallEvery
+        MOV     R1, R12
+        SWI     XOS_RemoveTickerEvent
+  ]
+
+        LDR     R0, =Period-1           ; adjust for bug
+        ADR     R1, MyCallEvery
+        MOV     R2, R12
+        SWI     XOS_CallEvery
+        BLVS    GetOffWordV
+        EXIT
+
+; **************************************************************************
+;
+;       InitVars - Init called on init, reset or set time
+;
+
+InitVars Entry
+        MOV     R0, #0
+        STR     R0, LastError
+
+        SWI     XOS_ReadMonotonicTime
+        STRVC   R0, LastMonoTime
+        EXIT
+
+; **************************************************************************
+;
+;       GetOffWordV - Get off WordV
+;
+; out:  PSR preserved
+;
+
+GetOffWordV EntryS
+        MOV     R0, #WordV
+        ADR     R1, MyWordV
+        MOV     R2, R12
+        SWI     XOS_Release
+        EXITS
+
+; **************************************************************************
+;
+;       MyWordV - Routine on WordV
+;
+
+MyWordV ROUT
+        TEQ     R0, #OswordSetTime
+        MOVNE   PC, R14
+        Push    "R0,R14"
+        BL      InitVars
+        Pull    "R0,PC"
+
+; **************************************************************************
+;
+;       MyCallEvery - CallEvery routine
+;
+
+MyCallEvery Entry "R0,R1,R8,R9"
+        SavePSR R9
+        ORR     R8, R9, #SVC_mode       ; IRQ->SVC (32-bit mode independent)
+        RestPSR R8,,fc                   ; change mode
+        NOP
+        Push    R14
+        ADR     R0, Recalibrate
+        MOV     R1, R12
+        SWI     XOS_AddCallBack
+        Pull    R14
+        RestPSR R9,,fc                   ; restore old processor mode
+        NOP
+
+        LDR     R0, CallBackPending
+        ADD     R0, R0, #1              ; indicate another pending CallBack
+        STR     R0, CallBackPending
+        EXIT
+
+; *****************************************************************************
+;
+;	BCDToHex - Convert byte in BCD to hex
+;
+; in:	R0 = byte in BCD (ie x*16 + y)
+;
+; out:	R0 = byte in hex (ie x*10 + y)
+;	All other registers preserved
+;
+
+BCDToHex ROUT
+	Push	"R14"
+	MOV	R14, R0, LSR #4			; R14 := x
+	ADD	R14, R14, R14, LSL #1		; R14 := x*3
+	SUB	R0, R0, R14, LSL #1		; R0 := R0 - x*6 = x*10
+	Pull	"PC"
+
+
+; **************************************************************************
+;
+;       Recalibrate - Recalibration routine
+;
+; in:   SVC mode
+;       R12 -> my workspace
+;
+;                          (P+C)       P'
+; new latch := old latch * ------ * --------
+;                            P      (P'-C+W)
+;
+; where P = Period, the requested number of cs ticks between calls
+;
+;       P' = the actual number of cs ticks since last called (different from
+;            P because of the time taken to grant the callback)
+;
+;       C  = the number of cs we are ahead of the RTC this call
+;
+;       W  = the number of cs we were ahead of the RTC last call
+;
+
+Recalibrate Entry "R0-R9"
+        LDR     R0, CallBackPending
+        SUBS    R0, R0, #1              ; one fewer pending callbacks
+        STRCS   R0, CallBackPending     ; don't go negative
+
+        MOV     R0, #OsbyteReadCMOS     ; Read year MOD 100
+        MOV     R1, #YearCMOS
+        SWI     XOS_Byte
+        MOVVC   R4, R2                  ; and put it into R4
+        MOVVC   R1, #YearCMOS +1        ; Read year DIV 100
+        SWIVC   XOS_Byte
+        MOVVS   R0, #Failure_ReadCMOS
+        BVS     %FT99
+        MOV     R5, R2                  ; and put it into R5
+
+; now read the RTC values
+
+        SUB     R13, R13, #2*4          ; need 6 bytes rounded up
+        MOV     R1, R13
+        LDRB    R0, RTCAddress          ; write CMOS address
+        TEQ     R0, #0                  ; RTC Fitted?
+        MOVEQ   R0, #Failure_ReadIIC
+        BEQ     %FT98
+        TEQ     R0, #RTCDAL
+        MOVEQ   R2, #&00                ; CMOS address to start reading from
+        MOVNE   R2, #&01                ; CMOS address to start reading from
+        STRB    R2, [R1,#0]             ;
+        MOV     R2, #&01                ; also length of this write block
+        SWI     XIIC_Control
+        MOVVS   R0, #Failure_WriteIIC
+        BVS     %FT98
+        LDRB    R0, RTCAddress          ; write CMOS address
+        ORR     R0, R0, #1              ; read
+        MOV     R2, #6                  ; 6 bytes
+        SWI     XIIC_Control
+        MOVVS   R0, #Failure_ReadIIC
+        BVS     %FT98
+
+
+	TEQ     R8, #RTCPHI
+	BNE	%FT50
+
+	; Philips specific read
+        LDRB    R0, [R13, #0]
+        BL      BCDToHex
+        MOV     R7, R0                  ; centiseconds
+        LDRB    R0, [R13, #1]
+        BL      BCDToHex
+        MOV     R6, R0                  ; seconds
+        LDRB    R0, [R13, #2]
+        BL      BCDToHex
+        MOV     R1, R0                  ; minutes
+        LDRB    R0, [R13, #3]
+        BL      BCDToHex
+        MOV     R4, R0                  ; hours
+        LDRB    R0, [R13, #4]
+        AND     R0, R0, #&3F            ; day of month (clear year bits)
+        BL      BCDToHex
+        MOV     R2, R0
+        LDRB    R0, [R13, #5]
+        AND     R0, R0, #&1F            ; month (clear day of week bits)
+        BL      BCDToHex
+        MOV     R3, R0
+	B	ReadTimeYear
+
+50
+	; Dallas specific read
+        MOV     R7, #0                  ; centiseconds
+        LDRB    R0, [R13, #0]
+        BL      BCDToHex
+        MOV     R6, R0                  ; seconds
+        LDRB    R0, [R13, #1]
+        BL      BCDToHex
+        MOV     R1, R0                  ; minutes
+        LDRB    R0, [R13, #2]
+        BL      BCDToHex
+        MOV     R4, R0                  ; hours
+        LDRB    R0, [R13, #4]
+        BL      BCDToHex
+        MOV     R2, R0                  ; day of month
+        LDRB    R0, [R13, #5]
+        BL      BCDToHex
+        MOV     R3, R0                  ; month
+
+ReadTimeYear
+        Push    "R1,R2"
+        Push    "R4"
+        MOV     R0, #OsbyteReadCMOS     ; Read year MOD 100
+        MOV     R1, #YearCMOS
+        SWI     XOS_Byte
+        MOVVC   R4, R2                  ; and put it into R4
+        MOVVC   R1, #YearCMOS +1        ; Read year DIV 100
+        SWIVC   XOS_Byte
+        MOV     R5, R2                  ; and put it into R5
+        Pull    "R0,R1,R2"                 ; r0..hours was originally in R4
+        MOVVS   R0, #Failure_ReadCMOS
+        BVS     %FT98
+
+	TEQ	R2, #0			; Ensure day/month are non-zero (LRust, fix RP-0370)
+	MOVEQ	R2, #1			; No then force 1st
+	TEQ	R3, #0			; Invalid month?
+	MOVEQ	R3, #1			; Yes then force Jan
+
+
+        ADD     R13, R13, #2*4
+        BL      ConvertTo5Byte
+
+        CMP     R8, #-1
+        MOVEQ   R0, #Failure_Conversion
+        BEQ     %FT99
+        STR     R7, RTCCentiLo
+        STR     R8, RTCCentiHi
+
+        ADR     R1, IOCCentiLo
+        MOV     R0, #3                  ; read 5-byte IOC realtime
+        STRB    R0, [R1, #0]
+        MOV     R0, #&0E
+        SWI     XOS_Word
+        MOVVS   R0, #Failure_ReadIOCTime
+        BVS     %FT99
+
+        LDR     R5, IOCCentiLo
+        LDRB    R6, IOCCentiHi
+        SUBS    R5, R5, R7              ; R5 = C
+        SBCS    R6, R6, R8
+        CMP     R6, R5, ASR #31         ; if hiword not all bit 31 of loword
+        MOVNE   R0, #Failure_ErrorTooBig ; then error
+        BNE     %FT99
+
+        SWI     XOS_ReadMonotonicTime
+        MOVVS   R0, #Failure_ReadMonoTime
+        BVS     %FT99
+        LDR     R1, LastMonoTime
+        STR     R0, LastMonoTime
+        SUB     R9, R0, R1              ; R9 = P'
+
+        LDR     R0, LastLatchValue      ; R0 = L
+        MOV     R1, #0                  ; R1 = L(hi) = 0
+        LDR     R2, =Period             ; R2 = P
+        ADDS    R3, R2, R5              ; R3 = P + C
+        MOVLT   R3, #0                  ; if <0 then make 0
+        MOV     R4, #0                  ; R4 = (P + C)(hi) = 0
+        mextralong_multiply R6, R7, R0, R1, R3, R4
+                                        ; R6,R7 = L*(P+C)
+        mextralong_multiply R3, R4, R6, R7, R9, R1
+                                        ; R3,R4 = L*(P+C)*P'
+
+        LDR     R8, LastError           ; R8 = W
+        STR     R5, LastError
+        SUB     R5, R5, R8              ; R5 = C-W
+        SUBS    R9, R9, R5              ; R9 = P'-(C-W)
+        MOVLE   R9, #1                  ; if <=0 then make 1
+
+        mextralong_divide R6, R7, R3, R4, R2, R1, R0, R5, R8
+                                        ; R6,R7 = L*(P+C)*P'/P
+        mextralong_divide R3, R4, R6, R7, R9, R1, R0, R5, R8
+                                        ; R3,R4 = L*(P+C)*P'/P/(P'-(C-W))
+        LDR     R1, MaximumLatchValue
+        CMP     R3, R1
+        SBCS    R0, R4, #0
+        MOVGE   R3, R1
+        MOVGE   R4, #0
+
+        LDR     R1, MinimumLatchValue
+        CMP     R3, R1
+        SBCS    R0, R4, #0
+        MOVLT   R3, R1
+        MOVLT   R4, #0
+
+;        CMP     R3, #&10000
+;        CMPCC   R4, #1
+;        MOVCS   R0, #Failure_NewLatchTooBig
+;        BCS     %FT99
+        STR     R3, LastLatchValue
+
+        BL      ProgramLatch
+
+        MOV     R0, #0
+        B       %FT99
+
+98
+        ADD     R13, R13, #2*4
+99
+        STR     R0, FailureMode
+  [ SingleCallEveryFix
+        LDR     R0, NCorrections
+        ADD     R0, R0, #1
+        STR     R0, NCorrections
+  ]
+        EXIT
+
+; **************************************************************************
+;
+;       ProgramLatch - Program IOC Timer 0 latch with R3 value
+;       or use the HAL if present
+;
+
+ProgramLatch Entry "R0, R1, R3, R8, R9"
+        LDRB    lr, NoHal
+        TEQ     lr, #0
+        BNE     PLNoHal
+        MOV     R0, #0
+        MOV     R1, R3
+        MOV     R8, R0
+        MOV     R9, #EntryNo_HAL_TimerSetPeriod
+        SWI     XOS_Hardware
+        EXIT
+
+PLNoHal SUB     R3, R3, #1              ; TMD 21-May-93: Apply correction - IOC latch should be programmed with n-1
+        MOV     R0, #IOC
+        STRB    R3, [R0, #Timer0LL]
+        MOV     R3, R3, LSR #8
+        STRB    R3, [R0, #Timer0LH]
+        EXIT
+
+; **************************************************************************
+;
+;       ConvertTo5Byte - Convert real time value (separate registers) into
+;                        5-byte centisecond format
+;
+; in:   R0 = hours
+;       R1 = minutes
+;       R2 = days
+;       R3 = months
+;       R4 = year MOD 100
+;       R5 = year DIV 100
+;       R6 = seconds
+;       R7 = centiseconds
+;
+; out:  R7 = centiseconds (lo)
+;       R8 = centiseconds (hi)
+;       R0-R6, R9 corrupted
+;
+
+ConvertTo5Byte Entry
+        MOV     R9, #24
+        SUB     R2, R2, #1              ; decrement day (day=1 => nowt to add)
+        MLA     R0, R9, R2, R0          ; R0 = hours + day*24
+        MOV     R9, #60
+        MLA     R1, R0, R9, R1          ; R1 = mins + hours*60
+        MLA     R6, R1, R9, R6          ; R6 = secs + mins*60
+        MOV     R9, #100
+        MLA     R7, R6, R9, R7          ; R7 = centisecs + secs*100
+
+        ADR     R0, STMonths-4          ; Point to table (month = 1..12)
+        LDR     R1, [R0, R3, LSL #2]    ; get word of offset
+        ADD     R7, R7, R1              ; add to total
+
+; if not had leap day in this year yet, then exclude this year from the
+; leap day calculations
+
+        CMP     R3, #3                  ; if month >= 3
+        SBCS    R0, R4, #0              ; then R0,R1 = R4,R5
+        MOVCC   R0, #99                 ; else R0,R1 = R4,R5 -1
+        SBC     R1, R5, #0
+
+; want (yl+100*yh) DIV 4 - (yl+100*yh) DIV 100 + (yl+100*yh) DIV 400
+; = (yl DIV 4)+ (25*yh) - yh + (yh DIV 4)
+; = (yl >> 2) + 24*yh + (yh >> 2)
+
+        MOV     R0, R0, LSR #2          ; yl >> 2
+        ADD     R0, R0, R1, LSR #2      ; + yh >> 2
+        ADD     R0, R0, R1, LSL #4      ; + yh * 16
+        ADD     R0, R0, R1, LSL #3      ; + yh * 8
+
+; now subtract off the number of leap days in first 1900 years = 460
+
+        SUBS    R0, R0, #460
+        BCC     BadYear                 ; before 1900, so bad
+        CMP     R0, #86                 ; if more than 86 days, then it's
+        BCS     BadYear                 ; after 2248, so bad
+
+        LDR     R9, =ticksperday        ; multiply by ticksperday and add to
+        MLA     R7, R9, R0, R7          ; total (no overflow possible as this
+                                        ; can never be more than 85+31 days)
+
+; now add on (year-1900)*ticksperyear
+
+        SUBS    R5, R5, #19             ; subtract off 1900
+        BCC     BadYear
+        MOV     R9, #100
+        MLA     R4, R9, R5, R4          ; R4 = year-1900
+
+        LDR     R0, =ticksperyear       ; lo word of amount to add on
+        MOV     R1, #0                  ; hi word of amount to add on
+        MOV     R8, #0                  ; hi word of result
+10
+        MOVS    R4, R4, LSR #1
+        BCC     %FT15
+
+        ADDS    R7, R7, R0              ; if bit set then add on amount
+        ADCS    R8, R8, R1
+        BCS     BadYear                 ; overflow => bad time value
+15
+        ADDS    R0, R0, R0              ; shift up amount
+        ADCS    R1, R1, R1
+        TEQ     R4, #0                  ; if still bits to add in
+        BNE     %BT10                   ; then loop
+
+        CMP     R8, #&100               ; R8 must only be a byte
+        EXIT    CC
+
+BadYear
+        MOV     R7, #-1
+        MOV     R8, #-1
+        EXIT
+
+tickspersecond  * 100
+ticksperminute  * tickspersecond * 60
+ticksperhour    * ticksperminute * 60
+ticksperday     * ticksperhour   * 24
+ticksperyear    * ticksperday    * 365  ; &BBF81E00
+
+STMonths
+        &       &00000000       ; Jan
+        &       &0FF6EA00       ; Feb
+        &       &1E625200       ; Mar
+        &       &2E593C00       ; Apr
+        &       &3DCC5000       ; May
+        &       &4DC33A00       ; Jun
+        &       &5D364E00       ; Jul
+        &       &6D2D3800       ; Aug
+        &       &7D242200       ; Sep
+        &       &8C973600       ; Oct
+        &       &9C8E2000       ; Nov
+        &       &AC013400       ; Dec
+        &       &F0000000       ; terminator, must be less than this (+1)
+
+CopyError Entry r1-r7
+        BL      open_messagefile
+        EXIT    VS
+        ADR     R1, MessageFile_Block
+        MOV     R2, #0
+        MOV     R4, #0
+        MOV     R5, #0
+        MOV     R6, #0
+        MOV     R7, #0
+        SWI     XMessageTrans_ErrorLookup
+        EXIT
+
+message_filename
+        DCB     "Resources:$.Resources.RTCAdjust.Messages", 0
+        ALIGN
+
+open_messagefile Entry r0-r2
+        LDR     r0, MessageFile_Open
+        CMP     r0, #0
+        EXIT    NE
+        ADR     R0, MessageFile_Block
+        ADR     R1, message_filename
+        MOV     r2, #0
+        SWI     XMessageTrans_OpenFile
+        EXIT    VS
+        MOV     r0, #1
+        STR     r0, MessageFile_Open
+        EXIT
+
+        END

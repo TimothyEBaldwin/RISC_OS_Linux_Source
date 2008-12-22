@@ -1,0 +1,1290 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Title  : ctl.c
+ * Purpose: Provides handling of user events controlled by a resource file.
+ * Author : William Stoye
+ * History:
+ *   30-Jun-89: started
+ *
+ */
+
+# include <stdlib.h>
+# include <string.h>
+# include <stdio.h>
+
+# include "dbox.h"
+# include "ctl.h"
+# include "res.h"
+# include "werr.h"
+# include "msgs.h"
+# include "trace.h"
+
+/****************************** Errors **********************/
+
+void ctl__err(int err)
+/* Used for errors when not reading in a file. */
+{
+  werr(
+    TRUE,
+    msgs_lookup("ctl_err:Error (type %i): bad Control file"),
+    err);
+}
+/* Possible error codes:
+  1 - named ctl object not found
+  2 - named ctl object does not define a menu
+  3* - ctl_init called twice
+  4* - bad menu event passed to ctl_decode
+  5 - 'error' in action list, without error message
+  6* - badly contructed ctl_decode loop, or state.index not initialised
+  7! - menu not found at run-time.
+  8 - 'opendbox' in action list, without argument
+  9 - 'opendbox' can only appear at the end of an action list
+ 10 - 'closedbox' when not in a dbox
+ 11 - 'closedbox' not last thing in an action list
+*/
+/* Those with a * must be C programmer errors. Those marked with ! are ctl
+internal consistency checks. Others could be caused by bad Control files. */
+
+/****************************** Storage management **********************/
+
+void *ctl__malloc(int size) /* Defined just like malloc */
+{
+  void *result = malloc(size);
+  if (result == NULL)
+    werr(TRUE, msgs_lookup("ctl_nosp:Not enough space to read in control file"));
+  return result;
+}
+/* The usage pattern of this module is to generate lots of teeny blocks
+(2-10 words typical), and never to free anything. Blocks are allocated
+only during read-in, not while the program is actually running. */
+
+/* ... Better to use heap_ probably, it will give far better behaviour on
+the small blocks. */
+
+/****************************** Symbols **********************/
+
+typedef struct ctl__s /* a symbol */
+{
+  struct ctl__s *next;
+  char *string;
+  int code;
+} ctl__s;
+
+static ctl__s *ctl__symbols = NULL; /* list of all symbols. */
+
+ctl__s *ctl__lookup_symbol(char *name, BOOL copyname)
+/* Try to find the named symbol. If you do, return a pointer to the existing
+symbol. If you fail, make a new one (copying the string if copyname) and
+return that. */
+{
+  ctl__s *s = ctl__symbols;
+
+  /* Search for symbol, and return if found. */
+  while (s != NULL)
+  {
+    if (strcoll(name, s->string) == 0) return s;
+    s = s->next;
+  };
+
+  /* It doesn't exist yet, so create a new symbol. */
+  tracef1("ctl__symbol making new symbol '%s'.\n", (int) name);
+  s = ctl__malloc(sizeof(ctl__s));
+  s->next = ctl__symbols;
+  s->code = 0;
+  ctl__symbols = s;
+  if (copyname)
+  {
+    s->string = ctl__malloc(strlen(name) + 1);
+    strcpy(s->string, name);
+  }
+  else
+  {
+    s->string = name;
+  };
+  return s;
+}
+
+/****************************** Lexical analysys **********************/
+
+static char ctl__ch = ' ';       /* current char */
+static int ctl__lineno = 1;      /* for error messages */
+static int ctl__symno = 1;       /* for error messages */
+static BOOL ctl__wassym = FALSE; /* last symbol returned was non-NULL:
+                                  * used to improve the value of symno
+                                  * at error messages
+                                  */
+FILE *ctl__in = NULL;            /* input stream */
+
+#define SYMBMAX 256
+/* maximum size of a symbol */
+
+void ctl__synerr(int err)
+/* Syntax error while reading file. */
+{
+  if (ctl__in != NULL) fclose(ctl__in);
+  werr(
+    TRUE,
+    msgs_lookup("ctl_syn:Startup error in 'Control' resource file (Syntax error type %i around symbol %i of line %i)"),
+    err,
+    ctl__symno,
+    ctl__lineno);
+}
+/* In normal use a call to synerr does not return, but in the code below an attempt
+is made to continue after a call, as this makes it easier to test cases where errors
+occur. */
+
+/*
+Error numbers when reading in Ctl files or using Ctl objects are as follows:
+  1 - EOF found in quoted symbol
+  2 - newline or control char found in quoted symbol
+  3 - quoted symbol too long
+  4 - unexpected character in unquoted symbol
+  5 - command not recognised
+  6 - unexpected end of line or file
+  7 - entry/menuend while not in a menu
+  8 - menu/dbox while still in other menu/dbox
+  9 - menu with no entries in it
+ 10 - menu title string too long (12 char maximum)
+ 11 - menu name not recognised
+ 12 - missing endmenu at end of file
+ 13 - superfluous symbols at end of line
+ 14 - no control objects defined
+ 15 - dbox name not recognised
+ 16 - icon/enddbox/onentry/onexit while not in a dbox
+ 17 - bad number for icon
+*/
+
+BOOL ctl__alphach(char c)
+{
+  if (c >= 'a' && c <= 'z') return TRUE;
+  if (c >= 'A' && c <= 'Z') return TRUE;
+  if (c == '_') return TRUE;
+  return FALSE;
+}
+
+BOOL ctl__symch(char c)
+/* Is this character legitimate in an unquoted symbol? */
+{
+  if (ctl__alphach(c)) return TRUE;
+  if (c >= '0' && c <= '9') return TRUE;
+  return FALSE;
+}
+
+ctl__s *ctl__read_symbol(void)
+{
+  char a[SYMBMAX];
+  int i = 0;
+  ctl__s *result = NULL;
+
+  if (ctl__wassym) ctl__symno++;
+  ctl__wassym = FALSE;
+
+  while (ctl__ch == ' ' && ! feof(ctl__in)) ctl__ch = fgetc(ctl__in);
+  if (feof(ctl__in)) return NULL;
+  switch (ctl__ch)
+  {
+    case '\n':
+      ctl__lineno++;
+      ctl__symno = 1;
+      ctl__ch = ' ';
+      break;
+    case '#':
+      while (ctl__ch != '\n' && ! feof(ctl__in)) ctl__ch = fgetc(ctl__in);
+      break;
+    case '\"':
+    case '\'':
+    {
+      char sep = ctl__ch;
+      while (TRUE)
+      {
+        if (feof(ctl__in)) {ctl__synerr(1); return NULL;};
+        a[i] = fgetc(ctl__in);
+        if (i == SYMBMAX) {ctl__synerr(3); return NULL;};
+        if (a[i] < ' ') {ctl__synerr(2); return NULL;};
+        if (a[i] == sep) break; else i++;
+      };
+      ctl__ch = ' ';
+      a[i] = 0;
+      result = ctl__lookup_symbol(a, TRUE);
+      ctl__wassym = TRUE;
+      break;
+    };
+    default:
+    {
+      if (! ctl__alphach(ctl__ch))
+      {
+        ctl__ch = ' ';
+        ctl__synerr(4);
+        return NULL;
+      };
+      a[i++] = ctl__ch;
+      while (TRUE)
+      {
+        ctl__ch = fgetc(ctl__in);
+        a[i] = ctl__ch;
+        if (i == SYMBMAX) {ctl__synerr(3); return NULL;};
+        if (ctl__symch(a[i])) i++; else break;
+      };
+      a[i] = 0;
+      result = ctl__lookup_symbol(a, TRUE);
+      ctl__wassym = TRUE;
+      break;
+    };
+  }; /* case */
+
+#if TRACE
+  if (result != NULL)
+    tracef3("ctl__read_symbol read '%s' at '%i' at line %i.\n",
+      (int) result->string, (int) result, ctl__lineno);
+  else
+    tracef1("ctl__read_symbol read NULL at line %i.\n", ctl__lineno);
+#endif
+
+  return result;
+}
+
+/* Note that a pointer to a null string, the result of the symbol "" in the
+source, is legal and is distinct from returning NULL (to denote newline or
+possible EOF). */
+
+ctl__s *ctl__read_nonnull_symbol(void)
+{
+  ctl__s *result = ctl__read_symbol();
+  if (result == NULL) {ctl__synerr(6); return ctl__symbols;};
+  return result;
+}
+
+ctl__s *ctl__read_null_symbol(void)
+{
+  ctl__s *result = ctl__read_symbol();
+  if (result != NULL) {ctl__synerr(13); return ctl__symbols;};
+  return result;
+}
+
+/****************************** Built-in symbols **********************/
+
+/* Done in capitals because they're thought of as constants, even though
+they get initialised at run-time. */
+
+static ctl__s *ctl__CTL;
+static ctl__s *ctl__MENU;
+static ctl__s *ctl__ENTRY;
+static ctl__s *ctl__ENDMENU;
+static ctl__s *ctl__SUBMENU;
+static ctl__s *ctl__ERROR;
+static ctl__s *ctl__ACTION;
+static ctl__s *ctl__OPENDBOX;
+static ctl__s *ctl__CLOSEDBOX;
+static ctl__s *ctl__DBOX;
+static ctl__s *ctl__ENDDBOX;
+static ctl__s *ctl__ONOPEN;
+static ctl__s *ctl__ONCLOSE;
+static ctl__s *ctl__ICON;
+
+void ctl__init(void)
+{
+  if (ctl__symbols != NULL) ctl__err(3);
+
+  ctl__CTL = ctl__lookup_symbol("ctl", FALSE);
+  ctl__MENU = ctl__lookup_symbol("menu", FALSE);
+  ctl__ENTRY = ctl__lookup_symbol("entry", FALSE);
+  ctl__ENDMENU = ctl__lookup_symbol("endmenu", FALSE);
+  ctl__SUBMENU = ctl__lookup_symbol("submenu", FALSE);
+  ctl__ERROR = ctl__lookup_symbol("error", FALSE);
+  ctl__ACTION = ctl__lookup_symbol("action", FALSE);
+  ctl__OPENDBOX = ctl__lookup_symbol("opendbox", FALSE);
+  ctl__CLOSEDBOX = ctl__lookup_symbol("closedbox", FALSE);
+  ctl__DBOX = ctl__lookup_symbol("dbox", FALSE);
+  ctl__ENDDBOX = ctl__lookup_symbol("enddbox", FALSE);
+  ctl__ONOPEN = ctl__lookup_symbol("onopen", FALSE);
+  ctl__ONCLOSE = ctl__lookup_symbol("onclose", FALSE);
+  ctl__ICON = ctl__lookup_symbol("icon", FALSE);
+}
+
+/****************************** Data structures **********************/
+
+typedef struct ctl__a   /* action [list] */
+{
+  struct ctl__a *next;  /* list of actions */
+  ctl__s *name;         /* name of the action */
+} ctl__a;
+
+typedef struct ctl__e   /* menu entry */
+{
+  struct ctl__e *next;  /* all entries in this menu */
+  ctl__a actions;     /* list of actions for this menu entry */
+  ctl__s *submenu;    /* submenu name */
+  ctl__s *dbox;       /* dbox name */
+} ctl__e;
+/* Many meny entries in fact just lead to a single action. The first action
+in the list is crunched into the entry structure, as a minor space saving.
+*/
+
+typedef struct ctl__m
+{
+  struct ctl__m *next;  /* list of all menus defined. */
+  ctl__s *name;         /* its name */
+  char *title;          /* its title text */
+  menu m;               /* the menu which represents it. */
+  ctl__e *entries;      /* the entries */
+} ctl__m;
+
+typedef struct ctl__i
+{
+  struct ctl__i *next;  /* list of icons in this dbox. */
+  int n;                /* icon number (in template). */
+  ctl__a actions;       /* list of actions for this icon. */
+} ctl__i;
+
+typedef struct ctl__d
+{
+  struct ctl__d *next;  /* list of all dboxes defined. */
+  ctl__s *name;         /* its name */
+  ctl__s *temname;      /* template name */
+  ctl__a onopen;        /* action(s) on entry */
+  ctl__a onclose;       /* action(s) on close */
+  ctl__i *icons;        /* list of icons */
+} ctl__d;
+
+typedef struct ctl__c   /* a whole ctl object */
+{
+  struct ctl__c *next;  /* list of all ctl objects. */
+  ctl__s *name;         /* its name */
+  ctl__m *menus;        /* list of all menus */
+  ctl__d *dboxes;       /* list of all dboxes */
+} ctl__c;
+
+static ctl__c *ctl__ctls = NULL; /* list of all ctl objects. */
+
+void ctl__new_ctl(ctl__s *name)
+/* The result, the "current" ctl while reading in, is
+at the start of the ctl list in ctl__ctls. */
+{
+  ctl__c *c = ctl__malloc(sizeof(ctl__c));
+  c->next = ctl__ctls;
+  c->name = name;
+  c->menus = NULL;
+  c->dboxes = NULL;
+  ctl__ctls = c;
+}
+
+/****************************** Menu access/construction **********************/
+
+void ctl__new_menu(ctl__s *name, char *title)
+/* The result is the head menu of the head ctl. */
+{
+  ctl__m *m = ctl__malloc(sizeof(ctl__m));
+
+#if TRACE
+  if (ctl__ctls == NULL) werr(TRUE, "ctl__new_menu: no ctl exists!");
+  tracef2("ctl__new_menu '%s' '%s'.\n", (int) name->string, (int) title);
+#endif
+
+  m->next = ctl__ctls->menus;
+  ctl__ctls->menus = m;
+  m->name = name;
+  m->title = title;
+  m->m = 0; /* can't make a zero-length menu - wait for the first entry. */
+  m->entries = NULL;
+}
+
+ctl__m *ctl__find_menu(ctl__c *ctl, ctl__s *name)
+/* find, within the stated ctl. Return NULL if not found. */
+{
+  ctl__m *m = ctl->menus;
+  while (m != NULL && m->name != name) m = m->next;
+  return m;
+}
+
+ctl__m *ctl__syn_must_find_menu(ctl__c *ctl, ctl__s *name)
+/* will not return NULL. Error returned is a syntax-like one,
+giving the position in the file. */
+{
+  ctl__m *m = ctl__find_menu(ctl, name);
+  if (m == NULL) {ctl__synerr(11); exit(-1);};
+  return m;
+}
+
+#if FALSE
+/* Not recognised, all references are caught and checked when reading in the
+file. */
+ctl__m *ctl__must_find_menu(ctl__c *ctl, ctl__s *name)
+/* will not return NULL. */
+{
+  ctl__m *m = ctl__find_menu(ctl, name);
+  if (m == NULL)
+    werr(
+      TRUE,
+      msgs_lookup("ctl_menuname:Menu '%s' in Control '%s' not defined"),
+      name->string,
+      ctl->name->string);
+  return m;
+}
+#endif
+
+ctl__e *ctl__new_entry(void)
+/* A new entry is appended to the list of entries in the head of
+ctl__ctls->menus. Its address is returned. */
+{
+  ctl__e **eptr;
+  ctl__e *e;
+
+#if TRACE
+  if (ctl__ctls == NULL) werr(TRUE, "ctl__new_entry: no ctl exists!");
+  if (ctl__ctls->menus == NULL) werr(TRUE, "ctl__new_entry: no menu exists!");
+  tracef0("ctl__new_entry.\n");
+#endif
+
+  eptr = &(ctl__ctls->menus->entries);
+  while ((*eptr) != NULL)
+  {
+    tracef1("ctl__new_entry: passing entry in menu '%s'.\n",
+      (int) ctl__ctls->menus->name->string);
+    eptr = &((*eptr)->next);
+  };
+
+  e = ctl__malloc(sizeof(ctl__e));
+  e->next = NULL;
+  e->submenu = NULL;
+  e->dbox = NULL;
+  e->actions.name = NULL;
+  e->actions.next = NULL;
+  (*eptr) = e;
+  return e;
+}
+
+/****************************** dbox access/construction **********************/
+
+void ctl__new_dbox(ctl__s *name, ctl__s *temname)
+/* The result is the head dbox of the head ctl. */
+{
+  ctl__d *d = ctl__malloc(sizeof(ctl__d));
+
+#if TRACE
+  if (ctl__ctls == NULL) werr(TRUE, "ctl__new_dbox: no ctl exists!");
+  tracef2("ctl__new_dbox '%s' '%s'.\n", (int) name->string, (int) temname->string);
+#endif
+
+  d->next = ctl__ctls->dboxes;
+  ctl__ctls->dboxes = d;
+  d->name = name;
+  d->temname = temname;
+  d->onopen.next = NULL;
+  d->onopen.name = NULL;
+  d->onclose.next = NULL;
+  d->onclose.name = NULL;
+  d->icons = NULL;
+}
+
+ctl__d *ctl__find_dbox(ctl__c *ctl, ctl__s *name)
+/* find, within the stated ctl. Return NULL if not found. */
+{
+  ctl__d *d = ctl->dboxes;
+  while (d != NULL && d->name != name) d = d->next;
+  return d;
+}
+
+ctl__d *ctl__syn_must_find_dbox(ctl__c *ctl, ctl__s *name)
+/* will not return NULL. Error returned is a syntax-like one,
+giving the position in the file. */
+{
+  ctl__d *d = ctl__find_dbox(ctl, name);
+  if (d == NULL) {ctl__synerr(11); exit(-1);};
+  return d;
+}
+
+ctl__d *ctl__must_find_dbox(ctl__c *ctl, ctl__s *name)
+/* will not return NULL. */
+{
+  ctl__d *d = ctl__find_dbox(ctl, name);
+  if (d == NULL)
+    werr(
+      TRUE,
+      msgs_lookup("ctl_menuname:Dialogue box '%s' in Control '%s' not defined"),
+      name->string,
+      ctl->name->string);
+  return d;
+}
+
+ctl__i *ctl__new_icon(void)
+/* A new icon is added to the list of icons in the head of
+ctl__ctls->dboxes. Its address is returned. */
+{
+  ctl__i *i;
+
+#if TRACE
+  if (ctl__ctls == NULL) werr(TRUE, "ctl__new_icon: no ctl exists!");
+  if (ctl__ctls->dboxes == NULL) werr(TRUE, "ctl__new_icon: no dbox exists!");
+  tracef0("ctl__new_icon.\n");
+#endif
+
+  i = ctl__malloc(sizeof(ctl__i));
+  i->next = ctl__ctls->dboxes->icons;
+  ctl__ctls->dboxes->icons = i;
+  i->n = 0; /* icon number - must be filled in */
+  i->actions.name = NULL;
+  i->actions.next = NULL;
+  return i;
+}
+
+/****************************** Syntax analysis **********************/
+
+void ctl__read_action_sequence(ctl__s *s, ctl__a *actions)
+/* s is the next symbol in the input stream. If it's non-null then fill in
+*actions with a list of the symbols up to the next newline. actions->name
+and actions->next will already be NULL. */
+{
+  if (s != NULL)
+  {
+    ctl__a **actptr;
+
+    /* Fill in the first entry straight away. */
+    actions->name = s;
+    /* actions->next is already NULL. */
+
+    actptr = &(actions->next);
+    while (TRUE)
+    {
+      s = ctl__read_symbol();
+      if (s == NULL) break;
+      tracef1("ctl_init: adding '%s' to event action chain.\n", (int) s->string);
+      (*actptr) = ctl__malloc(sizeof(ctl__a));
+      (*actptr)->name = s;
+      (*actptr)->next = NULL;
+      actptr = &((*actptr)->next);
+    };
+  };
+}
+
+/* ------------------------------ ctl_init -------------------------------
+ * Description:   Makes named control decode objects from a resource file.
+ * Parameters:    void.
+ * Other Info:    The module keeps an internal table of all made ctls.
+ *                You can't destroy a ctl, their use in a program is
+ *                  expected to be static.
+ *                Any errors in reading in the object, or resource file
+ *                  not found, are fatal.
+ *                The resource file is called Control. The syntax is
+ *                  documented elsewhere.
+ *                res_init(), flex_init() and wimpt_init() must
+ *                  be called before calling this.
+ */
+
+typedef enum
+{
+  ctl__MODE_NONE,   /* not reading in anything */
+  ctl__MODE_CTL,    /* reading in a control object */
+  ctl__MODE_MENU,   /* reading in a menu */
+  ctl__MODE_DBOX    /* reading in a dbox */
+} ctl__init_mode;
+
+void ctl_init(void)
+{
+  ctl__s *s = NULL; /* current symbol */
+  ctl__init_mode mode = ctl__MODE_NONE;
+  int entryno = 0;
+    /* if mode==ctl__MODE_MENU then this is the number of
+    entries in the menu so far. */
+
+  ctl__init();
+
+  /* openin resource file */
+  ctl__in = res_openfile("Control", "r");
+  if (ctl__in == 0)
+  {
+    werr(TRUE,
+      msgs_lookup("ctl_init:Cannot open resource file 'Control'"));
+  };
+
+  while (1) /* for each line */
+  {
+    while (s == NULL && !feof(ctl__in)) s = ctl__read_symbol();
+    if (s == NULL) break; /* end of file */
+
+    if (s == ctl__CTL)
+    {
+      tracef0("ctl_init, keyword=ctl.\n");
+      if (mode == ctl__MODE_MENU) ctl__synerr(12);
+      mode = ctl__MODE_CTL;
+      ctl__new_ctl(ctl__read_nonnull_symbol());
+      s = ctl__read_null_symbol();
+    }
+    else if (s == ctl__MENU)
+    {
+      tracef0("ctl_init, keyword=menu.\n");
+      if (mode != ctl__MODE_CTL) ctl__synerr(8);
+      {
+        ctl__s *title = ctl__read_nonnull_symbol();
+        ctl__s *name = ctl__read_nonnull_symbol();
+
+        if (strlen(title->string) > 12) ctl__synerr(10);
+        s = ctl__read_null_symbol();
+        ctl__new_menu(name, title->string);
+        entryno = 0;
+        mode = ctl__MODE_MENU;
+      };
+    }
+    else if (s == ctl__ENDMENU)
+    {
+      tracef0("ctl_init, keyword=endmenu.\n");
+      if (mode != ctl__MODE_MENU) ctl__synerr(7);
+      if (entryno == 0) ctl__synerr(9);
+      s = ctl__read_null_symbol();
+      mode = ctl__MODE_CTL;
+    }
+    else if (s == ctl__ENTRY)
+    {
+      tracef0("ctl_init, keyword=entry.\n");
+      if (mode != ctl__MODE_MENU) ctl__synerr(7);
+      {
+        ctl__s *text = ctl__read_nonnull_symbol();
+        ctl__e *entry = ctl__new_entry();
+
+        s = ctl__read_nonnull_symbol(); /* first word of content of entry. */
+
+        /* ... Should check the text for various things, e.g. ',' */
+
+        /* If this is a dbox entry then we have to munge the string before passing
+        it to menu_... */
+        {
+          char a[50];
+          sprintf(a, (s == ctl__DBOX ? ">%s" : "%s"), text->string);
+          /* Add the menu entry to the 'menu' structures. */
+          if (entryno == 0)
+          {
+            /* because we can't make a menu with 0 entries in it,
+            the first entry must cause the menu to be actually made. */
+            ctl__ctls->menus->m = menu_new(ctl__ctls->menus->title, &a[0]);
+          }
+          else
+          {
+            menu_extend(ctl__ctls->menus->m, &a[0]);
+          }; /* if */
+        };
+        entryno++;
+
+        /* submenu or dbox. */
+        if (s == ctl__SUBMENU || s == ctl__DBOX)
+        {
+          if (s == ctl__SUBMENU)
+          {
+            s = ctl__read_nonnull_symbol(); /* arg is the dbox/submenu name */
+            entry->submenu = s;
+            menu_submenu(ctl__ctls->menus->m, entryno,
+                         (ctl__syn_must_find_menu(ctl__ctls, s))->m);
+          }
+          else /* dbox */
+          {
+            s = ctl__read_nonnull_symbol(); /* arg is the dbox/submenu name */
+            ctl__syn_must_find_dbox(ctl__ctls, s); /* check it's there. */
+            entry->dbox = s;
+          };
+          s = ctl__read_symbol();
+          if (s == ctl__ACTION)
+            s = ctl__read_symbol(); /* start of action sequence */
+          else
+            /* Otherwise, must be end of the line. */
+            if (s != NULL) ctl__synerr(13);
+        } /* if */
+
+        /* action sequence (if s != NULL) */
+        ctl__read_action_sequence(s, &(entry->actions));
+        s = NULL;
+      };
+    }
+    else if (s == ctl__DBOX)
+    {
+      tracef0("ctl_init, keyword=dbox.\n");
+      if (mode != ctl__MODE_CTL) ctl__synerr(8);
+      {
+        ctl__s *name = ctl__read_nonnull_symbol();
+        ctl__s *temname = ctl__read_nonnull_symbol();
+
+        s = ctl__read_null_symbol();
+        ctl__new_dbox(name, temname);
+        mode = ctl__MODE_DBOX;
+      };
+    }
+    else if (s == ctl__ENDDBOX)
+    {
+      tracef0("ctl_init, keyword=enddbox.\n");
+      if (mode != ctl__MODE_DBOX) ctl__synerr(16);
+      s = ctl__read_null_symbol();
+      mode = ctl__MODE_CTL;
+    }
+    else if (s == ctl__ONOPEN)
+    {
+      tracef0("ctl_init, keyword=onopen.\n");
+      if (mode != ctl__MODE_DBOX) ctl__synerr(16);
+      s = ctl__read_nonnull_symbol();
+      ctl__read_action_sequence(s, &(ctl__ctls->dboxes->onopen));
+      s = NULL;
+    }
+    else if (s == ctl__ONCLOSE)
+    {
+      tracef0("ctl_init, keyword=onclose.\n");
+      if (mode != ctl__MODE_DBOX) ctl__synerr(16);
+      s = ctl__read_nonnull_symbol();
+      ctl__read_action_sequence(s, &(ctl__ctls->dboxes->onclose));
+      s = NULL;
+    }
+    else if (s == ctl__ICON)
+    {
+      ctl__i *i;
+      tracef0("ctl_init, keyword=icon.\n");
+      if (mode != ctl__MODE_DBOX) ctl__synerr(16);
+      i = ctl__new_icon();
+      s = ctl__read_nonnull_symbol();
+      if (! sscanf(s->string, "%i", &(i->n))) ctl__synerr(17);
+      s = ctl__read_nonnull_symbol();
+      ctl__read_action_sequence(s, &(ctl__ctls->dboxes->onclose));
+      s = NULL;
+    }
+    else /* first symbol on line not recognised. */
+    {
+      ctl__synerr(5);
+    };
+  }; /* while */
+
+  if (mode == ctl__MODE_MENU) ctl__synerr(12);
+  if (mode == ctl__MODE_NONE) ctl__synerr(14);
+
+  /* close resource file */
+  fclose(ctl__in);
+  ctl__in = 0;
+}
+
+/* ------------------------------ ctl_action_code -------------------------------
+ * Description:   Associates a code number with a named action.
+ * Parameters:    action -- name of an action within that ctl
+ *                code -- the code (> 0) to be associated with this action
+ * Returns:       void
+ * Other Info:    Note that this association is true for all
+ *                ctl objects. A fatal error can occur if there is
+ *                not enough space to set up the association.
+ *                All codes should be greater than zero.
+ */
+
+void ctl_action_code(char *action, int code)
+{
+  (ctl__lookup_symbol(action, FALSE))->code = code;
+}
+
+/****************************** Finding ctls **********************/
+
+ctl__c *ctl__find_ctl(ctl__s *name)
+/* Find the named ctl. Return NULL if not found. */
+{
+  ctl__c *c = ctl__ctls;
+  while (c != NULL && c->name != name) c = c->next;
+  return c;
+}
+
+ctl__c *ctl__must_find_ctl(ctl__s *name)
+/* will not return NULL. */
+{
+  ctl__c *c = ctl__find_ctl(name);
+  if (c == NULL) ctl__err(1);
+  return c;
+}
+
+/****************************** Registering a menu **********************/
+
+/* ------------------------------ ctl_menu -------------------------------
+ * Description:   Return the menu associated with a ctl.
+ * Parameters:    name - name of a ctl
+ * Returns:       menu - the menu constructed by this ctl
+ * Other Info:    This should typically be called during a menu creation proc
+ *                registered with the event module, in order to return
+ *                the result that the call requires.
+ *
+ */
+
+menu ctl_menu(char *name)
+{
+  ctl__c *c = ctl__must_find_ctl(ctl__lookup_symbol(name, TRUE));
+
+  if (c->menus == NULL) ctl__err(2);
+
+  /* menu->m cannot be null, because parsing of endmenu checks there have been
+  entries in the menu. */
+#if TRACE
+  if (c->menus->m == NULL) werr(TRUE, "ctl_menu: fatal internal consistency error.");
+#endif
+
+  return c->menus->m;
+}
+
+/* ------------------------------ ctl_menuentry_enable -------------------------------
+ * Description:   Grey or ungrey menu entries corresponding to an action name.
+ * Parameters:    name -- name of a ctl
+ *                action -- an action name in that ctl
+ *                BOOL -- enable (ungrey) or disable (grey) any menu entries
+ *                  that correspond to this action
+ * Returns:       void
+ * Other Info:    No error if the action is not found.
+ *                This should typically be called during a menu creation proc
+ *                registered with the event module.
+ *
+ */
+
+void ctl_menuentry_enable(char *name, char *action, BOOL enable)
+{
+}
+
+/* ------------------------------ ctl_menuentry_tick -------------------------------
+ * Description:   Tick or untick menu entries corresponding to an action name.
+ * Parameters:    name -- name of a ctl
+ *                action -- an action name in that ctl
+ *                BOOL -- tick (if true) or untick (if false) any menu entries
+ *                  that correspond to this action
+ * Returns:       void
+ * Other Info:    No error if the action is not found.
+ *                This should typically be called during a menu creation proc
+ *                registered with the event module.
+ *
+ */
+void ctl_menuentry_tick(char *name, char *action, BOOL tick)
+{
+}
+
+/* ------------------------------ ctl_submenu -------------------------------
+ * Description:   Register a submenu of the ctl menu tree.
+ * Parameters:    name -- name of a ctl
+ *                action -- an action name in that ctl
+ *                menu -- a menu structure
+ * Returns:       void
+ * Other Info:    Call this only once, the first time the menu structure
+ *                is created. It is typically used when attaching portions
+ *                of menu (for instance, a wimp colour selection submenu)
+ *                that are created in other ways.
+ *                The menu is attached wherever the named action appears.
+ *                A fatal error will occur if the name appears in a
+ *                dialogue box action, or in any action sequence.
+ */
+
+void ctl_submenu(char *name, char *action, menu m)
+{
+}
+
+/* ------------------------------ ctl_menuitem -------------------------------
+ * Description:   Returns a pointer to a menu item implementing an action.
+ * Parameters:    name -- name of a ctl
+ *                action -- an action name in that ctl
+ *                count -- counter in case there are several items
+ *                m -- also return pointer to menu structure in which
+ *                  the result applies. May be NULL if this result
+ *                  not required.
+ * Returns:       a pointer to a menu item
+ * Other Info:    This allows special effects to be performed on menu
+ *                entries, such as inserting a specific sprite or colour.
+ *                The count variable should be 0 initially, and any setup
+ *                should be repeated until count is 0.
+ *                Example:
+ *                  int count = 0;
+ *                  while () {
+ *                    wimp_menuitem *item = ctl_menuitem
+ *                      "ctl", "zap", &count, NULL);
+ *                    if (count == 0) break;
+ *                    item->data.iconflags &= ! 0x0F000000;
+ *                    item->data.iconflags !=   0x0B000000;
+ *                  }; /+ make those entries red text. +/
+ */
+
+wimp_menuitem *ctl_menuitem(char *name, char *action, int *count,
+                            wimp_menustr **m)
+{
+  werr(TRUE, "ctl_menuitem: not implemented");
+}
+    /* for special effects: count is for multiples */
+
+/* ------------------------------ ctl_make_writable -------------------------------
+ * Description:   Make a menu entry writable.
+ * Parameters:    name -- name of a ctl
+ *                action -- an action name in that ctl
+ *                char *buffer -- pointer to buffer to hold text of entry
+ *                int bufferlength -- size of buffer
+ *                char *validstring -- pointer to validation string
+ * Returns:       void.
+ * Other Info:    This makes a menu entry corresponding to the
+ *                given action name writable. There should only be one
+ *                occurrence of this action name in the ctl description.
+ *
+ */
+
+void ctl_make_writable(char *name, char *action, char *buffer,
+                       int bufferlength, char *validstring)
+{
+}
+
+/* ------------------------------ ctl_make_sprite -------------------------------
+ * Description:   Make a menu entry writable.
+ * Parameters:    name -- name of a ctl
+ *                action -- an action name in that ctl
+ *                char *spritename -- name of the sprite
+ *                int &count -- counter in case there are several items
+ * Returns:       void
+ * Other Info:    Makes a menu entry corresponding to the given action
+ *                name a sprite, in the sprite pool in resspr_area().
+ *                The count variable should be 0 initially, and any setup
+ *                should be repeated until count is 0 (see the example
+ *                in ctl_menuitem above).
+ *
+ */
+
+void ctl_writablemenuentry(char *name, char *action, char *buffer,
+                           int bufferlength, char *validstring)
+{
+}
+
+/************************** Event decoding ************************** */
+
+/* ------------------------------ ctl_decode -------------------------------
+ * Description:   Decode a wimp event according to a control object.
+ * Parameters:    name -- name of a ctl
+ *                wimp_eventstr* - a wimp event structure to decode
+ *                state - a state object to control the iteration
+ * Returns:       TRUE for each action to perform
+ * Other Info:
+ *     Typical example code for decoding wimp_eventstr *e:
+ *
+ *       ctl_decode_state state;
+ *       state.code = 1;
+ *       while (ctl_decode("ctl", e, &state))
+ *       {
+ *         switch (state.action)
+ *         {
+ *           1:
+ *             ... logical action for action 1 ...
+ *             break;
+ *           2:
+ *             ... logical action for action 1 ...
+ *           ... other actions ...
+ *           default:
+ *             /+ error message already produced by ctl_decode +/
+ *         };
+ *       };
+ *       if (state.code != 2) /+ i.e. if not already processed +/
+ *       {
+ *         ... your own handling of event e ...
+ *       };
+ *     If errors occur then you can exit from this sequence at any time.
+ *
+ * During the code for an action in the sequence above, the following
+ * useful values are available in the ctl_decode_state object:
+ *   state.action -- the code number, as set up using ctl_action_code,
+ *     for the action that should be executed.
+ *   state.menui -- if the action is associated with a submenu
+ *     attached using ctl_submenu, then this value is the index
+ *     into e->data.menu which contains the first level of your
+ *     submenu.
+ *   state.dbox -- if there is currently a dbox open on the menu
+ *     structure then this value is the dbox handle for it.
+ *
+ */
+
+/* Decode state index values: */
+typedef enum
+{
+  ctl__UNKNOWNEVENT,        /* 0 - cannot process this event - not recognised */
+  ctl__STARTUP,             /* 1 - startup */
+  ctl__PROCESSING,          /* 2 - in the middle of an action sequence */
+  ctl__DONE,                /* 3 - done, processed event */
+  ctl__PROCESSING_ONOPEN,   /* 4 - in the middle of a dbox onopen sequence */
+  ctl__PROCESSING_ONCLOSE   /* 5 - in the middle of a dbox onclose sequence */
+} ctl__indexvalue;
+
+BOOL ctl_decode(char *name, wimp_eventstr *ee, ctl_decode_state *state)
+{
+  ctl__c *c = ctl__must_find_ctl(ctl__lookup_symbol(name, TRUE));
+  wimp_eventstr eee = *ee;
+  wimp_eventstr *e = &eee;
+
+  state->code = 0;    /* default returned result. */
+  state->menui = 0;   /* default returned result. */
+
+  if (state->index < 0 || state->index > ctl__PROCESSING_ONCLOSE) ctl__err(6);
+
+  if (state->index == ctl__STARTUP)
+  {
+    /* This is a new eventstr to be decoded. */
+
+    if (e->e == wimp_ESEND && e->data.msg.hdr.action == wimp_MMENUWARN)
+    /* If the event is a MENUWARN message (e.g. touch arrow leading
+    to dbox on a menu structure) then convert it first to a menu hit.
+    c.event does exactly the same thing. */
+    {
+      int i;
+
+      e->e = wimp_EMENU;
+      i = 0;
+      while ((e->data.menu[i] = e->data.msg.data.words[i+3]) != -1) i++;
+      e->data.menu[i++] = 0;
+      e->data.menu[i++] = -1;
+    };
+
+    /* Default returned values */
+    state->dbox = 0;
+    state->alist = NULL;
+    state->d = NULL;
+
+    switch (e->e)
+    {
+    default:
+      /* We do not recognise this event: return saying that we cannot
+      process it. */
+      tracef1("ctl_decode: event type %i not known.\n", e->e);
+      state->index = ctl__UNKNOWNEVENT; /* cannot process this. */
+      return FALSE;
+
+    case wimp_EMENU:
+      if (c->menus == NULL)
+      { /* No menus defined in this ctl. */
+        tracef0("ctl_decode: no menus here.\n");
+        state->index = ctl__UNKNOWNEVENT; /* cannot process this. */
+        return FALSE;
+      }
+      else
+      {
+        /* We must decode the menu hit through the tree. */
+        ctl__m *m = c->menus; /* Start at main menu of this ctl. */
+        int i = 0;
+
+        tracef0("ctl_decode: decoding menu hit.\n");
+        while (1) /* at level i of the menu tree. */
+        {
+          /* e->data.menu[i] != -1, because we look one ahead. */
+          ctl__e *ent = m->entries;
+          int j = e->data.menu[i];
+
+#if TRACE
+          if (e->data.menu[i] < 0) werr(TRUE, "ctl_decode: err 1.\n");
+          tracef2("ctl_decode: menu level %i, hit is %i.\n", i, j);
+#endif
+          while (j-- > 0)
+          {
+#if TRACE
+            if (ent == NULL) werr(TRUE, "ctl_decode: err 2.\n");
+            if (ent->next == NULL) werr(TRUE, "ctl_decode: err 3.\n");
+            tracef0("ctl_decode: counting entries.\n");
+#endif
+            ent = ent->next; /* Count down the entry chain. */
+          };
+
+          if (e->data.menu[i+1] == -1) {
+            /* It's a hit on ent. */
+            /* Want to execute the content of ent->actions. */
+            tracef0("ctl_decode: hit.\n");
+
+            state->alist = &(ent->actions);
+            state->index = ctl__PROCESSING;
+            break;
+
+          } else {
+            /* ent must have a submenu or dbox: check this. */
+            if (ent->submenu != NULL)
+            {
+              m = ctl__find_menu(c, ent->submenu);
+              tracef0("ctl: must be a submenu.\n");
+              if (m == 0) ctl__err(7);
+              i++; /* go one level down in the menu */
+              tracef1("ctl_decode: go deeper, to submenu '%s'.\n", (int) m->name);
+              /* and loop */
+            }
+            else if (ent->dbox != NULL)
+            {
+              state->d = ctl__must_find_dbox(c, ent->dbox);
+              state->dbox = dbox_new(state->d->temname->string);
+              tracef1("ctl: dbox, %i.\n", (int) state->dbox);
+              if (state->dbox != 0)
+              {
+                tracef0("ctl: dbox opened, processing onopen events.\n");
+                state->alist = &(state->d->onopen);
+                state->index = ctl__PROCESSING_ONOPEN;
+              }
+              break;
+            }
+            else
+              ctl__err(4);
+          }; /* if */
+        }; /* while */
+      }; /* if */
+
+    }; /* switch */
+  }; /* if */
+
+
+  /* If we get to this point then state->alist should be examined,
+  to see what actions should be communicated back to the user. */
+
+  while (state->alist != NULL && state->alist->name != NULL)
+  /* The latter test is for null lists, which may in fact be a pointer to
+  an action with no name (because of ctl__e containing a ctl__a). */
+  {
+    if (state->alist->name == ctl__ERROR)
+    {
+      tracef0("ctl_decode: error action signalled.\n");
+      state->alist = state->alist->next;
+      if (state->alist == NULL) ctl__err(5);
+      werr(FALSE, state->alist->name->string);
+      state->alist = state->alist->next;
+      /* and loop */
+    }
+    else if (state->alist->name == ctl__OPENDBOX)
+    {
+      tracef0("ctl_decode: opendbox action signalled.\n");
+      state->alist = state->alist->next;
+      if (state->alist == NULL) ctl__err(8);
+      state->d = ctl__must_find_dbox(c, state->alist->name);
+      state->alist = state->alist->next;
+      if (state->alist != NULL) ctl__err(9);
+      state->dbox = dbox_new(state->d->temname->string);
+      if (state->dbox != 0)
+      {
+        state->alist = &(state->d->onopen);
+        state->index = ctl__PROCESSING_ONOPEN;
+      };
+      /* And loop, executing the onopen actions (if any). */
+    }
+    else if (state->alist->name == ctl__CLOSEDBOX)
+    {
+      tracef0("ctl_decode: closedbox action signalled.\n");
+      if (state->d == NULL) ctl__err(10);
+      state->alist = state->alist->next;
+      if (state->alist != NULL) ctl__err(11);
+      if (! dbox_persist())
+      {
+        state->alist = &(state->d->onclose);
+        state->index = ctl__PROCESSING_ONCLOSE;
+        /* And loop, executing the onclose actions (if any). */
+      };
+    }
+    else
+    {
+      tracef1("ctl_decode: returning action '%s'.\n", (int) state->alist->name->string);
+      state->code = state->alist->name->code;
+      if (state->code == 0)
+      {
+        werr(FALSE, msgs_lookup("ctl_decode:Action '%s' in '%s' not recognised"),
+          state->alist->name->string,
+          name);
+        state->index = ctl__DONE; /* Action completed. */
+        return FALSE;
+      };
+      state->alist = state->alist->next;
+      /* Return saying that there is an action to perform, and signal that
+      when we get back here, it's the continuation of an existing action. */
+      /* state->index already set up. */
+      return TRUE;
+    }; /* if */
+  }; /* while */
+
+  /* If we get to here, the action list is exhausted. */
+
+  if (state->index == ctl__PROCESSING_ONOPEN)
+  {
+    /* We have just finished an action sequence for opening the dbox.
+    So now, show the dbox and get it filled in, and keep going. */
+    tracef0("ctl: Opening a dbox.\n");
+    dbox_show(state->dbox);
+    state->index = ctl__PROCESSING;
+  }
+  else if (state->index == ctl__PROCESSING_ONCLOSE)
+  {
+    /* We have just finished the action sequence concerned with closing the
+    dbox. */
+    tracef0("ctl: closing a dbox.\n");
+    dbox_dispose(&state->dbox);
+    state->dbox = 0;
+    state->d = NULL;
+  };
+
+  /* Check for being in a dbox. */
+  if (state->index == ctl__PROCESSING && state->d != 0)
+  {
+    /* We have just finished processing the actions from a dbox icon,
+    or have just opened the dbox. */
+    tracef0("ctl: filling in a dbox.\n");
+    while (1)
+    {
+      dbox_field f;
+      ctl__i *i;
+
+      f = dbox_fillin(state->dbox);
+      if (f == dbox_CLOSE)
+      {
+        state->alist = &(state->d->onclose);
+        state->index = ctl__PROCESSING_ONCLOSE;
+        return TRUE;
+        /* code is not set up, but nothing will happen: ctl_decode
+        will get called again, the closedown actions (if any)
+        will occur, and then we'll close/delete the dbox. */
+      }
+      else
+      {
+        /* Have we actions registered for field f? */
+        i = state->d->icons;
+        while (i != NULL && i->n != f) i = i->next;
+        if (i != NULL) /* We have a meaning for this icon/field */
+        {
+          state->alist = &(i->actions);
+          state->index = ctl__PROCESSING;
+          return TRUE;
+          /* state->code is not set up, but we'll soon get back here
+          again and start processing the actions. */
+        };
+        /* Otherwise, this field has no meaning: ignore it and fill
+        in again. */
+      }; /* if */
+    }; /* while */
+  }; /* if */
+
+  /* Nothing left to be done. */
+  tracef0("ctl_decode: exit, nothing left to do.\n");
+  state->index = ctl__DONE; /* Action complete */
+  return FALSE;
+
+} /* end ctl_decode */
+
+/* ------------------------------ ctl_arg -------------------------------
+ * Description:   Provide an argument to an action returned by ctl_decode
+ * Parameters:    void.
+ * Returns:       the next symbol in the current action sequence
+ * Other Info:    This call allows the body of a textually named action
+ *                to request an argument from the Control description.
+ *                NULL will be returned if there is no argument.
+ *                ctl_arg can be called several times for an action,
+ *                before calling ctl_decode again, during an action sequence.
+ *
+ */
+
+char *ctl_arg(ctl_decode_state *state)
+{
+  if (state->alist == NULL)
+  {
+    tracef0("ctl_arg returning NULL.\n");
+    return NULL;
+  }
+  else
+  {
+    char *result = state->alist->name->string;
+    state->alist = state->alist->next;
+    tracef1("ctl_arg returning '%s'.\n", (int) result);
+    return result;
+  }
+}
+
+/* end ctl.c */

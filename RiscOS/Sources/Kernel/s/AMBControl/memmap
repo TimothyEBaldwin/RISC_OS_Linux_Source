@@ -1,0 +1,768 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > s.memmap
+
+; low level memory mapping
+;
+; ----------------------------------------------------------------------------------
+;
+;convert page number in $pnum to L2PT entry (physical address+protection bits),
+;using PhysBin table for speed
+;
+;entry: $ptable -> PhysBin table, $pbits = protection bits
+;exit:  $temp corrupted
+;
+        MACRO
+        PageNumToL2PT $pnum,$ptable,$pbits,$temp
+        BIC     $temp,$pnum,#(3:SHL:(AMBPhysBinShift-2))       ;word alignment for PhysBin lookup
+        LDR     $temp,[$ptable,$temp,LSR #(AMBPhysBinShift-2)] ;start physical address of bin
+        AND     $pnum,$pnum,#AMBPhysBinMask                    ;no. pages into bin
+        ADD     $pnum,$temp,$pnum,LSL #Log2PageSize            ;physical address of page
+        ORR     $pnum,$pnum,$pbits                             ;munge in protection bits
+        MEND
+
+
+  [ AMB_LazyMapIn
+
+; ----------------------------------------------------------------------------------
+;
+;AMB_LazyFixUp
+;
+; *Only* for ARMs where the abort handler can restart instructions
+;
+; Routine to be used in abort handlers (in abort32 mode), that checks to see if abort
+; is expected, and fixes things up if so, ready to restart instruction.
+;
+; Fix up consists of mapping in affected page, and updating AMBMappedInRegister. This
+; may seem like a lot of work, but remember that the L2PT and CAM updates for each page are
+; needed anyway in non-lazy scheme, so there is really only a housekeeping overhead.
+;
+; There is no cache clean/flush consideration here, since the map is a map in from Nowhere.
+; TLB flush consideration is left to main abort handler code - in fact there may not
+; be a TLB flush consideration at all, if ARM TLB can be assumed not to cache an
+; entry which is a translation fault, as seems rational.
+;
+; entry: r0 = aborting address (data address for data abort, instruction address
+;        for prefetch abort), r1-r7 trashable, no stack
+;        r2 = 1 for prefetch abort, 0 for data abort
+;        FSR valid for data aborts, unpredictable for prefetch aborts
+; exit:  r0 = non-zero (NE status) if abort was expected and fixed up, zero (EQ status) if not
+;        FAR,FSR,SPSR_abt,lr_abt preserved
+;
+AMB_LazyFixUp ROUT
+        MOV     r7,r12
+        MOV     r12,#AMBControl_ws
+        LDR     r12,[r12]
+        CMP     r12,#0
+        BEQ     %FT90                                    ;not initialised!
+        LDR     r1,AMBFlags
+        TST     r1,#AMBFlag_LazyMapIn_disable :OR: AMBFlag_LazyMapIn_suspend
+        BNE     %FT90                                    ;not active
+        LDR     r1,AMBMappedInNode
+        CMP     r1,#0
+        BEQ     %FT90                                    ;no current node
+        ARM_read_FSR r6                                  ;hang onto FSR in case we have to preserve it
+        TEQ     r2,#1                                    ;if data abort
+        ANDNE   r3,r6,#&F
+        TEQNE   r3,#7                                    ; and not a page translation fault
+        BNE     %FT20                                    ; then not a lazy abort (and FAR may be invalid anyway)
+        LDR     r2,[r1,#AMBNode_Npages]
+        SUBS    r0,r0,#ApplicationStart
+        BLO     %FT20                                    ;abort not in current app space
+        MOV     r0,r0,LSR #Log2PageSize                  ;address now in terms of pages from ApplicationStart
+        CMP     r0,r2
+        BHS     %FT20                                    ;abort not in current app space
+;
+; check/update the MappedIn bitmap
+;
+        ADR     r2,AMBMappedInRegister
+        MOV     r5,#1
+        ADD     r2,r2,r0,LSR #5-2
+        BIC     r2,r2,#3                                 ;r2 -> bitmap word affected
+        AND     r3,r0,#31
+        MOV     r5,r5,LSL r3                             ;mask for bit affected in bitmap word
+        LDR     r3,[r2]
+        LDR     r4,AMBMappedInNpages                     ;count it
+        TST     r3,r5                                    ;if page already mapped in, not a lazy abort
+        BNE     %FT20
+        ORR     r3,r3,r5                                 ;ok, mark that we are going to map this page in
+        STR     r3,[r2]
+        ADD     r4,r4,#1
+        STR     r4,AMBMappedInNpages
+;
+; now map in the the page that went pop
+;
+        ADD     r1,r1,#AMBNode_pages
+        ADD     r1,r1,r0,LSL #2                          ;r1 -> page involved, in node page list
+        LDR     r2,AMBPhysBin
+        MOV     r3,#&FF0
+        ORR     r3,r3,#&E                                ;&FFE = L2PT protection bits for ordinary page
+        LDR     r4,[r1]
+        MOV     r6,r4
+        PageNumToL2PT r4,r2,r3,r5
+;
+;here, r6 = page number of page involved, r4 = new L2PT entry value to map in page
+;
+        ADD     r0,r0,#ApplicationStart:SHR:Log2PageSize ;address now in terms of pages from 0
+        MOV     r5,#L2PT
+        STR     r4,[r5,r0,LSL #2]                        ;update L2PT
+;
+        MOV     r5,#0
+        LDR     r5,[r5,#CamEntriesPointer]
+        ADD     r5,r5,r6,LSL #3                          ;r5 -> CAM entry affected
+        MOVS    r0,r0,LSL #Log2PageSize                  ;address is now ordinary again, and must be non-zero
+        MOV     r1,#0                                    ;0 = AP for ordinary page
+        STMIA   r5,{r0,r1}                               ;update CAM entry
+        MOV     r12,r7
+        MOV     pc,lr                                    ;r0 is non-zero, NE status
+;
+; not our abort, but is possible that client abort handler is in app space, so force all
+; app space pages in now (so that client abort handler does not cause lazy abort, scribbling over original abort details)
+;
+        ASSERT  No26bitCode                              ;assumes we have an abort stack! (recursive lazy fixup aborts may occur)
+20
+        MOV     r1,#ApplicationStart                     ;good old page walk to provoke lazy fixups
+        LDR     r2,AMBMappedInNode
+        LDR     r2,[r2,#AMBNode_Npages]
+        CMP     r2,#0
+        BEQ     %FT90
+        MRS     r0,SPSR                                  ;preserve SPSR_abort for original abort details
+        MOV     r4,lr                                    ;preserve lr_abort so we can return properly (!)
+        ARM_read_FAR r5                                  ;preserve FAR in case client abort handler wants to read it
+                                                         ;preserve FSR (already in r6) similarly
+30
+        LDR     r3,[r1]                                  ;bring that page in by the magic of aborts
+        SUBS    r2,r2,#1
+        ADD     r1,r1,#PageSize
+        BNE     %BT30
+        MSR     SPSR_cxsf,r0                             ;SPSR for original abort
+        MOV     lr,r4                                    ;restore return address
+        ARM_write_FAR r5                                 ;restore FAR
+        ARM_write_FSR r6                                 ;restore FSR
+;
+90
+        MOVS    r0,#0
+        MOV     r12,r7
+        MOV     pc,lr                                    ;r0 is zero, EQ status
+
+  ] ;AMB_LazyMapIn
+
+; ----------------------------------------------------------------------------------
+
+  [ AMB_LazyMapIn
+
+;
+; If page of given logical address (r0) is in current app space, make sure page is
+; 'honest' ie. properly mapped in. This is for things like FindMemMapEntries
+; that must return sensible info (and presumably their client needs a consistent
+; view of app space mapping, so that laziness is transparent)
+;
+AMB_MakeHonestLA  ROUT
+        CMP     r0,#AbsMaxAppSize                        ;quick dismiss if definitely not app address
+        MOVHS   pc,lr
+        Push    "r1,r12,lr"
+        MOV     r12,#AMBControl_ws
+        LDR     r12,[r12]
+        CMP     r12,#0
+        BEQ     %FT90                                    ;we're dormant!
+        SUBS    r14,r0,#ApplicationStart
+        BMI     %FT90                                    ;below app space
+        MOV     r14,r14,LSR #Log2PageSize                ;pages from ApplicationStart
+        LDR     r1,AMBMappedInNode
+        CMP     r1,#0
+        BEQ     %FT90                                    ;no node mapped in
+        LDR     r1,[r1,#AMBNode_Npages]
+        CMP     r1,r14                                   ;HI if log addr is in current app space
+        LDRHI   r1, [r0,#0]                              ;make honest if necessary (magic of abort fixups!)
+90
+        Pull    "r1,r12,pc"
+
+
+; similar to AMB_MakeHonestLA, but for page of given page number (r0)
+;
+AMB_MakeHonestPN  ROUT
+        Push    "r1-r3,r12,lr"
+        MOV     r12,#AMBControl_ws
+        LDR     r12,[r12]
+        CMP     r12,#0
+        BEQ     %FT90                                    ;we're dormant!
+        MOV     r14,#0
+        LDR     r1,[r14,#MaxCamEntry]
+        CMP     r0,r1
+        BHI     %FT90                                    ;invalid page number
+        LDR     r1,[r14,#CamEntriesPointer]
+        LDR     r1,[r1,r0,LSL #3]                        ;logical address from CAM
+        LDR     r14,=Nowhere
+        TEQ     r1,r14
+        BNE     %FT90                                    ;only a page at Nowhere might be dishonest
+        LDR     r1,AMBMappedInNode                       ;let's check the current node
+        CMP     r1,#0
+        BEQ     %FT90                                    ;no node mapped in
+        LDR     r14,[r1,#AMBNode_Npages]
+        MOV     r14,r14,LSL #Log2PageSize
+        ADD     r14,r14,#ApplicationStart                ;top of current app space
+        ADD     r1,r1,#AMBNode_pages                     ;[r1] is page number
+        MOV     r2,#ApplicationStart                     ;r2 is logical address for page
+10
+        CMP     r2,r14
+        BHS     %FT90
+        LDR     r3,[r1],#4                               ;next page number in node
+        TEQ     r3,r0                                    ;see if its the one that wants to be honest
+        ADDNE   r2,r2,#PageSize                          ;next logical address
+        BNE     %BT10
+        LDR     r1,[r2,#0]                               ;make honest if necessary (magic of abort fixups!)
+90
+        Pull    "r1-r3,r12,pc"
+
+  ] ;AMB_LazyMapIn
+
+; ----------------------------------------------------------------------------------
+;
+;AMB_movepagesin_L2PT
+;
+;updates L2PT for new logical page positions, does not update CAM
+;
+; entry:
+;       r3  =  new logical address of 1st page
+;       r8  =  number of pages
+;       r10 -> page list
+;       r11 =  protection/control bits for L2PT
+;
+AMB_movepagesin_L2PT ROUT
+        Push    "r0-r10,r12,lr"
+
+        LDR     lr,AMBPhysBin                  ;lr -> PhysBin
+        LDR     r9,=L2PT
+        ADD     r9,r9,r3,LSR #(Log2PageSize-2) ;r9 -> L2PT for 1st new logical page
+
+        CMP     r8,#8
+        BLT     %FT20
+10
+        LDMIA   r10!,{r0-r7}         ;next 8 page numbers
+        PageNumToL2PT r0,lr,r11,r12
+        PageNumToL2PT r1,lr,r11,r12
+        PageNumToL2PT r2,lr,r11,r12
+        PageNumToL2PT r3,lr,r11,r12
+        PageNumToL2PT r4,lr,r11,r12
+        PageNumToL2PT r5,lr,r11,r12
+        PageNumToL2PT r6,lr,r11,r12
+        PageNumToL2PT r7,lr,r11,r12
+        STMIA   r9!,{r0-r7}          ;write 8 L2PT entries
+        SUB     r8,r8,#8
+        CMP     r8,#8
+        BGE     %BT10
+20
+        CMP     r8,#0
+        BEQ     %FT35
+30
+        LDR     r0,[r10],#4
+        PageNumToL2PT r0,lr,r11,r12
+        STR     r0,[r9],#4
+        SUBS    r8,r8,#1
+        BNE     %BT30
+35
+        Pull    "r0-r10,r12,pc"
+
+; ----------------------------------------------------------------------------------
+;
+;update CAM entry for page number in $reg
+;
+;entry: r11 -> CAM, r9 = logical addr of page, lr = PPL of page
+;exit: $reg = addr of CAM entry
+;
+        MACRO
+        UpdateCAM $reg
+        ADD     $reg,r11,$reg,LSL #3    ;r0 -> CAM entry for 1st page
+        STMIA   $reg,{r9,lr}            ;store logical addr,PPL
+        MEND
+
+; ----------------------------------------------------------------------------------
+;
+;AMB_movepagesin_CAM
+;
+;updates CAM, does not update L2PT
+;
+; entry:
+;       r3  =  new logical address of 1st page
+;       r8  =  number of pages
+;       r9  =  PPL for CAM
+;       r10 -> page list
+;
+AMB_movepagesin_CAM ROUT
+        Push    "r0-r11,lr"
+
+
+        MOV     lr,r9
+        MOV     r9,r3
+        MOV     r11,#0
+        LDR     r11,[r11,#CamEntriesPointer]   ;r11 -> CAM
+
+        CMP     r8,#8
+        BLT     %FT20
+10
+        LDMIA   r10!,{r0-r7}                   ;next 8 page numbers
+        UpdateCAM r0
+        ADD     r9,r9,#PageSize                ;next logical addr
+        UpdateCAM r1
+        ADD     r9,r9,#PageSize
+        UpdateCAM r2
+        ADD     r9,r9,#PageSize
+        UpdateCAM r3
+        ADD     r9,r9,#PageSize
+        UpdateCAM r4
+        ADD     r9,r9,#PageSize
+        UpdateCAM r5
+        ADD     r9,r9,#PageSize
+        UpdateCAM r6
+        ADD     r9,r9,#PageSize
+        UpdateCAM r7
+        ADD     r9,r9,#PageSize
+        SUB     r8,r8,#8
+        CMP     r8,#8
+        BGE     %BT10
+20
+        CMP     r8,#0
+        Pull    "r0-r11,pc",EQ
+30
+        LDR     r0,[r10],#4
+        UpdateCAM r0
+        ADD     r9,r9,#PageSize
+        SUBS    r8,r8,#1
+        BNE     %BT30
+        Pull    "r0-r11,pc"
+
+; ----------------------------------------------------------------------------------
+;
+;AMB_movepagesout_CAM
+;
+;updates CAM, does not update L2PT
+;
+; entry:
+;       r8  =  number of pages
+;       r9  =  PPL for CAM
+;       r10 -> page list
+;
+AMB_movepagesout_CAM ROUT
+        Push    "r0-r11,lr"
+
+        MOV     lr,r9
+        LDR     r9,=DuffEntry
+        MOV     r11,#0
+        LDR     r11,[r11,#CamEntriesPointer]   ;r11 -> CAM
+
+        CMP     r8,#8
+        BLT     %FT20
+10
+        LDMIA   r10!,{r0-r7}                   ;next 8 page numbers
+        UpdateCAM r0
+        UpdateCAM r1
+        UpdateCAM r2
+        UpdateCAM r3
+        UpdateCAM r4
+        UpdateCAM r5
+        UpdateCAM r6
+        UpdateCAM r7
+        SUB     r8,r8,#8
+        CMP     r8,#8
+        BGE     %BT10
+20
+        CMP     r8,#0
+        Pull    "r0-r11,pc",EQ
+30
+        LDR     r0,[r10],#4
+        UpdateCAM r0
+        SUBS    r8,r8,#1
+        BNE     %BT30
+        Pull    "r0-r11,pc"
+
+; ----------------------------------------------------------------------------------
+;
+;AMB_movepagesout_L2PT
+;
+;updates L2PT for old logical page positions, does not update CAM
+;
+; entry:
+;       r4  =  old logical address of 1st page
+;       r8  =  number of pages
+;
+AMB_movepagesout_L2PT ROUT
+        Push    "r0-r8,lr"
+
+        LDR     lr,=L2PT
+        ADD     lr,lr,r4,LSR #(Log2PageSize-2)    ;lr -> L2PT 1st entry
+
+        MOV     r0,#0                             ;0 means translation fault
+        MOV     r1,#0
+        MOV     r2,#0
+        MOV     r3,#0
+        MOV     r4,#0
+        MOV     r5,#0
+        MOV     r6,#0
+        MOV     r7,#0
+
+        CMP     r8,#8
+        BLT     %FT20
+10
+        STMIA   lr!,{r0-r7}                       ;blam! (8 entries)
+        SUB     r8,r8,#8
+        CMP     r8,#8
+        BGE     %BT10
+20
+        CMP     r8,#0
+        BEQ     %FT35
+30
+        STR     r0,[lr],#4
+        SUBS    r8,r8,#1
+        BNE     %BT30
+35
+        Pull    "r0-r8,pc"
+
+; ----------------------------------------------------------------------------------
+;
+; AMB_SetMemMapEntries:
+;
+; entry:
+;   R3 =  no. of pages
+;   R4 -> list of page entries (1 word per entry, giving page no.)
+;   R5 =  start logical address of mapping (-1 means 'out of the way')
+;   R6 =  PPL ('page protection level') for mapping
+;
+AMB_SetMemMapEntries ROUT
+
+        Push    "r0-r4,r7-r11,lr"
+
+        MOVS    r8,r3
+        BEQ     AMB_smme_exit
+
+        CMP     r5,#-1
+        MOVEQ   r9,#AP_Duff  ;PPL for mapped out pages
+        MOVNE   r9,r6        ;PPL for mapped in pages
+
+;get L2PT protection etc. bits, appropriate to PPL in R9, into R11
+        ADRL    r1,PPLTrans
+        AND     lr,r9,#3
+        LDR     r11,[r1,lr,LSL #2]
+        TST     r9,#DynAreaFlags_NotCacheable
+        TSTEQ   r9,#PageFlags_TempUncacheableBits
+        ORREQ   r11,r11,#L2_C         ;if cacheable (area bit CLEAR + temp count zero), then OR in C bit
+        TST     r9,#DynAreaFlags_NotBufferable
+        ORREQ   r11,r11,#L2_B         ;if bufferable (area bit CLEAR), then OR in B bit
+
+        MOV     r10,r4                      ;ptr to next page number
+
+        LDR     r2,[r10]                    ;page number of 1st page
+        MOV     r7,#0
+        LDR     r7,[r7,#CamEntriesPointer]  ;r7 -> CAM
+        ADD     r1,r7,r2,LSL #3             ;r1 -> CAM entry for 1st page
+  [ AMB_LimpidFreePool
+        LDR     r4,[r1]                     ;fetch old logical addr. of 1st page from CAM
+        LDR     r3,[r1,#4]                  ;fetch old PPL of 1st page from CAM
+  |
+        LDR     r4,[r1]                     ;fetch old logical addr. of 1st page from CAM
+  ]
+
+        CMP     r5,#-1
+        BEQ     AMB_smme_mapout
+;map or mapin
+        LDR     r1,=DuffEntry
+        CMP     r4,r1
+        BEQ     AMB_smme_mapin
+
+;map from somewhere to somewhere (should be App Space <-> Free Pool)
+;
+  [ AMB_LimpidFreePool
+    ;can avoid cache clean/flush for moving pages out from FreePool, since FreePool pages are uncacheable
+    ;
+        TST     r3, #DynAreaFlags_NotCacheable  ;test PPL of 1st page for not cacheable bit set
+        BEQ     AMB_smme_mapnotlimpid           ;if clear, must do full map somewhere with cache clean/flush
+    ;
+    ;this should be map FreePool -> App Space then
+    ;
+        MOV     r0,r4                            ;address of 1st page
+        MOV     r1,r8                            ;number of pages
+        MOV     r3,#0
+        ARMop   MMU_ChangingUncachedEntries,,,r3 ;no cache worries, hoorah
+        MOV     r3,r5
+        BL      AMB_movepagesout_L2PT            ;unmap 'em from where they are
+        BL      AMB_movepagesin_L2PT             ;map 'em to where they now be
+        BL      AMB_movepagesin_CAM              ;keep the bloomin' soft CAM up to date
+        Pull    "r0-r4,r7-r11, pc"
+AMB_smme_mapnotlimpid
+  ]
+;
+        MOV     r0,r4                            ;address of 1st page
+        MOV     r1,r8                            ;number of pages
+        MOV     r3,#0
+        ARMop   MMU_ChangingEntries,,,r3         ;
+        MOV     r3,r5
+        BL      AMB_movepagesout_L2PT
+        BL      AMB_movepagesin_L2PT
+        BL      AMB_movepagesin_CAM
+        Pull    "r0-r4,r7-r11, pc"
+
+;all pages sourced from same old logical page Nowhere, ie. pages currently mapped out, no cache worries
+;
+AMB_smme_mapin
+        MOV     r0,r4                            ;address of 1st page
+        MOV     r1,r8                            ;number of pages
+        MOV     r3,#0
+        ARMop   MMU_ChangingUncachedEntries,,,r3 ;TLB coherency, possibly not needed (TLBs shouldn't cache 0 entries)
+        MOV     r3,r5
+        BL      AMB_movepagesin_L2PT
+        BL      AMB_movepagesin_CAM
+        Pull    "r0-r4,r7-r11, pc"
+
+;all pages destined for same new logical page Nowhere, ie. mapping them out
+;
+AMB_smme_mapout
+        MOV     r0,r4                            ;address of 1st page
+        MOV     r1,r8                            ;number of pages
+        MOV     r3,#0
+        ARMop   MMU_ChangingEntries,,,r3         ;
+        LDR     r3,=DuffEntry
+        BL      AMB_movepagesout_L2PT
+        BL      AMB_movepagesout_CAM
+
+AMB_smme_exit
+        Pull    "r0-r4,r7-r11, pc"
+
+
+
+  [ AMB_LazyMapIn
+
+; ----------------------------------------------------------------------------------
+;
+; AMB_SetMemMapEntries_SparseMapOut:
+;
+;
+; entry:
+;   R3  =  no. of pages currently mapped in (0=none)
+;   R4  -> list of page entries (1 word per entry, giving page no.)
+;   R5  -> bitmap of pages mapped in (1 bit per page in whole page list)
+;   R6  =  total no. of pages in slot
+;
+AMB_SetMemMapEntries_SparseMapOut ROUT
+
+        CMP     r3,#0
+        MOVEQ   pc,lr
+        Push    "r0-r11,lr"
+
+        MOV     r10,r4                            ;ptr to page list
+        MOV     r7,#0
+        LDR     r7,[r7,#CamEntriesPointer]        ;r7 -> CAM
+        MOV     r9,#AP_Duff                       ;permissions for DuffEntry
+        LDR     r1,=DuffEntry                     ;means Nowhere, in CAM
+        MOV     r4,#ApplicationStart              ;log. address of first page
+        MOV     r2,#0                             ;r2 is zero during sparse map out
+
+        ;if the number of pages mapped in is small enough, we'll do cache/TLB coherency on
+        ;just those pages, else global (performance decision, threshold probably not critical)
+
+        ARMop   Cache_RangeThreshold,,,r2         ;returns threshold (bytes) in r0
+        CMP     r3,r0,LSR #Log2PageSize
+        MOVLO   r6,#0                             ;r6 := 0 if we are to do coherency as we go
+        BLO     %FT10                             ;let's do it
+
+        ARMop   MMU_Changing,,,r2                 ;global coherency
+        B       %FT10
+
+;skip next 32 pages then continue
+06
+        ADD     r10,r10,#32*4
+        ADD     r4,r4,#32*PageSize
+
+;find the sparsely mapped pages, map them out, doing coherency as we go if enabled
+10
+        MOV     r8,#1                             ;initial bitmap mask for new bitmap word
+        LDR     r11,[r5],#4                       ;next word of bitmap
+        CMP     r11,#0                            ;if next 32 bits of bitmap clear, skip
+        BEQ     %BT06                             ;skip loop must terminate if r3 > 0
+12
+        TST     r11,r8                            ;page is currently mapped in if bit set
+        BEQ     %FT16
+        TEQ     r6, #0
+        BNE     %FT14                             ;check for coherency as we go
+        MOV     r0,r4                             ;address of page
+        ARMop   MMU_ChangingEntry,,,r2
+14
+        LDR     r0,[r10]                          ;page no.
+        ADD     r0,r7,r0,LSL #3                   ;r0 -> CAM entry for page
+        STMIA   r0,{r1,r9}                        ;CAM entry for page set to DuffEntry,AP_Duff
+        LDR     lr,=L2PT                          ;lr -> L2PT
+        STR     r2,[lr,r4,LSR #(Log2PageSize-2)]  ;L2PT entry for page set to 0 (means translation fault)
+        SUBS    r3,r3,#1
+        STREQ   r2,[r5,#-4]                       ;make sure we clear last word of bitmap, and...
+        BEQ     %FT20                             ;done
+16
+        ADD     r10,r10,#4                        ;next page no.
+        ADD     r4,r4,#PageSize                   ;next logical address
+        MOVS    r8,r8,LSL #1                      ;if 32 bits processed...
+        BNE     %BT12
+        STR     r2,[r5,#-4]                       ;zero word of bitmap we've just traversed (r2 is 0)
+        B       %BT10
+
+20
+        Pull    "r0-r11,pc"
+
+
+
+; ----------------------------------------------------------------------------------
+;
+; AMB_MakeUnsparse
+;
+; entry: r0 = size of area (at top of current slot) to ensure is not sparsely mapped
+;
+; action: walk over space involved, to force abort handler fix up to map in any
+;         pages not already there
+;
+AMB_MakeUnsparse ROUT
+        Push    "r0-r2,r12,lr"
+;  Debug AMB,"AMB_MakeUnsparse r0",r0
+        ADD     r0,r0,#PageSize
+        SUB     r0,r0,#1
+        MOVS    r0,r0,LSR #Log2PageSize
+        BEQ     %FT20
+        MOV     r12,#AMBControl_ws
+        LDR     r12,[r12]
+        CMP     r12,#0
+        BEQ     %FT20
+        LDR     r1,AMBMappedInNode
+        CMP     r1,#0
+        BEQ     %FT20
+        LDR     r2,AMBFlags
+        TST     r2,#AMBFlag_LazyMapIn_disable :OR: AMBFlag_LazyMapIn_suspend
+        BNE     %FT20
+  [ AMB_ChocTrace
+        LDR     r2,AMBNmakeunsparse
+        ADD     r2,r2,#1
+        STR     r2,AMBNmakeunsparse
+  ]
+        LDR     r2,[r1,#AMBNode_Npages]
+; Debug AMB,"AMB_MakeUnsparse pages Npages ",r0,r2
+        CMP     r0,r2
+        MOVHI   r0,r2
+        SUB     lr,r2,r0
+        MOV     lr,lr,LSL #Log2PageSize
+        ADD     lr,lr,#ApplicationStart
+;  Debug AMB,"AMB_MakeUnsparse MappedInNode addr pages ",r1,lr,r0
+10
+        LDR     r2,[lr]                ;tends to wash data cache a bit, but this should be called rarely
+        ADD     lr,lr,#PageSize
+        SUBS    r0,r0,#1
+        BNE     %BT10
+20
+        Pull    "r0-r2,r12,pc"
+
+
+  ] ;AMB_LazyMapIn
+
+; ----------------------------------------------------------------------------------
+;
+; AMB_FindMemMapEntries
+;
+; finds page numbers for pages currently at given logical start address,
+; and fills in buffer; pages must exist
+;
+; (does not have any page number guesses)
+;
+; entry:
+;   R3 =  no. of pages
+;   R4 -> buffer for page entries
+;   R5 =  logical address of 1st page
+; exit:
+;   buffer at R4 filled in with page numbers
+;
+AMB_FindMemMapEntries ROUT
+
+        Push    "r0-r11,lr"
+
+;initialise r0,r1,r2 as physical RAM chunk cache for AMB_r11topagenum routine
+        MOV     r9,#PhysRamTable
+        LDMIA   r9,{r0,r1}        ;r0,r1 := phys addr,size of chunk
+        ADD     r1,r1,r0          ;r0,r1 := lowest addr,highest addr + 1 of chunk
+        MOV     r2,#0             ;r2    := first page number of chunk
+
+        LDR     r10,=L2PT
+        ADD     r10,r10,r5,LSR #(Log2PageSize-2) ;r10 -> L2 entry for 1st page
+        CMP     r3,#4                            ;handle pages in chunks of 4
+        BLT     %FT20
+10
+        LDMIA   r10!,{r5-r8}                     ;next 4 L2PT entries
+        MOV     r11,r5,LSR #Log2PageSize         ;r11 := phys_addr/page_size
+        BL      AMB_r11topagenum
+        MOV     r5,r11
+        MOV     r11,r6,LSR #Log2PageSize
+        BL      AMB_r11topagenum
+        MOV     r6,r11
+        MOV     r11,r7,LSR #Log2PageSize
+        BL      AMB_r11topagenum
+        MOV     r7,r11
+        MOV     r11,r8,LSR #Log2PageSize
+        BL      AMB_r11topagenum
+        STMIA   r4!,{r5-r7,r11}                  ;fill in next 4 page numbers
+        SUB     r3,r3,#4
+        CMP     r3,#4
+        BGE     %BT10
+20
+        CMP     r3,#0
+        Pull    "r0-r11,pc",EQ
+30
+        LDR     r11,[r10],#4
+        MOV     r11,r11,LSR #Log2PageSize
+        BL      AMB_r11topagenum
+        STR     r11,[r4],#4
+        SUBS    r3,r3,#1
+        BNE     %BT30
+        Pull    "r0-r11,pc"
+
+; ----------------------------------------------------------------------------------
+;
+;AMB_r11topagenum
+;entry:
+;     r0,r1,r2 = lowest addr,highest addr +1,first page no.
+;                (cached physical RAM chunk)
+;     r11      = physical_addr/page_size for page
+;
+;exit:
+;     r11      = page number of page
+;     r0,r1,r2 cache updated if necessary
+;     r9       corrupted
+;
+AMB_r11topagenum ROUT
+        CMP     r11,r0,LSR #Log2PageSize
+        BLO     %FT10
+        CMP     r11,r1,LSR #Log2PageSize
+        BHS     %FT10
+;cache hit (phys address in range of cached chunk)
+        SUB     r11,r11,r0,LSR #Log2PageSize    ;pages into chunk
+        ADD     r11,r11,r2                      ;page number
+        MOV     pc,lr
+10
+        MOV     r9,#PhysRamTable
+        MOV     r2,#0                        ;start at page number 0
+20
+        LDMIA   r9!,{r0,r1}                  ;r0,r1 := phys addr,size of chunk
+        SUB     r11,r11,r0,LSR #Log2PageSize
+        CMP     r11,r1,LSR #Log2PageSize
+        ADDHS   r11,r11,r0,LSR #Log2PageSize
+        ADDHS   r2,r2,r1,LSR #Log2PageSize
+        BHS     %BT20
+        ADD     r1,r1,r0
+        ADD     r11,r11,r2
+        MOV     pc,lr
+
+        LTORG
+
+    END

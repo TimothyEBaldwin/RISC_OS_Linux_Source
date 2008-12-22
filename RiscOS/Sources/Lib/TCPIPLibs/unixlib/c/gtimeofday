@@ -1,0 +1,223 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -*-C-*-
+ *
+ * $Header$
+ * $Source$
+ *
+ * Copyright (c) 1995 Acorn Computers Ltd., Cambridge, England
+ *
+ * :RCS Log discontinued:
+ * Revision 1.1  95/04/20  09:50:18  kwelton
+ * Initial revision
+ *
+ */
+#include <sys/time.h>
+#include <sys/types.h>
+#include <swis.h>
+#include <Global/HalEntries.h>
+#include "unixlib.h"
+#include "asm.h"
+#include "stdio.h"
+
+#define secs0070 (((unsigned)86400) * (365 * 70 + 17))	/* less than 2^32 */
+
+typedef struct {unsigned int l,h;} machinetime;
+
+/**********************************************************************/
+static long machinetime_to_realtime(machinetime *t, long *csecs)
+{
+    machinetime bt, w, w2;
+    /* to two 3-byte things - for divide */
+    w.h = ((t->h & 255) << 8) | (t->l >> 24);
+    w.l = t->l & 0xffffff;
+    /* turn csecs to secs */
+    w2.h = w.h / 100;
+    w2.l = ((w.h % 100 << 24) | w.l) / 100;
+    if (csecs)
+        *csecs = ((w.h % 100L << 24) | w.l) % 100;
+    /* back to 8 byte binary */
+    bt.h = w2.h >> 8;
+    bt.l = (w2.h << 24) | w2.l;
+    /* normalise to Jan70 instead of Jan00... */
+    if (bt.l < secs0070) bt.h--;
+    bt.l -= secs0070;
+    /*
+     * if high word is non-zero then date
+     * is unset/out of unix range...
+     */
+    return bt.h ? -1 : bt.l;
+}
+
+static unsigned int t0_divisor; /* Divisor to convert ticks to usecs */
+static unsigned int t0_period;  /* Timer 0 period */
+static void       * HAL_TimerReadCountdown_Ptr;
+static uint32_t     HAL_TimerReadCountdown_SB;
+
+typedef enum
+{
+    timer_NOT_CHECKED,
+    timer_IOMD,
+    timer_HAL,
+    timer_NONE
+} timer_type;
+
+/**********************************************************************/
+/*
+ * Return the type of hardware timer this platform has, and perform
+ * any necessary initialisation.
+ */
+static timer_type hw_check()
+{
+    _kernel_oserror * e;
+    unsigned int      granularity;
+
+    /* Try to get Timer 0 granularity from HAL */
+    e = _swix(OS_Hardware,
+              _IN(0) | _INR(8,9) | _OUT(0),
+              0,
+              0,
+              EntryNo_HAL_TimerGranularity,
+
+              &granularity);
+
+    /*
+     * Can only use HAL if this succeeded and granularity is an even
+     * number of MHz.
+     */
+    if (e == NULL && (granularity % 1000000) == 0)
+    {
+        t0_divisor = granularity / 1000000;
+
+        /* Try to get Timer 0 period from HAL */
+        e = _swix(OS_Hardware,
+                  _IN(0) | _INR(8,9) | _OUT(0),
+                  0,
+                  0,
+                  EntryNo_HAL_TimerPeriod,
+    
+                  &t0_period);
+
+        if (e == NULL && t0_divisor != 0 && t0_period != 0)
+        {
+            /* HAL_TimerReadCountdown counts from (period-1) to 0 */
+            t0_period--;
+
+            /* Try to get HAL_TimerReadCountdown pointer from HAL */
+            e = _swix(OS_Hardware,
+                      _INR(8,9) | _OUTR(0,1),
+                      1,
+                      EntryNo_HAL_TimerReadCountdown,
+        
+                      &HAL_TimerReadCountdown_Ptr,
+                      &HAL_TimerReadCountdown_SB);
+
+            if (e == NULL)
+            {
+                /*
+                 * OK so far, now make sure HAL_TimerReadCountdown doesn't
+                 * always return 0.
+                 */
+
+                unsigned long count1, count2;
+
+                count1 = _get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+                _swix(OS_Hardware, _IN(0)|_INR(8,9), 2, 0, EntryNo_HAL_CounterDelay);
+                count2 = _get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+
+                if (count1 != 0 || count2 != 0)
+                {
+                    /* Everything worked - use HAL */
+                    return timer_HAL;
+                }
+            }
+        }
+    }
+
+    /* Couldn't use HAL, look for IOMD instead */
+
+    /* (OS_ReadSysInfo 2 bits 8-15 is I/O chip = 0 or 1 - IOC or IOMD) */
+    unsigned int hardware;
+    if (_swix(OS_ReadSysInfo, _IN(0)|_OUT(0), 2, &hardware))
+        return timer_NONE;
+    return (hardware & 0xFF00) <= 0x0100 ? timer_IOMD : timer_NONE;
+}
+
+/**********************************************************************/
+/*
+ * This function is actully reasonably fast - it's between 7 and 8us
+ * on a 200MHz StrongARM.
+ */
+int gettimeofday(struct timeval *tv, struct timezone *tzp)
+{
+    static timer_type timer_check = timer_NOT_CHECKED;
+    machinetime t1, t2;
+    unsigned long timer_count;
+
+    /* Only poke the hardware if we're sure it's there :) */
+    if (timer_check == timer_NOT_CHECKED)
+        timer_check = hw_check();
+
+    t1.l = 3;
+    t2.l = 3;
+    if (timer_check != timer_NONE)
+    {
+        /* Check initial time */
+        _kernel_osword(14, (int *) &t1);
+        /* Read the Timer 0 value */
+        if (timer_check == timer_IOMD)
+            timer_count = _get_t0_count();
+        else
+            timer_count = _get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+    }
+    /* Check new time */
+    _kernel_osword(14, (int *) &t2);
+    tv->tv_sec = machinetime_to_realtime(&t2, &tv->tv_usec);
+    tv->tv_usec *= 10000;
+    if (timer_check != timer_NONE && t1.l == t2.l)
+    {
+        /* Clock didn't tick - add in timer count */
+        if (timer_check == timer_IOMD)
+        {
+            /*
+             * IOMD timer counts down from 19999 to 0, the clock tick
+             * occurring as it changes from 0 to 19999.
+             */
+            tv->tv_usec += (19999 - timer_count) / 2;
+        }
+        else
+        {
+            tv->tv_usec += (t0_period - timer_count) / t0_divisor;
+        }
+    }
+    else
+    {
+        /* Clock ticked - let it rest at the 10000us boundary */
+    }
+
+    if (tzp)
+    {
+        struct tm *t_gmt;
+        struct tm *t_local;
+	t_gmt = gmtime( (time_t *)&tv->tv_sec );
+	t_local = localtime( (time_t *)&tv->tv_sec );
+	tzp->tz_minuteswest = (int)difftime(mktime(t_gmt),
+					    mktime(t_local)) / 60;
+	tzp->tz_dsttime = t_local->tm_isdst;
+    }
+    return(0);
+}
+/**********************************************************************/
+/* EOF gtimeofday.c */

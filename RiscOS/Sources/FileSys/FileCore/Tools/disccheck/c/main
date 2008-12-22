@@ -1,0 +1,328 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -> c.main
+ *
+ * ADFS Winchester disc check program
+ * Main section
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "types.h"
+#include "discs.h"
+#include "kernel.h"
+#include "swis.h"
+
+typedef struct {
+  char sequence_number;
+  char author_name[4];
+} directory_header;
+
+#define header_size 5
+
+typedef struct {
+  char pad[2];          /* Won't be used, just to get alignment */
+  char ob_name[10];
+  unsigned int32 load;
+  unsigned int32 exec;
+  unsigned int32 len;
+  unsigned int32 disc_address:24,
+                 seq:8;
+} directory_entry;
+
+typedef struct {
+  char last_mark;
+  char name[10];
+  char parent[3];
+  char title[19];
+  char reserved[14];
+  char sequence_number; /* Should match that in the header */
+  char author_name[4];  /* Should match that in the header */
+  char check_byte;
+} old_directory_trailer;
+
+typedef struct {
+  char last_mark;
+  char reserved[2];
+  char parent[3];
+  char title[19];
+  char name[10];
+  char sequence_number; /* Should match that in the header */
+  char author_name[4];  /* Should match that in the header */
+  char check_byte;
+} new_directory_trailer;
+
+#define old_size 0x500
+#define new_size 0x800
+
+#define map_size 82
+
+typedef struct {
+  char starts[map_size*3];  /* Starts of free space, three bytes per entry */
+  char reserved_1;
+  char name_1[5];           /* First part of name */
+  char size[3];             /* Disc size in sectors */
+  char check_1;             /* Sector zero check */
+  char lengths[map_size*3]; /* Starts of free space, three bytes per entry */
+  char name_2[5];           /* Second part of name */
+  char id[2];               /* Disc size id */
+  char boot;                /* Boot option */
+  char free_end;            /* Pointer to end free space list */
+  char check_2;             /* Sector one check */
+} initial_map;
+
+typedef struct internal_map *internal_map_ptr;
+
+typedef struct internal_map {
+  internal_map_ptr next;
+  unsigned int32   start,
+                   length;
+} internal_map;
+
+initial_map disc_map;
+
+internal_map_ptr imap = NULL;
+
+int dir_type; /* 0 for old directories, 1 for new */
+
+int32 directory_size;
+
+int32 sector_size;
+
+int32 file_round;
+
+int32 number_of_map_entries;
+
+static int32 get_int_from_char3(char *arg)
+{
+  int32 i = 0;
+  memcpy(&i, arg, 3);
+  return i;
+}
+
+static int read_map(char *shape, int32 disc)
+{
+  return read_sectors(0x0, &disc_map, 0x200, disc, shape);
+}
+
+static int read_directory(char *shape,
+  int32 disc,
+  int32 disc_address,
+  void *ram_address)
+{
+  return read_sectors(disc_address, ram_address, directory_size, disc, shape);
+}
+
+static void print_internal_map(void)
+{
+  internal_map *map = imap;
+  printf("internal map:\n");
+  while (map) {
+    printf("(%8x, %7x) ", map->start, map->length);
+    map = map->next;
+  };
+  printf("\n");
+}
+
+static void update_map(int32 disc_address, int32 length, char *name)
+{
+  internal_map *map = (internal_map *)&imap,
+               *temp;
+  length = (length + file_round) & ~file_round; /* Round up length */
+  if (!length) return; /* Don't care about zero length objects */
+/*
+  printf("Current map:\n");
+  print_internal_map();
+  printf("Updating with address 0x%x, length 0x%x\n", disc_address, length);
+*/
+  if (disc_address < imap->start) {
+    printf("Error, object '%s' has disc address 0x%x, before start of map\n",
+      name, disc_address);
+    print_internal_map();
+    exit(1);
+  };
+  while (map->next && map->next->start <= disc_address) {
+    temp = map;
+    map = map->next;
+  };
+  /* Exit with map->start <= disc_address and
+     map->next NULL or map->next->start >= disc_address
+     temp points to previous entry in case of collapse
+   */
+  if (disc_address + length > map->start + map->length) {
+    printf("Error, object '%s' has disc address 0x%x, length 0x%x, off end of map entry\n",
+      name, disc_address, length);
+    print_internal_map();
+    exit(1);
+  };
+  /* Now we can actually update the map */
+  if (map->start == disc_address) {
+    map->start += length;
+    map->length -= length;
+    if (map->length == 0) {
+      /* Deal with collapsed entries */
+      temp->next = map->next;
+      free(map);
+    };
+  } else if (map->start + map->length == disc_address + length) {
+    /* Chop a bit off the end */
+    map->length -= length;
+  } else {
+    /* Split the entry */
+    temp = malloc(sizeof(*temp));
+    temp->next = map->next;
+    temp->start = disc_address + length;
+    temp->length = map->start + map->length - (disc_address + length);
+    map->length = disc_address - map->start;
+    map->next = temp;
+  };
+}
+
+static int analyse_directory(char *shape, int32 disc, int32 disc_address)
+{
+  /* Later this must recurse, but not yet */
+  char *directory = malloc(directory_size);
+  if (read_directory(shape, disc, disc_address, directory)) {
+    directory_entry temp_entry,
+                    *entry = (directory_entry *)(directory + header_size - 2);
+    memcpy(&temp_entry, entry, sizeof(*entry));
+    while (temp_entry.ob_name[0]) {
+      char name[11];
+      int i = 0;
+      while (i < 10 && temp_entry.ob_name[i] > ' ') {
+        name[i] = temp_entry.ob_name[i];
+        i++;
+      };
+      name[i] = 0;
+/*
+      printf("Name '%s', load 0x%x, exec 0x%x, length 0x%x, addr 0x%x, att 0x%x\n", name, temp_entry.load, temp_entry.exec, temp_entry.len, temp_entry.disc_address, temp_entry.seq);
+*/
+      update_map(temp_entry.disc_address << 8, temp_entry.len, name);
+      /* Now if this is a directory, do its subdirectories */
+      if (temp_entry.seq & directory_bit) {
+/*
+        printf("Handling directory %s\n", name);
+*/
+        if (!analyse_directory(shape, disc, temp_entry.disc_address << 8))
+          return 0;
+      };
+      entry = (directory_entry *)
+        (((char *)entry) + sizeof(directory_entry) - 2);
+      memcpy(&temp_entry, entry, sizeof(*entry));
+    };
+    if (!dir_type) {
+      printf("Old directories not supported (yet)\n");
+      exit(0);
+    };
+    return 1;
+  } else {
+    printf("Failed to read directory at address 0x%x\n", disc_address);
+    return 0;
+  };
+}
+
+static void compare_maps(void)
+{
+  internal_map *map = imap;
+  int i;
+  for (i = 0; i < number_of_map_entries; i++) {
+    if (!map) {
+      printf("Disc map terminates before internal one\n");
+      exit(1);
+    };
+    if (get_int_from_char3(&(disc_map.starts[3*i])) << 8 != map->start ||
+      get_int_from_char3(&(disc_map.lengths[3*i])) << 8 != map->length) {
+      printf("Clash at map entry %d, disc map says (%6x00, %5x00)\n", i,
+        get_int_from_char3(&(disc_map.starts[3*i])),
+        get_int_from_char3(&(disc_map.lengths[3*i])));
+      printf("internal map says (%8x, %7x)\n", map->start, map->length);
+      exit(1);
+    };
+    map = map->next;
+  };
+  if (map) {
+    if (!map->next) {
+      printf("Internal map has extra entry, possibly for defective sectors\n");
+      return;
+    } else {
+      printf("Internal map has extra entries\n");
+      exit(1);
+    };
+  };
+  printf("All ok!\n");
+}
+
+int main (int argc, char *argv[]) {
+char  disc_shape[64];
+int32 disc = 4;
+if (argc > 2) {
+  printf("Too many arguments. Should be at most one, the disc number\n");
+  exit(1);
+};
+if (argc == 2 && !isdigit(*argv[1])) {
+  printf("Bad argument, must be number\n");
+  exit(1);
+};
+if (argc == 2) disc = atoi(argv[1]);
+if (read_disc_shape(disc, disc_shape)) {
+  int i;
+/*
+  printf("Disc shape: ");
+  for (i = 0; i < 64; i++) printf("0x%x ", disc_shape[i]);
+  printf("\n");
+  printf("Sector size %d\n", 1 << *disc_shape);
+*/
+  sector_size = 1 << *disc_shape;
+  file_round = sector_size - 1;
+  dir_type = (disc_shape[2] == 1) ? 0 : 1;
+  directory_size = (dir_type) ? new_size : old_size;
+/*
+  printf("%s directories, size %x\n", (dir_type) ? "New" : "Old", directory_size);
+*/
+  if (read_map(disc_shape, disc)) {
+    char name[11];
+    for (i = 0; i < 5; i++) {
+      name[2*i] = disc_map.name_1[i];
+      name[2*i+1] = disc_map.name_2[i];
+    };
+    name[10] = 0;
+    printf("Disc name \"%s\", map:\n", name);
+    number_of_map_entries = disc_map.free_end / 3;
+    for (i = 0; i < number_of_map_entries; i++) {
+      int32 j = get_int_from_char3(&(disc_map.starts[3*i])),
+            k = get_int_from_char3(&(disc_map.lengths[3*i]));
+      printf("(%6x00, %5x00) ", j, k);
+    };
+    printf("\n");
+    /* Now initialise internal map from disc record */
+    imap = malloc(sizeof(*imap));
+    imap->next = NULL;
+    imap->start = 0x400; /* Start at sector four (what are 2 & 3 used for?) */
+    memcpy(&imap->length, disc_shape+16, 4);
+    printf("Disc size %d\n", imap->length);
+    imap->length -= 0x400; /* Since we're starting at sector four */
+    update_map(0x400, directory_size, "root");
+    if (disc >= 4) update_map(0xc00, 0x200, "boot block");
+    analyse_directory(disc_shape, disc, 0x400);
+    print_internal_map();
+    compare_maps();
+  };
+};
+return 0;
+}
+
+/* End main.c */
