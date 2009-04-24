@@ -159,7 +159,7 @@ CanonX:
 
 Sprite:
 	${DIR} PDumperSP
-	${SUBMAKE} ^.rm.PDumperSP INSTDIR=^.rm
+	${SUBMAKE} ^.rm.PDumperSP25 INSTDIR=^.rm
 	@back
 
 # Dynamic dependencies:

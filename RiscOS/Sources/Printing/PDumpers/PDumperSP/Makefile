@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for PDumperSP (Simple Printer dumper that outputs monochrome sprites)
+# Makefile for PDumperSP25 (Simple Printer dumper that outputs monochrome sprites)
 #
 # ***********************************
 # ***    C h a n g e   L i s t    ***
@@ -23,7 +23,7 @@
 # 27 Jun 1997  RWB   Build seperatly from rest of dumpers
 # 08 Nov 2002  SAR   Now uses objasm and shared makefiles
 
-COMPONENT = PDumperSP
+COMPONENT = PDumperSP25
 
 include StdTools
 include AAsmModule
@@ -36,4 +36,4 @@ export_hdrs:: ^.hdr.PDumper
 	${CP} ^.hdr.PDumper ${EXP_HDR}.PDumper ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: header export complete
 
-# Dynamic dependencies:o.Tungsten.PDumperSPSA: s.PDumperSP
+# Dynamic dependencies:
