@@ -11,7 +11,7 @@ all:
 	@| Do nothing by default
 
 install_rom:
-	${CP} rm.${TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
+	${CP} rm.${MACHINE}.${TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: installed
 
 # Resource export phases
