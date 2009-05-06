@@ -56,6 +56,7 @@ EXPORTS   = \
  ${HDRDIR}.AUN \
  ${HDRDIR}.CMOS \
  ${HDRDIR}.Countries \
+ ${HDRDIR}.CPU.Arch \
  ${HDRDIR}.CPU.ARM600 \
  ${HDRDIR}.CPU.FPA \
  ${HDRDIR}.CPU.Generic26 \
@@ -255,6 +256,7 @@ ${HDRDIR}.Machine.Machine:   hdr.Machine.Machine;   ${CP} hdr.Machine.Machine   
 ${HDRDIR}.ImageSize.<ImageSize>: hdr.ImageSize.<ImageSize>; ${CP} hdr.ImageSize.<ImageSize> $@ ${CPFLAGS}
 ${HDRDIR}.APCS.<APCS>:       hdr.APCS.<APCS>;       ${CP} hdr.APCS.<APCS>          $@ ${CPFLAGS}
 ${HDRDIR}.APCS.Common:       hdr.APCS.Common;       ${CP} hdr.APCS.Common          $@ ${CPFLAGS}
+${HDRDIR}.CPU.Arch:          hdr.CPU.Arch;          ${CP} hdr.CPU.Arch             $@ ${CPFLAGS}
 ${HDRDIR}.CPU.ARM600:        hdr.CPU.ARM600;        ${CP} hdr.CPU.ARM600           $@ ${CPFLAGS}
 ${HDRDIR}.CPU.FPA:           hdr.CPU.FPA;           ${CP} hdr.CPU.FPA              $@ ${CPFLAGS}
 ${HDRDIR}.CPU.Generic26:     hdr.CPU.Generic26;     ${CP} hdr.CPU.Generic26        $@ ${CPFLAGS}
