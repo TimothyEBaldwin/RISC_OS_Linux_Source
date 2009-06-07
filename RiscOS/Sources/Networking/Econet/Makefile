@@ -38,6 +38,7 @@ CP       = copy
 MODGEN   = modgen
 RM       = remove
 TOKENISE = tokenise
+PERL     = do <Perl$Dir>.perl
 
 AFLAGS   = -depend !Depend -stamp -closeexec -quit
 CPFLAGS  = ~cfr~v
@@ -116,7 +117,7 @@ ${EXP_HDR}.Econet: hdr.Econet
 	
 ${C_EXP_HDR}.Econet: hdr.Econet
 	${mkdir} ${C_EXP_HDR}
-	perl Build:Hdr2H hdr.Econet $@
+	${PERL} Build:Hdr2H hdr.Econet $@
 
 # 
 # Generate an Econet Messages module
