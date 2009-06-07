@@ -31,7 +31,7 @@ MODGEN   = modgen
 MODSQZ   = modsqz
 RM       = remove
 SCANRES  = scanres
-PL       = perl
+PERL     = do <Perl$Dir>.perl
 WIPE    = -wipe
 
 CPFLAGS  = ~cfr~v
@@ -68,7 +68,7 @@ ${TARGET}: ${FILELIST} versionvar
 	Do ${MODGEN} $@ ${COMPONENT} ${MODULE_HELP} ${VERSION} -via ${FILELIST}
 
 versionvar:
-	${PL} ${PLSCRIPT} ${VERSIONVAR}
+	${PERL} ${PLSCRIPT} ${VERSIONVAR}
 
 BBETYPE = aunmsgs
 bbe-aunmsgs: bbe-generic-resources-get-alias
