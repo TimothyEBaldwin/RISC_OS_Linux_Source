@@ -56,6 +56,7 @@ WIPE    = -wipe
 CD      = dir
 TOUCH   = stamp
 WINEDIT = /Apps:!WinEdit
+PERL    = do <Perl$Dir>.perl
 
 CPFLAGS = ~cfr~v
 WFLAGS  = f~c~vr
@@ -135,19 +136,19 @@ ICONS=icons.h.dialogue_i icons.h.cmyk_i icons.h.rgb_i icons.h.hsv_i
 
 icons.h.dialogue_i: Resources.Templates
 	${WINEDIT} "-h??=define dialogue_%w_%n ((wimp_i) %i)" Resources.Templates >$@
-	perl Resources.perlscript $@
+	${PERL} Resources.perlscript $@
 
 icons.h.cmyk_i: Resources.CMYK.Templates
 	${WINEDIT} "-h??=define cmyk_%w_%n ((wimp_i) %i)" Resources.CMYK.Templates >$@
-	perl Resources.perlscript $@
+	${PERL} Resources.perlscript $@
 
 icons.h.rgb_i: Resources.RGB.Templates
 	${WINEDIT} "-h??=define rgb_%w_%n ((wimp_i) %i)" Resources.RGB.Templates >$@
-	perl Resources.perlscript $@
+	${PERL} Resources.perlscript $@
 
 icons.h.hsv_i: Resources.HSV.Templates
 	${WINEDIT} "-h??=define hsv_%w_%n ((wimp_i) %i)" Resources.HSV.Templates >$@
-	perl Resources.perlscript $@
+	${PERL} Resources.perlscript $@
 
 #
 # Main rules:
