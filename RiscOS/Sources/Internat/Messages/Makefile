@@ -168,7 +168,7 @@ bbe-messages: bbe-generic-resources-get-alias ${TAGEXT}
 # Tokenise the Messages file using Help and Dictionary Tokens
 #
 ${DATA}.Tokenised: ${DICTIONARY} ${HELPTOKENS} ${HELPTAGS}
-	Perl Utils.HelpAppend ${PROCESSDIR} ${HELPTOKENS}
+	${PERL} Utils.HelpAppend ${PROCESSDIR} ${HELPTOKENS}
 	${MSGTOK} ${HELPTOKENS} ${HELPTAGS} 
 	${CP} ${DICTIONARY} ${PROCESSDIR}.Common.Resources.Kernel.Dictionary ${CPFLAGS}
 	${MSGTOK2} ${DICTTOKENS} ${DICTTAGS}
@@ -181,7 +181,7 @@ ${HELPTAGS}: ${TAGEXT} ${DIRS}
 	@echo Copying Resources to Processed directory for tokenising ...
 	${MKDIR} ${PROCESSDIR}
 	${RESCOMM} Resources.${BUILD}.<Build$LocaleListNumeric> ${PROCESSDIR}
-	Perl Utils.RemoveEmpt ${PROCESSDIR}
+	${PERL} Utils.RemoveEmpt ${PROCESSDIR}
 	Do ${TAGEXT} ${PROCESSDIR} ${DICTTAGS} ${HELPTAGS}
 
 #
