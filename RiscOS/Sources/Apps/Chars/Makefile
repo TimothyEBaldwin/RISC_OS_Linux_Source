@@ -46,6 +46,7 @@ CP      = copy
 RM      = remove
 SQUISH  = squish
 WIPE    = x wipe
+PERL    = do <Perl$Dir>.perl
 
 AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit -module
 CPFLAGS = ~cfr~v
@@ -114,7 +115,7 @@ clean:
 #
 
 ${ROM_MODULE}: VersionNum ${RESFILES}
-	perl build:getversion Chars$Version
+	${PERL} build:getversion Chars$Version
 	do modgen ${ROM_MODULE} !Chars !Chars <Chars$Version> Resources.!RunImage Resources.Chars.!RunImage
 
 ${RDIR}.!RunImage: crunched.!RunImage
