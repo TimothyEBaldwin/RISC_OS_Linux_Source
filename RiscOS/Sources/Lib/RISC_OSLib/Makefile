@@ -64,10 +64,11 @@ MODSQZ  = modsqz
 OBJASM  = objasm
 RM      = remove
 WIPE    = -wipe
+PERL    = do <Perl$Dir>.perl
 
 # Note the output redirection on the end of this macro to enable parameters
 # to match those of the old application xtentries.
-XTENT   = perl build:xtentries >
+XTENT   = ${PERL} build:xtentries >
 
 DIFF    = gnu.diff -df >null:
 
