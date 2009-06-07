@@ -245,10 +245,10 @@ HEADERS =\
 
 # Unfortunately these need to be exported to build Edit
 INTERNAL_HEADERS =\
- RISC_OSLib:h.EditIntern.message \
- RISC_OSLib:h.EditIntern.txtar \
- RISC_OSLib:h.EditIntern.txtfile \
- RISC_OSLib:h.EditIntern.txtoptmenu
+ RISC_OSLib:EditIntern.h.message \
+ RISC_OSLib:EditIntern.h.txtar \
+ RISC_OSLib:EditIntern.h.txtfile \
+ RISC_OSLib:EditIntern.h.txtoptmenu
 
 LIBRARIES =\
  Clib:o.ansilib \
@@ -522,7 +522,7 @@ dirs:
 	${MKDIR} ${LIBDIR}.CLib.o
 	${MKDIR} ${LIBDIR}.RISC_OSLib
 	${MKDIR} ${LIBDIR}.RISC_OSLib.h
-	${MKDIR} ${LIBDIR}.RISC_OSLib.h.EditIntern
+	${MKDIR} ${LIBDIR}.RISC_OSLib.EditIntern.h
 	${MKDIR} ${LIBDIR}.RISC_OSLib.s
 	${MKDIR} ${LIBDIR}.RISC_OSLib.o
 
@@ -744,10 +744,10 @@ RISC_OSLib:h.win: rlib.h.win;                ${CP} rlib.h.win $@ ${CPFLAGS}
 RISC_OSLib:h.xferrecv: rlib.h.xferrecv;      ${CP} rlib.h.xferrecv $@ ${CPFLAGS}
 RISC_OSLib:h.xfersend: rlib.h.xfersend;      ${CP} rlib.h.xfersend $@ ${CPFLAGS}
 
-RISC_OSLib:h.EditIntern.message: rlib.h.EditIntern.message;       ${CP} rlib.h.EditIntern.message $@ ${CPFLAGS}
-RISC_OSLib:h.EditIntern.txtar: rlib.h.EditIntern.txtar;           ${CP} rlib.h.EditIntern.txtar $@ ${CPFLAGS}
-RISC_OSLib:h.EditIntern.txtfile: rlib.h.EditIntern.txtfile;       ${CP} rlib.h.EditIntern.txtfile $@ ${CPFLAGS}
-RISC_OSLib:h.EditIntern.txtoptmenu: rlib.h.EditIntern.txtoptmenu; ${CP} rlib.h.EditIntern.txtoptmenu $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.message:    rlib.EditIntern.h.message;    ${CP} rlib.EditIntern.h.message    $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.txtar:      rlib.EditIntern.h.txtar;      ${CP} rlib.EditIntern.h.txtar      $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.txtfile:    rlib.EditIntern.h.txtfile;    ${CP} rlib.EditIntern.h.txtfile    $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.txtoptmenu: rlib.EditIntern.h.txtoptmenu; ${CP} rlib.EditIntern.h.txtoptmenu $@ ${CPFLAGS}
 
 # Libraries
 Clib:o.ansilib:          lib.ansilib;        ${CP} lib.ansilib    $@ ${CPFLAGS}
