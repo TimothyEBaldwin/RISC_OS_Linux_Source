@@ -56,6 +56,7 @@ RM      = remove
 SQUISH  = squish
 WIPE    = -wipe
 XWIPE   = x wipe
+PERL    = do <Perl$Dir>.perl
 
 AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit -module
 CFLAGS  = ${THROWBACK} -depend !Depend -ffa ${INCLUDES} 
@@ -163,7 +164,7 @@ ${MODULE}: ${FILES} ${VERSION}
 	   Do ${MODGEN} $@ ${MODULE_NAME} ${MODULE_HELP} <Help2$BuildVersion> -via ${FILELIST}
 
 ${VERSION}:
-	perl build:getversion Help2$BuildVersion
+	${PERL} build:getversion Help2$BuildVersion
 	
 BBETYPE = help2
 bbe-help2: bbe-generic
