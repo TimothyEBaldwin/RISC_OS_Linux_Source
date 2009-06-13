@@ -46,8 +46,7 @@ ${ROM_OBJECT} ${SA_OBJECT} ${DBG_OBJECT}: ${MATRIX1} ${MATRIX2}
 .SUFFIXES: .c .s
 
 .c.s:
-	${MKDIR} o
-	${CC} ${STDTOOLOPTIONS} -o $* $<
-	$* $@
+	${MAKE} -f matrix/mk COMPONENT=$* THROWBACK=${THROWBACK}
+	${RUN}$* $@
 
 # Dynamic dependencies:
