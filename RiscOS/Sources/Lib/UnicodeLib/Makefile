@@ -35,7 +35,6 @@ MKDIR   = do mkdir -p
 AS      = objasm
 CP      = copy
 CC      = cc
-CC_HOST = %cc
 CM      = cmhg
 RM      = remove
 LD      = link
@@ -191,7 +190,6 @@ clean:
 	${RM} c.unictype
 	${RM} mkunictype
 	${RM} TextConv
-	${STRIP}
 	@echo ${COMPONENT}: cleaned
 
 export_hdrs: ${HDRS} dirs
@@ -227,11 +225,11 @@ dirs:
 	${MKDIR} ${UNICODELIBDIR}.o
 
 unictype.c: mkunictype data.UnicodeData
-	mkunictype < data.UnicodeData > c.unictype
+	${RUN}mkunictype < data.UnicodeData > c.unictype
 	echo Made unictype.c
 
 mkunictype: mkunictype.c
-	${CC_HOST} mkunictype
+	${MAKE} -f mkunictype/mk COMPONENT=mkunictype THROWBACK=${THROWBACK}
 
 TextConv: textconv.o ${TARGET}
 	${LD} -o $@ textconv.o ${TARGET} ${CLIB}
