@@ -63,18 +63,17 @@ resources-colourtrans: Palettes.8desktop
 	${CP} Tables   ${RESFSDIR}.* ${CPFLAGS}
 	@echo ${COMPONENT}: extra resource files copied
 
-MkTables.o.maketables: MkTables.c.maketables
-	${CC} $(ccflags) -c -o $@ MkTables.c.maketables
-
-MkTables.maketables:   MkTables.o.maketables ${CLIB} MkTables.o._dirs
-	link $(linkflags) -o $@ MkTables.o.maketables ${CLIB}
+MkTables.maketables:   MkTables.c.maketables
+	${CD} MkTables
+	${MAKE} -f maketables/mk COMPONENT=maketables THROWBACK=${THROWBACK}
+	${CD} ^
 
 Palettes.8desktop: MkTables.maketables ${ROM_MODULE}
 	ifthere ${ROM_MODULE} then rmload ${ROM_MODULE} else rmload rm.${TARGET}
-	MkTables.maketables @  
+	${RUN}MkTables.maketables @  
 	settype Tables.8greys text
 	settype Tables.4greys text
-	MkTables.dosqueeze
+	${RUN}MkTables.dosqueeze
 	
 MkTables.o._dirs:
 	${MKDIR} MkTables.o
