@@ -56,20 +56,21 @@ WIPE    = -wipe
 RM      = -remove
 CP      = copy
 CC	= cc
-CC_HOST	= %cc
 AS	= objasm
 LD	= link
 LIB	= libfile
 CMHG	= cmhg
+TOUCH   = create
 
 WFLAGS  = ~c~v
 CPFLAGS = ~cflnr~v
 
 INCLUDES=	TCPIPLibs:,C:
 
-CFLAGS=		-pcc -zps0 -I${INCLUDES} -fah -Fn -DINET
-CFLAGSZM=	-pcc -zps1 -I${INCLUDES} -ffah -DINET -zM
-ASFLAGSZM=	-predefine "module SETL {TRUE}"
+CFLAGS=		-depend !Depend ${THROWBACK} -pcc -zps0 -I${INCLUDES} -fah -Fn -DINET
+CFLAGSZM=	-depend !Depend ${THROWBACK} -pcc -zps1 -I${INCLUDES} -ffah -DINET -zM
+ASFLAGS=	-depend !Depend ${THROWBACK}
+ASFLAGSZM=	-depend !Depend ${THROWBACK} -predefine "module SETL {TRUE}"
 
 CCZM=		${CC} ${CFLAGSZM}
 ASZM=		${AS} ${ASFLAGSZM}
@@ -117,8 +118,8 @@ ZFILES5=	z.accept5 z.bind z.connect z.copyerror z.getpeerna5 \
 .c.o:;		${CC} ${CFLAGS} -c -o $@ $<
 .s.z:;		${ASZM} $< $@
 .sz.z:;		${ASZM} $< $@
-.s.o:;		${AS} $< $@
-.sn.o:;		${AS} $< $@
+.s.o:;		${AS} ${ASFLAGS} $< $@
+.sn.o:;		${AS} ${ASFLAGS} $< $@
 
 COMPONENT = socklib
 LIBDIR = <Lib$Dir>
@@ -130,28 +131,28 @@ ${ZFILES4}:	veneers
 ${OFILES5}:	veneers
 ${ZFILES5}:	veneers
 
-socklib:	${OFILES4} local_dirs
+socklib:	${OFILES4} o._dirs
 	${LIB} -c socklib ${OFILES4}
 	${LIB} -o socklib
 
-socklibzm:	${ZFILES4} local_dirs
+socklibzm:	${ZFILES4} o._dirs
 	${LIB} -c socklibzm ${ZFILES4}
 	${LIB} -o socklibzm
 
-socklib5:	${OFILES5} local_dirs
+socklib5:	${OFILES5} o._dirs
 	${LIB} -c socklib5 ${OFILES5}
 	${LIB} -o socklib5
 
-socklib5zm:	${ZFILES5} local_dirs
+socklib5zm:	${ZFILES5} o._dirs
 	${LIB} -c socklib5zm ${ZFILES5}
 	${LIB} -o socklib5zm
 
 veneers:	mkveneers Prototypes
-	mkveneers Prototypes
+	${RUN}mkveneers Prototypes
 	Create veneers
 
 mkveneers:	c.mkveneers
-	${CC_HOST} mkveneers -LC:o.Stubs
+        ${MAKE} -f mkveneers/mk COMPONENT=mkveneers THROWBACK=${THROWBACK}
 
 export: export_${PHASE}
 
@@ -170,11 +171,12 @@ dirs:
 	${MKDIR} $(LIBDIR).TCPIPLibs
 	${MKDIR} $(LIBDIR).TCPIPLibs.o
 
-local_dirs:
+o._dirs:
         ${MKDIR} o
         ${MKDIR} z
 	${MKDIR} sn
 	${MKDIR} sz
+	${TOUCH} $@
 clean:
 	${WIPE} o.* ${WFLAGS}
 	${WIPE} z.* ${WFLAGS}
@@ -187,4 +189,4 @@ clean:
 	${RM} socklib5
 	${RM} socklib5zm
 
-
+# Dynamic dependencies:
