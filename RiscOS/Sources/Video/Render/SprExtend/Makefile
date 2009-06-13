@@ -38,8 +38,6 @@ EXP_HDR = <export$dir>
 #   change the #define of DEBUG at the top of c.PutScaled
 #   change the SETL of 'debug' in sources.SprExtend.
 
-ASFLAGS  = -APCS 3/32bit/nofp -cpu 4
-TFLAGS   = -APCS 3/32bit/nofp
 CDEFINES = -DRISCOS -DASMHUFF
 #CDEFINES += -DDEBUG
 CINCLUDES = -IC:
@@ -160,22 +158,22 @@ ${EXP_HDR}.SprExtend: hdr.SprExtend
         ${CP} s.temp s.$* ${CPFLAGS}d
         
 s.yuvtabs: ${GENYUVTABS}
-        ${GENYUVTABS} > $@
+        ${RUN}${GENYUVTABS} > $@
 
 s.stdpalette: ${GENPALETTE}
-        ${GENPALETTE} > $@
+        ${RUN}${GENPALETTE} > $@
 
 s.jhdr: ${MAKEJHDR}
-        ${MAKEJHDR} > $@
+        ${RUN}${MAKEJHDR} > $@
 
-${GENPALETTE}: oh.genpalette ${CLIB}
-        ${LD} -o $@ oh.genpalette ${CLIB}
+${GENPALETTE}: c.genpalette
+        ${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
 
-${GENYUVTABS}: oh.genyuvtabs ${CLIB}
-        ${LD} -o $@ oh.genyuvtabs ${CLIB}
+${GENYUVTABS}: c.genyuvtabs
+        ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
-${MAKEJHDR}: oh.makejhdr ${CLIB}
-        ${LD} -o $@ oh.makejhdr ${CLIB}
+${MAKEJHDR}: c.makejhdr
+        ${MAKE} -f util/mk COMPONENT=makejhdr THROWBACK=${THROWBACK}
 #
 # For ChangeFSI:
 #
