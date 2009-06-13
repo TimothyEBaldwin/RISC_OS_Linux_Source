@@ -58,7 +58,6 @@ ${ROM_OBJECT}: ${LAYOUTS}
 ${LAYOUTS}: keygen
 
 .layout.s:;  keygen ${STDTOOLOPTIONS} ${EXTRAKEYS} $< $@
-.c.o:;  ${MKDIR} o ; ${CC} ${CFLAGS} -o $@ $<
 
 clean::
 	${WIPE} s ${WFLAGS}
@@ -66,13 +65,13 @@ clean::
 	${RM} keyconvert
 	@echo ${COMPONENT}: cleaned
 
-keygen: keygen.o throwback.o unicdata.o
+keygen: keygen.c throwback.c unicdata.c
 	${MKDIR} s
-	${CC_HOST} -o $@ keygen.o throwback.o unicdata.o
+	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
-keyconvert: keyconvert.o unicdata.o
+keyconvert: keyconvert.c unicdata.c
 	${MKDIR} s
-	${CC_HOST} -o $@ keyconvert.o unicdata.o
+	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 install: ${LAYOUTS}
 
