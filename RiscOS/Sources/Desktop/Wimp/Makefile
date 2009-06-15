@@ -39,7 +39,7 @@ HEADER2   = WimpSpace
 RESOURCES = manual
 
 SA_FLAGS  =
-ASFLAGS   = -cpu 3 -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
+ASFLAGS   = -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
 
 include StdTools
 include AAsmModule
