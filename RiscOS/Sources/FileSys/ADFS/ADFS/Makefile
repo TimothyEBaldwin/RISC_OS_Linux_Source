@@ -34,7 +34,7 @@ TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
 ROM_SOURCE = ADFS.s
 
-ASFLAGS    = ${OPTIONS} -cpu 5TE
+ASFLAGS    = ${OPTIONS}
 
 include StdTools
 include AAsmModule
