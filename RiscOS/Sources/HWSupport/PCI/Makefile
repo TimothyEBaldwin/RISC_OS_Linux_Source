@@ -34,7 +34,7 @@ TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpTexts
 ROM_SOURCE = GetAll.s
 
-ASFLAGS    = ${OPTIONS} -cpu 4
+ASFLAGS    = ${OPTIONS}
 
 include StdTools
 include AAsmModule
