@@ -196,6 +196,11 @@ dirs:
         ${MKDIR} ${LIBDIR}
         ${MKDIR} ${LIBDIR}.TCPIPLibs
 
+install:
+        ${MKDIR} ${INSTDIR}.TCPIPLibs
+        ${CP} ${LIBDIR}.TCPIPLibs.* ${INSTDIR}.TCPIPLibs.* ${CPFLAGS}
+        @echo ${COMPONENT}: installed
+
 # End of RISC OS Build targets
 #------------------------------------------------------------------------
 
