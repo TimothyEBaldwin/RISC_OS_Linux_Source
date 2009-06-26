@@ -138,6 +138,14 @@ EXPORTS   = \
  ${HDIR}.Global.IO.h.GenericIO \
  ${HDIR}.Global.IO.h.IOMD \
 
+INSTALLS   = \
+ ${INSTDIR}.Hdr.APCS.APCS-32 \
+ ${INSTDIR}.Hdr.APCS.APCS-R \
+ ${INSTDIR}.Hdr.APCS.Common \
+ ${INSTDIR}.Hdr.CPU.Generic26 \
+ ${INSTDIR}.Hdr.CPU.Generic32 \
+ ${INSTDIR}.Hdr.ListOpts \
+
 #
 # Generic rules:
 #
@@ -165,8 +173,25 @@ Dirs:
 	${MKDIR} ${HDIR}.Interface.h
 	${MKDIR} ${LIBDIR}
 
+install: ${INSTALLS} install_Dirs
+
+install_Dirs:
+	${MKDIR} ${INSTDIR}.Hdr.APCS
+	${MKDIR} ${INSTDIR}.Hdr.CPU
+
 clean:
 	@echo ${COMPONENT}: nothing to clean
+
+#
+# Rules for installing:
+#
+
+${INSTDIR}.Hdr.APCS.APCS-32:  hdr.APCS.APCS-32;  ${CP} hdr.APCS.APCS-32  $@ ${CPFLAGS}
+${INSTDIR}.Hdr.APCS.APCS-R:   hdr.APCS.APCS-R;   ${CP} hdr.APCS.APCS-R   $@ ${CPFLAGS}
+${INSTDIR}.Hdr.APCS.Common:   hdr.APCS.Common;   ${CP} hdr.APCS.Common   $@ ${CPFLAGS}
+${INSTDIR}.Hdr.CPU.Generic26: hdr.CPU.Generic26; ${CP} hdr.CPU.Generic26 $@ ${CPFLAGS}
+${INSTDIR}.Hdr.CPU.Generic32: hdr.CPU.Generic32; ${CP} hdr.CPU.Generic32 $@ ${CPFLAGS}
+${INSTDIR}.Hdr.ListOpts:      hdr.ListOpts;      ${CP} hdr.ListOpts      $@ ${CPFLAGS}
 
 #
 # Special rule for exporting all ImageSize, Machine and UserIF files.
