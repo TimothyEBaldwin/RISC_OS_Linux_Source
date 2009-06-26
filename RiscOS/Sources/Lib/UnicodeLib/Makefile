@@ -179,6 +179,11 @@ export: export_${PHASE}
 install_rom: ${TARGET}
 	@echo ${COMPONENT}: rom module installed
 
+install:
+	${MKDIR} ${INSTDIR}.Unicode
+	${CP} ${UNICODELIBDIR}.* ${INSTDIR}.Unicode.* ${CPFLAGS}
+	@echo ${COMPONENT}: installed
+
 clean:
 	${WIPE} o ${WFLAGS}
 	${WIPE} oz ${WFLAGS}
