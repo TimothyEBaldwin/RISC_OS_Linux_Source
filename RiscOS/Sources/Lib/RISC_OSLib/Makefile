@@ -452,17 +452,33 @@ export_hdrs: ${EXP_HDR}.SharedCLib; @
 
 export_libs: ${EXPORTS} dirs; @
 
-install: lib.clib
+install: install-${INSTTYPE}
+
+install-: lib.clib
 	${MKDIR}  ${INSTDIR}
 	${CP} lib.clib ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: ram module installed
+
+install-libraries: lib.ansilib lib.ansilibm o.overmgr lib.stubs lib.risc_oslib lib.riscoslibm
+	${MKDIR}             ${INSTDIR}.CLib.h
+	${CP} CLIB:h.*       ${INSTDIR}.CLib.h.*       ${CPFLAGS}
+	${MKDIR}             ${INSTDIR}.CLib.o
+	${CP} lib.ansilib    ${INSTDIR}.CLib.o.*       ${CPFLAGS}
+	${CP} lib.ansilibm   ${INSTDIR}.CLib.o.*       ${CPFLAGS}
+	${CP} o.overmgr      ${INSTDIR}.CLib.o.*       ${CPFLAGS}
+	${CP} lib.stubs      ${INSTDIR}.CLib.o.*       ${CPFLAGS}
+	${MKDIR}             ${INSTDIR}.RISC_OSLib.h
+	${CP} RISC_OSLib:h.* ${INSTDIR}.RISC_OSLib.h.* ${CPFLAGS}
+	${MKDIR}             ${INSTDIR}.RISC_OSLib.o
+	${CP} lib.risc_oslib ${INSTDIR}.RISC_OSLib.o.* ${CPFLAGS}
+	${CP} lib.riscoslibm ${INSTDIR}.RISC_OSLib.o.* ${CPFLAGS}
+	@echo ${COMPONENT}: libraries installed
 
 install_rom: ${OBJECT}
 	${CP} ${OBJECT} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: rom library installed
 
-clean:
-	@echo ${COMPONENT}: *** NOT cleaned *** run locally if required
+clean: clean_all
 
 clean_all:
 	${WIPE} o.* ${WFLAGS}
