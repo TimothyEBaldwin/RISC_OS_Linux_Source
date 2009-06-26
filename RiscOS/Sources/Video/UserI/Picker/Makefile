@@ -157,6 +157,10 @@ icons.h.hsv_i: Resources.HSV.Templates
 all: ${RAM_MODULE} o.dirs
 	@echo ${FULL_COMPONENT}: Module built (RAM)
 
+install: ${RAM_MODULE} o.dirs
+	${CP} ${RAM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
+	@echo ${FULL_COMPONENT}: Module installed (RAM)
+
 ramtrace: ${DBG_MODULE} o.dirs
 	@echo ${FULL_COMPONENT}: Module built (TRACE)
 
