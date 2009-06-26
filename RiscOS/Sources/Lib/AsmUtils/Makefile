@@ -113,6 +113,11 @@ export: export_${PHASE}
 install_rom: ${TARGET}
 	@echo ${COMPONENT}: rom module installed
 
+install:
+	${MKDIR} ${INSTDIR}.${COMPONENT}
+	${CP} ${LIBDIR}.* ${INSTDIR}.${COMPONENT}.* ${CPFLAGS}
+	@echo ${COMPONENT}: installed
+
 clean:
 	${WIPE} o ${WFLAGS}
 	${WIPE} oz ${WFLAGS}
