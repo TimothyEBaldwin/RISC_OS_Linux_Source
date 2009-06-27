@@ -177,7 +177,7 @@ rm.${COMPONENT}: ${OBJS} ${OSLIB}
 	${MODSQZ} $@
 	Access $@ WR/R
 
-o.msgs oz.msgs: h.ToolAction
+o.msgs oz.msgs o.resource oz.resource o.toolact oz.toolact: h.ToolAction
 
 o.main oz.main: h.modhdr
 
