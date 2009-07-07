@@ -25,6 +25,7 @@ CFLAGS        = -ff -fa
 ROMCDEFINES   = -DROM
 ROMASMDEFINES = -pd "IncludeCLib SETL {TRUE}"
 RES_AREA      = messages_file
+RESFSDIR      = ${RESDIR}.${COMPONENT}
 
 include CModule
 include StdTools
