@@ -30,6 +30,7 @@ CDFLAGS     = -DTRACE=1
 CDEFINES    = -DDRAWFILE
 RAMCDEFINES = -DSTANDALONE
 RES_AREA    = files_messages
+RESFSDIR    = ${RESDIR}.${COMPONENT}
 
 include CModule
 include StdTools
