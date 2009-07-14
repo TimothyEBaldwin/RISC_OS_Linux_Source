@@ -33,6 +33,7 @@ HEADER1   = ${COMPONENT}
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
 ROM_SOURCE = s.Hdr_fst
+RESOURCES  = No
 
 include StdTools
 include AAsmModule
@@ -42,6 +43,6 @@ include AAsmModule
 #
 clean::
 	${WIPE} o ${WFLAGS}
-	@@echo ${COMPONENT}: cleaned 
+	@@echo ${COMPONENT}: cleaned
 
 # Dynamic dependencies:
