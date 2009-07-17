@@ -460,18 +460,22 @@ install-: lib.clib
 	@echo ${COMPONENT}: ram module installed
 
 install-libraries: lib.ansilib lib.ansilibm o.overmgr lib.stubs lib.risc_oslib lib.riscoslibm
-	${MKDIR}             ${INSTDIR}.CLib.h
-	${CP} CLIB:h.*       ${INSTDIR}.CLib.h.*       ${CPFLAGS}
-	${MKDIR}             ${INSTDIR}.CLib.o
-	${CP} lib.ansilib    ${INSTDIR}.CLib.o.*       ${CPFLAGS}
-	${CP} lib.ansilibm   ${INSTDIR}.CLib.o.*       ${CPFLAGS}
-	${CP} o.overmgr      ${INSTDIR}.CLib.o.*       ${CPFLAGS}
-	${CP} lib.stubs      ${INSTDIR}.CLib.o.*       ${CPFLAGS}
-	${MKDIR}             ${INSTDIR}.RISC_OSLib.h
-	${CP} RISC_OSLib:h.* ${INSTDIR}.RISC_OSLib.h.* ${CPFLAGS}
-	${MKDIR}             ${INSTDIR}.RISC_OSLib.o
-	${CP} lib.risc_oslib ${INSTDIR}.RISC_OSLib.o.* ${CPFLAGS}
-	${CP} lib.riscoslibm ${INSTDIR}.RISC_OSLib.o.* ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.CLib.h
+	${CP} CLIB:h.*            ${INSTDIR}.CLib.h.*                  ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.CLib.o
+	${CP} lib.ansilib         ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${CP} lib.ansilibm        ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${CP} o.overmgr           ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${CP} lib.stubs           ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h
+	${CP} RISC_OSLib:h.*      ${INSTDIR}.RISC_OSLib.h.*            ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h.EditIntern
+	${CP} rlib.EditIntern.h.* ${INSTDIR}.RISC_OSLib.h.EditIntern.* ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.s
+	${CP} s.modulewrap        ${INSTDIR}.RISC_OSLib.s.modulewrap   ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.o
+	${CP} lib.risc_oslib      ${INSTDIR}.RISC_OSLib.o.*            ${CPFLAGS}
+	${CP} lib.riscoslibm      ${INSTDIR}.RISC_OSLib.o.*            ${CPFLAGS}
 	@echo ${COMPONENT}: libraries installed
 
 install_rom: ${OBJECT}
