@@ -2111,15 +2111,9 @@ err_t SMB_GetFreeSpace ( char lettr, struct disk_size_response *pDSR  )
 /* ------------------------------- */
 
 #ifdef LONGNAMES
-
-/* Note.
- *
- * Requesting close_if_done doesn't seem to work (at least on NT 4.0 SP3)
- *
- */
 enum {
   ffirst_FORCE_CLOSE = 1,
-  ffirst_CLOSE_IF_DONE = 2,
+  ffirst_CLOSE_IF_DONE = 2, /* Note close_if_done doesn't seem to work (at least on NT 4.0 SP3) */
   ffirst_RETURN_KEYS = 4,
   fnext_CONTINUE = 8, /* This bit allows continuation without the need to use resume keys */
   ffirst_BACKUP_INTENT = 16
@@ -2142,8 +2136,8 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
   int n_read = 0;
   int eos;
   int i;
-  int flags;
   const int first_flags = ffirst_RETURN_KEYS;
+  const int stuck_flags = ffirst_RETURN_KEYS | fnext_CONTINUE;
   const int next_flags  = ffirst_RETURN_KEYS;
   bool path_changed = false;
   bool taken;
@@ -2171,39 +2165,44 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
     /* Initial search - note we accept SIX return parameters - contrary to
      * Microsoft's own document - because it doesn't work if you only pass 5. Grr.
      */
-    flags = first_flags;
-    Transact_init(&con->tp, 6 * 2);           /* will accept 6 WORD return params */
+    Transact_init(&con->tp, 6 * 2);                /* will accept 6 WORD return params */
     Transact_addsetupword(&con->tp, TRANSACT2_FINDFIRST);
-    if (LM_Vars.namemode & NM_INTERNAL) {
-      Transact_addword(&con->tp, ATTR_DIR | ATTR_SYS | ATTR_HID);     /* findfirst_Attribute */
+    if (LM_Vars.namemode & NM_INTERNAL) {          /* findfirst_Attribute */
+      Transact_addword(&con->tp, ATTR_DIR | ATTR_SYS | ATTR_HID);
     }
     else {
-      Transact_addword(&con->tp, ATTR_DIR);   /* findfirst_Attribute */
+      Transact_addword(&con->tp, ATTR_DIR);
     }
-    Transact_addword(&con->tp, count);        /* findfirst_SearchCount */
-    Transact_addword(&con->tp, first_flags);  /* findfirst_flags */
-    Transact_addword(&con->tp, 1);            /* Search level  */
-    Transact_addlong(&con->tp, 0L);           /* reserved, MBZ */
-    Transact_addstring(&con->tp, path+2);     /* findfirst_FileName[] */
+    Transact_addword(&con->tp, count);             /* findfirst_SearchCount */
+    Transact_addword(&con->tp, first_flags);       /* findfirst_flags */
+    Transact_addword(&con->tp, 1);                 /* Search level  */
+    Transact_addlong(&con->tp, 0L);                /* reserved, MBZ */
+    Transact_addstring(&con->tp, path+2);          /* findfirst_FileName[] */
     res = SMB_Transact2(hS, &con->tp);
     if (res != OK)
       return res;
     p = con->tp.parms_out_buf;
     con->dir_handle = Transact_getword(p); p += 2;
     con->dir_handle_valid = true;
+    con->resume_fake = 0;
+    con->resume_key_stuck = false;
     debug1("SMB_ReadDirEntriesX2 -> new dir handle %x\n", con->dir_handle);
   }
   else {
     /* Continuation */
-    con->resume_key_encountered = true;
-    flags = next_flags;
     Transact_init(&con->tp, 4 * 2);                /* will accept 4 WORD return params */
     Transact_addsetupword(&con->tp, TRANSACT2_FINDNEXT);
     Transact_addword(&con->tp, con->dir_handle);   /* findnext_DirHandle */
     Transact_addword(&con->tp, count);             /* findnext_SearchCount */
     Transact_addword(&con->tp, 1);                 /* Search level  */
     Transact_addlong(&con->tp, con->resume_key);   /* Resume key from previous */
-    Transact_addword(&con->tp, next_flags);        /* findnext_flags */
+    if (con->resume_key_stuck) {
+      Transact_addword(&con->tp, stuck_flags);     /* Set continuation bit as NTFS maintains the position */
+    }
+    else {
+      Transact_addword(&con->tp, next_flags);      /* Jump to place using the resume key */
+      con->resume_key_encountered = true;
+    }
     Transact_addstring(&con->tp, "");              /* no name needed */
     debug1("SMB_ReadDirEntriesX2 -> continue with key %08x\n", con->resume_key);
     res = SMB_Transact2(hS, &con->tp);
@@ -2216,15 +2215,14 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
   eos = Transact_getword(p); p += 2;
   if (eos)
     debug0(">> Server said it was the end of the search operation\n");
-
   p = con->tp.data_out_buf;
+  if (n_read == 0)
+    return ENOMOREFILES;
+
   /* At this point, p is pointing to the start of the returned data
    * buffer, n_read contains the number of files known to be in the
    * return buffer, eos is non-zero if the search is completed.
    */
-  if (n_read == 0)
-    return ENOMOREFILES;
-
   for (i = 1; i <= n_read; i++) {
     int length;
     DWORD next_resume_key;
@@ -2232,7 +2230,20 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
     /* Get next resume key */
     next_resume_key = Transact_getlong(p); p += 4;
     length = p[22];
+    con->resume_fake++;
 
+    /* Special case . and .. so the duff resume key detection doesn't see them */
+    if ( ((p[22] == 1) && (p[23] == '.') && (p[24] == 0)) ||
+         ((p[22] == 2) && (p[24] == '.') && (p[25] == 0) && (p[23] == '.')) ) {
+      p += 23 + length + 1;
+      continue;
+    }
+
+    /* Workaround for NTFS always returning zero */
+    con->resume_key_stuck = (next_resume_key == 0) ? true : false;
+    if (con->resume_key_stuck) next_resume_key = con->resume_fake;
+
+    /* Either consume the name or keep waiting for sync */
     if ( con->resume_key_encountered ) {
       debug1("SMB_ReadDirEntriesX2 -> call back with key %08x\n", next_resume_key);
       res = dirfn(p, 1, &taken, private);
