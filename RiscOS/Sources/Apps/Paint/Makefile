@@ -220,13 +220,13 @@ asms: ${ASMS}
 incs: ${INCS}
 
 clean_all:
-	Access ${INSTDIR}.!Boot      rw/rw
-	Access ${INSTDIR}.!Help      rw/rw
-	Access ${INSTDIR}.!Run       rw/rw
-	Access ${INSTDIR}.!RunImage  rw/rw
-	Access ${INSTDIR}.Messages   rw/rw
-	Access ${INSTDIR}.Sprites    rw/rw
-	Access ${INSTDIR}.Templates  rw/rw
+	x Access ${INSTDIR}.!Boot      rw/rw
+	x Access ${INSTDIR}.!Help      rw/rw
+	x Access ${INSTDIR}.!Run       rw/rw
+	x Access ${INSTDIR}.!RunImage  rw/rw
+	x Access ${INSTDIR}.Messages   rw/rw
+	x Access ${INSTDIR}.Sprites    rw/rw
+	x Access ${INSTDIR}.Templates  rw/rw
 	Destroy ${OBJS} ${OBJSZ} ${OBJSD} o.ModuleWrap \
         ${APP}.!RunImage \
         debug.${APP}.!RunImage \
