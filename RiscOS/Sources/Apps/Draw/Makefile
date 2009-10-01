@@ -243,14 +243,14 @@ map:
 	${LD} -map -rmf -base 0 -o null: ${OBJS} ${LIBS} > map.base0
 
 clean_all:
-	-Access ${INSTDIR}.!Boot     rw/rw
-	-Access ${INSTDIR}.!Help     rw/rw
-	-Access ${INSTDIR}.!Run      rw/rw
-	-Access ${INSTDIR}.!RunImage rw/rw
-	-Access ${INSTDIR}.!Sprites  rw/rw
-	-Access ${INSTDIR}.Messages  rw/rw
-	-Access ${INSTDIR}.Sprites   rw/rw
-	-Access ${INSTDIR}.Templates rw/rw
+	x Access ${INSTDIR}.!Boot     rw/rw
+	x Access ${INSTDIR}.!Help     rw/rw
+	x Access ${INSTDIR}.!Run      rw/rw
+	x Access ${INSTDIR}.!RunImage rw/rw
+	x Access ${INSTDIR}.!Sprites  rw/rw
+	x Access ${INSTDIR}.Messages  rw/rw
+	x Access ${INSTDIR}.Sprites   rw/rw
+	x Access ${INSTDIR}.Templates rw/rw
 	Destroy ${OBJS} ${OBJSD} ${ASMS} ${ROM_MODULE} ${MODULE} abs.!RunImage \
          s.AppName s.ModuleWrap s.ResFiles \
          Debug.RM.!Draw ${INSTDIR}.!Boot ${INSTDIR}.!Help \
