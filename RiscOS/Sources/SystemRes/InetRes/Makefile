@@ -125,6 +125,7 @@ NETUTILS = \
         ${RDIR}.!Boot                 \
         ${RDIR}.!Run                  \
         ${RDIR}.!Sprites              \
+        ${RDIR}.!Sprites11            \
         ${RDIR}.!Sprites22            \
 
 #
@@ -168,8 +169,11 @@ install_: ${DISCFILES} dirs
         ${AWK} -f awk.Version ${RDIR}.!Run > ${INSTAPP}.!Run
         SetType ${INSTAPP}.!Run Obey
         ${CP} ${RDIR}.!Sprites   ${INSTAPP}.!Sprites   ${CPFLAGS}
+        ${CP} ${RDIR}.!Sprites11 ${INSTAPP}.!Sprites11 ${CPFLAGS}
         ${CP} ${RDIR}.!Sprites22 ${INSTAPP}.!Sprites22 ${CPFLAGS}
         ${CP} ${RDIR}.files      ${INSTAPP}.files      ${CPFLAGS}
+        ${AWK} -f awk.Version ${RDIR}.files.AUNMap > ${INSTAPP}.files.AUNMap
+        SetType ${INSTAPP}.files.AUNMap Obey
         ${CP} ${RDIR}.utils      ${INSTAPP}.utils      ${CPFLAGS}
         |
         ${CP} ${SDIR}.map-mbone.Map-MBone   ${INSTAPP}.bin.Map-MBone    ${CPFLAGS}
@@ -229,6 +233,7 @@ resources-NetUtils: ${NETUTILS}
         ${AWK} -f awk.Version ${RDIR}.!Run > ${RESD}.!Run
         SetType ${RESD}.!Run Obey
         ${CP} ${RDIR}.!Sprites              ${RESD}.!Sprites   ${CPFLAGS}
+        ${CP} ${RDIR}.!Sprites11            ${RESD}.!Sprites11 ${CPFLAGS}
         ${CP} ${RDIR}.!Sprites22            ${RESD}.!Sprites22 ${CPFLAGS}
 
 resources-EmergencyUtils: ${EMERGENCYUTILS}
