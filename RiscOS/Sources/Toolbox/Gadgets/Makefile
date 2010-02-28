@@ -50,8 +50,8 @@ CP      = copy
 LD      = link
 RM      = remove
 WIPE    = x wipe
-CD	= dir
-CHMOD	= access
+CD      = dir
+CHMOD   = access
 
 #FEATURES   = -zM -zps1 -g ${DFLAGS}
 FEATURES   = -zM -zps1 -ffah ${DFLAGS}
@@ -64,7 +64,7 @@ CHMODFLAGS = RW/R
 
 DFLAGS  = -D${SYSTEM}_BUILD #-DUSE_TINY ${DEBUG}
 
-INCLUDES = -IC:tboxlibint,C:tboxlibs,C:
+INCLUDES = -IC:tboxlibint,tbox:,C:
 
 
 # ------------------------------------------------------------------------------
