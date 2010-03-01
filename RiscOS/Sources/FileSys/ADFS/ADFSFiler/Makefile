@@ -39,6 +39,10 @@ resources_SCSIFiler: ${MERGEDMSGS}
 	IfThere LocalRes:^.Zip11 Then ${CP} LocalRes:^.Zip11 ${RESFSDIR}.Sprites11 ${CPFLAGS}
 	IfThere LocalRes:^.Zip22 Then ${CP} LocalRes:^.Zip22 ${RESFSDIR}.Sprites22 ${CPFLAGS}
 
+ifeq (${SCSITEMPLATES},yes)
+resources_SCSIFiler: resources_templates
+endif
+
 o.${MACHINE}._Messages_.ADFSFiler:
 	${MKDIR} ${MERGEDMDIR}
 	${TOUCH} $@
