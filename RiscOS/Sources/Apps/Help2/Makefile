@@ -54,6 +54,7 @@ LD      = link
 CP      = copy
 RM      = remove
 SQUISH  = squish
+SQZ     = squeeze
 WIPE    = -wipe
 XWIPE   = x wipe
 PERL    = do <Perl$Dir>.perl
@@ -158,6 +159,7 @@ clean:
 
 Resources.!RunImage: ${OBJS} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} ${CLIB}
 	${LD} -o $@ ${OBJS} ${CLIB} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} 
+	${SQZ} ${SQZFLAGS} $@
 
 ${MODULE}: ${FILES} ${VERSION}
 	   ${MKDIR} rm
