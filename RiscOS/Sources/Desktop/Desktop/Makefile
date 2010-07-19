@@ -30,7 +30,7 @@ resources:
 	${CP}  LocalRes:Messages ${RESFSDIR}.Messages        ${CPFLAGS}
 	${CAT} LocalRes:CmdHelp { >> ${RESFSDIR}.Messages }
 	${CP}  LocalRes:Templates ${RESFSDIR}.Templates      ${CPFLAGS}
-	${CP}  LocalRes:<UserIF>.Sprites ${RESFSDIR}.Sprites ${CPFLAGS}
+	${SQUASH} LocalRes:<UserIF>.Sprites ${RESFSDIR}.Sprites
 
 include StdTools
 include AAsmModule
