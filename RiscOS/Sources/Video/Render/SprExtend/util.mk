@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for genpalette, genyuvtabs and makejhdr
+# Makefile for genpalette, genyuvtabs and genjhdr
 
 TARGET   = utils.${COMPONENT}
 OBJS     = ${COMPONENT}

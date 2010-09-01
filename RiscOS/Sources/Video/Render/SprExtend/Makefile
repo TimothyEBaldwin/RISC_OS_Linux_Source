@@ -69,7 +69,7 @@ SFILES =\
  s.yuvtabs
 
 # Extra utilites (generate assembler code)
-MAKEJHDR   = utils.makejhdr
+GENJHDR    = utils.genjhdr
 GENPALETTE = utils.genpalette
 GENYUVTABS = utils.genyuvtabs
 
@@ -119,7 +119,7 @@ clean:
         ${RM} ${LOCALMSG}
         ${RM} ${GENPALETTE}
         ${RM} ${GENYUVTABS}
-        ${RM} ${MAKEJHDR}
+        ${RM} ${GENJHDR}
         ${RM} ${CFSI-JPEG}
         ${WIPE} o.* ${WFLAGS}
         ${WIPE} oh.* ${WFLAGS}
@@ -163,8 +163,8 @@ s.yuvtabs: ${GENYUVTABS}
 s.stdpalette: ${GENPALETTE}
         ${RUN}${GENPALETTE} > $@
 
-s.jhdr: ${MAKEJHDR}
-        ${RUN}${MAKEJHDR} > $@
+s.jhdr: ${GENJHDR}
+        ${RUN}${GENJHDR} > $@
 
 ${GENPALETTE}: c.genpalette
         ${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
@@ -172,8 +172,8 @@ ${GENPALETTE}: c.genpalette
 ${GENYUVTABS}: c.genyuvtabs
         ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
-${MAKEJHDR}: c.makejhdr
-        ${MAKE} -f util/mk COMPONENT=makejhdr THROWBACK=${THROWBACK}
+${GENJHDR}: c.genjhdr
+        ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 #
 # For ChangeFSI:
 #
