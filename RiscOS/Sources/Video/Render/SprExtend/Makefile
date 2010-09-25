@@ -27,6 +27,8 @@
 # 01-Feb-95  GPS     Now compiles with cc505
 # 13-Feb-95  GPS     CFSIjpeg now compiles with cc505
 # 15-May-01  SNB     Re-engineered to use objasm throughout, not aasm
+# 25-Sep-10  RPS     Now objasm is used, no need to postprocess C code
+#                    as assembler with 'sed', just use the linker
 #
 
 #
@@ -37,9 +39,7 @@ EXP_HDR = <export$dir>
 # To switch between making debugging and non-debugging versions of SprExtend:
 #   change the #define of DEBUG at the top of c.PutScaled
 #   change the SETL of 'debug' in sources.SprExtend.
-
 CDEFINES = -DRISCOS -DASMHUFF
-#CDEFINES += -DDEBUG
 CINCLUDES = -IC:
 
 #
@@ -63,10 +63,9 @@ LOCALMSG  = rm.${TARGET}M
 EXPORTS   = ${EXP_HDR}.SprExtend
 
 SFILES =\
- s.jhdr\
- s.putscaled\
- s.stdpalette\
- s.yuvtabs
+ jhdr.s\
+ stdpalette.s\
+ yuvtabs.s
 
 # Extra utilites (generate assembler code)
 GENJHDR    = utils.genjhdr
@@ -134,78 +133,58 @@ resources:
 
 
 ROM_OBJECT  = ${TARGET}.o
-${ROM_OBJECT}: ${ROM_SOURCE} ${SFILES}
+${ROM_OBJECT}: ${ROM_SOURCE} ${SFILES} putscaled.o
         do mkdir -p o
         ${AS} ${ASFLAGS} -o $@ ${ROM_SOURCE}
 ${ROM_TARGET}: ${ROM_OBJECT}
-        ${LD} -o $@ -rmf ${ROM_OBJECT}
+        ${LD} -o $@ -rmf ${ROM_OBJECT} putscaled.o
 
 # Get the Messages from somewhere other than Resources:$.Resources.SprExtend
 LCL_OBJECT = ${TARGET}M.o
 ${LOCALMSG}: ${LCL_OBJECT}
-        ${LD} -rmf -o $@ ${LCL_OBJECT}
-${LCL_OBJECT}: ${ROM_SOURCE} ${SFILES}
+        ${LD} -rmf -o $@ ${LCL_OBJECT} putscaled.o
+${LCL_OBJECT}: ${ROM_SOURCE} ${SFILES} putscaled.o
         ${AS} ${ASFLAGS} -o $@ ${ROM_SOURCE} -PD "localmessages SETL {TRUE}"
 
 # Export the SWI definitions to Hdr:
 ${EXP_HDR}.SprExtend: hdr.SprExtend
         ${CP} hdr.SprExtend $@ ${CPFLAGS}
-#
-# Generate the SFILES
-#
-.c.s:;  ${CC} -S ${CFLAGS} ${TFLAGS} -ff -zps1 -DEMBED -DSOURCE_IS_$* $*.c
-        ${SED} -e /IMPORT/d -e /dataseg/d -e /codeseg/d -e /AREA/d < s.$* > s.temp
-        ${CP} s.temp s.$* ${CPFLAGS}d
         
-s.yuvtabs: ${GENYUVTABS}
+#
+# Generate the SFILES:
+#
+yuvtabs.s: ${GENYUVTABS}
         ${RUN}${GENYUVTABS} > $@
 
-s.stdpalette: ${GENPALETTE}
+stdpalette.s: ${GENPALETTE}
         ${RUN}${GENPALETTE} > $@
 
-s.jhdr: ${GENJHDR}
+jhdr.s: ${GENJHDR}
         ${RUN}${GENJHDR} > $@
 
-${GENPALETTE}: c.genpalette
+${GENPALETTE}: genpalette.c
         ${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
 
-${GENYUVTABS}: c.genyuvtabs
+${GENYUVTABS}: genyuvtabs.c
         ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
-${GENJHDR}: c.genjhdr
+${GENJHDR}: genjhdr.c
         ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
+
 #
 # For ChangeFSI:
 #
-${CFSI-JPEG}: Sources.cfsi-jpeg s.jhdr s.rojpeg s.stdpalette
-        ${AS} ${ASFLAGS} -o o.cfsi-jpeg Sources.cfsi-jpeg
-        ${LD} -bin -o $@ o.cfsi-jpeg
+${CFSI-JPEG}: Sources.CFSI-JPEG jhdr.s stdpalette.s rojpeg.o
+        ${AS} ${ASFLAGS} -o cfsi-jpeg.o Sources.CFSI-JPEG
+        ${LD} -bin -o $@ cfsi-jpeg.o rojpeg.o
 
 #
-# Other bits:
+# Standalone C code (no library calls) for the assembler to use:
 #
-j2s: o.j2s o.jdhuff o.jrevdct o.jcconv o.diffuse
-        ${LD} -o $@ o.j2s o.jdhuff o.jrevdct o.jcconv o.diffuse ${CLIB}
+rojpeg.o:
+        ${CC} ${CFLAGS} ${TFLAGS} -ff -zps1 -DEMBED -DSOURCE_IS_rojpeg $*.c
 
-o.diffuse: sources.diffuseo s.stdpalette
-        ${AS} ${ASFLAGS} -from sources.diffuseo -to $@
-
-o.jcconv: sources.jcconvo s.yuvtabs
-        ${AS} ${ASFLAGS} -from sources.jcconvo -to $@
-
-o.jdhuff: sources.jdhuffo s.jhdr
-        ${AS} ${ASFLAGS} -from sources.jdhuffo -to $@
-
-o.jrevdct: sources.jrevdcto
-        ${AS} ${ASFLAGS} -from sources.jrevdcto -to $@
-
-put: o.put
-        ${LD} -o $@ o.put ${CLIB}
-
-jput: o.jput
-        ${LD} -o $@ o.jput ${CLIB}
-
-tdct: o.testdct o.idcto
-        ${LD} -o $@ o.testdct o.idcto ${CLIB}
+putscaled.o:
+        ${CC} ${CFLAGS} ${TFLAGS} -ff -zps1 -DEMBED -DSOURCE_IS_putscaled $*.c
 
 # Dynamic dependencies:
