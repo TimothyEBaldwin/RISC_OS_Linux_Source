@@ -15,20 +15,12 @@ this archive as Licence_v1.pdf), or see:
   http://www.castle-technology.co.uk/riscosbaselicence.htm
 
 
-U-Boot scripts
-==============
+How to install the ROM image
+============================
 
-In addition to the ROM image, this archive also contains a set of U-Boot scripts to allow you to easily boot RISC OS on machines that use the U-Boot bootloader (e.g. BeagleBoard, IGEPv2, Touch Book, etc.)
+The easiest way to install the ROM image onto an SD card is to use the included !SDCreate application. If you have the RISC OS 5 USB mass storage drivers then !SDCreate can write the image straight to an SD card. Alternatively you can create a disc image file which can then be written to a card using any ordinary Windows/Linux/Mac PC. For more information, including a description of the SD card structure, see the !SDCreate help file or the RISC OS Open wiki:
 
-In the U-Boot_scripts folder, find the script that corresponds to your machine type and copy it to an SD card along with the RISC OS ROM image. Note that you must also rename the boot script to 'boot.scr' so that U-Boot will find it (with a few exceptions - see below)
-
-Notes:
-* Owners of IGEPv2 boards must name the script 'boot.ini'
-* If your board contains a version of u-boot prior to 2009.01, the script may instead have to be named 'reset.scr'
-* Also note that 'boot.scr' is the Unix/Windows name of the file - if you're using RISC OS to copy the file you'll obviously have to copy it as 'boot/scr' instead (or 'boot/ini', etc.)
-* If you use Windows to copy the file, please make sure that 'Hide extensions for known file types' is not enabled in your Folder Options, otherwise you may inadvertently copy the script as 'boot.scr.scr'!
-
-For the curious, the 'source' folder contains the source code for the U-Boot scripts, along with an explanation of how they function.
+  http://www.riscosopen.org/wiki/documentation/pages/Using+the+Cortex-A8+port
 
 
 -- RISC OS Open
