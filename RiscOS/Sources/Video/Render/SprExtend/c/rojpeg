@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include "swis.h"
 #include "commondefs.h"
+#include "jinclude.h"
 #include "rojpeg.h"
 
 /* ----------------- surrogate C library stuff, if embedded use within RISC OS ----------------- */
@@ -31,7 +32,6 @@ assembler. It makes use of facilities provided by c.PutScaled for trace output,
 since the two in factshare the same namespace. */
 #ifdef EMBED
 
-extern void exit(int reason); /* Provided by assembler */
 
 extern void *memcpy(void *dest, const void *src, size_t n)
 {
@@ -39,15 +39,6 @@ extern void *memcpy(void *dest, const void *src, size_t n)
   char *s = (char*) src;
 
   while (n-- > 0) *d++ = *s++;
-  return dest;
-}
-
-extern char *strcpy(char *dest, const char *src)
-{
-  char *d = (char*) dest;
-  char *s = (char*) src;
-
-  while (*s > 31) *d++ = *s++;
   return dest;
 }
 
@@ -63,9 +54,9 @@ extern void *memset(void *s, int c, size_t n)
 /* Debug only has an effect if embedded. */
 
 #ifndef assert
-  #define assert(x, y) do_assert(__LINE__, x, y, 0)
-#endif
+#define assert(x, y) do_assert(__LINE__, x, y, NULL)
 extern void do_assert(int line, BOOL arg, int error, char *describe); /* defined in c.PutScaled */
+#endif
 
 #ifndef tracef
 #define _ ,
@@ -87,10 +78,10 @@ extern void sprintf(char *d, char *format, ...); /* defined in c.PutScaled */
 #define newline() ((void) 0)
 #endif
 #ifndef assert
-#define assert(x, y) do_assert(__LINE__, x, y, 0)
+#define assert(x, y) do_assert(__LINE__, x, y, NULL)
 static void do_assert(int line, BOOL arg, int error, char *describe)
 {
-  if (arg == 0)
+  if (!arg)
   {
     tracef("ASSERTION FAILED (line %i): %s\n" _ line _ describe);
     exit(error);
@@ -115,14 +106,6 @@ j2s can turn on/off the comments dynamically */
 
 #endif
 
-#ifdef ASMHUFF
-extern void panic_exit(int i)
-{
-  tracef("Assembler panic exit %i.\n" _ i);
-  exit(i);
-}
-#endif
-
 /* ----------------- 'global' facilities declared within nested c files ----------------- */
 
 #include "jrdjfif.c"
@@ -134,7 +117,7 @@ extern void panic_exit(int i)
 
 /* Reassert this file ID, for error exit identification */
 #undef FILE_
-#define FILE_ (10000)
+#define FILE_ (40000)
 
 /* ----------------- Assembler debug assistance ----------------------------- */
 
@@ -163,23 +146,196 @@ being painted. */
 
 
 /* ----------------- JPEG entrypoints and control ----------------------------- */
+#ifndef CFSI
+static int palette_is_grey(int *palette, int entries); /* In c.PutScaled */
 
-#if 0
-static int jpeg_workspace_size(void)
-/* Return size of workspace needed */
+static void check_jpeg_workspace(asm_workspace *wp, int jpeg_ws_size)
+/* Check (and adjust) the workspace needed */
 {
-  int s;
+  decompress_info_ptr cinfo = wp->jpeg_info_ptr;
 
-#if 0
-  s = sizeof(struct decompress_info_struct)
-    + 3 * sizeof(jpeg_component_info)          /* max of 3 components allowed */
-    + NUM_QUANT_TBLS * sizeof(QUANT_TBL)
-    + 2 * NUM_HUFF_TBLS * sizeof(HUFF_TBL);
+#ifdef DYNAMIC_AREA
+  if (!cinfo)
+  {
+    _kernel_oserror *error;
+    int              area_no, size;
+
+    tracef("Creating JPEG Dynamic Area\n");
+    area_no = create_dynamic_area(jpeg_ws_size);
+    assert(area_no != 0, ERROR_NO_MEMORY);
+    error = _swix(OS_ReadDynamicArea, _IN(0) | _OUT(0) | _OUT(1), area_no, &cinfo, &size);
+    tracef("JPEG Dynamic area no %d is %x bytes big\n" _ area_no _ size);
+    assert(error == NULL, ERROR_FATAL);
+    wp->jpeg_info_ptr = cinfo;
+    wp->area_number = area_no;
+    cinfo->error_code = -1;                      /* mark the workspace entirely uninitialised */
+    cinfo->workspace_size = size;
+  }
+  else
+  {
+    _kernel_oserror *error;
+    int              size;
+
+    tracef("JPEG area exists\n");
+    error = _swix(OS_ReadDynamicArea, _IN(0) | _OUT(1), wp->area_number, &size);
+    tracef("JPEG area is %x bytes big\n" _ size);
+    assert(error == NULL, ERROR_FATAL);
+    if ((size > 0) && (size != cinfo->workspace_size))
+    {
+      cinfo->error_code = -1;
+      cinfo->workspace_size = size;
+      tracef("Area was resized behind our back, marking area as duff\n");
+    }
+    if (size < jpeg_ws_size)      /* Need to grow area */
+    {
+      _kernel_oserror *error;
+      int              bytes_moved;
+      
+      error = _swix(OS_ChangeDynamicArea, _IN(0) | _IN(1) | _OUT(1),
+                    wp->area_number, jpeg_ws_size - size, &bytes_moved);
+      tracef("JPEG area grown by %x bytes\n" _ bytes_moved);
+      assert(error == NULL, ERROR_NO_MEMORY);
+      cinfo->error_code = -1;                    /* mark the workspace entirely uninitialised */
+      cinfo->workspace_size = size + bytes_moved;
+      tracef("JPEG area size recorded as %x bytes\n" _ cinfo->workspace_size);
+    }
+  }
 #else
-  s = sizeof(struct decompress_info_struct);
+  if (!cinfo)
+  {
+    cinfo = malloc(jpeg_ws_size);                /* Allocate space on RMA */
+    assert(cinfo != NULL, ERROR_NO_MEMORY);      /* >>>> Got to be a better way of returning this error! */
+    wp->jpeg_info_ptr = cinfo;
+    cinfo->error_code = -1;                      /* mark the workspace entirely uninitialised */
+    cinfo->workspace_size = jpeg_ws_size;
+  }
+  else
+  {
+    if (cinfo->workspace_size < jpeg_ws_size)    /* Need to realloc */
+    {
+      cinfo = realloc_delta(cinfo, jpeg_ws_size - cinfo->workspace_size);
+      assert(cinfo != 0, ERROR_NO_MEMORY);       /* >>>> Got to be a better way of returning this error! */
+      wp->jpeg_info_ptr = cinfo;
+      cinfo->error_code = -1;                    /* mark the workspace entirely uninitialised */
+      cinfo->workspace_size = jpeg_ws_size;
+    }
+  }
 #endif
-  tracef("Workspace block - %i bytes\n" _ s); /* 18776 at 27-oct-93 */
-  return s;
+}
+
+static int jpeg_decompressor_opts(decompress_info_ptr cinfo, asm_workspace *wp)
+/* Deduce the decompressor options */
+{
+  int opt = 0;
+  
+  /* JPEG decompression options */
+  if (wp->BPP < 4)
+  {
+    opt |= jopt_GREY; /* greyscale if 4bpp or less */
+    if ((wp->save_PdriverIntercept & 2) == 0) /* printing is not on */
+      wp->ColourTTR = 0; /* don't use trans table for 4bpp or less, results are naff */
+  }
+  if ((wp->BPP <=8) && (wp->dither_truecolour & 2))
+  {
+    opt |= jopt_DIFFUSE;
+    wp->ColourTTR = 0;
+  }
+  if ((wp->save_xadd - wp->save_xdiv) * 6 <= wp->save_xdiv &&
+      (wp->save_yadd - wp->save_ydiv) * 6 <= wp->save_ydiv)
+    opt |= jopt_DC_ONLY; /* postage stamp - go faster, do only DC values of JPEG tiles */
+
+  if (wp->BPP == 8)
+  {
+    int temp;
+    int size;
+
+    _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) | _OUT(3),
+                                   -1, -1, 0, 256*4, 0, &size); /* save palette into newtranstable area */
+    tracef("need %x bytes for palette\n" _ size);
+    _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4),
+                                   -1, -1, &(wp->newtranstable[0]), size, 0); /* save palette into newtranstable area */
+    temp = palette_is_grey(wp->newtranstable, size/4);
+    if (temp) opt |= jopt_GREY;
+    if (temp == 2)
+    {
+      opt |= jopt_OUTBPP_8GREY;
+      opt &= ~jopt_DIFFUSE;
+    }
+  }
+  if ((wp->save_PdriverIntercept & 2) == 0 && (wp->dither_truecolour & 1)) /* old format palette and printing is not on */
+  {
+    int  size;
+
+    if ((wp->dither_truecolour & 2) && wp->BPP < 16)
+    {
+#ifdef DEBUG
+      int loop;
+#endif
+      tracef("trying new shiny 8BPP plotting technique\n");
+      _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) | _OUT(3),
+                                     -1, -1, 0, 256*4, 0, &size); /*save palette into newtranstable area */
+      tracef("need %x bytes for palette\n" _ size);
+      _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4),
+                                     -1, -1, &(wp->newtranstable[0]), size, 0); /*save palette into newtranstable area */
+      tracef("created palette at %x\n" _ &(wp->newtranstable[0]));
+#ifdef DEBUG
+      tracef("Read palette, palette entries are:-\n");
+      for(loop = 0;loop<size/4;loop++)
+        tracef("Entry %d = %x\n" _ loop _ wp->newtranstable[loop]);
+#endif
+      if (wp->BPP == 4)
+      {
+        if (palette_is_grey(wp->newtranstable, size/4)) opt |= jopt_GREY;
+      }
+      else if (wp->BPP == 8)
+      {
+        int temp;
+
+        temp = palette_is_grey(wp->newtranstable, size/4);
+        if (temp) opt |= jopt_GREY;
+        if (temp == 2)
+        {
+          opt |= jopt_OUTBPP_8GREY;
+          opt &= ~jopt_DIFFUSE;
+        }
+      }
+    }
+
+    if ((wp->BPP == 4) && !(wp->dither_truecolour & 2)) opt |= jopt_GREY;
+
+    if (wp->BPP == 8)
+    {
+      if ((wp->dither_truecolour & 2) && !(opt & jopt_OUTBPP_8GREY))
+      {
+        opt |= jopt_OUTBPP_8;                        /* full error diffusion */
+        cinfo->error_code = -1;                      /* mark the workspace entirely uninitialised */
+      }
+      else
+      {
+        int modeflags;
+
+        _swix(OS_ReadModeVariable, _IN(0) | _IN(1) | _OUT(2), -1, 0, &modeflags);
+        if ((modeflags & (1<<7)) == 0)
+          opt |= jopt_OUTBPP_8YUV;                   /* strange diffusion from YUV data */
+      }
+    }
+    else if (wp->BPP == 16)
+      opt |= jopt_OUTBPP_16;
+  }
+
+#ifdef DEBUG
+  tracef("After set up, options are:\n");
+  if (opt & jopt_GREY) tracef("   jopt_GREY\n");
+  if (opt & jopt_DC_ONLY) tracef("   jopt_DC_ONLY\n");
+  if (opt & jopt_INTERP_X) tracef("   jopt_INTERP_X\n");
+  if (opt & jopt_OUTBPP_8) tracef("   jopt_OUTBPP_8\n");
+  if (opt & jopt_OUTBPP_16) tracef("   jopt_OUTBPP_16\n");
+  if (opt & jopt_OUTBPP_8YUV) tracef("   jopt_OUTBPP_8YUV\n");
+  if (opt & jopt_DIFFUSE) tracef("   jopt_DIFFUSE\n");
+  if (opt & jopt_OUTBPP_8GREY) tracef("   jopt_OUTBPP_8GREY\n");
+#endif
+
+  return opt;
 }
 #endif
 
@@ -387,7 +543,7 @@ do_huff_decode_blocks(decompress_info_ptr cinfo, JBLOCK block,
 
 
 /* --------------------------------------------------------------------------------------------- */
-
+#ifdef CFSI
 int do_jpeg_scan_file(char *space, int space_size, char *file_image, int image_length)
 /* Simple entry sequence for use by ChangeFSI */
 {
@@ -417,6 +573,7 @@ int do_jpeg_scan_file_16(char *space, int space_size, char *file_image, int imag
   cinfo->error_code = -1; /* force total reset */
   return jpeg_scan_file(cinfo, file_image, image_length, 0, 0x7fffffff, -1, -1, jopt_OUTBPP_16);
 }
+#endif
 
 int jpeg_scan_file(decompress_info_ptr cinfo, char *file_image, int image_length,
                           int xmin, int xmax, int width, int height, int options)
@@ -676,6 +833,7 @@ a bit illogical. cinfo->error_code is also important. */
   cinfo->options = options; /* in case processing above has discovered options we're not prepared to do */
 
 #ifdef DEBUG
+  tracef("cinfo->erooarg1 = %d\n" _ cinfo->error_argument1);
   tracef("After scan file, options are:\n");
   if (options & jopt_GREY) tracef("  jopt_GREY\n");
   if (options & jopt_DC_ONLY) tracef("  jopt_DC_ONLY\n");
@@ -688,7 +846,7 @@ a bit illogical. cinfo->error_code is also important. */
 #endif
 
 #ifdef EMBED
-    tracef("Exit jpeg_scan_file OK\n\n");
+  tracef("Exit jpeg_scan_file OK\n\n");
 #endif
   return cinfo->error_code;
 }
@@ -743,7 +901,8 @@ or so it must do some de-JPEGing of some more data. */
       HUFF_TBL *dc = cinfo->dc_huff_tbl_ptrs[compptr->dc_tbl_no];
       HUFF_TBL *ac = cinfo->ac_huff_tbl_ptrs[compptr->ac_tbl_no];
 
-      /* tracef("Greyscale line.\n"); */
+      tracef("in mono half of jpeg_find_line\n");
+
       if (cinfo->xmin >= 8)
       {
         int count = (cinfo->xmin - 8) >> 3; /* how many blocks we can just skip */
@@ -784,7 +943,7 @@ or so it must do some de-JPEGing of some more data. */
           /* Could convert and DCT the data 6 blocks at a time? Increases cache requirement... so, we won't */
           do_huff_decode_blocks(cinfo, cinfo->jblocks[1], dc, ac, quanttbl, &cinfo->last_dc_val[0], 1, TRUE);
 #ifdef TIMINGS
-            if (!(cinfo->options & jopt_HUFF_ONLY))
+          if (!(cinfo->options & jopt_HUFF_ONLY))
 #endif
           {
 #ifdef STATS
@@ -827,7 +986,6 @@ or so it must do some de-JPEGing of some more data. */
       int hsamp = cinfo->comp_info[0].h_samp_factor;
 
       tracef("in colour half of jpeg_find_line\n");
-      /* tracef("Fetching colour band\n"); */
 
       while (width + 8*hsamp <= cinfo->xmin) /* skip over blocks we don't want */
       {
@@ -859,23 +1017,59 @@ or so it must do some de-JPEGing of some more data. */
           }
           asm_huff_skip_blocks(cinfo, cinfo->jblocks[5], udc, uac, uquanttbl, &cinfo->last_dc_val[1], 1);
           asm_huff_skip_blocks(cinfo, cinfo->jblocks[6], vdc, vac, vquanttbl, &cinfo->last_dc_val[2], 1);
-          u = cinfo->last_dc_val[1] * uquanttbl[0];
-          v = cinfo->last_dc_val[2] * vquanttbl[0];
-          /* tracef("Colour values %i %i %i %i, %i %i\n" _ y[0] _ y[1] _ y[2] _ y[3] _ u _ v); */
-          colour_convert_pixels(y, u, v); /* results back in y[0..3] */ /* wasteful for weird sample ratios, don't care */
-          /* tracef("Converted colour values %i %i %i %i, %i %i\n" _ y[0] _ y[1] _ y[2] _ y[3] _ u _ v); */
-          for (i = 0; i < 8; i++)
+          if (cinfo->options & jopt_GREY) /* greyscale output is acceptable */
           {
-            outptr[i] = y[0];
-            if (hsamp == 2) outptr[8+i] = y[1];
-            if (vsamp == 2)
+            tracef("about to do replicate some luma\n");
+            mono_convert_pixels(y); /* results back in y[0..3] */
+            if (cinfo->options & jopt_OUTBPP_8GREY)
             {
-              outptr[line_offset+i] = y[hsamp == 2 ? 2 : 1];
-              if (hsamp == 2) outptr[line_offset+8+i] = y[3];
+              /* Native greyscale 8bpp */
+              outptr[0] = outptr[1] = YYYTOYYYY(y[0]);
+              if (hsamp == 2) outptr[2] = outptr[3] = YYYTOYYYY(y[1]);
+              if (vsamp == 2)
+              {
+                outptr[line_offset + 0] = outptr[line_offset + 1] = YYYTOYYYY(y[hsamp == 2 ? 2 : 1]);
+                if (hsamp == 2) outptr[line_offset + 2] = outptr[line_offset + 3] = YYYTOYYYY(y[3]);
+              }
+            }
+            else
+            {
+              /* Output greyscale 24bpp, and dither it later if needed */
+              for (i = 0; i < 8; i++)
+              {
+                outptr[0 + i] = y[0];
+                if (hsamp == 2) outptr[8 + i] = y[1];
+                if (vsamp == 2)
+                {
+                  outptr[line_offset + 0 + i] = y[hsamp == 2 ? 2 : 1];
+                  if (hsamp == 2) outptr[line_offset + 8 + i] = y[3];
+                }
+              }
+            }
+          }
+          else
+          {
+            u = cinfo->last_dc_val[1] * uquanttbl[0];
+            v = cinfo->last_dc_val[2] * vquanttbl[0];
+            /* tracef("Colour values %i %i %i %i, %i %i\n" _ y[0] _ y[1] _ y[2] _ y[3] _ u _ v); */
+            colour_convert_pixels(y, u, v); /* results back in y[0..3] */
+            /* tracef("Converted colour values %i %i %i %i, %i %i\n" _ y[0] _ y[1] _ y[2] _ y[3] _ u _ v); */
+            for (i = 0; i < 8; i++)
+            {
+              outptr[i] = y[0];
+              if (hsamp == 2) outptr[8+i] = y[1];
+              if (vsamp == 2)
+              {
+                outptr[line_offset+i] = y[hsamp == 2 ? 2 : 1];
+                if (hsamp == 2) outptr[line_offset+8+i] = y[3];
+              }
             }
           }
           width += 8*hsamp;
-          outptr += 8*hsamp;
+          if (cinfo->options & jopt_OUTBPP_16) outptr += 4*hsamp;
+          else if (cinfo->options & jopt_OUTBPP_8YUV) outptr += 2*hsamp;
+          else if (cinfo->options & jopt_OUTBPP_8GREY) outptr += 2*hsamp;
+          else outptr += 8*hsamp;
         }
         nlines_fetched = vsamp;
       }
@@ -887,11 +1081,11 @@ or so it must do some de-JPEGing of some more data. */
           asm_huff_decode_blocks(cinfo, cinfo->jblocks[5], udc, uac, uquanttbl, &cinfo->last_dc_val[1], 1);
           asm_huff_decode_blocks(cinfo, cinfo->jblocks[6], vdc, vac, vquanttbl, &cinfo->last_dc_val[2], 1);
 #ifdef TIMINGS
-            if (!(cinfo->options & jopt_HUFF_ONLY))
+          if (!(cinfo->options & jopt_HUFF_ONLY))
 #endif
           {
 #ifdef TIMINGS
-              if (!(cinfo->options & jopt_DCT_ONLY))
+            if (!(cinfo->options & jopt_DCT_ONLY))
 #endif
             {
               if (cinfo->options & jopt_GREY) /* greyscale output is acceptable */
@@ -907,16 +1101,15 @@ or so it must do some de-JPEGing of some more data. */
                     asm_mono_convert_block_8(cinfo->jblocks[hsamp == 1 ? 1 : 2], outptr + 8*line_offset, line_offset);
                     if (hsamp == 2) asm_mono_convert_block_8(cinfo->jblocks[3], outptr + 8*line_offset + 2, line_offset);
                   }
-
                 }
                 else
                 {
 #ifdef STATS
-                    if (stats)
-                      j_rev_dct(cinfo, cinfo->jblocks[1], hsamp*vsamp); /* output in jblocks[0..3] */
-                    else
+                  if (stats)
+                    j_rev_dct(cinfo, cinfo->jblocks[1], hsamp*vsamp); /* output in jblocks[0..3] */
+                  else
 #endif
-                      asm_j_rev_dct(cinfo, cinfo->jblocks[1], hsamp*vsamp); /* output in jblocks[0..3] */
+                    asm_j_rev_dct(cinfo, cinfo->jblocks[1], hsamp*vsamp); /* output in jblocks[0..3] */
                   asm_mono_convert_block(cinfo->jblocks[0], outptr, line_offset);
                   if (hsamp == 2) asm_mono_convert_block(cinfo->jblocks[1], outptr + 8, line_offset);
                   if (vsamp == 2)
@@ -1064,8 +1257,11 @@ or so it must do some de-JPEGing of some more data. */
 
     if (cinfo->options & jopt_DC_ONLY)
     {
-      if (l2_band_height == 4 && (ycoord & 0xf) >= 8) /* colour - choose between two rows of pixels */
-        result += line_offset; /* second row in colour output */
+      /* Rather than copy the data 8 times, the DC content is spaced out by just 1 line and the
+       * address frigged here to point to one or the other
+       */
+      if (l2_band_height == 4 && (ycoord & 0xf) >= 8)
+        result += line_offset;
     }
     else /* normal - choose between 8 or 16 rows of pixels */
       result += (ycoord & ((1<<l2_band_height)-1)) * line_offset;
@@ -1080,15 +1276,20 @@ or so it must do some de-JPEGing of some more data. */
 width, so that you can call jpeg_scan_file with sensible amounts of
 workspace. Used by the ChangeFSI code, and by j2s. */
 
-static BOOL looks_like_jpeg(char *jdata)
-{
+#define M_APP0        0xE0
+#define M_APP1        0xE1
+#define M_SOI         0xd8
+#define M_SOF0        0xc0
+#define M_SOF1        0xc1
+#define M_SOF9        0xc9
 
+static BOOL looks_like_jpeg(char *jdata)
 /* Just check there's a SOI tag, the other decoding software can look
    at the M_APPn tags. Thus we let through JFIF and EXIF at this stage
    See JFIF 1.02 spec
        EXIF 2.00 spec */
-
-  if (jdata[0] != 0xff | jdata[1] != 0xd8 | jdata[2] != 0xff) return FALSE;
+{
+  if (jdata[0] != 0xff || jdata[1] != M_SOI || jdata[2] != 0xff) return FALSE;
   return TRUE;
 }
 
@@ -1117,12 +1318,6 @@ recommended minimum space needed by jpeg_scan_file in ws_size. */
 
 #define CMTOINCH      254
 #define STANDARDDPI   90
-#define M_APP0        0xE0
-#define M_APP1        0xE1
-#define M_SOI         0xd8
-#define M_SOF0        0xc0
-#define M_SOF1        0xc1
-#define M_SOF9        0xc9
 
   tracef("Find image dims called.\n");
   if (((unsigned)ws_size & 3) == 1)
@@ -1139,7 +1334,6 @@ recommended minimum space needed by jpeg_scan_file in ws_size. */
       tracef("e points to '%s'\n" _ e->errmess);
       tracef("err is %x\n" _ err);
       *err = (int)e;
-     /* strcpy(err->errmess, e->errmess);*/
       tracef("err points to %x\n" _ e);
       tracef("err is %x\n" _ err);
       return((int)e);
@@ -1278,7 +1472,7 @@ recommended minimum space needed by jpeg_scan_file in ws_size. */
       tracef("Header looks like JPEG data, but can't find image height/width.\n");
       return 1;
       /* It's hard to be more specific than this. The header of the file looks like
-      JPEG, but it has been truncated, or has the wrong sort of entropy encoding. */#
+      JPEG, but it has been truncated, or has the wrong sort of entropy encoding. */
     }
   }
 
@@ -1325,9 +1519,6 @@ recommended minimum space needed by jpeg_scan_file in ws_size. */
     if (!info)
     {
       new_size = (new_size + page_size-1) & ~(page_size-1);
-/*      new_size += page_size; lets be a bit conservative!!*/
-/*      new_size -= (new_size % page_size);
-        new_size += page_size<<1;*/
     }
     else
     {
@@ -1340,29 +1531,33 @@ recommended minimum space needed by jpeg_scan_file in ws_size. */
       {
         new_size -= info->workspace_size;  /* size that will be added to Dynamic area for this jpeg */
         new_size = (new_size + page_size-1) & ~(page_size-1);
-/*      new_size += page_size; lets be a bit conservative!!*/
-/*      new_size--;
-        new_size -= (new_size % page_size);
-        new_size += page_size<<1; */
       }
     }
-    *ws_size = new_size;
-    tracef("We need another %x bytes\n" _ new_size);
 #else
     if (!info)
-      *ws_size = new_size + 10000;   /* first jpeg => alloc size we need plus safety margin */
+    {
+      new_size = new_size + 10000;   /* first jpeg => alloc size we need plus safety margin */
+    }
     else
+    {
       if (info->workspace_size >= new_size)
-        *ws_size = 0;   /* we already have enough memory */
+      {
+        new_size = 0;   /* we already have enough memory */
+      }
       else
-        *ws_size = new_size + 20000;  /* size that will be re-alloced for this jpeg */
+      {
+        new_size = new_size + 20000;  /* size that will be re-alloced for this jpeg */
+      }
+    }
 #endif
+    *ws_size = new_size;
+    tracef("We need another %x bytes\n" _ new_size);
   }
   if (image_height) *image_height = iheight;
   if (image_width) *image_width = iwidth;
   if (image_type) *image_type = itype;
   if (image_density) *image_density = pixel_density;
-  if (image_density) tracef("4.pixel density in %d\n" _ *image_density);
+  tracef("4.pixel density in %d\n" _ pixel_density);
   if (load_file) /* We need to close the file... */
   {
     tracef("closing file\n");
