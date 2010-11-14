@@ -30,4 +30,17 @@ RISC OS Open wiki:
   http://www.riscosopen.org/wiki/documentation/pages/Using+the+Cortex-A8+port
 
 
+The 'InstallHD4' script, and setting up a !Boot sequence
+========================================================
+
+For details of how to setup up a !Boot sequence for your OMAP3 machine, please
+see the 'Putting the HardDisc4 image onto a USB drive' section of this wiki
+page:
+
+  http://www.riscosopen.org/wiki/documentation/pages/Using+the+Cortex-A8+port
+
+The 'InstallHD4' script supplied with this archive is intended to be used in
+conjunction with the installation steps given on the above page.
+
+
 -- RISC OS Open
