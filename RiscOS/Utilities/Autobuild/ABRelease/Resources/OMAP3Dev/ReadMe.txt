@@ -18,7 +18,14 @@ this archive as Licence_v1.pdf), or see:
 How to install the ROM image
 ============================
 
-The easiest way to install the ROM image onto an SD card is to use the included !SDCreate application. If you have the RISC OS 5 USB mass storage drivers then !SDCreate can write the image straight to an SD card. Alternatively you can create a disc image file which can then be written to a card using any ordinary Windows/Linux/Mac PC. For more information, including a description of the SD card structure, see the !SDCreate help file or the RISC OS Open wiki:
+The easiest way to install the ROM image onto an SD card is to use the
+included !SDCreate application. If you have the RISC OS 5 USB mass storage
+drivers then !SDCreate can write the image straight to an SD card.
+
+Alternatively you can create a disc image file which can then be written to a
+card using any ordinary Windows/Linux/Mac PC. For more information, including
+a description of the SD card structure, see the !SDCreate help file or the
+RISC OS Open wiki:
 
   http://www.riscosopen.org/wiki/documentation/pages/Using+the+Cortex-A8+port
 

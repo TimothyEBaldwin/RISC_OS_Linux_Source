@@ -31,6 +31,7 @@ clean clean_all export_hdrs export_libs rom install install_rom release_autobuil
 	@Set ab_res$path    <ab_res$dir>.,ab_csd:Resources.<Build>.,ab_csd:Resources.Generic.
 	@Set ab_build$dir   <AutoBuild$Root>.builds.<Autobuild$Build>
 	@Set ab_build$path  <ab_build$dir>.
+	@Set ab_local$zip   tmp/zip
 	@Set ab_zip$file    ab_build:<Autobuild$Build>/zip
 	@If "<Autobuild$Build>" <> "" Then CDir <ab_build$dir>
 	@If "<Autobuild$Build>" <> "" Then IfThere ab_res:$@ Then Obey -v ab_res:$@ ${INSTDIR}
