@@ -1,0 +1,753 @@
+; 
+; Copyright (c) 2010, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+
+        AREA    |!!!ModuleHeader|, CODE, READONLY, PIC
+
+Module_BaseAddr
+        &       0
+        &       InitModule - Module_BaseAddr
+        &       KillModule - Module_BaseAddr
+        &       0
+        &       ModuleTitle - Module_BaseAddr
+        &       HelpString - Module_BaseAddr
+        &       0
+        &       VFPSupportSWI_Base
+        &       SWIEntry - Module_BaseAddr
+        &       SWINameTable - Module_BaseAddr
+        &       0
+ [ International_Help <> 0
+        DCD     MessageFilename - Module_BaseAddr
+ |
+        DCD     0
+ ]
+        &       ModuleFlags - Module_BaseAddr
+
+HelpString
+        =       "VFPSupport", 9, "$Module_MajorVersion ($Module_Date)"
+        [       Module_MinorVersion <> ""
+        =       " $Module_MinorVersion"
+        ]
+        =       0
+ModuleTitle
+SWINameTable
+        =       "VFPSupport", 0
+        =       "CheckContext", 0
+        =       "CreateContext", 0
+        =       "DestroyContext", 0
+        =       "ChangeContext", 0
+        =       "ExamineContext", 0
+        =       "FastAPI", 0
+        =       "ActiveContext", 0
+        =       "Version", 0
+        =       "Features", 0
+        =       0
+        ALIGN
+        
+ModuleFlags
+        &       ModuleFlag_32bit
+
+; Workspace
+
+                      ^ 0, wp
+MessageFile_Block     # 16
+MessageFile_Open      # 4
+ActiveContext         # 4 ; Context that's actually active
+LazyContext           # 4 ; Context awaiting lazy activation (==ActiveContext if none)
+NumVFPRegs            # 1 ; Number of doubleword regs available on this hardware
+ARMVersion            # 1 ; ARM architecture version from MIDR. <7=ARMv5, 7=ARMv6, &F=ARMv7
+VFPVersion            # 1 ; VFP subarchitecture field from FPSID
+CPEnabledFlag         # 1 ; Nonzero if CP access is enabled
+OldHandler            # 4 ; Original undefined instruction handler
+UndefinedHandler      # 4 ; Undefined instruction handler code
+LazyHandler           # 8*4 ; Code to call the lazy handler
+ChangeContext         # 4 ; Address of SWI_ChangeContext
+CurrentRoutine        # 4 ; OldHandler or LazyHandler
+SoftFPSID             # 4 ; FPSID
+SoftMVFR0             # 4 ; MVFR0
+SoftMVFR1             # 4 ; MVFR1
+                      
+WSSize                * :INDEX: @
+
+; Undefined instruction handler code - gets copied into workspace
+UndefinedHandlerTemplate
+        LDR     pc, UndefinedHandlerTemplateEnd+4 ; Branch to address in CurrentRoutine
+        SUB     lr, lr, #4 ; LazyHandler starts here
+        STMDB   r13!,{r0-r1,wp,lr}
+        ADR     wp, UndefinedHandlerTemplate-:INDEX:UndefinedHandler ; Get wp
+        MOV     r1, #0
+        LDR     r0, LazyContext
+        MOV     lr, pc
+        LDR     pc, ChangeContext ; Reuse main code for simplicity
+        LDMIA   r13!,{r0-r1,wp,pc}^ ; Restart aborting instruction
+UndefinedHandlerTemplateEnd
+
+        ASSERT  LazyHandler-UndefinedHandler+?LazyHandler = UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate
+        ASSERT  CurrentRoutine-UndefinedHandler=UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate+4
+
+; Module code
+
+InitModule
+        Entry   "r7-r11"
+ [ standalone
+        ADRL    R0,ResourceFSFiles
+        SWI     XResourceFS_RegisterFiles
+ ]
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =WSSize
+        SWI     XOS_Module
+        BVS     %FT20
+        STR     r2, [r12]
+        MOV     r12, r2
+
+        MOV     r0, #0
+10      SUBS    r3, r3, #4
+        STR     r0, [r12, r3]
+        BNE     %BT10
+
+        BL      CheckHardware
+
+        BLVC    InstallHandler
+
+20
+        EXIT
+
+CheckHardware
+        Push    "lr"
+        ; Check for any VFP hardware
+        ; First step is to check what ARM architecture we're on
+        MRC     p15,0,r0,c0,c0,0 ; read main id register
+        ANDS    r1, r0, #&F000
+        TEQNE   r1, #&7000
+        BEQ     NoVFP ; ARM7 or below
+        AND     r0, r0, #&F0000
+        CMP     r0, #&30000
+        BLT     NoVFP ; pre ARMv5
+        MOV     r0, r0, LSR #16
+        STRB    r0, ARMVersion
+
+        ; Interrupts off for the remainder of the tests
+        MRS     r1, CPSR
+        ORR     r2, r1, #I32_bit
+        MSR     CPSR_c, r2
+
+        CMP     r0, #&7
+        BLT     IsARMv5
+        ; ARMv6 and above have the coprocessor access control register, which allows us to poll for CP presence
+        MRC     p15,0,r2,c1,c0,2 ; read CPACR
+        ORR     r3, r2, #&F<<20
+        MCR     p15,0,r3,c1,c0,2
+        MRC     p15,0,r3,c1,c0,2 ; read it back to get status
+        AND     r4, r3, #&F<<20
+        CMP     r4, #&F<<20
+        MCRNE   p15,0,r2,c1,c0,2 ; restore original CPACR
+        BNE     NoVFP_v6v7
+        ; VFP coprocessors exist and are now enabled, read FPSID
+        myISB   ,r4 ; ISB to ensure that the coprocessors really are enabled
+        myVMRS  ,r4, FPSID
+        B       GotFPSID
+
+IsARMv5
+        ; No CPACR on ARMv5, so only way we can test for VFP is to try reading FPSID and seeing if we trigger an abort
+        ; TODO - There are some extra things, e.g. ARMv5 CPACR as found on XScale
+        Push    "r1-r2"
+        LDR     r0, =&101
+        ADR     r1, ARMv5Und
+        SWI     XOS_ClaimProcessorVector
+        Pull    "r1-r2",VS
+        MSRVS   CPSR_c, r1
+        Pull    "pc",VS
+
+        MOV     r5, #0
+        myVMRS  ,r4, FPSID
+
+        MOV     r0, #1
+        ADR     r2, ARMv5Und
+        SWI     XOS_ClaimProcessorVector
+        Pull    "r1-r2"
+        MSRVS   CPSR_c, r1
+        Pull    "pc",VS
+        ; r5 will be nonzero if we aborted
+        CMP     r5, #0
+        LDREQB  r0, ARMVersion
+        BEQ     GotFPSID
+NoVFP_v6v7
+        MSR     CPSR_c, r1 ; restore interrupts
+NoVFP
+        ADRL    r0, ErrorBlock_NoVFP
+        B       ReturnError_Stacked
+
+ARMv5Und
+        MOV     r5, #1
+        MOVS    pc, lr
+
+GotFPSID
+        ; r0 = ARM version
+        ; r1 = old PSR
+        ; r2 = old CPACR if >ARMv5
+        ; r4 = FPSID
+        TST     r4, #1:SHL:23 ; Is the software bit set?
+        BNE     BadVFP
+        ; The FPSID format has changed a bit between ARMv5, v6 and v7
+        CMP     r0, #&7
+        BLT     CheckFPSIDv5
+        BEQ     CheckFPSIDv6
+        ; v7 version. Must be VFPv3 or above to be valid, but we currently don't allow anything other than vanilla VFPv3 with null subarchitecture due to lack of support code
+        AND     r3, r4, #&7F0000
+        CMP     r3, #&30000
+        BNE     BadVFP
+        B       GoodVFP
+CheckFPSIDv5 ; TODO
+CheckFPSIDv6 ; TODO
+BadVFP
+        ; Restore CPACR if ARMv6+
+        CMP     r0, #&7
+        MCRGE   p15,0,r2,c1,c0,2
+        myISB   GE,r0 ; Deal with pipelined CP15 ops on ARMv6+. TODO - ARMv5
+        ; Restore interrupts
+        MSR     CPSR_c, R1
+        ADRL    r0, ErrorBlock_BadVFP
+        B       ReturnError_Stacked
+GoodVFP
+        ; r0 = ARM version
+        ; r1 = old PSR
+        ; r2 = old CPACR if >ARMv5
+        ; r3 = FPSID subarchitecture field
+        ; r4 = FPSID
+        ; Read MVFR0/1 if they're available
+        CMP     r3, #&2<<16
+        BLT     %FT10
+        myVMRS  ,r5,MVFR0
+        myVMRS  ,r6,MVFR1
+10
+        ; Done for now, make sure VFP access is disabled
+        ; For the moment we just disable access via the FPEXC.EN bit. This will disable everything except VMSR & VMRS from privileged modes
+        MOV     r7, #0
+        myVMSR  ,FPEXC, r7
+        ; Restore interrupts
+        MSR     CPSR_c, R1
+        ; Store our results
+        ; TODO - Calculate fake MVFR0/MVFR1 values for pre-VFPv3
+        MOV     r3, r3, LSR #16
+        STRB    r3, VFPVersion
+        STR     r4, SoftFPSID
+        STR     r5, SoftMVFR0
+        STR     r6, SoftMVFR1
+        ; Work out how many registers there are
+        ; Assumes we've faked up MVFR0!
+        AND     r5, r5, #&F
+        CMP     r5, #2
+        MOVEQ   r3, #32
+        MOVNE   r3, #16
+        STRB    r3, NumVFPRegs
+        Pull    "pc"
+
+InstallHandler
+        Entry
+        ; Copy the handler code over
+        ADR     r0, UndefinedHandlerTemplate
+        ADR     r1, UndefinedHandler
+        ASSERT  UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate = 9*4
+        LDMIA   r0, {r2-r10}
+        ASSERT  ChangeContext = UndefinedHandler+(UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate)
+        ADR     r11, SWI_ChangeContext
+        STMIA   r1, {r2-r11}
+        ORR     r0, r0, #1
+        ADD     r2, r1, #UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate
+        SWI     XOS_SynchroniseCodeAreas
+        ; Install the handler. Interrupts disabled to ensure we don't get caught before we set up CurrentRoutine.
+        MRS     r4, CPSR
+        ORR     r3, r4, #I32_bit
+        MSR     CPSR_c, r3
+        LDR     r0, =&101        
+        SWI     XOS_ClaimProcessorVector
+        STRVC   r1, OldHandler
+        STRVC   r1, CurrentRoutine
+        MSR     CPSR_c, r4
+        EXIT
+
+KillModule
+        LDR     wp, [r12]
+        MOV     r6, lr
+
+        ; Remove undefined instruction handler
+        MOV     r0, #1
+        LDR     r1, OldHandler
+        ADR     r2, UndefinedHandler
+        SWI     XOS_ClaimProcessorVector
+        MOVVS   pc, r6 ; Improperly nested handlers
+
+        ; Disable VFP
+        BL      DisableCPAccess
+
+        ; TODO - Disable in CPACR as well?
+
+        ; TODO - Free any contexts?
+
+        BL      CloseMessages
+
+ [ standalone
+        ADRL    R0,ResourceFSFiles
+        SWI     XResourceFS_DeregisterFiles   ; ignore errors
+ ]
+
+        CLRV
+        MOV     pc, r6
+
+SWIEntry
+        LDR     wp, [r12]
+        CMP     r11, #(EndOfJumpTable-JumpTable)/4
+        ADDLO   pc, pc, r11, LSL #2
+        B       UnknownSWI
+JumpTable
+        B       SWI_CheckContext
+        B       SWI_CreateContext
+        B       SWI_DestroyContext
+        B       SWI_ChangeContext
+        B       SWI_ExamineContext
+        B       SWI_FastAPI
+        B       SWI_ActiveContext
+        B       SWI_Version
+        B       SWI_Features
+EndOfJumpTable
+
+UnknownSWI
+        ADRL    r0, ErrorBlock_ModuleBadSWI
+        B       ReturnError_LR
+
+SWI_CheckContext
+;  in: R0 = flags
+;           b0 = user mode flag (0=user mode access not required, 1=user mode access required)
+;           other bits reserved, sbz
+;      R1 = number of doubleword registers required (1-32)
+; out: R0 = required size of context save area
+        ; Validate flags & reg count
+        CMP     r1,#0
+        BEQ     %FT10
+        CMP     r0,#1
+        LDRLSB  r0,NumVFPRegs
+        CMPLS   r1,r0
+        MOVLS   r0,#Context_RegDump
+        ADDLS   r0,r0,r1,LSL #3
+        MSRLS   CPSR_f,#Z_bit ; Clear V while retaining LS state
+        MOVLS   pc,lr
+10
+        ADRL    r0, ErrorBlock_FeatureUnavailable
+        B       ReturnError_LR
+
+SWI_CreateContext
+;  in: R0 = flags
+;           b0 = user mode flag (0=user mode access not required, 1=user mode access required)
+;           b31 = activate flag (0=leave context inactive, 1=activate now)
+;           other bits reserved, sbz
+;      R1 = number of doubleword registers required (1-32)
+;      R2 = pointer to word-aligned context save area of the size indicated by VFPSupport_CheckContext, or 0 if VFPSupport is to allocate memory itself
+;      R3 = FPSCR value to initialise context with
+; out: R0 = context ID
+;      R1 = previously active context ID/preserved
+        Push    "r0-r3,lr"
+        CMP     r2,#0
+        BIC     r0,r0,#VFPSupport_Context_Activate
+        BNE     %FT10
+        BL      SWI_CheckContext
+        MOVVC   r3,r0
+        MOVVC   r0,#ModHandReason_Claim
+        SWIVC   XOS_Module
+        ADDVS   sp,sp,#4
+        Pull    "r1-r3,pc",VS
+        LDR     r0,[sp]
+        ORR     r0,r0,#VFPSupport_Context_VFPMemory
+        LDR     r3,[sp,#12]
+10
+        ; Initialise context contents
+        ASSERT  Context_Flags = 0
+        ASSERT  Context_NumRegs = 4
+        ASSERT  Context_FPSCR = 8
+        ASSERT  Context_FPEXC = 12
+        MOV     lr, #0 ; null FPEXC == no registers to restore
+        STMIA   r2,{r0,r1,r3,lr}
+        ; Did they want the context activating?
+        Pull    "r1" ; Actually R0 on input
+        MOV     r0,r2
+        CLRV
+        TST     r1,#VFPSupport_Context_Activate
+        Pull    "r1-r3,pc",EQ
+        STR     r0,[sp]
+        MOV     r1,#0 ; activate non-lazily
+        BL      SWI_ChangeContext
+        ; Assumes that ChangeContext won't return an error
+        MOV     r1,r0
+        Pull    "r0,r2-r3,pc"
+
+SWI_DestroyContext
+;  in: R0 = context ID
+;      R1 = context ID to activate if R0 was the active context
+; out: R0 = context ID that's now active
+        Entry   "r1-r4"
+        MRS     r4, CPSR
+        ORR     r3, r4, #I32_bit
+        MSR     CPSR_c, r3
+        ; Dereference R0
+        ; TODO - Improve this so it doesn't save the context we're about to delete
+        ; Would need to make sure ActiveContext, LazyContext, coprocessor access & CurrentRoutine all stay in sync
+        MOV     r2, r0
+        CMP     r0, r1
+        MOVEQ   r1, #0 ; Don't activate R1 if we're destroying it!
+        LDR     r0, LazyContext
+        CMP     r0, r2
+        MOVEQ   r0, r1 ; if dying context is active/lazily active, activate user's R1
+        LDRNE   r1, ActiveContext
+        CMPNE   r1, r2 ; if dying context is really active, activate LazyContext
+        MOVEQ   r1, #0 ; Activate desired context non-lazily
+        STREQ   r1, [r2, #Context_NumRegs] ; ChangeContext will attempt to save the context we're deleting. But we can make things a little bit faster by skipping the main FP registers.
+        BLEQ    SWI_ChangeContext
+        ; Ignore error?
+        MSR     CPSR_cf, r4 ; Restore interrupts
+        LDR     r1, [r2, #Context_Flags]
+        TST     r1, #VFPSupport_Context_VFPMemory
+        MOV     r0, #ModHandReason_Free
+        SWINE   XOS_Module
+        CLRV    ; Ignore error?
+        LDR     r0, LazyContext
+        EXIT
+
+SWI_ChangeContext
+;  in: R0 = context ID to activate
+;      R1 = flags
+;           b0 = lazy activation (0=activate now, 1=use lazy activation)
+;           other bits reserved, sbz
+; out: R0 = previously active context ID
+; TODO - rewrite to use state machine based around array of function pointers?
+; TODO - make use of user mode flag
+        Entry   "r1-r4"
+        MRS     r4, CPSR
+        ORR     r3, r4, #I32_bit
+        MSR     CPSR_c, r3
+        LDR     r2, LazyContext
+        TST     r1, #VFPSupport_ChangeContext_Lazy
+        LDR     r1, ActiveContext
+        STR     r0, LazyContext
+        BEQ     ChangeContext_Now
+        ; Lazy activation
+        CMP     r2, r0
+        BEQ     ChangeContext_Exit_IRQ_R0 ; Already (lazily) active
+        CMP     r0, #0
+        LDREQ   r0, OldHandler
+        BEQ     ChangeContext_Exit_IRQ_R2_SetHandler ; Lazy deactivation - clear CurrentRoutine and disable CP access
+        ; Else some form of lazy activation. If r0 is actually active, enable CP access, else disable
+        CMP     r0, r1
+        ADRNE   r0, LazyHandler
+        BNE     ChangeContext_Exit_IRQ_R2_SetHandler ; Enable lazy handler
+        BL      EnableCPAccess
+        LDR     r1, OldHandler ; Disable lazy handler, it's no longer needed
+        STR     r1, CurrentRoutine
+        B       ChangeContext_Exit_IRQ_R0
+ChangeContext_Now
+        ; Nonlazy activation
+        ; Start by disabling the lazy handler
+        LDR     lr, OldHandler
+        CMP     r0, r1
+        STR     r0, ActiveContext
+        CMPEQ   r0, #0
+        STR     lr, CurrentRoutine
+        BEQ     ChangeContext_Exit_IRQ_R2_Disable ; We're turning it off and it's already off, so do nothing
+        BL      EnableCPAccess
+        CMP     r0, r1
+        BEQ     ChangeContext_Exit_IRQ_R2_MaybeDisable ; Context is already loaded
+        ; Save r1 if necessary
+        CMP     r1, #0
+        BLNE    SaveContext_R1
+        ; Load r0 if necessary
+        CMP     r0, #0
+        BLNE    LoadContext_R0
+ChangeContext_Exit_IRQ_R2_MaybeDisable
+        CMP     r0, #0
+        BLEQ    DisableCPAccess
+ChangeContext_Exit_IRQ_R2
+        MOV     r0, r2
+ChangeContext_Exit_IRQ_R0
+        MSR     CPSR_c, r4
+        CLRV
+        EXIT
+
+ChangeContext_Exit_IRQ_R2_SetHandler
+        STR     r0, CurrentRoutine
+ChangeContext_Exit_IRQ_R2_Disable
+        BL      DisableCPAccess
+        MOV     r0, r2
+        MSR     CPSR_c, r4
+        CLRV
+        EXIT
+
+SWI_ExamineContext
+;  in: R0 = context ID
+;      R1 = flags
+;           b0 = Serialise context
+; out: R0 = flags:
+;           b0 = User mode flag (0=user mode access not required, 1=user mode access required)
+;           b29 = context is awaiting lazy activation (1=yes, 0=no)
+;           b30 = context status registers are active (1=active, 0=saved)
+;           b31 = memory allocation method (0=user allocated, 1=VFPSupport allocated)
+;      R1 = number of doubleword registers (may be greater than number requested upon context creation)
+;      R2 = register status. bit n is 1 if doubleword register is active, 0 if saved.
+;      R3 = pointer to dump format descriptor block
+;      R4 = pointer to context register dump
+        CMP     r0, #0
+        BNE     %FT10
+        ADRL    r0, ErrorBlock_BadContext
+        B       ReturnError_LR
+10
+        TST     r1, #VFPSupport_ExamineContext_Serialise
+        BEQ     %FT20
+        ; Serialise it the easy way
+        ; TODO - Do something a bit more sophisticated!
+        Push    "r0-r1,lr"
+        LDR     r1, [r0, #Context_NumRegs]
+        MOV     r0, #VFPSupport_Context_Activate
+        MOV     r2, #0
+        MOV     r3, #0
+        BL      SWI_CreateContext
+        BLVC    SWI_DestroyContext
+        ADDVS   sp, sp, #4
+        Pull    "pc",VS
+        Pull    "r0-r1,lr"
+20
+        MOV     r4, r0
+        ; Check the FPEXC value in the dump as a method of determining which format of descriptor block we should use
+        ; This won't work too well if programs use this as a method of inserting fake exceptions!
+        LDR     r2, [r0, #Context_FPEXC]
+        ASSERT  FPEXC_EX = N_bit
+        ASSERT  FPEXC_FP2V = V_bit
+        MSR     CPSR_f, r2
+        ADRGE   r3, FormatDescriptorBlock_FPINST2 ; EX=1 FP2V=1 (EX=1 enforced by PL check below)
+        ADRLT   r3, FormatDescriptorBlock_FPINST ; EX=1 FP2V=0 (EX=1 enforced by PL check below)
+        ADRPL   r3, FormatDescriptorBlock_NullSubarch ; EX=0
+        ; Compute LazyActivation flag
+        LDR     r2, LazyContext
+        CMP     r4, r2
+        LDR     r0, [r4, #Context_Flags]
+        ORREQ   r0, r0, #VFPSupport_Context_LazyActivation
+        ; Compute StatusRegsActive flag and R2
+        LDR     r2, ActiveContext
+        CMP     r4, r2
+        BICEQ   r0, r0, #VFPSupport_Context_LazyActivation ; If this context is active, then it shouldn't be waiting for lazy activation
+        MOVEQ   r2, #1
+        LDR     r1, [r4, #Context_NumRegs]
+        MOVNE   r2, #0
+        ORREQ   r0, r0, #VFPSupport_Context_StatusRegsActive
+        RSBEQ   r2, r2, r2, LSL r1
+        CLRV
+        MOV     pc, lr
+        
+FormatDescriptorBlock_FPINST2
+        DCD     VFPSupport_Field_FPINST2 + Context_FPINST2<<16
+FormatDescriptorBlock_FPINST
+        DCD     VFPSupport_Field_FPINST + Context_FPINST<<16
+FormatDescriptorBlock_NullSubarch
+        DCD     VFPSupport_Field_FPSCR + Context_FPSCR<<16
+        DCD     VFPSupport_Field_FPEXC + Context_FPEXC<<16
+        DCD     VFPSupport_Field_RegDump + Context_RegDump<<16
+        DCD     -1 
+
+SWI_FastAPI
+; out: R0 = Workspace pointer to pass in R12
+;      R1 = CheckContext function pointer
+;      R2 = CreateContext function pointer
+;      R3 = DestroyContext function pointer
+;      R4 = ChangeContext function pointer
+        MOV     r0, wp
+        ADR     r1, SWI_CheckContext
+        ADR     r2, SWI_CreateContext
+        ADR     r3, SWI_DestroyContext
+        ADR     r4, SWI_ChangeContext
+        CLRV
+        MOV     pc, lr
+
+SWI_ActiveContext
+; out: R0 = currently active context ID (or ID of context pending lazy activation)
+        LDR     r0, LazyContext
+        CLRV
+        MOV     pc, lr
+
+SWI_Version
+; out: R0 = Module version number * 100
+        MOV     r0, #Module_Version
+        CLRV
+        MOV     pc, lr
+
+SWI_Features
+; in: R0 = Reason code
+        CMP     r0, #(EndOfFeaturesJumpTable-FeaturesJumpTable)/4
+        ADDLO   pc, pc, r0, LSL #2
+        B       UnknownFeature
+FeaturesJumpTable
+        B       Feature_SystemRegs
+EndOfFeaturesJumpTable
+
+UnknownFeature
+        ADRL    r0, ErrorBlock_BadFeature
+        B       ReturnError_LR
+
+Feature_SystemRegs
+;  in: R0 = 0
+; out: R0 = FPSID
+;      R1 = MVFR0
+;      R2 = MVFR1
+        ASSERT SoftMVFR0=SoftFPSID+4
+        ASSERT SoftMVFR1=SoftMVFR0+4
+        ADR    r0, SoftFPSID
+        LDMIA  r0, {r0-r2}
+        CLRV
+        MOV    pc, lr
+
+EnableCPAccess
+        ; Enable VFP CP access
+        Entry
+        LDRB    lr,CPEnabledFlag
+        EORS    lr,lr,#255
+        EXIT    EQ
+        STRB    lr,CPEnabledFlag
+        myVMRS  ,lr,FPEXC
+        ORR     lr,lr,#FPEXC_EN
+        myVMSR  ,FPEXC,lr
+        EXIT
+
+DisableCPAccess
+        ; Disable VFP CP access
+        Entry
+        LDRB    lr,CPEnabledFlag
+        EORS    lr,lr,#255
+        EXIT    NE
+        STRB    lr,CPEnabledFlag
+        myVMRS  ,lr,FPEXC
+        BIC     lr,lr,#FPEXC_EN
+        myVMSR  ,FPEXC,lr
+        EXIT
+
+SaveContext_R1
+        ; Save active context to R1
+        ; This should work with VFPv2/3, not sure about VFPv1
+        Entry   "r2-r3"
+        myVMRS  ,r2, FPEXC
+        ASSERT  FPEXC_EX = N_bit
+        ASSERT  FPEXC_FP2V = V_bit
+        MSR     CPSR_f, r2
+        STR     r2, [r1,#Context_FPEXC]
+        BPL     %FT10
+        ; Must store FPINST
+        myVMRS  ,r2, FPINST
+        STR     r2, [r1,#Context_FPINST]
+        ; Might need to store FPINST2
+        myVMRS  VS,r2, FPINST2
+        STRVS   r2, [r1,#Context_FPINST2]
+10
+        LDR     lr, [r1,#Context_NumRegs]
+        myVMRS  ,r2, FPSCR
+        ADD     r3, r1, #Context_RegDump
+        STR     r2, [r1,#Context_FPSCR]
+        ADD     pc, pc, lr, LSL #4
+        NOP
+        EXIT ; Don't malfunction if the context we're saving has 0 regs. Used by DeleteContext to make things a bit faster.
+        NOP
+        NOP
+        NOP
+
+        ; Generate VSTM jump table
+        GBLA    count
+count   SETA    1
+        WHILE   count < 33
+       [ count <= 16
+        DCI     &EC830B00 + count*2 ; VSTMIA r3,{D0-Dn}
+        EXIT
+        NOP
+        NOP
+       |
+        DCI     &ECA30B20 ; VSTMIA r3!,{D0-D15} (we can only STM 16 at once)
+        DCI     &ECC30B00 + (count-16)*2 ; VSTMIA r3,{D16-Dn}
+        EXIT
+        NOP
+       ]
+count   SETA    count+1
+        WEND
+
+LoadContext_R0
+        ; Load context from R0
+        ; This should work with VFPv2/3, not sure about VFPv1
+        Entry   "r2-r3"
+        LDR     r2, [r0,#Context_FPEXC]
+        ASSERT  FPEXC_EX = N_bit
+        ASSERT  FPEXC_FP2V = V_bit
+        ASSERT  FPEXC_EN = Z_bit ; EN bit will be clear if there are no data registers to restore (actually, entire FPEXC will be clear)
+        MSR     CPSR_f, r2
+        myVMSR  EQ,FPEXC, r2 ; Don't write FPEXC if EN isn't set
+        BPL     %FT10
+        ; Must restore FPINST
+        LDR     r2, [r0,#Context_FPINST]
+        myVMSR  ,FPINST, r2
+        ; Might need to restore FPINST2
+        LDRVS   r2, [r0,#Context_FPINST2]
+        myVMSR  VS,FPINST2, r2
+10
+        LDREQ   lr, [r0,#Context_NumRegs]
+        LDR     r2, [r0,#Context_FPSCR]
+        ADDEQ   r3, r0, #Context_RegDump
+        myVMSR  ,FPSCR, r2 ; Will only work on first use of new context if we already have CP access (which we currently will)
+        ADDEQ   pc, pc, lr, LSL #4
+        ; If we're still here, we need to reset FPEXC to default and load 0 regs
+        MOV     r2, #FPEXC_EN
+        myVMSR  ,FPEXC, r2
+        EXIT
+        NOP
+        NOP
+        
+        ; Generate VLDM jump table
+        GBLA    count
+count   SETA    1
+        WHILE   count < 33
+       [ count <= 16
+        DCI     &EC930B00 + count*2 ; VLDMIA r3,{D0-Dn}
+        EXIT
+        NOP
+        NOP
+       |
+        DCI     &ECB30B20 ; VLDMIA r3!,{D0-D15} (we can only LDM 16 at once)
+        DCI     &ECD30B00 + (count-16)*2 ; VLDMIA r3,{D16-Dn}
+        EXIT
+        NOP
+       ]
+count   SETA    count+1
+        WEND
+
+        LTORG
+
+        [ standalone
+ResourceFSFiles
+        ResourceFile    $MergedMsgs, Resources.VFPSupport.Messages
+        DCD     0
+        ]
+
+        END
