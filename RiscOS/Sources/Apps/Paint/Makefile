@@ -32,7 +32,7 @@ MODULE     = rm.!Paint
 ROM_MODULE = aof.Paint
 RDIR       = Resources
 LDIR       = ${RDIR}.${LOCALE}
-
+MSGVERSION = ${AWK} -f Build:AwkVers
 MSGS       = Resources.GenMessage
 
 #
@@ -54,6 +54,7 @@ RM      = remove
 SQUEEZE = squeeze
 WIPE    = -wipe
 XWIPE   = x wipe
+AWK     = GNU.gawk
 
 AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
 CFLAGS  = ${THROWBACK} -c -depend !Depend -fah ${INCLUDES} -wp
@@ -107,11 +108,11 @@ DFILES = \
  debug.${APP}.Templates
 
 OBJS      = o.colours o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow \
-            o.jpeg o.writepixel o.AltRename o.PaintLib
+            o.jpeg o.AltRename o.PaintLib
 OBJSZ     = oz.colours oz.main oz.menus oz.psprite oz.sprwindow\
-            oz.tools oz.toolwindow o.jpeg o.writepixel oz.AltRename oz.PaintLib
+            oz.tools oz.toolwindow o.jpeg oz.AltRename oz.PaintLib
 OBJSD     = od.colours od.ftrace od.guard od.main od.menus\
-            od.psprite od.sprwindow od.tools od.toolwindow o.jpeg o.m  o.writepixel\
+            od.psprite od.sprwindow od.tools od.toolwindow o.jpeg o.m\
             od.AltRename od.PaintLib
 ASMS      = s.colours s.main s.menus s.psprite s.sprwindow s.tools s.toolwindow
 INCS      = i.colours i.main i.menus i.psprite i.sprwindow i.tools i.toolwindow
@@ -262,8 +263,8 @@ oz.ModuleWrap: s.ModuleWrap ${MSGS} s.AppName ${RESFILES} s.Resfiles
 s.ModuleWrap: ${WRAPPER}
 	${CP} ${WRAPPER} $@ ${CPFLAGS}
 
-${MSGS}: ${LDIR}.Messages awk.Version
-	GNU.gawk -f awk.Version ${LDIR}.Messages > $@
+${MSGS}: ${LDIR}.Messages VersionNum
+	${MSGVERSION} ${LDIR}.Messages > $@
 
 s.ResFiles: asm.ResFiles
 	${CP} asm.ResFiles $@ ${CPFLAGS}
