@@ -53,7 +53,7 @@ DBGTARGET = aif.IOMD
 GPATARGET = gpa.IOMD
 EXPORTS   =
 
-OBJECTS   = o.Boot o.IIC o.NVRAM o.Video o.Interrupts o.MachineID o.Timers
+OBJECTS   = o.Boot o.IIC o.NVRAM o.Video o.Interrupts o.MachineID o.Timers o.ATA
 
 .s.o:;	${ARMASM} ${ARMASMFLAGS} $< $@
 
