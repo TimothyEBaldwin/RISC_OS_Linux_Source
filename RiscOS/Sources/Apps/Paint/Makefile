@@ -60,7 +60,7 @@ AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
 CFLAGS  = ${THROWBACK} -c -depend !Depend -fah ${INCLUDES} -wp
 CPFLAGS = ~cfr~v
 SQFLAGS = 
-WFLAGS  = ~c~v
+WFLAGS  = ~c~vf
 
 #
 # Libraries
@@ -131,8 +131,6 @@ INCS      = i.colours i.main i.menus i.psprite i.sprwindow i.tools i.toolwindow
 #
 # Main rules:
 #
-# Application
-#
 all: ${FILES}
 	@echo ${COMPONENT}: Application built (Disc)
 
@@ -162,7 +160,7 @@ installd: ${FILESD}
 	${CP} ${LDIR}.!Help      ${INSTDIR}.!Help      ${CPFLAGS}
 	${CP} ${LDIR}.!Run       ${INSTDIR}.!Run       ${CPFLAGS}
 	${CP} abs.!RunImageD     ${INSTDIR}.!RunImage  ${CPFLAGS}
-	${CP} ${LDIR}.Messages   ${INSTDIR}.Messages   ${CPFLAGS}
+	${CP} ${MSGS}            ${INSTDIR}.Messages   ${CPFLAGS}
 	${CP} ${LDIR}.Sprites    ${INSTDIR}.Sprites    ${CPFLAGS}
 	${CP} ${LDIR}.Templates  ${INSTDIR}.Templates  ${CPFLAGS}
 	Access ${INSTDIR}.!Boot      lr/r
@@ -197,45 +195,14 @@ clean:
 	${XWIPE} s.* ${WFLAGS}
 	${XWIPE} linked.* ${WFLAGS}
 	${XWIPE} map.* ${WFLAGS}
+	${XWIPE} debug.!Paint.* ${WFLAGS}
+	${XWIPE} !Paint.* ${WFLAGS}
 	${RM} abs.!RunImage
 	${RM} abs.!RunImageD
 	${RM} ${ROM_MODULE}
 	${RM} ${MSGS}
 	${RM} ${MODULE}
 	@echo ${COMPONENT}: cleaned
-
-#
-# Development rules:
-# 
-app: ${FILES}
-	@echo Made application ${APP}
-
-appd: ${DFILES}
-	@echo Made debug.${APP}
-
-mod: ${MODULE}
-	@echo ${COMPONENT}: Module built (RAM)
-
-asms: ${ASMS}
-
-incs: ${INCS}
-
-clean_all:
-	x Access ${INSTDIR}.!Boot      rw/rw
-	x Access ${INSTDIR}.!Help      rw/rw
-	x Access ${INSTDIR}.!Run       rw/rw
-	x Access ${INSTDIR}.!RunImage  rw/rw
-	x Access ${INSTDIR}.Messages   rw/rw
-	x Access ${INSTDIR}.Sprites    rw/rw
-	x Access ${INSTDIR}.Templates  rw/rw
-	Destroy ${OBJS} ${OBJSZ} ${OBJSD} o.ModuleWrap \
-        ${APP}.!RunImage \
-        debug.${APP}.!RunImage \
-        ${ROM_MODULE} ${MODULE} \
-        ${ASMS} s.Appname s.ModuleWrap s.ResFiles \
-        ${DFILES} ${INSTDIR}.!Boot ${INSTDIR}.!Help ${INSTDIR}.!Run \
-        ${INSTDIR}.!RunImage ${INSTDIR}.Messages ${INSTDIR}.Sprites \
-        ${INSTDIR}.Templates
 
 #
 # Static dependencies:
