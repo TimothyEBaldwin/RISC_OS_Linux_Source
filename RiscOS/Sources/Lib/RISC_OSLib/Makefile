@@ -217,6 +217,7 @@ HEADERS =\
  RISC_OSLib:h.fontselect \
  RISC_OSLib:h.heap \
  RISC_OSLib:h.help \
+ RISC_OSLib:h.jpeg \
  RISC_OSLib:h.magnify \
  RISC_OSLib:h.menu \
  RISC_OSLib:h.msgs \
@@ -370,6 +371,7 @@ ROM_OBJS =\
  rm_o_rl.flex \
  rm_o_rl.font \
  rm_o_rl.heap \
+ rm_o_rl.jpeg \
  rm_o_rl.magnify \
  rm_o_rl.menu \
  rm_o_rl.msgs \
@@ -415,7 +417,7 @@ RLIB_OBJS =\
  o_rl.colourtran o_rl.coords o_rl.ctl o_rl.dbox o_rl.dboxfile o_rl.dboxquery \
  o_rl.dboxtcol o_rl.dragasprit o_rl.drawcheck o_rl.drawfdiag o_rl.drawfiles \
  o_rl.drawfobj o_rl.drawmod o_rl.drawtextc o_rl.event o_rl.fileicon o_rl.flex \
- o_rl.font o_rl.fontlist o_rl.fontselect o_rl.heap o_rl.help o_rl.magnify o_rl.menu \
+ o_rl.font o_rl.fontlist o_rl.fontselect o_rl.heap o_rl.help o_rl.jpeg o_rl.magnify o_rl.menu \
  o_rl.msgs o_rl.os o_rl.pointer o_rl.poll o_rl.print o_rl.res o_rl.resspr \
  o_rl.saveas o_rl.sprite o_rl.swi o_rl.template o_rl.trace o_rl.txt o_rl.txt1 \
  o_rl.txt3 o_rl.txtar o_rl.txtedit o_rl.txtfile o_rl.txtfind o_rl.txtmisc \
@@ -431,7 +433,7 @@ RLIB_MOD_OBJS =\
  m_o_rl.dboxfile m_o_rl.dboxquery  m_o_rl.dboxtcol m_o_rl.dragasprit \
  m_o_rl.drawcheck m_o_rl.drawfdiag m_o_rl.drawfiles m_o_rl.drawfobj m_o_rl.drawmod \
  m_o_rl.drawtextc m_o_rl.event m_o_rl.fileicon m_o_rl.flex m_o_rl.font \
- m_o_rl.fontlist m_o_rl.fontselect m_o_rl.heap m_o_rl.help m_o_rl.magnify \
+ m_o_rl.fontlist m_o_rl.fontselect m_o_rl.heap m_o_rl.help m_o_rl.jpeg m_o_rl.magnify \
  m_o_rl.menu m_o_rl.msgs m_o_rl.os m_o_rl.pointer m_o_rl.poll m_o_rl.print \
  m_o_rl.res m_o_rl.resspr m_o_rl.saveas m_o_rl.sprite m_o_rl.swi m_o_rl.template \
  m_o_rl.trace m_o_rl.txt m_o_rl.txt1 m_o_rl.txt3 m_o_rl.txtar m_o_rl.txtedit \
@@ -738,6 +740,7 @@ RISC_OSLib:h.fontlist: rlib.h.fontlist;      ${CP} rlib.h.fontlist $@ ${CPFLAGS}
 RISC_OSLib:h.fontselect: rlib.h.fontselect;  ${CP} rlib.h.fontselect $@ ${CPFLAGS}
 RISC_OSLib:h.heap: rlib.h.heap;              ${CP} rlib.h.heap $@ ${CPFLAGS}
 RISC_OSLib:h.help: rlib.h.help;              ${CP} rlib.h.help $@ ${CPFLAGS}
+RISC_OSLib:h.jpeg: rlib.h.jpeg;              ${CP} rlib.h.jpeg $@ ${CPFLAGS}
 RISC_OSLib:h.magnify: rlib.h.magnify;        ${CP} rlib.h.magnify $@ ${CPFLAGS}
 RISC_OSLib:h.menu: rlib.h.menu;              ${CP} rlib.h.menu $@ ${CPFLAGS}
 RISC_OSLib:h.msgs: rlib.h.msgs;              ${CP} rlib.h.msgs $@ ${CPFLAGS}
