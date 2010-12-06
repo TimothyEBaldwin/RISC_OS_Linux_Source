@@ -32,7 +32,7 @@ MODULE     = rm.!Draw
 ROM_MODULE = aof.Draw
 RDIR       = Resources
 LDIR       = ${RDIR}.${LOCALE}
-
+MSGVERSION = ${AWK} -f Build:AwkVers
 MSGS       = Resources.GenMessage
 
 #
@@ -54,6 +54,7 @@ RM      = remove
 SQUEEZE = squeeze
 WIPE    = -wipe
 XWIPE   = x wipe
+AWK     = GNU.gawk
 
 AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
 CFLAGS  = ${THROWBACK} -depend !Depend -fah ${INCLUDES} -wp
@@ -115,20 +116,20 @@ OBJS =\
  o.Draw o.DrawAction o.DrawCheck o.DrawDispl o.DrawDXF\
  o.DrawEdit o.DrawEnter o.DrawFileIO o.DrawGrid o.DrawHelp\
  o.DrawMenu o.DrawObject o.DrawPrint o.DrawScan o.DrawSelect\
- o.DrawTextC o.DrawTrans o.DrawUndo o.bezierarc o.jpeg
+ o.DrawTextC o.DrawTrans o.DrawUndo o.bezierarc
 
 OBJSZ =\
  oz.Draw oz.DrawAction oz.DrawCheck oz.DrawDispl oz.DrawDXF\
  oz.DrawEdit oz.DrawEnter oz.DrawFileIO oz.DrawGrid oz.DrawHelp\
  oz.DrawMenu oz.DrawObject oz.DrawPrint oz.DrawScan oz.DrawSelect\
- oz.DrawTextC oz.DrawTrans oz.DrawUndo oz.bezierarc o.jpeg
+ oz.DrawTextC oz.DrawTrans oz.DrawUndo oz.bezierarc
 
 OBJSD =\
  od.Draw od.DrawAction od.DrawCheck od.DrawDispl\
  od.DrawDXF od.DrawEdit od.DrawEnter od.DrawFileIO od.DrawGrid\
  od.DrawHelp od.DrawMenu od.DrawObject od.DrawPrint od.DrawScan\
  od.DrawSelect od.DrawTextC od.DrawTrans od.DrawUndo\
- od.bezierarc od.ftrace od.guard od.flex o.jpeg
+ od.bezierarc od.ftrace od.guard od.flex
 
 ASMS =\
  s.Draw s.DrawAction s.DrawCheck s.DrawDispl s.DrawDXF\
@@ -236,11 +237,11 @@ mod: ${MODULE}
 
 asms: ${ASMS}
 
-linkmap: ${OBJS} ${LIBS}
-	${LD} -map -o null:x ${OBJS} ${LIBS} > map.linked
+linkmap: ${OBJS} ${LIBSD}
+	${LD} -map -o null:x ${OBJS} ${LIBSD} > map.linked
 
 map:
-	${LD} -map -rmf -base 0 -o null: ${OBJS} ${LIBS} > map.base0
+	${LD} -map -rmf -base 0 -o null: ${OBJS} ${LIBSD} > map.base0
 
 clean_all:
 	x Access ${INSTDIR}.!Boot     rw/rw
@@ -284,8 +285,8 @@ oz.ModuleWrap: s.ModuleWrap ${MSGS} s.AppName ${RESFILES} s.resfiles
 s.ModuleWrap: ${WRAPPER}
 	${CP} ${WRAPPER} $@ ${CPFLAGS}
 
-${MSGS}: ${LDIR}.Messages awk.Version
-	GNU.gawk -f awk.Version ${LDIR}.Messages > $@
+${MSGS}: ${LDIR}.Messages VersionNum
+	${MSGVERSION} ${LDIR}.Messages > $@
 
 s.ResFiles: asm.ResFiles
 	${CP} asm.ResFiles $@ ${CPFLAGS}
