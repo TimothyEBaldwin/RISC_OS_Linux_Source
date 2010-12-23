@@ -37,7 +37,6 @@
 
 #include "jrdjfif.c"
 #include "jdhuff.c"
-#include "jcconv.c"
 
 #undef FILE_
 #define FILE_ (40000)
@@ -305,6 +304,122 @@ static void process_restart(decompress_info_ptr cinfo)
 
 /**************************************************************************
 *                                                                         *
+*    Colour conversions which are not important enough for assembler.     *
+*                                                                         *
+**************************************************************************/
+
+static int mono_convert_pixel(int pix)
+/* Just do a single pixel - eg. for DC-only display. The pixel does not have to
+ * be shifted down, as it has not gone through the DCT.
+ */
+{
+  int y = pix;
+
+  y += 128;                      /* normalise */
+  if (y < 0) y = 0;              /* range check */
+  if (y > 255) y = 255;
+  
+  return y | (y << 8) | (y << 16); /* replicate Y value */
+}
+
+static void colour_convert_unusual_block(JCOEF *yuv, int *outptr, int outoffset, int wide, int high)
+/* yuv[0..1] are Y, yuv[4] is U, yuv[5] is V. wide/high are 1 or 2.
+ * Both being 2 is the most common case, for which we use hand-coded assembler instead.
+ */
+{
+  unsigned int i, j;
+  JCOEF *by0 = yuv + 0*DCTSIZE2;
+  JCOEF *by1 = yuv + 1*DCTSIZE2;
+  JCOEF *bu = yuv + 4*DCTSIZE2;
+  JCOEF *bv = yuv + 5*DCTSIZE2;
+
+#define SCALEBITS       8       /* speedier right-shift on some machines */
+#define ONE_HALF        ((INT32) 1 << (SCALEBITS-1))
+#define FIX(x)          ((INT32) ((x) * (1L<<SCALEBITS) + 0.5))
+
+  for (j = 0; j < 8*high; j++)
+  {
+    for (i = 0; i < 8*wide; i++)
+    {
+      int y;
+      int u;
+      int v;
+
+      /* Simplification because we don't use this code in the 2x2 case, so
+       * we only need to worry about accessing a second block. */
+
+      y = ((i < 8 && j < 8) ? by0 : by1)[(j&7) + (i&7)*8]; /* extract from right block, NB row order */
+      u = bu[(j>>(high-1)) + (i>>(wide-1))*8];
+      v = bv[(j>>(high-1)) + (i>>(wide-1))*8];
+
+      y = (y + (1<<18)) >> 19;      /* descale */
+      y += 128;                     /* normalise */
+      u = (u + (1<<18)) >> 19;
+      v = (v + (1<<18)) >> 19;
+      {
+        int r =                        v * FIX(1.40200);
+        int g = 0 - u * FIX(0.34414) - v * FIX(0.71414);
+        int b =     u * FIX(1.77200);
+
+        r += ONE_HALF; r >>= SCALEBITS; r += y; if (r < 0) r = 0; if (r > 255) r = 255;
+        g += ONE_HALF; g >>= SCALEBITS; g += y; if (g < 0) g = 0; if (g > 255) g = 255;
+        b += ONE_HALF; b >>= SCALEBITS; b += y; if (b < 0) b = 0; if (b > 255) b = 255;
+        outptr[i] = r | (g << 8) | (b << 16);
+      }
+    }
+    outptr += outoffset;
+  }
+}
+
+static void colour_convert_pixels(int *y, int u, int v)
+/* Convert four pixels. Input y values are in y[0..3], put output there too.
+ * Used for DC-only colour output. The input pixels do not have to be shifted
+ * down by 19, as they have not been through the DCT.
+ */
+{
+  u = (u + 4) >> 3; /* descale */
+  v = (v + 4) >> 3;
+
+  {
+    int r =                        v * FIX(1.40200);
+    int g = 0 - u * FIX(0.34414) - v * FIX(0.71414);
+    int b =     u * FIX(1.77200);
+    int i;
+    int rr, gg, bb, yy;
+
+    r += ONE_HALF; r >>= SCALEBITS;
+    g += ONE_HALF; g >>= SCALEBITS;
+    b += ONE_HALF; b >>= SCALEBITS;
+    for (i = 0; i < 4; i++)
+    {
+      yy = ((y[i] + 4) >> 3) + 128;
+      rr = r + yy; if (rr < 0) rr = 0; if (rr > 255) rr = 255;
+      gg = g + yy; if (gg < 0) gg = 0; if (gg > 255) gg = 255;
+      bb = b + yy; if (bb < 0) bb = 0; if (bb > 255) bb = 255;
+      y[i] = rr | (gg << 8) | (bb << 16);
+    }
+  }
+}
+
+static void mono_convert_pixels(int *y)
+/* Convert four pixels. Input y values are in y[0..3], put output there too.
+ * Used for DC-only mono output. The input pixels do not have to be shifted
+ * down by 19, as they have not been through the DCT.
+ */
+{
+  int i;
+  int yy;
+
+  for (i = 0; i < 4; i++)
+  {
+    yy = ((y[i] + 4) >> 3) + 128;
+    if (yy < 0) yy = 0; if (yy > 255) yy = 255;
+    y[i] = yy | (yy << 8) | (yy << 16);
+  }
+}
+
+/**************************************************************************
+*                                                                         *
 *    Huffman.                                                             *
 *                                                                         *
 **************************************************************************/
@@ -445,7 +560,7 @@ static int do_1_component_band(decompress_info_ptr cinfo, int line_offset)
       int pix;
   
       do_huff_skip_blocks(cinfo, cinfo->jblocks[1], dc, ac, quanttbl, &cinfo->last_dc_val[0], 1, TRUE);
-      pix = mono_convert_pixel(cinfo, cinfo->last_dc_val[0] * quanttbl[0]);
+      pix = mono_convert_pixel(cinfo->last_dc_val[0] * quanttbl[0]);
       outptr[0] = pix; outptr[1] = pix;
       outptr[2] = pix; outptr[3] = pix;
       outptr[4] = pix; outptr[5] = pix;
