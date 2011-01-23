@@ -43,4 +43,10 @@ The 'InstallHD4' script supplied with this archive is intended to be used in
 conjunction with the installation steps given on the above page.
 
 
+An important note about CMOS RAM
+================================
+
+The OMAP port of RISC OS now has the ability to use CMOS settings that are saved to the SD card alongside the ROM image. However, RISC OS currently lacks the ability to write updated settings back to the card. Therefore if you make any configuration changes that will affect CMOS RAM (e.g. switching to boot from drive 4 instead of 0) then you must make sure you manually save the settings using *SaveCMOS and copy the new file onto the SD card. For more information about how the CMOS file is handled, please see the !SDCreate help file.
+
+
 -- RISC OS Open
