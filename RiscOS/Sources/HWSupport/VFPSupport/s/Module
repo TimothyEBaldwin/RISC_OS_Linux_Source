@@ -342,13 +342,18 @@ UnknownSWI
 SWI_CheckContext
 ;  in: R0 = flags
 ;           b0 = user mode flag (0=user mode access not required, 1=user mode access required)
+;           b1 = application space flag (0=not in application space, 1=in application space)
+;           b30 = ignored (for CreateContext compatability)
+;           b31 = ignored (for CreateContext compatability)
 ;           other bits reserved, sbz
 ;      R1 = number of doubleword registers required (1-32)
 ; out: R0 = required size of context save area
         ; Validate flags & reg count
         CMP     r1,#0
-        BEQ     %FT10
-        CMP     r0,#1
+        BLE     %FT10
+        ; Note that this next bit relies on C being set by the above CMP
+        ASSERT  VFPSupport_Context_UserMode+VFPSupport_Context_AppSpace+VFPSupport_Context_LazyActivate+VFPSupport_Context_Activate >= &80000000 ; Must clear sign bit
+        BICS    r0,r0,#VFPSupport_Context_UserMode+VFPSupport_Context_AppSpace+VFPSupport_Context_LazyActivate+VFPSupport_Context_Activate
         LDRLSB  r0,NumVFPRegs
         CMPLS   r1,r0
         MOVLS   r0,#Context_RegDump
@@ -362,16 +367,18 @@ SWI_CheckContext
 SWI_CreateContext
 ;  in: R0 = flags
 ;           b0 = user mode flag (0=user mode access not required, 1=user mode access required)
+;           b1 = application space flag (0=not in application space, 1=in application space)
+;           b30 = lazy activation flag (0=leave context inactive, 1=activate lazily. Supercedes b31.)
 ;           b31 = activate flag (0=leave context inactive, 1=activate now)
 ;           other bits reserved, sbz
 ;      R1 = number of doubleword registers required (1-32)
 ;      R2 = pointer to word-aligned context save area of the size indicated by VFPSupport_CheckContext, or 0 if VFPSupport is to allocate memory itself
 ;      R3 = FPSCR value to initialise context with
-; out: R0 = context ID
+; out: R0 = context pointer
 ;      R1 = previously active context ID/preserved
         Push    "r0-r3,lr"
         CMP     r2,#0
-        BIC     r0,r0,#VFPSupport_Context_Activate
+        BIC     r0,r0,#VFPSupport_Context_LazyActivate+VFPSupport_Context_Activate ; Clear unwanted flags
         BNE     %FT10
         BL      SWI_CheckContext
         MOVVC   r3,r0
@@ -394,19 +401,21 @@ SWI_CreateContext
         Pull    "r1" ; Actually R0 on input
         MOV     r0,r2
         CLRV
-        TST     r1,#VFPSupport_Context_Activate
-        Pull    "r1-r3,pc",EQ
+        TST     r1,#VFPSupport_Context_LazyActivate+VFPSupport_Context_Activate ; Check activation flags
+        Pull    "r1-r3,pc",EQ ; Exit if context doesn't need activating
         STR     r0,[sp]
-        MOV     r1,#0 ; activate non-lazily
+        ASSERT  VFPSupport_Context_Activate = &80000000
+        MOVMI   r1,#0 ; Nonlazy activation
+        MOVPL   r1,#VFPSupport_ChangeContext_Lazy ; Lazy activation
         BL      SWI_ChangeContext
         ; Assumes that ChangeContext won't return an error
         MOV     r1,r0
         Pull    "r0,r2-r3,pc"
 
 SWI_DestroyContext
-;  in: R0 = context ID
-;      R1 = context ID to activate if R0 was the active context
-; out: R0 = context ID that's now active
+;  in: R0 = context to destroy
+;      R1 = context to activate if R0 was the active context
+; out: R0 = context that's now active
         Entry   "r1-r4"
         MRS     r4, CPSR
         ORR     r3, r4, #I32_bit
@@ -436,21 +445,33 @@ SWI_DestroyContext
         EXIT
 
 SWI_ChangeContext
-;  in: R0 = context ID to activate
+;  in: R0 = context to activate
 ;      R1 = flags
 ;           b0 = lazy activation (0=activate now, 1=use lazy activation)
+;           b1 = application space changing (0=no change, 1=changing)
 ;           other bits reserved, sbz
-; out: R0 = previously active context ID
+; out: R0 = previously active context
 ; TODO - rewrite to use state machine based around array of function pointers?
 ; TODO - make use of user mode flag
         Entry   "r1-r4"
         MRS     r4, CPSR
         ORR     r3, r4, #I32_bit
         MSR     CPSR_c, r3
+        ; If application space is being moved, and ActiveContext is in app
+        ; space, clear the lazy activation flag to ensure that the context
+        ; gets flushed out of the system 
+        LDR     r3, ActiveContext
+        TST     r1, #VFPSupport_ChangeContext_AppSpace
+        BEQ     %FT10
+        CMP     r3, #0
+        LDRNE   r2, [r3, #Context_Flags]
+        ASSERT  VFPSupport_Context_AppSpace = VFPSupport_ChangeContext_Lazy*2
+        BICNE   r1, r1, r2, LSR #1
+10
         LDR     r2, LazyContext
         TST     r1, #VFPSupport_ChangeContext_Lazy
-        LDR     r1, ActiveContext
         STR     r0, LazyContext
+        MOV     r1, r3
         BEQ     ChangeContext_Now
         ; Lazy activation
         CMP     r2, r0
@@ -504,39 +525,36 @@ ChangeContext_Exit_IRQ_R2_Disable
         EXIT
 
 SWI_ExamineContext
-;  in: R0 = context ID
+;  in: R0 = context
 ;      R1 = flags
 ;           b0 = Serialise context
 ; out: R0 = flags:
 ;           b0 = User mode flag (0=user mode access not required, 1=user mode access required)
+;           b1 = application space flag (0=not in application space, 1=in application space)
 ;           b29 = context is awaiting lazy activation (1=yes, 0=no)
 ;           b30 = context status registers are active (1=active, 0=saved)
 ;           b31 = memory allocation method (0=user allocated, 1=VFPSupport allocated)
 ;      R1 = number of doubleword registers (may be greater than number requested upon context creation)
 ;      R2 = register status. bit n is 1 if doubleword register is active, 0 if saved.
 ;      R3 = pointer to dump format descriptor block
-;      R4 = pointer to context register dump
-        CMP     r0, #0
-        BNE     %FT10
-        ADRL    r0, ErrorBlock_BadContext
-        B       ReturnError_LR
-10
-        TST     r1, #VFPSupport_ExamineContext_Serialise
+;      R4 = context size
+        MOVS    r4, r0
         BEQ     %FT20
-        ; Serialise it the easy way
+        TST     r1, #VFPSupport_ExamineContext_Serialise
+        BEQ     %FT10
+        ; Serialise it if it's active
         ; TODO - Do something a bit more sophisticated!
-        Push    "r0-r1,lr"
-        LDR     r1, [r0, #Context_NumRegs]
-        MOV     r0, #VFPSupport_Context_Activate
-        MOV     r2, #0
-        MOV     r3, #0
-        BL      SWI_CreateContext
-        BLVC    SWI_DestroyContext
-        ADDVS   sp, sp, #4
-        Pull    "pc",VS
-        Pull    "r0-r1,lr"
-20
-        MOV     r4, r0
+        LDR     r2, ActiveContext
+        CMP     r2, r0
+        BNE     %FT10
+        MOV     r3, lr
+        MOV     r0, #0
+        MOV     r1, #0
+        BL      SWI_ChangeContext ; Deactivate it
+        BLVC    SWI_ChangeContext ; Reactivate it
+        MOVVS   pc, r3
+        MOV     lr, r3
+10
         ; Check the FPEXC value in the dump as a method of determining which format of descriptor block we should use
         ; This won't work too well if programs use this as a method of inserting fake exceptions!
         LDR     r2, [r0, #Context_FPEXC]
@@ -560,8 +578,14 @@ SWI_ExamineContext
         MOVNE   r2, #0
         ORREQ   r0, r0, #VFPSupport_Context_StatusRegsActive
         RSBEQ   r2, r2, r2, LSL r1
+        ; Compute R4
+        MOV     r4, #Context_RegDump
+        ADD     r4, r4,r1,LSL #3
         CLRV
         MOV     pc, lr
+20
+        ADRL    r0, ErrorBlock_BadContext
+        B       ReturnError_LR
         
 FormatDescriptorBlock_FPINST2
         DCD     VFPSupport_Field_FPINST2 + Context_FPINST2<<16
