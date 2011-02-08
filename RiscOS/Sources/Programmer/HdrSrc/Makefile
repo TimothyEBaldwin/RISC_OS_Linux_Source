@@ -38,10 +38,11 @@
 #
 # Paths
 #
-TOPDIR = <hdr$dir>
-HDRDIR = ${TOPDIR}.Global
-HDIR   = <CExport$dir>
-LIBDIR = <Lib$Dir>
+TOPDIR   = <hdr$dir>
+HDRDIR   = ${TOPDIR}.Global
+HDIR     = <CExport$dir>
+LIBDIR   = <Lib$Dir>
+INSTDIR ?= <APCSExport$Dir>
 
 include StdTools
 
