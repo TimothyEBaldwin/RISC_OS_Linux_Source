@@ -120,9 +120,9 @@ clean:
         ${RM} ${GENYUVTABS}
         ${RM} ${GENJHDR}
         ${RM} ${CFSI-JPEG}
-        ${WIPE} o.* ${WFLAGS}
-        ${WIPE} oh.* ${WFLAGS}
-        ${WIPE} s.* ${WFLAGS}
+        ${XWIPE} o.* ${WFLAGS}
+        ${XWIPE} oh.* ${WFLAGS}
+        ${XWIPE} s.* ${WFLAGS}
         @echo ${COMPONENT}: cleaned
 
 resources:
