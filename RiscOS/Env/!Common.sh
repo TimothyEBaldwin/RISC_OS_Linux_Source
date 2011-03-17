@@ -15,7 +15,7 @@ export PATH=$TOOLSDIR/Build:$TOOLSDIR/Misc:$ROOL_BIN:$GCCSDK_INSTALL_CROSSBIN:`e
 
 export APPDIR=$BUILDDIR/Apps
 export MAKEFILEDIR=$BUILDDIR/BuildSys/GNUmakefiles
-export SRCDIR=$BUILDDIR/Sources
+#export SRCDIR=$BUILDDIR/Sources
 export INSTALLDIR=$BUILDDIR/Install
 
 if [ "$APCS" == "APCS-R" ]; then
