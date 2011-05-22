@@ -13,6 +13,7 @@ export SYSTEM=Ursula
 export USERIF=Iyonix
 export DISPLAYTYPE=PAL
 export IMAGESIZE=4096K
+export HALSIZE=64K
 export BUILD=ROOL/CTools
 export APCS=APCS-32
 

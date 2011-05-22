@@ -13,6 +13,7 @@ export SYSTEM=Ursula
 export USERIF=Iyonix
 export DISPLAYTYPE=PAL
 export IMAGESIZE=4096K
+export HALSIZE=64K
 export BUILD=ROOL/CrossTools
 export APCS=Host
 export TOOLCHAIN=GNU
