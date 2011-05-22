@@ -72,6 +72,7 @@ EXPORTS   = \
  ${HDRDIR}.FileTypes \
  ${HDRDIR}.FSNumbers \
  ${HDRDIR}.GraphicsV \
+ ${HDRDIR}.HALSize.<HALSize> \
  ${HDRDIR}.Heap \
  ${HDRDIR}.ImageSize.<ImageSize> \
  ${HDRDIR}.IO.GenericIO \
@@ -162,6 +163,7 @@ Dirs:
 	${MKDIR} ${HDRDIR}.APCS
 	${MKDIR} ${HDRDIR}.CPU
 	${MKDIR} ${HDRDIR}.FDC
+	${MKDIR} ${HDRDIR}.HALSize
 	${MKDIR} ${HDRDIR}.IO
 	${MKDIR} ${HDRDIR}.ImageSize
 	${MKDIR} ${HDRDIR}.Machine
@@ -199,9 +201,10 @@ ${INSTDIR}.Hdr.ListOpts:      hdr.ListOpts;      ${CP} hdr.ListOpts      $@ ${CP
 # Special rule for exporting all ImageSize, Machine and UserIF files.
 # Trigger by invoking the export with OPTIONS=ALL.
 #
-ALL: ${HDRDIR}.Machine.Machine ${HDRDIR}.UserIF.UserIF ${HDRDIR}.ImageSize.<ImageSize> ${HDRDIR}.APCS.<APCS>
+ALL: ${HDRDIR}.Machine.Machine ${HDRDIR}.UserIF.UserIF ${HDRDIR}.HALSize.<HALSize> ${HDRDIR}.ImageSize.<ImageSize> ${HDRDIR}.APCS.<APCS>
 	${CP} hdr.Machine ${HDRDIR}.Machine ${CPFLAGS}
 	${CP} hdr.UserIF ${HDRDIR}.UserIF ${CPFLAGS}
+	${CP} hdr.HALSize ${HDRDIR}.HALSize ${CPFLAGS}
 	${CP} hdr.ImageSize ${HDRDIR}.ImageSize ${CPFLAGS}
 	${CP} hdr.APCS ${HDRDIR}.APCS ${CPFLAGS}
 
@@ -280,6 +283,7 @@ ${HDIR}.Global.h.IOCtl:      h.IOCtl;               ${CP} h.IOCtl               
 # Machine/UI/hardware specific headers:
 ${HDRDIR}.Machine.<Machine>: hdr.Machine.<Machine>; ${CP} hdr.Machine.<Machine>    $@ ${CPFLAGS}
 ${HDRDIR}.Machine.Machine:   hdr.Machine.Machine;   ${CP} hdr.Machine.Machine      $@ ${CPFLAGS}
+${HDRDIR}.HALSize.<HALSize>: hdr.HALSize.<HALSize>; ${CP} hdr.HALSize.<HALSize>    $@ ${CPFLAGS}
 ${HDRDIR}.ImageSize.<ImageSize>: hdr.ImageSize.<ImageSize>; ${CP} hdr.ImageSize.<ImageSize> $@ ${CPFLAGS}
 ${HDRDIR}.APCS.<APCS>:       hdr.APCS.<APCS>;       ${CP} hdr.APCS.<APCS>          $@ ${CPFLAGS}
 ${HDRDIR}.APCS.Common:       hdr.APCS.Common;       ${CP} hdr.APCS.Common          $@ ${CPFLAGS}
