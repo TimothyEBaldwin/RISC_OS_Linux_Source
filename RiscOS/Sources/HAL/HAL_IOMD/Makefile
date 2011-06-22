@@ -85,10 +85,10 @@ resources:
 	@echo ${COMPONENT}: nothing to do
 
 ${TARGET}: ${OBJECTS}
-	Link -bin -o $@ ${OBJECTS}
+	Link -bin -o $@ ${OBJECTS} -base 0xFC000000
 
 ${DBGTARGET}: ${OBJECTS}
-	Link -bin -aif -d -o $@ ${OBJECTS}
+	Link -bin -aif -d -o $@ ${OBJECTS} -base 0xFC000000
 
 ${GPATARGET}: ${DBGTARGET}
 	ToGPA -s ${DBGTARGET} $@
