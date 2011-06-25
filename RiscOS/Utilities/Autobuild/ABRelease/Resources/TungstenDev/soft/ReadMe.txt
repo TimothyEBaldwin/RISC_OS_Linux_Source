@@ -23,7 +23,7 @@ when asked.
 
 Please note: this is a development release of the operating system and is
 supplied in an entirely untested state. The softload tool is also largely
-untested at present to please send a report of any problems you encounter to
+untested at present so please send a report of any problems you encounter to
 info@riscosopen.org.
 
 Thanks!

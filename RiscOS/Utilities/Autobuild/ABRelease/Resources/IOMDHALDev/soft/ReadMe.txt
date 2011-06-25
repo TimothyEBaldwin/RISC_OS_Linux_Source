@@ -1,5 +1,5 @@
 This is a ROM softloader patch for RiscPC and A7000 machines. It includes a
-development release of the RISC OS 5.15 ROM image which can be installed into
+development release of the RISC OS 5.17 ROM image which can be installed into
 your boot sequence as follows:
 
 * Open your main hard disc (left click on the hard disc iconbar icon)
@@ -23,22 +23,13 @@ your choice when asked.
 
 Please note: this is a development release of the operating system and is
 supplied in an entirely untested state. The softload tool is also largely
-untested at present to please send a report of any problems you encounter to
+untested at present so please send a report of any problems you encounter to
 info@riscosopen.org.
 
-There are a number of very significant known issues with this ROM at present:
+For a list of known issues with this ROM image, please see the ROOL wiki:
 
-* No hard drive support
+http://www.riscosopen.org/wiki/documentation/show/Software%20information:%20IOMD%20ROM
 
-* No networking support
-
-* No hardware scrolling or acceleration of window moves, etc
-
-* The CMOS gets reset each time it boots
-
-* Will likely forget the pointer type each reboot
-
-* Doesn't recognise installed VRAM correctly
 
 Thanks!
 
