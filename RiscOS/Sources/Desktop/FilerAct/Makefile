@@ -38,9 +38,9 @@ LD      = link
 RM      = remove
 WIPE    = -wipe
 
-DFLAGS  =
+#DFLAGS  = -Ddebugfile="\"RAM::0.$.out\""
 AFLAGS  = -depend !Depend -Stamp -quit
-CFLAGS  = -c -depend !Depend -ffah ${INCLUDES} ${DFLAGS}
+CFLAGS  = -c -throwback -depend !Depend -ffah ${INCLUDES} ${DFLAGS} 
 CPFLAGS = ~cfr~v
 WFLAGS  = ~c~v
 
