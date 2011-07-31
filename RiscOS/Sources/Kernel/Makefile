@@ -132,12 +132,11 @@ ${GPADBG}: ${AIFDBG}
 s.TMOSHelp: ${TOKENS} HelpStrs
 	${TOKENISE} ${TOKENS} HelpStrs $@
 
-s.Time+Date:
-	@echo |IGBLS Builddate|JBuilddate SETS "<Sys$Date> <Sys$Year>.<Sys$Time>" |J|IEND { > s.Time+Date }
-	settype s.Time+Date FFF
+#s.Time+Date:
+#        @echo |IGBLS Builddate|JBuilddate SETS "<Sys$Date> <Sys$Year>.<Sys$Time>" |J|IEND { > s.Time+Date }
+#        settype s.Time+Date FFF
 	
-o.GetAll: s.TMOSHelp \
-          s.Time+Date
+o.GetAll: s.TMOSHelp
 
 #
 # Exported interface headers
