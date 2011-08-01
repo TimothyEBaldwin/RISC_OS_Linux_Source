@@ -182,11 +182,11 @@ ${C_EXP_HDR}.HALDevice: o.Global.h.HALDevice h.HALDevice
 
 ${C_EXP_HDR}.OSEntries: hdr.OSEntries
 	${MKDIR} ${C_EXP_HDR}
-	perl Build:Hdr2H hdr.OSEntries $@
+	${PERL} Build:Hdr2H hdr.OSEntries $@
 
 ${C_EXP_HDR}.Variables: hdr.Variables
 	${MKDIR} ${C_EXP_HDR}
-	perl Build:Hdr2H hdr.Variables $@
+	${PERL} Build:Hdr2H hdr.Variables $@
 
 o.Global.h.HALDevice: hdr.HALDevice
 	${MKDIR} o.Global.h
