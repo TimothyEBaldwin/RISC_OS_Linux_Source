@@ -66,11 +66,13 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${EXP_HDR}.HALEntries \
             ${EXP_HDR}.HALDevice \
             ${EXP_HDR}.OSEntries \
+            ${EXP_HDR}.OSRSI6 \
             ${C_EXP_HDR}.RISCOS \
             ${C_EXP_HDR}.HALEntries \
             ${C_EXP_HDR}.HALDevice \
             ${C_EXP_HDR}.OSEntries \
-            ${C_EXP_HDR}.Variables
+            ${C_EXP_HDR}.Variables \
+            ${C_EXP_HDR}.OSRSI6
 
 #
 # Generic rules:
@@ -168,6 +170,9 @@ ${EXP_HDR}.HALDevice: hdr.HALDevice
 ${EXP_HDR}.OSEntries: hdr.OSEntries
 	${CP} hdr.OSEntries $@ ${CPFLAGS}
 	
+${EXP_HDR}.OSRSI6: hdr.OSRSI6
+	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
+	
 ${C_EXP_HDR}.RISCOS: hdr.RISCOS
 	${MKDIR} ${C_EXP_HDR}
 	${PERL} Build:Hdr2H hdr.RISCOS $@
@@ -187,6 +192,10 @@ ${C_EXP_HDR}.OSEntries: hdr.OSEntries
 ${C_EXP_HDR}.Variables: hdr.Variables
 	${MKDIR} ${C_EXP_HDR}
 	${PERL} Build:Hdr2H hdr.Variables $@
+
+${C_EXP_HDR}.OSRSI6: hdr.OSRSI6
+	${MKDIR} ${C_EXP_HDR}
+	${PERL} Build:Hdr2H hdr.OSRSI6 $@
 
 o.Global.h.HALDevice: hdr.HALDevice
 	${MKDIR} o.Global.h
