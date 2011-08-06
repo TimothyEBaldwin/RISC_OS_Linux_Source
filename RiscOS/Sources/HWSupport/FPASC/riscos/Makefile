@@ -50,29 +50,32 @@ WFLAGS  = ~c~v
 # Program specific options:
 #
 COMPONENT = FPEmulator
-TARGET    = rm.${MACHINE}.FPEmulator
+TARGET_ROM = rm.${MACHINE}.FPEmulator
+TARGET_RAM = rm.${MACHINE}.FPERAM
 EXPORTS   = ${EXP_HDR}.FPEmulator
+FPEANCHOR ?= Low
 
 #
 # Generic rules:
 #
-rom: ${TARGET}
+rom: ${TARGET_ROM}
 	@echo ${COMPONENT}: rom module built
 
 export: ${EXPORTS}
 	@echo ${COMPONENT}: export complete
 
-install: ${TARGET}
+install: ${TARGET_RAM}
 	${MKDIR} ${INSTDIR}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
+	${CP} ${TARGET_RAM} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
 	@echo ${COMPONENT}: ram module installed
 
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
+install_rom: ${TARGET_ROM}
+	${CP} ${TARGET_ROM} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
 	@echo ${COMPONENT}: rom module installed
 
 clean:
-	${RM} ${TARGET}
+	${RM} ${TARGET_ROM}
+	${RM} ${TARGET_RAM}
 	${WIPE} o.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
@@ -82,12 +85,19 @@ resources:
 	${CP} LocalRes:Messages  ${RESDIR}.${COMPONENT}.Messages  ${CPFLAGS}
 	@echo ${COMPONENT}: resource files copied
 
-${TARGET}: o.fpe
+${TARGET_RAM}: o.fpe_ram
 	${MKDIR} rm.${MACHINE}
-	${LD} -rmf -o $@ o.fpe
+	${LD} -rmf -o $@ o.fpe_ram
 
-o.fpe: s.${MACHINE}
-	${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -CPU 5 s.${MACHINE} $@
+${TARGET_ROM}: o.fpe_rom
+	${MKDIR} rm.${MACHINE}
+	${LD} -rmf -o $@ o.fpe_rom
+
+o.fpe_ram: s.${MACHINE}
+	${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"Local\"" s.${MACHINE} $@
+
+o.fpe_rom: s.${MACHINE}
+	${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR}\"" s.${MACHINE} $@
 
 ${EXP_HDR}.FPEmulator: hdr.FPEmulator
 	${CP} hdr.FPEmulator $@ ${CPFLAGS}
