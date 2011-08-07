@@ -28,28 +28,45 @@
 ; 'Number too big' is given if the result overflowed a 32-bit word
 
 ; In    r1 -> string
-;       r0 =  base to read number in (0 means any based number allowed)
+;       r0 =     bits 0-7: base to read number in (0 means any based number allowed)
 ;                bit 31 set -> check term chars for ok-ness
 ;                bit 30 set -> restrict range to 00..FF
 ;                bit 29 set -> restrict range to 0..R2 (inclusive)
 ;                               (overrides bit 30)
+;                bit 28 set -> read 64-bit value to R2,R3 and
+;                               if applicable, range is in R2,R3
+;       r4 != &45444957 ("WIDE") -> legacy mode: bits 8-28 are considered part of the base
 
 ; Out   VC : r1 -> first unused char, r2 = number
 ;       VS : r1 unchanged, r2 = 0, current error block set
+;       either way, R4 = mask of flag bits supported
 
-ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
+ReadUnsigned_Routine Entry "r0-r1, r3-r6, r9"
 
         WritePSRc SVC_mode, r9
 
-; first set range limit
-        MOV     r9, r2            ; limit value
-        TST     r0, #3 :SHL: 29
-        MOVEQ   r9, #-1           ; used unsigned; allows anything
-        TSTNE   r0, #1 :SHL: 30
-        MOVNE   r9, #&FF
+        LDR     lr, =&45444957
+        CMP     r4, lr
+        MOVEQ   r4, #(2_1111 :SHL: 28)
+        MOVNE   r4, #(2_111 :SHL: 29)
+        STREQ   r4, [stack, #3*4]
 
-        MOV     r11, r0         ; Remember the input flags
-        BIC     r12, r0, #(2_111 :SHL: 29) ; r12 := base
+        AND     r11, r0, r4       ; Remember the input flags
+        ANDEQ   r12, r0, #255     ; r12 := base
+        BICNE   r12, r0, r4
+
+; first set range limit
+        MOV     r9, r2            ; limit value lo word
+        TST     r11, #1 :SHL: 28
+        MOVEQ   r6, #0            ; limit value hi word
+        MOVNE   r6, r3
+        TST     r11, #3 :SHL: 29
+        MOVEQ   r9, #-1           ; used unsigned; allows anything
+        MOVEQ   r6, #-1
+        TST     r11, #1 :SHL: 30
+        MOVNE   r9, #&FF
+        MOVNE   r6, #0
+
         CMP     r12, #2          ; If base nonsensical, default to 10
         RSBGES  r14, r12, #36    ; ie. try to match most generally
         MOVLT   r12, #10
@@ -62,8 +79,11 @@ ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
         TEQ     r0, #"&"        ; '&' always forces hex read
         BNE     %FT20
         MOV     r4, #16
-        BL      ReadNumberInBase
-        BVS     %FT95
+        TST     r11, #1 :SHL: 28
+        ADR     lr, %FT09
+        BEQ     ReadNumberInBase
+        BNE     Read64BitNumberInBase
+09      BVS     %FT95
 
 10      STR     r1, [sp, #4]       ; Update string^
         TST     r11, #(1 :SHL: 31) ; Was the termcheck flag set ?
@@ -72,8 +92,11 @@ ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
         CMP     r0, #" "           ; CtrlChar + space all ok
         BGT     %FT85              ; For bad term errors
 
-15      CMP     r2, r9
-        BHI     %FT80
+15      CMP     r9, r2
+        SBCS    lr, r6, r5
+        BCC     %FT80
+        TST     r11, #1 :SHL: 28
+        STRNE   r5, [stack, #4*2]
         PullEnv
         ExitSWIHandler          ; VClear already in lr
 
@@ -83,11 +106,10 @@ ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
         BL      ReadNumberInBase
         MOVVS   r4, r12          ; If we failed to read a decimal number
         BVS     %FT30           ; then use the one supplied (r12). r1 ok
-        LDRB    r0, [r1]        ; Is it base_number ?
+        LDRB    r0, [r1], #1    ; Is it base_number ?
         CMP     r0, #"_"        ; If not based, use supplied base
         MOVNE   r1, r10         ; to read from given start of string (spaces !)
         MOVNE   r4, r12         ; restore supplied base!
-        ADDEQ   r1, r1, #1      ; Skip the '_'
         MOVEQ   r4, r2          ; Use this as new base
 
 ; Reading number in base r4
@@ -95,8 +117,11 @@ ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
 30      CMP     r4, #2          ; Is base valid (2..36) ?
         RSBGES  r0, r4, #36     ; LT -> invalid
         BLT     %FT90
-        BL      ReadNumberInBase ; Read rest of number
-        BVS     %FT95
+        TST     r11, #1 :SHL: 28
+        ADR     lr, %FT39
+        BEQ     ReadNumberInBase ; Read rest of number
+        BNE     Read64BitNumberInBase
+39      BVS     %FT95
         B       %BT10
 
 
@@ -127,8 +152,10 @@ ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
 
 95
         STR     r2, [stack]     ; Go set the current error
-        PullEnv
         MOV     r2, #0          ; Defined to return 0 on error
+        TST     r11, #1 :SHL: 28
+        STRNE   r2, [stack, #4*2] ; return MSB=0 on error too, if 64-bit read reqd
+        PullEnv
         B       SLVK_SetV
 
         MakeErrorBlock BadBase
@@ -140,18 +167,23 @@ ReadUnsigned_Routine Entry "r0-r1, r3-r4, r9"
 
 ; In    r1 -> string, r4 = base (valid)
 
-; Out   VC : Number read in r2, r1 updated. r3 = number of chars used
+; Out   VC : Number read in r2, r1 updated. r3 = number of chars used, r5 = 0
 ;       VS : r1 preserved, r2 -> error block
 
 ReadNumberInBase Entry "r0, r1, r12"
 
         MOV     r2, #0          ; Result
         MOV     r3, #0          ; Number of valid digits read
+        MOV     r5, #0
 
 10      BL      GetCharForReadNumber
         BNE     %FT50           ; Finished ?
-        MOV     r12, r4
 
+        TST     r2, #&F8000000  ; If EQ, can't possibly overflow in any base up to 26
+        MLAEQ   r2, r4, r2, r0
+        BEQ     %BT10
+
+        MOV     r12, r4
         MOV     r14, #0         ; Multiply by repeated addition. Base <> 0 !
 20      ADDS    r14, r14, r2
         BCS     %FT90           ; Now checks for overflow !
@@ -191,6 +223,45 @@ ReadNumberInBase Entry "r0, r1, r12"
       ]
         EXIT
         MakeErrorBlock NumbTooBig
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; Read64BitNumberInBase
+; =====================
+
+; In    r1 -> string, r4 = base (valid)
+
+; Out   VC : Number read in r2 (lo) and r5 (hi), r1 updated. r3 = number of chars used
+;       VS : r1 preserved, r2 -> error block, r5 corrupted
+
+Read64BitNumberInBase ALTENTRY
+
+        MOV     r2, #0          ; Result lo
+        MOV     r3, #0          ; Number of valid digits read
+        MOV     r5, #0          ; Result hi
+
+10      BL      GetCharForReadNumber
+        BNE     %BT50           ; Finished ?
+
+      [ :LNOT: NoARMv4
+        TST     r5, #&F8000000  ; If EQ, can't possibly overflow in any base up to 26
+        MULEQ   r5, r4, r5      ; r0,r5 = new_digit + (old_msw * base)<<32
+        UMLALEQ r0, r5, r4, r2  ; r0,r5 += old_lsw * base
+        MOVEQ   r2, r0
+        BEQ     %BT10
+      ]
+                                ; Multiply by repeated addition. Base <> 0 !
+        SUBS    r12, r4, #1     ; Final iteration has r2,r5 as dest, so one fewer main iterations
+        MOV     r14, #0         ; r0,r14 is accumulator, initialised to new_digit,0
+20      ADDS    r0, r0, r2
+        ADCS    r14, r14, r5
+        BCS     %BT90
+        SUBS    r12, r12, #1
+        BNE     %BT20
+        ADDS    r2, r0, r2
+        ADCS    r5, r14, r5
+        BCC     %BT10
+        B       %BT90           ; Checks for overflow here too!
 
 ; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ;
