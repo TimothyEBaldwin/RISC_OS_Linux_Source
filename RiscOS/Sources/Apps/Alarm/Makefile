@@ -31,7 +31,7 @@ APP        = !${COMPONENT}
 ROM_MODULE = rm.${COMPONENT}
 RDIR       = Resources
 LDIR       = LocalRes:
-
+MSGVERSION = ${AWK} -f Build:AwkVers
 MSGS       = Resources.GenMessage
 
 #
@@ -44,6 +44,7 @@ RESAPP = <resource$dir>.Apps.${APP}
 # Generic options:
 #
 MKDIR   = do mkdir -p
+AWK     = GNU.gawk
 ARMASM  = objasm
 CP      = copy
 RM      = remove
@@ -142,8 +143,8 @@ ${ROM_MODULE}: s.Main ${MSGS} ${RESFILES}
 	${ARMASM} ${AFLAGS} -o o.Main s.Main
 	Link -rmf -o $@ o.Main 
 
-${MSGS}: LocalRes:Messages VersionASM
-	GNU.gawk -f awk.Version LocalRes:Messages > $@
+${MSGS}: LocalRes:Messages VersionNum
+	${MSGVERSION} LocalRes:Messages > $@
 
 ${RDIR}.!RunImage: crunched.!RunImage
 	${SQUISH} ${SQFLAGS} -from crunched.!RunImage -to $@
