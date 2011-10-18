@@ -53,18 +53,7 @@ LIBDIR  = <Lib$Dir>
 #
 # Generic options:
 #
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-LIBFILE = libfile
-MKDIR   = do mkdir -p
-MODSQZ  = modsqz
-OBJASM  = objasm
-RM      = remove
-WIPE    = -wipe
-PERL    = do <Perl$Dir>.perl
+include Makefiles:StdTools
 
 # Note the output redirection on the end of this macro to enable parameters
 # to match those of the old application xtentries.
@@ -143,12 +132,12 @@ VPATH = @ kernel clib rlib
 .c.m_o_rl:;   ${CC} ${CFLAGS} -ffah ${DFLAGS} -zM -o $@ $<
 .c.rm_o:;     ${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
 .c.rm_o_rl:;  ${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
-.s.o:;        ${OBJASM} ${AFLAGS} ${ALFLAGS} $< $@
-.s.m_o:;      ${OBJASM} ${AFLAGS} ${ALFLAGS} $< $@
-.s.o_rl:;     ${OBJASM} ${AFLAGS} $< $@
-.s.m_o_rl:;   ${OBJASM} ${AFLAGS} $< $@
-.s.rm_o:;     ${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
-.s.rm_o_rl:;  ${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
+.s.o:;        ${AS} ${AFLAGS} ${ALFLAGS} $< $@
+.s.m_o:;      ${AS} ${AFLAGS} ${ALFLAGS} $< $@
+.s.o_rl:;     ${AS} ${AFLAGS} $< $@
+.s.m_o_rl:;   ${AS} ${AFLAGS} $< $@
+.s.rm_o:;     ${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
+.s.rm_o_rl:;  ${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
 
 #
 # Libraries
@@ -487,22 +476,22 @@ install_rom: ${OBJECT}
 clean: clean_all
 
 clean_all:
-	${WIPE} o.* ${WFLAGS}
-	${WIPE} m_o.* ${WFLAGS}
-	${WIPE} o_rl.* ${WFLAGS}
-	${WIPE} m_o_rl.* ${WFLAGS}
-	${WIPE} rm_o.* ${WFLAGS}
-	${WIPE} rm_o_rl.* ${WFLAGS}
-	${WIPE} linked.* ${WFLAGS}
-	${WIPE} map.* ${WFLAGS}
-	${WIPE} aof.* ${WFLAGS}
-	${WIPE} syms.* ${WFLAGS}
+	${XWIPE} o.* ${WFLAGS}
+	${XWIPE} m_o.* ${WFLAGS}
+	${XWIPE} o_rl.* ${WFLAGS}
+	${XWIPE} m_o_rl.* ${WFLAGS}
+	${XWIPE} rm_o.* ${WFLAGS}
+	${XWIPE} rm_o_rl.* ${WFLAGS}
+	${XWIPE} linked.* ${WFLAGS}
+	${XWIPE} map.* ${WFLAGS}
+	${XWIPE} aof.* ${WFLAGS}
+	${XWIPE} syms.* ${WFLAGS}
 	${RM} derived.swis
 	${RM} s.swioptions
 	${RM} s.abssym
 	${RM} s.c_abssym
 	${RM} s.a_abssym
-	${WIPE} lib.* ${WFLAGS}
+	${XWIPE} lib.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
 resources:
@@ -603,58 +592,58 @@ rom_link: rom_link_${TARGET}
 # Build rules for Libraries and Stubs:
 #
 lib.ansilib: ${ANSI_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${ANSI_OBJS}
+	${AR} ${LIBFLAGS} $@ ${ANSI_OBJS}
 
 lib.ansilibm: ${ANSI_MOD_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${ANSI_MOD_OBJS}
+	${AR} ${LIBFLAGS} $@ ${ANSI_MOD_OBJS}
 
 lib.risc_oslib: ${RLIB_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${RLIB_OBJS}
+	${AR} ${LIBFLAGS} $@ ${RLIB_OBJS}
 
 lib.riscoslibm: ${RLIB_MOD_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${RLIB_MOD_OBJS}
+	${AR} ${LIBFLAGS} $@ ${RLIB_MOD_OBJS}
 
 o.cl_stub_r: clib.s.cl_stub_r
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
 
 o.cl_stub2_r: clib.s.cl_stub2_r
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
 
 o.k_stub2_r: kernel.s.k_stub2_r
-	${OBJASM} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
+	${AS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
 
 m_o.cl_stub_m: clib.s.cl_stub_m
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
 
 o_rl.rl_stub_r: rlib.s.rl_stub_r
-	${OBJASM} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
+	${AS} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
 
 rm_o.cl_stub_rm: clib.s.cl_stub_rm
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
 
 rm_o.cl_stub2_rm: clib.s.cl_stub2_rm
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
 
 rm_o.k_stub2_rm: kernel.s.k_stub2_rm
-	${OBJASM} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
+	${AS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
 
 rm_o_rl.rl_stub_rm: rlib.s.rl_stub_rm
-	${OBJASM} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
+	${AS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
 
 lib.stubs: o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
+	${AR} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
 
 lib.rstubs: o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
+	${AR} ${LIBFLAGS} $@ o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
 
 lib.romcstubs: rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
+	${AR} ${LIBFLAGS} $@ rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
 
 lib.romstubs: rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
+	${AR} ${LIBFLAGS} $@ rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
 
 lib.romastubs: rlib.s.rl_stub_a
-	${OBJASM} ${AFLAGS} -from rlib.s.rl_stub_a -to $@
+	${AS} ${AFLAGS} -from rlib.s.rl_stub_a -to $@
 
 # Non-exported libraries:
 lib.clib: ${CLIB_MOD_OBJS}
@@ -791,40 +780,40 @@ RISC_OSLib:s.modulewrap: s.modulewrap;       ${CP} s.modulewrap $@ ${CPFLAGS}
 # Objects whose name isn't the same as their source
 #
 o.clib: clib.s.cl_obj_r
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_r -to $@
 
 o.kernel: kernel.s.k_obj_r
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_r -to $@
 
 m_o.clib: clib.s.cl_obj_m
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_m -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_m -to $@
 
 m_o.kernel: kernel.s.k_obj_m
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_m -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_m -to $@
 
 rm_o.clib:  clib.s.cl_obj_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.cl_obj_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.cl_obj_r -to $@
 
 rm_o.cl_modbody: clib.s.cl_mod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} ${UROM_ROM_DEFS} -from clib.s.cl_mod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} ${UROM_ROM_DEFS} -from clib.s.cl_mod_r -to $@
 
 rm_o_rl.rl_modbody: rlib.s.rl_mod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.rl_mod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.rl_mod_r -to $@
 
 rm_o.k_modbody: kernel.s.k_mod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from kernel.s.k_mod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from kernel.s.k_mod_r -to $@
 
 rm_o.memcpy: s.memcpy s.h_regs
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from s.memcpy -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from s.memcpy -to $@
 
 o.initmodule: clib.s.initmod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_r -to $@
 
 rm_o.initmodule: clib.s.initmod_rm
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_rm -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_rm -to $@
 
 rm_o_rl.initmodule: rlib.s.initmod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.initmod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.initmod_r -to $@
 
 #
 # Objects that require extra flags
@@ -858,22 +847,22 @@ rm_o.string: c.string
 # Note: New Assembler - could use -PreDefine "UROM SETL {FALSE}"
 
 o_rl.swi: rlib.s.swi
-	${OBJASM} ${UROM_DEFS} rlib.s.swi o_rl.swi ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.swi o_rl.swi ${AFLAGS}
 
 o_rl.poll: rlib.s.poll
-	${OBJASM} ${UROM_DEFS} rlib.s.poll o_rl.poll ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.poll o_rl.poll ${AFLAGS}
 
 m_o_rl.swi: rlib.s.swi
-	${OBJASM} ${UROM_DEFS} rlib.s.swi m_o_rl.swi ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.swi m_o_rl.swi ${AFLAGS}
 
 m_o_rl.poll: rlib.s.poll
-	${OBJASM} ${UROM_DEFS} rlib.s.poll m_o_rl.poll ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.poll m_o_rl.poll ${AFLAGS}
 
 rm_o_rl.swi: rlib.s.swi
-	${OBJASM} ${UROM_ROM_DEFS} rlib.s.swi rm_o_rl.swi ${AFLAGS} ${OPTIONS}
+	${AS} ${UROM_ROM_DEFS} rlib.s.swi rm_o_rl.swi ${AFLAGS} ${OPTIONS}
 
 rm_o_rl.poll: rlib.s.poll
-	${OBJASM} ${UROM_ROM_DEFS} rlib.s.poll rm_o_rl.poll ${AFLAGS} ${OPTIONS}
+	${AS} ${UROM_ROM_DEFS} rlib.s.poll rm_o_rl.poll ${AFLAGS} ${OPTIONS}
 
 #
 # trace separated out to allow defining of TRACE
