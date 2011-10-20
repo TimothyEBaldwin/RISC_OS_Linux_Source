@@ -1,11 +1,11 @@
 RISC OS Open Release Archive
 ============================
 
-This is the OMAP (Beagle Board) development ROM image. It is a bleeding-edge
+This is the OMAP4 (PandaBoard) development ROM image. It is a bleeding-edge
 build which comes from the latest revisions of all the relevant sources in
 our source code repository and is completely untested.
 
-Using this ROM image in your Beagle should only be done if you are confident
+Using this ROM image in your board should only be done if you are confident
 that you know what you are doing! It is likely to be functionally incomplete
 and probably unstable in various ways.
 
@@ -33,7 +33,7 @@ RISC OS Open wiki:
 The 'InstallHD4' script, and setting up a !Boot sequence
 ========================================================
 
-For details of how to setup up a !Boot sequence for your OMAP3 machine, please
+For details of how to setup up a !Boot sequence for your OMAP4 machine, please
 see the 'Putting the HardDisc4 image onto a USB drive' section of this wiki
 page:
 
