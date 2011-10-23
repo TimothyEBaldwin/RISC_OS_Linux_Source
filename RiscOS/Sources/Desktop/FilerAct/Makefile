@@ -30,13 +30,7 @@ EXP_HDR = <export$dir>
 #
 # Generic options:
 #
-MKDIR   = cdir
-AS      = objasm
-CC      = cc
-CP      = copy
-LD      = link
-RM      = remove
-WIPE    = -wipe
+include StdTools
 
 #DFLAGS  = -Ddebugfile="\"RAM::0.$.out\""
 AFLAGS  = -depend !Depend -Stamp -quit
@@ -130,12 +124,12 @@ install_rom: ${TARGET}
 	@echo ${COMPONENT}: rom module installed
 
 clean:
-	${WIPE} o.* ${WFLAGS}
-	${WIPE} oa.* ${WFLAGS}
-	${WIPE} app.* ${WFLAGS}
-	${WIPE} rm.* ${WFLAGS}
-	${WIPE} linked.* ${WFLAGS}
-	${WIPE} map.* ${WFLAGS}
+	${XWIPE} o.* ${WFLAGS}
+	${XWIPE} oa.* ${WFLAGS}
+	${XWIPE} app.* ${WFLAGS}
+	${XWIPE} rm.* ${WFLAGS}
+	${XWIPE} linked.* ${WFLAGS}
+	${XWIPE} map.* ${WFLAGS}
 	${RM} ${TARGET}
 	${RM} s.ModuleWrap
 	@echo ${COMPONENT}: cleaned
