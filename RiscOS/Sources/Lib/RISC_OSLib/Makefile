@@ -63,7 +63,7 @@ DIFF    = gnu.diff -df >null:
 
 AFLAGS  = -depend !Depend
 # The zz switch stops library static data being placed in a zero-init area
-CFLAGS  = -c -depend !Depend ${INCLUDES} -DDDE -fK -zz10000000
+CFLAGS  = -c -depend !Depend ${INCLUDES} -DDDE -fK -zz10000000 -jC:
 CPFLAGS = ~cfr~v
 WFLAGS  = ~c~r~v
 
