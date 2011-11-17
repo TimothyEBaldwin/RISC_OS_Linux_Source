@@ -37,45 +37,19 @@
 # 17-Mar-95  JDavies      Removed CNFLAGS definition, no longer needed
 #
 
-#
-# Generic options:
-#
-MKDIR   = cdir
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-WIPE    = -wipe
-
-AFLAGS  = -depend !Depend -Stamp -quit
-CFLAGS  = -c -depend !Depend -fahf -zps1 -wp -zM ${INCLUDES} ${DFLAGS}
-CMHGFLAGS = -p -depend !Depend
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
-
-#
-# Libraries
-#
-CLIB      = CLIB:o.stubs
-RLIB      = RISCOSLIB:o.risc_oslib
-RSTUBS    = RISCOSLIB:o.rstubs
-ROMSTUBS  = RISCOSLIB:o.romstubs
-ROMCSTUBS = RISCOSLIB:o.romcstubs
-ABSSYM    = RISC_OSLib:o.AbsSym
+include StdTools
+include ModuleLibs
 
 #
 # Program specific options:
 #
-COMPONENT = Net
-TARGET    = aof.Net
+COMPONENT  = Net
+TARGET     = aof.Net
+CFLAGS    += ${C_NO_STKCHK} ${C_MODULE} -wp
+VPATH      = @ gwroute
+CINCLUDES += -ITCPIPLibs:,C:
 
-VPATH     = @ gwroute
-INCLUDES  = -ITCPIPLibs:,C:
-#DFLAGS    = -DDEBUG
-
-LIBS   = TCPIPLibs:o.unixlibzm TCPIPLibs:o.inetlibzm TCPIPLibs:o.socklib5zm C:AsmUtils.o.AsmUtilsZM
+LIBS   = ${UNIXLIB} ${INETLIB} ${SOCK5LIB} ${ASMUTILS}
 
 OBJS   = o.mns o.mnscommon o.io o.swis o.configure o.netasm o.route o.showrt \
          o.text o.inetfn o.debug
@@ -87,10 +61,9 @@ IOBJS  = o.mnsi o.mnscommon o.io o.swis o.configure o.netasm \
          o.text o.inetfn o.debug
 
 GOBJS  = o.mnsg o.mnscommon o.io o.swis o.configure o.netasm o.showrt \
-	 o.text o.inetfn \
+         o.text o.inetfn \
          o.af o.if o.input o.output o.startup o.tables \
          o.timer o.trace o.inet o.data
-	 
 
 #
 # Rule patterns
@@ -109,6 +82,7 @@ install:    rm.NetI
 	${CP} rm.NetI ${INSTDIR}.NetI ${CPFLAGS}
 	Access ${INSTDIR}.NetI WR/r
 	@echo ${COMPONENT}: NetI installed
+	
 #
 # RISC OS ROM build rules:
 #
@@ -123,10 +97,10 @@ install_rom: ${TARGET}
 	@echo ${COMPONENT}: rom module installed
 
 clean:
-	${WIPE} o.* ${WFLAGS}
-	${WIPE} rm.* ${WFLAGS}
-	${WIPE} linked.* ${WFLAGS}
-	${WIPE} map.* ${WFLAGS}
+	${XWIPE} o.* ${WFLAGS}
+	${XWIPE} rm.* ${WFLAGS}
+	${XWIPE} linked.* ${WFLAGS}
+	${XWIPE} map.* ${WFLAGS}
 	${RM} ${TARGET}
 	@echo ${COMPONENT}: cleaned
 
@@ -140,15 +114,6 @@ rom_link:
 	${LD} -o linked.${COMPONENT} -map -module -base ${ADDRESS} ${TARGET} ${ABSSYM} > map.${COMPONENT}
 	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
 	@echo ${COMPONENT}: rom_link complete
-
-#
-# AUN:
-#
-#rm.NetMsgs: Resources.UK.Messages
-#        modgen rm.~NetMsgs NetMsgs NetMsgs 0.03 Resources.UK.Messages Resources.Net.Messages
-#        modsqz rm.~NetMsgs
-#        remove rm.NetMsgs
-#        rename rm.~NetMsgs rm.NetMsgs
 
 rm.Net:  ${OBJS} o.MNSHdr_c ${LIBS} ${LCLIB}
 	 ${LD} -o $@ -module -map o.mnshdr_c ${OBJS} ${LIBS} ${CLIB} > map.linkmap_c
