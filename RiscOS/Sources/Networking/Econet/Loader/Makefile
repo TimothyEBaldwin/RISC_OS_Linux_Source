@@ -28,7 +28,6 @@
 MKDIR    = cdir
 AS       = aasm
 CP       = copy
-MODGEN   = modgen
 RM       = remove
 TOKENISE = tokenise
 

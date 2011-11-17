@@ -32,12 +32,14 @@ C_EXP_HDR = <cexport$dir>.Interface.h
 #
 # Generic options:
 #
-MKDIR    = cdir
-AS       = aasm
+MKDIR    = do mkdir -p
+AS       = objasm
+LD       = link
 CP       = copy
 MODGEN   = modgen
 RM       = remove
 TOKENISE = tokenise
+XWIPE    = x wipe
 PERL     = do <Perl$Dir>.perl
 
 AFLAGS   = -depend !Depend -stamp -closeexec -quit
@@ -92,7 +94,7 @@ clean:
 	${RM} ${TARGET}
 	${RM} ${TARGET200}
 	${RM} ${MESSAGESMOD}
-	${RM} setversion
+	${XWIPE} o ~CFR~V
 	@echo ${COMPONENT}: cleaned
 
 resources:
@@ -104,10 +106,14 @@ resources:
 # Assemble the Econet module
 #
 ${TARGET}: ${SOURCE}
-	${AS} ${SOURCE} $@ ${AFLAGS} -module
+	${MKDIR} o
+	${AS} ${SOURCE} -o o.Module ${AFLAGS}
+	${LD} -rmf -o $@ o.Module
 
 ${TARGET200}: ${SOURCE200}
-	${AS} ${SOURCE200} $@ ${AFLAGS} -module
+	${MKDIR} o
+	${AS} ${SOURCE200} -o o.Module ${AFLAGS}
+	${LD} -rmf -o $@ o.Module
 
 #
 # Export hdr files
@@ -126,21 +132,10 @@ ${C_EXP_HDR}.Econet: hdr.Econet
 msgmod: ${MESSAGESMOD}
 	@echo ${COMPONENT}: messages module built
 
-${MESSAGESMOD}: ${MESSAGES} setversion
-	setversion
-	set alias$modgen_ver ${MODGEN} $@ ${MODNAME} ${MODHELP} <Version> ${MESSAGES} ${RESPATH}
-	modgen_ver
-	unset alias$modgen
-	unset Version
-
-setversion: Time+Date
-	${AS} utils.getversion $@ ${AFLAGS}
-	settype setversion obey
-
-maketime:
-	MakeTime
-
-version:
-	Version
+${MESSAGESMOD}: ${MESSAGES} VersionNum
+	${PERL} build:getversion Econet$BuildV Econet$FullV Econet$Date
+	Do ${MODGEN} -date "<Econet$Date>" $@ ${MODNAME} ${MODHELP} <Econet$BuildV> ${MESSAGES} ${RESPATH}
 
 #---------------------------------------------------------------------------
+
+# Dynamic dependencies:
