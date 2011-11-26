@@ -1,0 +1,1303 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > VMSAv6
+
+        GBLL    DebugAborts
+DebugAborts SETL {FALSE}
+
+        GBLL    UseProcessTransfer
+UseProcessTransfer SETL {FALSE} ; Needs updating to cope with HiProcVecs (for proc. vector protection) and all the ARMv6+ (ARMv3+?) load/store instructions
+
+
+; MMU interface file - VMSAv6 version
+
+; Created from s.ARM600 by JL 18-Feb-09
+
+
+; Make sure we aren't being compiled against a CPU that can't possibly support a VMSAv6 MMU
+
+        ASSERT HAL32
+        ASSERT :LNOT: ECC
+        ASSERT :LNOT: ARM6support
+
+OneMByte                EQU     (1024*1024)
+SixteenMByte            EQU     (1024*1024 * 16)
+
+        KEEP
+
+; *****************************************************************************
+
+; mjs Oct 2000 kernel/HAL split
+; SetDAG stuff is no more, routines like SetVinit now call equivalent HAL
+; routine
+
+; **************** CAM manipulation utility routines ***********************************
+
+; **************************************************************************************
+;
+;       BangCamUpdate - Update CAM, MMU for page move, coping with page currently mapped in
+;
+; mjs Oct 2000
+; reworked to use generic ARM ops (vectored to appropriate routines during boot)
+;
+; First look in the CamEntries table to find the logical address L this physical page is
+; currently allocated to. Then check in the Level 2 page tables to see if page L is currently
+; at page R2. If it is, then map page L to be inaccessible, otherwise leave page L alone.
+; Then map logical page R3 to physical page R2.
+;
+; in:   r2 = physical page number
+;       r3 = logical address (2nd copy if doubly mapped area)
+;       r9 = offset from 1st to 2nd copy of doubly mapped area (either source or dest, but not both)
+;       r11 = PPL + CB bits
+;
+; out:  r0, r1, r4, r6 corrupted
+;       r2, r3, r5, r7-r12 preserved
+;
+; NB Use of stack is allowed in this routine
+
+BangCamUpdate ROUT
+        TST     r11, #DynAreaFlags_DoublyMapped ; if moving page to doubly mapped area
+        SUBNE   r3, r3, r9                      ; then CAM soft copy holds ptr to 1st copy
+
+        LDR     r1, =ZeroPage
+        LDR     r1, [r1, #CamEntriesPointer]
+        ADD     r1, r1, r2, LSL #3              ; point at cam entry (logaddr, PPL)
+        LDMIA   r1, {r0, r6}                    ; r0 = current logaddress, r6 = current PPL
+        STMIA   r1, {r3, r11}                   ; store new address, PPL
+        Push    "r0, r6"                        ; save old logical address, PPL
+        LDR     r1, =ZeroPage+PhysRamTable      ; go through phys RAM table
+        MOV     r6, r2                          ; make copy of r2 (since that must be preserved)
+10
+        LDMIA   r1!, {r0, r4}                   ; load next address, size
+        SUBS    r6, r6, r4, LSR #12             ; subtract off that many pages
+        BCS     %BT10                           ; if more than that, go onto next bank
+
+        ADD     r6, r6, r4, LSR #12             ; put back the ones which were too many
+        ADD     r0, r0, r6, LSL #12             ; move on address by the number of pages left
+        LDR     r6, [r13]                       ; reload old logical address
+
+; now we have r6 = old logical address, r2 = physical page number, r0 = physical address
+
+        TEQ     r6, r3                          ; TMD 19-Jan-94: if old logaddr = new logaddr, then
+        BEQ     %FT20                           ; don't remove page from where it is, to avoid window
+                                                ; where page is nowhere.
+        LDR     r1, =L2PT
+        ADD     r6, r1, r6, LSR #10             ; r6 -> L2PT entry for old log.addr
+        MOV     r4, r6, LSR #12                 ; r4 = word offset into L2 for address r6
+        LDR     r4, [r1, r4, LSL #2]            ; r4 = L2PT entry for L2PT entry for old log.addr
+        TST     r4, #3                          ; if page not there
+        BEQ     %FT20                           ; then no point in trying to remove it
+
+        LDR     r4, [r6]                        ; r4 = L2PT entry for old log.addr
+        MOV     r4, r4, LSR #12                 ; r4 = physical address for old log.addr
+        TEQ     r4, r0, LSR #12                 ; if equal to physical address of page being moved
+        BNE     %FT20                           ; if not there, then just put in new page
+
+        Push    "r0, r3, r11, r14"              ; save phys.addr, new log.addr, new PPL, lr
+        ADD     r3, sp, #4*4
+        LDMIA   r3, {r3, r11}                   ; reload old logical address, old PPL
+        MOV     r0, #0                          ; cause translation fault
+        BL      BangL2PT                        ; map page out
+        Pull    "r0, r3, r11, r14"
+20
+        ADD     sp, sp, #8                      ; junk old logical address, PPL
+        B       BangCamAltEntry                 ; and branch into BangCam code
+
+; **************************************************************************************
+;
+;       BangCam - Update CAM, MMU for page move, assuming page currently mapped out
+;
+; This routine maps a physical page to a given logical address
+; It is assumed that the physical page is currently not mapped anywhere else
+;
+; in:   r2 = physical page number
+;       r3 = logical address (2nd copy if doubly mapped)
+;       r9 = offset from 1st to 2nd copy of doubly mapped area (either source or dest, but not both)
+;       r11 = PPL
+;
+; out:  r0, r1, r4, r6 corrupted
+;       r2, r3, r5, r7-r12 preserved
+;
+; NB Can't use stack - there might not be one!
+;
+; NB Also - the physical page number MUST be in range.
+
+; This routine must work in 32-bit mode
+
+BangCam ROUT
+        TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
+        SUBNE   r3, r3, r9              ; then move ptr to 1st copy
+
+        LDR     r1, =ZeroPage+PhysRamTable ; go through phys RAM table
+        MOV     r6, r2                  ; make copy of r2 (since that must be preserved)
+10
+        LDMIA   r1!, {r0, r4}           ; load next address, size
+        SUBS    r6, r6, r4, LSR #12     ; subtract off that many pages
+        BCS     %BT10                   ; if more than that, go onto next bank
+
+        ADD     r6, r6, r4, LSR #12     ; put back the ones which were too many
+        ADD     r0, r0, r6, LSL #12     ; move on address by the number of pages left
+BangCamAltEntry
+        LDR     r4, =DuffEntry          ; check for requests to map a page to nowhere
+        ADR     r1, PPLTrans
+        TEQ     r4, r3                  ; don't actually map anything to nowhere
+        MOVEQ   pc, lr
+        AND     r4, r11, #3             ; first use PPL bits
+        LDR     r1, [r1, r4, LSL #2]    ; get PPL bits and SmallPage indicator
+
+ [ {FALSE}
+        TST     r11, #DynAreaFlags_NotCacheable
+        TSTEQ   r11, #PageFlags_TempUncacheableBits
+        ORREQ   r1, r1, #L2_C           ; if cacheable (area bit CLEAR + temp count zero), then OR in C bit
+        TST     r11, #DynAreaFlags_NotBufferable
+        ORREQ   r1, r1, #L2_B           ; if bufferable (area bit CLEAR), then OR in B bit
+
+        ORR     r0, r0, r1
+ |
+        ASSERT  DynAreaFlags_CPBits = 7 :SHL: 12
+        ASSERT  DynAreaFlags_NotCacheable = 1 :SHL: 5
+        ASSERT  DynAreaFlags_NotBufferable = 1 :SHL: 4
+
+        ORR     r0, r0, r1
+
+        LDR     r6, =ZeroPage
+        LDR     r6, [r6, #MMU_PCBTrans]
+        AND     r4, r11, #DynAreaFlags_CPBits
+        AND     r1, r11, #DynAreaFlags_NotCacheable + DynAreaFlags_NotBufferable
+        TST     r11, #PageFlags_TempUncacheableBits
+        ORRNE   r1, r1, #DynAreaFlags_NotCacheable      ; if temp uncache, set NC bit, ignore P
+        ORREQ   r1, r1, r4, LSR #6                      ; else use NC, NB and P bits
+        LDRB    r1, [r6, r1, LSR #4]                    ; convert to X, C and B bits for this CPU
+        ORR     r0, r0, r1
+ ]
+
+        LDR     r1, =L2PT               ; point to level 2 page tables
+
+        ;fall through to BangL2PT
+
+;internal entry point for updating L2PT entry
+;
+; entry: r0 = new L2PT value, r1 -> L2PT, r3 = logical address (4k aligned), r11 = PPL
+;
+; exit: r0,r1,r4,r6 corrupted
+;
+BangL2PT                                        ; internal entry point used only by BangCamUpdate
+        Push    "lr"
+        MOV     r6, r0
+
+        TST     r11, #DynAreaFlags_DoublyMapped
+        BNE     BangL2PT_sledgehammer           ;if doubly mapped, don't try to be clever
+
+        ;we sort out cache coherency _before_ remapping, because some ARMs might insist on
+        ;that order (write back cache doing write backs to logical addresses)
+        ;we need to worry about cache only if mapping out a cacheable page
+        ;
+        TEQ     r6, #0                          ;EQ if mapping out
+        TSTEQ   r11, #DynAreaFlags_NotCacheable ;EQ if also cacheable (overcautious for temp uncache+illegal PCB combos)
+        MOV     r0, r3                          ;MMU page entry address
+        ADR     lr, %FT20
+        LDR     r4, =ZeroPage
+        ARMop   MMU_ChangingEntry, EQ, tailcall, r4
+        ARMop   MMU_ChangingUncachedEntry, NE, tailcall, r4
+
+20      STR     r6, [r1, r3, LSR #10]           ;update L2PT entry
+
+        Pull    "pc"
+
+BangL2PT_sledgehammer
+
+        ;sledgehammer is super cautious and does cache/TLB coherency on a global basis
+        ;should only be used for awkward cases
+        ;
+        TEQ     r6, #0                          ;EQ if mapping out
+        TSTEQ   r11, #DynAreaFlags_NotCacheable ;EQ if also cacheable (overcautious for temp uncache+illegal PCB combos)
+        ADR     lr, %FT30
+        LDR     r4, =ZeroPage
+        ARMop   MMU_Changing, EQ, tailcall, r4
+        ARMop   MMU_ChangingUncached, NE, tailcall, r4
+
+30      STR     r6, [r1, r3, LSR #10]!          ; update level 2 page table (and update pointer so we can use bank-to-bank offset
+        TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
+        STRNE   r6, [r1, r9, LSR #10]           ; then store entry for 2nd copy as well
+        ADDNE   r3, r3, r9                      ; and point logical address back at 2nd copy
+
+        Pull    "pc"
+
+
+PPLTransL1
+        &       (AP_Full * L1_APMult) + L1_Section        ; R any W any
+        &       (AP_Read * L1_APMult) + L1_Section        ; R any W sup
+        &       (AP_None * L1_APMult) + L1_Section        ; R sup W sup
+        &       (AP_ROM  * L1_APMult) + L1_Section        ; R any W none
+
+PPLTrans
+        &       (AP_Full * L2X_APMult) + L2_ExtPage       ; R any W any
+        &       (AP_Read * L2X_APMult) + L2_ExtPage       ; R any W sup
+        &       (AP_None * L2X_APMult) + L2_ExtPage       ; R sup W sup
+        &       (AP_ROM  * L2X_APMult) + L2_ExtPage       ; R any W none
+
+PPLTransLarge
+        &       (AP_Full * L2_APMult) + L2_LargePage      ; R any W any
+        &       (AP_Read * L2_APMult) + L2_LargePage      ; R any W sup
+        &       (AP_None * L2_APMult) + L2_LargePage      ; R sup W sup
+        &       (AP_ROM  * L2_APMult) + L2_LargePage      ; R any W none
+
+PageShifts
+        =       12, 13, 0, 14           ; 1 2 3 4
+        =       0,  0,  0, 15           ; 5 6 7 8
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SWI OS_UpdateMEMC: Read/write MEMC1 control register
+
+SSETMEMC ROUT
+
+        AND     r10, r0, r1
+        LDR     r12, =ZeroPage
+        WritePSRc SVC_mode+I_bit+F_bit, r0
+        LDR     r0, [r12, #MEMC_CR_SoftCopy] ; return old value
+        BIC     r11, r0, r1
+        ORR     r11, r11, R10
+        BIC     r11, r11, #&FF000000
+        BIC     r11, r11, #&00F00000
+        ORR     r11, r11, #MEMCADR
+        STR     r11, [r12, #MEMC_CR_SoftCopy]
+
+; mjs Oct 2000 kernel/HAL split
+;
+; The kernel itself should now never call this SWI, but grudgingly has
+; to maintain at least bit 10 of soft copy
+;
+; Here, we only mimic action of bit 10 to control video/cursor DMA (eg. for ADFS)
+; The whole OS_UpdateMEMC thing would ideally be withdrawn as archaic, but
+; unfortunately has not even been deprecated up to now
+
+; for reference, the bits of the MEMC1 control register are:
+;
+; bits 0,1 => unused
+; bits 2,3 => page size, irrelevant since always 4K
+; bits 4,5 => low ROM access time (mostly irrelevant but set it up anyway)
+; bits 6,7 => hi  ROM access time (definitely irrelevant but set it up anyway)
+; bits 8,9 => DRAM refresh control
+; bit 10   => Video/cursor DMA enable
+; bit 11   => Sound DMA enable
+; bit 12   => OS mode
+
+ [ UseGraphicsV
+        Push  "r0,r1,r4, r14"
+        TST   r11, #(1 :SHL: 10)
+        MOVEQ r0, #1             ; blank (video DMA disable)
+        MOVNE r0, #0             ; unblank (video DMA enable)
+        MOV   r1, #0             ; no funny business with DPMS
+        MOV   r4, #GraphicsV_SetBlank
+        BL    CallGraphicsV
+        Pull  "r0,r1,r4, r14"
+ |
+        Push  "r0-r3, r9, r14"   ; can corrupt r12
+        TST   r11, #(1 :SHL: 10)
+        MOVEQ r0, #1             ; blank (video DMA disable)
+        MOVNE r0, #0             ; unblank (video DMA enable)
+        MOV   r1, #0             ; no funny business with DPMS
+        MOV     r0, #0
+        MOV     r1
+        mjsAddressHAL
+        mjsCallHAL    HAL_Video_SetBlank
+        Pull  "r0-r3, r9, r14"
+ ]
+
+        WritePSRc SVC_mode+I_bit, r11
+        ExitSWIHandler
+
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       SWI OS_MMUControl
+;
+; in:   r0 = 0 (reason code 0, for modify control register)
+;       r1 = EOR mask
+;       r2 = AND mask
+;
+;       new control = ((old control AND r2) EOR r1)
+;
+; out:  r1 = old value
+;       r2 = new value
+;
+; in:   r0 bits 1 to 28 = 0, bit 0 = 1  (reason code 1, for flush request)
+;          r0 bit 31 set if cache(s) to be flushed
+;          r0 bit 30 set if TLB(s) to be flushed
+;          r0 bit 29 set if flush of entry only (else whole flush)
+;          r0 bit 28 set if write buffer to be flushed (implied by bit 31)
+;       r1 = entry specifier, if r0 bit 29 set
+;       (currently, flushing by entry is ignored, and just does full flush)
+;
+
+        ^       0
+MMUCReason_ModifyControl        # 1    ; reason code 0
+MMUCReason_Flush                # 1    ; reason code 1
+MMUCReason_Unknown              # 0
+
+MMUControlSWI   Entry
+        BL      MMUControlSub
+        PullEnv
+        ORRVS   lr, lr, #V_bit
+        ExitSWIHandler
+
+MMUControlSub
+        Push    lr
+        AND     lr,r0,#&FF
+        CMP     lr, #MMUCReason_Unknown
+        ADDCC   pc, pc, lr, LSL #2
+        B       MMUControl_Unknown
+        B       MMUControl_ModifyControl
+        B       MMUControl_Flush
+
+MMUControl_Unknown
+        ADRL    r0, ErrorBlock_HeapBadReason
+ [ International
+        BL      TranslateError
+ ]
+        Pull    lr
+        SETV
+        MOV     pc, lr
+
+
+MMUControl_ModifyControl ROUT
+        Push    "r0,r3,r4,r5"
+        CMP     r1,#0
+        CMPEQ   r2,#&FFFFFFFF
+        BEQ     MMUC_modcon_readonly
+        LDR     r3,=ZeroPage
+        PHPSEI  r4                      ; disable IRQs while we modify soft copy (and possibly switch caches off/on)
+
+        ; We're ARMv6+, just read the real control reg and ignore the soft copy
+        ARM_read_control lr
+        AND     r2, r2, lr
+        EOR     r2, r2, r1
+        MOV     r1, lr
+        LDR     r5, [r3, #ProcessorFlags]
+        TST     r5, #CPUFlag_SplitCache
+        BEQ     %FT05
+05
+        STR     r2, [r3, #MMUControlSoftCopy]
+        BIC     lr, r2, r1              ; lr = bits going from 0->1
+        TST     lr, #MMUC_C             ; if cache turning on then flush cache before we do it
+        TSTEQ   lr, #MMUC_I
+        BEQ     %FT10
+
+        ARMop   Cache_InvalidateAll,,,r3
+10
+        BIC     lr, r1, r2              ; lr = bits going from 1->0
+        TST     lr, #MMUC_C             ; if cache turning off then clean data cache first
+        BEQ     %FT15
+        ARMop   Cache_CleanAll,,,r3
+15
+        ARM_write_control r2
+        myISB   ,r3 ; Must be running on >=ARMv6, so perform ISB to ensure CP15 write is complete
+        BIC     lr, r1, r2              ; lr = bits going from 1->0
+        TST     lr, #MMUC_C             ; if cache turning off then flush cache afterwards
+        TSTNE   lr, #MMUC_I
+        BEQ     %FT20
+        LDR     r3,=ZeroPage
+        ARMop   Cache_InvalidateAll,,,r3
+20
+        PLP     r4                      ; restore IRQ state
+        Pull    "r0,r3,r4,r5,pc"
+
+MMUC_modcon_readonly
+        LDR     r3, =ZeroPage
+        ; We're ARMv6+, just read the real control reg and ignore the soft copy
+        ARM_read_control r1
+        STR     r1, [r3, #MMUControlSoftCopy]
+        MOV     r2, r1
+        Pull    "r0,r3,r4,r5,pc"
+
+MMUControl_Flush
+       MOVS     r10, r0
+       LDR      r12, =ZeroPage
+       ARMop    Cache_CleanInvalidateAll,MI,,r12
+       TST      r10,#&40000000
+       ARMop    TLB_InvalidateAll,NE,,r12
+       TST      r10,#&10000000
+       ARMop    WriteBuffer_Drain,NE,,r12
+       ADDS     r0,r10,#0
+       Pull     "pc"
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       Exception veneers
+
+ [ No26bitCode :LAND: ChocolateAMB
+;  Instruction fetch abort pre-veneer, just to field possible lazy AMB aborts
+;
+PAbPreVeneer    ROUT
+        Push    "r0-r7, lr"               ; wahey, we have an abort stack
+        SUB     r0, lr_abort, #4          ; aborting address
+        MOV     r2, #1
+        BL      AMB_LazyFixUp             ; can trash r0-r7, returns NE status if claimed and fixed up
+        Pull    "r0-r7, lr", NE           ; restore regs and
+        SUBNES  pc, lr_abort, #4          ; restart aborting instruction if fixed up
+        LDR     lr, [sp, #8*4]            ; (not a lazy abort) restore lr
+        LDR     r0, =PAbHan               ; we want to jump to PAb handler, in abort mode
+        LDR     r0, [r0]
+        STR     r0, [sp, #8*4]
+        Pull    "r0-r7, pc"
+ ]
+
+; Preliminary layout of abort indirection nodes
+
+        ^       0
+AI_Link #       4
+AI_Low  #       4
+AI_High #       4
+AI_WS   #       4
+AI_Addr #       4
+
+        EXPORT DAbPreVeneer
+
+DAbPreVeneer    ROUT
+
+        SUB     r13_abort, r13_abort, #17*4     ; we use stacks, dontcherknow
+        STMIA   r13_abort, {r0-r7}              ; save unbanked registers anyway
+        STR     lr_abort, [r13_abort, #15*4]    ; save old PC, ie instruction address
+
+        ; Fixup code for MVA-based cache/TLB ops, which can abort on ARMv7 if the specified MVA doesn't have a mapping.
+        ; Must come before AMBControl, else things can go very wrong during OS_ChangeDynamicArea
+        ; MVA cache ops have the form coproc=p15, CRn=c7, opc1=0, opc2=1
+        ; MVA TLB ops have the form coproc=p15, CRn=c8, opc1=0, opc2=1
+        ; Note that some non-MVA ops also follow the above rules - at the moment we make no attempt to filter those false-positives out
+        ; This code is also written from the perspective of running on an ARMv7 CPU - behaviour under ARMv6 hasn't been checked!
+
+        ; Also, as wrong as it seems, attempting to load the aborting instruction could trigger an abort (something wrong with the prefetch handler? or cache flushes not being done properly?)
+        ; So this code must protect DFAR, DFSR, spsr_abort, and lr_abort from being clobbered
+
+        ; We also need to be careful about how AMBControl will react to the abort:
+        ; If DFAR and lr_abort both point to the same page, when we try loading the instruction (and it triggers an abort), AMBControl will map in the page
+        ; So when control returns to us (and we determine that it wasn't an MVA op) AMBControl will be called again (for DFAR), see that the page is mapped in, and claim that it's a real abort instead of the lazy fixup that it really is
+        ; (The workaround for that issue probably makes the DFAR, DFSR, spsr_abort, lr_abort saving irrelevant, but it's better to be safe than sorry)
+
+        CMP     lr, #AplWorkMaxSize             ; Assume that MVA ops won't come from application space (cheap workaround for above-mentioned AMBControl issue)
+        BLO     %FT10
+        MRS     r1, SPSR
+        TST     r1, #T32_bit
+        BNE     %FT10                           ; We don't cope with Thumb ATM. Should really check for Jazelle too!
+        MOV     r2, lr                          ; LR is already saved on the stack, but we can't load from it because any recursive abort won't have a clue what address we're trying to access.
+        ; Protect DFAR, DFSR
+        ARM_read_FAR r3
+        ARM_read_FSR r4
+        LDR     r0, [r2, #-8]                   ; Get aborting instruction
+        MSR     SPSR_cxsf, r1                   ; un-clobber SPSR, FAR, FSR
+        ARM_write_FAR r3
+        ARM_write_FSR r4
+        CMP     r0, #&F0000000
+        BHS     %FT10                           ; Ignore cc=NV, which is MCR2 encoding
+        BIC     r0, r0, #&F000000F              ; Mask out the uninteresting bits
+        BIC     r0, r0, #&0000F000
+        EOR     r0, r0, #&0E000000              ; Desired value, minus CRn
+        EOR     r0, r0, #&00000F30
+        CMP     r0,     #&00070000              ; CRn=c7?
+        CMPNE   r0,     #&00080000              ; CRn=c8?
+        BNE     %FT10                           ; It's not an MVA-based op
+        MOV     lr_abort, r2                    ; un-clobber LR (doesn't need un-clobbering if it wasn't an MVA op)
+        LDMIA   r13_abort, {r0-r4}              ; Restore the regs we intentionally clobbered
+        ADD     r13_abort, r13_abort, #17*4
+        SUBS    pc, lr_abort, #4                ; Resume execution at the next instruction
+10
+
+  [ ChocolateAMB
+        ARM_read_FAR r0                         ; aborting address
+        MOV     r2, #0
+        BL      AMB_LazyFixUp                   ; can trash r0-r7, returns NE status if claimed and fixed up
+        LDR     lr_abort, [r13_abort, #15*4]    ; restore lr_abort
+        LDMIA   r13_abort, {r0-r7}              ; restore regs
+        ADDNE   r13_abort, r13_abort, #17*4     ; if fixed up, restore r13_abort
+        SUBNES  pc, lr_abort, #8                ; and restart aborting instruction
+  ]
+
+        MRS     r0, SPSR                        ; r0 = PSR when we aborted
+        MRS     r1, CPSR                        ; r1 = CPSR
+        ADD     r2, r13_abort, #8*4             ; r2 -> saved register bank for r8 onwards
+
+        LDR     r4, =ZeroPage+Abort32_dumparea+3*4 ;use temp area (avoid overwriting main area for expected aborts)
+        ARM_read_FAR r3
+        STMIA   r4, {r0,r3,lr_abort}            ; dump 32-bit PSR, fault address, 32-bit PC
+
+        MOV     r4, lr_abort                    ; move address of aborting instruction into an unbanked register
+        BIC     r1, r1, #&1F                    ; knock out current mode bits
+        ANDS    r3, r0, #&1F                    ; extract old mode bits (and test for USR26_mode (=0))
+        TEQNE   r3, #USR32_mode                 ; if usr26 or usr32 then use ^ to store registers
+        STMEQIA r2, {r8-r14}^
+        BEQ     %FT05
+
+        ORR     r3, r3, r1                      ; and put in user's
+        MSR     CPSR_c, r3                      ; switch to user's mode
+
+        STMIA   r2, {r8-r12}                    ; save the banked registers
+        STR     r13, [r2,#5*4]
+        STR     r14, [r2,#6*4]
+
+        MRS     r5, SPSR                        ; get the SPSR for the aborter's mode
+        STR     r5, [r2, #8*4]                  ; and store away in the spare slot on the end
+                                                ; (this is needed for LDM with PC and ^)
+        ORR     r1, r1, #ABT32_mode
+        MSR     CPSR_c, r1                      ; back to abort mode for the rest of this
+05
+        Push    "r0"                            ; save SPSR_abort
+
+        SUB     sp, sp, #8*4                    ; make room for r8_usr to r14_usr and PC
+        STMIA   sp, {r8-r15}^                   ; save USR bank in case STM ^, and also so we can corrupt them
+
+        SUB     r11, r2, #8*4                   ; r11 -> register bank
+        STR     r4, [sp, #7*4]                  ; store aborter's PC in user register bank
+; B %FT90
+
+ [ UseProcessTransfer
+        TST     r0, #T32_bit                    ; were they in Thumb mode? if so, give up now
+        BNE     %FT90
+
+;ARM 810 or StrongARM allow signed byte load or half-word load/stores - not supported at present
+;***KJB - need to think about LDRH family
+        LDR     r10, [r4, #-8]!                 ; r10 = actual instruction that aborted, and r4 points to it
+        AND     r9, r10, #&0E000000
+        TEQ     r9, #&08000000                  ; test for LDM/STM
+        BNE     %FT50                           ; if not LDM/STM, then it's an "easy" LDR/STR
+
+;        Write   "It's an LDM/STM"
+
+ [ DebugAborts
+        DLINE   "It's an LDM/STM"
+ ]
+
+; First count the number of transferred registers, and undo any writeback
+
+        MOV     r9, #0                          ; r9 = no. of registers in list
+        MOVS    r8, r10, LSL #16
+        BEQ     %FT20
+10
+        MOVS    r8, r8, LSL #1
+        ADDCS   r9, r9, #1
+        BNE     %BT10
+20
+        MOV     r8, r10, LSR #16
+        AND     r8, r8, #&0F                    ; base register number
+        LDR     r7, [r11, r8, LSL #2]           ; ------""----- value
+
+        TST     r10, #1 :SHL: 23                ; test up/down
+        MOVNE   r1, r9                          ; if up, r1 = +ve no. of regs
+        RSBEQ   r1, r9, #0                      ; if down, r1 = -ve no. of regs
+
+;initially assume writeback
+;we want r6 = base reg value before assumed writeback (r7 is base reg value after abort)
+;writeback will have been performed for ARMs with CPUFlag_BaseRestored clear
+;
+        LDR     r6, =ZeroPage
+        LDR     r6, [r6, #ProcessorFlags]
+        TST     r6, #CPUFlag_BaseRestored
+        MOVNE   r6, r7
+        SUBEQ   r6, r7, r1, ASL #2
+
+;now we want r6 to be the base register value before the abort, so we will discard
+;our adjusted value and take r7, if the instruction in fact had no writeback
+;
+        TST     r10, #1 :SHL: 21                ; test if write-back bit set
+        TEQNE   r8, #15                         ; (if base is PC then write-back not allowed)
+        MOVEQ   r6, r7                          ; if not wb, reg after abort is correct
+
+        MOV     r1, sp                          ; r1 -> end of stack frame, and start of user-mode register bank
+        SUB     sp, sp, r9, LSL #2              ; make stack frame for registers
+        TST     r10, #1 :SHL: 20                ; if its an STM, we have to load up the stack frame
+        BNE     %FT30                           ; but if it's an LDM, we call trap routine first
+
+        STR     r6, [r11, r8, LSL #2]           ; store original base in register list, to be overwritten after 1st transfer
+
+; now go through registers, storing them into frame
+
+        MOV     r5, sp                          ; pointer to position in stack frame
+        MOV     lr, r10, LSL #16                ; extract bottom 16 bits
+        MOVS    lr, lr, LSR #16                 ; ie bitmask of which registers r0-r15 stored
+        BEQ     %FT30                           ; this shouldn't happen (it's illegal)
+
+        MOV     r3, r11                         ; current pointer into register bank
+21
+        TST     r10, #1 :SHL: 22                ; is it STM with ^
+        ANDNE   lr, lr, #&FF                    ; if so then extract bottom 8 bits (r0-r7 on 1st pass, r8-r15 on 2nd)
+22
+        MOVS    lr, lr, LSR #1                  ; shift bit into carry
+        LDRCS   r2, [r3], #4                    ; if set bit then transfer word from register bank
+        STRCS   r2, [r5], #4                    ; into stack frame
+        STRCS   r7, [r11, r8, LSL #2]           ; and after 1st transfer, store updated base into register bank
+        ADDCC   r3, r3, #4                      ; else just increment register bank pointer
+        BNE     %BT22                           ; if more bits to do, then loop
+
+        TEQ     r5, r1                          ; have we done all registers?
+        MOVNE   lr, r10, LSR #8                 ; no, then must have been doing STM with ^, and have some user-bank regs to store
+        MOVNE   r3, r1                          ; so point r3 at user-mode register bank
+        BNE     %BT21                           ; and go back into loop
+
+30
+
+; now work out address of 1st transfer
+
+        ANDS    r5, r10, #(3 :SHL: 23)          ; bit 24 set => pre, bit 23 set => inc
+        SUBEQ   r2, r6, r9, LSL #2              ; if post-dec, then 1st address = initial-nregs*4+4
+        ADDEQ   r2, r2, #4
+        BEQ     %FT32
+
+        CMP     r5, #2 :SHL: 23
+        MOVCC   r2, r6                          ; CC => post-inc, so 1st address = initial
+        SUBEQ   r2, r6, r9, LSL #2              ; EQ => pre-dec,  so 1st address = initial-nregs*4
+        ADDHI   r2, r6, #4                      ; HI => pre-inc,  so 1st address = initial+4
+32
+        ANDS    r0, r10, #1 :SHL: 20            ; r0 = 0 => STM
+        MOVNE   r0, #1                          ;    = 1 => LDM
+        LDR     r1, [r1, #8*4]                  ; get SPSR_abort
+        TST     r1, #&F                         ; test if transfer took place in USR mode
+        ORRNE   r0, r0, #2                      ; if not then set bit 1 of flags word in r0
+        MOV     r1, sp                          ; block to transfer from/into
+        BIC     r2, r2, #3                      ; LDM/STM always present word-aligned address
+        MOV     r3, r9, LSL #2                  ; length of transfer in bytes, and r4 still points to aborting instruction
+        BL      ProcessTransfer
+        ADDVS   sp, sp, r9, LSL #2              ; if invalid transfer then junk stack frame
+        BVS     %FT90                           ; and generate an exception
+
+; we transferred successfully, so now check if LDM and load up register bank from block
+
+        TST     r10, #1 :SHL: 20
+        ADDEQ   sp, sp, r9, LSL #2              ; it's an STM, so junk stack frame and tidy up
+        BEQ     %FT70
+
+; now go through registers, loading them from frame
+
+        ADD     r1, sp, r9, LSL #2              ; r1 -> end of stack frame, and start of user-mode bank registers
+        MOV     r5, sp                          ; pointer to position in stack frame
+        MOV     r4, r10, LSL #16                ; extract bottom 16 bits
+        MOVS    r4, r4, LSR #16                 ; ie bitmask of which registers r0-r15 stored
+        BEQ     %FT40                           ; this shouldn't happen (it's illegal)
+
+        SUB     r3, r1, #8*4                    ; r3 -> notional start of user bank, if it began at r0 (it actually starts at r8)
+        MOV     r0, #0                          ; assume no user registers by default
+        TST     r10, #1 :SHL: 15                ; is PC in list
+        BNE     %FT34                           ; then can't be LDM of user bank
+        TST     r10, #1 :SHL: 22                ; is it LDM with ^
+        BEQ     %FT34                           ; no, then use main bank for all registers
+        LDR     r2, [r1, #8*4]                  ; get SPSR
+        ANDS    r2, r2, #15                     ; get bottom 4 bits of mode (EQ => USR26 or USR32)
+        BEQ     %FT34                           ; if USR mode then use main bank for all
+        TEQ     r2, #FIQ26_mode                 ; if FIQ mode then put r8-r14 in user bank
+        LDREQ   lr, =&7F00                      ; then put r8-r14 in user bank
+        LDRNE   lr, =&6000                      ; else put r13,r14 in user bank
+        AND     r0, r4, lr                      ; r0 = mask of registers to put into user bank
+        BIC     r4, r4, lr                      ; r4 = mask of registers to put into main bank
+        MOV     lr, #0
+34
+        MOVS    r4, r4, LSR #1                  ; shift bit into carry
+        LDRCS   r2, [r5], #4                    ; if set bit then transfer word from stack frame
+        STRCS   r2, [r11, lr, LSL #2]           ; into main register bank
+        MOVS    r0, r0, LSR #1                  ; shift bit into carry
+        LDRCS   r2, [r5], #4                    ; if set bit then transfer word from stack frame
+        STRCS   r2, [r3, lr, LSL #2]            ; into user register bank
+        ADD     lr, lr, #1
+        ORRS    r6, r0, r4                      ; have we finished both banks?
+        BNE     %BT34                           ; no, then loop
+
+; If LDM with PC in list, then add 4 to it, so the exit procedure is the same as if PC not loaded
+; Also, if it was an LDM with PC and ^, then we have to update the stacked SPSR
+
+40
+        MOV     sp, r1                          ; junk frame
+
+        TST     r10, #1 :SHL: 15                ; check PC in list
+        ADDNE   r2, r2, #4                      ; since PC is last, r2 will still hold the value loaded
+        STRNE   r2, [r11, #15*4]                ; store back into main register bank
+        TSTNE   r10, #1 :SHL: 22                ; now check LDM ^
+        BEQ     %FT70                           ; [not LDM with PC in list]
+
+        LDR     r9, [sp, #8*4]                  ; get SPSR_abort
+        AND     r8, r9, #&1F                    ; r8 = aborter's mode
+        TEQ     r8, #USR32_mode                 ; if in USR32
+        BEQ     %FT70                           ; then the ^ has no effect (actually uses CPSR)
+        TST     r8, #&1C                        ; if 32-bit mode
+        LDRNE   r7, [r11, #16*4]                ; then use SPSR for the aborter's mode else use updated r15 in r2 (26-bit format)
+        ANDEQ   r7, r2, #&F0000003              ; flag and mode bits in same place
+        ANDEQ   r2, r2, #&0C000000              ; but I and F have to move to bits 7 and 6
+        ORREQ   r7, r7, r2, LSR #(26-6)
+
+; r7 is now desired PSR (in 32-bit format) to update to
+; now check which bits can actually be updated
+
+        TEQ     r8, #USR26_mode
+        BICEQ   r9, r9, #&F0000000              ; if USR26 then we can only update NZCV
+        ANDEQ   r7, r7, #&F0000000
+        ORREQ   r9, r9, r7
+        MOVNE   r9, r7                          ; else can update all bits
+        STR     r9, [sp, #8*4]                  ; store back updated SPSR_abort (to become CPSR)
+        B       %FT70                           ; now tidy up
+
+50
+
+; it's an LDR/STR - first work out offset
+
+ [ DebugAborts
+        DLINE   "It's an LDR/STR"
+ ]
+
+        TST     r10, #1 :SHL: 25                ; if immediate
+        MOVEQ   r9, r10, LSL #(31-11)           ; then extract bottom 12 bits
+        MOVEQ   r9, r9, LSR #(31-11)
+        BEQ     %FT60
+
+        AND     r8, r10, #&0F                   ; register to shift
+        LDR     r9, [r11, r8, LSL #2]           ; get actual value of register
+
+        MOV     r8, r10, LSR #7                 ; extract shift amount
+        ANDS    r8, r8, #&1F                    ; (bits 7..11)
+        MOVEQ   r8, #32                         ; if zero then make 32
+
+        ANDS    r7, r10, #&60
+        ANDEQ   r8, r8, #&1F                    ; LSL 0 is really zero
+        MOVEQ   r9, r9, LSL r8
+        TEQ     r7, #&20
+        MOVEQ   r9, r9, LSR r8
+        TEQ     r7, #&40
+        MOVEQ   r9, r9, ASR r8
+        TEQ     r7, #&60
+        MOVEQ   r9, r9, ROR r8                  ; if 32 then we haven't spoilt it!
+        TEQEQ   r8, #32                         ; if ROR #32 then really RRX
+        BNE     %FT60
+        LDR     r7, [sp, #8*4]                  ; get SPSR
+        AND     r7, r7, #C_bit
+        CMP     r7, #1                          ; set carry from original user
+        MOV     r9, r9, RRX
+60
+        TST     r10, #1 :SHL: 23                ; test for up/down
+        RSBEQ   r9, r9, #0                      ; if down then negate
+
+        LDR     r8, =ZeroPage
+        LDR     r8, [r8, #ProcessorFlags]
+        TST     r8, #CPUFlag_BaseRestored
+        BNE     %FT62
+;not base restored
+        TST     r10, #1 :SHL: 21                ; if write-back
+        MOVNE   r8, #0                          ; then no post-inc
+        RSBEQ   r8, r9, #0                      ; else post-inc = - pre-inc
+        ADD     r0, r8, r9                      ; amount to subtract off base register for correction
+
+        TST     r10, #1 :SHL: 24                ; however, if we're doing post-increment
+        MOVEQ   r8, r9                          ; then post-inc = what was pre-inc
+        MOVEQ   r0, r9                          ; and adjustment is what was added on
+        RSB     r9, r8, #0                      ; and pre-inc = -post-inc
+        B       %FT63
+62
+;base restored
+        TST     r10, #1 :SHL: 21                ; if write-back
+        MOVNE   r8, #0                          ; then no post-inc
+        RSBEQ   r8, r9, #0                      ; else post-inc = - pre-inc
+
+        TST     r10, #1 :SHL: 24                ; however, if we're doing post-increment
+        MOVEQ   r8, r9                          ; then post-inc = what was pre-inc
+        MOVEQ   r9, #0                          ; and pre-inc = 0
+
+63
+        MOV     r7, r10, LSL #31-19
+        MOV     r7, r7, LSR #28                 ; r7 = base register number
+        LDR     r6, [r11, r7, LSL #2]           ; r6 = base register value
+
+        LDR     r1, =ZeroPage
+        LDR     r1, [r1, #ProcessorFlags]
+        TST     r1, #CPUFlag_BaseRestored
+        SUBEQ   r0, r6, r0                      ; compute adjusted base register (if not base restored)
+        STREQ   r0, [r11, r7, LSL #2]           ; and store back in case we decide to abort after all
+
+; no need to clear PSR bits out of R15, because PSR is separate
+
+        ADD     r9, r9, r6                      ; r2 = offset+base = illegal address
+
+ [ DebugAborts
+        DREG    r9, "Aborting address = "
+        DREG    r8, "Post-increment = "
+        DREG    r4, "Instruction where abort happened = "
+ ]
+
+        ANDS    r0, r10, #1 :SHL: 20            ; if an LDR then bit 20 set
+        MOVNE   r0, #1                          ; so make 1
+        SUBNE   sp, sp, #4                      ; then just create 1 word stack frame
+        BNE     %FT65
+
+        MOV     r5, r10, LSR #12                ; else it's an STR (r0 = 0)
+        AND     r5, r5, #&0F                    ; r5 = source register number
+        LDR     r5, [r11, r5, LSL #2]           ; r5 = value of source register
+ [ DebugAborts
+        DREG    r5, "Data value to store = "
+ ]
+        Push    "r5"                            ; create stack frame with this value in it
+65
+        LDR     r1, [sp, #(1+8)*4]              ; get SPSR_abort
+        TST     r1, #&F                         ; test if transfer took place in USR mode
+        ORRNE   r0, r0, #2                      ; if not then set bit 1 of flags word in r0
+
+        MOV     r1, sp                          ; r1 -> data block
+        TST     r10, #1 :SHL: 22                ; if byte transfer
+        MOVNE   r3, #1                          ; then length of transfer = 1
+        MOVNE   r2, r9                          ; and use unmolested address
+        MOVEQ   r3, #4                          ; else length = 4
+        BICEQ   r2, r9, #3                      ; and mask out bottom 2 bits of address
+
+        BL      ProcessTransfer
+        ADDVS   sp, sp, #4                      ; if illegal transfer, junk stack frame
+        BVS     %FT90                           ; and cause exception
+
+        ADD     r6, r9, r8                      ; update base register with offset
+        STR     r6, [r11, r7, LSL #2]           ; and store back (NB if LDR and dest=base, the load overwrites the updated base)
+
+        TST     r10, #1 :SHL: 20                ; if it's STR (not LDR)
+        ADDEQ   sp, sp, #4                      ; then junk stack frame
+        BEQ     %FT70                           ; and tidy up
+
+        Pull    "r6"                            ; LDR/LDRB, so get value to load into register
+        TST     r10, #1 :SHL: 22                ; if LDRB
+        ANDNE   r6, r6, #&FF                    ; then put zero in top 3 bytes of word
+        ANDEQ   r9, r9, #3                      ; else rotate word to correct position - r9 = bottom 2 bits of address
+        MOVEQ   r9, r9, LSL #3                  ; multiply by 8 to get rotation factor
+        MOVEQ   r6, r6, ROR r9                  ; rotate to correct position in register
+
+        MOV     r5, r10, LSR #12                ; test for LDR PC
+        AND     r5, r5, #&0F                    ; r5 = dest register number
+        TEQ     r5, #15                         ; if PC
+        ADDEQ   r6, r6, #4                      ; then adjust for abort exit
+        STR     r6, [r11, r5, LSL #2]           ; store into register bank
+
+70
+
+; Tidy up routine, common to LDR/STR and LDM/STM
+
+        ADD     r2, r11, #8*4                   ; point r2 at 2nd half of main register bank
+        LDMIA   sp, {r8-r14}^                   ; reload user bank registers
+        NOP                                     ; don't access banked registers after LDM^
+        ADD     sp, sp, #8*4                    ; junk user bank stack frame
+
+        Pull    "r0"                            ; r0 = (possibly updated) SPSR_abort
+        MRS     r1, CPSR
+
+        MRS     r6, SPSR                        ; get original SPSR, with aborter's original mode
+        AND     r7, r6, #&0F
+        TEQ     r7, #USR26_mode                 ; also matches USR32
+        LDMEQIA r2, {r8-r14}^                   ; if user mode then just use ^ to reload registers
+        NOP
+        BEQ     %FT80
+
+        ORR     r6, r6, #I32_bit                ; use aborter's flags and mode but set I
+        BIC     r6, r6, #T32_bit                ; and don't set Thumb bit
+        MSR     CPSR_c, r6                      ; switch to aborter's mode
+        LDMIA   r2, {r8-r14}                    ; reload banked registers
+        MSR     CPSR_c, r1                      ; switch back to ABT32
+
+80
+        LDR     lr_abort, [r13_abort, #15*4]    ; get PC to return to
+        MSR     SPSR_cxsf, r0                   ; set up new SPSR (may have changed for LDM {PC}^)
+
+        LDMIA   r13_abort, {r0-r7}              ; reload r0-r7
+        ADD     r13_abort, r13_abort, #17*4     ; we use stacks, dontcherknow
+        SUBS    pc, lr_abort, #4                ; go back 8 to adjust for PC being 2 words out,
+                                                ; then forward 4 to skip instruction we've just executed
+
+ ] ; UseProcessTransfer
+
+; Call normal exception handler
+
+90
+
+; copy temp area to real area (we believe this is an unexpected data abort now)
+
+        LDR     r0, =ZeroPage+Abort32_dumparea
+        LDR     r1, [r0,#3*4]
+        STR     r1, [r0]
+        LDR     r1, [r0,#4*4]
+        STR     r1, [r0,#4]
+        LDR     r1, [r0,#5*4]
+        STR     r1, [r0,#2*4]
+
+        LDR     r0, =ZeroPage                           ; we're going to call abort handler
+      [ ZeroPage = 0
+        STR     r0, [r0, #CDASemaphore]                 ; so allow recovery if we were in CDA
+      |
+        MOV     r2, #0
+        STR     r2, [r0, #CDASemaphore]                 ; so allow recovery if we were in CDA
+      ]
+
+        LDR     r0, [r0, #DAbHan]                       ; get address of data abort handler
+ [ DebugAborts
+        DREG    r0, "Handler address = "
+ ]
+
+        ADD     r2, r11, #8*4                   ; point r2 at 2nd half of main register bank
+        LDMIA   sp, {r8-r14}^                   ; reload user bank registers
+        NOP                                     ; don't access banked registers after LDM^
+        ADD     sp, sp, #9*4                    ; junk user bank stack frame + saved SPSR
+
+        MRS     r1, CPSR
+
+        MRS     r6, SPSR                        ; get original SPSR, with aborter's original mode
+        AND     r7, r6, #&0F
+        TEQ     r7, #USR26_mode                 ; also matches USR32
+        LDMEQIA r2, {r8-r14}^                   ; if user mode then just use ^ to reload registers
+        NOP
+        BEQ     %FT80
+
+        ORR     r6, r6, #I32_bit                ; use aborter's flags and mode but set I
+        BIC     r6, r6, #T32_bit                ; and don't set Thumb
+        MSR     CPSR_c, r6                      ; switch to aborter's mode
+        LDMIA   r2, {r8-r12}                    ; reload banked registers
+        LDR     r13, [r2, #5*4]
+        LDR     r14, [r2, #6*4]
+        MSR     CPSR_c, r1                      ; switch back to ABT32
+
+80
+        STR     r0, [r13_abort, #16*4]          ; save handler address at top of stack
+        LDR     lr_abort, [r13_abort, #15*4]    ; get abort address back in R14
+
+        LDMIA   r13_abort, {r0-r7}              ; reload r0-r7
+        ADD     r13_abort, r13_abort, #16*4     ; we use stacks, dontcherknow
+
+        Pull    pc
+
+ [ UseProcessTransfer
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+;       ProcessTransfer - Process an abort transfer
+;
+; in:   r0 = flags
+;               bit 0 = 0 => Store to memory
+;                       1 => Load from memory
+;               bit 1 = 0 => Transfer executed in user mode
+;                       1 => Transfer executed in non-user mode
+;       r1 = block of data to transfer from/into
+;       r2 = illegal address
+;       r3 = length of transfer in bytes
+;       r4 -> instruction which aborted
+;       SVC26/32 mode
+;
+; out:  V=0 => transfer accomplished
+;       V=1 => transfer not accomplished
+;       All registers preserved
+;
+
+SectionSizeShift *      20
+SectionSize     *       1 :SHL: SectionSizeShift
+
+LargePageSizeShift *    16
+LargePageSize   *       1 :SHL: LargePageSizeShift
+
+SmallPageSizeShift *    12
+SmallPageSize   *       1 :SHL: SmallPageSizeShift
+
+ProcessTransfer Entry "r1-r7,r12"
+
+ [ DebugAborts
+        DLINE   "ProcessTransfer entered"
+        DREG    r2, "Illegal address = "
+        DREG    r3, "Length of transfer = "
+        DREG    r4, "Abort happened at address "
+        DREG    r0, "Flags = "
+        DLINE   "Data = ",cc
+
+        MOV     r5, r3
+        MOV     r6, r1
+01
+        LDR     r7, [r6], #4
+        DREG    r7," ",cc
+        SUBS    r5, r5, #4
+        BHI     %BT01
+        DLINE   ""
+ ]
+
+
+; First identify if start address should have aborted
+
+10
+        LDR     r7, =L1PT
+        MOV     lr, r2, LSR #SectionSizeShift           ; r2 as a multiple of 1Mb
+        EOR     r5, r2, lr, LSL #SectionSizeShift       ; r5 = offset within section
+        SUB     r5, r2, r5                              ; r5 -> start of section containing r2
+        ADD     r5, r5, #SectionSize                    ; r5 -> start of section after r2
+
+        LDR     lr, [r7, lr, LSL #2]                    ; get L1PT entry
+        ANDS    r7, lr, #3                              ; 00 => trans.fault, 01 => page, 10 => section, 11 => reserved (fault)
+        TEQNE   r7, #3
+        BEQ     Fault
+        TEQ     r7, #1
+        BEQ     CheckPage
+
+; it's section mapped - check section access privileges
+
+15
+        AND     r7, lr, #L1_AP      ; extract ap, apx
+        CMP     r7, #AP_ROM * L1_APMult
+        BEQ     Fault                                   ; ROM => no access for anyone (at the moment)
+        TST     r0, #2                                  ; test for non-usr access
+        BNE     %FT20                                   ; if non-usr then OK to access here
+        CMP     r7, #2 * L1_APMult
+        BCC     Fault                                   ; 01 => no usr access
+        BHI     %FT20                                   ; 11 => full user access, so OK
+        TST     r0, #1
+        BEQ     Fault                                   ; 10 => usr read-only, so stores not allowed
+
+; access OK, so copy up to end of section/sub-page
+
+20
+;ARM 8 and StrongARM will abort for vector reads (as well as writes) in 26bit mode, so we must
+;handle vector reads properly as well now
+;In fact, StrongARM does not abort (optional in architecture 4), but ARM 8 does - MJS 08-10-96
+  [ {FALSE}
+        TST     r0, #1                                  ; if load from memory
+        BNE     %FT60                                   ; then skip
+  ]
+
+; it's a store to memory (may be a vector write), or a read from memory (may be a vector read)
+; do it in words if >= 4 bytes, so word writes to VIDC work for example
+
+25
+        ASSERT  (:LNOT: HiProcVecs) ; Needs updating for high vectors!
+        CMP     r2, #&1C                                ; if in abort area (but allow any access to &1C)
+  [ OnlyKernelCanAccessHardwareVectors
+        BHS     %FT22
+        CMP     r4, #ROM                                ; and executing outside the kernel
+        BLO     %FT23
+        ADRL    lr, EndOfKernel
+        CMP     r4, lr
+        BLO     %FT22
+23
+        MOV     r5, #&20                                ; then set end-of-section = 32
+        B       Fault                                   ; and check user list
+22
+  |
+        CMPCC   r4, #ROM                                ; and executing out of RAM
+        MOVCC   r5, #&20                                ; then set end-of-section = 32
+        BCC     Fault                                   ; and check user list
+  ]
+
+        TST     r0, #1                                  ; test for peek/poke
+        BEQ     %FT30
+26
+;peeking
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BEQ     %FT50                                   ; if so then exit if finished else go back to outer loop
+        SUBS    r3, r3, #4                              ; have we got at least a word to do?
+        LDRCS   lr, [r2], #4                            ; if so then copy word
+        STRCS   lr, [r1], #4
+        BHI     %BT26                                   ; and if not all done then loop
+        BEQ     %FT50                                   ; if all done then switch back to SVC26 and exit
+
+        ADDS    r3, r3, #4
+27
+        LDRB    lr, [r2], #1                            ; read byte from register bank
+        STRB    lr, [r1], #1                            ; and store to memory
+        SUBS    r3, r3, #1                              ; decrement byte count
+        BEQ     %FT50                                   ; if finished then switch back to SVC26 and exit
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BNE     %BT27                                   ; no, then loop
+        B       %FT50
+
+30
+;poking
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BEQ     %FT50                                   ; if so then exit if finished else go back to outer loop
+        SUBS    r3, r3, #4                              ; have we got at least a word to do?
+        LDRCS   lr, [r1], #4                            ; if so then copy word
+        STRCS   lr, [r2], #4
+        BHI     %BT30                                   ; and if not all done then loop
+        BEQ     %FT50                                   ; if all done then switch back to SVC26 and exit
+
+        ADDS    r3, r3, #4
+40
+        LDRB    lr, [r1], #1                            ; read byte from register bank
+        STRB    lr, [r2], #1                            ; and store to memory
+        SUBS    r3, r3, #1                              ; decrement byte count
+        BEQ     %FT50                                   ; if finished then switch back to SVC26 and exit
+        TEQ     r2, r5                                  ; have we gone onto a new block?
+        BNE     %BT40                                   ; no, then loop
+
+50
+        CMP     r3, #0
+        BNE     %BT10
+        EXIT                                            ; exit (VC from CMP)
+
+; it's page mapped, so check L2PT
+; lr = L1 table entry
+; We use the logical copy of physical space here, in order to access the entry pointed to by the L1 entry
+
+CheckPage
+        MOV     r5, r2, LSR #SmallPageSizeShift         ; r2 as a multiple of 4K
+        MOV     r5, r5, LSL #SmallPageSizeShift
+        ADD     r5, r5, #SmallPageSize                  ; if translation fault, then it applies to small page
+
+        MOV     lr, lr, LSR #10                         ; remove domain and U bits
+        MOV     lr, lr, LSL #10
+        SUB     sp, sp, #4
+        Push    "r0-r3,r12"
+        MOV     r0, #0
+        MOV     r1, lr
+        ADD     r2, sp, #5*4
+        BL      RISCOS_AccessPhysicalAddress
+        MOV     lr, r0
+        Pull    "r0-r3,r12"
+        AND     r7, r2, #&000FF000                      ; extract bits which are to form L2 offset
+
+        LDR     lr, [lr, r7, LSR #10]                   ; lr = L2PT entry
+        Push    "r0-r3,r12,lr"
+        LDR     r0, [sp, #6*4]
+        BL      RISCOS_ReleasePhysicalAddress
+        Pull    "r0-r3,r12,lr"
+        ADD     sp, sp, #4
+        ANDS    r7, lr, #3                              ; 00 => trans.fault, 01 => large page
+                                                        ; 10 => small page, 11 => small page XN (fault)
+        TEQNE   r7, #3
+        BEQ     Fault
+        TEQ     r7, #2                          ; if small page
+        MOVEQ   r7, #SmallPageSizeShift-2       ; then sub-page size = 1<<10
+        MOVNE   r7, #LargePageSizeShift-2       ; else sub-page size = 1<<14
+
+        MOV     r5, r2, LSR r7                  ; round down to start of sub-page
+        MOV     r5, r5, LSL r7
+        MOV     r6, #1
+        ADD     r5, r5, r6, LSL r7              ; then move on to start of next sub-page
+
+        MOV     r7, r2, LSR r7                  ; put sub-page number in bits 1,2
+        AND     r7, r7, #3                      ; and junk other bits
+        RSB     r7, r7, #3                      ; invert sub-page ordering
+        MOV     r7, r7, LSL #1                  ; and double it
+        MOV     lr, lr, LSL r7                  ; then shift up access privileges so that correct ones appear in bits 10,11
+        B       %BT15                           ; re-use code to check access privileges
+
+Fault
+        SUB     r5, r5, r2                      ; r5 = number of bytes we can do in this section/page/sub-page
+        Push    "r3"                            ; save number of bytes to do
+        CMP     r3, r5                          ; if more bytes than there are in this block
+        MOVHI   r3, r5
+
+; Now scan list of user abort addresses
+
+        LDR     r6, =ZeroPage
+        LDR     r6, [r6, #AbortIndirection]
+        TEQ     r6, #0
+        BEQ     %FT85                           ; address not in any abort node
+75
+        LDR     r5, [r6, #AI_Low]
+        CMP     r2, r5
+        BCC     %FT80
+        LDR     r5, [r6, #AI_High]
+        CMP     r2, r5
+        BCS     %FT80
+
+        Push    "r3"                            ; save number of bytes we can do in this section/page/sub-page
+        SUB     r5, r5, r2                      ; number of bytes we can do for this node
+        CMP     r3, r5                          ; if bigger than the size of this node
+        MOVHI   r3, r5                          ; then restrict number of bytes
+
+        ADD     r5, r6, #AI_WS
+        MOV     lr, pc
+        LDMIA   r5, {r12, pc}
+
+; returns to here
+
+        ADDVS   sp, sp, #8                      ; if user abort failed, then junk both pushed r3's
+        EXIT    VS                              ; and exit
+
+        ADD     r1, r1, r3                      ; advance register block
+        ADD     r2, r2, r3                      ; and illegal address pointer
+
+        LDR     r5, [sp, #4]                    ; subtract amount done from stacked total amount to do
+        SUBS    r5, r5, r3
+        STR     r5, [sp, #4]                    ; and store back
+
+        Pull    "r5"
+        SUBS    r3, r5, r3                      ; is there more to do in this section/page/sub-page?
+        BEQ     %FT90                           ; no then skip
+80
+        LDR     r6, [r6, #AI_Link]              ; else try next node
+        TEQ     r6, #0
+        BNE     %BT75
+85
+        ADD     sp, sp, #4                      ; junk pushed r3
+        SETV                                    ; indicate access invalid
+        EXIT                                    ; and exit
+
+90
+        Pull    "r3"                            ; restore total amount left to do
+        TEQ     r3, #0
+        BNE     %BT10                           ; yes, then loop
+        EXIT                                    ; no, then exit (V=0 from SUBS)
+
+ ] ; UseProcessTransfer
+
+;
+; ---------------- XOS_SynchroniseCodeAreas implementation ---------------
+;
+
+;this SWI effectively implements IMB and IMBrange (Instruction Memory Barrier)
+;for newer ARMs
+
+;entry:
+;   R0 = flags
+;        bit 0 set ->  R1,R2 specify virtual address range to synchronise
+;                      R1 = start address (word aligned, inclusive)
+;                      R2 = end address (word aligned, inclusive)
+;        bit 0 clear   synchronise entire virtual space
+;        bits 1..31    reserved
+;
+;exit:
+;   R0-R2 preserved
+;
+SyncCodeAreasSWI ROUT
+        Push    "lr"
+        BL      SyncCodeAreas
+        Pull    "lr"                    ; no error return possible
+        B       SLVK
+
+SyncCodeAreas
+        TST     R0,#1                   ; range variant of SWI?
+        BEQ     SyncCodeAreasFull
+
+SyncCodeAreasRange
+        Push    "r0-r2, lr"
+        MOV     r0, r1
+        ADD     r1, r2, #4                 ;exclusive end address
+        LDR     r2, =ZeroPage
+        LDRB    lr, [r2, #Cache_Type]
+        CMP     lr, #CT_ctype_WB_CR7_Lx ; DCache_LineLen lin or log?
+        LDRB    lr, [r2, #DCache_LineLen]
+        MOVEQ   r2, #4
+        MOVEQ   lr, r2, LSL lr
+        LDREQ   r2, =ZeroPage
+        SUB     lr, lr, #1
+        ADD     r1, r1, lr                 ;rounding up end address
+        MVN     lr, lr
+        AND     r0, r0, lr                 ;cache line aligned
+        AND     r1, r1, lr                 ;cache line aligned
+        ARMop   IMB_Range,,,r2
+        Pull    "r0-r2, pc"
+
+SyncCodeAreasFull
+        Push    "r0, lr"
+        LDR     r0, =ZeroPage
+        ARMop   IMB_Full,,,r0
+        Pull    "r0, pc"
+
+        LTORG
+
+ [ DebugAborts
+        InsertDebugRoutines
+ ]
+        END

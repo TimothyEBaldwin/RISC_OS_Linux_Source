@@ -41,7 +41,7 @@ WIPE    = -wipe
 PERL    = do <Perl$Dir>.perl
 CCFLAGS = -c -depend !Depend -IC:
 ASFLAGS = -depend !Depend ${THROWBACK} -Stamp -quit -To $@ -From
-ARMASMFLAGS = -depend !Depend -g ${THROWBACK} -cpu 5TE
+ARMASMFLAGS = -depend !Depend -g ${THROWBACK}
 CPFLAGS = ~cfr~v
 WFLAGS  = ~cfr~v
 
@@ -65,6 +65,9 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${EXP_HDR}.VduExt \
             ${EXP_HDR}.HALEntries \
             ${EXP_HDR}.HALDevice \
+            ${EXP_HDR}.RTCDevice \
+            ${EXP_HDR}.VideoDevice \
+            ${EXP_HDR}.GPIODevice \
             ${EXP_HDR}.OSEntries \
             ${EXP_HDR}.OSRSI6 \
             ${C_EXP_HDR}.RISCOS \
@@ -167,8 +170,17 @@ ${EXP_HDR}.HALEntries: hdr.HALEntries
 ${EXP_HDR}.HALDevice: hdr.HALDevice
 	${CP} hdr.HALDevice $@ ${CPFLAGS}
 	
+${EXP_HDR}.RTCDevice: hdr.RTCDevice
+	${CP} hdr.RTCDevice $@ ${CPFLAGS}
+	
 ${EXP_HDR}.OSEntries: hdr.OSEntries
 	${CP} hdr.OSEntries $@ ${CPFLAGS}
+	
+${EXP_HDR}.VideoDevice: hdr.VideoDevice
+	${CP} hdr.VideoDevice $@ ${CPFLAGS}
+	
+${EXP_HDR}.GPIODevice: hdr.GPIODevice
+	${CP} hdr.GPIODevice $@ ${CPFLAGS}
 	
 ${EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
