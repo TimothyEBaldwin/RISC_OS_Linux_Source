@@ -37,7 +37,7 @@ ARMASM  = objasm
 LD      = link
 CP      = copy
 RM      = remove
-WIPE    = -wipe
+XWIPE   = x wipe
 PERL    = do <Perl$Dir>.perl
 CCFLAGS = -c -depend !Depend -IC:
 ASFLAGS = -depend !Depend ${THROWBACK} -Stamp -quit -To $@ -From
@@ -96,11 +96,11 @@ install_rom: ${TARGET}
 clean:
 	${RM} s.TMOSHelp
 	${RM} s.Time+Date
-	${WIPE} o.* ${WFLAGS}
+	${XWIPE} o.* ${WFLAGS}
 	${RM} ${TARGET}
-	${WIPE} aif ${WFLAGS}
+	${XWIPE} aif ${WFLAGS}
 	${RM} ${GPADBG}
-	${WIPE} list.* ${WFLAGS}
+	${XWIPE} list.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
 export: ${EXPORTS}
