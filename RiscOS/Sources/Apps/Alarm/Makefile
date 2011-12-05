@@ -40,21 +40,10 @@ MSGS       = Resources.GenMessage
 RESDIR = <resource$dir>.Resources2.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AWK     = GNU.gawk
-ARMASM  = objasm
-CP      = copy
-RM      = remove
-SQUISH    = squish
-WIPE    = -wipe
+include StdTools
 
-AFLAGS  = ${THROWBACK} -depend !Depend -stamp -quit
-CPFLAGS = ~cfr~v
-SQFLAGS = -nolist
-WFLAGS  = ~c~v
+SQUISH    = squish
+SQFLAGS   = -nolist
 
 FILES =\
  ${RDIR}.!Boot \
@@ -64,9 +53,9 @@ FILES =\
  ${RDIR}.Alarms \
  ${RDIR}.Code \
  ${MSGS} \
- ${LDIR}Templates 
+ ${LDIR}Template3D 
 
-# Resources to be included in the ROM module (not in Messages module}
+# Resources to be included in the ROM module (not in Messages module)
 RESFILES =\
  ${RDIR}.code \
  ${RDIR}.!RunImage
@@ -75,10 +64,10 @@ RESFILES =\
 # Main rules:
 #
 all: ${FILES}
-	@echo ${COMPONENT}: Application built (Disc}
+	@echo ${COMPONENT}: Application built (Disc)
 
 rom: ${ROM_MODULE}
-	@echo ${COMPONENT}: Module built (ROM}
+	@echo ${COMPONENT}: Module built (ROM)
 
 install: ${FILES}
 	${MKDIR} ${INSTDIR}.${APP}
@@ -95,21 +84,20 @@ install: ${FILES}
 	Access ${INSTDIR}.${APP}.* lr/r
 	Access ${INSTDIR}.${APP}.Alarms wr/r
 	|
-	@echo ${COMPONENT}: Application installed {Disc}
+	@echo ${COMPONENT}: Application installed (Disc)
 
 install_rom: ${ROM_MODULE}
 	${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
 	@echo ${COMPONENT}: Module installed {ROM}
 
-resources: ${RDIR}.!RunLink ${MSGS} ${RDIR}.Code
+resources: ${MSGS} ${RDIR}.Code
 	${MKDIR} ${RESAPP}
 	${MKDIR} ${RESDIR}
 	|
 	${CP} ${RDIR}.!Boot      ${RESAPP}.!Boot     ${CPFLAGS}
 	${CP} ${LDIR}!Help       ${RESAPP}.!Help     ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Run   ${RESAPP}.!Run      ${CPFLAGS}
-	|
-	${CP} ${RDIR}.!RunLink   ${RESDIR}.!RunLink  ${CPFLAGS}
+	${CP} ${LDIR}!RunLink    ${RESDIR}.!RunLink  ${CPFLAGS}
 	${CP} ${RDIR}.Code       ${RESDIR}.Code      ${CPFLAGS}
 	${CP} ${MSGS}            ${RESDIR}.Messages  ${CPFLAGS}
 	${CP} ${LDIR}Template3D  ${RESDIR}.Templates ${CPFLAGS}
@@ -119,11 +107,11 @@ resources: ${RDIR}.!RunLink ${MSGS} ${RDIR}.Code
 clean:
 	${RM} ${ROM_MODULE}
 	${RM} ${RDIR}.!RunImage
-	${RM} ${RDIR}.!RunLink
 	${RM} ${RDIR}.Code
 	${RM} ${MSGS}
-	${WIPE} o          ${WFLAGS}
-	${WIPE} crunched.* ${WFLAGS}
+	${XWIPE} !Alarm     ${WFLAGS}
+	${XWIPE} o          ${WFLAGS}
+	${XWIPE} crunched.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
 #
@@ -131,8 +119,8 @@ clean:
 # 
 ResVsn:
 	${MKDIR} o
-	${ARMASM} ${AFLAGS} -o o.AlarmRes s.ResVsn
-	Link -rmf -o rm.AlarmRes o.AlarmRes 
+	${AS} ${ASFLAGS} -o o.AlarmRes s.ResVsn
+	${LD} -rmf -o rm.AlarmRes o.AlarmRes 
 
 #
 # Static dependencies:
@@ -140,8 +128,8 @@ ResVsn:
 
 ${ROM_MODULE}: s.Main ${MSGS} ${RESFILES}
 	${MKDIR} o
-	${ARMASM} ${AFLAGS} -o o.Main s.Main
-	Link -rmf -o $@ o.Main 
+	${AS} ${ASFLAGS} -o o.Main s.Main
+	${LD} -rmf -o $@ o.Main 
 
 ${MSGS}: LocalRes:Messages VersionNum
 	${MSGVERSION} LocalRes:Messages > $@
@@ -151,9 +139,6 @@ ${RDIR}.!RunImage: crunched.!RunImage
 
 crunched.!RunImage: bas.!RunImage
 	crunch.!RunImage; BASIC
-
-${RDIR}.!RunLink: bas.!RunLink
-	${SQUISH} ${SQFLAGS} -from bas.!RunLink -to $@
 
 # Note! name of output file (Resources.Code) is in AlarmSrc
 ${RDIR}.Code: bas.AlarmSrc
