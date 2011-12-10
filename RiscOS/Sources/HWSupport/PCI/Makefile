@@ -46,4 +46,4 @@ clean::
 	${WIPE} rm ${WFLAGS}
 	@@echo ${COMPONENT}: cleaned 
 
-# Dynamic dependencies:o.Tungsten.PCISA: s.GetAll
+# Dynamic dependencies:
