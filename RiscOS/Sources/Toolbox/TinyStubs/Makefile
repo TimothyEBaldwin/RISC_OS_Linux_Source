@@ -28,9 +28,5 @@ RES_AREA      = messages_file
 RESFSDIR      = ${RESDIR}.${COMPONENT}
 
 include CModule
-include StdTools
-include ModStdRule
-include DbgRules
-include ModuleLibs
 
 # Dynamic dependencies:
