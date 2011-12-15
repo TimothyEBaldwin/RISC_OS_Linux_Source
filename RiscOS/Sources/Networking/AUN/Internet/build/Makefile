@@ -63,14 +63,7 @@ CPFLAGS  = ~cfr~v
 LDFLAGS  = -linkversion 514
 WFLAGS   = ~c~v
 
-#
-# Libraries
-#
-ANSILIB   = CLib:o.ansilib
-CLIB      = CLIB:o.stubs
-RLIB      = RISCOSLIB:o.risc_oslib
-ROMCSTUBS = RISCOSLIB:o.romcstubs
-ABSSYM    = RISC_OSLib:o.abssym
+include ModuleLibs
 
 OBJS =\
  InetHdr.o\
@@ -138,10 +131,10 @@ OBJS =\
 # Main rules:
 #
 all: ${TARGET}
-	@echo ${COMPONENT}: Module built (Relocatable)
+        @echo ${COMPONENT}: Module built (Relocatable)
 
 ${TARGET}: ${OBJS} ${CLIB}
-        ${LD} ${LDFLAGS} -rmf -o $@ ${OBJS} ${CLIB} -s Syms
+        ${LD} ${LDFLAGS} -rmf -o $@ ${OBJS} ${CLIB} ${ASMUTILS} -s Syms
         ${MODSQZ} $@
         Access $@ WR/r
 
@@ -170,7 +163,7 @@ clean:
         @echo ${COMPONENT}: cleaned
 
 ${ROM_MODULE}: ${OBJS} ${ROMCSTUBS}
-        ${LD} ${LDFLAGS} -o $@ -aof ${OBJS} ${ROMCSTUBS}
+        ${LD} ${LDFLAGS} -o $@ -aof ${OBJS} ${ROMCSTUBS} ${ASMUTILS}
 
 o.socket_swi: InetHdr.h
 
