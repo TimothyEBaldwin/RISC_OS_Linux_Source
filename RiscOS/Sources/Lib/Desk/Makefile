@@ -93,8 +93,10 @@ include CLibrary
 
 ${LIBEXT}.${LIBRARY}: !Desk.o.Normal
         ${CP} !Desk.o.Normal $@ ${CPFLAGS}
+        BASIC -quit Patch325 $@
 
 ${LIBEXT}.${LIBRARYZM}: !Desk.o.Normalzm
         ${CP} !Desk.o.Normalzm $@ ${CPFLAGS}
+        BASIC -quit Patch325 $@
 
 # Dynamic dependencies:
