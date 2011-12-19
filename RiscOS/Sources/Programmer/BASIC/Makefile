@@ -23,8 +23,21 @@
 
 COMPONENT   ?= BASIC105
 RESOURCES    = no
+VFPASM      ?= TRUE
+CLEAN_DEPEND = vfpclean
 
 include StdTools
 include AAsmModule
+
+ifeq ($(VFPASM),TRUE)
+o.${MACHINE}.${COMPONENT}: s.VFPData
+ASFLAGS += -PD "VFPAssembler SETL {TRUE}"
+endif
+
+s.VFPData: VFPLib.VFPLib VFPLib.GenData
+	VFPLib.GenData
+
+vfpclean::
+	${RM} s.VFPData
 
 # Dynamic dependencies:
