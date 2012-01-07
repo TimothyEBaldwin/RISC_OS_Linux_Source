@@ -1,5 +1,5 @@
 This is a ROM softloader patch for RiscPC and A7000 machines. It includes a
-development release of the RISC OS 5.17 ROM image which can be installed into
+development release of the RISC OS ROM image which can be installed into
 your boot sequence as follows:
 
 * Open your main hard disc (left click on the hard disc iconbar icon)
