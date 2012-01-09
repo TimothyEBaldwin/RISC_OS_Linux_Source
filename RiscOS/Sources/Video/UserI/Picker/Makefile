@@ -82,7 +82,7 @@ CENV            = ${DEPEND} ${THROWBACK}
 
 ASFLAGS         = ${DEPEND} ${THROWBACK}
 CFLAGS          = -W -c -ffh -zM -zps1 -Wcp ${INCLUDES} ${DEFINES} ${CENV}
-CMHGFLAGS       = ${DEPEND} ${THROWBACK} -p
+CMHGFLAGS       = ${OPTIONS} ${DEPEND} ${THROWBACK} -p
 
 OTHER_OBJS      = o.veneer o.header
 
