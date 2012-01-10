@@ -92,17 +92,15 @@ ROM_OBJS        = or.cmyk  or.dialogue  or.helpreply  or.hsv              \
                   or.task  or.riscos    or.window     or.resource         \
                   or.icon  or.steppable or.relocate   ${OTHER_OBJS}
 RAM_OBJS        = o.cmyk   o.dialogue   o.helpreply   o.hsv               \
-                  o.main   o.model      o.rgb         o.tables    ${RESF} \
+                  o.main   o.model      o.rgb         o.tables    o.msgs  \
                            o.callback   o.lookup      o.realloc           \
                   o.task   o.riscos     o.window      o.resource          \
                   o.icon   o.steppable  o.relocate    ${OTHER_OBJS}
 DBG_OBJS        = od.cmyk  od.dialogue  od.helpreply  od.hsv              \
-                  od.main  od.model     od.rgb        od.tables   ${RESF} \
+                  od.main  od.model     od.rgb        od.tables   o.msgs  \
                   od.m     od.callback  od.lookup     od.realloc          \
                   od.task  od.riscos    od.window     od.resource         \
                   od.icon  od.steppable od.relocate   ${OTHER_OBJS}
-	          
-RESF            = o.msgs
 
 RESOURCEFILES   = \
   Resources.CMYK.Messages\
@@ -111,7 +109,7 @@ RESOURCEFILES   = \
   Resources.HSV.Templates\
   Resources.RGB.Messages\
   Resources.RGB.Templates\
-  Resources.Messages\
+  Resources.MergedMsgs\
   Resources.Sprites\
   Resources.Templates
 
@@ -153,7 +151,6 @@ icons.h.hsv_i: Resources.HSV.Templates
 #
 # Main rules:
 #
-#
 all: ${RAM_MODULE} o.dirs
 	@echo ${FULL_COMPONENT}: Module built (RAM)
 
@@ -182,10 +179,10 @@ resources: ${RESOURCEFILES}
 	${CP} Resources.HSV.Messages    ${RESDIR}.HSV.Messages   ${CPFLAGS}
 	${CP} Resources.RGB.Templates   ${RESDIR}.RGB.Templates  ${CPFLAGS}
 	${CP} Resources.RGB.Messages    ${RESDIR}.RGB.Messages   ${CPFLAGS}
-	${CP} Resources.Messages        ${RESDIR}.Messages       ${CPFLAGS}
+	${CP} Resources.MergedMsgs      ${RESDIR}.Messages       ${CPFLAGS}
 	${CP} Resources.Sprites         ${RESDIR}.Sprites        ${CPFLAGS}
 	${CP} Resources.Templates       ${RESDIR}.Templates      ${CPFLAGS}
-	@echo ${FULL_COMPONENT}: resource files copied to Messages module
+	@echo ${FULL_COMPONENT}: resources copied to Messages module
 
 clean:
 	${WIPE} o ${WFLAGS}
@@ -196,7 +193,33 @@ clean:
 	${WIPE} h.header ${WFLAGS}
 	${WIPE} linked ${WFLAGS}
 	${WIPE} icons ${WFLAGS}
+	${WIPE} Resources.MergedMsgs ${WFLAGS}
 	@echo ${FULL_COMPONENT}: cleaned
+
+export:
+	${CP} hdr.ColourPick ${EXP_HDR}.ColourPick ${CPFLAGS}
+	@echo ${FULL_COMPONENT}: export complete
+
+rom_link:
+	${MKDIR} linked
+	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM}
+	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
+	@echo ${COMPONENT}: rom_link complete
+
+BBETYPE = picker
+bbe-picker: bbe-generic
+	BBE_Export_Dir Resources
+
+#
+# Static dependencies:
+#
+ifeq (${OPTIONS},-DNO_INTERNATIONAL_HELP)                  
+Resources.MergedMsgs:
+	${CP} Resources.Messages  Resources.MergedMsgs    ${CPFLAGS}
+else
+Resources.MergedMsgs:
+	FAppend Resources.MergedMsgs Resources.Messages Resources.CmdHelp
+endif
 
 o.dirs:
 	${MKDIR} o
@@ -206,10 +229,17 @@ o.dirs:
 	${MKDIR} icons.h
 	create $@
 
-export:
-	${CP} hdr.ColourPick ${EXP_HDR}.ColourPick ${CPFLAGS}
-	@echo ${FULL_COMPONENT}: export complete
-
+o.msgs: ${RESOURCEFILES}
+	resgen resourcefs_files $@ \
+ Resources.CMYK.Messages   ${RESFSDIR}.CMYK.Messages    \
+ Resources.CMYK.Templates  ${RESFSDIR}.CMYK.Templates   \
+ Resources.HSV.Templates   ${RESFSDIR}.HSV.Templates    \
+ Resources.HSV.Messages    ${RESFSDIR}.HSV.Messages     \
+ Resources.RGB.Templates   ${RESFSDIR}.RGB.Templates    \
+ Resources.RGB.Messages    ${RESFSDIR}.RGB.Messages     \
+ Resources.MergedMsgs      ${RESFSDIR}.Messages         \
+ Resources.Sprites         ${RESFSDIR}.Sprites          \
+ Resources.Templates       ${RESFSDIR}.Templates
 
 #
 # Targets
@@ -228,31 +258,5 @@ ${DBG_MODULE}:  ${DBG_OBJS} ${CLIB} ${OSLIB} ${ICONS} ${ASMUTILS}
 	${MKDIR} rm
 	$(LD) -o $@ -rmf ${DBG_OBJS} ${OSLIB} ${CLIB} ${ASMUTILS}
 	Access $@ RW/R
-
-${RESF}: ${RESOURCEFILES}
-	resgen resourcefs_files $@ \
- Resources.CMYK.Messages   ${RESFSDIR}.CMYK.Messages    \
- Resources.CMYK.Templates  ${RESFSDIR}.CMYK.Templates   \
- Resources.HSV.Templates   ${RESFSDIR}.HSV.Templates    \
- Resources.HSV.Messages    ${RESFSDIR}.HSV.Messages     \
- Resources.RGB.Templates   ${RESFSDIR}.RGB.Templates    \
- Resources.RGB.Messages    ${RESFSDIR}.RGB.Messages     \
- Resources.Messages        ${RESFSDIR}.Messages         \
- Resources.Sprites         ${RESFSDIR}.Sprites          \
- Resources.Templates       ${RESFSDIR}.Templates
-
-#
-# Final link for the ROM Image (using given base address)
-#
-rom_link:
-	${MKDIR} linked
-	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM}
-	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom_link complete
-
-BBETYPE = picker
-bbe-picker: bbe-generic
-	BBE_Export_Dir Resources
-
 
 # Dynamic dependencies:
