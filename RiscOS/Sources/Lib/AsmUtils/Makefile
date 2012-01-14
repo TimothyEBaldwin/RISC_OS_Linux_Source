@@ -40,7 +40,7 @@ RM      = remove
 LD      = link
 LB      = libfile
 TOUCH   = create
-WIPE    = -wipe
+WIPE    = x wipe
 
 # No specific preference
 OBJASMCPU =
