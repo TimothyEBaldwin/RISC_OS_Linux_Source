@@ -52,7 +52,7 @@ CP      = copy
 LD      = link
 RM      = remove
 SQUEEZE = squeeze
-WIPE    = -wipe
+WIPE    = x wipe
 XWIPE   = x wipe
 
 AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
