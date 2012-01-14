@@ -36,12 +36,12 @@ COMPONENT  = SSound
 TARGET     = SSound
 ROM_SOURCE = Gets.s
 
-CUSTOMRES  = custom
+CMDHELP = custom
 
 include StdTools
 include AAsmModule
 
-resources:
+resources-custom:
 	${NOP}
 
 # Dynamic dependencies:
