@@ -17,7 +17,7 @@
 MKDIR		= cdir
 CP		= copy
 RM		= remove
-WIPE		= -wipe
+WIPE		= x wipe
 STRIPDEPND	= stripdepnd
 
 
