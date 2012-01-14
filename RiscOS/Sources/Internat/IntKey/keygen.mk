@@ -17,7 +17,7 @@
 OBJS = keygen throwback unicdata
 
 include HostTools
-include StdRules
+#include StdRules
 include AppLibs
 include CApp
 
