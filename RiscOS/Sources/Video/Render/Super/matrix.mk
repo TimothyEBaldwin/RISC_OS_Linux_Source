@@ -15,7 +15,7 @@
 # Makefile for Matrix1 and Matrix2
 
 include HostTools
-include StdRules
+#include StdRules
 include AppLibs
 include CApp
 
