@@ -21,7 +21,7 @@ INCLUDES=	C:,TCPIPLibs:
 CC=		cc
 RM=             remove
 WFLAGS=         fr~c~v
-WIPE=           -wipe
+WIPE=           x wipe
 
 CFLAGS=		-wp -I$(INCLUDES) -Dlint -c ${THROWBACK} -depend !Depend
 

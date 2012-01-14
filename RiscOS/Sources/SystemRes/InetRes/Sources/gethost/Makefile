@@ -22,7 +22,7 @@ CMHG    = cmhg
 CP      = copy
 LD      = link
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 SQUEEZE = squeeze
 
 DEFINES = -DRISCOS_TWEAK

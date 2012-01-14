@@ -22,7 +22,7 @@ CMHG    = cmhg
 CP      = copy
 LD      = link
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 
 DEFINES = -DRISCOS_TWEAK -Dlint
 AFLAGS  = -depend !Depend -Stamp -quit

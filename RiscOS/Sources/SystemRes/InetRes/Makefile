@@ -41,7 +41,7 @@ MKDIR   = do mkdir -p
 CHMOD   = Unix.chmod ${CHMODFLAGS}
 CP      = copy
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 AWK     = GNU.gawk
 
 CPFLAGS = ~cfr~v
