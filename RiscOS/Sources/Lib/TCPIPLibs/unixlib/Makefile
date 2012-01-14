@@ -27,9 +27,9 @@ LIBDIR = <Lib$Dir>
 #
 # Generic options:
 #
-MKDIR   = cdir
-WIPE    = -wipe
-RM      = -remove
+MKDIR   = do mkdir -p
+WIPE    = x wipe
+RM      = x remove
 CP      = copy
 CC	= cc
 AS	= objasm

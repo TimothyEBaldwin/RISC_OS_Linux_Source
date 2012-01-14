@@ -15,7 +15,7 @@
 # Makefile for mkveneers
 
 include HostTools
-include StdRules
+#include StdRules
 include AppLibs
 include CApp
 
