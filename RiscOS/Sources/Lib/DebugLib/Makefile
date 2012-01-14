@@ -36,7 +36,7 @@ CM		= cmhg
 RM		= remove
 LD		= link
 LB		= libfile
-WIPE		= -wipe
+WIPE		= x wipe
 AOF2ALF		= aof.AOF2ALF
 STRIP		= stripdepnd
 

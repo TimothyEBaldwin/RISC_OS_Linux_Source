@@ -35,7 +35,7 @@ LD		= link #${MemCheckLD} link
 RM		= remove
 MODSQZ		= modsqz
 RESGEN		= resgen
-WIPE		= -wipe
+WIPE		= x wipe
 STRIP		= stripdepnd
 
 AFLAGS		= -depend !Depend -Stamp -quit ${THROWBACK}
