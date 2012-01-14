@@ -35,7 +35,7 @@ LD      = link
 CP      = copy
 RM      = remove
 SQUISH  = squish
-WIPE    = -wipe
+WIPE    = x wipe
 
 AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit -module
 CFLAGS  = ${THROWBACK} -depend !Depend -ffa ${INCLUDES} 
