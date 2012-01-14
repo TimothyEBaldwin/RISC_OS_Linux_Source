@@ -50,7 +50,7 @@ LD      = link
 MKDIR   = cdir
 MODSQZ  = modsqz
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 
 AFLAGS   = -depend !Depend -I<Hdr$Dir>.Global.,<Hdr$Dir>.Interface. -Stamp -quit
 CFLAGS   = -depend !Depend -zps1 -zM -ffa -Wacnp ${INCLUDES} ${DFLAGS} ${OPTS} ${THROWBACK}
