@@ -44,7 +44,7 @@ CMHG    = cmhg
 CP      = copy
 LD      = link
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 SQZ     = modsqz
 TOUCH   = create
 
