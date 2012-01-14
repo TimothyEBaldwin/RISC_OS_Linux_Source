@@ -18,7 +18,7 @@ LIBDIR = <Lib$Dir>
 # Generic options:
 #
 MKDIR   = cdir
-WIPE    = -wipe
+WIPE    = x wipe
 RM      = -remove
 CP      = copy
 CC	= cc
