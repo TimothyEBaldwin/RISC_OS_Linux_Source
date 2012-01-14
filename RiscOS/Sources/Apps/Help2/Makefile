@@ -53,7 +53,7 @@ LD      = link
 CP      = copy
 RM      = remove
 SQZ     = squeeze
-WIPE    = -wipe
+WIPE    = x wipe
 XWIPE   = x wipe
 PERL    = do <Perl$Dir>.perl
 
