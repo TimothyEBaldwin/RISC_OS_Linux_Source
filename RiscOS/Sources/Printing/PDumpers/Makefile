@@ -50,7 +50,7 @@ DUMPERS   = DotMatrix \
 CP      = copy
 MKDIR   = do mkdir -p
 DIR     = @dir
-WIPE    = -wipe
+WIPE    = x wipe
 MAKE   ?= amu
 SUBMAKE = @${MAKE} ${MFLAGS} ${MAKECMDGOALS}
 
