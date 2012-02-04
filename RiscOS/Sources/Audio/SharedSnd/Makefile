@@ -25,23 +25,13 @@
 # 
 # Makefile for SharedSound
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# When          Who     What
-# ----          ---     ----
-# 28-Jun-2001   BJGA    Created
 
 COMPONENT  = SSound
 TARGET     = SSound
 ROM_SOURCE = Gets.s
-
-CMDHELP = custom
+RESOURCES  = No
 
 include StdTools
 include AAsmModule
-
-resources-custom:
-	${NOP}
 
 # Dynamic dependencies:
