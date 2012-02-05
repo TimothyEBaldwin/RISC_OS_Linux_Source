@@ -14,17 +14,10 @@
 #
 # Makefile for BASIC
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name   Description
-# ----       ----   -----------
-# 11-May-01  SNB    Recreated.
 
 COMPONENT   ?= BASIC105
 RESOURCES    = no
 VFPASM      ?= TRUE
-CLEAN_DEPEND = vfpclean
 
 include StdTools
 include AAsmModule
@@ -35,9 +28,9 @@ ASFLAGS += -PD "VFPAssembler SETL {TRUE}"
 endif
 
 s.VFPData: VFPLib.VFPLib VFPLib.GenData
-	VFPLib.GenData
+	${RUN}VFPLib.GenData
 
-vfpclean::
+clean::
 	${RM} s.VFPData
 
 # Dynamic dependencies:
