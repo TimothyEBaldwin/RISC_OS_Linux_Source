@@ -87,7 +87,6 @@ Palettes.8desktop: MkTables.maketables MkTables.module
 	${SQUASH} Tables.4greys
 	${SQUASH} Tables.8greys  
 	${SQUASH} Tables.4desktop
-	${SQUASH} Tables.8desktop
 	
 MkTables.o._dirs:
 	${MKDIR} MkTables.o
