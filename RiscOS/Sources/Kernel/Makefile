@@ -197,9 +197,9 @@ ${C_EXP_HDR}.HALDevice: o.Global.h.HALDevice h.HALDevice
 	${CP} h.HALDevice $@ ${CPFLAGS}
 	print o.Global.h.HALDevice { >> $@ }
 
-${C_EXP_HDR}.OSEntries: hdr.OSEntries
-	${MKDIR} ${C_EXP_HDR}
-	${PERL} Build:Hdr2H hdr.OSEntries $@
+${C_EXP_HDR}.OSEntries: o.Global.h.OSEntries h.OSEntries
+	${CP} h.OSEntries $@ ${CPFLAGS}
+	print o.Global.h.OSEntries { >> $@ }
 
 ${C_EXP_HDR}.Variables: hdr.Variables
 	${MKDIR} ${C_EXP_HDR}
@@ -213,6 +213,12 @@ o.Global.h.HALDevice: hdr.HALDevice
 	${MKDIR} o.Global.h
 	dir o
 	${PERL} Build:Hdr2H ^.hdr.HALDevice Global.h.HALDevice
+	back
+
+o.Global.h.OSEntries: hdr.OSEntries
+	${MKDIR} o.Global.h
+	dir o
+	${PERL} Build:Hdr2H ^.hdr.OSEntries Global.h.OSEntries
 	back
 
 BBETYPE = kernel
