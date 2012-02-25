@@ -12,85 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for Kernel
-#
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 25-May-94  AMcC         Created.
+# Makefile for IOMD HAL
 #
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
-C_EXP_HDR = <cexport$dir>.Global.h
+COMPONENT = IOMD HAL
+TARGET = IOMD
+OBJS = Top Boot ATA IIC Interrupts MachineID NVRAM Timers Video cbits KbdScan
 
-#
-# Generic options:
-#
-MKDIR   = mkdir -p
-AS      = aasm
-ARMASM  = objasm
-CP      = copy
-RM      = remove
-CCFLAGS = -c -depend !Depend -IC:
-ASFLAGS = -depend !Depend ${THROWBACK} -Stamp -quit -To $@ -From
-ARMASMFLAGS = -depend !Depend -g -APCS 3/nofp/noswst ${THROWBACK}
-CPFLAGS = ~cfr~v
+HDRS =
+CMHGFILE =
+CUSTOMRES = custom
+CUSTOMROM = custom
+ROM_TARGET = custom
+LNK_TARGET = custom
+AIFDBG    = aif._IOMD
+GPADBG    = gpa.GPA
 
-TOKENISE = tokenise
-TOKENS   = Hdr:Tokens
+include StdTools
+include CModule
 
-#
-# Program specific options:
-#
-COMPONENT = IOMD
-TARGET    = bin.IOMD
-DBGTARGET = aif.IOMD
-GPATARGET = gpa.IOMD
-EXPORTS   =
-
-OBJECTS   = o.Boot o.IIC o.NVRAM o.Video o.Interrupts o.MachineID o.Timers o.ATA
-
-.s.o:;	${ARMASM} ${ARMASMFLAGS} $< $@
-
-#
-# Generic rules:
-#
-rom: ${TARGET}
-	@echo ${COMPONENT}: rom module built
-
-debug: ${GPATARGET}
-	@echo ${COMPONENT}: debug module built
-
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom module installed
-
-clean:
-	${RM} ROM
-	${RM} ${TARGET}
-	-Wipe o.* ~C~V
-	-Wipe aif.* ~C~V
-	-Wipe gpa.* ~C~V
-	@echo ${COMPONENT}: cleaned
-
-export: ${EXPORTS}
-	@echo ${COMPONENT}: export complete
+CCFLAGS += -ff -APCS 3/32bit/nofp/noswst
+ASFLAGS += -APCS 3/nofp/noswst
+AASMFLAGS += -APCS 3/nofp/noswst
 
 resources:
-	@echo ${COMPONENT}: nothing to do
+	@${ECHO} ${COMPONENT}: no resources
 
-${TARGET}: ${OBJECTS}
-	Link -bin -o $@ ${OBJECTS} -base 0xFC000000
+rom: aof.${TARGET}
+	@${ECHO} ${COMPONENT}: rom module built
 
-${DBGTARGET}: ${OBJECTS}
-	Link -bin -aif -d -o $@ ${OBJECTS} -base 0xFC000000
+_debug: ${GPADBG}
+	@echo ${COMPONENT}: debug image built
 
-${GPATARGET}: ${DBGTARGET}
-	ToGPA -s ${DBGTARGET} $@
+install_rom: linked.${TARGET}
+	${CP} linked.${TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
+	@echo ${COMPONENT}: rom module installed
+
+aof.${TARGET}: ${ROM_OBJS_} ${ROM_LIBS} ${DIRS} ${ROM_DEPEND}
+	${LD} -o $@ -aof ${ROM_OBJS_} ${ROM_LIBS}
+
+linked.${TARGET}: aof.${TARGET}
+	${LD} ${LDFLAGS} ${LDLINKFLAGS} -o $@ -bin -base 0xFC000000 aof.${TARGET}
+
+${AIFDBG}: ${ROM_OBJS_} ${ROM_LIBS}
+	${MKDIR} aif
+	${LD} -aif -bin -d -o ${AIFDBG} ${ROM_OBJS_} ${ROM_LIBS}
+
+${GPADBG}: ${AIFDBG}
+	ToGPA -s ${AIFDBG} ${GPADBG}
 
 # Dynamic dependencies:
