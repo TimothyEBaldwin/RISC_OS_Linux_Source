@@ -2,9 +2,16 @@ This is a ROM softloader patch for RiscPC and A7000 machines. It includes a
 development release of the RISC OS ROM image which can be installed into
 your boot sequence as follows:
 
+* Ensure you have an up to date !System containing SharedCLibrary 5.46 or
+  later. An updated !System for 26 bit operating systems is available from
+    http://www.riscosopen.org/content/downloads/other-zipfiles
+  follow the instructions inside the archive to install this.
+  Remember that although RISC OS 5 runs in 32 bit mode, the early part of
+  the softloading is on the original 26 bit host operating system. 
+
 * Open your main hard disc (left click on the hard disc iconbar icon)
 
-* Run the !Boot application by left double-clicking '!Boot'
+* Run the configure application by left double-clicking '!Boot'
 
 * Left click on the 'Boot' icon to open the "Boot sequence" configuration
   window
