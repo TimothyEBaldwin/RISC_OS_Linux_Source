@@ -82,7 +82,6 @@ EXPORTS   = \
  ${HDRDIR}.IO.IOMD \
  ${HDRDIR}.IO.IOMDL \
  ${HDRDIR}.Keyboard \
- ${HDRDIR}.KEYV \
  ${HDRDIR}.ListOpts \
  ${HDRDIR}.MEMM.ARM600 \
  ${HDRDIR}.MEMM.MEMC1 \
@@ -94,6 +93,7 @@ EXPORTS   = \
  ${HDRDIR}.Messages \
  ${HDRDIR}.NdrDebug \
  ${HDRDIR}.NewErrors \
+ ${HDRDIR}.OsBytes \
  ${HDRDIR}.OsWords \
  ${HDRDIR}.PaletteV \
  ${HDRDIR}.PDriverReg \
@@ -125,8 +125,8 @@ EXPORTS   = \
  ${HDIR}.Global.h.GraphicsV \
  ${HDIR}.Global.h.Heap \
  ${HDIR}.Global.h.Keyboard \
- ${HDIR}.Global.h.KeyV \
  ${HDIR}.Global.h.NewErrors \
+ ${HDIR}.Global.h.OsBytes \
  ${HDIR}.Global.h.OsWords \
  ${HDIR}.Global.h.PaletteV \
  ${HDIR}.Global.h.PDriverReg \
@@ -223,9 +223,9 @@ ${HDRDIR}.FileTypes:  hdr.FileTypes;   ${CP} hdr.FileTypes  $@ ${CPFLAGS}
 ${HDRDIR}.FSNumbers:  hdr.FSNumbers;   ${CP} hdr.FSNumbers  $@ ${CPFLAGS}
 ${HDRDIR}.GraphicsV:  hdr.GraphicsV;   ${CP} hdr.GraphicsV  $@ ${CPFLAGS}
 ${HDRDIR}.Keyboard:   hdr.Keyboard;    ${CP} hdr.Keyboard   $@ ${CPFLAGS}
-${HDRDIR}.KEYV:       hdr.KEYV;        ${CP} hdr.KEYV       $@ ${CPFLAGS}
 ${HDRDIR}.Messages:   hdr.Messages;    ${CP} hdr.Messages   $@ ${CPFLAGS}
 ${HDRDIR}.NewErrors:  hdr.NewErrors;   ${CP} hdr.NewErrors  $@ ${CPFLAGS}
+${HDRDIR}.OsBytes:    hdr.OsBytes;     ${CP} hdr.OsBytes    $@ ${CPFLAGS}
 ${HDRDIR}.OsWords:    hdr.OsWords;     ${CP} hdr.OsWords    $@ ${CPFLAGS}
 ${HDRDIR}.PaletteV:   hdr.PaletteV;    ${CP} hdr.PaletteV   $@ ${CPFLAGS}
 ${HDRDIR}.PDriverReg: hdr.PDriverReg;  ${CP} hdr.PDriverReg $@ ${CPFLAGS}
@@ -248,10 +248,10 @@ ${HDIR}.Global.h.FreeWay:    hdr.FreeWay;     ${HDR2H} hdr.FreeWay    $@
 ${HDIR}.Global.h.FSNumbers:  hdr.FSNumbers;   ${HDR2H} hdr.FSNumbers  $@
 ${HDIR}.Global.h.GraphicsV:  hdr.GraphicsV;   ${HDR2H} hdr.GraphicsV  $@
 ${HDIR}.Global.h.Keyboard:   hdr.Keyboard;    ${HDR2H} hdr.Keyboard   $@
-${HDIR}.Global.h.KeyV:       hdr.KeyV;        ${HDR2H} hdr.KeyV       $@
 ${HDIR}.Global.h.Messages:   hdr.Messages;    ${HDR2H} hdr.Messages   $@
 ${HDIR}.Global.h.NewErrors:  hdr.NewErrors;   ${HDR2H} hdr.NewErrors  $@
 # NewErrors still has a few problems.  Partial support is there.
+${HDIR}.Global.h.OsBytes:    hdr.OsBytes;     ${HDR2H} hdr.OsBytes    $@
 ${HDIR}.Global.h.OsWords:    hdr.OsWords;     ${HDR2H} hdr.OsWords    $@
 ${HDIR}.Global.h.PaletteV:   hdr.PaletteV;    ${HDR2H} hdr.PaletteV   $@
 ${HDIR}.Global.h.PDriverReg: hdr.PDriverReg;  ${HDR2H} hdr.PDriverReg $@
