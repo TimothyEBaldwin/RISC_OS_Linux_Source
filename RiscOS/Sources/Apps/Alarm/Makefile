@@ -115,17 +115,8 @@ clean:
 	@echo ${COMPONENT}: cleaned
 
 #
-# Development rules:
-# 
-ResVsn:
-	${MKDIR} o
-	${AS} ${ASFLAGS} -o o.AlarmRes s.ResVsn
-	${LD} -rmf -o rm.AlarmRes o.AlarmRes 
-
-#
 # Static dependencies:
 #
-
 ${ROM_MODULE}: s.Main ${MSGS} ${RESFILES}
 	${MKDIR} o
 	${AS} ${ASFLAGS} -o o.Main s.Main
@@ -140,9 +131,10 @@ ${RDIR}.!RunImage: crunched.!RunImage
 crunched.!RunImage: bas.!RunImage
 	crunch.!RunImage; BASIC
 
-# Note! name of output file (Resources.Code) is in AlarmSrc
-${RDIR}.Code: bas.AlarmSrc
-	/bas.AlarmSrc
+${RDIR}.Code: s.Browser
+	${MKDIR} o
+	${AS} ${ASFLAGS} -o o.Browser s.Browser
+	${LD} -bin -o $@ o.Browser
 
 BBETYPE = alarm
 bbe-alarm: bbe-generic
