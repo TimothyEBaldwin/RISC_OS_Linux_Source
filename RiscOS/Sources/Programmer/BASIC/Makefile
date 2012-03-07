@@ -16,19 +16,31 @@
 #
 
 COMPONENT   ?= BASIC105
-RESOURCES    = no
 VFPASM      ?= TRUE
+ifeq ($(VFPASM),TRUE)
+RESOURCES    = -private
+else
+RESOURCES    = no
+endif
+RESFSDIR     = ${RESDIR}.BASIC
 
 include StdTools
 include AAsmModule
 
 ifeq ($(VFPASM),TRUE)
-o.${MACHINE}.${COMPONENT}: s.VFPData
+${ROM_OBJECT} ${SA_OBJECT} ${DBG_OBJECT}: s.VFPData
 ASFLAGS += -PD "VFPAssembler SETL {TRUE}"
+
+resources: o.VFPData
+	${MKDIR} ${RESFSDIR}
+	${LD} -BIN -Output ${RESFSDIR}.VFPData o.VFPData
 endif
 
 s.VFPData: VFPLib.VFPLib VFPLib.GenData
-	${RUN}VFPLib.GenData
+	BASIC { < VFPLib.GenData }
+
+o.VFPData: s.VFPData
+	${AS} ${ASFLAGS} -PD "standaloneVFPData SETL {TRUE}" -PD "standalone SETL {TRUE}" -o $@ s.VFPData 
 
 clean::
 	${RM} s.VFPData
