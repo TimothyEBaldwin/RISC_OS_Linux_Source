@@ -61,6 +61,8 @@ LD	= link
 LIB	= libfile
 CMHG	= cmhg
 TOUCH   = create
+DO      = do
+PERL    = ${DO} <Perl$Dir>.perl
 
 WFLAGS  = ~c~v
 CPFLAGS = ~cflnr~v
@@ -148,11 +150,8 @@ socklib5zm:	${ZFILES5} o._dirs
 	${LIB} -o socklib5zm
 
 veneers:	mkveneers Prototypes
-	${RUN}mkveneers Prototypes
+	${PERL} mkveneers Prototypes
 	Create veneers
-
-mkveneers:	c.mkveneers
-        ${MAKE} -f mkveneers/mk COMPONENT=mkveneers THROWBACK=${THROWBACK}
 
 export: export_${PHASE}
 
@@ -182,7 +181,6 @@ clean:
 	${WIPE} z.* ${WFLAGS}
 	${WIPE} sn.* ${WFLAGS}
 	${WIPE} sz.* ${WFLAGS}
-	${RM} mkveneers
 	${RM} veneers
 	${RM} socklib
 	${RM} socklibzm
