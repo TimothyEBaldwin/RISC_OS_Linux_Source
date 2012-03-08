@@ -40,6 +40,7 @@ s.VFPData: VFPLib.VFPLib VFPLib.GenData
 	BASIC { < VFPLib.GenData }
 
 o.VFPData: s.VFPData
+	${MKDIR} o
 	${AS} ${ASFLAGS} -PD "standaloneVFPData SETL {TRUE}" -PD "standalone SETL {TRUE}" -o $@ s.VFPData 
 
 clean::
