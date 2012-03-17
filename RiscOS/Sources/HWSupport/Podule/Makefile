@@ -48,11 +48,4 @@ ASFLAGS    = ${OPTIONS}
 include StdTools
 include AAsmModule
 
-#
-# Generic rules:
-#
-clean::
-	${WIPE} o ${WFLAGS}
-	@echo ${COMPONENT}: cleaned 
-
 # Dynamic dependencies:
