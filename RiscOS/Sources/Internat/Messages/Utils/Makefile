@@ -22,38 +22,19 @@
 # 25-Oct-94  SMC          Created.
 #
 
-#
-# Generic options:
-#
-CC      = cc
-LD      = link
-RM      = remove
-WIPE    = -wipe
-
-CCFLAGS = -c -depend !Depend -IC:
-WFLAGS  = ~cr~v
-
-#
-# Libraries
-#
-CLIB    = CLIB:o.stubs
-
-#
-# Program specific options:
-#
 TARGETS = TagExtract MsgExt TokGen MsgTok MsgExt2 TokGen2 MsgTok2 ScanRes ResCommon LocaleChk
+CUSTOMLINK = custom
+COMPONENT = Messages utilities
+TARGET = _dummy_
 
-#
-# Rule patterns
-#
-.c.o:;  ${CC} ${CCFLAGS} -o $@ $<
+include CApp
 
-#
-# Generic rules:
-#
-all: ${TARGETS}
+all: ${TARGETS} ${DIRS}
 
-clean:
+_dummy_:: ${TARGETS} ${DIRS}
+	${NOP}
+
+clean::
 	${RM} TagExtract
 	${RM} MsgExt
 	${RM} TokGen
@@ -64,36 +45,35 @@ clean:
 	${RM} ScanRes
 	${RM} ResCommon
 	${RM} LocaleChk
-	${WIPE} o.* ${WFLAGS}
 
-TagExtract: o.TagExtract
-	${LD} -o $@ o.TagExtract ${CLIB}
+TagExtract: o.TagExtract ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.TagExtract ${CLIB}
 
-MsgExt: o.MsgExt o.MsgCommon
-	${LD} -o $@ o.MsgExt o.MsgCommon ${CLIB}
+MsgExt: o.MsgExt o.MsgCommon ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.MsgExt o.MsgCommon ${CLIB}
 
-TokGen: o.TokGen
-	${LD} -o $@ o.TokGen ${CLIB}
+TokGen: o.TokGen ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.TokGen ${CLIB}
 
-MsgTok: o.MsgTok
-	${LD} -o $@ o.MsgTok ${CLIB}
+MsgTok: o.MsgTok ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.MsgTok ${CLIB}
 
-MsgExt2: o.MsgExt2
-	${LD} -o $@ o.MsgExt2 ${CLIB}
+MsgExt2: o.MsgExt2 ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.MsgExt2 ${CLIB}
 
-TokGen2: o.TokGen2
-	${LD} -o $@ o.TokGen2 ${CLIB}
+TokGen2: o.TokGen2 ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.TokGen2 ${CLIB}
 
-MsgTok2: o.MsgTok2
-	${LD} -o $@ o.MsgTok2 ${CLIB}
+MsgTok2: o.MsgTok2 ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.MsgTok2 ${CLIB}
 
-ScanRes: o.ScanRes
-	${LD} -o $@ o.ScanRes ${CLIB}
+ScanRes: o.ScanRes ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.ScanRes ${CLIB}
 
-ResCommon: o.ResCommon
-	${LD} -o $@ o.ResCommon ${CLIB}
+ResCommon: o.ResCommon ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.ResCommon ${CLIB}
 
-LocaleChk: o.LocaleChk
-	${LD} -o $@ o.LocaleChk ${CLIB}
+LocaleChk: o.LocaleChk ${DIRS}
+	${LD} ${LDFLAGS} -o $@ o.LocaleChk ${CLIB}
 
 # Dynamic dependencies:
