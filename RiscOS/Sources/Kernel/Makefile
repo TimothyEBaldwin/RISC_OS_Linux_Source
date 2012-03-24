@@ -70,6 +70,7 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${EXP_HDR}.GPIODevice \
             ${EXP_HDR}.OSEntries \
             ${EXP_HDR}.OSRSI6 \
+            ${C_EXP_HDR}.ModHand \
             ${C_EXP_HDR}.RISCOS \
             ${C_EXP_HDR}.HALEntries \
             ${C_EXP_HDR}.HALDevice \
@@ -185,6 +186,10 @@ ${EXP_HDR}.GPIODevice: hdr.GPIODevice
 ${EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
 	
+${C_EXP_HDR}.ModHand: hdr.ModHand
+	${MKDIR} ${C_EXP_HDR}
+	${PERL} Build:Hdr2H hdr.ModHand $@
+
 ${C_EXP_HDR}.RISCOS: hdr.RISCOS
 	${MKDIR} ${C_EXP_HDR}
 	${PERL} Build:Hdr2H hdr.RISCOS $@
