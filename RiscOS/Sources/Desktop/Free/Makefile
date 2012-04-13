@@ -24,7 +24,10 @@
 
 COMPONENT = Free
 HEADER1   = Free
+ASMCHEADER1 = Free
 RESOURCEEXTRA = resources_templates
+
+EXPORTS = ${C_EXP_HDR}.Free
 
 include StdTools
 include AAsmModule
