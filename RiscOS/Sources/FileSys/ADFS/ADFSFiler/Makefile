@@ -43,6 +43,10 @@ ifeq (${SCSITEMPLATES},yes)
 resources_SCSIFiler: resources_templates
 endif
 
+resources_SDFSFiler: ${MERGEDMSGS}
+	${CP} ${MERGEDMSGS} ${RESFSDIR}.Messages ${CPFLAGS}
+	${INSTRES} -I Resources.${LOCALE},Resources.UK,Resources ${RESFSDIR} SDFS.Sprites [SDFS.Sprites11] [SDFS.Sprites22] Templates
+
 o.${MACHINE}._Messages_.ADFSFiler:
 	${MKDIR} ${MERGEDMDIR}
 	${TOUCH} $@
@@ -56,5 +60,12 @@ o.${MACHINE}._Messages_.SCSIFiler:
 	IfThere LocalRes:MessagesS Then ${CP} LocalRes:MessagesS $@ ${CPFLAGS}
 	IfThere LocalRes:CmdHelpS Then ${TOKENCHECK} LocalRes:CmdHelpS
 	IfThere LocalRes:CmdHelpS Then ${CAT} LocalRes:CmdHelpS { >> $@ }
+
+o.${MACHINE}._Messages_.SDFSFiler:
+	${MKDIR} ${MERGEDMDIR}
+	${TOUCH} $@
+	IfThere LocalRes:MessagesSD Then ${CP} LocalRes:MessagesSD $@ ${CPFLAGS}
+	IfThere LocalRes:CmdHelpSD Then ${TOKENCHECK} LocalRes:CmdHelpSD
+	IfThere LocalRes:CmdHelpSD Then ${CAT} LocalRes:CmdHelpSD { >> $@ }
 
 # Dynamic dependencies:
