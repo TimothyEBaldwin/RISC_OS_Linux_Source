@@ -1,125 +1,43 @@
+# Copyright 1997 Acorn Computers Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Makefile for ScrSaver
 #
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
+COMPONENT   = ScrSaver
+OBJS        = module
+CINCLUDES   = -IC:
+CMHGFILE    = header
+CMHGDEPENDS = module
+RES_OBJ     =
+CUSTOMEXP   = custom
+CUSTOMRES   = custom
 
-#
-# Generic options:
-#
-MKDIR   = cdir
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-WIPE    = -wipe
-SHRINK  = ShrinkWrapZipCompress
+include CModule
 
-AFLAGS = -depend !Depend -Stamp -quit
-CFLAGS  = -c -depend !Depend -zM -zps1 -ff ${INCLUDES} ${DFLAGS}
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
+resources:
+	@${ECHO} ${COMPONENT}: no resources
 
-#
-# Libraries
-#
-CLIB      = CLIB:o.stubs
-RLIB      = RISCOSLIB:o.risc_oslib
-RSTUBS    = RISCOSLIB:o.rstubs
-ROMSTUBS  = RISCOSLIB:o.romstubs
-ROMCSTUBS = RISCOSLIB:o.romcstubs
-ABSSYM    = RISC_OSLib:o.AbsSym
+clean::
+	${XWIPE} !SaverAni ${WFLAGS}
 
-#
-# Include files
-#
-INCLUDES = -IC:
-
-LIBS     =
-
-DFLAGS   =
-
-#
-# Program specific options:
-#
-COMPONENT = ScrSaver
-TARGET    = aof.${COMPONENT}
-APPTARGET = abs.!RunImage
-RAMTARGET = rm.${COMPONENT}
-OBJS      = o.header o.module
-APPOBJS   = o.app
-EXPORTS   = 
-
-#
-# Rule patterns
-#
-.c.o:;      ${CC} ${CFLAGS} -o $@ $<
-.cmhg.o:;   ${CMHG} -o $@ $<
-.s.o:;      ${AS} ${AFLAGS} $< $@
-
-#
-# build a relocatable module:
-#
-all: ${RAMTARGET} ${APPTARGET}
-
-#
-# RISC OS ROM build rules:
-#
-rom: ${TARGET}
-	@echo ${COMPONENT}: rom module built
-
-export: ${EXPORTS}
-	@echo ${COMPONENT}: export complete
-
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom module installed
-
-clean:
-	${WIPE} o.* ${WFLAGS}
-	${WIPE} linked ${WFLAGS}
-	${WIPE} map ${WFLAGS}
-	${RM} ${TARGET}
-	${RM} ${RAMTARGET}
-	${RM} ${APPTARGET}
-	@echo ${COMPONENT}: cleaned
-
-#resources: ${APPTARGET}
-#        ${MKDIR} ${RESDIR}.ScrSaver
-#        ${CP} ${APPTARGET}                     ${RESDIR}.ScrSaver.!RunImage  ${CPFLAGS}
-#        ${CP} Resources.${LOCALE}.!Run         ${RESDIR}.ScrSaver.!Run       ${CPFLAGS}
-#        ${CP} Resources.${LOCALE}.Templates    ${RESDIR}.ScrSaver.Templates  ${CPFLAGS}
-#        ${SHRINK} Resources.${LOCALE}.Sprites  ${RESDIR}.ScrSaver.Sprites
-#        @echo ${COMPONENT}: resource files copied
-
-#
-# ROM target (re-linked at ROM Image build time)
-#
-${TARGET}: ${OBJS} ${ROMCSTUBS}
-	${LD} -o $@ -aof ${OBJS} ${LIBS} ${ROMCSTUBS}
-
-${APPTARGET}: ${APPOBJS}
-	${MKDIR} abs
-	${LD} -aif -o $@ ${APPOBJS} ${CLIB} ${RLIB}
-
-#
-# Final link for the ROM Image (using given base address)
-#
-rom_link:
-	${MKDIR} linked
-	${MKDIR} map
-	${LD} -o linked.${COMPONENT} -map -rmf -base ${ADDRESS} ${TARGET} ${ABSSYM} > map.${COMPONENT}
-	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom_link complete
-
-${RAMTARGET}: ${OBJS} ${CLIB}
-	${LD} -o $@ -module ${OBJS} ${LIBS} ${CLIB}
-
-${EXP_HDR}.${COMPONENT}: hdr.${COMPONENT}
-#       ${CP} hdr.${COMPONENT} $@ ${CPFLAGS}
+app:
+	${MKDIR} o
+	${MKDIR} !SaverAni
+	${CC} -c -IRISC_OSLib: app.c
+	${LD} -o !SaverAni.!RunImage -aif app.o ${RLIB} ${CLIB}
+	${CP} LocalRes:!Run !SaverAni.!Run ${CPFLAGS}
+	${CP} LocalRes:Templates !SaverAni.Templates ${CPFLAGS}
 
 # Dynamic dependencies:
