@@ -128,8 +128,9 @@ ${MSGS}: LocalRes:Messages VersionNum
 ${RDIR}.!RunImage: crunched.!RunImage
 	${SQUISH} ${SQFLAGS} -from crunched.!RunImage -to $@
 
-crunched.!RunImage: bas.!RunImage
-	crunch.!RunImage; BASIC
+crunched.!RunImage: bas.Main bas.Dialogues bas.Utils bas.Clock bas.Alarms
+	FAppend crunched.All bas.Main bas.Dialogues bas.Utils bas.Clock bas.Alarms
+	${RUN}crunch.!RunImage; BASIC
 
 ${RDIR}.Code: s.Browser
 	${MKDIR} o
