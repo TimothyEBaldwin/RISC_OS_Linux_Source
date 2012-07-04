@@ -1,4 +1,4 @@
-# Copyright 1996 Acorn Computers Ltd
+# Copyright 2012 Castle Technology Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for IRQUtils2
-#
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 25-May-94  AMcC         Created.
+# Makefile for VIDC20Video
 #
 
-COMPONENT = IRQUtils2
+COMPONENT = VIDC20Video
 RESOURCES = no
 
 include StdTools
