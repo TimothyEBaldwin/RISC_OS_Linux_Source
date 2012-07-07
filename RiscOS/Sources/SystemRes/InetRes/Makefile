@@ -62,33 +62,33 @@ COMMONFILES=\
 STBFILES=${SDIR}.pong.Pong
 
 DISCFILES= ${RDIR}.!Boot\
- ${LDIR}.!Help\
- ${RDIR}.!Run\
- ${RDIR}.!Sprites\
- ${RDIR}.!Sprites22\
- ${SDIR}.gethost.GetHost\
- ${SDIR}.ifrconfig.IfRConfig\
- ${SDIR}.map-mbone.Map-MBone\
- ${SDIR}.mrinfo.MRInfo\
- ${SDIR}.mtrace.MTrace\
- ${SDIR}.pong.Pong\
- ${SDIR}.utils.utl.RMFind\
- ${RDIR}.files.AUNMap\
- ${RDIR}.files.Hosts\
- ${RDIR}.files.MimeMap\
- ${RDIR}.files.Networks\
- ${RDIR}.files.Protocols\
- ${RDIR}.files.Services\
- ${RDIR}.utils.BootNet\
- ${SDIR}.utils.utl.CheckMem\
- ${SDIR}.newfiler.NewFiler\
- ${SDIR}.utils.utl.ReadCMOSIP\
- ${SDIR}.utils.utl.TriggerCBs
+        ${LDIR}.!Help\
+        ${RDIR}.!Run\
+        ${RDIR}.!Sprites\
+        ${RDIR}.!Sprites22\
+        ${SDIR}.gethost.GetHost\
+        ${SDIR}.ifrconfig.IfRConfig\
+        ${SDIR}.map-mbone.Map-MBone\
+        ${SDIR}.mrinfo.MRInfo\
+        ${SDIR}.mtrace.MTrace\
+        ${SDIR}.pong.Pong\
+        ${SDIR}.utils.utl.RMFind\
+        ${RDIR}.files.AUNMap\
+        ${RDIR}.files.Hosts\
+        ${RDIR}.files.MimeMap\
+        ${RDIR}.files.Networks\
+        ${RDIR}.files.Protocols\
+        ${RDIR}.files.Services\
+        ${RDIR}.utils.BootNet\
+        ${SDIR}.utils.utl.CheckMem\
+        ${SDIR}.newfiler.NewFiler\
+        ${SDIR}.utils.utl.ReadCMOSIP\
+        ${SDIR}.utils.utl.TriggerCBs
 
 FILES=\
-  ${COMMONFILES} \
-  ${DISCFILES} \
-  ${STBFILE}
+        ${COMMONFILES} \
+        ${DISCFILES} \
+        ${STBFILE}
 
 BAREMINUTILS = \
         ${SDIR}.ifconfig.IfConfig    \
@@ -103,7 +103,6 @@ EMERGENCYUTILS = \
         ${SDIR}.utils.utl.CheckMem   \
         ${SDIR}.newfiler.NewFiler    \
         ${SDIR}.sysctl.SysCtl        \
-        ${RDIR}.!Boot                \
         ${RDIR}.!Run                 \
   
 NETUTILS = \
@@ -254,8 +253,6 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${CP} ${RDIR}.files.Networks        ${RESD}.files.Networks   ${CPFLAGS}
         ${CP} ${RDIR}.files.Protocols       ${RESD}.files.Protocols  ${CPFLAGS}
         ${CP} ${RDIR}.files.Services        ${RESD}.files.Services   ${CPFLAGS}
-        ${AWK} -f awk.Version ${RDIR}.!Boot > ${RESD}.!Boot
-        SetType ${RESD}.!Boot Obey
         ${AWK} -f awk.Version ${RDIR}.!Run > ${RESD}.!Run
         SetType ${RESD}.!Run Obey
 
