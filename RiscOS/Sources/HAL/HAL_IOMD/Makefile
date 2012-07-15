@@ -15,24 +15,23 @@
 # Makefile for IOMD HAL
 #
 
-COMPONENT = IOMD HAL
-TARGET = IOMD
-OBJS = Top Boot ATA IIC Interrupts MachineID NVRAM Timers Video cbits KbdScan Debug
-
-HDRS =
-CMHGFILE =
-CUSTOMRES = custom
-CUSTOMROM = custom
+COMPONENT  = IOMD HAL
+TARGET     = IOMD
+OBJS       = Top Boot ATA IIC Interrupts MachineID NVRAM \
+             Timers Video cbits KbdScan Debug Post
+HDRS       =
+CMHGFILE   =
+CUSTOMRES  = custom
+CUSTOMROM  = custom
 ROM_TARGET = custom
 LNK_TARGET = custom
-AIFDBG    = aif._IOMD
-GPADBG    = gpa.GPA
+AIFDBG     = aif._IOMD
+GPADBG     = gpa.GPA
 
-include StdTools
 include CModule
 
-CCFLAGS += -ff -APCS 3/32bit/nofp/noswst
-ASFLAGS += -APCS 3/nofp/noswst
+CCFLAGS   += -ff -APCS 3/32bit/nofp/noswst
+ASFLAGS   += -APCS 3/nofp/noswst
 AASMFLAGS += -APCS 3/nofp/noswst
 
 resources:
