@@ -23,6 +23,7 @@ ASMHDRS       = ScrModes
 CFLAGS       += -ff -zM
 CDFLAGS       = -DDODEBUG=1
 CMHGDEPENDS   = ScrModes
+RESFSDIR      = ${RESDIR}.ScreenMode
 
 include CModule
 
