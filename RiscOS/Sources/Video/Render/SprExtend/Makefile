@@ -39,7 +39,7 @@ EXP_HDR = <export$dir>
 # To switch between making debugging and non-debugging versions of SprExtend:
 #   change the #define of DEBUG at the top of c.PutScaled
 #   change the SETL of 'debug' in sources.SprExtend.
-CDEFINES = -DRISCOS -DASMHUFF
+CDEFINES = -DRISCOS -DASMHUFF -DASMIDCT -DASMCOLOR
 CINCLUDES = -IC:
 
 #

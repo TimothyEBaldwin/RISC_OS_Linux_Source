@@ -19,8 +19,6 @@ OBJS     = ${COMPONENT}
 CDEFINES = -DRISCOS -DASMHUFF
 
 include HostTools
-#include StdRules
-include AppLibs
 include CApp
 
 # Dynamic dependencies:
