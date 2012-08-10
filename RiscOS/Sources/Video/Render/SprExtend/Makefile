@@ -56,11 +56,12 @@ CLIB = CLIB:o.stubs
 # Program specific options:
 #
 COMPONENT = SpriteExtend
-TARGET    = SprExtend
-ROM_SOURCE= sources.${TARGET}
+TARGET   ?= SprExtend
+OBJS      = sources.${TARGET}
 ROM_TARGET= rm.${TARGET}
-LOCALMSG  = rm.${TARGET}M
-EXPORTS   = ${EXP_HDR}.SprExtend
+RAM_TARGET= rm.SprExtendSA
+ROM_OBJECT= ${TARGET}.o
+RAM_OBJECT= ${TARGET}SA.o
 
 SFILES =\
  jhdr.s\
@@ -76,50 +77,46 @@ GENYUVTABS = utils.genyuvtabs
 CFSI-JPEG  = data.CFSIjpeg
 
 #
-# Rule patterns
+# Targets:
 #
-.SUFFIXES: .o .oh .c .sources
+install: install_${TARGET}; @
 
-.c.o:;       ${CC} -c ${CFLAGS} ${TFLAGS} -o $@ $<
-.c.oh:;      ${CC} -c ${CFLAGS} -o $@ $<
-.sources.o:; ${AS} ${ASFLAGS} -from $< -to $@
-
-#
-# Rules:
-#
-all: ${CFSI-JPEG} ${LOCALMSG}
-        @echo ${COMPONENT}: all built
-
-install: ${CFSI-JPEG}
+install_CFSIjpeg: ${CFSI-JPEG}
         ${MKDIR} ${INSTDIR}
         ${CP} ${CFSI-JPEG} ${INSTDIR}.CFSIjpeg ${CPFLAGS}
         Access ${INSTDIR}.CFSIjpeg lr/r
         @echo ${COMPONENT}: CFSIjpeg file installed
 
-cfsi-jpeg: ${CFSI-JPEG}
-        @echo ${COMPONENT}: CFSIjpeg file generated
-
-#
-# Generic rules:
-#
-rom: ${ROM_TARGET}
-        @echo ${COMPONENT}: rom module built
-
-export: ${EXPORTS}
-        @echo ${COMPONENT}: export complete
+install_SprExtend: ${RAM_TARGET}
+        ${MKDIR} ${INSTDIR}
+        ${CP} ${RAM_TARGET} ${INSTDIR}.SprExtend ${CPFLAGS}
+        @echo ${COMPONENT}: ram module installed
 
 install_rom: ${ROM_TARGET}
         ${MKDIR} ${INSTDIR}
         ${CP} ${ROM_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
         @echo ${COMPONENT}: rom module installed
 
+cfsi-jpeg: ${CFSI-JPEG}
+        @echo ${COMPONENT}: CFSIjpeg file generated
+
+rom: ${ROM_TARGET}
+        @echo ${COMPONENT}: rom module built
+
+standalone: ${RAM_TARGET}
+        @echo ${COMPONENT}: ram module built
+
+export: hdr.SprExtend
+        ${CP} hdr.SprExtend ${EXP_HDR}.SprExtend ${CPFLAGS}
+        @echo ${COMPONENT}: export complete
+
 clean:
         ${RM} ${ROM_TARGET}
-        ${RM} ${LOCALMSG}
+        ${RM} ${RAM_TARGET}
+        ${RM} ${CFSI-JPEG}
         ${RM} ${GENPALETTE}
         ${RM} ${GENYUVTABS}
         ${RM} ${GENJHDR}
-        ${RM} ${CFSI-JPEG}
         ${XWIPE} o.* ${WFLAGS}
         ${XWIPE} oh.* ${WFLAGS}
         ${XWIPE} s.* ${WFLAGS}
@@ -131,25 +128,6 @@ resources:
         ${CP} LocalRes:Messages  ${RESDIR}.${TARGET}.Messages  ${CPFLAGS}
         @echo ${COMPONENT}: resource files copied
 
-
-ROM_OBJECT  = ${TARGET}.o
-${ROM_OBJECT}: ${ROM_SOURCE} ${SFILES} putscaled.o
-        do mkdir -p o
-        ${AS} ${ASFLAGS} -o $@ ${ROM_SOURCE}
-${ROM_TARGET}: ${ROM_OBJECT}
-        ${LD} -o $@ -rmf ${ROM_OBJECT} putscaled.o
-
-# Get the Messages from somewhere other than Resources:$.Resources.SprExtend
-LCL_OBJECT = ${TARGET}M.o
-${LOCALMSG}: ${LCL_OBJECT}
-        ${LD} -rmf -o $@ ${LCL_OBJECT} putscaled.o
-${LCL_OBJECT}: ${ROM_SOURCE} ${SFILES} putscaled.o
-        ${AS} ${ASFLAGS} -o $@ ${ROM_SOURCE} -PD "localmessages SETL {TRUE}"
-
-# Export the SWI definitions to Hdr:
-${EXP_HDR}.SprExtend: hdr.SprExtend
-        ${CP} hdr.SprExtend $@ ${CPFLAGS}
-        
 #
 # Generate the SFILES:
 #
@@ -179,12 +157,31 @@ ${CFSI-JPEG}: Sources.CFSI-JPEG jhdr.s stdpalette.s rojpeg.o
         ${LD} -bin -o $@ cfsi-jpeg.o rojpeg.o
 
 #
-# Standalone C code (no library calls) for the assembler to use:
+# Static dependencies:
 #
+${ROM_OBJECT}: ${OBJS} ${SFILES} putscaled.o
+        do mkdir -p o
+        ${AS} ${ASFLAGS} -o $@ ${OBJS}
+
+${ROM_TARGET}: ${ROM_OBJECT}
+        ${LD} -o $@ -rmf ${ROM_OBJECT} putscaled.o
+
+${RAM_OBJECT}: ${OBJS} ${SFILES} resmsg.o putscaled.o
+        do mkdir -p o
+        ${AS} ${ASFLAGS} -PD "standalone SETL {TRUE}" -o $@ ${OBJS}
+
+${RAM_TARGET}: ${RAM_OBJECT}
+        ${LD} -o $@ -rmf ${RAM_OBJECT} resmsg.o putscaled.o
+        ${MODSQZ} $@
+
+resmsg.o: LocalRes:Messages
+        TokenCheck LocalRes:Messages
+        ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
+
 rojpeg.o:
-        ${CC} ${CFLAGS} ${TFLAGS} -ff -zps1 -DEMBED -DSOURCE_IS_rojpeg $*.c
+        ${CC} ${CFLAGS} ${C_NO_STKCHK} -DEMBED -DSOURCE_IS_rojpeg $*.c
 
 putscaled.o:
-        ${CC} ${CFLAGS} ${TFLAGS} -ff -zps1 -DEMBED -DSOURCE_IS_putscaled $*.c
+        ${CC} ${CFLAGS} ${C_NO_STKCHK} -DEMBED -DSOURCE_IS_putscaled $*.c
 
 # Dynamic dependencies:
