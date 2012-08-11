@@ -41,43 +41,19 @@ MSGS       = Resources.GenMessage
 RESDIR = <resource$dir>.Resources.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-SQUEEZE = squeeze
-WIPE    = x wipe
-XWIPE   = x wipe
-AWK     = GNU.gawk
+include StdTools
+include ModuleLibs
 
-AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
-CFLAGS  = ${THROWBACK} -depend !Depend -fah ${INCLUDES} -wp
-CPFLAGS = ~cfr~v
-SQFLAGS = -f
-WFLAGS  = ~c~v
-
-#
-# Libraries
-#
-CLIB      = CLib:o.stubs
-RLIB      = RISC_OSLib:o.risc_oslib
-ROMSTUBS  = RISC_OSLib:o.romstubs
-ABSSYM    = RISC_OSLib:o.abssym
+SQZFLAGS  = -f
+CINCLUDES = -IC:
+ASFLAGS   = ${STDTOOLOPTIONS} -nocache -stamp -quit
+CFLAGS    = ${STDTOOLOPTIONS} ${C_WARNINGS} ${CINCLUDES} -wp
 WRAPPER   = RISC_OSLib:s.ModuleWrap
-
 LIBSD     = ${RLIB} ${CLIB}
 
 #
-# Include files
+# Include files:
 #
-INCLUDES  = -IC:
-
 FILES =\
  ${RDIR}.!Boot\
  ${LDIR}.!Help\
@@ -98,7 +74,6 @@ FILESD =\
  ${LDIR}.Templates\
  abs.!RunImageD
 
-# Include these in the ROM module
 RESFILES =\
  ${RDIR}.Sprites
 
@@ -141,21 +116,28 @@ ASMS =\
 # Rule patterns
 #
 .SUFFIXES: .oz .od .asm
-.c.o:;    ${CC} ${CFLAGS} -c -ff $<
-.c.oz:;   ${CC} ${CFLAGS} -c -ff -zM -zps1 -o $@ $<
+.c.o:;    ${CC} ${CFLAGS} -c ${C_NO_FNAMES} $<
+.c.oz:;   ${CC} ${CFLAGS} -c ${C_NO_FNAMES} ${C_MODULE} ${C_NO_STKCHK} -o $@ $<
 .c.od:;   ${CC} ${CFLAGS} -c -DTRACE=1 -g -o $@ $<
-.asm.o:;  ${AS} ${AFLAGS} $< $@
-.c.s:;    ${CC} ${CFLAGS} -s -ff $<
+.asm.o:;  ${AS} ${ASFLAGS} $< $@
+.c.s:;    ${CC} ${CFLAGS} -s ${C_NO_FNAMES} $<
 
 #
 # Main rules:
 #
 all: ${FILES}
-	@echo ${COMPONENT}: Application built (Disc)
+	@${ECHO} ${COMPONENT}: Application built (Disc)
 
 rom: ${ROM_MODULE}
-	@echo ${COMPONENT}: Module built (ROM)
+	@${ECHO} ${COMPONENT}: Module built (ROM)
 
+ifeq (${TARGET},ThemeDefs)
+install:
+	${MKDIR} ${INSTDIR}.${USERIF}
+	${CP} LocalRes:DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Draw   ${CPFLAGS}
+	${CP} LocalRes:DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Draw22 ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: disc theme resources installed
+else
 install: ${FILES}
 	${MKDIR} ${INSTDIR}
 	$(CP) $(RDIR).!Boot     ${INSTDIR}.!Boot     ${CPFLAGS}
@@ -174,11 +156,12 @@ install: ${FILES}
 	-Access ${INSTDIR}.Messages  lr/r
 	-Access ${INSTDIR}.Sprites   lr/r
 	-Access ${INSTDIR}.Templates lr/r
-	@echo ${COMPONENT}: Application installed (Disc)
+	@${ECHO} ${COMPONENT}: Application installed (Disc)
+endif
 
 install_rom: ${ROM_MODULE}
 	${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: Module installed (ROM)
+	@${ECHO} ${COMPONENT}: Module installed (ROM)
 
 installd: ${FILESD}
 	$(CP) $(RDIR).!Boot     ${INSTDIR}.!Boot     ${CPFLAGS}ln
@@ -197,7 +180,7 @@ installd: ${FILESD}
 	-Access ${INSTDIR}.Messages  lr/r
 	-Access ${INSTDIR}.Sprites   lr/r
 	-Access ${INSTDIR}.Templates lr/r
-	@echo ${COMPONENT}: Application installed (Disc)
+	@${ECHO} ${COMPONENT}: Application installed (Disc)
 
 resources: ${MSGS}
 	${MKDIR} ${RESDIR}
@@ -208,7 +191,7 @@ resources: ${MSGS}
 	|
 	${CP} ${MSGS}           ${RESDIR}.Messages   ${CPFLAGS}
 	${CP} ${LDIR}.Templates ${RESDIR}.Templates ${CPFLAGS}
-	@echo ${COMPONENT}: resource files copied to Messages module
+	@${ECHO} ${COMPONENT}: resource files copied to Messages module
 
 clean:
 	${XWIPE} o.* ${WFLAGS}
@@ -221,19 +204,19 @@ clean:
 	${RM} ${ROM_MODULE}
 	${RM} ${MSGS}
 	${RM} ${MODULE}
-	@echo ${COMPONENT}: cleaned
+	@${ECHO} ${COMPONENT}: cleaned
 
 #
 # Development rules:
 # 
 app: ${FILES}
-	@echo Made application ${APP}
+	@${ECHO} Made application ${APP}
 
 appd: ${DFILES}
-	@echo Made Debug.${APP}
+	@${ECHO} Made Debug.${APP}
 
 mod: ${MODULE}
-	@echo ${COMPONENT}: Module built (RAM)
+	@${ECHO} ${COMPONENT}: Module built (RAM)
 
 asms: ${ASMS}
 
@@ -262,7 +245,7 @@ clean_all:
 #
 abs.!RunImage: ${OBJS} ${RLIB} ${CLIB}
 	${LD} -o $@ ${OBJS} ${RLIB} ${CLIB}
-	${SQUEEZE} ${SQFLAGS} $@
+	${SQZ} ${SQZFLAGS} $@
 
 abs.!RunImageD: ${OBJSD} ${RLIB} ${CLIB}
 	${LD} -debug -o $@ ${OBJSD} ${RLIB} ${CLIB}
@@ -277,10 +260,10 @@ ${ROM_MODULE}: oz.ModuleWrap ${OBJSZ} ${ROMSTUBS}
 rom_link:
 	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM}
 	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom_link complete
+	@${ECHO} ${COMPONENT}: rom_link complete
 
 oz.ModuleWrap: s.ModuleWrap ${MSGS} s.AppName ${RESFILES} s.resfiles
-	${AS} ${AFLAGS} s.ModuleWrap $@
+	${AS} ${ASFLAGS} s.ModuleWrap $@
 
 s.ModuleWrap: ${WRAPPER}
 	${CP} ${WRAPPER} $@ ${CPFLAGS}
