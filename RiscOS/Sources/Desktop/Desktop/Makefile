@@ -14,33 +14,33 @@
 #
 # Makefile for Desktop
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 07-Mar-01  SNB          Recreated
+
+COMPONENT     = Desktop
+RESOURCEEXTRA = resources_banner resources_templates
+
 #
-
-COMPONENT = Desktop
-RESOURCES = manual
-
-resources:
-	${MKDIR} ${RESFSDIR}
-	${CP}  LocalRes:Messages ${RESFSDIR}.Messages        ${CPFLAGS}
-	${CAT} LocalRes:CmdHelp { >> ${RESFSDIR}.Messages }
-	${CP}  LocalRes:Templates ${RESFSDIR}.Templates      ${CPFLAGS}
+# Resource specials
+# In ROM
+#   This component has messages, a template, and squashed sprites
+#   which are copied in the 'resources' phase
+# In RAM
+#   The 'install' rule produces a RAM loading standalone module
+# On disc
+#   If the target is the ThemeDefs application, the 'install' rule is
+#   overridden to just install the various banner themes
+#
+resources_banner: LocalRes:<UserIF>.Sprites
 	${SQUASH} LocalRes:<UserIF>.Sprites ${RESFSDIR}.Sprites
+
+ifeq (${TARGET},ThemeDefs)
+CUSTOMSA = custom
+install: 
+	${MKDIR} ${INSTDIR}.${USERIF}
+	${CP} LocalRes:${USERIF}.Sprites ${INSTDIR}.${USERIF}.Banner ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: disc theme resources installed
+endif
 
 include StdTools
 include AAsmModule
-
-BBETYPE = desktop
-bbe-desktop: bbe-generic-resources-get-alias
-	BBE_Export_File_In_Dir Resources.${LOCALE} CmdHelp
-	BBE_Export_File_In_Dir Resources.${LOCALE} Messages
-	BBE_Export_File_In_Dir Resources.${LOCALE} Templates
-	BBE_Export_Dir Resources.${LOCALE}.${USERIF}
-	BBE_Export_File VersionNum
 
 # Dynamic dependencies:
