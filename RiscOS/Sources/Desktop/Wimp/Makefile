@@ -33,13 +33,24 @@
 # Program specific options:
 #
 COMPONENT = WindowManager
-TARGET    = Wimp
+TARGET   ?= Wimp
 HEADER1   = ${TARGET}
 HEADER2   = WimpSpace
 RESOURCES = manual
 
 SA_FLAGS  =
 ASFLAGS   = -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
+
+ifeq (${TARGET},ThemeDefs)
+CUSTOMSA = custom
+install: 
+	${MKDIR} ${INSTDIR}.${USERIF}
+	IfThere LocalRes:${USERIF}.DiscSprites.Sprites   Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS}
+	IfThere LocalRes:${USERIF}.DiscSprites.Sprites11 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites11 ${INSTDIR}.${USERIF}.Sprites11 ${CPFLAGS}
+	IfThere LocalRes:${USERIF}.DiscSprites.Sprites22 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Sprites22 ${CPFLAGS}
+	IfThere LocalRes:${USERIF}.DiscSprites.Tools     Then ${CP} LocalRes:${USERIF}.DiscSprites.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: disc theme resources installed
+endif
 
 include StdTools
 include AAsmModule
