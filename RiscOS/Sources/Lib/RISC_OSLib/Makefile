@@ -660,7 +660,7 @@ o.swis: s.makehswis h.swisheader s.swioptions
 	${AS} ${AFLAGS} s.makehswis -o $@
 	settype $@ text
 
-s.swioptions:
+s.swioptions: SWIOptions
 	@SWIOptions
 
 #
