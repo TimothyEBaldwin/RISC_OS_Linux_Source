@@ -32,7 +32,7 @@ MODULE     = rm.Edit
 ROM_MODULE = aof.Edit
 RDIR       = Resources
 LDIR       = LocalRes:
-
+MSGVERSION = ${AWK} -f Build:AwkVers
 MSGS       = Resources.GenMessage
 
 #
@@ -41,44 +41,23 @@ MSGS       = Resources.GenMessage
 RESDIR = <resource$dir>.Resources.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-SQUEEZE = squeeze
-WIPE    = x wipe
-XWIPE   = x wipe
+include StdTools
+include ModuleLibs
 
-AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
-CFLAGS  = ${THROWBACK} -c -depend !Depend -fah ${INCLUDES} ${DFLAGS} -wp
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
-
-#
-# Libraries
-#
-ANSILIB   = CLib:o.ansilib
-CLIB      = CLib:o.stubs
-RLIB      = RISC_OSLib:o.risc_oslib
-RSTUBS    = RISC_OSLib:o.rstubs
-ROMSTUBS  = RISC_OSLib:o.romstubs
-ROMCSTUBS = RISC_OSLib:o.romcstubs
-ABSSYM    = RISC_OSLib:o.abssym
+SQZFLAGS  = -f
+CINCLUDES = -IC:
+ASFLAGS   = ${STDTOOLOPTIONS} -nocache -stamp -quit
+CFLAGS    = ${STDTOOLOPTIONS} ${C_WARNINGS} ${CINCLUDES} -wp
 WRAPPER   = RISC_OSLib:s.ModuleWrap
+LIBSD     = ${RLIB} ${CLIB}
 
-INCLUDES   = -IC:
-
-DFLAGS     = 
-
+#
+# Include files:
+#
 FILES =\
  ${RDIR}.!Boot\
  ${RDIR}.!Run\
+ ${RDIR}.!Sprites\
  ${RDIR}.!Sprites22\
  abs.!RunImage\
  ${RDIR}.Export\
@@ -98,10 +77,10 @@ OBJSD = od.edit od.editv od.message od.slist
 # Rule patterns
 #
 .SUFFIXES: .oz .od
-.c.o:;      ${CC} ${CFLAGS} -ff -o $@ $<
-.c.oz:;     ${CC} ${CFLAGS} -ff -zM -zps1 -o $@ $<
-.c.od:;     ${CC} ${CFLAGS} -DTRACE=1 -g -o $@ $<
-.s.o:;    ${AS} ${AFLAGS} $< $@
+.c.o:;    ${CC} ${CFLAGS} -c ${C_NO_FNAMES} $<
+.c.oz:;   ${CC} ${CFLAGS} -c ${C_NO_FNAMES} ${C_MODULE} ${C_NO_STKCHK} -o $@ $<
+.c.od:;   ${CC} ${CFLAGS} -c -DTRACE=1 -g -o $@ $<
+.s.o:;    ${AS} ${ASFLAGS} $< $@
 
 #
 # Main rules:
@@ -117,6 +96,7 @@ install: ${FILES}
 	${CP} ${RDIR}.!Boot        ${INSTDIR}.!Boot      ${CPFLAGS}
 	${CP} ${LDIR}!Help         ${INSTDIR}.!Help      ${CPFLAGS}
 	${CP} ${RDIR}.!Run         ${INSTDIR}.!Run       ${CPFLAGS}
+	${CP} ${RDIR}.!Sprites     ${INSTDIR}.!Sprites   ${CPFLAGS}
 	${CP} ${RDIR}.!Sprites22   ${INSTDIR}.!Sprites22 ${CPFLAGS}
 	${CP} abs.!RunImage        ${INSTDIR}.!RunImage  ${CPFLAGS}
 	${CP} ${RDIR}.Export       ${INSTDIR}.Export     ${CPFLAGS}
@@ -125,6 +105,7 @@ install: ${FILES}
 	Access ${INSTDIR}.!Boot      lr/r
 	Access ${INSTDIR}.!Help      lr/r
 	Access ${INSTDIR}.!Run       lr/r
+	Access ${INSTDIR}.!Sprites   lr/r
 	Access ${INSTDIR}.!Sprites22 lr/r
 	Access ${INSTDIR}.!RunImage  lr/r
 	Access ${INSTDIR}.Export     lr/r
@@ -139,10 +120,9 @@ install_rom: ${ROM_MODULE}
 resources: ${MSGS}
 	${MKDIR} ${RESDIR}
 	${MKDIR} ${RESAPP}
-	${CP} ${RDIR}.!Boot      ${RESAPP}.!Boot      ${CPFLAGS}
+	${CP} ${RDIR}.ROM.!Boot  ${RESAPP}.!Boot      ${CPFLAGS}
 	${CP} ${LDIR}!Help       ${RESAPP}.!Help      ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Run   ${RESAPP}.!Run       ${CPFLAGS}
-	${CP} ${RDIR}.!Sprites22 ${RESAPP}.!Sprites22 ${CPFLAGS}
 	${CP} ${MSGS}            ${RESDIR}.Messages   ${CPFLAGS}
 	${CP} ${LDIR}Templates   ${RESDIR}.Templates  ${CPFLAGS}
 	@echo ${COMPONENT}: resource files copied to Messages module
@@ -170,6 +150,7 @@ mod: ${MODULE}
 #
 abs.!RunImage: ${OBJS} ${RLIB} ${CLIB}
 	${LD} -o $@ ${OBJS} ${RLIB} ${CLIB}
+	${SQZ} ${SQZFLAGS} $@
 
 ${MODULE}: oz.ModuleWrap ${OBJSZ} ${RLIB} ${CLIB}
 	${LD} -o $@ -module oz.ModuleWrap ${OBJSZ} ${RLIB} ${CLIB}
@@ -184,13 +165,13 @@ rom_link:
 	@echo ${COMPONENT}: rom_link complete
 
 oz.ModuleWrap: s.ModuleWrap s.AppName ${MSGS} ${RESFILES}
-	${AS} ${AFLAGS} s.ModuleWrap $@
+	${AS} ${ASFLAGS} s.ModuleWrap $@
 
 s.ModuleWrap: ${WRAPPER}
 	${CP} ${WRAPPER} $@ ${CPFLAGS}
 
-${MSGS}: ${LDIR}Messages awk.Version
-	gnu.gawk -f awk.Version ${LDIR}Messages > $@
+${MSGS}: ${LDIR}Messages VersionNum
+	${MSGVERSION} ${LDIR}Messages > $@
 
 BBETYPE = edit
 bbe-edit: bbe-generic
