@@ -169,7 +169,7 @@ o.socket_swi: InetHdr.h
 
 
 # final link for ROM Image (using given base address)
-rom_link:
+rom_link: ${ROM_MODULE}
         ${MKDIR} linked
         ${MKDIR} map
         ${LD} -o linked.${COMPONENT} ${LDFLAGS} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM} \
