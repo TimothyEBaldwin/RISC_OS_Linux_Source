@@ -188,6 +188,7 @@ install_: ${DISCFILES} dirs
         ${CP} ${SDIR}.utils.utl.TriggerCBs  ${INSTAPP}.utils.TriggerCBs ${CPFLAGS}
 
 dirs:
+	${WIPE} ${INSTAPP} ${WFLAGS}
         ${MKDIR} ${INSTAPP}
         ${MKDIR} ${INSTAPP}.bin
 
