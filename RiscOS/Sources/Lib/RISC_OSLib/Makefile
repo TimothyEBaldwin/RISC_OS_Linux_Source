@@ -581,6 +581,7 @@ rom_link_CLib: ${CLIB_ROM_OBJS} rom_link_Entries
 
 rom_link: rom_link_${TARGET}
 	${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
+	${CP} syms.${TARGET} ${LINKDIR}.${TARGET}_sym ${CPFLAGS}
 	|
 	${CP} syms.Entries ${ABSSYM} ${CPFLAGS}
 	${CP} syms.C_Entries ${C_ABSSYM} ${CPFLAGS}
