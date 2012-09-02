@@ -138,6 +138,10 @@ install: install_${OPTIONS} install_common dirs
         @echo ${COMPONENT}: All installed (Disc)
 
 install_common: ${COMMONFILES}
+        ${RM} ${INSTAPP}.!Help
+        ${RM} ${INSTAPP}.!Run
+        ${RM} ${INSTAPP}.!Boot
+        ${RM} ${INSTAPP}.files.AUNMap
         ${CP} ${SDIR}.arp.ARP               ${INSTAPP}.bin.ARP          ${CPFLAGS}
         ${CP} ${SDIR}.ifconfig.IfConfig     ${INSTAPP}.bin.IfConfig     ${CPFLAGS}
         ${CP} ${SDIR}.inetstat.InetStat     ${INSTAPP}.bin.InetStat     ${CPFLAGS}
@@ -188,7 +192,6 @@ install_: ${DISCFILES} dirs
         ${CP} ${SDIR}.utils.utl.TriggerCBs  ${INSTAPP}.utils.TriggerCBs ${CPFLAGS}
 
 dirs:
-	${WIPE} ${INSTAPP} ${WFLAGS}
         ${MKDIR} ${INSTAPP}
         ${MKDIR} ${INSTAPP}.bin
 
