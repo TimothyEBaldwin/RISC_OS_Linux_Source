@@ -17,10 +17,10 @@
 
 COMPONENT    = BootCmds
 CMHGFILE     = header
-CINCLUDES   += -IOS:
+CINCLUDES   += -IOS:,<Lib$Dir>.ConfigLib.
 CDEFINES    += -DTRACE=0
-OBJS         = main riscos
-LIBS        += ${OSLIB}
+OBJS         = main
+LIBS        += ${OSLIB} ${CONLIB}
 HDRS         =
 RES_OBJ      =
 CUSTOMRES    = custom
