@@ -28,6 +28,11 @@
 EXP_HDR = <export$dir>
 C_EXP_HDR = <cexport$dir>.Global.h
 
+# Override this to "TRUE" in the components file if
+# you want an odd-numbered (development) build to be
+# a 'freezable' build - e.g. with no ROM debug output
+FREEZE_DEV_REL ?= FALSE
+
 #
 # Generic options:
 #
@@ -41,7 +46,7 @@ XWIPE   = x wipe
 PERL    = do <Perl$Dir>.perl
 CCFLAGS = -c -depend !Depend -IC:
 ASFLAGS = -depend !Depend ${THROWBACK} -Stamp -quit -To $@ -From
-ARMASMFLAGS = -depend !Depend -g ${THROWBACK}
+ARMASMFLAGS = -depend !Depend -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}" -g ${THROWBACK}
 CPFLAGS = ~cfr~v
 WFLAGS  = ~cfr~v
 
