@@ -42,7 +42,10 @@ SA_FLAGS  =
 ASFLAGS   = -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
 
 ifeq (${TARGET},ThemeDefs)
-CUSTOMSA = custom
+
+CUSTOMSA  = custom
+CUSTOMEXP = custom
+
 install: 
 	${MKDIR} ${INSTDIR}.${USERIF}
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites   Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS}
@@ -50,6 +53,10 @@ install:
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites22 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Sprites22 ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Tools     Then ${CP} LocalRes:${USERIF}.DiscSprites.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: disc theme resources installed
+
+export:
+	@${ECHO} ${COMPONENT}: nothing to export when target is ${TARGET}
+
 endif
 
 include StdTools
