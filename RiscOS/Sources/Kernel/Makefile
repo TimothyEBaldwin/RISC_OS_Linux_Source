@@ -101,7 +101,6 @@ install_rom: ${TARGET}
 
 clean:
 	${RM} s.TMOSHelp
-	${RM} s.Time+Date
 	${XWIPE} o.* ${WFLAGS}
 	${RM} ${TARGET}
 	${XWIPE} aif ${WFLAGS}
@@ -143,10 +142,6 @@ ${GPADBG}: ${AIFDBG}
 s.TMOSHelp: ${TOKENS} HelpStrs
 	${TOKENISE} ${TOKENS} HelpStrs $@
 
-#s.Time+Date:
-#        @echo |IGBLS Builddate|JBuilddate SETS "<Sys$Date> <Sys$Year>.<Sys$Time>" |J|IEND { > s.Time+Date }
-#        settype s.Time+Date FFF
-	
 o.GetAll: s.TMOSHelp
 
 #
