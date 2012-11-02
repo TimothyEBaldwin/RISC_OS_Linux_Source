@@ -10,7 +10,7 @@ know what you are doing and have a good backup strategy in place! It is
 likely to be incomplete and only partially functional.
 
 Some components in this archive are released under the licence (included in
-this archive as Licence_v1.pdf), or see:
+this archive as Licence_v1_1.pdf), or see:
 
   http://www.castle-technology.co.uk/riscosbaselicence.htm
 
