@@ -83,21 +83,25 @@ EXPORTS   = ${EXP_HDR}.DOSFS
 
 OBJS_COMMON =\
  o.DOSFS\
- o.DOSFSops\
  o.DOSFSctl\
+ o.DOSclusters\
+ o.DOSdirs\
  o.DOSnaming\
- o.FSerrors\
- o.TIMEconv\
- o.wcompare\
- o.debug\
+ o.Helpers\
  o.MsgTrans\
+ o.OpsArgs\
+ o.OpsFind\
+ o.OpsFunc\
+ o.OpsFile\
+ o.OpsGetPut\
  o.Statics\
+ o.TIMEconv\
+ o.debug\
  o.StaticDefs\
 
 OBJS_RAM =\
  ${OBJS_COMMON}\
  o.DOSFShdrRAM
-
 
 OBJS_ROM =\
  ${OBJS_COMMON}\
@@ -142,6 +146,7 @@ clean:
 	${WIPE} o.* ${WFLAGS}
 	${WIPE} rm.* ${WFLAGS}
 	${WIPE} linked.* ${WFLAGS}
+	${RM} symbols
 	${RM} ${TARGET}
 	${RM} h.DOSFShdr
 	@echo ${COMPONENT}: cleaned
@@ -156,7 +161,7 @@ resources:
 # ROM target (re-linked at ROM Image build time)
 #
 ${TARGET}: ${OBJS_ROM} ${ROMCSTUBS}
-	${LD} -o $@ -aof ${OBJS_ROM} ${ROMCSTUBS}
+	${LD} -o $@ -aof ${OBJS_ROM} ${ASMUTILS} ${ROMCSTUBS}
 
 #
 # Final link for the ROM Image (using given base address)
@@ -167,11 +172,11 @@ rom_link:
 	@echo ${COMPONENT}: rom_link complete
 
 rm.DOSFS: ${OBJS_RAM} ${CLIB}
-	${LD} -o $@ -module ${OBJS_RAM} ${CLIB}
+	${LD} -o $@ -module ${OBJS_RAM} ${ASMUTILS} ${CLIB} 
 	@echo ${COMPONENT}: RAM module built
 
 rm.DOSFSd: ${OBJS_RAM} ${CLIB}
-	${LD} -o $@ -module -symbols symbols ${OBJS_RAM} ${DEBUGLIB} ${MODMALLOCLIB} ${WILDLIB} ${DDTLIB} ${DESKLIB} ${NET5LIBS} ${CLIB}
+	${LD} -o $@ -module -symbols symbols ${OBJS_RAM} ${DEBUGLIB} ${MODMALLOCLIB} ${WILDLIB} ${DDTLIB} ${DESKLIB} ${NET5LIBS} ${ASMUTILS} ${CLIB}
 	@echo ${COMPONENT}: RAM debug module built
 
 ${EXP_HDR}.DOSFS: hdr.DOSFS
