@@ -20,7 +20,6 @@ OBJS          = ScrModes
 CMHGFILE      = ScrModesv
 HDRS          =
 ASMHDRS       = ScrModes
-CFLAGS       += ${C_NO_FNAMES} ${C_MODULE}
 CDFLAGS       = -DDODEBUG=1
 CMHGDEPENDS   = ScrModes
 RESFSDIR      = ${RESDIR}.ScreenMode
