@@ -26,10 +26,11 @@ CMHGDEPENDS  = DOSFS MsgTrans
 ASMHDRS      = DOSFS
 HDRS         =
 CINCLUDES    = -IC:
-LIBS        += ${ASMUTILS}
+LIBS         = ${ASMUTILS}
 
 include CModule
 
+DBG_LIBS    += ${NET5LIBS}
 ASFLAGS     += -pd "PCMCIATRUE SETL {${PCMCIA}}"
 CFLAGS      += -DPCMCIA${PCMCIA}
 CDFLAGS     += -DPCMCIA${PCMCIA} -DDEBUGLIB

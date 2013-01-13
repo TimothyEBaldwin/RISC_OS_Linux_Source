@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"
+#include "swis.h"
+#include "Interface/HighFSI.h"
 #include "DebugLib/DebugLib.h"
 
 #include "DOSFS.h"
@@ -331,17 +333,123 @@ int ensure_FATs(DOSdisc *ihand)
  return(0) ;
 }
 
-
-/*-------------------------------------------------------------------------*/
-/* DOS_cluster_RW:
- *  load/save the specified (possibly partial) cluster to/from the given memory address
- *    returns  n : next cluster
- *    returns  0 : no more clusters (cluster 0 never holds data)
- *    returns -1 : failed to load any data
- *  NB. len MUST always be <= the cluster size (in bytes)
+/*!
+ * \param  memaddr Source or destination of the data
+ * \param  bytes Number of bytes
+ * \param  foff File offset
+ * \param  fhand Fileswitch handle
+ * \param  op Reads, writes, or zeroes
+ * \brief  Read or write a group of bytes to a file inside the image filing system
+ * \return 0 for success, -1 for failure
  */
+int DOS_bytes_RW(int op, char *memaddr, word bytes, word foff, FILEhand *fhand)
+{
+  int clustercount = 0;
+  DOSdisc *ihand = fhand->ihand;
+  int clustersize, nextcluster;
+  word size;
+  int zero = 0;
+  int result = 0;
 
-int DOS_cluster_RW(int op,int cluster,int coff,char *memaddr,int len,DOSdisc *ihand)
+  dprintf(("","DOS_bytes_RW: op = %c, memaddr = &%08X, bytes = %d, foff = %d, fhand = &%08X\n", (op == Rdata ? 'R' : 'W'), (int)memaddr, bytes, foff, (int)fhand));
+
+  if (bytes == 0)
+    return 0;
+
+  if (op == Wzero) {
+    zero = 1;
+    op = Wdata;
+  }
+
+  /* Check if the request is outside the file. */
+  if (foff + bytes > fhand->filelen) {
+    if (op == Rdata) {
+      /* If reading then generate an error for an offset outside the file but just
+       * truncate the request if the requested number of bytes is too large.
+       */
+      if (foff > fhand->filelen) {
+        return_error0(int, err_EOF);
+      } else
+        bytes = fhand->filelen - foff;
+    } else {
+      /* If writing then extend the file. */
+      if (DOSFS_ensure(fhand, foff + bytes) < (foff + bytes))
+        return -1;
+    }
+  }
+
+  /* Determine which cluster the operation is to start in (on exit foff will contain
+   * the offset within that cluster).
+   */
+  if ((nextcluster = clusterfromoffset(fhand->startCLUSTER, &foff, ihand)) < 0)
+    return -1;
+
+  /* If the operation is to write zeros then allocate a suitable block of memory and zero it. */
+  clustersize = secsalloc(ihand) * DOSsecsize;
+  if (zero) {
+    size = (bytes < clustersize ? bytes : clustersize);
+    if ((memaddr = (char *)calloc(size, 1)) == NULL)
+      return_errorT(int, err_heapexhausted, tok_heapexhausted, 0, 0);
+  }
+
+  while (bytes > 0) {
+    if (nextcluster >= CLUSTER_end(ihand))
+    {
+      global_error0(err_EOF);
+      result = -1;
+      break;
+    }
+    dprintf(("","DOS_bytes_RW: cluster offset = %d, bytes left = %d\n",foff,bytes));
+
+    /* Terminate loops in bad FAT. */
+    if ( (++clustercount > ihand->disc_FATentries) || (nextcluster < CLUSTER_first(ihand)) )
+    {
+      global_error0(err_clusterchain);
+      result = -1;
+      break;
+    }
+
+    if (bytes > clustersize-foff) {
+      /* Try to read/write as much as possible straight to/from memory using a cluster multiple op. */
+      size = (zero ? clustersize-foff : bytes);
+      dprintf(("","DOS_bytes_RW: trying %d bytes starting at cluster %d\n",size,nextcluster));
+      if ((nextcluster = DOS_multiple_RW(op, nextcluster, foff, memaddr, size, &size, ihand)) < 0)
+      {
+        result = -1;
+        break;
+      }
+    } else {
+      /* Do the last partial cluster. */
+      size = bytes;
+      dprintf(("","DOS_bytes_RW: transferring %d bytes in cluster %d\n",size,nextcluster));
+      if ((nextcluster = DOS_cluster_RW(op, nextcluster, foff, memaddr, size, ihand)) < 0)
+      {
+        result = -1;
+        break;
+      }
+    }
+    foff = 0;         /* if we go round again then must have stopped at cluster boundary */
+
+    if (!zero)
+      memaddr += size;
+    bytes -= size;
+  }
+
+  if (zero) free(memaddr);
+
+  return result;
+}
+
+/*!
+ * \param  memaddr Source or destination of the data
+ * \param  len Number of bytes
+ * \param  coff Cluster offset
+ * \param  cluster Cluster number to start from
+ * \param  op Reads, writes, or zeroes
+ * \brief  Load/save the specified (possibly partial) cluster to/from the given memory address
+ * \return 0 if no more clusters, n next cluster number, or -1 if error
+ */
+int DOS_cluster_RW(int op, int cluster, int coff, char *memaddr, word len, DOSdisc *ihand)
 {
  int           nextcluster = -1 ;
  int           startsector = CLUSTERtoSECTOR(cluster,ihand) ;
@@ -350,26 +458,32 @@ int DOS_cluster_RW(int op,int cluster,int coff,char *memaddr,int len,DOSdisc *ih
  dprintf(("","DOS_cluster_RW: startsector = %x\n",startsector));
  dprintf(("","DOS_cluster_RW: sector = %x\n",startsector+(coff>>log2DOSsecsize)));
 
- if (DOS_image_RW(op,startsector+(coff>>log2DOSsecsize),coff&(DOSsecsize-1),(byte *)memaddr,len,ihand) < 0)
-  return(-1) ;
-
+ /* NB. len MUST always be <= the cluster size (in bytes) */
+ if (DOS_image_RW(op, startsector + (coff>>log2DOSsecsize), coff & (DOSsecsize - 1), (byte *)memaddr, len, ihand) < 0)
+ {
+   return(-1) ;
+ }
  nextcluster = getnextCLUSTER(cluster,ihand) ;
- if ( (nextcluster >= CLUSTER_end(ihand)) || (nextcluster < CLUSTER_first(ihand)) )
-  return(0) ;
-
- return(nextcluster) ;
+ if ((nextcluster >= CLUSTER_end(ihand)) || (nextcluster < CLUSTER_first(ihand)))
+ {
+   return (0) ;
+ }
+ return (nextcluster) ;
 }
 
-/*---------------------------------------------------------------------------*/
-/* DOS_multiple_RW:
- *  load/save as many consecutive CLUSTERs as possible, starting at the specified
- *  cluster, to/from the given memory address.
- *  returns  n : next cluster
- *  returns  0 : no more clusters (cluster 0 never holds data)
- *  returns -1 : failed to load all the data
+/*!
+ * \param  ihand Image handle
+ * \param  memaddr Source or destination of the data
+ * \param  ta Variable to accept number of bytes actually transferred
+ * \param  limit Number of bytes in buffer 'ma'
+ * \param  coff Cluster offset
+ * \param  cluster Cluster number to start from
+ * \param  op Reads, writes, or zeroes
+ * \brief  Load/save as many consecutive CLUSTERs as possible, starting at the specified
+ *         cluster, to/from the given memory address.
+ * \return 0 if no more clusters, n next cluster number, or -1 if error
  */
-
-int DOS_multiple_RW(int op,int cluster,int coff,char *ma,int limit,word *ta,DOSdisc *ihand)
+int DOS_multiple_RW(int op, int cluster, int coff, char *memaddr, word limit, word *ta, DOSdisc *ihand)
 {
  int count = 0;
  int           nextcluster = cluster ;
@@ -408,7 +522,7 @@ int DOS_multiple_RW(int op,int cluster,int coff,char *ma,int limit,word *ta,DOSd
   *ta = limit;
  *ta-=coff;
  dprintf(("","DOS_multiple_RW: ss:%x sec:%x offset:%x\n",startsector+(coff>>log2DOSsecsize),startsector,coff&(DOSsecsize-1)));
- if (DOS_image_RW(op,startsector+(coff>>log2DOSsecsize),coff&(DOSsecsize-1),(byte *)ma,*ta,ihand) < 0)
+ if (DOS_image_RW(op,startsector+(coff>>log2DOSsecsize),coff&(DOSsecsize-1),(byte *)memaddr,*ta,ihand) < 0)
  {
  dprintf(("","DOS_multiple_RW: DOS_image_RW failed \n"));
   return(-1) ;
@@ -417,15 +531,23 @@ int DOS_multiple_RW(int op,int cluster,int coff,char *ma,int limit,word *ta,DOSd
  return(nextcluster) ;
 }
 
-/*---------------------------------------------------------------------------*/
-
-int DOS_object_RW(int op,int startcluster,char *ma,word bytelength,DOSdisc *ihand)
+/*!
+ * \param  ihand Image handle
+ * \param  memaddr Source or destination of the data
+ * \param  bytelength Number of bytes in buffer 'ma'
+ * \param  startcluster Cluster number to start from
+ * \param  op Reads, writes, or zeroes
+ * \brief  Load/save as many consecutive CLUSTERs as possible, starting at the specified
+ *         cluster, to/from the given memory address.
+ * \return 0 if no more clusters, n next cluster number, or -1 if error
+ */
+int DOS_object_RW(int op, int startcluster, char *memaddr, word bytelength, DOSdisc *ihand)
 {
  word allocsize = secsalloc(ihand) * DOSsecsize;
  word tamount ;
  int  nextcluster = startcluster ;
 
- dprintf(("","DOS_object_RW: op = %c, startCLUSTER = &%03X, ma = &%08X, bytelength = &%08X, ihand = &%08X\n",(op == Rdata ? 'R' : 'W'),startcluster,(word)ma,bytelength,(word)ihand));
+ dprintf(("","DOS_object_RW: op = %c, startCLUSTER = &%03X, ma = &%08X, bytelength = &%08X, ihand = &%08X\n",(op == Rdata ? 'R' : 'W'),startcluster,(word)memaddr,bytelength,(word)ihand));
 
  /* load whole clusters directly into memory */
  while ((bytelength != 0) && (nextcluster > 0))
@@ -434,19 +556,19 @@ int DOS_object_RW(int op,int startcluster,char *ma,word bytelength,DOSdisc *ihan
     {
      tamount = bytelength ;
      dprintf(("","DOS_object_RW: Calling Cluster_RW\n"));
-     nextcluster = DOS_cluster_RW(op,nextcluster,0,ma,bytelength,ihand) ;
+     nextcluster = DOS_cluster_RW(op,nextcluster,0,memaddr,bytelength,ihand) ;
     }
    else
    {
     dprintf(("","DOS_object_RW: Calling Multiple_RW\n"));
-    nextcluster = DOS_multiple_RW(op,nextcluster,0,ma,bytelength,&tamount,ihand) ;
+    nextcluster = DOS_multiple_RW(op,nextcluster,0,memaddr,bytelength,&tamount,ihand) ;
    }
    /* cluster op failure */
    if (nextcluster == -1)
     return(-1) ;       /* assumes error message already defined */
 
    bytelength -= tamount ;
-   ma += tamount ;
+   memaddr += tamount ;
   }
    dprintf(("","DOS_object_RW: nextcluster = &%03X, bytelength = &%08X\n",nextcluster,bytelength));
 
@@ -455,6 +577,65 @@ int DOS_object_RW(int op,int startcluster,char *ma,word bytelength,DOSdisc *ihan
    dprintf(("","DOS_object_RW: FAILURE (nextcluster = &%03X, bytelength = &%08X)\n",nextcluster,bytelength));
    return_error0(int,err_clusterchain) ; /* the CLUSTER chain is bad */
   }
+
+ return(0) ;
+}
+
+/*!
+ * \param  ihand Image handle
+ * \param  memaddr Source or destination of the data
+ * \param  nbytes Number of bytes in buffer 'ma'
+ * \param  off Offset from sector start
+ * \param  sec Sector number to start from
+ * \param  op Reads, writes, or zeroes
+ * \brief  Read or write a block from the specified image file
+ * \return -1 if error occurred
+ */
+int DOS_image_RW(int op,word sec,word off,byte *memaddr,word nbytes,DOSdisc *ihand)
+{
+ word              discaddress ;
+ _kernel_swi_regs  reglist ;
+ _kernel_oserror  *rerror ;
+
+ dprintf(("","DOS_image_RW: %c sec: %x ma: &%08X nbytes: &%08X ihand: &%08X\n",((op == Rdata) ? 'R' : 'W'),sec,(int)memaddr,nbytes,(word)ihand));
+
+ /* NOTE: the "disc_winioffset" value SHOULD be 0x00000000 for floppies */
+ discaddress = ((sec - 1) * DOSsecsize) + ihand->disc_winioffset + off ;
+
+ dprintf(("","DOS_image_RW: handle = &%08X, disc address = &%08X\n",ihand->disc_fhand,discaddress));
+
+ /* transfer the bytes */
+ reglist.r[0] = ((op == Rdata) ? OSGBPB_ReadFromGiven : OSGBPB_WriteAtGiven) ;
+ reglist.r[1] = ihand->disc_fhand ; /* FileSwitch handle */
+ reglist.r[2] = (word)memaddr ;
+ reglist.r[3] = nbytes ;
+ reglist.r[4] = discaddress ;
+ reglist.r[5] = NULL ;
+ reglist.r[6] = NULL ;
+
+ if ((rerror = _kernel_swi(OS_GBPB,&reglist,&reglist)) != NULL)
+  {
+   dprintf(("","DOS_image_RW: (&%08X) \"%s\"\n",rerror->errnum,rerror->errmess));
+   return_errorX(int,rerror) ;
+  }
+
+ dprintf(("","DOS_image_RW: transfer complete, &%08X bytes left\n",reglist.r[3]));
+
+ if (reglist.r[3] != 0)
+  {
+   return_error0(int,((op == Rdata) ? err_readfailed : err_writefailed)) ;
+  }
+
+ /* If this call has written data to the image (op == Wdata) and the new image
+  * ID flag is set then we must generate a new disc ID and tell FileSwitch
+  * about it.
+  *     OS_Args
+  *             r0 = 8
+  *             r1 = image file handle
+  *             r2 = new image identity
+  */
+ if ((op == Wdata) && (ihand->disc_flags & disc_UPDATEID))
+  return(update_imageID(ihand)) ;
 
  return(0) ;
 }
@@ -801,103 +982,3 @@ word max_sector(DOS_bootsector *bb)
  return max_sect;
 }
 
-int DOS_bytes_RW(int op, char *memaddr, word bytes, word foff, FILEhand *fhand)
-{
-  int clustercount = 0;
-  DOSdisc *ihand = fhand->ihand;
-  int clustersize, nextcluster;
-  word size;
-  int zero = 0;
-  int result = 0;
-
-  dprintf(("","DOS_bytes_RW: op = %c, memaddr = &%08X, bytes = %d, foff = %d, fhand = &%08X\n", (op == Rdata ? 'R' : 'W'), (int)memaddr, bytes, foff, (int)fhand));
-
-  if (bytes == 0)
-    return 0;
-
-  if (op == Wzero) {
-    zero = 1;
-    op = Wdata;
-  }
-
-  /* Check if the request is outside the file. */
-  if (foff + bytes > fhand->filelen) {
-    if (op == Rdata) {
-      /* If reading then generate an error for an offset outside the file but just
-       * truncate the request if the requested number of bytes is too large.
-       */
-      if (foff > fhand->filelen) {
-        return_error0(int, err_EOF);
-      } else
-        bytes = fhand->filelen - foff;
-    } else {
-      /* If writing then extend the file. */
-      if (DOSFS_ensure(fhand, foff + bytes) < (foff + bytes))
-        return -1;
-    }
-  }
-
-  /* Determine which cluster the operation is to start in (on exit foff will contain
-   * the offset within that cluster).
-   */
-  if ((nextcluster = clusterfromoffset(fhand->startCLUSTER, &foff, ihand)) < 0)
-    return -1;
-
-  /* If the operation is to write zeros then allocate a suitable block of memory and zero it. */
-  clustersize = secsalloc(ihand) * DOSsecsize;
-  if (zero) {
-    char *cp;
-    size = (bytes < clustersize ? bytes : clustersize);
-    if ((cp = memaddr = (char *)malloc(size)) == NULL)
-      return_errorT(int, err_heapexhausted, tok_heapexhausted, 0, 0);
-    while (size--)
-      *(cp++) = '\0';
-  }
-
-  while (bytes > 0) {
-    if (nextcluster >= CLUSTER_end(ihand))
-    {
-      global_error0(err_EOF);
-      result = -1;
-      break;
-    }
-    dprintf(("","DOS_bytes_RW: cluster offset = %d, bytes left = %d\n",foff,bytes));
-
-    /* Terminate loops in bad FAT. */
-    if ( (++clustercount > ihand->disc_FATentries) || (nextcluster < CLUSTER_first(ihand)) )
-    {
-      global_error0(err_clusterchain);
-      result = -1;
-      break;
-    }
-
-    if (bytes > clustersize-foff) {
-      /* Try to read/write as much as possible straight to/from memory using a cluster multiple op. */
-      size = (zero ? clustersize-foff : bytes);
-      dprintf(("","DOS_bytes_RW: trying %d bytes starting at cluster %d\n",size,nextcluster));
-      if ((nextcluster = DOS_multiple_RW(op, nextcluster, foff, memaddr, size, &size, ihand)) < 0)
-      {
-        result = -1;
-        break;
-      }
-    } else {
-      /* Do the last partial cluster. */
-      size = bytes;
-      dprintf(("","DOS_bytes_RW: transferring %d bytes in cluster %d\n",size,nextcluster));
-      if ((nextcluster = DOS_cluster_RW(op, nextcluster, foff, memaddr, size, ihand)) < 0)
-      {
-        result = -1;
-        break;
-      }
-    }
-    foff = 0;         /* if we go round again then must have stopped at cluster boundary */
-
-    if (!zero)
-      memaddr += size;
-    bytes -= size;
-  }
-
-  if (zero) free(memaddr);
-
-  return result;
-}
