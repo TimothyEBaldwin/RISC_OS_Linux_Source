@@ -77,8 +77,8 @@ MkTables.module: MkTables.o.module
 # This is all very nasty
 MkTables.o.module: MkTables.o._dirs
 	set OldMachine <Machine>
-	set Machine All32
-	%objasm -APCS 3/32bit -cpu 3 -Stamp -quit -depend !Depend -ihdr -i<Hdr$Dir>.Global -i<Hdr$Dir>.Interface -i<Hdr$Dir>.Interface2 -pd "APCS SETS \"APCS-32\"" -pd "Machine SETS \"All32\"" -o $@ ${ROM_SOURCE} -PD "standalone SETL {TRUE}"
+	set Machine 32
+	%objasm -APCS 3/32bit -cpu 3 -Stamp -quit -depend !Depend -ihdr -i<Hdr$Dir>.Global -i<Hdr$Dir>.Interface -i<Hdr$Dir>.Interface2 -pd "APCS SETS \"APCS-32\"" -pd "Machine SETS \"32\"" -o $@ ${ROM_SOURCE} -PD "standalone SETL {TRUE}"
 	set Machine <OldMachine>         
 
 Palettes.8desktop: MkTables.maketables MkTables.module
