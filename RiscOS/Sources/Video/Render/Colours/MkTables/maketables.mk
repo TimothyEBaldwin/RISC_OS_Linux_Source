@@ -15,7 +15,6 @@
 # Makefile for maketables
 
 include HostTools
-#include StdRules
 include AppLibs
 include CApp
 
