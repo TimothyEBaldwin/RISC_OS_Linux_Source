@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-CCflags 	= -c -depend !Depend -IOS:,C: -throwback
-Linkflags 	= -aif -c++ -o $@
-ObjAsmflags 	= -throwback -NoCache -depend !Depend
+# Makefile for FSBash
+#
 
-Libraries 	= C:o.Stubs
-ObjectFiles 	= @.o.Args @.o.BGet @.o.BPut @.o.File @.o.Find @.o.FSControl \
-		  @.o.GBPB @.o.logger @.o.mymalloc @.o.Random @.o.Tester
+COMPONENT = FSBash
+OBJS      = Args BGet BPut File Find FSControl GBPB logger mymalloc Random BigFiles Tester
 
-@.FSBash:    	$(ObjectFiles) $(Libraries)
-		Link $(Linkflags) $(ObjectFiles) $(Libraries)
-
-.SUFFIXES:	.c .o
-
-.c.o:;		cc $(CCflags) -o $@ $<
+include CApp
 
 # Dynamic dependencies:

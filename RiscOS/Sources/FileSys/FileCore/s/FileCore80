@@ -23,9 +23,9 @@
 
 ; entry:
 ;  R1   file handle
-;  R2   start RAM address
-;  R3   number of bytes to read
-;  R4   file address
+;  R2   start RAM address (no alignment guarantee)
+;  R3   number of bytes to read (FileSwitch buffer multiple)
+;  R4   file address (FileSwitch buffer multiple)
 
 ; exit:
 ;  R1-R4 ?
@@ -53,29 +53,26 @@ GetBytesEntry ROUT
         BL      HandleCheck     ;(R1->R0,R1,LR,V)
         BVS     %FT00
 
- [ {FALSE}
-        ; If don't want read ahead enable this
+      [ BigFiles
+        ; If transfer ends at exactly 4G, use foreground
+        ; If transfer ends near 4G, use foreground
+        ADDS    R5, R3, R4
+        CMPCC   R5, #-1*K
+        BCS     %FT03
+      ]
 
-        ; Set if FcbDiscImage
-        LDRB    r5, [r1, #FcbFlags]
-        TST     r5, #FcbDiscImage
-
-        ; On non-filecore discs transfer in foreground
-        BNE     GetBytesForeground
- ]
-
+        ; Do in background if got some file buffers
         LDRB    R5, MaxFileBuffers
         TEQS    R5, #0
         BNE     %FT05
-
-; doing in foreground requires no change
-
-GetBytesForeground
-        Push    "R2-R4"
-        Pull    "R3-R5"
+03
+        ; Foreground
+        MOV     R5, R4
+        MOV     R4, R3
+        MOV     R3, R2
         LDR     R2, [R1,#FcbIndDiscAdd]
         MOV     R1, #DiscOp_ReadSecs :OR: DiscOp_Op_IgnoreEscape_Flag
-        BL      GenIndDiscOp   ;(R1-R5->R0-R5,V)
+        BL      GenIndDiscOp    ;(R1-R5->R0-R5,V)
 00
         BLVS    FindErrBlock    ; (R0->R0,V)
         BL      FileCoreExit
@@ -87,11 +84,9 @@ GetBytesForeground
  ]
  [ DebugB :LOR: DebugBE
         DLINE   "<GetBytes"
-        DebugError "Adfs get bytes error"
+        DebugError "GetBytes error"
  ]
         Pull    "R5-R11,SB,PC"
-
-05
 
 ;Stack workspace for read buffers
 
@@ -115,7 +110,7 @@ ReadBuffersWork # 0
 ; R3 LENGTH
 ; R4 FILE PTR
 ; LR PREVIOUS FCB
-
+05
         MOV     R8, LR
  [ DebugJ
         BL      Check
@@ -142,7 +137,7 @@ ReadBuffersWork # 0
 
  [ BigDisc
         LDRB    LR, [R6,#DiscRecord_Heads]
-        MUL     LR, R11,LR              ; bytes per cylinder - need to change to sectors?
+        MUL     LR, R11,LR      ; sectors per cylinder
  |
         MOV     R11,R11,LSL R10
         LDRB    LR, [R6,#DiscRecord_Heads]
@@ -158,12 +153,13 @@ ReadBuffersWork # 0
 
 ;DEAL WITH SEQUENTIAL / NON SEQUENTIAL
         BL      ClaimFileCache
-        LDR     LR, [Fcb,#LastReadEnd]
         LDRB    R1, [Fcb,#FcbFlags]
-        TEQS    R1, R1, LSR #SequentialBitNo+1  ;C<=>sequential
-        TEQS    LR, FileOff     ;does read start = last end ?
-        BEQ     %FT14
-        BCC     %FT16
+        AND     LR, R1, #Sequential
+        CMP     LR, #0                  ;C<=>sequential
+        LDR     LR, [Fcb,#FcbLastReadEnd]
+        TEQS    LR, FileOff             ;does read start = last end ?
+        BEQ     %FT14                   ;yes, so it can be sequential
+        BCC     %FT16                   ;no, and CC, it wasn't sequential previously anyway
 
 ;HERE WHEN CONVERTING A FILE FROM SEQUENTIAL TO NON SEQUENTIAL
  [ DebugG
@@ -203,13 +199,15 @@ ReadBuffersWork # 0
         LDR     BufPtr, [BufPtr,#NextInFile]
         TEQS    BufPtr, Fcb
         BNE     %BT10   ;loop if more buffers for this file
+
         BL      MoreValid
-        LDRB    R8, [Fcb,#ReadAheadBufs]        ;halve read ahead
+        LDRB    R8, [Fcb,#FcbRdAheadBufs]        ;halve read ahead
         MOVS    R8, R8, LSR #1
-        STRNEB  R8, [Fcb,#ReadAheadBufs]
+        STRNEB  R8, [Fcb,#FcbRdAheadBufs]
         B       %FT16
 
 14
+;READ AHEAD (BECOMES) SEQUENTIAL
         ORRCC   R1, R1, #Sequential
         STRCCB  R1, [Fcb,#FcbFlags]
 
@@ -230,13 +228,12 @@ ReadBuffersWork # 0
         LDR     BufPtr,[Fcb,#PrevInFile]
         BL      FindSubBuf      ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
         MOV     FragEnd, TransferEnd
-;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr, LO/EQ/HI
-        BL      ScanBuffers
+        BL      ScanBuffers     ;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr, LO/EQ/HI
         BHS     %FT17
         TEQS    FileOff, FragEnd
         BNE     %FT17
 
-        MOV     FileOff, R6
+        MOV     FileOff, R6     ;Restore FileOff
         MOV     R2, TransferEnd
         LDR     R1, [SP,#ReadRamAdjust]
         BL      BufsToRam       ;R1,R2,BufSz,FileOff,Fcb
@@ -247,13 +244,14 @@ ReadBuffersWork # 0
         MOVNE   R1, #WinnieLock
         BL      BackgroundOps   ;(R0,R1->R3-R11)
         ADD     SP, SP, #ReadBuffersWork
-        B       %BT00
+        B       %BT00           ;Exit (checking V)
 
 17
+; SCHEDULE A NEW READ TRANSFER
  [ DebugB
         CPBs
  ]
-        MOV     FileOff, R6
+        MOV     FileOff, R6     ;Restore FileOff
         BL      ReleaseFileCache
         BL      DiscWriteBehindWait                  ;(R3)
  [ DebugB
@@ -261,7 +259,7 @@ ReadBuffersWork # 0
  ]
         BL      ClaimFileCache
         LDR     BufPtr,[Fcb,#PrevInFile]
-        STR     TransferEnd, [Fcb,#LastReadEnd]
+        STR     TransferEnd, [Fcb,#FcbLastReadEnd]
 
 ;CONSIDER WHETHER CURRENT READ AHEAD IF ANY COULD BE EXTENDED FOR THIS REQUEST
 
@@ -290,8 +288,7 @@ ReadBuffersWork # 0
         MOV     R2, FileOff
         CMPS    TransferEnd, FragEnd
         MOVLO   FragEnd, TransferEnd
-;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr, LO/EQ(/HI)
-        BL      ScanBuffers
+        BL      ScanBuffers     ;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr, LO/EQ(/HI)
         BNE     %FT18           ;(R0-R2->Z)
 
         LDR     R1, [SP,#ReadRamAdjust]
@@ -306,7 +303,7 @@ ReadBuffersWork # 0
         STMIA   SP, {FileOff,TransferEnd}
         MOV     TransferEnd,R2
 18
-        MOV     FileOff,R6
+        MOV     FileOff,R6      ;Restore FileOff
 20
         BL      UpdateProcesses
         BL      BeforeReadFsMap ;(R3->R0,V)
@@ -332,8 +329,7 @@ ReadBuffersWork # 0
         MOVHI   FragEnd, TransferEnd
 25
         Push    "FileOff"
-;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr,LR, LO/EQ/HI
-        BL      ScanBuffers
+        BL      ScanBuffers     ;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr,LR, LO/EQ/HI
         Push    "FileOff,TransferEnd,FragEnd,BufOff,BufPtr"
         MOV     R3, FileOff
         LDR     FileOff,[SP,#5*4]       ;old FileOff
@@ -347,7 +343,7 @@ ReadBuffersWork # 0
         ASSERT  BufOff =R10
         ASSERT  BufPtr =R11
         ADD     R7, SP, #6*4+LastDiscAdjust
-        LDMIA   R7, {R7,R8,R10,R11}
+        LDMIA   R7, {R7,R8,R10,R11}     ; aka {LastDiscAdjust,LastType,LastEnd,LastStart}
  [ DebugG
         DREG    R7,,cc
         DREG    R8,,cc
@@ -366,9 +362,9 @@ ReadBuffersWork # 0
  ]
         STR     DiscAdjust, [SP, #6*4+LastDiscAdjust]
         ADD     LR, SP, #6*4+LastType
-        STMIA   LR, {R2,R3,FileOff}
-        TSTS    R8, #bit31
-        BMI     %FT30           ;no last op
+        STMIA   LR, {R2,R3,FileOff}     ; aka {LastType,LastEnd,LastStart}
+        TSTS    R8, #bit31              ; check last type
+        BMI     %FT30                   ; no last op
         TSTS    R8, #ReadAhead
         BNE     %FT26
 
@@ -380,7 +376,7 @@ ReadBuffersWork # 0
         MOV     R1, #DiscOp_ReadSecs :OR: DiscOp_Op_IgnoreEscape_Flag
  [ BigDisc
         LDR     LR, [Fcb, #FcbIndDiscAdd]
-        MOV     LR, LR, LSR #29
+        MOV     LR, LR, LSR #(32-3)
         DiscRecPtr LR,LR                ; disc record pointer
         LDRB    LR, [LR,#DiscRecord_Log2SectorSize]    ; sector size
         ADD     R2, R7, R11, LSR LR     ; disc address
@@ -419,6 +415,7 @@ ReadBuffersWork # 0
         MOV     FileOff,R11
         MOV     R2, R10
 28
+; GOT SOMETHING, COPY TO USER RAM
         LDR     R1, [SP,#6*4+ReadRamAdjust]
         BL      BufsToRam       ;R1,R2,BufSz,FileOff,Fcb
 
@@ -434,6 +431,9 @@ ReadBuffersWork # 0
         LDMIA   SP, {FileOff,TransferEnd}
         MOV     LR, #bit31
         STR     LR, [SP,#PendingReadEnd]
+      [ BigFiles
+        ! 0, "BigFiles suspect bit31 check"
+      ]
         TEQS    TransferEnd, #bit31
         BNE     %BT22
         LDR     LR, [SP,#LastType]
@@ -457,8 +457,8 @@ ReadBuffersWork # 0
         MOV     TransferEnd, FileOff
 
         Push    "FileOff,BufOff,BufPtr"
-;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
-        BL      SkipEmpty
+        BL      SkipEmpty       ;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
+
         CMPS    FileOff, FragEnd
         MOVLO   FragEnd, FileOff
         LDMIA   SP, {FileOff,BufOff,BufPtr}
@@ -477,22 +477,18 @@ ReadBuffersWork # 0
         ADD     R0, R0, BufSz, LSL #5
         Pull    "FileOff,BufOff,BufPtr"
         CMPS    R0, R3
-        MOVGT   R3, R0
+        MOVHI   R3, R0
 
 ;round lower bound above cylinder boundary below read end, old map winnie
 ;defect skipping may give wrong answer
 
  [ BigDisc
         SUB     R2, FileOff, #1
- [ {TRUE}
+
         LDR     LR, [Fcb, #FcbIndDiscAdd]
-        MOV     LR, LR, LSR #29
+        MOV     LR, LR, LSR #(32-3)     ; reassess disc (DiscAdjust may contain incorrect number)
         DiscRecPtr LR,LR
- |
-        MOV     LR, DiscAdjust, LSR #29 ; this is broken because can contain
-                                        ; incorrect disc number
-        DiscRecPtr LR, LR
- ]
+
         LDRB    LR, [LR, #DiscRecord_Log2SectorSize]
 
         MOV     R2, R2, LSR LR
@@ -537,7 +533,7 @@ ReadBuffersWork # 0
         TSTS    R2, #Sequential
 
         MOVNE   R0, #AwaitsSeqChain*2-1
-        LDRNEB  LR, [Fcb,#ReadAheadBufs]
+        LDRNEB  LR, [Fcb,#FcbRdAheadBufs]
         ADDNE   R1, R1, LR, LSL #10
  [ DebugG
         BEQ     %FT01
@@ -569,15 +565,10 @@ ReadBuffersWork # 0
         BL      ExtendDown              ;(R0,R1,R3,FileOff->R1,FileOff)
 35
  [ BigDisc
- [ {TRUE}
         LDR     LR, [Fcb, #FcbIndDiscAdd]
-        MOV     LR, LR, LSR #29
+        MOV     LR, LR, LSR #(32-3)     ; reassess disc (DiscAdjust may contain incorrect number)
         DiscRecPtr LR,LR
- |
-        MOV     LR, DiscAdjust, LSR #29 ; this is broken because disc
-                                        ; bits can become invalid
-        DiscRecPtr LR, LR
- ]
+
         LDRB    LR, [LR, #DiscRecord_Log2SectorSize]
 
         ADD     R0, DiscAdjust, TransferEnd, LSR LR
@@ -631,8 +622,7 @@ ReadBuffersWork # 0
         MOV     R3, #DiscOp_ReadSecs
         LDR     R6, [SP, #LastEnd]
         SUB     R6, R6, FileOff
-        BL      BackgroundFileCacheOp1
-;R0-R3,FileOff,R6,TransferEnd,FragEnd,Fcb,BufPtr -> R1,R3,R10,V
+        BL      BackgroundFileCacheOp1  ;R0-R3,FileOff,R6,TransferEnd,FragEnd,Fcb,BufPtr -> R1,R3,R10,V
         BL      UpdateProcesses
         MOVVS   R0, R3
         BVS     %FT68
@@ -651,15 +641,14 @@ ReadBuffersWork # 0
         BLHI    BufsToRam               ;(R1,R2,BufSz,FileOff,Fcb)
         B       %FT68
 
-36      ;MANAGED TO SATISY READ ONLY FROM BUFFERS AND/OR EXTENDING READ AHEAD
+36
+;MANAGED TO SATISY READ ONLY FROM BUFFERS AND/OR EXTENDING READ AHEAD
  [ DebugH
         DLINE   "RFC ",cc
  ]
  [ DebugB
         CPBs
  ]
-;MANAGED TO SATISY READ ONLY FROM BUFFERS AND/OR EXTENDING READ AHEAD
-
         LDRB    LR, [Fcb,#FcbFlags]
         ANDS    R0, LR, #Sequential
         BEQ     %FT64
@@ -667,7 +656,7 @@ ReadBuffersWork # 0
         BL      UnlockMap
         BL      ReleaseFileCache
         LDR     R0, [SP,#ReadProcessBlock]
-        BL      ReleaseController
+        BL      ReleaseController       ;(R0)
         LDR     R1, FloppyProcessBlk
         TEQS    R0, R1
         MOVEQ   R1, #FloppyLock
@@ -679,7 +668,7 @@ ReadBuffersWork # 0
         TEQS    LR, #0
         BLNE    UpdateProcesses
         BNE     %BT38
-        BL      ReleaseController
+        BL      ReleaseController       ;(R0)
         LDR     R0, DirectError
         BL      SetVOnR0
         ADD     SP, SP, #ReadBuffersWork
@@ -700,8 +689,7 @@ ReadBuffersWork # 0
         LDR     FileOff, [R0, #ProcessEndOff]
         MOV     R3, FileOff
         BL      FindSubBuf      ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
-;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
-        BL      SkipEmpty
+        BL      SkipEmpty       ;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
         MOV     FragEnd, FileOff
         CMPS    FileOff, R3
         STRLS   R3, [SP,#SeqReadAheadLimit]
@@ -717,7 +705,7 @@ ReadBuffersWork # 0
         TSTS    R1, #&3FC
         BICNE   R1, TransferEnd, #&3FC
         ADDNE   R1, R1, #1*K
-        LDRB    LR, [Fcb,#ReadAheadBufs]
+        LDRB    LR, [Fcb,#FcbRdAheadBufs]
         ADD     R1, R1, LR, LSL #10
         CMPS    R1, FragEnd
         MOVHI   R1, FragEnd
@@ -731,15 +719,10 @@ ReadBuffersWork # 0
  ; again, we have to round to a cylinder
 
         STR     R1, [SP,#SeqReadAheadLimit]
- [ {TRUE}
+
         LDR     LR, [Fcb, #FcbIndDiscAdd]
-        MOV     LR, LR, LSR #29
+        MOV     LR, LR, LSR #(32-3)     ; reassess disc (DiscAdjust may contain incorrect number)
         DiscRecPtr LR,LR
- |
-        MOV     LR, DiscAdjust, LSR #29 ; broken - disc bits can be
-                                        ; invalid
-        DiscRecPtr LR, LR
- ]
 
         LDRB    LR, [LR, #DiscRecord_Log2SectorSize]
         SUB     FileOff, FileOff, #1
@@ -783,7 +766,7 @@ ReadBuffersWork # 0
         BL      UpdateProcess   ;(R0)
 ;LOOP
 
-;COPY DATA ANY DATA THAT HAS APPEARED FROM READ AHEAD
+;COPY ANY DATA THAT HAS APPEARED FROM READ AHEAD
  [ DebugB
         CPBs
  ]
@@ -913,251 +896,9 @@ ReadBuffersWork # 0
         LDRVC   R0, DirectError
         BLVC    SetVOnR0
         ADD     SP, SP, #ReadBuffersWork
-        B       %BT00
+        B       %BT00                   ;Exit (checking V)
 
- LTORG
-
-; ++++++++
-; ExtendUp
-; ++++++++
-
-;Entry
-; R0            maximum priority buffer willing to use*2(-1)
-; R1            suggested end
-; TransferEnd   current end
-; FragEnd       maximum end
-
-;Exit
-; R1            corrupt
-; TransferEnd   updated
-
-ExtendUp ROUT
- [ DebugG
-        DREG    R0,,cc
-        DREG    R1,,cc
-        DREG    TransferEnd,,cc
-        DREG    FragEnd,,cc
-        DLINE   ">ExtendUp"
- ]
-        CMPS    FragEnd, R1
-        MOVLO   R1, FragEnd
-        CMPS    TransferEnd,R1
-        MOVHS   PC, LR
-        Push    "R2,R3,FileOff,R6,LR"
-        MOV     FileOff,TransferEnd
-10
-        BL      FindSubBuf              ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
-        BIC     R6, FileOff, #&3FC      ;REUSING AS TEMP REGISTER
-        CMPS    BufOff, #32
-        LDRLO   R2, [BufPtr,#BufFlags]
-        MOVLO   R3, #-1
-        BLO     %FT30                   ;already have buffer
-        BL      FindFreeBuf             ;(R0,FileOff,Fcb,BufPtr->R2,BufPtr,Z)
-        BEQ     %FT90
-
-        MOV     R3, R2
-        STR     Fcb, [BufPtr,#BufFcb]
-        STR     R6, [BufPtr,#BufFileOff]
-        LDR     R2, =EmptyBuf * &01010101
-30                      ;set ReadAhead flags for appropriate sub buffers
-        CMPS    R6, FileOff
-        CMPHSS  R1, R6
-        BICHI   R2, R2, #AllocFlags
-        ORRHI   R2, R2, #ReadAhead
-        MOV     R2, R2, ROR BufSz
-        ADD     R6, R6, BufSz, LSL #5
-        TSTS    R6, #&300
-        BNE     %BT30
-        BL      UpdateBufState  ;R2,BufSz,BufPtr
-        MOVS    R2, R3          ;did we just claim a buffer ?
-        BLPL    LinkFileChain   ;(R2,BufPtr) must be done last for write behind
-
-        CMPS    R6, R1
-        MOVLO   FileOff, R6
-        BLO     %BT10
-        MOVHS   FileOff, R1
-90
-        MOV     TransferEnd, FileOff
- [ DebugG
-        DREG    R1,,cc
-        DREG    TransferEnd,,cc
-        DLINE   "<ExtendUp"
- ]
-        Pull    "R2,R3,FileOff,R6,PC"
-
-
-; ++++++++++
-; ExtendDown
-; ++++++++++
-;entry
-; R0            maximum priority buffer willing to use*2(-1)
-; R1            suggested start
-; R3            minimum start
-; FileOff       current start
-
-;exit
-; R1            corrupt
-; FileOff       updated
-
-ExtendDown ROUT
- [ DebugG
-        DREG    R0,,cc
-        DREG    R1,,cc
-        DREG    R3,,cc
-        DREG    FileOff,,cc
-        DLINE   ">ExtendDown"
- ]
-        CMPS    R3, R1
-        MOVHI   R1, R3
-        CMPS    FileOff, R1
-        MOVLS   PC, LR
-        Push    "R2,R6,R7,LR"
-10
-        SUB     FileOff, FileOff, BufSz, LSL #5
-        BL      FindSubBuf              ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
-        BIC     R6, FileOff, #&3FC      ;REUSING AS TEMP REGISTER
-        CMPS    BufOff, #32
-        LDRLO   R2, [BufPtr,#BufFlags]
-        MOVLO   R7, #-1
-        BLO     %FT30
-        BL      FindFreeBuf             ;(R0,FileOff,Fcb,BufPtr->R2,BufPtr,Z)
-        ADDEQ   FileOff, FileOff, BufSz, LSL #5
-        Pull    "R2,R6,R7,PC",EQ        ;No buffer available
-
-        MOV     R7, R2
-        STR     Fcb, [BufPtr,#BufFcb]
-        STR     R6, [BufPtr,#BufFileOff]
-        LDR     R2, =EmptyBuf * &01010101
-30                      ;set ReadAhead flags for appropriate sub buffers
-        ADD     FileOff, FileOff, BufSz, LSL #5
-40
-        CMPS    R6, R1
-        CMPHSS  FileOff, R6
-        BICHI   R2, R2, #AllocFlags
-        ORRHI   R2, R2, #ReadAhead
-        MOV     R2, R2, ROR BufSz
-        ADD     R6, R6, BufSz, LSL #5
-        TSTS    R6, #&300
-        BNE     %BT40
-        BL      UpdateBufState  ;R2,BufSz,BufPtr
-        MOVS    R2, R7
-        BLPL    LinkFileChain   ;(R2,BufPtr) must be done last for write behind
-
-        SUB     R6, R6, #1*K
-        CMPS    R1, R6
-        MOVLO   FileOff, R6
-        BLO     %BT10
-        MOVHS   FileOff, R1
- [ DebugG
-        DREG    R1,,cc
-        DREG    FileOff,,cc
-        DLINE   "<ExtendDown"
- ]
-        Pull    "R2,R6,R7,PC"
-
-
-; ============
-; IncReadAhead
-; ============
-
-;entry Fcb
-
-IncReadAhead
- [ DebugG
-        DREG    R9,,cc
-        DLINE   "IncReadAhead"
- ]
-        Push    "R0,LR"
-        LDRB    R0, [Fcb,#ReadAheadBufs]
-        LDRB    LR, MaxFileBuffers
-        CMPS    R0, LR
-        ADDLO   R0, R0, #1
-        STRLOB  R0, [Fcb,#ReadAheadBufs]
-        Pull    "R0,PC"
-
-
-
-; ++++++++++++
-; GetPutCommon
-; ++++++++++++
-
-; entry
-;  R0 1 read, 2 write
-;  R1 file handle
-;  R2 RAM start address
-;  R3 number of bytes to transfer
-;  R4 file offset
-
-; exit R0,V if error
-; NE <=> floppy
-; R0 -> process block for device
-; R2 RAM adjust
-; R3 IndDiscAdd of file
-; BufSz
-; FileOff
-; R6 disc rec
-; TransferEnd
-; Fcb
-; R10 log2 sector size
-
-GetPutCommon ROUT
- [ DebugB
-        DREG    R1,,cc
-        DREG    R2,,cc
-        DREG    R3,,cc
-        DREG    R4,,cc
-        DLINE   ">GetPutCommon"
- ]
-        LDRB    R6, [R1, #DataLostFlag]         ;CHECK FOR DATA LOST
-        TEQS    R6, #0
-        MOVNE   R0, #DataLostErr
-        SETV    NE                              ; preserves NE condition
-        MOVNE   PC, LR
-
-        SUB     R2, R2, R4
-        MOV     FileOff, R4
-        ADD     TransferEnd, FileOff, R3
-        MOV     Fcb, R1
-
-        LDR     R1, [Fcb,#AccessHWM]
-        CMPS    TransferEnd, R1
-        STRHI   TransferEnd, [Fcb,#AccessHWM]
-        CMPS    FileOff, R1             ;V=0
-        CMPLOS  R0, #2
-                        ;ON READ CLEAR MONOTONIC BIT IF ACCESS BELOW HWM
-        LDRLOB  R0, [Fcb,#FcbFlags]
-        BICLO   R0, R0, #Monotonic
-        STRLOB  R0, [Fcb,#FcbFlags]
-
-        LDR     R3, [Fcb,#FcbIndDiscAdd]
-        LDRB    BufSz, [Fcb,#FcbBufSz]
-        MOV     R6, R3, LSR #(32-3)
-        DiscRecPtr  R6, R6
-        LDRB    R10,[R6,#DiscRecord_Log2SectorSize]
-
-        LDRB    R0, [R6,#DiscFlags]
-        TSTS    R0, #FloppyFlag
-        LDRNE   R0, FloppyProcessBlk
-        LDREQ   R0, WinnieProcessBlk
-
- [ DebugB
-        DREG    R0,,cc
-        DREG    R2,,cc
-        DREG    R3,,cc
-        DREG    BufSz,,cc
-        DREG    FileOff,,cc
-        DREG    R6,,cc
-        DREG    TransferEnd,,cc
-        DREG    Fcb,,cc
-        DREG    R10,,cc
-        BEQ     %FT01
-        DLINE   "floppy <GetPutCommon"
-        B       %FT02
-01
-        DLINE   "winnie <GetPutCommon"
-02
- ]
-        MOV     PC, LR
+        LTORG
 
 
 ; >>>>>>>>>>>>>
@@ -1166,9 +907,9 @@ GetPutCommon ROUT
 
 ; entry:
 ;  R1   file handle
-;  R2   start RAM address
-;  R3   number of bytes to read
-;  R4   file address
+;  R2   start RAM address (no alignment guarantee)
+;  R3   number of bytes to write (FileSwitch buffer multiple)
+;  R4   file address (FileSwitch buffer multiple)
 
 ; exit:
 ;  R1-R4 ?
@@ -1194,47 +935,74 @@ PutBytesEntry ROUT
  ]
         Push    "R5-R11"
         BL      HandleCheck     ;(R1->R0,R1,LR,V)
-        BVS     %FT00
-        LDR     R0, [R1,#FcbLength]
+        BVS     %FT05
+        LDR     R0, [R1,#FcbAllocLen]
+      [ BigFiles
+        TEQ     R0, #RoundedTo4G
+        MOVEQ   R0, #&FFFFFFFF
         ADDS    LR, R4, R3
+        BCC     %FT01           ; No carry out, proceed with comparison
+        CMP     LR, #1          ; Allow carry out of only 4G exactly
+        MOVCC   LR, R0          ; LR <=> 0, C=0, be sure to pass the test
+01
+      |
+        ADDS    LR, R4, R3
+      ]
         SUBCC   LR, LR, #1
-        CMPCCS  LR, R0
+        CMPCCS  LR, R0          ; Outside allocation?
         MOVCS   R0, #BadParmsErr
         BLCS    SetV
-        BCS     %FT00
+        BCS     %FT05
 
-        ; Set if FcbDiscImage - do transfer if foreground
+        ; Non filecore disc images - do transfer in foreground
         LDRB    r5, [r1, #FcbFlags]
         TST     r5, #FcbDiscImage
-        BNE     %FT01
+        BNE     %FT03
 
         ; Ensure a new Id on FileCore disc only
         Push    "r3"
         LDR     r3, [r1, #FcbIndDiscAdd]
         BL      EnsureNewId
         Pull    "r3"
-        BVS     %FT00
+        BVS     %FT05
 
-        ; Write behind on FileCore disc only
+      [ BigFiles
+        ; If transfer ends at exactly 4G, use foreground
+        ; If transfer ends near 4G, use foreground
+        ADDS    R5, R3, R4
+        CMPCC   R5, #-1*K
+        BCS     %FT03
+      ]
+
+        ; Do in background if got some file buffers
         LDRB    R5, MaxFileBuffers
         TEQ     R5, #0
-
-        BNE     %FT05           ; Do in background if got some file buffers and not a disc image
-01
+        BNE     %FT06
+03
+        ; Foreground
         Push    "R1,R3,R4"
-        Push    "R2-R4"
-        Pull    "R3-R5"
-        LDRVC   R2, [R1,#FcbIndDiscAdd]
-        MOVVC   R1, #DiscOp_WriteSecs :OR: DiscOp_Op_IgnoreEscape_Flag
-        BLVC    GenIndDiscOp    ;(R1-R5->R0-R5,V)
+        MOV     R5, R4
+        MOV     R4, R3
+        MOV     R3, R2
+        LDR     R2, [R1,#FcbIndDiscAdd]
+        MOV     R1, #DiscOp_WriteSecs :OR: DiscOp_Op_IgnoreEscape_Flag
+        BL      GenIndDiscOp    ;(R1-R5->R0-R5,V)
 
-        ; On non-filecore discs discard any cached clashing buffers
+        ; Discard any cached clashing read ahead buffers
         Pull    "R1,R3,R4"
         LDRB    r5, [r1, #FcbFlags]
+      [ BigFiles
+        SavePSR r6              ; V from GenIndDiscOp
+        ASSERT  FcbDiscImage = 128
+        MOVS    r5, r5, LSR #8  ; FcbDiscImage set => C set
+        ADDCCS  r5, r3, r4      ; or foreground forced because write ended at 4G => C set
+        BLCS    ReleaseFcbBuffersInRange ;(r1,r3,r4) drop all buffers in range
+        RestPSR r6,,f
+      |
         TST     r5, #FcbDiscImage
         BLNE    ReleaseFcbBuffersInRange ;(r1,r3,r4) drop all buffers in range
-
-00
+      ]
+05
         BLVS    FindErrBlock    ; (R0->R0,V)
         BL      FileCoreExit
  [ Debug3L
@@ -1245,7 +1013,7 @@ PutBytesEntry ROUT
  ]
  [ DebugB :LOR: DebugBE
         DLINE   "<PutBytes"
-        DebugError "Adfs put bytes error"
+        DebugError "PutBytes error"
  ]
         Pull    "R5-R11,SB,PC"
 
@@ -1255,7 +1023,7 @@ WriteProcessBlock       # 4
 WriteRamAdjust          # 4
 WriteBuffersWork        # 0
 
-05
+06
 
 ;INITIALISATION
  [ DebugJ
@@ -1270,7 +1038,7 @@ WriteBuffersWork        # 0
  ]
         MOV     R0, #2
         BL      GetPutCommon  ;R0-R4->R0,R2,R3,BufSz,FileOff,R6,TransferEnd,Fcb,R10,Z,V
-        BVS     %BT00
+        BVS     %BT05
         ASSERT  WriteProcessBlock = 0
         ASSERT  WriteRamAdjust = 4
         ASSERT  WriteBuffersWork = 8
@@ -1280,7 +1048,7 @@ WriteBuffersWork        # 0
         BL      DiscWriteBehindWait             ;(R3)
         BL      ClaimController                 ;(R0)
 
-        MOV     R2, R3, LSR #29
+        MOV     R2, R3, LSR #(32-3)
         STRB    R2, WriteDisc
 ; ENSURE DISC PRESENT AND DRIVE LOCKED
         LDRB    LR, [R0, #ProcessWriteBehindDisc]
@@ -1289,7 +1057,7 @@ WriteBuffersWork        # 0
 
         LDRB    LR, LockedDisc
         CMPS    LR, R2                  ;V=0
-        BLEQ    DiscAddToRec
+        BLEQ    DiscAddToRec            ;(R3->LR)
         LDREQB  R1, [LR, #DiscsDrv]
         BEQ     %FT07
         BL      LockDisc                ;(R3->R0,R1,V)
@@ -1852,9 +1620,252 @@ WriteBuffersWork        # 0
         CPBs
  ]
         ADD     SP, SP, #WriteBuffersWork
-        B       %BT00
+        B       %BT05
 
- LTORG
+        LTORG
+
+
+; ++++++++++++
+; GetPutCommon
+; ++++++++++++
+
+; entry
+;  R0 1 read, 2 write
+;  R1 file handle
+;  R2 RAM start address (no alignment guarantee)
+;  R3 number of bytes to transfer (FileSwitch buffer multiple)
+;  R4 file offset (FileSwitch buffer multiple)
+
+; exit R0,V if error
+; NE <=> floppy
+; R0 -> process block for device
+; R2 RAM adjust
+; R3 IndDiscAdd of file
+; BufSz
+; FileOff
+; R6 disc rec
+; TransferEnd
+; Fcb
+; R10 log2 sector size
+
+GetPutCommon ROUT
+ [ DebugB
+        DREG    R1,,cc
+        DREG    R2,,cc
+        DREG    R3,,cc
+        DREG    R4,,cc
+        DLINE   ">GetPutCommon"
+ ]
+        LDRB    R6, [R1, #FcbDataLostFlag]      ;CHECK FOR DATA LOST
+        TEQS    R6, #0
+        MOVNE   R0, #DataLostErr
+        SETV    NE                              ; preserves NE condition
+        MOVNE   PC, LR
+
+        SUB     R2, R2, R4                      ; R2 := RAM adjust
+        MOV     FileOff, R4
+        ADD     TransferEnd, FileOff, R3
+        MOV     Fcb, R1
+
+        LDR     R1, [Fcb,#FcbAccessHWM]
+        CMPS    TransferEnd, R1
+        STRHI   TransferEnd, [Fcb,#FcbAccessHWM]
+
+        CMPS    FileOff, R1
+        CMPLOS  R0, #2                          ;Less than 2 <=> read
+        LDRLOB  R0, [Fcb,#FcbFlags]             ;ON READ CLEAR MONOTONIC BIT IF ACCESS BELOW HWM
+        BICLO   R0, R0, #Monotonic
+        STRLOB  R0, [Fcb,#FcbFlags]
+
+        LDR     R3, [Fcb,#FcbIndDiscAdd]
+        LDRB    BufSz, [Fcb,#FcbBufSz]
+        MOV     R6, R3, LSR #(32-3)
+        DiscRecPtr  R6, R6
+        LDRB    R10,[R6,#DiscRecord_Log2SectorSize]
+
+        LDRB    R0, [R6,#DiscFlags]
+        TSTS    R0, #FloppyFlag
+        LDRNE   R0, FloppyProcessBlk
+        LDREQ   R0, WinnieProcessBlk
+
+ [ DebugB
+        DREG    R0,,cc
+        DREG    R2,,cc
+        DREG    R3,,cc
+        DREG    BufSz,,cc
+        DREG    FileOff,,cc
+        DREG    R6,,cc
+        DREG    TransferEnd,,cc
+        DREG    Fcb,,cc
+        DREG    R10,,cc
+        BEQ     %FT01
+        DLINE   "floppy <GetPutCommon"
+        B       %FT02
+01
+        DLINE   "winnie <GetPutCommon"
+02
+ ]
+        CLRV
+        MOV     PC, LR
+
+
+; ++++++++
+; ExtendUp
+; ++++++++
+
+;Entry
+; R0            maximum priority buffer willing to use*2(-1)
+; R1            suggested end
+; TransferEnd   current end
+; FragEnd       maximum end
+
+;Exit
+; R1            corrupt
+; TransferEnd   updated
+
+ExtendUp ROUT
+ [ DebugG
+        DREG    R0,,cc
+        DREG    R1,,cc
+        DREG    TransferEnd,,cc
+        DREG    FragEnd,,cc
+        DLINE   ">ExtendUp"
+ ]
+        CMPS    FragEnd, R1
+        MOVLO   R1, FragEnd
+        CMPS    TransferEnd,R1
+        MOVHS   PC, LR
+        Push    "R2,R3,FileOff,R6,LR"
+        MOV     FileOff,TransferEnd
+10
+        BL      FindSubBuf              ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
+        BIC     R6, FileOff, #&3FC      ;REUSING AS TEMP REGISTER
+        CMPS    BufOff, #32
+        LDRLO   R2, [BufPtr,#BufFlags]
+        MOVLO   R3, #-1
+        BLO     %FT30                   ;already have buffer
+        BL      FindFreeBuf             ;(R0,FileOff,Fcb,BufPtr->R2,BufPtr,Z)
+        BEQ     %FT90
+
+        MOV     R3, R2
+        STR     Fcb, [BufPtr,#BufFcb]
+        STR     R6, [BufPtr,#BufFileOff]
+        LDR     R2, =EmptyBuf * &01010101
+30                      ;set ReadAhead flags for appropriate sub buffers
+        CMPS    R6, FileOff
+        CMPHSS  R1, R6
+        BICHI   R2, R2, #AllocFlags
+        ORRHI   R2, R2, #ReadAhead
+        MOV     R2, R2, ROR BufSz
+        ADD     R6, R6, BufSz, LSL #5
+        TSTS    R6, #&300
+        BNE     %BT30
+        BL      UpdateBufState  ;R2,BufSz,BufPtr
+        MOVS    R2, R3          ;did we just claim a buffer ?
+        BLPL    LinkFileChain   ;(R2,BufPtr) must be done last for write behind
+
+        CMPS    R6, R1
+        MOVLO   FileOff, R6
+        BLO     %BT10
+        MOVHS   FileOff, R1
+90
+        MOV     TransferEnd, FileOff
+ [ DebugG
+        DREG    R1,,cc
+        DREG    TransferEnd,,cc
+        DLINE   "<ExtendUp"
+ ]
+        Pull    "R2,R3,FileOff,R6,PC"
+
+
+; ++++++++++
+; ExtendDown
+; ++++++++++
+;entry
+; R0            maximum priority buffer willing to use*2(-1)
+; R1            suggested start
+; R3            minimum start
+; FileOff       current start
+
+;exit
+; R1            corrupt
+; FileOff       updated
+
+ExtendDown ROUT
+ [ DebugG
+        DREG    R0,,cc
+        DREG    R1,,cc
+        DREG    R3,,cc
+        DREG    FileOff,,cc
+        DLINE   ">ExtendDown"
+ ]
+        CMPS    R3, R1
+        MOVHI   R1, R3
+        CMPS    FileOff, R1
+        MOVLS   PC, LR
+        Push    "R2,R6,R7,LR"
+10
+        SUB     FileOff, FileOff, BufSz, LSL #5
+        BL      FindSubBuf              ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
+        BIC     R6, FileOff, #&3FC      ;REUSING AS TEMP REGISTER
+        CMPS    BufOff, #32
+        LDRLO   R2, [BufPtr,#BufFlags]
+        MOVLO   R7, #-1
+        BLO     %FT30
+        BL      FindFreeBuf             ;(R0,FileOff,Fcb,BufPtr->R2,BufPtr,Z)
+        ADDEQ   FileOff, FileOff, BufSz, LSL #5
+        Pull    "R2,R6,R7,PC",EQ        ;No buffer available
+
+        MOV     R7, R2
+        STR     Fcb, [BufPtr,#BufFcb]
+        STR     R6, [BufPtr,#BufFileOff]
+        LDR     R2, =EmptyBuf * &01010101
+30                      ;set ReadAhead flags for appropriate sub buffers
+        ADD     FileOff, FileOff, BufSz, LSL #5
+40
+        CMPS    R6, R1
+        CMPHSS  FileOff, R6
+        BICHI   R2, R2, #AllocFlags
+        ORRHI   R2, R2, #ReadAhead
+        MOV     R2, R2, ROR BufSz
+        ADD     R6, R6, BufSz, LSL #5
+        TSTS    R6, #&300
+        BNE     %BT40
+        BL      UpdateBufState  ;R2,BufSz,BufPtr
+        MOVS    R2, R7
+        BLPL    LinkFileChain   ;(R2,BufPtr) must be done last for write behind
+
+        SUB     R6, R6, #1*K
+        CMPS    R1, R6
+        MOVLO   FileOff, R6
+        BLO     %BT10
+        MOVHS   FileOff, R1
+ [ DebugG
+        DREG    R1,,cc
+        DREG    FileOff,,cc
+        DLINE   "<ExtendDown"
+ ]
+        Pull    "R2,R6,R7,PC"
+
+
+; ============
+; IncReadAhead
+; ============
+
+;entry Fcb
+
+IncReadAhead
+ [ DebugG
+        DREG    R9,,cc
+        DLINE   "IncReadAhead"
+ ]
+        Push    "R0,LR"
+        LDRB    R0, [Fcb,#FcbRdAheadBufs]
+        LDRB    LR, MaxFileBuffers
+        CMPS    R0, LR
+        ADDLO   R0, R0, #1
+        STRLOB  R0, [Fcb,#FcbRdAheadBufs]
+        Pull    "R0,PC"
 
 
 ; =====
@@ -1885,7 +1896,7 @@ Flush ROUT
         MOVEQ   R1, #WinnieLock
         BL      ClaimFileCache
 
-;make this files write behind buffers first to be done
+;make this file's write behind buffers first to be done
 
         sbaddr  R2, BufChainsRoot + WriteBehindChain * ChainRootSz
         LDR     R3, = WriteBehind * &01010101
@@ -1942,9 +1953,9 @@ Flush ROUT
 
         MOV     LR, #1
         STR     LR, TickerState
-        BL      ClaimController ;(R0)
+        BL      ClaimController         ;(R0)
         BL      UpdateProcesses
-        BL      ReleaseController
+        BL      ReleaseController       ;(R0)
         BL      ReleaseFileCache
 
 60
@@ -2133,10 +2144,10 @@ BackgroundFileCacheOp
         ASSERT  ProcessDirect = Process+1
         ASSERT  ProcessDrive = ProcessDirect + 1
         ASSERT  ProcessEndPtr=Process+4
-        ASSERT  OldLength=ProcessEndPtr+4
-        MOVS    R0,         R2
-        MOVNE   R0,       #&FF00
-        ORR     R0, R0,      #Inactive
+        ASSERT  ProcessOldLength=ProcessEndPtr+4
+        MOVS    R0, R2
+        MOVNE   R0, #&FF00
+        ORR     R0, R0, #Inactive
         ORR     R0, R0, #&FF0000
         LDR     R4, [SP]                        ;process block
         LDR     LR, [R4,#ProcessPairs+4]        ;first length
@@ -2154,10 +2165,10 @@ BackgroundFileCacheOp
  ]
  [ {TRUE}
         LDR     R10, [Fcb, #FcbIndDiscAdd]
-        MOV     R10, R10, LSR #29
+        MOV     R10, R10, LSR #(32-3)
         DiscRecPtr R10,R10
  |
-        MOV     R10, LR, LSR #29        ; this is broken because of
+        MOV     R10, LR, LSR #(32-3)    ; this is broken because of
                                         ; file wrap-around
         DiscRecPtr R10, R10
  ]
@@ -2321,7 +2332,6 @@ BackgroundOps ROUT
 
  [ DebugG
         DLINE   "BackgroundOps: process active"
-        ;MOV    PC, #0
  ]
         TSTS    R1, #FileCacheLock
         TSTEQS  R5, #WriteBehind        ;all write behind extension is done in
@@ -2448,13 +2458,14 @@ BackgroundOps ROUT
 
         ; Skip if on wrong controller
         LDRB    LR, [Fcb,#FcbFlags]
-        EORS    LR, R5, LR, LSL #31-FcbFloppyBitNo
+        EOR     LR, R5, LR
+        TST     LR, #FcbFloppyFlag
  [ DebugG
-        BPL     %FT01
+        BEQ     %FT01
         DLINE   "wrong controller"
 01
  ]
-        BMI     %BT34           ;wrong controller
+        BNE     %BT34           ;wrong controller
 
         ; Skip if map under modification
         BL      FcbCommon       ;Fcb -> R2, R3, BufSz, LR, C
@@ -2611,7 +2622,7 @@ BackgroundOps ROUT
         TEQS    LR, R5, LSR #(30-1)
         BNE     %BT55                   ;wrong controller
 
-        LDR     FileOff, [Fcb,#LastReadEnd]
+        LDR     FileOff, [Fcb,#FcbLastReadEnd]
         TSTS    FileOff, #&300          ;if extension would need another buffer
         TEQEQS  R6, #0                  ;and no suitable buffers available
         BEQ     %BT55                   ;then loop for next file
@@ -2624,10 +2635,13 @@ BackgroundOps ROUT
 
         LDR     BufPtr, [Fcb,#PrevInFile]
         BL      FindSubBuf              ;(FileOff,Fcb,BufPtr->BufPtr,BufOff)
-        LDR     FragEnd, [Fcb, #FcbLength]
+        LDR     FragEnd, [Fcb, #FcbAllocLen]
+      [ BigFiles
+        TEQ     FragEnd, #RoundedTo4G
+        MOVEQ   FragEnd, #&FFFFFFFF
+      ]
         Push    "FileOff,BufOff,BufPtr"
-;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr, LO/EQ(/HI)
-        BL      ScanBuffers
+        BL      ScanBuffers             ;FileOff,FragEnd,BufSz,BufOff,BufPtr->FileOff,BufOff,BufPtr, LO/EQ(/HI)
         Pull    "FileOff,BufOff,BufPtr",HS
         ADDLO   SP, SP, #3*4
 
@@ -2894,14 +2908,22 @@ ReadAheadCommon ROUT
 
 ;CHECK WHETHER ENOUGH ALREADY READ AHEAD
 
-        LDR     TransferEnd, [Fcb,#LastReadEnd]
+        LDR     TransferEnd, [Fcb,#FcbLastReadEnd]
         TSTS    TransferEnd, #&3FC
         BICNE   TransferEnd, TransferEnd, #&3FC
         ADDNE   TransferEnd, TransferEnd, #&400
-        LDRB    LR, [Fcb,#ReadAheadBufs]
+        LDRB    LR, [Fcb,#FcbRdAheadBufs]
         ADD     TransferEnd, TransferEnd, LR, LSL #10
+      [ BigFiles
+        CMP     FragEnd, #-1
+        MOVNE   LR, FragEnd
+        LDREQ   LR, [Fcb, #FcbAllocLen]
+        TEQEQ   LR, #RoundedTo4G
+        MOVEQ   LR, #&FFFFFFFF          ;For later comparisons
+      |
         MOVS    LR, FragEnd
-        LDRMI   LR, [Fcb,#FcbLength]
+        LDRMI   LR, [Fcb,#FcbAllocLen]
+      ]
         CMPS    TransferEnd, LR
         MOVHI   TransferEnd, LR
         CMPS    FileOff, TransferEnd
@@ -2913,9 +2935,12 @@ ReadAheadCommon ROUT
         BLNE    FindSubBuf              ;FileOff,Fcb,BufPtr -> BufOff,BufPtr
 
         Push    "FileOff,BufOff,BufPtr"
-        LDREQ   FragEnd,[Fcb,#FcbLength]
-;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
-        BL      SkipEmpty
+        LDREQ   FragEnd,[Fcb,#FcbAllocLen]
+      [ BigFiles
+        TEQEQ   FragEnd, #RoundedTo4G
+        MOVEQ   FragEnd, #&FFFFFFFF
+      ]
+        BL      SkipEmpty               ;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
         CMPS    FileOff, TransferEnd
         MOVLO   TransferEnd, FileOff
         Pull    "FileOff,BufOff,BufPtr"
@@ -3422,7 +3447,7 @@ UpdateProcess ROUT
         LDMIA   R1, {R3,R6}
 
         ; R7 = OldLength - 1st length
-        LDR     LR, [R0,#OldLength]
+        LDR     LR, [R0,#ProcessOldLength]
         SUB     R7, LR, R6
 
         ; if less than a buffer done and process still active then there's nothing to update
@@ -3505,7 +3530,7 @@ UpdateProcess ROUT
         BLO     %FT30
 
         ; Find out the start of the buffer corresponding to R3
-        ; This works on the bases that if the buffer wanted in the Nth, then
+        ; This works on the basis that if the buffer wanted in the Nth, then
         ; R3 will be within the Nth, and hence it will be between
         ; N*(1024+1<<BufScale) and N*(1024+1<<BufScale)+1023, lets say
         ; N*(1024+1<<BufScale)+O
@@ -3720,7 +3745,7 @@ UpdateProcess ROUT
         B       %FT70
 
 40
-        STRNE   R6, [R0,#OldLength]
+        STRNE   R6, [R0,#ProcessOldLength]
         BNE     %FT80
         LDRCS   LR, [R0, #ProcessError] ;take special note of errors in direct transfer
         STRCS   LR, DirectError
@@ -3749,8 +3774,6 @@ UpdateProcess ROUT
         TEQ     lr, #ReadAheadChain
         BNE     %BT02
         DREG    BufPtr, "Buffer still on read ahead chain after process gone inactive:"
-; MOV lr, #&df000000
-; LDR lr,[lr]
         B       %BT02
 01
  ]
@@ -3784,7 +3807,7 @@ UpdateProcess ROUT
 ; BackgroundTidyUp
 ; ================
 
-; Tidy up a files buffers after background error
+; Tidy up a file's buffers after background error
 ;  If read ahead error mark read ahead buffers empty
 ;  If write behind error mark all buffers as empty and set data lost flag
 ;  clear sequential flag
@@ -3805,7 +3828,7 @@ BackgroundTidyUp ROUT
         BL      LessValid
         TEQS    R3, #WriteBehind
         ASSERT  WriteBehind<>0
-        STREQB  R3, [Fcb,#DataLostFlag]
+        STREQB  R3, [Fcb,#FcbDataLostFlag]
         MOVEQ   R3, #AllocFlags :EOR: EmptyBuf
         MOV     BufPtr, Fcb
         MOV     R1, #0
@@ -4166,9 +4189,8 @@ ScanBuffers ROUT
         MOVEQ   R0, #EmptyBuf           ;deals with BufOff=32
         AND     R0, R0, #ReadAhead :OR: EmptyBuf
         CMPS    R0, #EmptyBuf
-;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
         BNE     %FT15
-        BL      SkipEmpty
+        BL      SkipEmpty               ;BufSz,FileOff,FragEnd,BufOff,BufPtr->FileOff,BufOff,BufPtr
         B       %FT80
 
 15      MOV     R2, #ReadAhead :OR: EmptyBuf
@@ -4438,14 +4460,18 @@ FileFrag ROUT
  |
         Push    "R2-R4,FileOff,R9,LR"
  ]
-        LDR     FragEnd, [Fcb,#FcbLength]
+        LDR     FragEnd, [Fcb,#FcbAllocLen]
+      [ BigFiles
+        TEQ     FragEnd, #RoundedTo4G
+        MOVEQ   FragEnd, #&FFFFFFFF     ; For compares below, FragEnd shouldn't escape
+      ]                                 ; into the wild non sector aligned
         LDR     R2, [Fcb,#FcbIndDiscAdd]
  [ DebugG
-        DREG    FragEnd,"FcbLength: "
+        DREG    FragEnd,"FcbAllocLen: "
         DREG    R2,"FcbIndDiscAdd: "
  ]
         MOV     R3, R2
-        BL      TestMap                 ;(R3->LR,Z)
+        BL      TestMap                 ;(R3->Z)
  [ BigDisc
 ; disc record ptr in LR, get sector size, make DiscAdjust point to file start
         LDRB    R7, [LR, #DiscRecord_Log2SectorSize]    ; get our old friend, SectorSize
@@ -4517,7 +4543,7 @@ FragLeft ROUT
         LDR     R2, [Fcb,#FcbIndDiscAdd]
         MOV     R3, R2
         BL      TestMap                 ;(R3->Z)
-        LDRNE   LR, [Fcb,#FcbLength]
+        LDRNE   LR, [Fcb,#FcbAllocLen]  ;always < 2G old map
         SUBNE   LR, LR, FileOff
         Pull    "R2-R4,R9,PC",NE
         BL      DefFindFileFragment     ;(R2,R5->R2,R4,R9,LR)
@@ -4595,9 +4621,9 @@ FindFreeBuf ROUT
         BEQ     %FT95
 
 63
-        LDRB    LR, [R3, #ReadAheadBufs]        ;decrement read ahead for buffer's file
+        LDRB    LR, [R3, #FcbRdAheadBufs]       ;decrement read ahead for buffer's file
         SUBS    LR, LR, #1
-        STRNEB  LR, [R3, #ReadAheadBufs]
+        STRNEB  LR, [R3, #FcbRdAheadBufs]
 
 65
         BL      UnlinkFileChain                 ;BufPtr
@@ -4825,7 +4851,7 @@ UpdateBufState ROUT
         LDRHI   LR, [BufPtr,#NextInFile]        ;IF new priority WriteBehind
 
 ; MB FIX
-; If we found a free buffer then it's next and prev pointers will be 0.
+; If we found a free buffer then its next and prev pointers will be 0.
         TEQS    LR,#0
         BEQ     %FT80
 ; end MB FIX
@@ -4886,6 +4912,10 @@ EmptyBuffers ROUT
         DLINE   "EmptyBuffers"
  ]
         Push    "R1,R2,FileOff,LR"
+        LDRB    LR, MaxFileBuffers
+        TEQ     LR, #0          ;no buffers to empty
+        Pull    "R1,R2,FileOff,PC",EQ
+
         MOV     R1, #0          ;to count write behind freed
         LDR     BufPtr, [Fcb,#PrevInFile]
         BL      LessValid
@@ -5624,7 +5654,8 @@ ReleaseFileCache ROUT
 
 
  [ DebugJ
-;entry FCB
+; Check process blocks, see also CPBs in FileCore70
+; entry FCB
 
 Check ROUT
         Push    "R0-R3,BufSz,R5,R6,Fcb,BufPtr,LR"
