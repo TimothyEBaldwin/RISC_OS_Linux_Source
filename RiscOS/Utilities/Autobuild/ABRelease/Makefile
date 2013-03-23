@@ -14,7 +14,7 @@
 #
 # Makefile for Autobuild
 #
-# This component should be placed into (disc) builds as the final component
+# This component should be placed into (any type of) builds as the final component
 # so that it can perform any final installation tasks, such as copying files
 # into archives, adding pre-built binaries, etc.
 #

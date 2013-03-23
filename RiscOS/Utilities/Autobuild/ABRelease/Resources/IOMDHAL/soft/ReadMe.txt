@@ -1,5 +1,5 @@
-This is a ROM softloader patch for RiscPC/A7000/A7000+ machines. It includes
-the softload tool and respective RISC OS ROM image which can be installed into
+This is a ROM softloader patch for RiscPC and A7000 machines. It includes a
+development release of the RISC OS ROM image which can be installed into
 your boot sequence as follows:
 
 * Ensure you have an up to date !System containing SharedCLibrary 5.46 or
@@ -22,11 +22,21 @@ your boot sequence as follows:
 
 * Click on the 'Merge' button to install the softloader
 
-You can now reboot in order to try out this version of RISC OS.
-You will be prompted when the machine boots as to whether you
-would like to softload or continue booting with your ROM installed (in the
-flash ROM memory chip on the motherboard) version of RISC OS.
-Press 'y' or 'n' on the keyboard to indicate your choice when asked.
+You can now reboot in order to try the latest development version of RISC OS
+for the RiscPC/A7000. You will be prompted when the machine boots as to
+whether you would like to softload or continue booting with your normal
+(installed) version of RISC OS. Press 'y' or 'n' on the keyboard to indicate
+your choice when asked.
+
+Please note: this is a development release of the operating system and is
+supplied in an entirely untested state. The softload tool is also largely
+untested at present so please send a report of any problems you encounter to
+info@riscosopen.org.
+
+For a list of known issues with this ROM image, please see the ROOL wiki:
+
+http://www.riscosopen.org/wiki/documentation/show/Software%20information:%20IOMD%20ROM
+
 
 Thanks!
 

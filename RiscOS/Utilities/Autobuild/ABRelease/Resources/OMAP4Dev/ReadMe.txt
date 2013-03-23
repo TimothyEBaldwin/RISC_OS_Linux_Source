@@ -46,14 +46,21 @@ conjunction with the installation steps given on the above page.
 An important note about CMOS RAM
 ================================
 
-The OMAP port of RISC OS now has the ability to use CMOS settings that are
-saved to the SD card alongside the ROM image. However, RISC OS currently
-lacks the ability to write updated settings back to the card. Therefore if
-you make any configuration changes that will affect CMOS RAM (e.g. switching
-to boot from drive 4 instead of 0) then you must make sure you manually save
-the settings using *SaveCMOS and copy the new file onto the SD card. For more
-information about how the CMOS file is handled, please see the !SDCreate help
-file.
+The OMAP port of RISC OS now supports saving configuration settings in a CMOS
+memory chip so that they are kept when the power is turned off. This
+requires a small carrier board to be plugged in, which you can obtain for
+a few pounds from your favourite supplier.
 
+If this carrier board is not detected it is possible to have 'read only' settings in one of two ways
+
+  * Add a CMOS file to the SD card
+    Make any configuration settings changes desired than use the *SaveCMOS
+    command to capture them in a file, put this file on the SD card alongside
+    the RISC OS ROM image.
+    For more information about how the CMOS file is handled, please see
+    the !SDCreate help file.
+  * Do nothing
+    If the hardware is not present, and you haven't put a CMOS file on the
+    SD card, you'll get the built in defaults.
 
 -- RISC OS Open

@@ -21,10 +21,6 @@ would like to softload or continue booting with your normal (installed)
 version of RISC OS. Press 'y' or 'n' on the keyboard to indicate your choice
 when asked.
 
-Please note: this is a development release of the softload tool which is
-largely untested at present to please send a report of any problems you
-encounter to info@riscosopen.org.
-
 Thanks!
 
 -- The ROOL Team

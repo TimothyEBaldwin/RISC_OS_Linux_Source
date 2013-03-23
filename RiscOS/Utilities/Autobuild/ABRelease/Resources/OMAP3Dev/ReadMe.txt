@@ -5,7 +5,7 @@ This is the OMAP (Beagle Board) development ROM image. It is a bleeding-edge
 build which comes from the latest revisions of all the relevant sources in
 our source code repository and is completely untested.
 
-Using this ROM image in your Beagle should only be done if you are confident
+Using this ROM image in your board should only be done if you are confident
 that you know what you are doing! It is likely to be functionally incomplete
 and probably unstable in various ways.
 
@@ -46,7 +46,10 @@ conjunction with the installation steps given on the above page.
 An important note about CMOS RAM
 ================================
 
-The OMAP port of RISC OS now supports saving configuration settings in a CMOS memory chip so that they are kept when the power is turned off. This requires a small carrier board to be plugged in, which you can obtain for a few pounds from your favourite supplier.
+The OMAP port of RISC OS now supports saving configuration settings in a CMOS
+memory chip so that they are kept when the power is turned off. This
+requires a small carrier board to be plugged in, which you can obtain for
+a few pounds from your favourite supplier.
 
 If this carrier board is not detected it is possible to have 'read only' settings in one of two ways
 
