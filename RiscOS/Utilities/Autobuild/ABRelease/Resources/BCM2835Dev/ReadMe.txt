@@ -1,7 +1,7 @@
 RISC OS Open Release Archive
 ============================
 
-This is the BCM2835 (RaspberryPi) development ROM image. It is a bleeding-edge
+This is the BCM2835 (Raspberry Pi) development ROM image. It is a bleeding-edge
 build which comes from the latest revisions of all the relevant sources in
 our source code repository and is completely untested.
 
