@@ -112,17 +112,6 @@ FastCDA_Prof_ChangingEntry           # 4
 ;       R1 set to bytes moved.
 ;******************************************************************************
 
-; The following flag controls the operation of ReadCMOSAndConfigure and FudgeConfigureRMA
-;
-; If false, then no memory is in the free pool to start off, and these routines just allocate pages
-; starting at page R2, and update this on exit.
-;
-; If true, then routine InitDynamicAreas initially moves all non-static free memory into the free pool,
-; and then the above routines just take pages off the end of that.
-
-        GBLL    GetPagesFromFreePool    ; whether ReadCMOSAndConfigure extract pages from the free pool
-GetPagesFromFreePool SETL {TRUE}
-
 AP_AppSpace     *       0                                       ; user r/w, CB
 AP_SysHeap      *       0                                       ; user r/w, CB
 AP_RMA          *       0                                       ; user r/w, CB
@@ -672,6 +661,7 @@ FindMemMapEntries_Code  ROUT
         LDMIA   r5!, {r6,r7}                    ; load next address, size
         SUB     r6, r8, r6, LSR #12             ; number of pages into this bank
         CMP     r6, r7, LSR #12                 ; if more than there are
+        BICCS   r7, r7, #&F00
         ADDCS   r10, r10, r7, LSR #12-3         ; then advance CAM entry position
         BCS     %BT30                           ; and loop to next bank
 
@@ -813,15 +803,18 @@ CP_CB_WritebackReadAlloc        * 2             ; Writeback cacheable, read allo
 CP_CB_WritebackWriteAlloc       * 3             ; Writeback cacheable, write allocate. If not available, WB/R.
 CP_CB_AlternativeDCache         * 4             ; Use XScale/SA11x0 mini-data cache. If not available, CB_Default.
 
+DynAreaFlags_NeedsDMA           *  1 :SHL: 15   ; only allocate from DMAable memory
 ;
-; bits 15 nominally reserved for future DA flags expansion
+; No more bits left for easy flag expansion. Will have to start claiming bits
+; from 16 to 31, or shuffle some of the following flags further up
+; (which should be safe in theory, as they all should be kernel private)
 ;
 DynAreaFlags_AccessMask * DynAreaFlags_APBits :OR: DynAreaFlags_NotBufferable :OR: DynAreaFlags_NotCacheable :OR: DynAreaFlags_DoublyMapped :OR: DynAreaFlags_CPBits
 ;
 ; The following bits are only present in page flags
 ;
 TempUncacheableShift            * 16
-PageFlags_TempUncacheableBits   * 15 :SHL: TempUncacheableShift    ; temporary count of uncacheability, used by DMA mgr
+PageFlags_TempUncacheableBits   * 15 :SHL: TempUncacheableShift    ; temporary count of uncacheability, used by DMA mgr (via OS_Memory 0)
 PageFlags_Unavailable           *  1 :SHL: 20                      ; physical page may not be requested by a PreShrink handler
 ;
 ; Temporary flags only used by kernel
@@ -903,8 +896,9 @@ DynArea_ReturnError
 ;               bit 10 = 1 => area may be sparsely mapped (only implemented if DA_Batman)
 ;               bit 11 = 1 => area is bound to client application (allows areas to be overlayed in address space)
 ;                             not implemented yet, but declared in public API for Ursula
-;               bits 12..15 reserved for future DA flag expansion (should be 0)
-;               bits 16..31 reserved for internal page flags (should be 0)
+;               bits 12..14 => cache policy (if bits 4 or 5 set)
+;               bit 15 = 1 => area requires DMA capable pages (is bit 12 in ROL's OS!)
+;               bits 16..31 reserved for future expansion + internal page flags (should be 0)
 ;
 ;       r5 = maximum size of area, or -1 for total RAM size
 ;       r6 -> area handler routine
@@ -2802,7 +2796,7 @@ ChocolateBlock_NOError
 ; out:  -
 ;
 
-InitDynamicAreas Entry "r0-r8,r11,r12"
+InitDynamicAreas Entry "r0-r12"
         LDR     lr, =ZeroPage+AppSpaceDANode
         ADR     r0, InitAppSpaceTable
         LDMIA   r0, {r0-r8}
@@ -2815,75 +2809,71 @@ InitDynamicAreas Entry "r0-r8,r11,r12"
         STMIA   lr, {r0-r8}
 
 
-; We have to move all free pages (ie ones not occupied by the static pages) into the free pool
-; The lowest numbered physical pages must be put in last, so that when ReadCMOSAndConfigure is
-; called to put in the screen, it will get the pages starting at 0 (when the screen is created
-; as a dynamic area, this limitation can be removed).
+; We have to move all free pages (ie ones not occupied by the static pages)
+; into the free pool.
+; By default, pages will get taken from the end of the free pool when other
+; dynamic areas are initialised or grown. So make sure that the slowest RAM
+; is at the start of the free pool and the fastest is at the end; this is the
+; reverse of the order in PhysRamTable.
 
-; The free pages consist of two chunks of pages, each of which having consecutive physical page
-; numbers. We start at MaxCamEntry and move back until we hit the end of the statics (which are
-; at the start of the 1st non-video-RAM chunk). We then separately do the video RAM.
+; The blocks of pages within the free pool are kept with consecutive physical
+; page numbers; I'm not sure how important this is, but the old code did it.
+; However instead of merely keeping the entire free pool in consecutive order,
+; we need to process each PhysRamTable entry in turn, to allow us to place the
+; fastest block at the end of the pool. Furthermore VRAM block is kept at the
+; start of the pool - again to match old behaviour, although moving it elsewhere
+; may not have any significant impact on the system
 
- [ HAL
         MOV     r11, r3                         ; r11 = PPL (inc CB) for free pool
         MOV     r6, r2                          ; r6 = base address of free pool, ie where to put stuff
-        LDR     r5, =ZeroPage                   ; r5 = amount of memory in free pool so far (and ptr to 0)
+        LDR     r5, =ZeroPage
         LDR     r0, [r5, #InitUsedStart]
         ADD     r0, r0, #DRAMOffset_FirstFixed - DRAMOffset_L1PT
         BL      PhysAddrToPageNo
         MOV     r7, r0                          ; r7 = page number of start of static chunk
         LDR     r0, [r5, #InitUsedEnd]
         BL      PhysAddrToPageNo
-        MOV     r8, r0                          ; r8 = page number of 1st page in 1st chunk not used for statics
+        SUB     r8, r0, #1                      ; r8 = page number of last page in statics
 
-        LDR     r2, [r5, #MaxCamEntry]          ; r2 = 1st page to put in free pool
-        MOV     r3, r6                          ; r3 = base address of free pool, ie where to put stuff
-        SUB     lr, r8, r7
-        SUB     lr, r2, lr
-        ADD     r3, r3, lr, LSL #12             ; r3 = end address of free pool
-      [ ZeroPage <> 0
-        MOV     r5, #0
-      ]
-
-        ! 0, "Sort out static check in InitDynamicAreas"
+        ADD     r9, r5, #PhysRamTable
+        LDMIA   r9, {r0, r10}                   ; get VRAM info
+        ADD     r9, r9, #PhysRamTableEnd-PhysRamTable ; skip to end
+        MOV     r10, r10, LSR #12
+        LDR     r5, [r5, #CamEntriesPointer]
+        ADD     r5, r5, #4                      ; r5 = base of PPLs
 10
-        CMP     r2, r8                          ; are we into statics already
-        SUBCC   r2, r7, #1                      ; if so, then move to last page of video RAM
-        MOVCC   r8, #0                          ; and move barrier so we never hit it again
+        BL      PhysAddrToPageNo
+        ; Move r10 pages to r6 starting from r0
+        MOV     r2, r0                          ; get ready for BangCamUpdate
+        MOV     r3, r6
+15
+        CMP     r2, r7
+        CMPHS   r8, r2
+        BHS     %FT20                           ; page is in statics
+        ; Check the CAM map to see if the page is already taken - this will detect the DMA regions, which aren't included in InitUsedStart/InitUsedEnd
+        LDR     lr, [r5, r2, LSL #3]
+        TST     lr, #PageFlags_Unavailable
+        BNE     %FT20
         BL      BangCamUpdate
-        SUB     r3, r3, #4096                   ; advance logical address
-        ADD     r5, r5, #4096
-        SUBS    r2, r2, #1                      ; decrement page number
-        BCS     %BT10                           ; if we haven't gone negative, then loop
- |
-        MOV     r11, r3                         ; r11 = PPL (inc CB) for free pool
-        MOV     r3, r2                          ; r3 = base address of free pool, ie where to put stuff
-        LDR     r5, =ZeroPage                   ; r5 = amount of memory in free pool so far (and ptr to 0)
-        LDR     r2, [r5, #MaxCamEntry]          ; r2 = 1st page to put in free pool
-        LDR     r7, [r5, #VideoSize]            ; r7 = size of video RAM
-      [ ZeroPage <> 0
-        MOV     r5, #0
-      ]
-        MOV     r7, r7, LSR #12                 ; r7 = page number of start of static chunk
-        ASSERT  SoftCamMapSize = L2PTSize +4
-        LDR     r0, =ZeroPage+L2PTSize
-        LDMIA   r0, {r0, r8}                    ; r0 = L2PTSize, r8 = SoftCamMapSize
-        ADD     r8, r8, r0                      ; add sizes together
-        ADD     r8, r8, #StaticPagesSize + UndStackSize ; + number of bytes used for other static bits
-        ADD     r8, r7, r8, LSR #12             ; r8 = page number of 1st page in 1st chunk not used for statics
-10
-        CMP     r2, r8                          ; are we into statics already
-        SUBCC   r2, r7, #1                      ; if so, then move to last page of video RAM
-        MOVCC   r8, #0                          ; and move barrier so we never hit it again
-        BL      BangCamUpdate
-        ADD     r3, r3, #4096                   ; advance logical address
-        ADD     r5, r5, #4096
-        SUBS    r2, r2, #1                      ; decrement page number
-        BCS     %BT10                           ; if we haven't gone negative, then loop
- ]
-
-        LDR     lr, =ZeroPage+FreePoolDANode    ; may be used below to update DAList head ptr
-        STR     r5, [lr, #DANode_Size]          ; update size of free pool in node
+        ADD     r3, r3, #4096
+20
+        ADD     r2, r2, #1
+        SUBS    r10, r10, #1
+        BNE     %BT15
+        ; Advance to next PhysRamTable entry, working backwards
+30
+        LDMDB   r9!, {r0, r10}
+        MOVS    r10, r10, LSR #12
+        BEQ     %BT30
+        LDR     lr, =ZeroPage+PhysRamTable
+        CMP     lr, r9                          ; stop once we hit first entry, it's already been processed
+        MOV     r6, r3
+        BNE     %BT10
+        ; Left with r6 = end of free pool
+        LDR     lr, =ZeroPage+FreePoolDANode
+        LDR     r5, [lr, #DANode_Base]
+        SUB     r5, r6, r5
+        STR     r5, [lr, #DANode_Size]
 
 ; Now initialise the system heap by hand, so we can start creating dynamic areas
 
@@ -3542,7 +3532,7 @@ AreaGrow ROUT
         LDREQ   r11, =ZeroPage+FreePoolDANode   ; then start with free
 
         LDR     lr, [r12, #DANode_Flags]        ; could this area require particular physical pages at all?
-        TST     lr, #DynAreaFlags_NeedsSpecificPages
+        TST     lr, #DynAreaFlags_NeedsSpecificPages+DynAreaFlags_NeedsDMA
         BNE     %FT70                           ; [yes it could, so do it in lumps]
 
         MOV     r1, #0                          ; no page block
@@ -4696,7 +4686,12 @@ CallPostShrink Entry "r0,r3,r4, r12"
 ;       endif
 ;
 
-CallPreGrow Entry "r0,r4, r12"
+CallPreGrow ROUT
+        Entry   "r0,r4, r12"
+        LDR     r0, [r12, #DANode_Flags]
+        TST     r0, #DynAreaFlags_NeedsDMA              ; if DMA needed
+        BNE     %FT10                                   ; use special PreGrow
+
         LDR     r0, [r12, #DANode_Handler]              ; check if no handler
         CMP     r0, #0                                  ; if none (V=0)
         EXIT    EQ                                      ; then exit
@@ -4711,6 +4706,7 @@ CallPreGrow Entry "r0,r4, r12"
         FastCDA_ProfEnd CallPreGrow, r12, r4, lr
         EXIT    VC                                      ; if no error then exit
 
+05
         TEQ     r0, #0                                  ; if generic error returned (V still set)
         ADREQL  r0, ErrorBlock_ChDynamNotAllMoved       ; then substitute real error message
  [ International
@@ -4718,6 +4714,51 @@ CallPreGrow Entry "r0,r4, r12"
  ]
         STR     r0, [sp]
         EXIT
+
+10
+        ; Instead of calling the users PreGrow handler, walk PhysRamTable and
+        ; the CAM map to look for some free DMAable pages
+        ; Note that we don't guarantee physical contiguity - if you want that,
+        ; just use OS_Memory 12 or PCI_RAMAlloc instead
+        Push    "r1-r3"
+        LDR     r0,=ZeroPage+PhysRamTable+4
+        MOV     r2,#0                    ; current page number
+        LDR     r4,=ZeroPage+CamEntriesPointer
+        LDR     r4,[r4]
+        ADD     r4,r4,#4                 ; -> base of PPLs
+        LDR     r12,[r0],#8              ; get video chunk flags
+20
+        ADD     r2,r2,r12,LSR #12        ; advance page number
+21
+        LDR     r12,[r0],#8              ; get next chunk details
+        CMP     r12,#0
+        BEQ     %FT90
+        TST     r12,#OSAddRAM_NoDMA
+        BNE     %BT20
+        ; Check the CAM map to see if any pages here are free
+        MOV     r12,r12,LSR #12
+30
+        LDR     lr,[r4,r2,LSL #3]
+        TST     lr,#PageFlags_Unavailable :OR: PageFlags_Required
+        STREQ   r2,[r1],#12
+        SUBEQS  r3,r3,#4096
+        BEQ     %FT80
+        SUBS    r12,r12,#1
+        ADD     r2,r2,#1
+        BNE     %BT30
+        B       %BT21
+80
+        ; Success
+        CLRV
+        Pull    "r1-r3"
+        EXIT
+90
+        ; Failure
+        SETV
+        Pull    "r1-r3"
+        MOV     r0,#0
+        B       %BT05
+
 
 ; ***********************************************************************************
 ;
@@ -5233,8 +5274,8 @@ PreShrink_Screen Entry   "R0-R2,R4-R5"
 
  [ HAL
         LDR     LR, =ZeroPage
-        LDR     LR, [LR, #VRAMFlags]            ;is VRAM suitable for general use?
-        TST     LR, #2                          ;if not - don't shrink screen memory
+        LDR     LR, [LR, #VideoSizeFlags]          ;is VRAM suitable for general use?
+        TST     LR, #OSAddRAM_VRAMNotForGeneralUse ;if not - don't shrink screen memory
         MOVNE   R3, #0
  ]
         SUB     R2, R5, #1                      ;make a page mask
@@ -5279,5 +5320,6 @@ PostShrink_Screen Entry
 
 ; ************************************************************************
 
+        LTORG
 
         END
