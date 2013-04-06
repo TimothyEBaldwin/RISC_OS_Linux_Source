@@ -30,20 +30,6 @@ include CModule
 CFLAGS      += -wp -DAUTH32 -DCOMPAT_INET4
 CDFLAGS     += -DDEBUG -DDEBUGSER
 
-
-#RDIR       = Resources
-#LDIR       = ${RDIR}.${LOCALE}
-#RESDIR     = ^.^.AUNMsgs.Resources.${Locale}.Resources.${COMPONENT}
-#CFLAGS  = -zM -zps1 -ffah -Wp ${INCLUDES} ${DFLAGS} ${THROWBACK}
-#DFLAGS  = -DAUTH32 -DCOMPAT_INET4
-# -DDEBUG -DDEBUGSER
-
-#SOCKLIBZM = TCPIPLibs:o.socklibzm
-#INETLIBZM = TCPIPLibs:o.inetlibzm
-#DEBUGLIB  = C:DebugLib.o.DebugLibZM
-#ASMUTILS  = C:AsmUtils.o.AsmUtilsZM
-
-
 resources:
 	@echo ${COMPONENT}: Resources in AUNMsgs
 
