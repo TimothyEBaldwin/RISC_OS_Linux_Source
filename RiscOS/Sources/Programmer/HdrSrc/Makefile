@@ -121,6 +121,7 @@ EXPORTS   = \
  ${HDIR}.Global.h.EnvNumbers \
  ${HDIR}.Global.h.FileTypes \
  ${HDIR}.Global.h.FreeWay \
+ ${HDIR}.Global.h.FreewayReg \
  ${HDIR}.Global.h.FSNumbers \
  ${HDIR}.Global.h.GraphicsV \
  ${HDIR}.Global.h.Heap \
@@ -245,6 +246,7 @@ ${HDIR}.Global.h.DrawObj:    hdr.DrawObj;     ${HDR2H} hdr.DrawObj    $@
 ${HDIR}.Global.h.EnvNumbers: hdr.EnvNumbers;  ${HDR2H} hdr.EnvNumbers $@
 ${HDIR}.Global.h.FileTypes:  hdr.FileTypes;   ${HDR2H} hdr.FileTypes  $@
 ${HDIR}.Global.h.FreeWay:    hdr.FreeWay;     ${HDR2H} hdr.FreeWay    $@
+${HDIR}.Global.h.FreewayReg: hdr.FreewayReg;  ${HDR2H} hdr.FreewayReg $@
 ${HDIR}.Global.h.FSNumbers:  hdr.FSNumbers;   ${HDR2H} hdr.FSNumbers  $@
 ${HDIR}.Global.h.GraphicsV:  hdr.GraphicsV;   ${HDR2H} hdr.GraphicsV  $@
 ${HDIR}.Global.h.Keyboard:   hdr.Keyboard;    ${HDR2H} hdr.Keyboard   $@
