@@ -48,6 +48,10 @@ CUSTOMEXP = custom
 
 install: 
 	${MKDIR} ${INSTDIR}.${USERIF}
+	| At least give the equivalent ROM ones for that UserIF
+	${CP} LocalRes:${USERIF}.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS}
+	${CP} LocalRes:${USERIF}.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS}
+	| Then give the disc ones in preference if they exist
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites   Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites11 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites11 ${INSTDIR}.${USERIF}.Sprites11 ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites22 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Sprites22 ${CPFLAGS}
