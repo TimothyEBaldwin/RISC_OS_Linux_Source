@@ -50,12 +50,12 @@ bbe-local: bbe-generic
 #
 clean::
 	${XWIPE} Tables.* ${WFLAGS}
-	${XWIPE} MkTables.o.* ${WFLAGS}
 	${XWIPE} Palettes.* ${WFLAGS}
+	${XWIPE} MkTables.o.* ${WFLAGS}
 	${RM} MkTables.maketables
-	${RM} MkTables.module
 
 resources-colourtrans: MkTables.maketables
+	${XWIPE} Tables.* ${WFLAGS}
 	${RUN}MkTables.maketables @
 	${SQUASH} Tables.4greys
 	${SQUASH} Tables.8greys  
