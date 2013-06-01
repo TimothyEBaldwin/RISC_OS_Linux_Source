@@ -22,23 +22,40 @@
 # 25-May-94  AMcC         Created.
 #
 
-COMPONENT ?= ADFSFiler
-ROM_SOURCE = s.ADFSFiler
-RESOURCEEXTRA = resources_${COMPONENT}
-PRIVATEMSGS = yes
+COMPONENT       ?= ADFSFiler
+ROM_SOURCE       = s.ADFSFiler
+RESOURCEEXTRA    = resources_${COMPONENT}
+PRIVATEMSGS      = yes
+ifeq (${TEMPLATES},yes)
+PRIVATETEMPLATES = resources_templates
+endif
 
 include StdTools
 include AAsmModule
 
+#
+# For ADFSFiler: templates + merged messages, sprites are in the Wimp pool
+#
 resources_ADFSFiler: resources_templates
 	@|
 
-resources_SCSIFiler: ${MERGEDMSGS}
+#
+# For SCSIFiler: sprites + merged messages, templates shared with ADFS unless requested explicitly
+#
+resources_SCSIFiler: ${MERGEDMSGS} ${PRIVATETEMPLATES}
 	${CP} ${MERGEDMSGS} ${RESFSDIR}.Messages ${CPFLAGS}
-	IfThere LocalRes:^.Zip Then ${CP} LocalRes:^.Zip ${RESFSDIR}.Sprites ${CPFLAGS}
-	IfThere LocalRes:^.Zip11 Then ${CP} LocalRes:^.Zip11 ${RESFSDIR}.Sprites11 ${CPFLAGS}
-	IfThere LocalRes:^.Zip22 Then ${CP} LocalRes:^.Zip22 ${RESFSDIR}.Sprites22 ${CPFLAGS}
+	${INSTRES} -I Resources.${LOCALE},Resources.UK,Resources ${RESFSDIR} SCSI.Sprites
 
+#
+# For SDFSFiler: sprites + merged messages, templates shared with ADFS unless requested explicitly
+#
+resources_SDFSFiler: ${MERGEDMSGS} ${PRIVATETEMPLATES}
+	${CP} ${MERGEDMSGS} ${RESFSDIR}.Messages ${CPFLAGS}
+	${INSTRES} -I Resources.${LOCALE},Resources.UK,Resources ${RESFSDIR} SDFS.Sprites
+
+#
+# Static dependencies:
+#
 o.${MACHINE}._Messages_.ADFSFiler:
 	${MKDIR} ${MERGEDMDIR}
 	${TOUCH} $@
@@ -52,5 +69,12 @@ o.${MACHINE}._Messages_.SCSIFiler:
 	IfThere LocalRes:MessagesS Then ${CP} LocalRes:MessagesS $@ ${CPFLAGS}
 	IfThere LocalRes:CmdHelpS Then ${TOKENCHECK} LocalRes:CmdHelpS
 	IfThere LocalRes:CmdHelpS Then ${CAT} LocalRes:CmdHelpS { >> $@ }
+
+o.${MACHINE}._Messages_.SDFSFiler:
+	${MKDIR} ${MERGEDMDIR}
+	${TOUCH} $@
+	IfThere LocalRes:MessagesSD Then ${CP} LocalRes:MessagesSD $@ ${CPFLAGS}
+	IfThere LocalRes:CmdHelpSD Then ${TOKENCHECK} LocalRes:CmdHelpSD
+	IfThere LocalRes:CmdHelpSD Then ${CAT} LocalRes:CmdHelpSD { >> $@ }
 
 # Dynamic dependencies:

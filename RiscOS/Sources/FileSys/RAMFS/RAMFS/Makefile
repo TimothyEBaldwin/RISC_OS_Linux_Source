@@ -25,10 +25,26 @@
 COMPONENT  = RAMFS
 
 HEADER1    = RAMFS
+HEADER2    = RAMFSErr
+ASMCHEADER1 = RAMFSErr
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
 
+EXPORTS    = hdr.RAMFSErr ${C_EXP_HDR}.RAMFSErr
+
 include StdTools
 include AAsmModule
+
+hdr.RAMFSErr: o.RAMFSErr
+	${LD} -bin -o $@ o.RAMFSErr
+	SetType $@ Text
+
+o.RAMFSErr: s.RAMFSErr
+	${MKDIR} o
+	${AS} -o $@ s.RAMFSErr -I<Hdr$Dir>.Global,<Hdr$Dir>.Interface
+
+clean::
+	${RM} hdr.RAMFSErr
+	@@echo ${COMPONENT}: cleaned 
 
 # Dynamic dependencies:

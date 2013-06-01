@@ -54,7 +54,7 @@ CMHG    = cmhg
 CP      = copy
 LD      = link
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 
 AFLAGS  = -depend !Depend -Stamp -quit
 CFLAGS  = -c -depend !Depend ${INCLUDES} ${DFLAGS} -zM

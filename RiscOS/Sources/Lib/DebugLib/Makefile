@@ -36,7 +36,7 @@ CM		= cmhg
 RM		= remove
 LD		= link
 LB		= libfile
-WIPE		= -wipe
+WIPE		= x wipe
 AOF2ALF		= aof.AOF2ALF
 STRIP		= stripdepnd
 
@@ -109,6 +109,7 @@ OBJS =\
  o.brainlink\
  o.reporter\
  o.syslog\
+ o.hal\
 
 OBJSZ =\
  oz.debug\
@@ -129,6 +130,7 @@ OBJSZ =\
  oz.brainlink\
  oz.reporter\
  oz.syslog\
+ oz.hal\
 
 OBJSD =\
  od.debug\
@@ -149,6 +151,7 @@ OBJSD =\
  od.brainlink\
  od.reporter\
  od.syslog\
+ od.hal\
 
 OBJSMC =\
  oMC.debug\
@@ -169,6 +172,7 @@ OBJSMC =\
  oMC.brainlink\
  oMC.reporter\
  oMC.syslog\
+ oMC.hal\
 
 OBJSMCD =\
  oMCD.debug\
@@ -189,6 +193,7 @@ OBJSMCD =\
  oMCD.brainlink\
  oMCD.reporter\
  oMCD.syslog\
+ oMCD.hal\
 
 LIBS = \
  $(PDEBUG)\

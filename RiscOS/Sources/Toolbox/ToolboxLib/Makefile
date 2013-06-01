@@ -107,4 +107,10 @@ export_libs:
 	@echo	Library $(COMPONENT): export libraries complete.
 
 
+install:
+	${MKDIR} ${INSTDIR}.tboxlibs
+	${CP} ${LIBDIR}.tboxlibs.* ${INSTDIR}.tboxlibs.* ${CPFLAGS}
+	@echo ${COMPONENT}: installed
+
+
 # Dynamic dependencies:

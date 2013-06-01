@@ -12,100 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for Kernel
-#
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 25-May-94  AMcC         Created.
+# Makefile for IOMD HAL
 #
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
-C_EXP_HDR = <cexport$dir>.Global.h
+COMPONENT  = IOMD HAL
+TARGET     = IOMD
+OBJS       = Top Boot ATA IIC Interrupts MachineID NVRAM \
+             Timers Video cbits KbdScan Debug Post IOMD21DMA
+HDRS       =
+CMHGFILE   =
+CUSTOMRES  = custom
+CUSTOMROM  = custom
+ROM_TARGET = custom
+LNK_TARGET = custom
+AIFDBG     = aif._IOMD
+GPADBG     = gpa.GPA
 
-#
-# Generic options:
-#
-MKDIR   = mkdir -p
-AS      = aasm
-ARMASM  = objasm
-CP      = copy
-RM      = remove
-CCFLAGS = -c -depend !Depend -IC:
-ASFLAGS = -depend !Depend ${THROWBACK} -Stamp -quit -To $@ -From
-ARMASMFLAGS = -depend !Depend -g -APCS 3/nofp/noswst ${THROWBACK}
-CPFLAGS = ~cfr~v
+include CModule
 
-TOKENISE = tokenise
-TOKENS   = Hdr:Tokens
+CCFLAGS   += -ff -APCS 3/32bit/nofp/noswst
+ASFLAGS   += -APCS 3/nofp/noswst
+AASMFLAGS += -APCS 3/nofp/noswst
 
-#
-# Program specific options:
-#
-COMPONENT = IOMD
-TARGET    = bin.IOMD
-DBGTARGET = aif.IOMD
-GPATARGET = gpa.IOMD
-EXPORTS   = 
+resources:
+	@${ECHO} ${COMPONENT}: no resources
 
-OBJECTS   = o.Boot o.IIC o.NVRAM o.Video o.Interrupts o.MachineID o.Timers
+rom: aof.${TARGET}
+	@${ECHO} ${COMPONENT}: rom module built
 
-.s.o:;	${ARMASM} ${ARMASMFLAGS} $< $@
+_debug: ${GPADBG}
+	@echo ${COMPONENT}: debug image built
 
-#
-# Generic rules:
-#
-rom: ${TARGET}
-	@echo ${COMPONENT}: rom module built
-
-debug: ${GPATARGET}
-	@echo ${COMPONENT}: debug module built
-
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
+install_rom: linked.${TARGET}
+	${CP} linked.${TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: rom module installed
 
-clean:
-	${RM} ROM
-	${RM} ${TARGET}
-	-Wipe o.* ~C~V
-	-Wipe aif.* ~C~V
-	-Wipe gpa.* ~C~V
-	@echo ${COMPONENT}: cleaned
+aof.${TARGET}: ${ROM_OBJS_} ${ROM_LIBS} ${DIRS} ${ROM_DEPEND}
+	${LD} -o $@ -aof ${ROM_OBJS_} ${ROM_LIBS}
 
-export: ${EXPORTS}
-	@echo ${COMPONENT}: export complete
+linked.${TARGET}: aof.${TARGET}
+	${LD} ${LDFLAGS} ${LDLINKFLAGS} -o $@ -bin -base 0xFC000000 aof.${TARGET}
 
-resources: resources-${CMDHELP}
-	@echo ${COMPONENT}: resource files copied
+${AIFDBG}: ${ROM_OBJS_} ${ROM_LIBS}
+	${MKDIR} aif
+	${LD} -aif -bin -d -o ${AIFDBG} ${ROM_OBJS_} ${ROM_LIBS}
 
-resources_common:
-	${MKDIR} ${RESDIR}.${COMPONENT}
-	Set Kernel$Messages LocalRes:Messages
-	IfThere LocalRes:<UserIF>.Messages Then Set Kernel$Messages LocalRes:<UserIF>.Messages
-	TokenCheck LocalRes:<UserIF>.Messages
-	${CP} <Kernel$Messages>  ${RESDIR}.${COMPONENT}.Messages  ${CPFLAGS}
-	UnSet Kernel$Messages
-
-resources-None: resources_common
-	@
-
-resources-: resources_common
-	TokenCheck LocalRes:Messages
-	print LocalRes:CmdHelp { >> ${RESDIR}.${COMPONENT}.Messages }
-
-${TARGET}: ${OBJECTS}
-	Link -bin -o $@ ${OBJECTS}
-
-${DBGTARGET}: ${OBJECTS}
-	Link -bin -aif -d -o $@ ${OBJECTS}
-
-${GPATARGET}: ${DBGTARGET}
-	ToGPA -s ${DBGTARGET} $@
+${GPADBG}: ${AIFDBG}
+	ToGPA -s ${AIFDBG} ${GPADBG}
 
 # Dynamic dependencies:

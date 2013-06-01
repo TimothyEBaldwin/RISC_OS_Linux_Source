@@ -19,13 +19,13 @@
 # ***********************************
 # Date       Name         Description
 # ----       ----         -----------
-# 09 Oct 1997  RWB 	  Tidied up old Toolbox.Common build
+# 09 Oct 1997  RWB        Tidied up old Toolbox.Common build
 #
 
 #
 # Paths
 #
-LIBDIR		= <Lib$Dir>
+LIBDIR  = <Lib$Dir>
 EXP_HDR = <export$dir>
 
 #
@@ -40,7 +40,7 @@ LD      = link
 RM      = remove
 WIPE    = -wipe
 XWIPE   = x wipe
-CD	= dir
+CD      = dir
 LIBFILE = libfile
 
 CFLAGS   = -c -depend !Depend -Wap -zps0 ${INCLUDES} -ffah ${DFLAGS}
@@ -49,22 +49,22 @@ CPFLAGS  = ~cfr~v
 WFLAGS   = ~c~v
 LIBFILEFLAGS = -c -o $@
 
-CCZM=		${CC} ${CFLAGSZM}
+CCZM=           ${CC} ${CFLAGSZM}
 
 #
 # Libraries
 #
-CLIB		= CLIB:o.stubs
-RLIB		= RISCOSLIB:o.risc_oslib
-RSTUBS		= RISCOSLIB:o.rstubs
-ROMSTUBS	= RISCOSLIB:o.romstubs
-ROMCSTUBS	= RISCOSLIB:o.romcstubs
-ABSSYM		= RISC_OSLib:o.AbsSym
+CLIB            = CLIB:o.stubs
+RLIB            = RISCOSLIB:o.risc_oslib
+RSTUBS          = RISCOSLIB:o.rstubs
+ROMSTUBS        = RISCOSLIB:o.romstubs
+ROMCSTUBS       = RISCOSLIB:o.romcstubs
+ABSSYM          = RISC_OSLib:o.AbsSym
 #
 # Include files
 #
-INCLUDES 	= -IC:,<Lib$Dir>.tboxlibint.
-DFLAGS		=
+INCLUDES        = -IC:,<Lib$Dir>.tboxlibint.
+DFLAGS          =
 
 # Program specific options:
 #
@@ -78,7 +78,7 @@ EXPORTS     = ${LIBDIR}.tboxlibint
 OBJ      = o.mem o.messages o.string32 o.rmensure o.objmodule o.objsupport o.slist o.toolboxmem
 OBJZM    = z.mem z.messages z.string32 z.rmensure z.objmodule z.objsupport z.slist z.toolboxmem
 
-DBG_OBJ	  = o.debug
+DBG_OBJ   = o.debug
 DBG_OBJZM = z.debug
 
 #
@@ -87,8 +87,8 @@ DBG_OBJZM = z.debug
 .SUFFIXES: .z .o .c .s
 .c.o:;      ${CC} ${CFLAGS} -o $@ $<
 .c.z:;      ${CCZM} -c -o $@ $<
-.s.o:;	    ${AS} ${ASFLAGS} -o $@ $<
-.s.z:;	    ${AS} ${ASFLAGS} -o $@ $<
+.s.o:;      ${AS} ${ASFLAGS} -o $@ $<
+.s.z:;      ${AS} ${ASFLAGS} -o $@ $<
 
 #
 # Build
@@ -121,7 +121,7 @@ export: export_${PHASE}
 export_hdrs: dirs
 	${CP} objects   ${EXPORTS}.objects   ${CPFLAGS}
 	${CP} h.*       ${EXPORTS}.h.*   ${CPFLAGS}
-	${CP} hdr.*	${EXP_HDR}.*	${CPFLAGS}
+	${CP} hdr.*     ${EXP_HDR}.*    ${CPFLAGS}
 	${CP} TboxMake  ${EXPORTS}.TboxMake ${CPFLAGS}
 	${CP} VersionNum ${EXPORTS}.LibVersion ${CPFLAGS}
 	@echo ${DEBUGLIB} and ${TBOXLIB}: export complete (hdrs)

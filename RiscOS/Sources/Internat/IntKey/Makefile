@@ -52,13 +52,12 @@ LAYOUTS   = UK.s Italy.s Spain.s France.s Germany.s Esperanto.s Greece.s \
             Swed-Finl.s Denmark.s Norway.s Iceland.s Turkey.s Russia.s \
             Israel.s LatinAm.s Belgium.s Netherlands.s Japan.s \
             Switzerland.s Wales.s USA.s Korea.s Korea2.s Taiwan.s \
-            DvorakUK.s DvorakUSA.s
+            DvorakUK.s DvorakUSA.s Pandora.s
 
 ${ROM_OBJECT}: ${LAYOUTS}
 ${LAYOUTS}: keygen
 
 .layout.s:;  keygen ${STDTOOLOPTIONS} ${EXTRAKEYS} $< $@
-.c.o:;  ${MKDIR} o ; ${CC} ${CFLAGS} -o $@ $<
 
 clean::
 	${WIPE} s ${WFLAGS}
@@ -66,13 +65,13 @@ clean::
 	${RM} keyconvert
 	@echo ${COMPONENT}: cleaned
 
-keygen: keygen.o throwback.o unicdata.o
+keygen: keygen.c throwback.c unicdata.c
 	${MKDIR} s
-	${CC_HOST} -o $@ keygen.o throwback.o unicdata.o
+	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
-keyconvert: keyconvert.o unicdata.o
+keyconvert: keyconvert.c unicdata.c
 	${MKDIR} s
-	${CC_HOST} -o $@ keyconvert.o unicdata.o
+	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 install: ${LAYOUTS}
 

@@ -35,7 +35,6 @@ RDIR        = Resources
 LDIR        = ${RDIR}.${LOCALE}
 MODULE_NAME = !Help
 MODULE_HELP = "!Help"
-VERSION     = 1.00
 FILELIST    = ${RDIR}.Filelist
 
 #
@@ -53,14 +52,13 @@ CC      = cc
 LD      = link
 CP      = copy
 RM      = remove
-SQUISH  = squish
-WIPE    = -wipe
+SQZ     = squeeze
+WIPE    = x wipe
 XWIPE   = x wipe
+PERL    = do <Perl$Dir>.perl
 
-AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit -module
-CFLAGS  = ${THROWBACK} -depend !Depend -ffa ${INCLUDES} 
+CFLAGS  = ${THROWBACK} -depend !Depend -ffa ${INCLUDES}
 CPFLAGS = ~cfr~v
-SQFLAGS = -nolist
 WFLAGS  = ~c~v
 
 #
@@ -70,7 +68,6 @@ CLIB       = CLib:o.stubs
 EVENTLIB   = tbox:o.eventlib
 TOOLBOXLIB = tbox:o.toolboxlib
 WIMPLIB    = tbox:o.wimplib
-WRAPPER    = RISC_OSLib:s.ModuleWrap
 
 #
 # Include files
@@ -90,10 +87,6 @@ OBJS =\
   o.help \
   o.common
 
-# Resources to be included in the ROM module (not in Messages module}
-#RESFILES =\
-# ${RDIR}.!RunImage
-
 #
 # Rule patterns
 #
@@ -106,7 +99,6 @@ OBJS =\
 #
 # Main rules:
 #
-
 rom: ${MODULE}
 	@echo ${COMPONENT}: rom module built
 
@@ -124,6 +116,7 @@ install: ${FILES}
 	 ${CP} ${RDIR}.!RunImage  ${INSTDIR}.${APP}.!RunImage  ${CPFLAGS} 
 	 ${CP} ${LDIR}.Messages   ${INSTDIR}.${APP}.Messages   ${CPFLAGS}
 	 ${CP} ${LDIR}.Res        ${INSTDIR}.${APP}.Res        ${CPFLAGS}
+	 ${CP} ${RDIR}.!Sprites   ${INSTDIR}.${APP}.!Sprites   ${CPFLAGS}
 	 ${CP} ${RDIR}.!Sprites22 ${INSTDIR}.${APP}.!Sprites22 ${CPFLAGS}
 	 Access ${INSTDIR}.${APP}.* wr/r
 	 @echo
@@ -157,13 +150,12 @@ clean:
 
 Resources.!RunImage: ${OBJS} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} ${CLIB}
 	${LD} -o $@ ${OBJS} ${CLIB} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} 
+	${SQZ} ${SQZFLAGS} $@
 
-${MODULE}: ${FILES} ${VERSION}
+${MODULE}: ${FILES} VersionNum
 	   ${MKDIR} rm
-	   Do ${MODGEN} $@ ${MODULE_NAME} ${MODULE_HELP} <Help2$BuildVersion> -via ${FILELIST}
-
-${VERSION}:
-	perl build:getversion Help2$BuildVersion
+	   ${PERL} build:getversion Help2$BuildV Help2$FullV Help2$Date
+	   do ${MODGEN} -date "<Help2$Date>" $@ ${MODULE_NAME} ${MODULE_HELP} <Help2$BuildV> -via ${FILELIST}
 	
 BBETYPE = help2
 bbe-help2: bbe-generic

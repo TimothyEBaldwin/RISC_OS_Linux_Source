@@ -12,6 +12,7 @@ bbe-export: bbe-generic-resources-get-alias
 	BBE_Export_File_In_Dir ${APCS}.Hdr.Global Macros
 	BBE_Export_File_In_Dir ${APCS}.Hdr.Global Proc
 	BBE_Export_File_In_Dir ${APCS}.Hdr.Global.Machine <Machine>
+	BBE_Export_File_In_Dir ${APCS}.Hdr.Global.Machine All32
 	BBE_Export_File_In_Dir ${APCS}.Hdr.Global.Machine Machine
 	BBE_Export_File_In_Dir ${APCS}.Hdr.Interface ModHand
 	BBE_Export_File_In_Dir ${APCS}.C.Global.h AUN

@@ -36,6 +36,7 @@
 #include "net/if.h"
 #include "protocols/dhcp.h"
 #include "netinet/in.h"
+#include "arpa/inet.h"
 
 #include "dhcp.h"
 #include "interfaces.h"
@@ -44,6 +45,7 @@
 #include "packets.h"
 #include "dhcperrors.h"
 #include "dhcpinform.h"
+#include "iparp.h"
 
 extern void usermode_donothing(void);
 
@@ -273,10 +275,10 @@ void dhcp_service(int service_number, _kernel_swi_regs *r, void *private_word)
 static _kernel_oserror *dhcp_command_args_parse(const char *arg_string, char *iname, int *flags)
 {
 	union {
-		const char *args[4];
+		const char *args[5];
 		char buffer[36];
 	} ra_buf;
-	const char *const ra_pattern = "e/s,b=block/s,w/s,/a";
+	const char *const ra_pattern = "e/s,b=block/s,w/s,p/s,/a";
 	_kernel_oserror *e;
 
 	e = _swix(OS_ReadArgs, _INR(0,3), ra_pattern, arg_string, &ra_buf, sizeof(ra_buf));
@@ -284,7 +286,8 @@ static _kernel_oserror *dhcp_command_args_parse(const char *arg_string, char *in
 		if (ra_buf.args[0]) *flags |= decf_SET_ERROR;
 		if (ra_buf.args[1]) *flags |= decf_BLOCK;
 		if (ra_buf.args[2]) *flags |= decf_WAIT;
-		(void) strncpy(iname, ra_buf.args[3], IFNAMSIZ);
+		if (ra_buf.args[3]) *flags |= decf_PRIVATE;
+		(void) strncpy(iname, ra_buf.args[4], IFNAMSIZ);
 		iname[IFNAMSIZ] = '\0';
 		iname[strcspn(iname, "\r\n\t ")] = '\0';
 	}
@@ -317,14 +320,22 @@ static _kernel_oserror *dhcp_cmd_execute(const char *arg_string, void *private_w
 	int oldescapestate;
 
 	e = dhcp_command_args_parse(arg_string, ifname, &flags);
+	if (e != NULL) {
+	  trace(("dhcp_command_args_parse: %s\n", e->errmess));
+	  return e;
+	}
 
         /* Polling escape will only work if escape is enabled */
         _swix(OS_Byte, _INR(0,2) | _OUT(1), 229, 0, 0, &oldescapestate);
 
 	while (e == NULL) {
 		dhcp_swi_execute_regs exec_args;
+
 		exec_args.flags = dse_IMMEDIATE_START;
+		if (flags & decf_BLOCK) exec_args.flags |= dse_BLOCKING_MODE;
+		if (flags & decf_PRIVATE) exec_args.flags |= dse_ASSIGN_PRIVATE_IP;
 		exec_args.if_name = ifname;
+
 		e = dhcp_swi_execute((_kernel_swi_regs *) &exec_args, private_word);
 		if (e == NULL) {
 		        flags &= ~decf_WAIT;
@@ -338,6 +349,9 @@ static _kernel_oserror *dhcp_cmd_execute(const char *arg_string, void *private_w
 		else if (exec_args.out_status == dhcpstate_BOUND) {
 			trace(("DHCP: %s is now bound - *DHCPExecute exiting\n", ifname));
 			break;
+		} else if (exec_args.out_status == dhcpstate_ABANDON) {
+		  trace(("DHCP: abandon\n"));
+		  break;
 		}
 
 		e = dhcp_check_escape_key();
@@ -438,3 +452,72 @@ void module_idle(enum moduleidle_reason mir)
 		semaphore = 0;
 	}
 }
+
+
+/*
+ * A private IP is of the form 169.254.a.b where we get a and b from the
+ * last two octets of the MAC address (from the Driver Information Block).
+ * interface_delete() must have been called before calling this function,
+ * otherwise we get a nasty reentrancy situation due to a service call from
+ * the internet module telling us about the new IP address.
+*/
+void apply_private_ip(Dib *dib) {
+  unsigned long a, b;
+  struct in_addr addr, mask, broad;
+  char ifname[IFNAMSIZ];
+
+  a = dib->dib_address[4];
+  b = dib->dib_address[5];
+
+  /*
+   * All this casting is just to avoid compiler warnings - under RISC OS
+   * 'long', 'int' and 'uint32_t' are all 32 bits.
+   */
+
+  addr.s_addr = (uint32_t) htonl(0xa9fe0000u | (a << 8) | b);
+  mask.s_addr = (uint32_t) htonl(0xffff0000);
+  broad.s_addr = addr.s_addr | ~mask.s_addr;
+
+  trace(("trying private ip %s\n", inet_ntoa(addr)));
+
+  /*
+   * Check the resolver cache to check this address doesn't exist
+   * (although this is highly unlikely given how we produce it)
+   */
+  if (arp_for_ip(dib, addr.s_addr) != 0) {
+    trace(("address already in ARP cache, duplicate MAC address?"));
+    return;
+  }
+
+  snprintf(ifname, IFNAMSIZ, "%s%d", dib->dib_name, dib->dib_unit);
+
+  if (sockets_set_if_address(ifname, &addr, &broad, &mask) == 0) {
+    trace(("address %s\n", inet_ntoa(addr)));
+    trace(("netmask %s\n", inet_ntoa(mask)));
+    trace(("broadcast %s\n", inet_ntoa(broad)));
+    trace(("ok\n"));
+  }
+
+}
+
+
+#ifdef TRACE
+#include <stdarg.h>
+
+void tracef(char *format, ...) {
+  va_list ap;
+  char date[32];
+  FILE *f = fopen("dhcplog", "a+");
+  if (f == NULL) return;
+
+  time_t t = time(NULL);
+  strftime(date, 32, "%H:%M:%S", localtime(&t));
+  fprintf(f, "%s : ", date);
+
+  va_start(ap, format);
+  vfprintf(f, format, ap);
+  va_end(ap);
+
+  fclose(f);
+}
+#endif

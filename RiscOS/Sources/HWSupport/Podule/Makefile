@@ -36,23 +36,17 @@ COMPONENT = Podule
 #
 # Program specific options:
 #
-CHEADER1  = ${COMPONENT}
-HEADER1   = ${COMPONENT}
+HEADER1     = ${COMPONENT}
+ASMCHEADER1 = ${COMPONENT}
+EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
 
-TOKHELPSRC = ${TOKENSOURCE}
-HELPSRC    = HelpTexts
-ROM_SOURCE = GetAll.s
+TOKHELPSRC  = ${TOKENSOURCE}
+HELPSRC     = HelpTexts
+ROM_SOURCE  = GetAll.s
 
-ASFLAGS    = ${OPTIONS}
+ASFLAGS     = ${OPTIONS}
 
 include StdTools
 include AAsmModule
-
-#
-# Generic rules:
-#
-clean::
-	${WIPE} o ${WFLAGS}
-	@echo ${COMPONENT}: cleaned 
 
 # Dynamic dependencies:

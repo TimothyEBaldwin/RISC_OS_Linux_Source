@@ -40,7 +40,7 @@ RM      = remove
 LD      = link
 LB      = libfile
 TOUCH   = create
-WIPE    = -wipe
+WIPE    = x wipe
 
 # No specific preference
 OBJASMCPU =
@@ -112,6 +112,11 @@ export: export_${PHASE}
 
 install_rom: ${TARGET}
 	@echo ${COMPONENT}: rom module installed
+
+install:
+	${MKDIR} ${INSTDIR}.${COMPONENT}
+	${CP} ${LIBDIR}.* ${INSTDIR}.${COMPONENT}.* ${CPFLAGS}
+	@echo ${COMPONENT}: installed
 
 clean:
 	${WIPE} o ${WFLAGS}

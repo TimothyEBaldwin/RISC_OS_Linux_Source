@@ -32,7 +32,7 @@ MODULE     = rm.!Paint
 ROM_MODULE = aof.Paint
 RDIR       = Resources
 LDIR       = ${RDIR}.${LOCALE}
-
+MSGVERSION = ${AWK} -f Build:AwkVers
 MSGS       = Resources.GenMessage
 
 #
@@ -41,41 +41,19 @@ MSGS       = Resources.GenMessage
 RESDIR = <resource$dir>.Resources.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-SQUEEZE = squeeze
-WIPE    = -wipe
-XWIPE   = x wipe
+include StdTools
+include ModuleLibs
 
-AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit
-CFLAGS  = ${THROWBACK} -c -depend !Depend -fah ${INCLUDES} -wp
-CPFLAGS = ~cfr~v
-SQFLAGS = 
-WFLAGS  = ~c~v
-
-#
-# Libraries
-#
-ANSILIB   = CLib:o.ansilib
-CLIB      = CLIB:o.stubs
-RLIB      = RISC_OSLib:o.risc_oslib
-ROMSTUBS  = RISC_OSLib:o.romstubs
-ABSSYM    = RISC_OSLib:o.abssym
+SQZFLAGS  = -f
+CINCLUDES = -IC:
+ASFLAGS   = ${STDTOOLOPTIONS} -nocache -stamp -quit
+CFLAGS    = ${STDTOOLOPTIONS} ${C_WARNINGS} ${CINCLUDES} -wp
 WRAPPER   = RISC_OSLib:s.ModuleWrap
+LIBSD     = ${RLIB} ${CLIB}
 
 #
-# Include files
+# Include files:
 #
-INCLUDES = -IC:
-
 FILES = \
  ${RDIR}.!Boot\
  ${LDIR}.!Help\
@@ -94,7 +72,6 @@ FILESD = \
  ${LDIR}.Templates\
  abs.!RunImageD
 
-# Include these in the ROM module
 RESFILES =
 
 DFILES = \
@@ -107,11 +84,11 @@ DFILES = \
  debug.${APP}.Templates
 
 OBJS      = o.colours o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow \
-            o.jpeg o.writepixel o.AltRename o.PaintLib
+            o.AltRename o.PaintLib
 OBJSZ     = oz.colours oz.main oz.menus oz.psprite oz.sprwindow\
-            oz.tools oz.toolwindow o.jpeg o.writepixel oz.AltRename oz.PaintLib
+            oz.tools oz.toolwindow oz.AltRename oz.PaintLib
 OBJSD     = od.colours od.ftrace od.guard od.main od.menus\
-            od.psprite od.sprwindow od.tools od.toolwindow o.jpeg o.m  o.writepixel\
+            od.psprite od.sprwindow od.tools od.toolwindow o.m\
             od.AltRename od.PaintLib
 ASMS      = s.colours s.main s.menus s.psprite s.sprwindow s.tools s.toolwindow
 INCS      = i.colours i.main i.menus i.psprite i.sprwindow i.tools i.toolwindow
@@ -119,25 +96,29 @@ INCS      = i.colours i.main i.menus i.psprite i.sprwindow i.tools i.toolwindow
 #
 # Rule patterns
 #
-.SUFFIXES: .oz .od .i .asm
-.c.o:;      ${CC} ${CFLAGS} -ff -o $@ $<
-.c.oz:;     ${CC} ${CFLAGS} -ff -zM -zps1 -o $@ $<
-.c.od:;     ${CC} ${CFLAGS} -DTRACE=1 -o $@ $<
-.asm.o:;    ${AS} ${AFLAGS} $< $@
-.c.i:;      ${CC} -E ${CFLAGS} $< > $@
-.c.s:;      ${CC} ${CFLAGS} -s $<
+.SUFFIXES: .oz .od .asm
+.c.o:;    ${CC} ${CFLAGS} -c ${C_NO_FNAMES} $<
+.c.oz:;   ${CC} ${CFLAGS} -c ${C_NO_FNAMES} ${C_MODULE} ${C_NO_STKCHK} -o $@ $<
+.c.od:;   ${CC} ${CFLAGS} -c -DTRACE=1 -g -o $@ $<
+.asm.o:;  ${AS} ${ASFLAGS} $< $@
+.c.s:;    ${CC} ${CFLAGS} -s ${C_NO_FNAMES} $<
 
 #
 # Main rules:
 #
-# Application
-#
 all: ${FILES}
-	@echo ${COMPONENT}: Application built (Disc)
+	@${ECHO} ${COMPONENT}: Application built (Disc)
 
 rom: ${ROM_MODULE}
-	@echo ${COMPONENT}: Module built (ROM)
+	@${ECHO} ${COMPONENT}: Module built (ROM)
 
+ifeq (${TARGET},ThemeDefs)
+install:
+	${MKDIR} ${INSTDIR}.${USERIF}
+	${CP} LocalRes:DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Paint   ${CPFLAGS}
+	${CP} LocalRes:DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Paint22 ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: disc theme resources installed
+else
 install: ${FILES}
 	${MKDIR} ${INSTDIR}
 	${CP} ${RDIR}.!Boot      ${INSTDIR}.!Boot      ${CPFLAGS}
@@ -154,14 +135,15 @@ install: ${FILES}
 	Access ${INSTDIR}.Messages   lr/r
 	Access ${INSTDIR}.Sprites    lr/r
 	Access ${INSTDIR}.Templates  lr/r
-	@echo ${COMPONENT}: Application installed (Disc)
+	@${ECHO} ${COMPONENT}: Application installed (Disc)
+endif
 
 installd: ${FILESD}
 	${CP} ${RDIR}.!Boot      ${INSTDIR}.!Boot      ${CPFLAGS}
 	${CP} ${LDIR}.!Help      ${INSTDIR}.!Help      ${CPFLAGS}
 	${CP} ${LDIR}.!Run       ${INSTDIR}.!Run       ${CPFLAGS}
 	${CP} abs.!RunImageD     ${INSTDIR}.!RunImage  ${CPFLAGS}
-	${CP} ${LDIR}.Messages   ${INSTDIR}.Messages   ${CPFLAGS}
+	${CP} ${MSGS}            ${INSTDIR}.Messages   ${CPFLAGS}
 	${CP} ${LDIR}.Sprites    ${INSTDIR}.Sprites    ${CPFLAGS}
 	${CP} ${LDIR}.Templates  ${INSTDIR}.Templates  ${CPFLAGS}
 	Access ${INSTDIR}.!Boot      lr/r
@@ -171,11 +153,11 @@ installd: ${FILESD}
 	Access ${INSTDIR}.Messages   lr/r
 	Access ${INSTDIR}.Sprites    lr/r
 	Access ${INSTDIR}.Templates  lr/r
-	@echo ${COMPONENT}: Debug application installed (Disc)
+	@${ECHO} ${COMPONENT}: Debug application installed (Disc)
 
 install_rom: ${ROM_MODULE}
 	${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: Module installed (ROM)
+	@${ECHO} ${COMPONENT}: Module installed (ROM)
 
 resources: ${MSGS}
 	${MKDIR} ${RESDIR}
@@ -187,7 +169,7 @@ resources: ${MSGS}
 	${CP} ${MSGS}           ${RESDIR}.Messages   ${CPFLAGS}
 	${CP} ${LDIR}.Sprites   ${RESDIR}.Sprites   ${CPFLAGS}
 	${CP} ${LDIR}.Templates ${RESDIR}.Templates ${CPFLAGS}
-	@echo ${COMPONENT}: resource files copied to Messages module
+	@${ECHO} ${COMPONENT}: resource files copied to Messages module
 
 clean:
 	${XWIPE} o.* ${WFLAGS}
@@ -196,52 +178,21 @@ clean:
 	${XWIPE} s.* ${WFLAGS}
 	${XWIPE} linked.* ${WFLAGS}
 	${XWIPE} map.* ${WFLAGS}
+	${XWIPE} debug.!Paint.* ${WFLAGS}
+	${XWIPE} !Paint.* ${WFLAGS}
 	${RM} abs.!RunImage
 	${RM} abs.!RunImageD
 	${RM} ${ROM_MODULE}
 	${RM} ${MSGS}
 	${RM} ${MODULE}
-	@echo ${COMPONENT}: cleaned
-
-#
-# Development rules:
-# 
-app: ${FILES}
-	@echo Made application ${APP}
-
-appd: ${DFILES}
-	@echo Made debug.${APP}
-
-mod: ${MODULE}
-	@echo ${COMPONENT}: Module built (RAM)
-
-asms: ${ASMS}
-
-incs: ${INCS}
-
-clean_all:
-	Access ${INSTDIR}.!Boot      rw/rw
-	Access ${INSTDIR}.!Help      rw/rw
-	Access ${INSTDIR}.!Run       rw/rw
-	Access ${INSTDIR}.!RunImage  rw/rw
-	Access ${INSTDIR}.Messages   rw/rw
-	Access ${INSTDIR}.Sprites    rw/rw
-	Access ${INSTDIR}.Templates  rw/rw
-	Destroy ${OBJS} ${OBJSZ} ${OBJSD} o.ModuleWrap \
-        ${APP}.!RunImage \
-        debug.${APP}.!RunImage \
-        ${ROM_MODULE} ${MODULE} \
-        ${ASMS} s.Appname s.ModuleWrap s.ResFiles \
-        ${DFILES} ${INSTDIR}.!Boot ${INSTDIR}.!Help ${INSTDIR}.!Run \
-        ${INSTDIR}.!RunImage ${INSTDIR}.Messages ${INSTDIR}.Sprites \
-        ${INSTDIR}.Templates
+	@${ECHO} ${COMPONENT}: cleaned
 
 #
 # Static dependencies:
 #
 abs.!RunImage: ${OBJS} ${RLIB} ${CLIB}
 	${LD} -o $@ ${OBJS} ${RLIB} ${CLIB}
-	${SQUEEZE} ${SQFLAGS} $@
+	${SQZ} ${SQZFLAGS} $@
 
 ${MODULE}: oz.ModuleWrap ${OBJSZ} ${RLIB} ${CLIB}
 	${LD} -o $@ -module oz.ModuleWrap ${OBJSZ} ${RLIB} ${CLIB}
@@ -254,7 +205,7 @@ rom_link:
 	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM} \
               -map > map.${COMPONENT}
 	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom_link complete
+	@${ECHO} ${COMPONENT}: rom_link complete
 
 oz.ModuleWrap: s.ModuleWrap ${MSGS} s.AppName ${RESFILES} s.Resfiles
 	${AS} ${AFLAGS} s.ModuleWrap $@
@@ -262,8 +213,8 @@ oz.ModuleWrap: s.ModuleWrap ${MSGS} s.AppName ${RESFILES} s.Resfiles
 s.ModuleWrap: ${WRAPPER}
 	${CP} ${WRAPPER} $@ ${CPFLAGS}
 
-${MSGS}: ${LDIR}.Messages awk.Version
-	GNU.gawk -f awk.Version ${LDIR}.Messages > $@
+${MSGS}: ${LDIR}.Messages VersionNum
+	${MSGVERSION} ${LDIR}.Messages > $@
 
 s.ResFiles: asm.ResFiles
 	${CP} asm.ResFiles $@ ${CPFLAGS}

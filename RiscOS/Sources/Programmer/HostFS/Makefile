@@ -41,7 +41,7 @@ CPFLAGS = ~cfr~v
 #
 # Program specific options:
 #
-COMPONENT = TML_HostFS
+COMPONENT ?= TML_HostFS
 SOURCE    = s.${COMPONENT}
 TARGET    = rm.${COMPONENT}
 EXPORTS   = ${EXP_HDR}.HostFS \
@@ -78,5 +78,9 @@ ${EXP_HDR}.HostFS: hdr.HostFS
 
 ${EXP_HDR}.HostDebug: hdr.HostDebug
 	${CP} hdr.HostDebug $@ ${CPFLAGS}
+
+install_rom: ${TARGET}
+	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
+	@echo ${COMPONENT}: rom module installed
 
 # Dynamic dependencies:

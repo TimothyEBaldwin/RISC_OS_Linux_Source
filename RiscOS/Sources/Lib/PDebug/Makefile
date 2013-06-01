@@ -36,7 +36,7 @@ CM		= cmhg
 RM		= remove
 LD		= link
 LB		= libfile
-WIPE		= -wipe
+WIPE		= x wipe
 
 CCFLAGS		= -c -depend !Depend -ffah ${INCLUDES} ${DFLAGS} ${THROWBACK}
 ASFLAGS		= -depend !Depend -Stamp -NoCache -CloseExec -PreDefine "Desk_AS_EMBED_FNNAMES SETA 1" -quit

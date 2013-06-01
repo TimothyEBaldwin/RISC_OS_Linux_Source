@@ -41,7 +41,7 @@ MKDIR   = do mkdir -p
 CHMOD   = Unix.chmod ${CHMODFLAGS}
 CP      = copy
 RM      = remove
-WIPE    = -wipe
+WIPE    = x wipe
 AWK     = GNU.gawk
 
 CPFLAGS = ~cfr~v
@@ -62,33 +62,34 @@ COMMONFILES=\
 STBFILES=${SDIR}.pong.Pong
 
 DISCFILES= ${RDIR}.!Boot\
- ${LDIR}.!Help\
- ${RDIR}.!Run\
- ${RDIR}.!Sprites\
- ${RDIR}.!Sprites22\
- ${SDIR}.gethost.GetHost\
- ${SDIR}.ifrconfig.IfRConfig\
- ${SDIR}.map-mbone.Map-MBone\
- ${SDIR}.mrinfo.MRInfo\
- ${SDIR}.mtrace.MTrace\
- ${SDIR}.pong.Pong\
- ${SDIR}.utils.utl.RMFind\
- ${RDIR}.files.AUNMap\
- ${RDIR}.files.Hosts\
- ${RDIR}.files.MimeMap\
- ${RDIR}.files.Networks\
- ${RDIR}.files.Protocols\
- ${RDIR}.files.Services\
- ${RDIR}.utils.BootNet\
- ${SDIR}.utils.utl.CheckMem\
- ${SDIR}.newfiler.NewFiler\
- ${SDIR}.utils.utl.ReadCMOSIP\
- ${SDIR}.utils.utl.TriggerCBs
+        ${LDIR}.!Help\
+        ${LDIR}.!Run\
+        ${RDIR}.!Sprites\
+        ${RDIR}.!Sprites22\
+        ${RDIR}.!Sprites11\
+        ${SDIR}.gethost.GetHost\
+        ${SDIR}.ifrconfig.IfRConfig\
+        ${SDIR}.map-mbone.Map-MBone\
+        ${SDIR}.mrinfo.MRInfo\
+        ${SDIR}.mtrace.MTrace\
+        ${SDIR}.pong.Pong\
+        ${SDIR}.utils.utl.RMFind\
+        ${RDIR}.files.AUNMap\
+        ${RDIR}.files.Hosts\
+        ${RDIR}.files.MimeMap\
+        ${RDIR}.files.Networks\
+        ${RDIR}.files.Protocols\
+        ${RDIR}.files.Services\
+        ${RDIR}.utils.BootNet\
+        ${SDIR}.utils.utl.CheckMem\
+        ${SDIR}.newfiler.NewFiler\
+        ${SDIR}.utils.utl.ReadCMOSIP\
+        ${SDIR}.utils.utl.TriggerCBs
 
 FILES=\
-  ${COMMONFILES} \
-  ${DISCFILES} \
-  ${STBFILE}
+        ${COMMONFILES} \
+        ${DISCFILES} \
+        ${STBFILE}
 
 BAREMINUTILS = \
         ${SDIR}.ifconfig.IfConfig    \
@@ -103,8 +104,7 @@ EMERGENCYUTILS = \
         ${SDIR}.utils.utl.CheckMem   \
         ${SDIR}.newfiler.NewFiler    \
         ${SDIR}.sysctl.SysCtl        \
-        ${RDIR}.!Boot                \
-        ${RDIR}.!Run                 \
+        ${LDIR}.!Run                 \
   
 NETUTILS = \
         ${SDIR}.arp.ARP              \
@@ -123,8 +123,9 @@ NETUTILS = \
         ${SDIR}.sysctl.SysCtl        \
         ${SDIR}.traceroute.TraceRoute \
         ${RDIR}.!Boot                 \
-        ${RDIR}.!Run                  \
+        ${LDIR}.!Run                  \
         ${RDIR}.!Sprites              \
+        ${RDIR}.!Sprites11            \
         ${RDIR}.!Sprites22            \
 
 #
@@ -138,6 +139,10 @@ install: install_${OPTIONS} install_common dirs
         @echo ${COMPONENT}: All installed (Disc)
 
 install_common: ${COMMONFILES}
+        ${RM} ${INSTAPP}.!Help
+        ${RM} ${INSTAPP}.!Run
+        ${RM} ${INSTAPP}.!Boot
+        ${RM} ${INSTAPP}.files.AUNMap
         ${CP} ${SDIR}.arp.ARP               ${INSTAPP}.bin.ARP          ${CPFLAGS}
         ${CP} ${SDIR}.ifconfig.IfConfig     ${INSTAPP}.bin.IfConfig     ${CPFLAGS}
         ${CP} ${SDIR}.inetstat.InetStat     ${INSTAPP}.bin.InetStat     ${CPFLAGS}
@@ -165,11 +170,19 @@ install_: ${DISCFILES} dirs
         ${AWK} -f awk.Version ${RDIR}.!Boot > ${INSTAPP}.!Boot
         SetType ${INSTAPP}.!Boot Obey
         ${AWK} -f awk.Version ${LDIR}.!Help > ${INSTAPP}.!Help
-        ${AWK} -f awk.Version ${RDIR}.!Run > ${INSTAPP}.!Run
+        ${AWK} -f awk.Version ${LDIR}.!Run >  ${INSTAPP}.!Run
         SetType ${INSTAPP}.!Run Obey
-        ${CP} ${RDIR}.!Sprites   ${INSTAPP}.!Sprites   ${CPFLAGS}
-        ${CP} ${RDIR}.!Sprites22 ${INSTAPP}.!Sprites22 ${CPFLAGS}
+        |
+        ${MKDIR} ${INSTAPP}.Themes
+        ${CP} ${RDIR}.!Sprites   ${INSTAPP}.Themes.!Sprites   ${CPFLAGS}
+        ${CP} ${RDIR}.!Sprites11 ${INSTAPP}.Themes.!Sprites11 ${CPFLAGS}
+        ${CP} ${RDIR}.!Sprites22 ${INSTAPP}.Themes.!Sprites22 ${CPFLAGS}
+        ${CP} ${LDIR}.Ursula     ${INSTAPP}.Themes.Ursula     ${CPFLAGS}
+        ${CP} ${LDIR}.Morris4    ${INSTAPP}.Themes.Morris4    ${CPFLAGS}
+        |
         ${CP} ${RDIR}.files      ${INSTAPP}.files      ${CPFLAGS}
+        ${AWK} -f awk.Version ${RDIR}.files.AUNMap > ${INSTAPP}.files.AUNMap
+        SetType ${INSTAPP}.files.AUNMap Obey
         ${CP} ${RDIR}.utils      ${INSTAPP}.utils      ${CPFLAGS}
         |
         ${CP} ${SDIR}.map-mbone.Map-MBone   ${INSTAPP}.bin.Map-MBone    ${CPFLAGS}
@@ -200,7 +213,7 @@ resources-:
         @echo ${COMPONENT}: No resource files to copy
 
 resources-NetUtils: ${NETUTILS}
-        ${MKDIR} ${RESD}
+        ${MKDIR} ${RESD}.Themes
         ${MKDIR} ${RESD}.bin
         ${MKDIR} ${RESD}.files
         ${CP} ${SDIR}.arp.ARP               ${RESD}.bin.ARP          ${CPFLAGS}
@@ -226,10 +239,10 @@ resources-NetUtils: ${NETUTILS}
         ${CP} ${RDIR}.files.Services        ${RESD}.files.Services   ${CPFLAGS}
         ${AWK} -f awk.Version ${RDIR}.!Boot > ${RESD}.!Boot
         SetType ${RESD}.!Boot Obey
-        ${AWK} -f awk.Version ${RDIR}.!Run > ${RESD}.!Run
+        ${AWK} -f awk.Version ${LDIR}.!Run > ${RESD}.!Run
         SetType ${RESD}.!Run Obey
-        ${CP} ${RDIR}.!Sprites              ${RESD}.!Sprites   ${CPFLAGS}
-        ${CP} ${RDIR}.!Sprites22            ${RESD}.!Sprites22 ${CPFLAGS}
+        ${CP} ${RDIR}.!Sprites              ${RESD}.Themes.!Sprites   ${CPFLAGS}
+        ${CP} ${RDIR}.!Sprites22            ${RESD}.Themes.!Sprites22 ${CPFLAGS}
 
 resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${MKDIR} ${RESD}
@@ -249,9 +262,7 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${CP} ${RDIR}.files.Networks        ${RESD}.files.Networks   ${CPFLAGS}
         ${CP} ${RDIR}.files.Protocols       ${RESD}.files.Protocols  ${CPFLAGS}
         ${CP} ${RDIR}.files.Services        ${RESD}.files.Services   ${CPFLAGS}
-        ${AWK} -f awk.Version ${RDIR}.!Boot > ${RESD}.!Boot
-        SetType ${RESD}.!Boot Obey
-        ${AWK} -f awk.Version ${RDIR}.!Run > ${RESD}.!Run
+        ${AWK} -f awk.Version ${LDIR}.!Run > ${RESD}.!Run
         SetType ${RESD}.!Run Obey
 
 resources-BareMinUtils: ${BAREMINUTILS}

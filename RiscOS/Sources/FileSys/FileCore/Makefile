@@ -26,11 +26,29 @@ COMPONENT = FileCore
 
 HEADER1 = FileCore
 HEADER2 = MultiFS
+HEADER3 = FileCoreErr
+ASMCHEADER1 = FileCore
+CHEADER1 = FileCoreErr
+
+EXPORTS = ${C_EXP_HDR}.FileCore ${C_EXP_HDR}.FileCoreErr
 
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
 
 include StdTools
 include AAsmModule
+
+h.FileCoreErr: o.FileCoreErr
+	${MKDIR} h
+	${LD} -bin -o $@ o.FileCoreErr
+	SetType $@ Text
+
+o.FileCoreErr: s.FileCoreErr
+	${MKDIR} o
+	${AS} -o $@ s.FileCoreErr -I<Hdr$Dir>.Global,<Hdr$Dir>.Interface
+
+clean::
+	@IfThere h Then ${ECHO} ${WIPE} h ${WFLAGS}
+	@IfThere h Then ${WIPE} h ${WFLAGS}
 
 # Dynamic dependencies:

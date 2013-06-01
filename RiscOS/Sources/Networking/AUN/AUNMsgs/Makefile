@@ -31,24 +31,19 @@ MODGEN   = modgen
 MODSQZ   = modsqz
 RM       = remove
 SCANRES  = scanres
-PL       = perl
-WIPE    = -wipe
+PERL     = do <Perl$Dir>.perl
+WIPE     = x wipe
 
 CPFLAGS  = ~cfr~v
-WFLAGS  = ~cr~v
+WFLAGS   = ~cr~v
 
 #
 # Program specific options:
 #
 COMPONENT   = AUNMsgs
-VERSIONVAR  = AUNMsgs$Version
-VERSION     = <AUNMsgs$Version>
 TARGET      = rm.AUNMsgs
 MODULE_HELP = "AUN Messages"
 FILELIST    = Resources.${LOCALE}.<System>
-PLSCRIPT    = build:getversion
-
-
 
 #
 # Generic rules:
@@ -64,11 +59,9 @@ clean:
 	${RM} ${TARGET}
 	@echo ${COMPONENT}: cleaned
 
-${TARGET}: ${FILELIST} versionvar
-	Do ${MODGEN} $@ ${COMPONENT} ${MODULE_HELP} ${VERSION} -via ${FILELIST}
-
-versionvar:
-	${PL} ${PLSCRIPT} ${VERSIONVAR}
+${TARGET}: ${FILELIST} VersionNum
+	${PERL} build:getversion AUNMsgs$BuildV AUNMsgs$FullV AUNMsgs$Date
+	Do ${MODGEN} -date "<AUNMsgs$Date>" $@ ${COMPONENT} ${MODULE_HELP} <AUNMsgs$BuildV> -via ${FILELIST}
 
 BBETYPE = aunmsgs
 bbe-aunmsgs: bbe-generic-resources-get-alias

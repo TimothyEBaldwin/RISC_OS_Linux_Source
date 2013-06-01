@@ -33,13 +33,13 @@ all:
 
 
 clean:
-	Wipe o.Lib* ~c~r~v
+	x Wipe o.Lib* ~c~r~v
 	Echo Library $(COMPONENT): 'clean' finished.
 
 
 clean_all:	clean
-	Wipe		@.o.Sources.!Module.Sources ~c~vr
-	Wipe		@.o.Sources.!Normal.Sources ~c~vr
+	x Wipe		@.o.Sources.!Module.Sources ~c~vr
+	x Wipe		@.o.Sources.!Normal.Sources ~c~vr
 	Echo		Library $(COMPONENT): 'clean_all' finished.
 
 

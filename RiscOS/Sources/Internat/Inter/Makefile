@@ -26,22 +26,13 @@
 
 COMPONENT   = International
 TARGET      = Inter
-ROM_SOURCE  = InterMod.s
+ROM_SOURCE  = InterBody.s
 RESFSDIR    = ${RESDIR}.Internatio
-HELPSRC     = s.IntHelp
-TOKENSOURCE = s.IntHelpTok
-TOKHELPSRC  = s.IntHelpTok
+HELPSRC     = s.HelpSrc
+HEADER1     = Internatio
+TOKHELPSRC  = ${TOKENSOURCE}
 
 include StdTools
 include AAsmModule
-
-clean::
-	${RM} s.IntHelpDat
-	${RM} ${HELPSRC}
-	@echo ${COMPONENT}: cleaned
-
-s.IntHelp: IntHelpSrc IntHelpBody
-	${AS} -ABS ${ASFLAGS} -o s.IntHelpDat -From IntHelpSrc
-	${LD} -bin -o $@ s.IntHelpDat
 
 # Dynamic dependencies:

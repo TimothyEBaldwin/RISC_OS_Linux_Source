@@ -22,6 +22,7 @@
 # 11-May-01  SNB    Recreated.
 
 COMPONENT   ?= BASICTrans
+HEADER1      = BASICTrans
 ROM_SOURCE   = TransSrc.s
 RESFSDIR     = ${RESDIR}.BASIC
 

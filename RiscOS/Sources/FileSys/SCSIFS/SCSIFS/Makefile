@@ -29,19 +29,33 @@ COMPONENT = SCSIFS
 #
 CHEADER1  = ${COMPONENT}
 HEADER1   = ${COMPONENT}
+HEADER2   = SCSIFSErr
+ASMCHEADER1 = SCSIFSErr
+
+EXPORTS   = hdr.SCSIFSErr ${C_EXP_HDR}.SCSIFSErr
 
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
 ROM_SOURCE = s.Hdr_fst
+RESOURCES  = No
 
 include StdTools
 include AAsmModule
+
+hdr.SCSIFSErr: o.SCSIFSErr
+	${LD} -bin -o $@ o.SCSIFSErr
+	SetType $@ Text
+
+o.SCSIFSErr: s.SCSIFSErr
+	${MKDIR} o
+	${AS} -o $@ s.SCSIFSErr -I<Hdr$Dir>.Global,<Hdr$Dir>.Interface
 
 #
 # Generic rules:
 #
 clean::
 	${WIPE} o ${WFLAGS}
-	@@echo ${COMPONENT}: cleaned 
+	${RM} hdr.SCSIFSErr
+	@@echo ${COMPONENT}: cleaned
 
 # Dynamic dependencies:

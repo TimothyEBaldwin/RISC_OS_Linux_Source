@@ -26,7 +26,6 @@ COMPONENT     = Debugger
 HELPSRC       = HelpSrc
 TOKENSOURCE   = TokHelpSrc
 TOKHELPSRC    = ${TOKENSOURCE}
-ASFLAGS       = -cpu 4
 HEADER1       = Debugger
 
 include StdTools

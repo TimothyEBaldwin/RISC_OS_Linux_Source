@@ -14,17 +14,36 @@
 #
 # Makefile for BASIC
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name   Description
-# ----       ----   -----------
-# 11-May-01  SNB    Recreated.
 
 COMPONENT   ?= BASIC105
+VFPASM      ?= TRUE
+ifeq ($(VFPASM),TRUE)
+RESOURCES    = -private
+else
 RESOURCES    = no
+endif
+RESFSDIR     = ${RESDIR}.BASIC
 
 include StdTools
 include AAsmModule
+
+ifeq ($(VFPASM),TRUE)
+${ROM_OBJECT} ${SA_OBJECT} ${DBG_OBJECT}: s.VFPData
+ASFLAGS += -PD "VFPAssembler SETL {TRUE}"
+
+resources: o.VFPData
+	${MKDIR} ${RESFSDIR}
+	${LD} -BIN -Output ${RESFSDIR}.VFPData o.VFPData
+endif
+
+s.VFPData: VFPLib.VFPLib VFPLib.GenData
+	BASIC { < VFPLib.GenData }
+
+o.VFPData: s.VFPData
+	${MKDIR} o
+	${AS} ${ASFLAGS} -PD "standaloneVFPData SETL {TRUE}" -PD "standalone SETL {TRUE}" -o $@ s.VFPData 
+
+clean::
+	${RM} s.VFPData
 
 # Dynamic dependencies:

@@ -32,10 +32,8 @@ HEADER1   = ColourTran
 
 RESOURCEEXTRA = resources-colourtrans
 
-
 include StdTools
 include AAsmModule
-include AppLibs
 
 #
 # Binary build environment
@@ -52,31 +50,24 @@ bbe-local: bbe-generic
 #
 clean::
 	${XWIPE} Tables.* ${WFLAGS}
-	${XWIPE} MkTables.o.* ${WFLAGS}
 	${XWIPE} Palettes.* ${WFLAGS}
+	${XWIPE} MkTables.o.* ${WFLAGS}
 	${RM} MkTables.maketables
-	@echo ${COMPONENT}: cleaned
 
-resources-colourtrans: Palettes.8desktop
+resources-colourtrans: MkTables.maketables
+	${XWIPE} Tables.* ${WFLAGS}
+	${RUN}MkTables.maketables @
+	${SQUASH} Tables.4greys
+	${SQUASH} Tables.8greys  
+	${SQUASH} Tables.4desktop
 	${MKDIR} ${RESFSDIR}
 	${CP} Palettes ${RESFSDIR}.* ${CPFLAGS}
 	${CP} Tables   ${RESFSDIR}.* ${CPFLAGS}
 	@echo ${COMPONENT}: extra resource files copied
 
-MkTables.o.maketables: MkTables.c.maketables
-	${CC} $(ccflags) -c -o $@ MkTables.c.maketables
-
-MkTables.maketables:   MkTables.o.maketables ${CLIB} MkTables.o._dirs
-	link $(linkflags) -o $@ MkTables.o.maketables ${CLIB}
-
-Palettes.8desktop: MkTables.maketables ${ROM_MODULE}
-	ifthere ${ROM_MODULE} then rmload ${ROM_MODULE} else rmload rm.${TARGET}
-	MkTables.maketables @  
-	settype Tables.8greys text
-	settype Tables.4greys text
-	MkTables.dosqueeze
-	
-MkTables.o._dirs:
-	${MKDIR} MkTables.o
+MkTables.maketables: MkTables.c.maketables
+	${CD} MkTables
+	${MAKE} -f maketables/mk COMPONENT=maketables THROWBACK=${THROWBACK}
+	${CD} ^
 
 # Dynamic dependencies:

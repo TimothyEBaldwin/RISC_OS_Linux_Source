@@ -35,7 +35,7 @@ CP      = copy
 LD      = link
 RM      = remove
 SQUEEZE = squeeze
-WIPE    = -wipe
+WIPE    = x wipe
 
 AFLAGS  = ${THROWBACK} -depend !Depend -stamp -quit
 CPFLAGS = ~cfr~v

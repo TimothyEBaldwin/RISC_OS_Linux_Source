@@ -34,7 +34,7 @@ TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpTexts
 ROM_SOURCE = GetAll.s
 
-ASFLAGS    = ${OPTIONS} -cpu 4
+ASFLAGS    = ${OPTIONS}
 
 include StdTools
 include AAsmModule
@@ -46,4 +46,4 @@ clean::
 	${WIPE} rm ${WFLAGS}
 	@@echo ${COMPONENT}: cleaned 
 
-# Dynamic dependencies:o.Tungsten.PCISA: s.GetAll
+# Dynamic dependencies:

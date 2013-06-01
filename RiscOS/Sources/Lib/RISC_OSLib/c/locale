@@ -44,11 +44,12 @@
 #define N_LC_MONETARY 2
 #define N_LC_NUMERIC  3
 #define N_LC_TIME     4
-#define N_LC_ALL      5
+#define N_LC_MAX      5
 
 extern int _sprintf_lf(char *buff, const char *fmt, ...);
 
-int __locales[5] = {0, 0, 0, 0, 0};
+extern int __locales[N_LC_MAX];
+int __locales[N_LC_MAX] = {0, 0, 0, 0, 0};
 
 /* lc initialised to C for default */
 static struct lconv lc =
@@ -151,16 +152,16 @@ static void setlconv(int category, int *values)
 char *setlocale(int category, const char *locale)
 {
     static char lc_str[LC_STR_SIZE];
-    int tmp_locales[5] = {0, 0, 0, 0, 0};
+    int tmp_locales[N_LC_MAX] = {0, 0, 0, 0, 0};
     _kernel_swi_regs r;
     char *s;
-    int i, n;
+    int i, n, tz;
 
     /* I expect the category to be a bit-map - complain if out of range  */
     if (((unsigned)category > LC_ALL) || (category == 0))
       /* no can do... */
       return NULL;
-    if (locale == 0) {
+    if (locale == NULL) {
       /* get locale */
       _sprintf_lf(lc_str, "=%d,%d,%d,%d,%d",
                   __locales[0], __locales[1], __locales[2], __locales[3], __locales[4]);
@@ -170,8 +171,9 @@ char *setlocale(int category, const char *locale)
       if (strcmp(locale, "ISO8859-1") == 0)
         locale = "UK";
       if (*locale == '=') {
+        /* ISO9899 7.11.1.1 Parse the string as given by get locale */
         s = (char *)(locale + 1);
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < N_LC_MAX; i++) {
             n = 0;
             while (*s >= '0' && *s <= '9') {
                 n = n * 10 + *s - '0';
@@ -182,23 +184,52 @@ char *setlocale(int category, const char *locale)
         }
       } else {
         if (*locale == 0 || strcmp(locale, "C") == 0) {
-          n = 0;
-          if (!*locale && !_kernel_swi(Territory_Number, &r, &r)) {
+          /* ISO9899 7.11.1.1 Use "" for current locale, "C" for minimal locale */
+          n = 0; tz = 0;
+          if (!*locale && (_kernel_swi(Territory_Number, &r, &r) == NULL)) {
             n = r.r[0];
             r.r[1] = (int)lc_str;
             r.r[2] = LC_STR_SIZE;
-            if (!_kernel_swi(Territory_NumberToName, &r, &r))
+            if (_kernel_swi(Territory_NumberToName, &r, &r) == NULL)
               locale = lc_str;
           }
         } else {
-          r.r[0] = TERRITORY_UK;
-          r.r[1] = (int)locale;
-          if (_kernel_swi(Territory_NameToNumber, &r, &r) || r.r[0] == 0)
-            return NULL;
-          n = r.r[0];
+          /* Platform specific, permit the territory name and (optional) standard timezone */
+          strncpy(lc_str, locale, LC_STR_SIZE - 1);
+          s = strchr(lc_str, '/'); /* eg. "USA/PST" */
+          if (s != NULL) *s = 0;
+          r.r[0] = TERRITORY_UK;   /* Names must be in english */
+          r.r[1] = (int)lc_str;
+          if ((_kernel_swi(Territory_NameToNumber, &r, &r) != NULL) || (r.r[0] == 0))
+            return NULL;           /* Don't know that name */
+          n = r.r[0]; tz = 0;
+          if (_kernel_swi(Territory_WriteDirection, &r, &r) != NULL)
+            return NULL;           /* Check it's loaded (avoids Territory_Exists Z flag faff) */
+          if (s != NULL) {
+            locale = lc_str;       /* eg. "USA" */
+            s++;                   /* eg. "PST" */
+            if (*s) {              /* Null timezone taken as 0th */
+              while (1) {
+                r.r[0] = n;
+                r.r[1] = tz;
+                r.r[4] = (int)TERRITORY_TZ_API_EXT;
+                if (_kernel_swi(Territory_ReadTimeZones, &r, &r) != NULL)
+                  return NULL;     /* No more timezones to match */
+                if (strcmp((char *)r.r[0], s) == 0)
+                  break;           /* Exact match */
+                if (r.r[4])
+                  break;           /* Extended API not supported, use 0th */
+                tz++;
+              }
+            }
+          }
         }
-        for (i = 0; i < 5; i++)
-          tmp_locales[i] = n;
+        for (i = 0; i < N_LC_MAX; i++) {
+          if (i == N_LC_TIME)
+            tmp_locales[i] = TERRITORY_ENCODE(n, tz); /* Packed format */
+          else
+            tmp_locales[i] = n;
+        }
       }
       setlocales(category, tmp_locales);
       setlconv(category, tmp_locales);
@@ -232,9 +263,17 @@ static int findweek(int yday, int startday, int today)
 static char *getterritorytimeinfo(int territory, const struct tm *tt, char *fmt, char *buff, int swi)
 {
     _kernel_swi_regs r;
-    int tm_block[7];
-    char utc_block[5];
+    int  tm_block[7];
+    long long utc_block;
 
+    /* The tm struct came from either gmtime() or localtime() and therefore already     */
+    /* has any timezone and daylight saving applied to it as implied by the choice of   */
+    /* the 2 functions called. Therefore it needs converting as though it's UTC         */
+    /* already. Note that Territory_ConvertOrdinalsToTime applies its own correction    */
+    /* based on the active territory (not necessarily the same as the locale set for    */
+    /* our client) and since there isn't a UTC equivalent of that SWI until             */
+    /* Territory_ConvertTimeFormats comes along (which might not be available on the    */
+    /* host OS) we must do the opposite correction to the calculated time. Sigh.        */
     tm_block[0] = 0;
     tm_block[1] = tt->tm_sec;
     tm_block[2] = tt->tm_min;
@@ -243,16 +282,21 @@ static char *getterritorytimeinfo(int territory, const struct tm *tt, char *fmt,
     tm_block[5] = tt->tm_mon + 1;
     tm_block[6] = tt->tm_year + 1900;
     r.r[0] = TERRITORY_UK;
-    r.r[1] = (int)utc_block;
+    r.r[1] = (int)&utc_block;
     r.r[2] = (int)tm_block;
-    if (_kernel_swi(Territory_ConvertOrdinalsToTime, &r, &r))
+    if (_kernel_swi(Territory_ConvertOrdinalsToTime, &r, &r) != NULL)
         return "???";
-    r.r[0] = territory;
-    r.r[1] = (int)utc_block;
+    if (_kernel_swi(Territory_ReadCurrentTimeZone, &r, &r) != NULL)
+        return "???";
+    utc_block = utc_block + r.r[1];
+
+    r.r[0] = TERRITORY_EXTRACT(territory);
+    r.r[1] = (int)&utc_block;
     r.r[2] = (int)buff;
-    r.r[3] = CDT_BUFFSIZE;
+    r.r[3] = CDT_BUFFSIZE | (1<<30) | (1<<31); /* No DST, R5 cs offset */
     r.r[4] = (int)fmt;
-    if (_kernel_swi(swi, &r, &r))
+    r.r[5] = 0;
+    if (_kernel_swi(swi, &r, &r) != NULL)
         return "???";
     return buff;
 }
@@ -264,30 +308,39 @@ static char *gettimeinfo(int territory, const struct tm *tt, char *fmt, char *bu
 
 static char *gettimedate(int territory, const struct tm *tt, char *buff, int swi)
 {
-    return getterritorytimeinfo(territory, tt, "", buff, swi);
+    return getterritorytimeinfo(territory, tt, NULL, buff, swi);
 }
 
-static char *gettimezone(int territory, char *buff)
+static char *gettimezone(int territory, const struct tm *tt, char *buff, int numeric)
 {
     _kernel_swi_regs r;
-    int dst, offset;
-    r.r[0] = 161;
-    dst = _kernel_osbyte(161, 220, 0);
-    if (dst < 0) return "";
-    r.r[0] = territory;
-    if (_kernel_swi(Territory_ReadTimeZones, &r, &r))
-        return "";
-    offset = dst & 0x8000 ? r.r[3] : r.r[2];
-    if (offset < 0)
-       offset = -offset, buff[0] = '-';
+
+    if (tt->tm_isdst < 0)
+        return ""; /* Undetermined */
+    r.r[0] = TERRITORY_EXTRACT(territory);
+    r.r[1] = TERRITORY_TZ_EXTRACT(territory);
+    r.r[4] = (int)TERRITORY_TZ_API_EXT;
+    if (_kernel_swi(Territory_ReadTimeZones, &r, &r) != NULL)
+        return ""; /* Undetermined */
+    if (numeric)
+    {
+        int offset = tt->tm_isdst ? r.r[3] : r.r[2];
+
+        if (offset < 0)
+            offset = -offset, buff[0] = '-';
+        else
+            buff[0] = '+';
+        offset = (offset + 3000) / 6000; /* centiseconds -> minutes */
+        sprintf(buff+1, "%.2d%.2d", offset / 60, offset % 60);
+    }
     else
-       buff[0] = '+';
-    offset = (offset + 3000) / 6000; /* centiseconds -> minutes */
-    sprintf(buff+1, "%.2d%.2d", offset / 60, offset % 60);
+    {
+        strcpy(buff, tt->tm_isdst ? (char *)r.r[1] : (char *)r.r[0]);
+    }
     return buff;
 }
 
-static int daysinyear(int year)
+static int getdaysinyear(int year)
 {
     if (year % 4 != 0) return 365;
     if (year % 100 != 0) return 366;
@@ -307,9 +360,9 @@ static void getiso8601week(char *buff, int spec, int year, int wday, int yday)
         if (week == 0)
         {
             /* This week belongs to last year - go round again */
-            start_of_week += daysinyear(--year);
+            start_of_week += getdaysinyear(--year);
         }
-        else if (week == 53 && start_of_week >= daysinyear(year)-3)
+        else if (week == 53 && start_of_week >= getdaysinyear(year)-3)
         {
             /* <=3 days of week 53 fall in this year, so we treat it as week 1 of next year */
             week = 1;
@@ -355,37 +408,38 @@ size_t strftime(char *s, size_t maxsize, const char *fmt, const struct tm *tt)
                 fmt--;
                 continue;
         case 'a':
-                ss = abbrweek[tt->tm_wday];
                 if (territory)
                     ss = gettimeinfo(territory, tt, "%W3", buff);
+                else
+                    ss = abbrweek[tt->tm_wday];
                 break;
         case 'A':
-                ss = fullweek[tt->tm_wday];
                 if (territory)
                     ss = gettimeinfo(territory, tt, "%WE", buff);
+                else
+                    ss = fullweek[tt->tm_wday];
                 break;
         case 'b': case 'h':
-                ss = abbrmonth[tt->tm_mon];
                 if (territory)
                     ss = gettimeinfo(territory, tt, "%M3", buff);
+                else
+                    ss = abbrmonth[tt->tm_mon];
                 break;
         case 'B':
-                ss = fullmonth[tt->tm_mon];
                 if (territory)
                     ss = gettimeinfo(territory, tt, "%MO", buff);
+                else
+                    ss = fullmonth[tt->tm_mon];
                 break;
         case 'c':
-                /* Format for "C" locale changed as per C99 */
-                if (!territory)
+                if (territory)
+                    ss = gettimedate(territory, tt, ss, Territory_ConvertStandardDateAndTime);
+                else
+                    /* Format for "C" locale changed as per C99 "%a %b %e %T %Y" */
                     sprintf(ss, "%s %s %2d %.2d:%.2d:%.2d %d",
                                 tt->tm_wday < 7U ? abbrweek[tt->tm_wday] : "???",
                                 abbrmonth[tt->tm_mon], tt->tm_mday,
                                 tt->tm_hour, tt->tm_min, tt->tm_sec, tt->tm_year + 1900);
-                    /*sprintf(ss, "%02d %s %d %02d:%02d:%02d",
-                        tt->tm_mday, abbrmonth[tt->tm_mon], tt->tm_year + 1900,
-                        tt->tm_hour, tt->tm_min, tt->tm_sec);*/
-                else
-                    ss = gettimedate(territory, tt, ss, Territory_ConvertStandardDateAndTime);
                 break;
         case 'C':
                 sprintf(ss, "%.2d", (tt->tm_year + 1900) / 100);
@@ -425,17 +479,18 @@ size_t strftime(char *s, size_t maxsize, const char *fmt, const struct tm *tt)
                 break;
         case 'p':
 /* I am worried here re 12.00 AM/PM and times near same.                 */
-                ss = ampmname[tt->tm_hour >= 12];
                 if (territory)
                     ss = gettimeinfo(territory, tt, "%AM", buff);
+                else
+                    ss = ampmname[tt->tm_hour >= 12];
                 break;
         case 'r':
-                if (!territory)
+                if (territory)
+                    ss = gettimeinfo(territory, tt, "%12:%MI:%SE %AM", buff);
+                else
                     sprintf(ss, "%.2d:%.2d:%.2d %s",
                             (tt->tm_hour + 11) % 12 + 1, tt->tm_min, tt->tm_sec,
                             ampmname[tt->tm_hour >= 12]);
-                else
-                    ss = gettimeinfo(territory, tt, "%12:%MI:%SE %AM", buff);
                 break;
         case 'R':
                 sprintf(ss, "%.2d:%.2d", tt->tm_hour, tt->tm_min);
@@ -462,21 +517,19 @@ size_t strftime(char *s, size_t maxsize, const char *fmt, const struct tm *tt)
                 sprintf(ss, "%.2d", findweek(tt->tm_yday, 1, tt->tm_wday));
                 break;
         case 'x':
-/* The next two had better agree with %c conversions                     */
-                /* Format for "C" locale changed as per C99 */
-                if (!territory)
-                    /*sprintf(ss, "%02d %s %d",
-                            tt->tm_mday, abbrmonth[tt->tm_mon], tt->tm_year + 1900);*/
-                    sprintf(ss, "%.2d/%.2d/%.2d", tt->tm_mon + 1, tt->tm_mday, tt->tm_year % 100);
-                else
+                if (territory)
                     ss = gettimedate(territory, tt, ss, Territory_ConvertStandardDate);
+                else
+                    /* Format for "C" locale changed as per C99 */
+                    sprintf(ss, "%.2d/%.2d/%.2d",
+                            tt->tm_mon + 1, tt->tm_mday, tt->tm_year % 100);
                 break;
         case 'X':
-                if (!territory)
+                if (territory)
+                    ss = gettimedate(territory, tt, ss, Territory_ConvertStandardTime);
+                else
                     sprintf(ss, "%.2d:%.2d:%.2d",
                             tt->tm_hour, tt->tm_min, tt->tm_sec);
-                else
-                    ss = gettimedate(territory, tt, ss, Territory_ConvertStandardTime);
                 break;
         case 'y':
                 sprintf(ss, "%.2d", tt->tm_year % 100);
@@ -484,16 +537,11 @@ size_t strftime(char *s, size_t maxsize, const char *fmt, const struct tm *tt)
         case 'Y':
                 sprintf(ss, "%d", tt->tm_year + 1900);
                 break;
-        case 'z':
-                ss = "";
+        case 'z': case 'Z':
                 if (territory)
-                    ss = gettimezone(territory, buff);
-                break;
-        case 'Z':
-                /* No timezone exists here */
-                ss = "";
-                if (territory)
-                    ss = gettimeinfo(territory, tt, "%TZ", buff);
+                    ss = gettimezone(territory, tt, buff, c == 'z');
+                else
+                    ss = "";
                 break;
         case '%':
                 push('%');

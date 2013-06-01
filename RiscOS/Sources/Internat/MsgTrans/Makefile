@@ -27,7 +27,7 @@ TARGET    = MsgTrans
 HEADER1   = MsgTrans
 HEADER2   = MsgMenus
 
-SA_DEBUG  =\
+ASDFLAGS  =\
  -PD "AltTitleAndSWI SETL {TRUE}" \
  -PD "standalone SETL {TRUE}" \
  -PD "MergedMsgs SETS \"${MERGEDMSGS}\""

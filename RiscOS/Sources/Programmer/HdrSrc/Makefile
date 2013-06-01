@@ -38,10 +38,11 @@
 #
 # Paths
 #
-TOPDIR = <hdr$dir>
-HDRDIR = ${TOPDIR}.Global
-HDIR   = <CExport$dir>
-LIBDIR = <Lib$Dir>
+TOPDIR   = <hdr$dir>
+HDRDIR   = ${TOPDIR}.Global
+HDIR     = <CExport$dir>
+LIBDIR   = <Lib$Dir>
+INSTDIR ?= <APCSExport$Dir>
 
 include StdTools
 
@@ -56,6 +57,7 @@ EXPORTS   = \
  ${HDRDIR}.AUN \
  ${HDRDIR}.CMOS \
  ${HDRDIR}.Countries \
+ ${HDRDIR}.CPU.Arch \
  ${HDRDIR}.CPU.ARM600 \
  ${HDRDIR}.CPU.FPA \
  ${HDRDIR}.CPU.Generic26 \
@@ -70,6 +72,7 @@ EXPORTS   = \
  ${HDRDIR}.FileTypes \
  ${HDRDIR}.FSNumbers \
  ${HDRDIR}.GraphicsV \
+ ${HDRDIR}.HALSize.<HALSize> \
  ${HDRDIR}.Heap \
  ${HDRDIR}.ImageSize.<ImageSize> \
  ${HDRDIR}.IO.GenericIO \
@@ -79,16 +82,18 @@ EXPORTS   = \
  ${HDRDIR}.IO.IOMD \
  ${HDRDIR}.IO.IOMDL \
  ${HDRDIR}.Keyboard \
- ${HDRDIR}.KEYV \
  ${HDRDIR}.ListOpts \
  ${HDRDIR}.MEMM.ARM600 \
  ${HDRDIR}.MEMM.MEMC1 \
+ ${HDRDIR}.MEMM.VMSAv6 \
  ${HDRDIR}.Machine.<Machine> \
+ ${HDRDIR}.Machine.All32 \
  ${HDRDIR}.Machine.Machine \
  ${HDRDIR}.Macros \
  ${HDRDIR}.Messages \
  ${HDRDIR}.NdrDebug \
  ${HDRDIR}.NewErrors \
+ ${HDRDIR}.OsBytes \
  ${HDRDIR}.OsWords \
  ${HDRDIR}.PaletteV \
  ${HDRDIR}.PDriverReg \
@@ -116,12 +121,13 @@ EXPORTS   = \
  ${HDIR}.Global.h.EnvNumbers \
  ${HDIR}.Global.h.FileTypes \
  ${HDIR}.Global.h.FreeWay \
+ ${HDIR}.Global.h.FreewayReg \
  ${HDIR}.Global.h.FSNumbers \
  ${HDIR}.Global.h.GraphicsV \
  ${HDIR}.Global.h.Heap \
  ${HDIR}.Global.h.Keyboard \
- ${HDIR}.Global.h.KeyV \
  ${HDIR}.Global.h.NewErrors \
+ ${HDIR}.Global.h.OsBytes \
  ${HDIR}.Global.h.OsWords \
  ${HDIR}.Global.h.PaletteV \
  ${HDIR}.Global.h.PDriverReg \
@@ -137,6 +143,14 @@ EXPORTS   = \
  ${HDIR}.Global.IO.h.GenericIO \
  ${HDIR}.Global.IO.h.IOMD \
 
+INSTALLS   = \
+ ${INSTDIR}.Hdr.APCS.APCS-32 \
+ ${INSTDIR}.Hdr.APCS.APCS-R \
+ ${INSTDIR}.Hdr.APCS.Common \
+ ${INSTDIR}.Hdr.CPU.Generic26 \
+ ${INSTDIR}.Hdr.CPU.Generic32 \
+ ${INSTDIR}.Hdr.ListOpts \
+
 #
 # Generic rules:
 #
@@ -151,6 +165,7 @@ Dirs:
 	${MKDIR} ${HDRDIR}.APCS
 	${MKDIR} ${HDRDIR}.CPU
 	${MKDIR} ${HDRDIR}.FDC
+	${MKDIR} ${HDRDIR}.HALSize
 	${MKDIR} ${HDRDIR}.IO
 	${MKDIR} ${HDRDIR}.ImageSize
 	${MKDIR} ${HDRDIR}.Machine
@@ -164,16 +179,34 @@ Dirs:
 	${MKDIR} ${HDIR}.Interface.h
 	${MKDIR} ${LIBDIR}
 
+install: ${INSTALLS} install_Dirs
+
+install_Dirs:
+	${MKDIR} ${INSTDIR}.Hdr.APCS
+	${MKDIR} ${INSTDIR}.Hdr.CPU
+
 clean:
 	@echo ${COMPONENT}: nothing to clean
+
+#
+# Rules for installing:
+#
+
+${INSTDIR}.Hdr.APCS.APCS-32:  hdr.APCS.APCS-32;  ${CP} hdr.APCS.APCS-32  $@ ${CPFLAGS}
+${INSTDIR}.Hdr.APCS.APCS-R:   hdr.APCS.APCS-R;   ${CP} hdr.APCS.APCS-R   $@ ${CPFLAGS}
+${INSTDIR}.Hdr.APCS.Common:   hdr.APCS.Common;   ${CP} hdr.APCS.Common   $@ ${CPFLAGS}
+${INSTDIR}.Hdr.CPU.Generic26: hdr.CPU.Generic26; ${CP} hdr.CPU.Generic26 $@ ${CPFLAGS}
+${INSTDIR}.Hdr.CPU.Generic32: hdr.CPU.Generic32; ${CP} hdr.CPU.Generic32 $@ ${CPFLAGS}
+${INSTDIR}.Hdr.ListOpts:      hdr.ListOpts;      ${CP} hdr.ListOpts      $@ ${CPFLAGS}
 
 #
 # Special rule for exporting all ImageSize, Machine and UserIF files.
 # Trigger by invoking the export with OPTIONS=ALL.
 #
-ALL: ${HDRDIR}.Machine.Machine ${HDRDIR}.UserIF.UserIF ${HDRDIR}.ImageSize.<ImageSize> ${HDRDIR}.APCS.<APCS>
+ALL: ${HDRDIR}.Machine.Machine ${HDRDIR}.UserIF.UserIF ${HDRDIR}.HALSize.<HALSize> ${HDRDIR}.ImageSize.<ImageSize> ${HDRDIR}.APCS.<APCS>
 	${CP} hdr.Machine ${HDRDIR}.Machine ${CPFLAGS}
 	${CP} hdr.UserIF ${HDRDIR}.UserIF ${CPFLAGS}
+	${CP} hdr.HALSize ${HDRDIR}.HALSize ${CPFLAGS}
 	${CP} hdr.ImageSize ${HDRDIR}.ImageSize ${CPFLAGS}
 	${CP} hdr.APCS ${HDRDIR}.APCS ${CPFLAGS}
 
@@ -191,9 +224,9 @@ ${HDRDIR}.FileTypes:  hdr.FileTypes;   ${CP} hdr.FileTypes  $@ ${CPFLAGS}
 ${HDRDIR}.FSNumbers:  hdr.FSNumbers;   ${CP} hdr.FSNumbers  $@ ${CPFLAGS}
 ${HDRDIR}.GraphicsV:  hdr.GraphicsV;   ${CP} hdr.GraphicsV  $@ ${CPFLAGS}
 ${HDRDIR}.Keyboard:   hdr.Keyboard;    ${CP} hdr.Keyboard   $@ ${CPFLAGS}
-${HDRDIR}.KEYV:       hdr.KEYV;        ${CP} hdr.KEYV       $@ ${CPFLAGS}
 ${HDRDIR}.Messages:   hdr.Messages;    ${CP} hdr.Messages   $@ ${CPFLAGS}
 ${HDRDIR}.NewErrors:  hdr.NewErrors;   ${CP} hdr.NewErrors  $@ ${CPFLAGS}
+${HDRDIR}.OsBytes:    hdr.OsBytes;     ${CP} hdr.OsBytes    $@ ${CPFLAGS}
 ${HDRDIR}.OsWords:    hdr.OsWords;     ${CP} hdr.OsWords    $@ ${CPFLAGS}
 ${HDRDIR}.PaletteV:   hdr.PaletteV;    ${CP} hdr.PaletteV   $@ ${CPFLAGS}
 ${HDRDIR}.PDriverReg: hdr.PDriverReg;  ${CP} hdr.PDriverReg $@ ${CPFLAGS}
@@ -213,13 +246,14 @@ ${HDIR}.Global.h.DrawObj:    hdr.DrawObj;     ${HDR2H} hdr.DrawObj    $@
 ${HDIR}.Global.h.EnvNumbers: hdr.EnvNumbers;  ${HDR2H} hdr.EnvNumbers $@
 ${HDIR}.Global.h.FileTypes:  hdr.FileTypes;   ${HDR2H} hdr.FileTypes  $@
 ${HDIR}.Global.h.FreeWay:    hdr.FreeWay;     ${HDR2H} hdr.FreeWay    $@
+${HDIR}.Global.h.FreewayReg: hdr.FreewayReg;  ${HDR2H} hdr.FreewayReg $@
 ${HDIR}.Global.h.FSNumbers:  hdr.FSNumbers;   ${HDR2H} hdr.FSNumbers  $@
 ${HDIR}.Global.h.GraphicsV:  hdr.GraphicsV;   ${HDR2H} hdr.GraphicsV  $@
 ${HDIR}.Global.h.Keyboard:   hdr.Keyboard;    ${HDR2H} hdr.Keyboard   $@
-${HDIR}.Global.h.KeyV:       hdr.KeyV;        ${HDR2H} hdr.KeyV       $@
 ${HDIR}.Global.h.Messages:   hdr.Messages;    ${HDR2H} hdr.Messages   $@
 ${HDIR}.Global.h.NewErrors:  hdr.NewErrors;   ${HDR2H} hdr.NewErrors  $@
 # NewErrors still has a few problems.  Partial support is there.
+${HDIR}.Global.h.OsBytes:    hdr.OsBytes;     ${HDR2H} hdr.OsBytes    $@
 ${HDIR}.Global.h.OsWords:    hdr.OsWords;     ${HDR2H} hdr.OsWords    $@
 ${HDIR}.Global.h.PaletteV:   hdr.PaletteV;    ${HDR2H} hdr.PaletteV   $@
 ${HDIR}.Global.h.PDriverReg: hdr.PDriverReg;  ${HDR2H} hdr.PDriverReg $@
@@ -251,10 +285,13 @@ ${HDIR}.Global.h.IOCtl:      h.IOCtl;               ${CP} h.IOCtl               
 
 # Machine/UI/hardware specific headers:
 ${HDRDIR}.Machine.<Machine>: hdr.Machine.<Machine>; ${CP} hdr.Machine.<Machine>    $@ ${CPFLAGS}
+${HDRDIR}.Machine.All32:     hdr.Machine.All32;     ${CP} hdr.Machine.All32        $@ ${CPFLAGS}
 ${HDRDIR}.Machine.Machine:   hdr.Machine.Machine;   ${CP} hdr.Machine.Machine      $@ ${CPFLAGS}
+${HDRDIR}.HALSize.<HALSize>: hdr.HALSize.<HALSize>; ${CP} hdr.HALSize.<HALSize>    $@ ${CPFLAGS}
 ${HDRDIR}.ImageSize.<ImageSize>: hdr.ImageSize.<ImageSize>; ${CP} hdr.ImageSize.<ImageSize> $@ ${CPFLAGS}
 ${HDRDIR}.APCS.<APCS>:       hdr.APCS.<APCS>;       ${CP} hdr.APCS.<APCS>          $@ ${CPFLAGS}
 ${HDRDIR}.APCS.Common:       hdr.APCS.Common;       ${CP} hdr.APCS.Common          $@ ${CPFLAGS}
+${HDRDIR}.CPU.Arch:          hdr.CPU.Arch;          ${CP} hdr.CPU.Arch             $@ ${CPFLAGS}
 ${HDRDIR}.CPU.ARM600:        hdr.CPU.ARM600;        ${CP} hdr.CPU.ARM600           $@ ${CPFLAGS}
 ${HDRDIR}.CPU.FPA:           hdr.CPU.FPA;           ${CP} hdr.CPU.FPA              $@ ${CPFLAGS}
 ${HDRDIR}.CPU.Generic26:     hdr.CPU.Generic26;     ${CP} hdr.CPU.Generic26        $@ ${CPFLAGS}
@@ -268,6 +305,7 @@ ${HDRDIR}.IO.IOMD:           hdr.IO.IOMD;           ${CP} hdr.IO.IOMD           
 ${HDRDIR}.IO.IOMDL:          hdr.IO.IOMDL;          ${CP} hdr.IO.IOMDL             $@ ${CPFLAGS}
 ${HDRDIR}.MEMM.ARM600:       hdr.MEMM.ARM600;       ${CP} hdr.MEMM.ARM600          $@ ${CPFLAGS}
 ${HDRDIR}.MEMM.MEMC1:        hdr.MEMM.MEMC1;        ${CP} hdr.MEMM.MEMC1           $@ ${CPFLAGS}
+${HDRDIR}.MEMM.VMSAv6:       hdr.MEMM.VMSAv6;       ${CP} hdr.MEMM.VMSAv6          $@ ${CPFLAGS}
 ${HDRDIR}.VIDC.VIDC1a:       hdr.VIDC.VIDC1a;       ${CP} hdr.VIDC.VIDC1a          $@ ${CPFLAGS}
 ${HDRDIR}.VIDC.VIDC20:       hdr.VIDC.VIDC20;       ${CP} hdr.VIDC.VIDC20          $@ ${CPFLAGS}
 

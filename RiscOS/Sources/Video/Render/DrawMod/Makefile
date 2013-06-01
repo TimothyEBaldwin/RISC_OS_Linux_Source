@@ -26,8 +26,6 @@ COMPONENT  = DrawMod
 ROM_SOURCE = Draw.s
 HEADER1    = Draw
 
-ASFLAGS    = -cpu 4
-
 include StdTools
 include AAsmModule
 

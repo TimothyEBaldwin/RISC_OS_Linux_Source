@@ -23,7 +23,7 @@
 # 08-Dec-94  AMcC         Adjust rules and dependencies so that
 #                         tokens don't need to be generated every time
 #                         - remove data.Dictionary to regenerate tokens
-# 05 Sep 1997 RWB	Corrected error on usage of WFLAGS
+# 05 Sep 1997 RWB       Corrected error on usage of WFLAGS
 
 #
 # Generic options:
@@ -87,13 +87,13 @@ install_rom: ${BUILT}
 # and no options - but must clean all targets).
 #
 clean:
-	${WIPE} ${BUILTDIR}.* ${WFLAGS}
+	${XWIPE} ${BUILTDIR}.* ${WFLAGS}
 	${RM} ${RESDATA}
 	${RM} ${DATA}.Tokenised
 	${RM} ${HELPTAGS}
 	${RM} ${DICTTAGS}
-	${WIPE} ${RESDIR}.^.* ${WFLAGS}
-	${WIPE} ${PROCESSDIR}.^.* ${WFLAGS}
+	${XWIPE} ${RESDIR}.^.* ${WFLAGS}
+	${XWIPE} ${PROCESSDIR}.^.* ${WFLAGS}
 	${RM} s.LocaleList
 	@echo ${COMPONENT}: cleaned (Dictionary & HelpTokens not removed)
 
@@ -101,12 +101,12 @@ clean:
 # Clean_all: totally clean all builds and locales
 #
 clean_all:
-	${WIPE} Data ${WFLAGS}
-	${WIPE} o ${WFLAGS}
-	${WIPE} rm ${WFLAGS}
+	${XWIPE} Data ${WFLAGS}
+	${XWIPE} o ${WFLAGS}
+	${XWIPE} rm ${WFLAGS}
 	${RM} s.LocaleList
-	${WIPE} Resources.* ${WFLAGS}
-	${WIPE} Processed.* ${WFLAGS}
+	${XWIPE} Resources.* ${WFLAGS}
+	${XWIPE} Processed.* ${WFLAGS}
 	@echo ${COMPONENT}: all cleaned
 
 resources:
@@ -168,7 +168,7 @@ bbe-messages: bbe-generic-resources-get-alias ${TAGEXT}
 # Tokenise the Messages file using Help and Dictionary Tokens
 #
 ${DATA}.Tokenised: ${DICTIONARY} ${HELPTOKENS} ${HELPTAGS}
-	Perl Utils.HelpAppend ${PROCESSDIR} ${HELPTOKENS}
+	${PERL} Utils.HelpAppend ${PROCESSDIR} ${HELPTOKENS}
 	${MSGTOK} ${HELPTOKENS} ${HELPTAGS} 
 	${CP} ${DICTIONARY} ${PROCESSDIR}.Common.Resources.Kernel.Dictionary ${CPFLAGS}
 	${MSGTOK2} ${DICTTOKENS} ${DICTTAGS}
@@ -181,7 +181,7 @@ ${HELPTAGS}: ${TAGEXT} ${DIRS}
 	@echo Copying Resources to Processed directory for tokenising ...
 	${MKDIR} ${PROCESSDIR}
 	${RESCOMM} Resources.${BUILD}.<Build$LocaleListNumeric> ${PROCESSDIR}
-	Perl Utils.RemoveEmpt ${PROCESSDIR}
+	${PERL} Utils.RemoveEmpt ${PROCESSDIR}
 	Do ${TAGEXT} ${PROCESSDIR} ${DICTTAGS} ${HELPTAGS}
 
 #

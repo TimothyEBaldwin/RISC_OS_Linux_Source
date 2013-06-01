@@ -28,7 +28,7 @@ LIBDIR = <Lib$Dir>
 # Generic options:
 #
 MKDIR   = cdir
-WIPE    = -wipe
+WIPE    = x wipe
 CP      = copy
 RM	= remove
 
@@ -195,6 +195,11 @@ export_hdrs: ${HDRS} dirs
 dirs:
         ${MKDIR} ${LIBDIR}
         ${MKDIR} ${LIBDIR}.TCPIPLibs
+
+install:
+        ${MKDIR} ${INSTDIR}.TCPIPLibs
+        ${CP} ${LIBDIR}.TCPIPLibs.* ${INSTDIR}.TCPIPLibs.* ${CPFLAGS}
+        @echo ${COMPONENT}: installed
 
 # End of RISC OS Build targets
 #------------------------------------------------------------------------

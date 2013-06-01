@@ -941,8 +941,28 @@ DMAForceActivate
 
         LDR     r0, [r5, #HALDevice_Device]     ; We only need to program the first transfer now
         CMP     r0, #-1                         ;    if the channel has no interrupt.
-        BNE     %FT35                           ; Otherwise we rely on the first interrupt to trigger programming.
+        BEQ     %FT32
+                                                ; Otherwise we rely on the first interrupt to trigger programming.
+        LDR     r0, [r9, #dmaq_DeviceFeatures]  ; Except not all DMA controllers can (sensibly) be made to trigger
+        TST     r0, #DMAFeaturesFlag_NoInitIRQ  ; an interrupt when they've got no data, so we need to check the flags as well
+        BEQ     %FT35
 
+        ; We have an IRQ (so we don't want to use the bounce buffer), but the
+        ; interrupt is not initially there - an initial transfer is needed.
+        ; Use 'program' to do the initial setup to kickstart the process.
+        Push    "r5-r10"                        ; Play it safe and store everything that 'program' might clobber (which hasn't already been stored on entry to DMAActivate)
+        LDR     r0, [r10, #dmar_Length]
+        MOV     r11, r5
+        LDR     r3, [r9, #dmaq_LastBuff]
+        LDR     r7, [r11, #HALDevice_DMASetCurrentTransfer]
+        ADD     r5, r10, #dmar_CurrBuff
+        LDR     r8, [r10, #dmar_Flags]
+        BL      program
+        Pull    "r0,r6-r10"                     ; Reload device ptr in R0 so we can call the device
+        CallHAL Activate
+        EXITS   , f
+
+32
         ADD     r3, r10, #dmar_CurrBuff         ; Program current buffer with a single transfer to/from the bounce buffer.
         ADD     r0, r9, #dmaq_BounceBuff
         MOV     r1, #0
@@ -1027,7 +1047,7 @@ DMAForceActivate
         LDREQ   r2, [r8, #lcb_PeripheralRead]
         LDRNE   r2, [r8, #lcb_PeripheralWrite]
         TST     lr, #dmarf_Circular
-        ORREQ   r1, r1, #DMASetOptionsFlag_Circular
+        ORRNE   r1, r1, #DMASetOptionsFlag_Circular
         ORR     r1, r1, r3, LSL #1              ; note lcbf_Registered is shifted off end, and lcbf_Blocked will be clear
         MOV     r0, r5
         CallHAL DMASetOptions
@@ -1043,16 +1063,13 @@ DMAForceActivate
         EXITS   NE, f                           ;   wait for Service_PagesSafe to start it. (CPSR c bits don't need restoring)
 
 70      LDR     lr, [r10, #dmar_Done]
-        LDR     r0, [r10, #dmar_Length]         ; Already holds 0 iff infinite.
-        Push    "r0"                            ; ATPCS arg 5 goes on stack.
+        LDR     r4, [r10, #dmar_Length]         ; Already holds 0 iff infinite.
         MOV     r0, r5
         LDR     r1, [r9, #dmaq_DescBlockPhysical]
         LDR     r2, [r9, #dmaq_DescBlockLogical]
         LDR     r3, [r9, #dmaq_DescBlockCount]
         STR     lr, [r10, #dmar_DoneAtStart]
-        MOV     lr, pc
-        LDR     pc, [r0, #HALDevice_DMASetListTransfer] ; mustn't use macro because of stack usage
-        ADD     sp, sp, #4
+        CallHAL DMASetListTransfer, "r4"        ; ATPCS arg 5 pushed
 
         MOV     r0, r5
         CallHAL Activate
@@ -2509,6 +2526,7 @@ DMAInterruptList
         TST     r8, #dmarf_Infinite             ; If a finite transfer
         LDREQ   lr, [r10, #dmar_Length]
         TEQEQ   lr, #0                          ;   which has finished
+        Push    "r12", EQ
         BEQ     finished_altentry               ;   then move on to next queued transfer.
 
         Pull    "r4-r11,pc"
@@ -2520,6 +2538,7 @@ DMAInterruptList
         BL      MsgTrans_ErrorLookup
       ]
         MOV     r4, r0
+        Push    "r12"
         B       finished_witherror
 
         MakeErrorBlock  DMA_MemoryError
@@ -2560,16 +2579,16 @@ testloop
         LDR     r4, [r10, #dmar_Length]         ;   (this needs to be unconditional - non-HAL code is broken!)
         TEQEQ   r4, #0                          ;   and length = 0
         ORREQ   r1, r1, #1                      ;   then take alternate action.
-        LDR     pc, [pc, r1, LSL #2]
+        ADD     pc, pc, r1, LSL #2
         DCD     0
-        DCD     nooverrun                       ; No overrun, more to program
-        DCD     nooverrun_finished              ; No overrun, no more to program
-        DCD     overrun                         ; Overrun, more to program
-        DCD     overrun_finished                ; Overrun, no more to program
+        B       nooverrun                       ; No overrun, more to program
+        B       nooverrun_finished              ; No overrun, no more to program
+        B       overrun                         ; Overrun, more to program
+        B       overrun_finished                ; Overrun, no more to program
         DCD     0
         DCD     0
-        DCD     earlyoverrun                    ; Early overrun, more to program
-        DCD     finished                        ; Early overrun, no more to program
+        B       earlyoverrun                    ; Early overrun, more to program
+        B       finished                        ; Early overrun, no more to program
 
 nooverrun_finished
         ADD     r3, r10, #dmar_CurrBuff
@@ -2588,6 +2607,8 @@ nooverrun_finished
         B       %FT40
 
 overrun
+        MOV     r0, r11
+        CallHAL DMAIRQClear
         LDR     r3, [r9, #dmaq_LastBuff]
         ADD     r5, r10, #dmar_CurrBuff
         MOV     r0, r5
@@ -2600,8 +2621,6 @@ overrun
         STR     r5, [r9, #dmaq_LastBuff]
         MOV     r0, #0
         STR     r0, [r10, #dmar_NextBuff + buff_Len] ; Mark next buffer as not programmed.
-        MOV     r0, r11
-        CallHAL DMAIRQClear
         B       %FT40
 
 overrun_finished
@@ -2615,17 +2634,19 @@ overrun_finished
         B       finished
 
 earlyoverrun
+        MOV     r0, r11
+        CallHAL DMAIRQClear
         ADD     r3, r10, #dmar_CurrBuff
         ADD     r5, r10, #dmar_NextBuff
         LDMIA   r5, {r0-r2}
         STMIA   r3, {r0-r2}                     ; Copy next to current because we put it in the wrong place before.
         STR     r3, [r9, #dmaq_LastBuff]
         BL      reprogram
-        MOV     r0, r11
-        CallHAL DMAIRQClear
         B       %FT40
 
 nooverrun
+        MOV     r0, r11
+        CallHAL DMAIRQClear
         ADD     r3, r10, #dmar_CurrBuff
         LDR     r5, [r9, #dmaq_LastBuff]
         TEQ     r5, r3
@@ -2639,8 +2660,6 @@ nooverrun
         MOV     r0, r4
         BL      program                         ; Program next transfer.
         STR     r5, [r9, #dmaq_LastBuff]
-        MOV     r0, r11
-        CallHAL DMAIRQClear
         ; drop through...
 40
         TST     r8, #dmarf_Sync
@@ -2849,7 +2868,9 @@ finished
 ;       r8 = DMA request flags
 ;       r9 = ptr to DMA queue
 ;       r10 = ptr to DMA request block
+;     [ :LNOT: HAL
 ;       r11 = IOMD base address
+;     ]
 ;
         Debug   int," finished"
         DebugTab r3,r4,#&05
@@ -2875,8 +2896,8 @@ finished_witherror
         ORR     r8, r8, #dmarf_Completed        ; Flag transfer as completed.
         STR     r8, [r10, #dmar_Flags]
 
-      [ :LNOT: HAL
         LDR     r8, [r10, #dmar_LCB]            ; r8->logical channel block
+      [ :LNOT: HAL
         MOV     r1, #1                          ; Disable physical channel interrupt.
         LDR     r2, [r8, #lcb_Physical]
  [ debugint

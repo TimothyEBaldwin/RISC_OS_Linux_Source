@@ -44,7 +44,7 @@ CP		= copy
 LD		= link #${MemCheckLD} link
 RM		= remove
 SQUEEZE		= squeeze
-WIPE		= -wipe
+WIPE		= x wipe
 STRIP		= stripdepnd
 
 AFLAGS		= -depend !Depend -nocache -stamp -quit ${THROWBACK}

@@ -27,8 +27,9 @@ COMPONENT = FileSwitch
 HEADER1     = LowFSI
 HEADER2     = HighFSI
 # C headers to generate from the assembler sources
-ASMCHEADER1 = HighFSI
-EXPORTS      = ${C_EXP_HDR}.${ASMCHEADER1}
+ASMCHEADER1 = LowFSI
+ASMCHEADER2 = HighFSI
+EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1} ${C_EXP_HDR}.${ASMCHEADER2}
 
 TOKHELPSRC  = ${TOKENSOURCE}
 HELPSRC     = HelpSrc

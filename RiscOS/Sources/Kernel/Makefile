@@ -28,6 +28,11 @@
 EXP_HDR = <export$dir>
 C_EXP_HDR = <cexport$dir>.Global.h
 
+# Override this to "TRUE" in the components file if
+# you want an odd-numbered (development) build to be
+# a 'freezable' build - e.g. with no ROM debug output
+FREEZE_DEV_REL ?= FALSE
+
 #
 # Generic options:
 #
@@ -37,10 +42,11 @@ ARMASM  = objasm
 LD      = link
 CP      = copy
 RM      = remove
-WIPE    = -wipe
+XWIPE   = x wipe
+PERL    = do <Perl$Dir>.perl
 CCFLAGS = -c -depend !Depend -IC:
 ASFLAGS = -depend !Depend ${THROWBACK} -Stamp -quit -To $@ -From
-ARMASMFLAGS = -depend !Depend -g ${THROWBACK} -cpu 5TE
+ARMASMFLAGS = -depend !Depend -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}" -g ${THROWBACK}
 CPFLAGS = ~cfr~v
 WFLAGS  = ~cfr~v
 
@@ -64,10 +70,18 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${EXP_HDR}.VduExt \
             ${EXP_HDR}.HALEntries \
             ${EXP_HDR}.HALDevice \
+            ${EXP_HDR}.RTCDevice \
+            ${EXP_HDR}.VideoDevice \
+            ${EXP_HDR}.GPIODevice \
             ${EXP_HDR}.OSEntries \
+            ${EXP_HDR}.OSRSI6 \
+            ${C_EXP_HDR}.ModHand \
             ${C_EXP_HDR}.RISCOS \
             ${C_EXP_HDR}.HALEntries \
-            ${C_EXP_HDR}.HALDevice
+            ${C_EXP_HDR}.HALDevice \
+            ${C_EXP_HDR}.OSEntries \
+            ${C_EXP_HDR}.Variables \
+            ${C_EXP_HDR}.OSRSI6
 
 #
 # Generic rules:
@@ -87,12 +101,11 @@ install_rom: ${TARGET}
 
 clean:
 	${RM} s.TMOSHelp
-	${RM} s.Time+Date
-	${WIPE} o.* ${WFLAGS}
+	${XWIPE} o.* ${WFLAGS}
 	${RM} ${TARGET}
-	${WIPE} aif ${WFLAGS}
+	${XWIPE} aif ${WFLAGS}
 	${RM} ${GPADBG}
-	${WIPE} list.* ${WFLAGS}
+	${XWIPE} list.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
 export: ${EXPORTS}
@@ -129,12 +142,7 @@ ${GPADBG}: ${AIFDBG}
 s.TMOSHelp: ${TOKENS} HelpStrs
 	${TOKENISE} ${TOKENS} HelpStrs $@
 
-s.Time+Date:
-	@echo |IGBLS Builddate|JBuilddate SETS "<Sys$Date> <Sys$Year>.<Sys$Time>" |J|IEND { > s.Time+Date }
-	settype s.Time+Date FFF
-	
-o.GetAll: s.TMOSHelp \
-          s.Time+Date
+o.GetAll: s.TMOSHelp
 
 #
 # Exported interface headers
@@ -163,25 +171,59 @@ ${EXP_HDR}.HALEntries: hdr.HALEntries
 ${EXP_HDR}.HALDevice: hdr.HALDevice
 	${CP} hdr.HALDevice $@ ${CPFLAGS}
 	
+${EXP_HDR}.RTCDevice: hdr.RTCDevice
+	${CP} hdr.RTCDevice $@ ${CPFLAGS}
+	
 ${EXP_HDR}.OSEntries: hdr.OSEntries
 	${CP} hdr.OSEntries $@ ${CPFLAGS}
 	
+${EXP_HDR}.VideoDevice: hdr.VideoDevice
+	${CP} hdr.VideoDevice $@ ${CPFLAGS}
+	
+${EXP_HDR}.GPIODevice: hdr.GPIODevice
+	${CP} hdr.GPIODevice $@ ${CPFLAGS}
+	
+${EXP_HDR}.OSRSI6: hdr.OSRSI6
+	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
+	
+${C_EXP_HDR}.ModHand: hdr.ModHand
+	${MKDIR} ${C_EXP_HDR}
+	${PERL} Build:Hdr2H hdr.ModHand $@
+
 ${C_EXP_HDR}.RISCOS: hdr.RISCOS
 	${MKDIR} ${C_EXP_HDR}
-	perl Build:Hdr2H hdr.RISCOS $@
+	${PERL} Build:Hdr2H hdr.RISCOS $@
 
 ${C_EXP_HDR}.HALEntries: hdr.HALEntries
 	${MKDIR} ${C_EXP_HDR}
-	perl Build:Hdr2H hdr.HALEntries $@
+	${PERL} Build:Hdr2H hdr.HALEntries $@
 
 ${C_EXP_HDR}.HALDevice: o.Global.h.HALDevice h.HALDevice
 	${CP} h.HALDevice $@ ${CPFLAGS}
 	print o.Global.h.HALDevice { >> $@ }
 
+${C_EXP_HDR}.OSEntries: o.Global.h.OSEntries h.OSEntries
+	${CP} h.OSEntries $@ ${CPFLAGS}
+	print o.Global.h.OSEntries { >> $@ }
+
+${C_EXP_HDR}.Variables: hdr.Variables
+	${MKDIR} ${C_EXP_HDR}
+	${PERL} Build:Hdr2H hdr.Variables $@
+
+${C_EXP_HDR}.OSRSI6: hdr.OSRSI6
+	${MKDIR} ${C_EXP_HDR}
+	${PERL} Build:Hdr2H hdr.OSRSI6 $@
+
 o.Global.h.HALDevice: hdr.HALDevice
 	${MKDIR} o.Global.h
 	dir o
-	perl Build:Hdr2H ^.hdr.HALDevice Global.h.HALDevice
+	${PERL} Build:Hdr2H ^.hdr.HALDevice Global.h.HALDevice
+	back
+
+o.Global.h.OSEntries: hdr.OSEntries
+	${MKDIR} o.Global.h
+	dir o
+	${PERL} Build:Hdr2H ^.hdr.OSEntries Global.h.OSEntries
 	back
 
 BBETYPE = kernel

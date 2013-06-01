@@ -35,13 +35,12 @@ MKDIR   = do mkdir -p
 AS      = objasm
 CP      = copy
 CC      = cc
-CC_HOST = %cc
 CM      = cmhg
 RM      = remove
 LD      = link
 LB      = libfile
 TOUCH   = create
-WIPE    = -wipe
+WIPE    = x wipe
 SQUEEZE = squeeze
 STRIP   = stripdepnd
 
@@ -180,6 +179,11 @@ export: export_${PHASE}
 install_rom: ${TARGET}
 	@echo ${COMPONENT}: rom module installed
 
+install:
+	${MKDIR} ${INSTDIR}.Unicode
+	${CP} ${UNICODELIBDIR}.* ${INSTDIR}.Unicode.* ${CPFLAGS}
+	@echo ${COMPONENT}: installed
+
 clean:
 	${WIPE} o ${WFLAGS}
 	${WIPE} oz ${WFLAGS}
@@ -191,7 +195,6 @@ clean:
 	${RM} c.unictype
 	${RM} mkunictype
 	${RM} TextConv
-	${STRIP}
 	@echo ${COMPONENT}: cleaned
 
 export_hdrs: ${HDRS} dirs
@@ -227,11 +230,11 @@ dirs:
 	${MKDIR} ${UNICODELIBDIR}.o
 
 unictype.c: mkunictype data.UnicodeData
-	mkunictype < data.UnicodeData > c.unictype
+	${RUN}mkunictype < data.UnicodeData > c.unictype
 	echo Made unictype.c
 
 mkunictype: mkunictype.c
-	${CC_HOST} mkunictype
+	${MAKE} -f mkunictype/mk COMPONENT=mkunictype THROWBACK=${THROWBACK}
 
 TextConv: textconv.o ${TARGET}
 	${LD} -o $@ textconv.o ${TARGET} ${CLIB}

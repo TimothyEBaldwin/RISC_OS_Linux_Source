@@ -42,10 +42,6 @@ include AAsmModule
 #
 # Generic rules:
 #
-clean::
-	${WIPE} rm ${WFLAGS}
-	@${ECHO} ${COMPONENT}: extra directories cleaned
-
 ${MERGEDMSGS}: Resources.${TARGET}.Territory LocalRes:Messages
 	${MKDIR} ${MERGEDMDIR}
 	${CP} Resources.${TARGET}.Territory $@ ${CPFLAGS}

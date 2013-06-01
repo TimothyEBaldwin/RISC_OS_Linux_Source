@@ -41,13 +41,13 @@ RESAPP = <resource$dir>.Apps.${APP}
 # Generic options:
 #
 MKDIR   = do mkdir -p
-AS      = aasm
 CP      = copy
 RM      = remove
 SQUISH  = squish
-WIPE    = x wipe
+XWIPE   = x wipe
+PERL    = do <Perl$Dir>.perl
+MODGEN  = modgen
 
-AFLAGS  = ${THROWBACK} -depend !Depend -nocache -stamp -quit -module
 CPFLAGS = ~cfr~v
 SQFLAGS = -nolist
 WFLAGS  = ~c~v
@@ -106,7 +106,7 @@ clean:
 	${RM} ${ROM_MODULE}
 	${RM} ${RDIR}.!RunImage
 	${RM} ${LDIR}.!RunLink
-	${WIPE} crunched.* ${WFLAGS}
+	${XWIPE} crunched.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
 #
@@ -114,8 +114,8 @@ clean:
 #
 
 ${ROM_MODULE}: VersionNum ${RESFILES}
-	perl build:getversion Chars$Version
-	do modgen ${ROM_MODULE} !Chars !Chars <Chars$Version> Resources.!RunImage Resources.Chars.!RunImage
+	${PERL} build:getversion Chars$BuildV Chars$FullV Chars$Date
+	do ${MODGEN} -date "<Chars$Date>" ${ROM_MODULE} !Chars !Chars <Chars$BuildV> Resources.!RunImage Resources.Chars.!RunImage
 
 ${RDIR}.!RunImage: crunched.!RunImage
 	${SQUISH} ${SQFLAGS} -from crunched.!RunImage -to $@

@@ -20,7 +20,7 @@ INCLUDES=	C:,TCPIPLibs:
 CC=		cc
 RM=             remove
 WFLAGS=         fr~c~v
-WIPE=           -wipe
+WIPE=           x wipe
 
 CFLAGS=		-Wp -I$(INCLUDES) -DGRAPHLET -Dlint -c ${THROWBACK} -depend !Depend
 

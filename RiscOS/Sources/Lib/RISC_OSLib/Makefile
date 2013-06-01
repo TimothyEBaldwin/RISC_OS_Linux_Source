@@ -53,27 +53,17 @@ LIBDIR  = <Lib$Dir>
 #
 # Generic options:
 #
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-LIBFILE = libfile
-MKDIR   = do mkdir -p
-MODSQZ  = modsqz
-OBJASM  = objasm
-RM      = remove
-WIPE    = -wipe
+include Makefiles:StdTools
 
 # Note the output redirection on the end of this macro to enable parameters
 # to match those of the old application xtentries.
-XTENT   = perl build:xtentries >
+XTENT   = ${PERL} build:xtentries >
 
 DIFF    = gnu.diff -df >null:
 
 AFLAGS  = -depend !Depend
 # The zz switch stops library static data being placed in a zero-init area
-CFLAGS  = -c -depend !Depend ${INCLUDES} -DDDE -fK -zz10000000
+CFLAGS  = -c -depend !Depend ${INCLUDES} -DDDE -fK -zz10000000 -jC:
 CPFLAGS = ~cfr~v
 WFLAGS  = ~c~r~v
 
@@ -142,12 +132,12 @@ VPATH = @ kernel clib rlib
 .c.m_o_rl:;   ${CC} ${CFLAGS} -ffah ${DFLAGS} -zM -o $@ $<
 .c.rm_o:;     ${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
 .c.rm_o_rl:;  ${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
-.s.o:;        ${OBJASM} ${AFLAGS} ${ALFLAGS} $< $@
-.s.m_o:;      ${OBJASM} ${AFLAGS} ${ALFLAGS} $< $@
-.s.o_rl:;     ${OBJASM} ${AFLAGS} $< $@
-.s.m_o_rl:;   ${OBJASM} ${AFLAGS} $< $@
-.s.rm_o:;     ${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
-.s.rm_o_rl:;  ${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
+.s.o:;        ${AS} ${AFLAGS} ${ALFLAGS} $< $@
+.s.m_o:;      ${AS} ${AFLAGS} ${ALFLAGS} $< $@
+.s.o_rl:;     ${AS} ${AFLAGS} $< $@
+.s.m_o_rl:;   ${AS} ${AFLAGS} $< $@
+.s.rm_o:;     ${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
+.s.rm_o_rl:;  ${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} $< $@
 
 #
 # Libraries
@@ -216,6 +206,7 @@ HEADERS =\
  RISC_OSLib:h.fontselect \
  RISC_OSLib:h.heap \
  RISC_OSLib:h.help \
+ RISC_OSLib:h.jpeg \
  RISC_OSLib:h.magnify \
  RISC_OSLib:h.menu \
  RISC_OSLib:h.msgs \
@@ -245,10 +236,10 @@ HEADERS =\
 
 # Unfortunately these need to be exported to build Edit
 INTERNAL_HEADERS =\
- RISC_OSLib:h.EditIntern.message \
- RISC_OSLib:h.EditIntern.txtar \
- RISC_OSLib:h.EditIntern.txtfile \
- RISC_OSLib:h.EditIntern.txtoptmenu
+ RISC_OSLib:EditIntern.h.message \
+ RISC_OSLib:EditIntern.h.txtar \
+ RISC_OSLib:EditIntern.h.txtfile \
+ RISC_OSLib:EditIntern.h.txtoptmenu
 
 LIBRARIES =\
  Clib:o.ansilib \
@@ -369,6 +360,7 @@ ROM_OBJS =\
  rm_o_rl.flex \
  rm_o_rl.font \
  rm_o_rl.heap \
+ rm_o_rl.jpeg \
  rm_o_rl.magnify \
  rm_o_rl.menu \
  rm_o_rl.msgs \
@@ -414,7 +406,7 @@ RLIB_OBJS =\
  o_rl.colourtran o_rl.coords o_rl.ctl o_rl.dbox o_rl.dboxfile o_rl.dboxquery \
  o_rl.dboxtcol o_rl.dragasprit o_rl.drawcheck o_rl.drawfdiag o_rl.drawfiles \
  o_rl.drawfobj o_rl.drawmod o_rl.drawtextc o_rl.event o_rl.fileicon o_rl.flex \
- o_rl.font o_rl.fontlist o_rl.fontselect o_rl.heap o_rl.help o_rl.magnify o_rl.menu \
+ o_rl.font o_rl.fontlist o_rl.fontselect o_rl.heap o_rl.help o_rl.jpeg o_rl.magnify o_rl.menu \
  o_rl.msgs o_rl.os o_rl.pointer o_rl.poll o_rl.print o_rl.res o_rl.resspr \
  o_rl.saveas o_rl.sprite o_rl.swi o_rl.template o_rl.trace o_rl.txt o_rl.txt1 \
  o_rl.txt3 o_rl.txtar o_rl.txtedit o_rl.txtfile o_rl.txtfind o_rl.txtmisc \
@@ -430,7 +422,7 @@ RLIB_MOD_OBJS =\
  m_o_rl.dboxfile m_o_rl.dboxquery  m_o_rl.dboxtcol m_o_rl.dragasprit \
  m_o_rl.drawcheck m_o_rl.drawfdiag m_o_rl.drawfiles m_o_rl.drawfobj m_o_rl.drawmod \
  m_o_rl.drawtextc m_o_rl.event m_o_rl.fileicon m_o_rl.flex m_o_rl.font \
- m_o_rl.fontlist m_o_rl.fontselect m_o_rl.heap m_o_rl.help m_o_rl.magnify \
+ m_o_rl.fontlist m_o_rl.fontselect m_o_rl.heap m_o_rl.help m_o_rl.jpeg m_o_rl.magnify \
  m_o_rl.menu m_o_rl.msgs m_o_rl.os m_o_rl.pointer m_o_rl.poll m_o_rl.print \
  m_o_rl.res m_o_rl.resspr m_o_rl.saveas m_o_rl.sprite m_o_rl.swi m_o_rl.template \
  m_o_rl.trace m_o_rl.txt m_o_rl.txt1 m_o_rl.txt3 m_o_rl.txtar m_o_rl.txtedit \
@@ -451,35 +443,55 @@ export_hdrs: ${EXP_HDR}.SharedCLib; @
 
 export_libs: ${EXPORTS} dirs; @
 
-install: lib.clib
+install: install-${INSTTYPE}
+
+install-: lib.clib
 	${MKDIR}  ${INSTDIR}
 	${CP} lib.clib ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: ram module installed
+
+install-libraries: lib.ansilib lib.ansilibm o.overmgr lib.stubs lib.risc_oslib lib.riscoslibm
+	${MKDIR}                  ${INSTDIR}.CLib.h
+	${CP} CLIB:h.*            ${INSTDIR}.CLib.h.*                  ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.CLib.o
+	${CP} lib.ansilib         ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${CP} lib.ansilibm        ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${CP} o.overmgr           ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${CP} lib.stubs           ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h
+	${CP} RISC_OSLib:h.*      ${INSTDIR}.RISC_OSLib.h.*            ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h.EditIntern
+	${CP} rlib.EditIntern.h.* ${INSTDIR}.RISC_OSLib.h.EditIntern.* ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.s
+	${CP} s.modulewrap        ${INSTDIR}.RISC_OSLib.s.modulewrap   ${CPFLAGS}
+	${MKDIR}                  ${INSTDIR}.RISC_OSLib.o
+	${CP} lib.risc_oslib      ${INSTDIR}.RISC_OSLib.o.*            ${CPFLAGS}
+	${CP} lib.riscoslibm      ${INSTDIR}.RISC_OSLib.o.*            ${CPFLAGS}
+	@echo ${COMPONENT}: libraries installed
 
 install_rom: ${OBJECT}
 	${CP} ${OBJECT} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: rom library installed
 
-clean:
-	@echo ${COMPONENT}: *** NOT cleaned *** run locally if required
+clean: clean_all
 
 clean_all:
-	${WIPE} o.* ${WFLAGS}
-	${WIPE} m_o.* ${WFLAGS}
-	${WIPE} o_rl.* ${WFLAGS}
-	${WIPE} m_o_rl.* ${WFLAGS}
-	${WIPE} rm_o.* ${WFLAGS}
-	${WIPE} rm_o_rl.* ${WFLAGS}
-	${WIPE} linked.* ${WFLAGS}
-	${WIPE} map.* ${WFLAGS}
-	${WIPE} aof.* ${WFLAGS}
-	${WIPE} syms.* ${WFLAGS}
+	${XWIPE} o.* ${WFLAGS}
+	${XWIPE} m_o.* ${WFLAGS}
+	${XWIPE} o_rl.* ${WFLAGS}
+	${XWIPE} m_o_rl.* ${WFLAGS}
+	${XWIPE} rm_o.* ${WFLAGS}
+	${XWIPE} rm_o_rl.* ${WFLAGS}
+	${XWIPE} linked.* ${WFLAGS}
+	${XWIPE} map.* ${WFLAGS}
+	${XWIPE} aof.* ${WFLAGS}
+	${XWIPE} syms.* ${WFLAGS}
 	${RM} derived.swis
 	${RM} s.swioptions
 	${RM} s.abssym
 	${RM} s.c_abssym
 	${RM} s.a_abssym
-	${WIPE} lib.* ${WFLAGS}
+	${XWIPE} lib.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
 
 resources:
@@ -522,7 +534,7 @@ dirs:
 	${MKDIR} ${LIBDIR}.CLib.o
 	${MKDIR} ${LIBDIR}.RISC_OSLib
 	${MKDIR} ${LIBDIR}.RISC_OSLib.h
-	${MKDIR} ${LIBDIR}.RISC_OSLib.h.EditIntern
+	${MKDIR} ${LIBDIR}.RISC_OSLib.EditIntern.h
 	${MKDIR} ${LIBDIR}.RISC_OSLib.s
 	${MKDIR} ${LIBDIR}.RISC_OSLib.o
 
@@ -569,6 +581,7 @@ rom_link_CLib: ${CLIB_ROM_OBJS} rom_link_Entries
 
 rom_link: rom_link_${TARGET}
 	${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
+	${CP} syms.${TARGET} ${LINKDIR}.${TARGET}_sym ${CPFLAGS}
 	|
 	${CP} syms.Entries ${ABSSYM} ${CPFLAGS}
 	${CP} syms.C_Entries ${C_ABSSYM} ${CPFLAGS}
@@ -580,58 +593,58 @@ rom_link: rom_link_${TARGET}
 # Build rules for Libraries and Stubs:
 #
 lib.ansilib: ${ANSI_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${ANSI_OBJS}
+	${AR} ${LIBFLAGS} $@ ${ANSI_OBJS}
 
 lib.ansilibm: ${ANSI_MOD_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${ANSI_MOD_OBJS}
+	${AR} ${LIBFLAGS} $@ ${ANSI_MOD_OBJS}
 
 lib.risc_oslib: ${RLIB_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${RLIB_OBJS}
+	${AR} ${LIBFLAGS} $@ ${RLIB_OBJS}
 
 lib.riscoslibm: ${RLIB_MOD_OBJS}
-	${LIBFILE} ${LIBFLAGS} $@ ${RLIB_MOD_OBJS}
+	${AR} ${LIBFLAGS} $@ ${RLIB_MOD_OBJS}
 
 o.cl_stub_r: clib.s.cl_stub_r
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
 
 o.cl_stub2_r: clib.s.cl_stub2_r
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
 
 o.k_stub2_r: kernel.s.k_stub2_r
-	${OBJASM} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
+	${AS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
 
 m_o.cl_stub_m: clib.s.cl_stub_m
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
 
 o_rl.rl_stub_r: rlib.s.rl_stub_r
-	${OBJASM} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
+	${AS} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
 
 rm_o.cl_stub_rm: clib.s.cl_stub_rm
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
 
 rm_o.cl_stub2_rm: clib.s.cl_stub2_rm
-	${OBJASM} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
+	${AS} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
 
 rm_o.k_stub2_rm: kernel.s.k_stub2_rm
-	${OBJASM} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
+	${AS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
 
 rm_o_rl.rl_stub_rm: rlib.s.rl_stub_rm
-	${OBJASM} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
+	${AS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
 
 lib.stubs: o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
+	${AR} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
 
 lib.rstubs: o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
+	${AR} ${LIBFLAGS} $@ o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
 
 lib.romcstubs: rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
+	${AR} ${LIBFLAGS} $@ rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
 
 lib.romstubs: rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
-	${LIBFILE} ${LIBFLAGS} $@ rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
+	${AR} ${LIBFLAGS} $@ rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
 
 lib.romastubs: rlib.s.rl_stub_a
-	${OBJASM} ${AFLAGS} -from rlib.s.rl_stub_a -to $@
+	${AS} ${AFLAGS} -from rlib.s.rl_stub_a -to $@
 
 # Non-exported libraries:
 lib.clib: ${CLIB_MOD_OBJS}
@@ -648,7 +661,7 @@ o.swis: s.makehswis h.swisheader s.swioptions
 	${AS} ${AFLAGS} s.makehswis -o $@
 	settype $@ text
 
-s.swioptions:
+s.swioptions: SWIOptions
 	@SWIOptions
 
 #
@@ -717,6 +730,7 @@ RISC_OSLib:h.fontlist: rlib.h.fontlist;      ${CP} rlib.h.fontlist $@ ${CPFLAGS}
 RISC_OSLib:h.fontselect: rlib.h.fontselect;  ${CP} rlib.h.fontselect $@ ${CPFLAGS}
 RISC_OSLib:h.heap: rlib.h.heap;              ${CP} rlib.h.heap $@ ${CPFLAGS}
 RISC_OSLib:h.help: rlib.h.help;              ${CP} rlib.h.help $@ ${CPFLAGS}
+RISC_OSLib:h.jpeg: rlib.h.jpeg;              ${CP} rlib.h.jpeg $@ ${CPFLAGS}
 RISC_OSLib:h.magnify: rlib.h.magnify;        ${CP} rlib.h.magnify $@ ${CPFLAGS}
 RISC_OSLib:h.menu: rlib.h.menu;              ${CP} rlib.h.menu $@ ${CPFLAGS}
 RISC_OSLib:h.msgs: rlib.h.msgs;              ${CP} rlib.h.msgs $@ ${CPFLAGS}
@@ -744,10 +758,10 @@ RISC_OSLib:h.win: rlib.h.win;                ${CP} rlib.h.win $@ ${CPFLAGS}
 RISC_OSLib:h.xferrecv: rlib.h.xferrecv;      ${CP} rlib.h.xferrecv $@ ${CPFLAGS}
 RISC_OSLib:h.xfersend: rlib.h.xfersend;      ${CP} rlib.h.xfersend $@ ${CPFLAGS}
 
-RISC_OSLib:h.EditIntern.message: rlib.h.EditIntern.message;       ${CP} rlib.h.EditIntern.message $@ ${CPFLAGS}
-RISC_OSLib:h.EditIntern.txtar: rlib.h.EditIntern.txtar;           ${CP} rlib.h.EditIntern.txtar $@ ${CPFLAGS}
-RISC_OSLib:h.EditIntern.txtfile: rlib.h.EditIntern.txtfile;       ${CP} rlib.h.EditIntern.txtfile $@ ${CPFLAGS}
-RISC_OSLib:h.EditIntern.txtoptmenu: rlib.h.EditIntern.txtoptmenu; ${CP} rlib.h.EditIntern.txtoptmenu $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.message:    rlib.EditIntern.h.message;    ${CP} rlib.EditIntern.h.message    $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.txtar:      rlib.EditIntern.h.txtar;      ${CP} rlib.EditIntern.h.txtar      $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.txtfile:    rlib.EditIntern.h.txtfile;    ${CP} rlib.EditIntern.h.txtfile    $@ ${CPFLAGS}
+RISC_OSLib:EditIntern.h.txtoptmenu: rlib.EditIntern.h.txtoptmenu; ${CP} rlib.EditIntern.h.txtoptmenu $@ ${CPFLAGS}
 
 # Libraries
 Clib:o.ansilib:          lib.ansilib;        ${CP} lib.ansilib    $@ ${CPFLAGS}
@@ -767,40 +781,40 @@ RISC_OSLib:s.modulewrap: s.modulewrap;       ${CP} s.modulewrap $@ ${CPFLAGS}
 # Objects whose name isn't the same as their source
 #
 o.clib: clib.s.cl_obj_r
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_r -to $@
 
 o.kernel: kernel.s.k_obj_r
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_r -to $@
 
 m_o.clib: clib.s.cl_obj_m
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_m -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_obj_m -to $@
 
 m_o.kernel: kernel.s.k_obj_m
-	${OBJASM} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_m -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_m -to $@
 
 rm_o.clib:  clib.s.cl_obj_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.cl_obj_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.cl_obj_r -to $@
 
 rm_o.cl_modbody: clib.s.cl_mod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} ${UROM_ROM_DEFS} -from clib.s.cl_mod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} ${UROM_ROM_DEFS} -from clib.s.cl_mod_r -to $@
 
 rm_o_rl.rl_modbody: rlib.s.rl_mod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.rl_mod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.rl_mod_r -to $@
 
 rm_o.k_modbody: kernel.s.k_mod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from kernel.s.k_mod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from kernel.s.k_mod_r -to $@
 
 rm_o.memcpy: s.memcpy s.h_regs
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from s.memcpy -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from s.memcpy -to $@
 
 o.initmodule: clib.s.initmod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_r -to $@
 
 rm_o.initmodule: clib.s.initmod_rm
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_rm -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_rm -to $@
 
 rm_o_rl.initmodule: rlib.s.initmod_r
-	${OBJASM} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.initmod_r -to $@
+	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from rlib.s.initmod_r -to $@
 
 #
 # Objects that require extra flags
@@ -834,22 +848,22 @@ rm_o.string: c.string
 # Note: New Assembler - could use -PreDefine "UROM SETL {FALSE}"
 
 o_rl.swi: rlib.s.swi
-	${OBJASM} ${UROM_DEFS} rlib.s.swi o_rl.swi ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.swi o_rl.swi ${AFLAGS}
 
 o_rl.poll: rlib.s.poll
-	${OBJASM} ${UROM_DEFS} rlib.s.poll o_rl.poll ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.poll o_rl.poll ${AFLAGS}
 
 m_o_rl.swi: rlib.s.swi
-	${OBJASM} ${UROM_DEFS} rlib.s.swi m_o_rl.swi ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.swi m_o_rl.swi ${AFLAGS}
 
 m_o_rl.poll: rlib.s.poll
-	${OBJASM} ${UROM_DEFS} rlib.s.poll m_o_rl.poll ${AFLAGS}
+	${AS} ${UROM_DEFS} rlib.s.poll m_o_rl.poll ${AFLAGS}
 
 rm_o_rl.swi: rlib.s.swi
-	${OBJASM} ${UROM_ROM_DEFS} rlib.s.swi rm_o_rl.swi ${AFLAGS} ${OPTIONS}
+	${AS} ${UROM_ROM_DEFS} rlib.s.swi rm_o_rl.swi ${AFLAGS} ${OPTIONS}
 
 rm_o_rl.poll: rlib.s.poll
-	${OBJASM} ${UROM_ROM_DEFS} rlib.s.poll rm_o_rl.poll ${AFLAGS} ${OPTIONS}
+	${AS} ${UROM_ROM_DEFS} rlib.s.poll rm_o_rl.poll ${AFLAGS} ${OPTIONS}
 
 #
 # trace separated out to allow defining of TRACE

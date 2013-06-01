@@ -17,6 +17,7 @@
 COMPONENT  = UnSqzAIF
 ROM_SOURCE = ModHead.s
 TARGET     = UnSqzAIF
+RESOURCES  = no
 
 include StdTools
 include AAsmModule

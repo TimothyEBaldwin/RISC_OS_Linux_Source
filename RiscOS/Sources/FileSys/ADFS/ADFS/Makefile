@@ -28,22 +28,35 @@ COMPONENT = ADFS
 #
 CHEADER1  = ${COMPONENT}
 HEADER1   = ${COMPONENT}
+HEADER2   = ADFSErr
+ASMCHEADER1 = ADFSErr
+
+EXPORTS   = hdr.ADFSErr ${C_EXP_HDR}.ADFSErr
 
 TOKENSOURCE = s.TokenHelp
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
 ROM_SOURCE = ADFS.s
 
-ASFLAGS    = ${OPTIONS} -cpu 5TE
+ASFLAGS    = ${OPTIONS}
 
 include StdTools
 include AAsmModule
+
+hdr.ADFSErr: o.ADFSErr
+	${LD} -bin -o $@ o.ADFSErr
+	SetType $@ Text
+
+o.ADFSErr: s.ADFSErr
+	${MKDIR} o
+	${AS} -o $@ s.ADFSErr -I<Hdr$Dir>.Global,<Hdr$Dir>.Interface
 
 #
 # Generic rules:
 #
 clean::
 	${WIPE} o ${WFLAGS}
+	${RM} hdr.ADFSErr
 	@@echo ${COMPONENT}: cleaned 
 
 # Dynamic dependencies:

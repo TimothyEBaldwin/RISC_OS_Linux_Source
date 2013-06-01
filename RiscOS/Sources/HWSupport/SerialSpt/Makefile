@@ -25,6 +25,7 @@
 COMPONENT = SerialDeviceSupport
 TARGET    = SerialSpt
 RESOURCES = no
+HEADER1   = SerialOp
 
 include StdTools
 include AAsmModule

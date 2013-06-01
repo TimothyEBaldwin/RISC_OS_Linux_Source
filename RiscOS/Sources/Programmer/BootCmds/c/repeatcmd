@@ -20,18 +20,36 @@
    16th Dec 1999 SAR   Rewritten to include the '-sort' switch and fill buffer in one go (if possible)
    2nd  Sep 2004 SAR   Added -STB switch to control handling of errors in pre-desktop
    20th Feb 2007 JWB   extended buffer allocation to allow up to 8 retries with extended buffer
+   17th Jan 2010 TM    os_CLI_LIMIT_RO4 and usage of OS_HeapSort32
 */
 
+/******************************************************************************
+ *
+ *             ...IMPORTANT NOTE TO ANYONE WORKING ON THIS CODE...
+ *
+ * Although the BootCommands module has a *command called "*Repeat", it actually
+ * just ends up running a stand-alone application called "Repeat" which is what
+ * is built from this source file. This application is installed as:
+ *
+ *   Resources:$.Resources.BootCmds.Repeat
+ *
+ * during the "export resources" phase for ROM builds. Thus, if you make edits
+ * to this code, you won't see any changes in your ROM build unless you re-run
+ * the export resources phase. I hope this saves someone the several hours of
+ * frustration I went though...
+ */
+
 /*From CLib*/
-#include <kernel.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 
+#include "kernel.h"
 #include "swis.h"
 
 /*From OSLib*/
+#include "messagetrans.h"
 #include "os.h"
 #include "osfile.h"
 #include "osfscontrol.h"
@@ -42,49 +60,62 @@
 /*Local*/
 #include "main.h"
 
+#ifndef BOOTFX_MAGIC_HANDLE
+#define BOOTFX_MAGIC_HANDLE (0xB007CED5)
+#endif
+
 int main(void)
 {
   struct
   {
-    char *prog, *command, *directory;
-    osbool directories, applications, files;
-    char *type, *tail;
-    osbool tasks, verbose, sort, stb;
-    char argb [os_CLI_LIMIT + 1];
+    char  *prog;
+    char  *command;
+    char  *directory;
+    osbool directories;
+    osbool applications;
+    osbool files;
+    char  *type;
+    char  *tail;
+    osbool tasks;
+    osbool verbose;
+    osbool sort;
+    osbool cont;
+    char  *progress;
+    char   argb [os_CLI_LIMIT_RO4 + 1];
   } argl;
   bool done_initialise = FALSE;
   bits file_type;
-  os_error mfail = {255, "Can't claim memory"};
   os_error *error = NULL, message;
   char *tail;
   osgbpb_info_stamped *info;
-  #define INITIALENTRYCOUNT  128
-  unsigned int bufclaim = INITIALENTRYCOUNT;         /* initial size .. for 128 shortfilenamr entries */
-  unsigned int max_buf  = bufclaim*32;
-  char **membuf         = malloc((sizeof(char*)*bufclaim) + max_buf);
-  char **objects        = membuf;
-  char *buffer          = (char*)membuf + (sizeof(char*)*bufclaim);
-  char *buf_pos         = buffer;
-  unsigned int obj_pos  = 0;
-  unsigned int read     = 0;
-  unsigned int entries  = 0;
-  unsigned int ent_sz   = 0;
-  unsigned int context  = 0;
-  unsigned int growth   = 0;
+  unsigned int bufclaim    = INITIALENTRYCOUNT;
+  unsigned int max_buf     = bufclaim*32;
+  char **membuf            = malloc((sizeof(char*)*bufclaim) + max_buf);
+  char **objects           = membuf;
+  char *buffer             = (char*)membuf + (sizeof(char*)*bufclaim);
+  char *buf_pos            = buffer;
+  unsigned int obj_pos     = 0;
+  unsigned int read        = 0;
+  unsigned int entries     = 0;
+  unsigned int ent_sz      = 0;
+  unsigned int context     = 0;
+  unsigned int growth      = 0;
+  unsigned int total;
+  int pct_start, pct_range = -1;
 
   /* Check that the buffer allocation was successful */
   if (membuf == NULL)
   {
-    error = &mfail;
+    static const os_error tmp = { error_STR_OFLO, "StrOFlo" }; /* In global messages */
+    error = xmessagetrans_error_lookup(&tmp, 0, 0, 0, 0, 0, 0, 0);
     goto finish;
   }
 
-
-  /* Check for the presence of the parameter string and get it's start address */
+  /* Check for the presence of the parameter string and get its start address */
   if ((error = xos_get_env(&tail, NULL, NULL)) != NULL) goto finish;
 
   /* Parse the parameter string (PRM 1-465) */
-  if ((error = xos_read_args("prog/a,command/a,directory/a,directories/s,applications/s,files/s,type/k,tail,tasks/s,verbose/s,sort/s,stb/s",
+  if ((error = xos_read_args("prog/a,command/a,directory/a,directories/s,applications/s,files/s,type/k,tail,tasks/s,verbose/s,sort/s,continue=stb/s,progress/k",
                              tail,
                              (char *) &argl,
                              sizeof argl,
@@ -112,6 +143,21 @@ int main(void)
     done_initialise = TRUE;
   }
 
+  /* Intepret the progress start [0..99] and range [0..100] parameter */
+  if (argl.progress != NULL)
+  {
+    unsigned int range;
+    int ret = sscanf(argl.progress, "%u,%u", &pct_start, &range);
+
+    if (ret == 2)
+    {
+      /* Clamp start point then clip range */
+      if (pct_start > 99) pct_start = 99;
+      if ((pct_start + range) > 100) range = 100 - pct_start;
+      pct_range = range;
+    }
+  }
+
   /* Fill a buffer with all the directory entries, and build an array of pointers to the leafname strings */
   while (context != -1)
   {
@@ -136,7 +182,7 @@ int main(void)
     while (read > 0)
     {
       objects[obj_pos++] = (char*)(buf_pos + 24);
-      ent_sz             = (28 + strlen(buf_pos + 24)) & ~3;
+      ent_sz             = (24 + strlen(buf_pos + 24) + 1 /* terminator */ + 3 /* align */) & ~3;
       max_buf           -= ent_sz;
       buf_pos           += ent_sz;
       read              -= 1;
@@ -149,9 +195,12 @@ int main(void)
     /* Sort the leafname pointer array */
     if (argl.sort)
     {
-      error = (os_error *) _swix(OS_HeapSort, _INR(0,2), entries, *objects, 4);
+      error = (os_error *) _swix(OS_HeapSort32, _INR(0,2), entries, objects, 4);
       if (error != NULL) goto finish;
     }
+
+    /* Keep the total entries - it's useful for doing the percent complete calculation */
+    total = entries;
 
     /* Iterate through each of the directory entries in order */
     obj_pos = 0;
@@ -159,11 +208,16 @@ int main(void)
     {
       info = (osgbpb_info_stamped *) (objects[obj_pos++] - 24);
 
+      if (pct_range > 0)
+      {
+        /* Report progress of this repeat command */
+        (void) _swix(BootFX_BarUpdate, _INR(0,2), 0, BOOTFX_MAGIC_HANDLE, pct_start + ((pct_range * (total - entries)) / total));
+      }
+
       if (
            ( info->obj_type == osfile_IS_FILE &&
              ( argl.files ||
                (argl.type && info->file_type == file_type)
-           /*^^^^^^^^^ avoid uninitialised variable. JRC 9th Jan 1995*/
              )
            )
            ||
@@ -174,7 +228,7 @@ int main(void)
            )
          )
       {
-        char cmd [os_CLI_LIMIT + 1];
+        char cmd [os_CLI_LIMIT_RO4 + 1];
 
         /* Create the CLI string which we're going to execute */
         if (!argl.tail)
@@ -186,7 +240,7 @@ int main(void)
           sprintf(cmd, "%s %s.%s %s", argl.command, argl.directory, info->name, argl.tail);
         }
 
-        /* Are we doing the commad as a WIMP task? */
+        /* Are we doing the command as a WIMP task? */
         if (argl.tasks)
         {
           if (argl.verbose)
@@ -206,26 +260,24 @@ int main(void)
         else
         {
           /* Do getenv() before system() so last error isn't "System variable 'foo' not found" */
-          char *var = getenv(main_X_ENVVAR);
+          char *var = getenv(X_ENVVAR);
 
           if (argl.verbose) fprintf(stderr, "Repeat: %s\n", cmd);
 
           if (system(cmd) != 0)
           {
             error = (os_error *) _kernel_last_oserror();
-
-            /* In STB mode, we put the error message string into X$Error (assuming it's
-             * not already set) and continue enumeration. In non-STB mode, we break out
-             * of the enumeration and output the error.
-             */
-            if (argl.stb != 0)
+            if (argl.cont)
             {
+              /* In continue mode, we put the error message string into X$Error (assuming it's
+               * not already set) and continue enumeration...
+               */
               int          context = 0;
               os_var_type  vartype = os_VARTYPE_STRING;
 
               if (var == NULL)
               {
-                (void) xos_set_var_val(main_X_ENVVAR,
+                (void) xos_set_var_val(X_ENVVAR,
                                        (byte *)(error->errmess),
                                        strlen(error->errmess),
                                        context,
@@ -236,8 +288,8 @@ int main(void)
               error = NULL;
             }
             else
-            /* Non-STB mode: break out with an error to the exit code */
             {
+              /* ...otherwise we break out of the enumeration and output the error */
               goto finish;
             }
           }
@@ -266,10 +318,10 @@ finish:
     {
       fprintf(stderr, "Repeat: %s\n", error->errmess);
     }
-    return(1);
+    return 1;
   }
   else
   {
-    return(0);
+    return 0;
   }
 }
