@@ -1,18 +1,13 @@
 RISC OS Open Release Archive
 ============================
 
-This is a Filecore-format disc image for programming onto a USB memory stick
-for booting RISC OS 5 devices.
+This is the standard HardDisc4 disc image. It is a
+bleeding-edge build which comes from the latest revisions of all the relevant
+sources in our source code repository and is completely untested.
 
 Some components in this archive are released under the licence (included in
 this archive as Licence_v1_1.pdf), or see:
 
   http://www.castle-technology.co.uk/riscosbaselicence.htm
-
-
-How to install the disc image
-=============================
-
-TBD. Something related to "dd"...
 
 -- RISC OS Open
