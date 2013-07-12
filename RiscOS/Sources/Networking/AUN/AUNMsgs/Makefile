@@ -32,7 +32,7 @@ MODSQZ   = modsqz
 RM       = remove
 SCANRES  = scanres
 PERL     = do <Perl$Dir>.perl
-WIPE     = x wipe
+WIPE     = -wipe
 
 CPFLAGS  = ~cfr~v
 WFLAGS   = ~cr~v
