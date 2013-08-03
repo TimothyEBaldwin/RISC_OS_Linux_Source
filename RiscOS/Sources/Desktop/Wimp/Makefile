@@ -56,6 +56,8 @@ install:
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites11 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites11 ${INSTDIR}.${USERIF}.Sprites11 ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites22 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Sprites22 ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Tools     Then ${CP} LocalRes:${USERIF}.DiscSprites.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS}
+	IfThere LocalRes:${USERIF}.DiscSprites.CoFlags   Then ${CP} LocalRes:${USERIF}.DiscSprites.CoFlags   ${INSTDIR}.${USERIF}.CoFlags   ${CPFLAGS}
+	IfThere LocalRes:${USERIF}.DiscSprites.CoSprite  Then ${CP} LocalRes:${USERIF}.DiscSprites.CoSprite  ${INSTDIR}.${USERIF}.CoSprite  ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: disc theme resources installed
 
 export:
