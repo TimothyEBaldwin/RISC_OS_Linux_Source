@@ -37,7 +37,7 @@
 EXP_HDR = <export$dir>
 
 # To switch between making debugging and non-debugging versions of SprExtend:
-#   change the #define of DEBUG at the top of c.PutScaled
+#   change the #define of DEBUG in h.commondefs
 #   change the SETL of 'debug' in sources.SprExtend.
 CDEFINES = -DRISCOS -DASMHUFF -DASMIDCT -DASMCOLOR
 CINCLUDES = -IC:
@@ -146,7 +146,7 @@ ${GENPALETTE}: genpalette.c
 ${GENYUVTABS}: genyuvtabs.c
         ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
-${GENJHDR}: genjhdr.c
+${GENJHDR}: genjhdr.c jinclude.h jconfig.h jpegdata.h
         ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
@@ -159,19 +159,19 @@ ${CFSI-JPEG}: Sources.CFSI-JPEG jhdr.s stdpalette.s rojpeg.o
 #
 # Static dependencies:
 #
-${ROM_OBJECT}: ${OBJS} ${SFILES} putscaled.o
+${ROM_OBJECT}: ${OBJS} ${SFILES}
         do mkdir -p o
         ${AS} ${ASFLAGS} -o $@ ${OBJS}
 
-${ROM_TARGET}: ${ROM_OBJECT}
-        ${LD} -o $@ -rmf ${ROM_OBJECT} putscaled.o
+${ROM_TARGET}: ${ROM_OBJECT} asmcore.o
+        ${LD} -o $@ -rmf ${ROM_OBJECT} asmcore.o
 
-${RAM_OBJECT}: ${OBJS} ${SFILES} resmsg.o putscaled.o
+${RAM_OBJECT}: ${OBJS} ${SFILES}
         do mkdir -p o
         ${AS} ${ASFLAGS} -PD "standalone SETL {TRUE}" -o $@ ${OBJS}
 
-${RAM_TARGET}: ${RAM_OBJECT}
-        ${LD} -o $@ -rmf ${RAM_OBJECT} resmsg.o putscaled.o
+${RAM_TARGET}: ${RAM_OBJECT} resmsg.o asmcore.o
+        ${LD} -o $@ -rmf ${RAM_OBJECT} resmsg.o asmcore.o
         ${MODSQZ} $@
 
 resmsg.o: LocalRes:Messages
@@ -181,7 +181,7 @@ resmsg.o: LocalRes:Messages
 rojpeg.o:
         ${CC} ${CFLAGS} ${C_NO_STKCHK} -DEMBED -DSOURCE_IS_rojpeg $*.c
 
-putscaled.o:
+asmcore.o:
         ${CC} ${CFLAGS} ${C_NO_STKCHK} -DEMBED -DSOURCE_IS_putscaled $*.c
 
 # Dynamic dependencies:
