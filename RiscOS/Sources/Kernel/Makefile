@@ -81,7 +81,8 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${C_EXP_HDR}.HALDevice \
             ${C_EXP_HDR}.OSEntries \
             ${C_EXP_HDR}.Variables \
-            ${C_EXP_HDR}.OSRSI6
+            ${C_EXP_HDR}.OSRSI6 \
+            ${C_EXP_HDR}.VduExt
 
 #
 # Generic rules:
@@ -213,6 +214,10 @@ ${C_EXP_HDR}.Variables: hdr.Variables
 ${C_EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${MKDIR} ${C_EXP_HDR}
 	${PERL} Build:Hdr2H hdr.OSRSI6 $@
+
+${C_EXP_HDR}.VduExt: hdr.VduExt
+	${MKDIR} ${C_EXP_HDR}
+	${PERL} Build:Hdr2H hdr.VduExt $@
 
 o.Global.h.HALDevice: hdr.HALDevice
 	${MKDIR} o.Global.h
