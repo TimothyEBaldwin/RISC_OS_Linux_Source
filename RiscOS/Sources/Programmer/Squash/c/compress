@@ -1,0 +1,394 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -> c.compress
+ * An LZW compression and decompression module
+ * Author: J.G.Thackray
+ * Copyright (c) 1990 Acorn Computers Ltd.
+ * Version 0.01 - Initial version
+ *         0.02 - Assembler swis added
+ *         0.03 - First restartable swi added (compress_store_store)
+ *         0.04 - First cut at all swis added
+ */
+
+#include "kernel.h"
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "debug.h"
+#include "cssr.h"
+#include "zssr.h"
+
+#define Module_Name "Squash"
+
+extern int zcat_store_ass( char *input, char *output, unsigned int length, char *workspace );
+
+extern int compress_store_ass( char *input, char *output, unsigned int length, char *workspace );
+
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+
+#define UNUSED(x)       (x = x)
+#define Compress        0
+#define Decompress      1
+
+/*
+ * Required work space sizes for compress and decompress.
+ */
+#define COMP_WORKSZ     (31 * 1024)
+#define DECOMP_WORKSZ   (17 * 1024)
+
+/*
+ * Masks for the flag bits in r0.
+ */
+#define SquashContinue  0x01
+#define SquashMoreInput 0x02
+#define SquashFast      0x04
+#define SquashWorkSize  0x08
+#define SquashLastFlag  0x10 /* First available flag bit in r0. */
+
+/*
+ * The help text is not actually used at present.
+ */
+#define  help_text \
+"SWI: Squash_Compress &42700\n\
+Input:  r0 - flags\n\
+             bit 0      0 -> start new operation\n\
+                        1 -> continue existing operation\n\
+                             (using existing workspace contents)\n\
+             bit 1      0 -> this is the end of the input\n\
+                        1 -> there is more input after this\n\
+             bit 2      has no effect\n\
+             bit 3      0 -> no effect\n\
+                        1 -> return the work space size required in\n\
+                             bytes (all other bits must be 0).\n\
+             bits 4..31 must be zero\n\
+        If bit 3 of r0 set then\n\
+          r1 - input size or -1 (don't want max output size)\n\
+        otherwise\n\
+          r1 - workspace pointer\n\
+          r2 - input pointer\n\
+          r3 - number of bytes of input available\n\
+          r4 - output pointer\n\
+          r5 - number of bytes of output available\n\
+Output: If bit 3 of r0 set on input then\n\
+          r0 - required work space size\n\
+          r1 - max output size or -1 (don't know or wasn't asked)\n\
+        otherwise\n\
+          r0 - Output status:\n\
+                 0 - operation completed\n\
+                 1 - operation ran out of input data (r3 = 0)\n\
+                 2 - operation ran out of output space (r5 < 12)\n\
+          r1 - preserved\n\
+          r2 - updated to show first unused byte\n\
+          r3 - updated to show number of input bytes not used\n\
+          r4 - updated to show first unused output byte\n\
+          r5 - updated to show number of output bytes not used\n\
+Errors: Squash_bad_address\n\
+        Squash_corrupt_workspace\n\
+        Squash_bad_parameters\n\
+\n\
+(Aside: The asymmetry in handling of running out of space is due to the\n\
+handling of the compressed stream in chunks of several bytes at a time, in\n\
+order to extract bit fields efficiently.)\n\
+\n\
+If bits 0 and 1 of r0 are clear, and the output is definitely big enough,\n\
+a fast algorithm will be used. The maximum output size for compressed data is\n\
+  3 + 3*input size/2\n\
+in the worst case.\n\
+\n\
+SWI: Squash_Decompress &42701\n\
+Input:  r0 - flags\n\
+             bit 0      0 -> start new operation\n\
+                        1 -> continue existing operation\n\
+                             (using existing workspace contents)\n\
+             bit 1      0 -> this is the end of the input\n\
+                        1 -> there is more input after this\n\
+             bit 2      0 -> normal\n\
+                        1 -> You may assume that the output\n\
+                             will all fit in this buffer (allows a faster algorithm\n\
+                             to be used, if bits 0 and 1 are both 0)\n\
+             bit 3      0 -> no effect\n\
+                        1 -> return the work space size required in\n\
+                             bytes (all other bits must be 0).\n\
+             bits 4..31 must be zero\n\
+        If bit 3 of r0 set then\n\
+          r1 - input size or -1 (don't want max output size)\n\
+        otherwise\n\
+          r1 - workspace pointer\n\
+          r2 - input pointer\n\
+          r3 - number of bytes of input available\n\
+          r4 - output pointer\n\
+          r5 - number of bytes of output available\n\
+Output: If bit 3 of r0 set on input then\n\
+          r0 - required work space size\n\
+          r1 - max output size or -1 (don't know or wasn't asked)\n\
+        otherwise\n\
+          r0 - Output status:\n\
+                 0 - operation completed\n\
+                 1 - operation ran out of input data (r3 < 12)\n\
+                 2 - operation ran out of output space (r5 = 0)\n\
+          r1 - preserved\n\
+          r2 - updated to show first unused byte\n\
+          r3 - updated to show number of input bytes not used\n\
+          r4 - updated to show first unused output byte\n\
+          r5 - updated to show number of output bytes not used\n\
+Errors: Squash_bad_address\n\
+        Squash_corrupt_workspace\n\
+        Squash_corrupt_input\n\
+        Squash_bad_parameters\n\
+\n\
+(Aside: in the case above where r3 < 12, the unused input must be resupplied.\n\
+See the note on Squash_Compress.)\n"
+
+#define Squash_bad_SWI           0
+#define Squash_bad_address       1
+#define Squash_corrupt_input     2
+#define Squash_corrupt_workspace 3
+#define Squash_bad_parameters    4
+
+extern _kernel_oserror *error_return( int e, char *parm );
+
+/*
+ * We don't link with the C library so we need our own memcpy.
+ */
+void *
+memcpy( void *s1, const void *s2, size_t n )
+{
+        int length = n;
+        char *a = (char *)s1,
+             *b = (char *)s2;
+
+        while (length-- > 0) *(a++) = *(b++);
+
+        return s1;
+}
+
+extern int check_address( unsigned int addr, unsigned int length );
+
+_kernel_oserror *
+Squash_swi( int swi_no, _kernel_swi_regs *r, void *private_word )
+{
+        UNUSED( private_word );
+
+        switch ( swi_no )
+        {
+                case Compress:
+
+                        if ( r->r[0] & SquashWorkSize )
+                        {
+                                if ( r->r[0] != SquashWorkSize )
+                                        return error_return( Squash_bad_parameters, 0 );
+                                r->r[0] = COMP_WORKSZ;
+                                if ( r->r[1] != -1 )
+                                        r->r[1] = 12 + 3 * r->r[1] / 2;         /* max output size */
+                                return NULL;
+                        }
+
+                        if ( check_address( r->r[1], 0 ) || check_address( r->r[4], r->r[5] ) )
+                                return error_return( Squash_bad_address, 0 );
+
+                        if ( (unsigned int)r->r[0] >= SquashLastFlag )
+                                return error_return( Squash_bad_parameters, 0 );
+
+                        {
+                                /* Fast <=> from scratch to end and enough output space worst case */
+                                int fast = (r->r[0] & (SquashContinue | SquashMoreInput)) == 0
+                                                && 3 + r->r[3]*3/2 <= r->r[5];
+                                char *input = (char *)r->r[2];
+
+                                if ( fast )
+                                {
+                                        unsigned int output_used;
+#ifdef Workspace
+#undef Workspace
+#endif
+#define Workspace (5003*4)
+                                        tracef0( "Squash: using fast compress\n" );
+
+                                        output_used = compress_store_ass( input, (char *)r->r[4], r->r[3], (char *)r->r[1] );
+
+                                        r->r[2] += r->r[3];             /* Where input starts */
+                                        r->r[3] = 0;                    /* Input remaining */
+                                        r->r[4] += output_used;         /* Where output starts */
+                                        r->r[5] -= output_used;         /* Output remaining */
+                                        r->r[0] = 0;                    /* Result */
+                                }
+                                else
+                                {
+                                        unsigned int output_size = r->r[5];
+                                        compress_state *state = (compress_state *)r->r[1];
+#ifdef Workspace
+#undef Workspace
+#endif
+#define Workspace sizeof(compress_state)
+                                        tracef0( "Squash: using state compress" );
+
+                                        if ( !(r->r[0] & SquashContinue) )
+                                        {
+                                                /* Start from scratch */
+                                                state->starting = 1;
+                                        }
+
+                                        r->r[0] = compress_store_store( &input, r->r[3], (char *)r->r[4],
+                                                        (unsigned int *)r->r+5, state, r->r[0] & SquashMoreInput );
+
+                                        if ( r->r[0] > output_failed )
+                                                switch ( r->r[0] )
+                                                {
+                                                        case output_ws_corrupt:
+                                                                return error_return( Squash_corrupt_workspace, 0 );
+                                                }
+
+                                        r->r[3] -= (int)input - r->r[2];        /* Input remaining */
+                                        r->r[2] = (int)input;                   /* Where input starts */
+                                        r->r[4] += r->r[5];                     /* Where output starts */
+                                        r->r[5] = output_size - r->r[5];        /* Output remaining */
+                                }
+                        }
+
+                        break;
+
+                 case Decompress:
+
+#ifdef Workspace
+#undef Workspace
+#endif
+#define Workspace sizeof(zcat_state)
+                        if ( r->r[0] & SquashWorkSize )
+                        {
+                                if ( r->r[0] != SquashWorkSize )
+                                        return error_return( Squash_bad_parameters, 0 );
+
+                                r->r[0] = DECOMP_WORKSZ;
+                                r->r[1] = -1;                   /* Can't determine max output size */
+                                return NULL;
+                        }
+
+                        if ( check_address( r->r[1], 0 ) || check_address( r->r[4], r->r[5] ) )
+                                return error_return( Squash_bad_address, 0 );
+
+                        if ( (unsigned int)r->r[0] >= SquashLastFlag )
+                                return error_return( Squash_bad_parameters, 0 );
+
+                        {
+                                unsigned int output_used;
+                                char *input = (char *)r->r[2];
+
+                                if ( r->r[0] & SquashFast )
+                                {
+#ifdef Workspace
+#undef Workspace
+#endif
+#define Workspace 0x4100
+                                        tracef0( "Squash: using fast decompress\n" );
+
+                                        output_used = zcat_store_ass( input, (char *)r->r[4], r->r[3], (char *)r->r[1] );
+
+                                        r->r[2] += r->r[3];             /* Where input starts */
+                                        r->r[3] = 0;                    /* Input remaining */
+                                        r->r[4] += output_used;         /* Where output starts */
+                                        r->r[5] -= output_used;         /* Output remaining */
+                                        r->r[0] = 0;                    /* Result */
+                                        break;
+                                }
+                                else
+                                {
+#ifdef Workspace
+#undef Workspace
+#endif
+#define Workspace sizeof(compress_state)
+                                        zcat_result result;
+                                        zcat_state *state = (zcat_state *)r->r[1];
+                                        unsigned int input_available = r->r[3];
+
+                                        tracef0( "Squash: using state decompress\n" );
+
+                                        if ( !(r->r[0] & SquashContinue) )
+                                        {
+                                                /* Start from scratch */
+                                                state->starting = 1;
+                                        }
+
+                                        output_used = zcat_store_store( input, (char *)r->r[4], (unsigned int *)r->r+3,
+                                                                r->r[5], r->r[0] & SquashMoreInput, state, &result );
+
+                                        if ( result > zcat_failed )
+                                                switch ( result )
+                                                {
+                                                        case zcat_input_corrupt:
+                                                                return error_return( Squash_corrupt_input, 0 );
+                                                        case zcat_ws_corrupt:
+                                                                return error_return( Squash_corrupt_workspace, 0 );
+                                                }
+
+                                        r->r[0] = result;
+                                        r->r[2] += input_available - r->r[3];   /* Where input starts */
+                                        r->r[4] += output_used;                 /* Where output starts */
+                                        r->r[5] -= output_used;                 /* Output remaining */
+                                }
+                        }
+
+                        break;
+
+                default:
+                        return error_return( Squash_bad_SWI, Module_Name );
+
+        }
+
+        return NULL;
+}
+
+/*
+ * We do not link with the C library so printing help text is not done at
+ * present.  The module does not need any initialisation.
+ */
+#ifdef notdef
+void
+Squash_service( int service_number, _kernel_swi_regs *r, void *private_word )
+{
+        UNUSED( private_word );
+
+        if ( service_number == 9 )
+        {
+                char    *com = (char *)r->r[0],
+                        *name = Module_Name;
+                int     i = 0;
+
+                while ( name[i] == tolower(com[i]) || (com[i] == '.' && name[i]) ||
+                                        (com[i] < ' ' && name[i] == 0) )
+                {
+                        if ( com[i] == 0 || com[i] == '.' || com[i] < ' ' )
+                        {
+                                printf( "%s: %s\n", Module_Name, help_text );
+                                return;
+                        }
+                        i++;
+                }
+        }
+}
+
+_kernel_oserror *
+Squash_init( char *cmd_tail, int podule_base, void *private_word )
+{
+        UNUSED( cmd_tail );
+        UNUSED( podule_base );
+        UNUSED( private_word );
+
+        /* This module is stateless, so no initialisation is required */
+        return NULL;
+}
+#endif
+
+/* End compress.c */
