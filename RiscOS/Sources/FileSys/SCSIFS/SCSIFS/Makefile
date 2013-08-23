@@ -56,6 +56,5 @@ o.SCSIFSErr: s.SCSIFSErr
 clean::
 	${WIPE} o ${WFLAGS}
 	${RM} hdr.SCSIFSErr
-	@@echo ${COMPONENT}: cleaned
 
 # Dynamic dependencies:
