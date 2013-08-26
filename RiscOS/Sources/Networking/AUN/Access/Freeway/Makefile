@@ -24,6 +24,9 @@ CINCLUDES    = -ITCPIPLibs:,C:
 CUSTOMRES    = custom
 RES_OBJ      =
 LIBS        += ${INETLIB} ${SOCK4LIB} ${ASMUTILS}
+ifeq ("${CMDHELP}","None")
+CMHGDEFINES += -DNO_INTERNATIONAL_HELP
+endif
 
 include CModule
 
