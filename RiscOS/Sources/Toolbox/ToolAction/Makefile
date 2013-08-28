@@ -79,7 +79,7 @@ COMPONENT = ToolAction
 TARGET    = aof.${COMPONENT}
 BASEOBJS  = o.msgs o.utils o.toolact
 
-OBJS	= o.modhdr o.resources o.resource o.resdata o.main o.string32 ${BASEOBJS}
+OBJS	= o.modhdr o.resource o.resdata o.main o.string32 ${BASEOBJS}
 ROMOBJS	= oz.modhdr oz.main oz.string32 ${BASEOBJS}
 
 EXPORTS   = h.ToolAction hdr.ToolAction o.ToolAction
