@@ -22,7 +22,7 @@ RAMBOTH =
 
 COMMON_OBJ = o.ModHdr o.glib o.glib3 o.MemMan o.riscos_uti o.Scrollbar \
  o.ScrollList o.Sizes o.TextArea o.TextMan \
- o.Font o.riscos_gra o.ScrollLisS o.TAsel_ven o.Text o.Utils
+ o.Font o.riscos_gra o.ScrollLisS o.TAsel_ven o.Text o.Utils ${WIMPLIB}
 
 ROM_OBJS = o.mainROM ${COMMON_OBJ}
 
@@ -30,11 +30,7 @@ RAM_OBJS = o.main ${RAMBOTH} ${COMMON_OBJ}
 
 DBG_OBJS = od.main ${RAMBOTH} od.ModHdr od.glib od.glib3 od.MemMan od.riscos_uti od.Scrollbar \
  od.ScrollList od.Sizes od.TextArea od.TextMan \
- od.Font od.riscos_gra od.ScrollLisS od.TAsel_ven od.Text od.Utils
-
-EXTRARAMLIBS = c:tboxlibs.o.wimplib c:tboxlibs.o.toolboxlib
-
-EXTRAROMLIBS = c:tboxlibs.o.wimplib c:tboxlibs.o.toolboxlib
+ od.Font od.riscos_gra od.ScrollLisS od.TAsel_ven od.Text od.Utils ${WIMPLIB}
 
 #
 # Get main rules
