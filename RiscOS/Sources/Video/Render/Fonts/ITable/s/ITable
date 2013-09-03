@@ -41,7 +41,6 @@
         GET     Hdr:ListOpts
         GET     Hdr:Macros
         GET     Hdr:System
-        GET     Hdr:CPU.Arch
         GET     Hdr:ModHand
         GET     Hdr:Proc
         GET     Hdr:Services
@@ -50,7 +49,8 @@
         GET     Hdr:NewErrors
         GET     Hdr:Variables
         GET     Hdr:VduExt
-        GET     Hdr:Debug
+        GET     Hdr:ResourceFS
+        GET     Hdr:MsgTrans
         GET     Hdr:Sprite
         GET     Hdr:ColourTran
         GET     Hdr:Hourglass
@@ -58,7 +58,6 @@
         GET     Hdr:PublicWS
         GET     Hdr:HostFS
         GET     Hdr:PaletteV
-        GET     Hdr:DDVMacros
 
         GET     hdr.ITable                      ; our SWI information
         GET     VersionASM                      ; and version data
@@ -72,6 +71,10 @@
                 GBLL    hostvdu
 debug           SETL    {FALSE}
 hostvdu         SETL    {FALSE}
+      [ :LNOT::DEF:standalone
+                GBLL    standalone
+standalone      SETL    {FALSE}
+      ]
 
                                  GBLL    UseResourceTable
 UseResourceTable                 SETL    {TRUE}
@@ -81,7 +84,6 @@ UseColourTransResourceTable      SETL    {TRUE}
 CallColourTransForTable          SETL    {TRUE}
                                  GBLL    DontAssumeRedirectionIsToggling
 DontAssumeRedirectionIsToggling  SETL    {TRUE}
-
 
 ; Constants used for computing table
 
@@ -197,6 +199,12 @@ Init    Entry   "R1-R3"
 10
         MOV     WP, R2
 
+      [ standalone
+        ADRL    R0, msg_area
+        SWI     XResourceFS_RegisterFiles
+        EXIT    VS
+      ]
+
  [ DontAssumeRedirectionIsToggling
         MOV     R0, # f_CurrentlyScreen         ; initially we're directed at the screen
         STR     R0, iFlags
@@ -217,10 +225,6 @@ Init    Entry   "R1-R3"
         BGE     %BT20
 
         Debug_Open      pipe:itable
-
- [ UseResourceTable :LAND: {FALSE}
-        BL      check_resource                  ; deliberately don't check error return
- ]
 
         BL      claim_vectors                   ; try to claim the vectors
         EXIT                                    ;   and return any possible errors
@@ -245,6 +249,10 @@ Die     Entry   "R1-R2"
 
         BL      release_area                    ; if we have a dynamic area then discard it
 
+      [ standalone
+        ADRL    R0, msg_area
+        SWI     XResourceFS_DeregisterFiles
+      ]
         Debug_Close
 
         EXIT
@@ -259,7 +267,8 @@ Die     Entry   "R1-R2"
         ASSERT  Service_Reset                   < Service_ModeChange
         ASSERT  Service_ModeChange              < Service_ResourceFSStarted
         ASSERT  Service_ResourceFSStarted       < Service_ResourceFSDying
-        ASSERT  Service_ResourceFSDying         < Service_SwitchingOutputToSprite
+        ASSERT  Service_ResourceFSDying         < Service_ResourceFSStarting
+        ASSERT  Service_ResourceFSStarting      < Service_SwitchingOutputToSprite
         ASSERT  Service_SwitchingOutputToSprite < Service_PostInit
 UServTab
         DCD     0
@@ -269,6 +278,9 @@ UServTab
   [ UseResourceTable
         DCD     Service_ResourceFSStarted
         DCD     Service_ResourceFSDying
+  ]
+  [ standalone
+        DCD     Service_ResourceFSStarting
   ]
         DCD     Service_SwitchingOutputToSprite
   [ UseResourceTable
@@ -285,6 +297,9 @@ Service ROUT
         TEQNE   R1, # Service_ResourceFSStarted
         TEQNE   R1, # Service_ResourceFSDying
         TEQNE   R1, # Service_PostInit
+ ]
+ [ standalone
+        TEQNE   R1, # Service_ResourceFSStarting
  ]
         MOVNE   PC, LR
 UService
@@ -306,9 +321,7 @@ UService
         STR     R0, iDynamicArea
         STR     R0, pInverseTable
         STR     R0, pDistanceTable
- [ UseResourceTable :LAND: {FALSE}
-        STR     R0, pResourceTable
- ]
+
         BL      claim_vectors                   ; must claim the vectors again
 
         EXIT
@@ -331,11 +344,21 @@ UService
 
 20
  ]
+ [ standalone
+        TEQ     R1, # Service_ResourceFSStarting
+        BNE     %FT30
+
+        ADRL    R0, msg_area                    ; reinstall the resource block
+        MOV     LR, PC
+        MOV     PC, R2
+        EXIT
+30
+ ]
         TEQ     R1, # Service_ModeChange
         BICEQ   R0, R0, # f_TableValid          ; mode change, therefore table bad
         TEQ     R1, # Service_SwitchingOutputToSprite
  [ DontAssumeRedirectionIsToggling
-        BNE     %FT30
+        BNE     %FT40
         ; we're changing redirection
         ORR     R0, R0, # f_SwitchInvalid       ; output gone to sprite - maybe invalid
 
@@ -346,10 +369,10 @@ UService
 
         TST     R0, # f_TableValid              ; if the table is already invalid
         TSTNE   R0, # f_CurrentlyScreen         ; ... or if we're not going to the screen now
-        BEQ     %FT30                           ; ... we don't care
+        BEQ     %FT40                           ; ... we don't care
         TST     R0, # f_TableScreen             ; is the table for the screen ?
         BICNE   R0, R0, # f_SwitchInvalid       ; if so, then the table /is/ valid again
-30
+40
  |
         EOREQ   R0, R0, # f_SwitchInvalid       ; output gone to sprite - maybe invalid
  ]
@@ -370,39 +393,63 @@ SWIDespatch ROUT
         LDR     WP, [WP]                        ; de-reference the workspace pointer
         WritePSRc SVC_mode, R10                 ;   ensure that IRQ's get re-enabled
 
+        Push    "LR"
+        BL      SWIDespatchInternal
+        Pull    "LR"
+
+      [ No32bitCode
+        ORRVSS  PC, LR, #V_bit                  ; mark that an error occurred
+        MOVS    PC, LR
+      |
+        TEQ     PC, PC                          ; preserves V
+        MOVEQ   PC, LR                          ; 32 bit exit
+        ORRVSS  PC, LR, #V_bit                  ; 26 bit error exit
+        MOVS    PC, LR
+      ]
+
+        MakeInternatErrorBlock ModuleBadSWI,,BadSWI
+
+msg_filename
+        DCB     "Resources:$.Resources.ITable.Messages", 0
+        ALIGN
+
+SWIDespatchInternal
+
         CMP     R11, #( %90-%00 ) / 4           ; is the index valid for our swi table
         ADDCC   PC, PC, R11, LSL # 2            ;   if it is then despatch
         B       %FT90
 00
         B       ITable_Calculate
 90
-        ADR     R0, ErrorBlock_NaffSWI
+        ADR     R0, ErrorBlock_ModuleBadSWI
+make_error
+        Push    "R1-R7,LR"
+        SUB     SP, SP, #16                     ; temporary MessageTrans structure
+
+        MOV     R7, R0                          ; Push R0
+        MOV     R0, SP
+        ADR     R1, msg_filename
+        MOV     R2, #0
+        SWI     XMessageTrans_OpenFile
+        BVS     %FT95                           ; someone ate my messages file
+        MOV     R0, R7                          ; Pull R0
+
+        MOV     R1, SP
+        MOV     R2, #0                          ; use MessageTrans internal buffer
+        ADRL    R4, Title
+        MOV     R5, #0
+        MOV     R6, #0
+        MOV     R7, #0
+        SWI     XMessageTrans_ErrorLookup
+
+        MOV     R7, R0                          ; Push R0
+        MOV     R0, SP
+        SWI     XMessageTrans_CloseFile
+        MOV     R0, R7                          ; Pull R0
 95
-      [ No32bitCode
-        ORRS    PC, LR, #V_bit                  ; mark that an error occurred
-      |
-        MRS     R10, CPSR                       ; preserve other flags on 26-bit system
-        TST     R10, #2_11100
-        ORREQS  PC, LR, #V_bit                  ; mark that an error occurred (26-bit)
-        SETV                                    ;                             (32-bit)
-        MOV     PC, LR
-     ]
-
-err_badmode
-      [ No32bitCode
-        ADR     R0, ErrorBlock_BadMODE
-        ORRS    PC, LR, #V_bit                  ; mark that an error occurred
-      |
-        MRS     R0, CPSR                        ; take care to preserve other flags
-        ORR     R0, R0, #V_bit
-        MSR     CPSR_f, R0
-        ADR     R0, ErrorBlock_BadMODE
-        MOV     PC, LR
-      ]
-
-        MakeErrorBlock NaffSWI
-        MakeErrorBlock BadMODE
-
+        ADD     SP, SP, #16                     ; finished with the structure
+        SETV
+        Pull    "R1-R7,PC"
 
 ;; ------------------------------------------------------------------------------
 ;; Claim vectors used by the modules
@@ -453,10 +500,11 @@ palVhandler ROUT
 ;; Check on the resource file presence
 
  [ UseResourceTable
+table_filename
   [ UseColourTransResourceTable
-ResourceFile    = "Resources:$.Resources.Colours.Tables.8desktop", 0
+        DCB     "Resources:$.Resources.Colours.Tables.8desktop", 0
   |
-ResourceFile    = "Resources:$.Resources.ITable.Tables.8desktop", 0
+        DCB     "Resources:$.Resources.ITable.Tables.8desktop", 0
   ]
         ALIGN
 
@@ -469,7 +517,7 @@ check_resource
         STR     R0, pResourceTable
 
         MOV     R0, #open_read :OR: open_nopath :OR: open_nodir
-        ADR     R1, ResourceFile
+        ADR     R1, table_filename
         SWI     XOS_Find
         EXIT    VS
 
@@ -548,8 +596,9 @@ ITable_Calculate Entry "R2"
         MOV     R1, #VduExt_Log2BPP
         SWI     XOS_ReadModeVariable            ; read the log2 bits per pixel for this mode
         TEQ     R2, #3                          ;   if this is not 8 bit then exit
-        BLNE    err_badmode
-        BNE     %FT90
+        ADRNE   R0, ErrorBlock_BadMODE
+        BLNE    make_error
+        BVS     %FT90
 
         LDR     R2, iFlags                      ; check to see if table is valid
         TST     R2, # f_SwitchInvalid
@@ -575,6 +624,7 @@ ITable_Calculate Entry "R2"
 90
         EXIT
 
+        MakeInternatErrorBlock BadMODE,,BadMODE
 
 ;; ------------------------------------------------------------------------------
 ;; Dynamic area management code.
@@ -1069,6 +1119,11 @@ StandardPalette
         DCW     &6739,&6F7B,&77BD,&7FFF
  ]
 
+      [ standalone
+msg_area
+        ResourceFile    $MergedMsgs, Resources.ITable.Messages
+        DCD     0
+      ]
       [ debug
         InsertNDRDebugRoutines
       ]
