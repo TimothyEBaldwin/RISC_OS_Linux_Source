@@ -25,6 +25,7 @@
 #include "swis.h"
 
 #include "Global/Services.h"
+#include "Global/NewErrors.h"
 #include "Global/RISCOS.h"
 
 #include "VersionNum"
@@ -43,7 +44,6 @@
 #include "sockets.h"
 #include "module.h"
 #include "packets.h"
-#include "dhcperrors.h"
 #include "dhcpinform.h"
 #include "iparp.h"
 
@@ -153,6 +153,9 @@ static _kernel_oserror *module_initsystemhooks(void *private_word)
 
 /* End callafter/callback management */
 
+static int msg_struct[4];
+static _kernel_oserror msg_buff;
+
 _kernel_oserror *dhcp_swi(int swi_number, _kernel_swi_regs *r, void *private_word)
 {
 	_kernel_oserror *e = NULL;
@@ -195,6 +198,11 @@ _kernel_oserror *dhcp_finalise(int fatal, int podule, void *private_word)
 	sockets_discard();
 	module_clearsystemhooks(private_word);
 
+	/* Tidy up the messages (and deregister from ResourceFS if not in ROM) */
+	_swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+#ifndef ROM
+	_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
 	return NULL;
 }
 
@@ -207,13 +215,28 @@ _kernel_oserror *dhcp_initialise(const char *cmd_tail, int podule_base, void *pr
 
 	srand(interfaces_current_time());
 
-	e = module_initsystemhooks(private_word);
-	if (e == NULL) {
-		interfaces_init();
-		sockets_init();
-		dhcpinform_init();
-	}
+#ifndef ROM
+	e = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+	if (e != NULL) goto failinit;
+#endif
+	e = _swix(MessageTrans_OpenFile, _INR(0,2), msg_struct, Module_MessagesFile, 0);
+	if (e != NULL) goto faildereg;
 
+	e = module_initsystemhooks(private_word);
+	if (e != NULL) goto failclose;
+
+	interfaces_init();
+	sockets_init();
+	dhcpinform_init();
+	return NULL;
+
+failclose:
+	_swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+faildereg:
+#ifndef ROM
+	_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+failinit:
+#endif
 	return e;
 }
 
@@ -244,6 +267,12 @@ void dhcp_service(int service_number, _kernel_swi_regs *r, void *private_word)
                         di = interfaces_find(name);
                         if (di) di->dib = dib;
                 }
+                return;
+        }
+        if (service_number == Service_ResourceFSStarting) {
+#ifndef ROM
+                (*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+#endif
                 return;
         }
 	/* Only Service_InternetStatus will arrive here */
@@ -299,15 +328,10 @@ static _kernel_oserror *dhcp_check_escape_key(void)
 	int esc_flags;
 	_swix(OS_ReadEscapeState, _OUT(_FLAGS), &esc_flags);
 	if (esc_flags & _C) {
-	        struct {
-	                int code;
-	                char msg[7];
-	        } eblock;
-		_swix(OS_Byte, _IN(0), 126);
 		trace(("DHCP:Escape pressed\n"));
-		eblock.code = 17;
-		strcpy(eblock.msg, "Escape");
-        	return _swix(MessageTrans_ErrorLookup, _INR(0,7), &eblock, 0, 0, 0, 0, 0, 0, 0);
+		_swix(OS_Byte, _IN(0), 126);
+
+		return module_make_error(ErrorNumber_Escape);
 	}
 	return NULL;
 }
@@ -342,7 +366,7 @@ static _kernel_oserror *dhcp_cmd_execute(const char *arg_string, void *private_w
 		}
 		if (e != NULL) {
 		        if ((flags & decf_WAIT) == 0) break;
-		        if (e->errnum != dhcperror_BASE + error_NO_SUCH_INTERFACE) break;
+		        if (e->errnum != ErrorNumber_DHCP_NoSuchInterface) break;
 		        /* The interface wasn't there.  Hmm.  We'll *try* a nasty nasty hack */
 		        usermode_donothing();
 		}
@@ -396,6 +420,32 @@ _kernel_oserror *dhcp_command(const char *arg_string, int argc, int cmd_no, void
 	}
 
 	return NULL;
+}
+
+const char *module_lookup_msg(const char *token)
+{
+	if (_swix(MessageTrans_Lookup, _INR(0,7),
+	          msg_struct, token,  &msg_buff, sizeof(msg_buff),
+	          0, 0, 0, 0) != NULL) {
+		return "";
+	}
+
+	return (const char *)&msg_buff;
+}
+
+_kernel_oserror *module_make_error(int error)
+{
+	char token[12];
+	_kernel_oserror *e;
+
+	sprintf(token, "@@@@E%02u", error & 0xFF);
+	e = _swix(MessageTrans_ErrorLookup, _INR(0,3),
+	          token, msg_struct, &msg_buff, sizeof(msg_buff));
+	if (e->errnum == 0x40404040) {
+		/* Same error number out as went in, looked up OK */
+		msg_buff.errnum = error;
+	}
+	return e;
 }
 
 void module_notify_dynamic_boot_start(dhcp_interface *di)
@@ -461,7 +511,7 @@ void module_idle(enum moduleidle_reason mir)
  * otherwise we get a nasty reentrancy situation due to a service call from
  * the internet module telling us about the new IP address.
 */
-void apply_private_ip(Dib *dib) {
+void module_apply_private_ip(Dib *dib) {
   unsigned long a, b;
   struct in_addr addr, mask, broad;
   char ifname[IFNAMSIZ];

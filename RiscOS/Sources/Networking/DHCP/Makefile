@@ -16,7 +16,7 @@
 #
 
 COMPONENT    = DHCP
-OBJS         = dhcp dhcperrors dhcpinform module interfaces\
+OBJS         = dhcp dhcpinform module interfaces\
                iparp packets sockets voting
 CMHGDEPENDS  = module
 #
@@ -28,11 +28,10 @@ CMHGDEPENDS  = module
 #
 CDEFINES     = ${OPTIONS} -UTRACE
 CINCLUDES    = -ITCPIPLibs:,C:
-CUSTOMRES    = custom
 C_EXP_HDR    = <cexport$dir>.h
 HDRS         = DHCP
 CMHGAUTOHDR  = DHCP
-RES_OBJ      =
+ROMCDEFINES  = -DROM
 LIBS        += ${NET5LIBS} ${ASMUTILS}
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
