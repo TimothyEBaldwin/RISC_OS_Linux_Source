@@ -29,7 +29,6 @@
 COMPONENT  = SSound
 TARGET     = SSound
 ROM_SOURCE = Gets.s
-RESOURCES  = No
 
 include StdTools
 include AAsmModule
