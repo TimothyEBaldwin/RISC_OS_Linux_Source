@@ -42,27 +42,22 @@ SA_FLAGS  =
 ASFLAGS   = -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
 
 ifeq (${TARGET},ThemeDefs)
-
 CUSTOMSA  = custom
 CUSTOMEXP = custom
 
 install: 
 	${MKDIR} ${INSTDIR}.${USERIF}
-	| At least give the equivalent ROM ones for that UserIF
-	${CP} LocalRes:${USERIF}.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS}
-	${CP} LocalRes:${USERIF}.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS}
-	| Then give the disc ones in preference if they exist
-	IfThere LocalRes:${USERIF}.DiscSprites.Sprites   Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS}
+	| Give the disc ones in preference if they exist, else minimalist ROM ones
+	IfThere LocalRes:${USERIF}.DiscSprites.Sprites   Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Sprites   ${CPFLAGS} Else ${CP} LocalRes:${USERIF}.Sprites ${INSTDIR}.${USERIF}.Sprites ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites11 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites11 ${INSTDIR}.${USERIF}.Sprites11 ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.Sprites22 Then ${CP} LocalRes:${USERIF}.DiscSprites.Sprites22 ${INSTDIR}.${USERIF}.Sprites22 ${CPFLAGS}
-	IfThere LocalRes:${USERIF}.DiscSprites.Tools     Then ${CP} LocalRes:${USERIF}.DiscSprites.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS}
+	IfThere LocalRes:${USERIF}.DiscSprites.Tools     Then ${CP} LocalRes:${USERIF}.DiscSprites.Tools     ${INSTDIR}.${USERIF}.Tools     ${CPFLAGS} Else ${CP} LocalRes:${USERIF}.Tools   ${INSTDIR}.${USERIF}.Tools   ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.CoFlags   Then ${CP} LocalRes:${USERIF}.DiscSprites.CoFlags   ${INSTDIR}.${USERIF}.CoFlags   ${CPFLAGS}
 	IfThere LocalRes:${USERIF}.DiscSprites.CoSprite  Then ${CP} LocalRes:${USERIF}.DiscSprites.CoSprite  ${INSTDIR}.${USERIF}.CoSprite  ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: disc theme resources installed
 
 export:
 	@${ECHO} ${COMPONENT}: nothing to export when target is ${TARGET}
-
 endif
 
 include StdTools
