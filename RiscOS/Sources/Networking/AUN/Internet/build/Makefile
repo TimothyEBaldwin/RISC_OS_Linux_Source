@@ -47,7 +47,7 @@ CC      = cc
 CMHG    = cmhg
 CP      = copy
 LD      = link
-MKDIR   = cdir
+MKDIR   = do mkdir -p
 MODSQZ  = modsqz
 RM      = remove
 WIPE    = x wipe
@@ -142,6 +142,7 @@ rom: ${ROM_MODULE}
         @echo ${COMPONENT}: Module built (ROM)
 
 install: ${TARGET}
+        ${MKDIR} ${INSTDIR}
         ${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
         @echo ${COMPONENT}: Module installed (RAM)
 
