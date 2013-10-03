@@ -39,7 +39,7 @@ endif
 include CModule
 
 # Static dependencies
-MyResObj.o: LocalRes:ROM.Sprites ${MERGEDMSGS} ${DIRS}
+o.MyResObj od.MyResObj: LocalRes:ROM.Sprites ${MERGEDMSGS} ${DIRS}
 	${RESGEN} ${RES_AREA} $@ ${MERGEDMSGS} ${RES_PATH}.Messages LocalRes:ROM.Sprites ${RES_PATH}.Sprites 
 
 # Dynamic dependencies:
