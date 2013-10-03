@@ -18,21 +18,28 @@
 COMPONENT    = LanManFS
 OBJS         = Xlate Transact Stats SMB RPC Printers Omni NetBIOS NBIP \
                NameCache Logon LLC LanMan CoreFn buflib Attr \
-               Errors Interface
+               Interface MyResObj
 CINCLUDES    = -ITCPIPLibs:,C:
 HDRS         =
 CMHGFILE     = Lanman_MH
 CMHGDEPENDS  = LanMan LLC Logon NBIP Omni
 LIBS         = ${NET4LIBS} ${ASMUTILS}
+RES_PATH     = ThirdParty.OmniClient.LanManFS
 RES_OBJ      =
 CUSTOMRES    = custom
 CDEFINES     = -DCOMPAT_INET4 -DLONGNAMES ${OPTIONS}
 CFLAGS       = -Wp
 CDFLAGS      = -DDEBUG -DDEBUGLIB -DTRACE -Dprintf=module_printf
-ASFLAGS      = -pd "ROMSPRITES SETL {${ROMSPRITES}}"
 ROMCDEFINES  = -DROM
 CMHGDEFINES  = ${OPTIONS}
+ifeq ("${CMDHELP}","None")
+CMHGDEFINES += -DNO_INTERNATIONAL_HELP
+endif
 
 include CModule
+
+# Static dependencies
+MyResObj.o: LocalRes:ROM.Sprites ${MERGEDMSGS} ${DIRS}
+	${RESGEN} ${RES_AREA} $@ ${MERGEDMSGS} ${RES_PATH}.Messages LocalRes:ROM.Sprites ${RES_PATH}.Sprites 
 
 # Dynamic dependencies:
