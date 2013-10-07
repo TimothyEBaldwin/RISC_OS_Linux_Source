@@ -28,6 +28,7 @@
 #include "putscaled.h"
 #include "Global/Sprite.h"
 #include "Global/VduExt.h"
+#include "Interface/BlendTable.h"
 
 /**************************************************************************
 *                                                                         *
@@ -38,9 +39,12 @@
 #define SOURCE_32_BIT  (wp->save_inlog2bpp == 5)
 #define SOURCE_16_BIT  (wp->save_inlog2bpp == 4)
 #define SOURCED_16_BIT (wp->save_inlog2bpc == 4) /* like SOURCE_16_BIT but includes 16-bit double-pixels */
-#define SOURCE_MASK    (ws->masked)
-#define SOURCE_BPPMASK (ws->mask1bpp)
-#define SOURCE_TABLE   ((wp->ColourTTR != 0) || (wp->trns_palette != 0))
+#define SOURCE_MASK    (ws->masktype != MaskType_None)
+#define SOURCE_OLDMASK (ws->masktype == MaskType_Old)
+#define SOURCE_BPPMASK (ws->masktype == MaskType_1bpp)
+#define SOURCE_ALPHAMASK (ws->masktype == MaskType_8bpp)
+#define SOURCE_TRICKYMASK (ws->masktype > MaskType_Old)
+#define SOURCE_TABLE   (wp->ColourTTR != 0)
 
 #define DPIXEL_INPUT   (wp->save_inlog2bpp != wp->save_inlog2bpc)
 #define DPIXEL_OUTPUT  (wp->BPP != wp->BPC)
@@ -62,18 +66,20 @@
 
 #ifdef DEBUG
 #define tracef(args)     do_sprintf(0, args)
-#define assert(x, y)     do_assert(__LINE__, x, y, NULL)
+#define assert(x, y)     do_assert(__FILE__, __LINE__, x, y, #x)
 #define newline()        tracef("\n");
 #define comment(ws,text) do_comment(text)
 #define IFDEBUG(a) a
 #include "tracing.c"
 #define COMPONENT_NAME(i) ((i==0?"red":(i==1?"green":(i==2?"blue":"alpha"))))
+#define EXIT_OSERROR(e)  { tracef("error %08x %s at %s %d\n" _ e->errnum _ e->errmess _ __FILE__ _ __LINE__); exit_oserror(e); }
 #else
 #define tracef(args)     /* Nothing */
 #define assert(x, y)     {if (!(x)) exit_erl(y, __LINE__);}
 #define newline()        /* Nothing */
 #define comment(ws,text) /* Nothing */
 #define IFDEBUG(a)       /* Nothing */
+#define EXIT_OSERROR     exit_oserror
 #endif
 
 /* Make a string constant unique to avoid Norcroft messing it up
@@ -164,6 +170,10 @@ typedef struct
   label plot_loop4b;
   label plot_loop4c;
 
+  label blend_nodestalpha;
+  label translate_noalpha;
+  label translate_noalpha2;
+
   label last;
   #define LAST_LABEL last
   /* If you add a label, add giving it a name in check_workspace */
@@ -174,11 +184,26 @@ typedef struct
 /* Register names - one for each register name (the register numbers are allocated at compile time) */
 typedef struct
 {
-  int regno;     /* the physical register number */
+  int regno;     /* the physical register number, negative if not allocated/paged out */
+  int flags;     /* usage flags */
+  int spindex;   /* index into stack frame where register is saved, -1 if not saved */
 #ifdef DEBUG
   char *name;    /* the name, for trace output */
+  char *describe;/* description, for trace output */
 #endif
 } regname;
+
+#define REGFLAG_TEMPORARY  0x01 /* Only used for temporary calculations, doesn't need saving/restoring */
+#define REGFLAG_CONSTANT   0x02 /* Constant value - once initialised, doesn't need saving */
+#define REGFLAG_GLOBAL     0x04 /* Register must always be available  */
+#define REGFLAG_PERPIXEL   0x08 /* Register needed for per-pixel block */
+#define REGFLAG_XLOOP      0x10 /* Register needed for x-loop block */
+#define REGFLAG_YLOOP      0x20 /* Register needed for y-loop block */
+#define REGFLAG_INPUT      0x40 /* Register needed for input block */
+#define REGFLAG_USED       0x80 /* Dummy flag for some global regs (sp, lr, etc.) */
+#define REGFLAG_XLOOPVAR  0x100 /* Restore initial value at end of x loop */
+
+#define REGFLAG_USAGE_MASK 0x7c /* All the interesting usage flags */
 
 /* Each register name must be added as a field to this structure. */
 typedef struct
@@ -189,9 +214,15 @@ typedef struct
   regname r_pixel;         /* In/out pixel value */
   regname r_temp1;         /* Temp regs for pixel format conversion */
   regname r_temp2;
-  regname r_expansionmask; /* Constant for BPP expansion */
+  regname r_expansionmask1;/* Constant for BPP expansion */
+  regname r_expansionmask2;/* Secondary mask for rare situations */
   regname r_oditheradd;    /* Current dither pattern */
   regname r_table;         /* Palette/colour translation table ptr */
+  regname r_alpha;         /* Computed alpha for sprite blending */
+  regname r_translucency;  /* User-supplied translucency for sprite blending, inverted to make alpha */
+  regname r_blendtable;    /* Pointer to blend table(s) */
+  regname r_screenpalette; /* 8bpp -> 15bpp LUT from InverseTable */
+  regname r_inversetable;  /* 15bpp -> 8bpp LUT from InverseTable */
 
   /* PutScaled registers */
   regname r_inptr;
@@ -236,12 +267,13 @@ typedef struct
 } regnames_rec;
 #define FOR_EACH_REGISTER_NAME(ptr) for (ptr = &ws->regnames.FIRST_REGISTER; ptr <= &ws->regnames.LAST_REGISTER; ptr++)
 
-#define R(reg) rr(ws->regnames.reg.regno)
-static int rr(int r)
+#define R(reg) rr(&ws->regnames.reg)
+static int rr(const regname *r)
 {
   /* Assert that the register is at least set */
-  assert(r != -1, ERROR_FATAL);
-  return r;
+  IFDEBUG(if(r->regno & 0x80000000) tracef("%x %s\n" _ r->regno _ r->name);)
+  assert(!(r->regno & 0x80000000), ERROR_FATAL);
+  return r->regno;
 }
 
 /* Must be kept in sync with corresponding definitions in Sources.PutScaled! */
@@ -283,6 +315,23 @@ typedef struct
 
 #define HINT_HIGHEST 1
 
+typedef enum
+{
+  MaskType_None, /* No mask, or we're not using it */
+  MaskType_Old, /* Old style mask */
+  MaskType_1bpp, /* New style 1bpp mask */
+  MaskType_8bpp, /* 8bpp alpha mask */
+} MaskType;
+
+typedef enum
+{
+  BlendImpl_None, /* No blending required */
+  BlendImpl_BlendTable, /* Use single blendtable */
+  BlendImpl_InverseTable, /* Use InverseTable for 8bpp -> 15bpp -> 8bpp */
+  BlendImpl_True, /* True colour blend, no tables required */
+  BlendImpl_BlendTables, /* Lots of blend tables for <=4bpp output */
+} BlendImpl;
+
 /* The structure containing all workspace - essentially our static variables. */
 #define CHECK_CODE 123456789
 typedef struct
@@ -301,18 +350,15 @@ typedef struct
 
   /* Register control and allocation */
   regnames_rec regnames;         /* physical assignment of each register name */
-  int  next_free_reg;            /* allocator of physical registers, as they are needed. */
-  BOOL leave_r12_alone;          /* Leave assembler 'wp' in place during compiled code */
+  int  regframesize;             /* size of stack frame holding regs */
+  int  regframeoffset;           /* sp offset to apply to get the register stack frame */
 
   int  gcol;                     /* GCOL action */
-  BOOL masked;                   /* whether to use mask */
-  BOOL mask1bpp;                 /* whether mask is 1bpp mask */
+  MaskType masktype;             /* Mask type to use */
 
   int  odither;                  /* If 0, then there's no ordered dither. If non-0, number of bits - 1 being truncated by dither. */
 
-  int  pixel_expansion_mask;     /* Computed mask that gets loaded into r_expansionmask */
-  int  pixel_expansion_shift;    /* Required shift amount */
-  const PixelFormatInfo *pixel_expansion_in,*pixel_expansion_out; /* Input & output formats the mask was generated for; it will be applied when performing this and only this type of conversion */
+  int pixel_expansion_mask[2];   /* Pixel expansion masks. Only rarely are both needed. */
 
   /* Assemble-time constants */
   int  in_bpp;
@@ -330,6 +376,7 @@ typedef struct
   BOOL cal_table_simple;         /* If true, a simple table lookup is possible */
   PixelFormat ColourTTRFormat;   /* Input format of ColourTTR (output format assumed to be out_pixelformat) */
   int  compiled_routine_stacked; /* Offset to apply to LDR_SP/STR_SP */
+  BlendImpl blendimpl;           /* Blending method/implementation to use */
 
   /* Space for compiled code, near the end so most field accesses have only a small offset. */
   code_buffer buffers[NBUFFERS];
@@ -403,6 +450,10 @@ static void check_workspace(workspace *ws)
       LN(plot_loop4b)
       LN(plot_loop4c)
 
+      LN(blend_nodestalpha)
+      LN(translate_noalpha)
+      LN(translate_noalpha2)
+
       LN(last)
       /* Check he's got them all */
       FOR_EACH_LABEL(l) assert(l->name != 0, ERROR_FATAL);
@@ -415,8 +466,14 @@ static void check_workspace(workspace *ws)
       RNN(r_pixel)
       RNN(r_temp1)
       RNN(r_temp2)
-      RNN(r_expansionmask)
+      RNN(r_expansionmask1)
+      RNN(r_expansionmask2)
       RNN(r_oditheradd)
+      RNN(r_alpha)
+      RNN(r_translucency)
+      RNN(r_blendtable)
+      RNN(r_screenpalette)
+      RNN(r_inversetable)
 
       RNN(r_inptr)
       RNN(r_inshift)
@@ -456,7 +513,6 @@ static void check_workspace(workspace *ws)
       RNN(lr)
       RNN(pc)
       FOR_EACH_REGISTER_NAME(r) assert(r->name != 0, ERROR_FATAL);
-      ws->leave_r12_alone = FALSE;
     }
 #endif
   }
@@ -515,8 +571,9 @@ static void dump_asm_workspace(asm_workspace *wp)
   tracef("BPP=%i                   %t32. bits per pixel of output.\n" _ wp->BPP);
   tracef("BPC=%i                   %t32. bits per character of output (only different for double pixels).\n" _ wp->BPC);
   tracef("ColourTTR=0x%x           %t32. translation table or palette.\n" _ wp->ColourTTR);
-  tracef("trns_palette=0x%x        %t32. if non-0 ignore TTR and use this palette instead.\n" _ wp->trns_palette);
+  tracef("TTRType=0x%x             %t32. translation table type.\n" _ wp->TTRType);
   tracef("spritecode=%i (& 255 = %i) %t32. SpriteOp - 52 for PutSpriteScaled, 50 for PlotMaskScaled.\n" _ wp->spritecode _ wp->spritecode & 255);
+  tracef("blending=%i              %t32. b0: translucency blending, b1: alpha mask/channel blending\n" _ wp->blending);
   newline();
 }
 #endif
@@ -555,6 +612,8 @@ static void dump_workspace(workspace *ws)
 #define GT 0xc0000000
 #define LE 0xd0000000
 #define AL 0xe0000000
+#define HS CS
+#define LO CC
 
 /* Branches */
 #define B  0x0a000000
@@ -582,7 +641,15 @@ static void dump_workspace(workspace *ws)
 #define MVN(dst,rest,str)          ins(ws,(0xf << 21) | DSTR(dst) | (rest), str)
 
 #define MUL(dst,op1,op2,rest,str)  ins(ws,(9<<4) | ((dst)<<16) | (op1) | ((op2)<<8) | (rest), str)
+
+/* CPUFlag_T2 instructions */
 #define MOVW(dst,rest,str)         ins(ws,(3<<24) | DSTR(dst) | (rest), str)
+#define MOVT(dst,rest,str)         ins(ws,(0x34<<20) | DSTR(dst) | (rest), str)
+#define UBFX(dst,src,lsb,width,rest,str) ins(ws,0x07e00050 | DSTR(dst) | (src) | (((width)-1)<<16) | ((lsb)<<7) | (rest), str)
+#define BFC(dst,lsb,width,rest,str) ins(ws,0x07c0001f | DSTR(dst) | (((lsb)+(width)-1)<<16) | ((lsb)<<7) | (rest), str)
+#define BFI(dst,src,lsb,width,rest,str) ins(ws,0x07c00010 | DSTR(dst) | (src) | (((lsb)+(width)-1)<<16) | ((lsb)<<7) | (rest), str)
+
+#define REV(dst,src,rest,str)      ins(ws,0x06bf0f30 | DSTR(dst) | (src) | (rest), str)
 
 #define ADD_OPCODE (0x4 << 21)
 #define SUB_OPCODE (0x2 << 21)
@@ -597,7 +664,7 @@ static void dump_workspace(workspace *ws)
 static int IMM12(unsigned int imm)   /* generate immediate constant for ALU ops */
 {
   int ror = 0;
-  while(imm > 256)
+  while(imm >= 256)
   {
     assert(ror < 32, ERROR_FATAL);
     imm = (imm<<2) | (imm>>30);
@@ -606,7 +673,7 @@ static int IMM12(unsigned int imm)   /* generate immediate constant for ALU ops 
   return IMM(imm) | IMMROR(ror);
 }
 
-#define IMM16(x) (((x) & 0xFFF) | (((x) & 0xF000)<<4)) /* encode 16 bit immediate constant for MOVW */ 
+#define IMM16(x) (((x) & 0xFFF) | (((x) & 0xF000)<<4)) /* encode 16 bit immediate constant for MOVW/MOVT */ 
 
 #define LSLI(x) (((x) << 7) | 0x00)   /* 5-bit immed shift applied to OP2R */
 #define LSRI(x) (((x) << 7) | 0x20)
@@ -666,7 +733,7 @@ static int IMM12(unsigned int imm)   /* generate immediate constant for ALU ops 
 #define SP_OFFSET(field) OFFSET((int) (((char*)&(((stack_ws *)0)->field)) + ws->compiled_routine_stacked))
 
 /* Define an assembler register */
-#define RN(name,no,describe) set_regname(ws, &ws->regnames.name, no, describe);
+#define RN(name,no,flags,describe) set_regname(ws, &ws->regnames.name, no, flags, describe);
 
 #ifdef DEBUG
 static void ldm_reg_list(workspace *ws, char *a, int regmask, BOOL lastname)
@@ -783,24 +850,25 @@ static void do_branch(workspace *ws, unsigned int opcode, label *lab)
 }
 
 #ifdef DEBUG
-static void set_regname(workspace *ws, regname *r, int regno, char *describe)
+static void set_regname(workspace *ws, regname *r, int regno, int flags, char *describe)
 #else
-#define set_regname(ws,r,regno,describe) do_set_regname(ws,r,regno)
-static void do_set_regname(workspace *ws, regname *r, int regno)
+#define set_regname(ws,r,regno,flags,describe) do_set_regname(ws,r,regno,flags)
+static void do_set_regname(workspace *ws, regname *r, int regno, int flags)
 #endif
 /* Allocate a physical register number. If regno is -1 then allocate an
  * as-yet-unused one, otherwise it's a specific register number.
  */
 {
-  if (regno == -1) /* allocate a number, one of 0..12 */
+  UNUSED(ws);
+  if(regno != -1)
   {
-    regno = ws->next_free_reg;
-    ws->next_free_reg++;
-    assert(regno >= 0 && regno <= 12, ERROR_FATAL); /* Check for register overflow */
-    if (regno == 12) assert(!ws->leave_r12_alone, ERROR_FATAL);
+    assert((r->regno == -1) || (r->regno == regno), ERROR_FATAL);
+    r->regno = regno;
   }
-  r->regno = regno;
-  tracef("%t20.%s%t27 RN %t36.%i %t68.; %s\n" _ r->name _ r->regno _ describe);
+  r->flags |= flags;
+#ifdef DEBUG
+  r->describe = describe;
+#endif
 }
 
 static void align16(asm_workspace *wp, workspace *ws)
@@ -917,6 +985,461 @@ static void arbitrary_add(workspace *ws, BOOL add, BOOL s, regname *r, int value
   }
 }
 
+static int countbits(unsigned int bits)
+/* Return count of how many bits are set */
+{
+  bits -= (bits & 0xaaaaaaaa)>>1;
+  bits = (bits & 0x33333333) + ((bits>>2) & 0x33333333);
+  bits += bits>>4;
+  bits &= 0x0f0f0f0f;
+  bits += bits>>8;
+  bits += bits>>16;
+  return (bits & 0xff);
+}
+
+/**************************************************************************
+*                                                                         *
+*    Register management                                                  *
+*                                                                         *
+**************************************************************************/
+#ifdef DEBUG
+static void dump_registers(asm_workspace *wp, workspace *ws)
+{
+  UNUSED(wp);
+  regname *r;
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    tracef("%s: %x %x\n" _ r->name _ r->regno _ r->flags);
+  }
+}
+#endif
+
+static void allocate_registers(asm_workspace *wp, workspace *ws)
+{
+  UNUSED(wp);
+  regname *r;
+//  IFDEBUG(dump_registers(wp,ws);)
+  /* Iterate through all registers and assign register numbers
+     For registers that must be saved to stack, allocate stack space */
+  int usedregs[15];
+  for(int i=0;i<15;i++)
+    usedregs[i] = 0;
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    if((r->regno >= 0) && (r->regno < 16))
+    {
+      usedregs[r->regno] |= r->flags & REGFLAG_USAGE_MASK;
+    }
+  }
+  /* Allocate in order of importance - global, then per-pixel, then x-loop, etc. */
+  for(int i=REGFLAG_GLOBAL;i<=REGFLAG_YLOOP;i<<=1)
+  {
+    FOR_EACH_REGISTER_NAME(r)
+    {
+      if(!(r->flags & i) || (r->regno != -1))
+        continue;
+      /* Look for a free register
+         We prefer a completely free register, or if none is available, the first one that doesn't clash with this allocation
+         Additionally, temporary registers are allocated from the top, non-temporary from the bottom, as I think this may help in some situations */
+      int regno=-1,nextbest=-1;
+      int blocking = (r->flags & REGFLAG_USAGE_MASK) | REGFLAG_GLOBAL;
+      if(r->flags & REGFLAG_TEMPORARY)
+      {
+        for(int j=15;j>=0;j--)
+        {
+          if(!usedregs[j])
+          {
+            regno = j;
+            break;
+          }
+          if(!(usedregs[j] & blocking) && (nextbest == -1))
+          {
+            nextbest = j;
+          }
+        }
+      }
+      else
+      {
+        for(int j=0;j<15;j++)
+        {
+          if(!usedregs[j])
+          {
+            regno = j;
+            break;
+          }
+          if(!(usedregs[j] & blocking) && (nextbest == -1))
+          {
+            nextbest = j;
+          }
+        }
+      }
+      if(regno == -1)
+      {
+        regno = nextbest;
+        assert(regno != -1, ERROR_FATAL);
+      }
+      r->regno = regno;
+      usedregs[regno] |= r->flags & REGFLAG_USAGE_MASK;
+      IFDEBUG(tracef("%s -> %i in %i\n" _ r->name _ r->regno _ i);)
+//      IFDEBUG(dump_registers(wp,ws);)
+    }
+  }
+  /* Work out which registers need saving on the stack */
+  regname *frame[4][15];
+  for(int i=0;i<4;i++)
+  {
+    for(int j=0;j<15;j++)
+      frame[i][j] = 0;
+  }
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    if((r->regno < 0) || (r->regno >= 16) || (r->flags & REGFLAG_GLOBAL))
+      continue;
+    for(int i=0;i<4;i++)
+    {
+      if(r->flags & (REGFLAG_PERPIXEL<<i))
+      {
+        IFDEBUG(if(frame[i][r->regno]) tracef("%s %x vs. %s %x\n" _ frame[i][r->regno]->name _ frame[i][r->regno]->regno _ r->name _ r->regno);)
+        assert(!frame[i][r->regno], ERROR_FATAL);
+        frame[i][r->regno] = r;
+      }
+    }
+  }
+  ws->regframesize = 0;
+  for(int i=0;i<4;i++)
+  {
+    for(int j=0;j<15;j++)
+    {
+      if(!frame[i][j] || (frame[i][j]->flags & REGFLAG_TEMPORARY) || (frame[i][j]->spindex != -1))
+        continue;
+      for(int k=0;k<4;k++)
+      {
+        if((k != i) && frame[k][j] && (frame[k][j] != frame[i][j]))
+        {
+          /* Need to save this reg */
+#ifdef DEBUG
+          if(!ws->regframesize) tracef("%t20.; Stack frame layout:\n");
+          tracef("%20.; +%x %s R%i\n" _ ws->regframesize _ frame[i][j]->name _ frame[i][j]->regno & 15);
+#endif
+          frame[i][j]->spindex = ws->regframesize;
+          ws->regframesize += 4;
+          break;
+        }
+      }
+    }
+  }
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    assert(!(r->flags && (r->regno == -1)), ERROR_FATAL); /* All used regs must be assigned */
+    /* Resolve any aliased registers */
+    if((r->regno < -1) || (r->regno >= 16))
+    {
+      regname *rr = (regname *) r->regno;
+      r->regno = rr->regno;
+      assert((r->regno & 0xff) < 16, ERROR_FATAL);
+      r->flags = rr->flags;
+      r->spindex = rr->spindex;
+    }
+    /* Set availability */
+    if(!(r->flags & (REGFLAG_GLOBAL | REGFLAG_INPUT | REGFLAG_USED)))
+      r->regno |= 0x80000000;
+#ifdef DEBUG
+    /* Output definition */
+    if((r->regno & 0xff) < 16)
+    {
+      tracef("%t20.%s%t27 RN %t36.%i %t68.; %s\n" _ r->name _ (r->regno & 0xff) _ r->describe);
+    }
+#endif
+  }
+  IFDEBUG(dump_registers(wp,ws);)
+}
+
+static void reserve_regstackframe(asm_workspace *wp, workspace *ws)
+{
+  UNUSED(wp);
+  /* Reserve stack space */
+  if(ws->regframesize)
+    SUB_A(sp, ws->regframesize)
+}
+
+static void discard_regstackframe(asm_workspace *wp, workspace *ws)
+{
+  UNUSED(wp);
+  /* Pop all saved registers off the stack */
+  if(ws->regframesize)
+    ADD_A(sp, ws->regframesize)
+}
+
+static void begin_init_bank(asm_workspace *wp, workspace *ws, int bank)
+{
+  UNUSED(wp);
+  /* Mark regs in 'bank' as switched in */
+  regname *r;
+  bank |= REGFLAG_GLOBAL | REGFLAG_USED;
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    if(r->flags & bank)
+    {
+      r->regno &= ~0x80000000;
+    }
+    else
+    {
+      r->regno |= 0x80000000;
+    }
+  }
+  IFDEBUG(tracef("begin_init_bank %x\n" _ bank);)
+//  IFDEBUG(dump_registers(wp,ws);)
+}
+
+static void save_bank(asm_workspace *wp, workspace *ws, regname **savelist, int temp, BOOL allow_auto_temp)
+{
+  UNUSED(wp);
+  /* Optimised save of given list */
+  IFDEBUG(char a[256];)
+  IFDEBUG(char b[256];)
+  int base=-1;
+  int count=0;
+  int mask=0;
+  int offset = ws->regframeoffset;
+  for(int i=0;i<15;i++)
+  {
+    if(!savelist[i])
+      continue;
+    if((temp == -1) && (savelist[i]->spindex+offset))
+    {
+      IFDEBUG(do_sprintf(a,"STR     %s,[sp,#%i+%i]",savelist[i]->name,savelist[i]->spindex,offset);)
+      ins(ws, STR(savelist[i]->regno & 0xff, R(sp)) | OFFSET(savelist[i]->spindex+offset), a);
+      /* If we're in end_init_bank, disallow selection of temp register here, as we assume that any regs we're saving in end_init_bank will remain valid in the future */
+      if(allow_auto_temp)
+      {
+        temp = savelist[i]->regno;
+      }
+    }
+    else if(base == -1)
+    {
+      base = i;
+      count = 1;
+      mask = 1<<i;
+      IFDEBUG(b[0] = 0;)
+      IFDEBUG(strcat(b,savelist[i]->name);)
+    }
+    else if(savelist[i]->spindex == savelist[base]->spindex + count*4)
+    {
+      count++;
+      mask |= 1<<i;
+      IFDEBUG(strcat(b,",");)
+      IFDEBUG(strcat(b,savelist[i]->name);)
+    }
+    else
+    {
+      if(count == 1)
+      {
+        IFDEBUG(do_sprintf(a,"STR     %s,[sp,#%i+%i]",savelist[base]->name,savelist[base]->spindex,offset);)
+        ins(ws, STR(savelist[base]->regno & 0xff, R(sp)) | OFFSET(savelist[base]->spindex+offset), a);
+      }
+      else if(savelist[base]->spindex+offset)
+      {
+        assert((savelist[base]->spindex+offset) < 256, ERROR_FATAL);
+        IFDEBUG(do_sprintf(a,"ADD     R%i,sp,#%i+%i",temp,savelist[base]->spindex,offset);)
+        ADD(temp,R(sp),IMM(savelist[base]->spindex+offset),a);
+        IFDEBUG(do_sprintf(a,"STMIA   R%i,{%s}",temp,b);)
+        ins(ws, STMIA(temp) | mask, a);
+      }
+      else
+      {
+        IFDEBUG(do_sprintf(a,"STMIA   sp,{%s}",b);)
+        ins(ws, STMIA(R(sp)) | mask, a);
+      }
+      base = i;
+      count = 1;
+      mask = 1<<i;
+    }
+  }
+  if(!count)
+    return;
+  if(count == 1)
+  {
+    IFDEBUG(do_sprintf(a,"STR     %s,[sp,#%i+%i]",savelist[base]->name,savelist[base]->spindex,offset);)
+    ins(ws, STR(savelist[base]->regno & 0xff, R(sp)) | OFFSET(savelist[base]->spindex+offset), a);
+  }
+  else if(savelist[base]->spindex+offset)
+  {
+    assert((savelist[base]->spindex+offset) < 256, ERROR_FATAL);
+    IFDEBUG(do_sprintf(a,"ADD     R%i,sp,#%i+%i",temp,savelist[base]->spindex,offset);)
+    ADD(temp,R(sp),IMM(savelist[base]->spindex+offset),a);
+    IFDEBUG(do_sprintf(a,"STMIA   R%i,{%s}",temp,b);)
+    ins(ws, STMIA(temp) | mask, a);
+  }
+  else
+  {
+    IFDEBUG(do_sprintf(a,"STMIA   sp,{%s}",b);)
+    ins(ws, STMIA(R(sp)) | mask, a);
+  }
+}
+
+static void load_bank(asm_workspace *wp, workspace *ws, regname **loadlist)
+{
+  UNUSED(wp);
+  /* Optimised load of given list */
+  IFDEBUG(char a[256];)
+  IFDEBUG(char b[256];)
+  int base=-1;
+  int count=0;
+  int mask=0;
+  int offset = ws->regframeoffset;
+  for(int i=0;i<15;i++)
+  {
+    if(!loadlist[i])
+      continue;
+    if(base == -1)
+    {
+      base = i;
+      count = 1;
+      mask = 1<<i;
+      IFDEBUG(b[0] = 0;)
+      IFDEBUG(strcat(b,loadlist[i]->name);)
+    }
+    else if(loadlist[i]->spindex == loadlist[base]->spindex + count*4)
+    {
+      count++;
+      mask |= 1<<i;
+      IFDEBUG(strcat(b,",");)
+      IFDEBUG(strcat(b,loadlist[i]->name);)
+    }
+    else
+    {
+      if(count == 1)
+      {
+        IFDEBUG(do_sprintf(a,"LDR     %s,[sp,#%i+%i]",loadlist[base]->name,loadlist[base]->spindex,offset);)
+        ins(ws, LDR(loadlist[base]->regno & 0xff, R(sp)) | OFFSET(loadlist[base]->spindex+offset), a);
+      }
+      else if(loadlist[base]->spindex+offset)
+      {
+        assert((loadlist[base]->spindex+offset) < 256, ERROR_FATAL);
+        IFDEBUG(do_sprintf(a,"ADD     %s,sp,#%i+%i",loadlist[base]->name,loadlist[base]->spindex,offset);)
+        ADD(loadlist[base]->regno,R(sp),IMM(loadlist[base]->spindex+offset),a);
+        IFDEBUG(do_sprintf(a,"LDMIA   %s,{%s}",loadlist[base]->name,b);)
+        ins(ws, LDMIA(loadlist[base]->regno) | mask, a);
+      }
+      else
+      {
+        IFDEBUG(do_sprintf(a,"LDMIA   sp,{%s}",b);)
+        ins(ws, LDMIA(R(sp)) | mask, a);
+      }
+      base = i;
+      count = 1;
+      mask = 1<<i;
+    }
+  }
+  if(!count)
+    return;
+  if(count == 1)
+  {
+    IFDEBUG(do_sprintf(a,"LDR     %s,[sp,#%i+%i]",loadlist[base]->name,loadlist[base]->spindex,offset);)
+    ins(ws, LDR(loadlist[base]->regno & 0xff, R(sp)) | OFFSET(loadlist[base]->spindex+offset), a);
+  }
+  else if(loadlist[base]->spindex+offset)
+  {
+    assert((loadlist[base]->spindex+offset) < 256, ERROR_FATAL);
+    IFDEBUG(do_sprintf(a,"ADD     %s,sp,#%i+%i",loadlist[base]->name,loadlist[base]->spindex,offset);)
+    ADD(loadlist[base]->regno,R(sp),IMM(loadlist[base]->spindex+offset),a);
+    IFDEBUG(do_sprintf(a,"LDMIA   %s,{%s}",loadlist[base]->name,b);)
+    ins(ws, LDMIA(loadlist[base]->regno) | mask, a);
+  }
+  else
+  {
+    IFDEBUG(do_sprintf(a,"LDMIA   sp,{%s}",b);)
+    ins(ws, LDMIA(R(sp)) | mask, a);
+  }
+}
+
+static void end_init_bank(asm_workspace *wp, workspace *ws, int bank)
+{
+  /* Save all 'bank' registers (including constants) */
+  regname *r;
+  regname *savelist[15];
+  for(int i=0;i<15;i++)
+    savelist[i] = 0;
+  BOOL dosave = FALSE;
+  int temp = -1;
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    if((r->flags & bank) && (r->spindex != -1) && !(r->flags & REGFLAG_INPUT))
+    {
+      savelist[r->regno & 15] = r;
+      dosave = TRUE;
+    }
+    if((r->regno >= 0) && (r->regno < 16) && (r->flags & REGFLAG_TEMPORARY))
+      temp = r->regno;
+  }
+  if(dosave)
+  {
+    save_bank(wp, ws, savelist, temp, FALSE);
+  }
+  IFDEBUG(tracef("end_init_bank %x\n" _ bank);)
+//  IFDEBUG(dump_registers(wp,ws);)
+}
+
+static void switch_bank(asm_workspace *wp, workspace *ws, int oldbank, int newbank)
+{
+  /* Save all non-constant 'oldbank', load all 'newbank'
+     Special hack: if newbank == 0, also save constant oldbank (used to save input regs) */
+  regname *r;
+  regname *savelist[15];
+  regname *loadlist[15];
+  for(int i=0;i<15;i++)
+  {
+    savelist[i] = 0;
+    loadlist[i] = 0;
+  }
+  BOOL dosave = FALSE;
+  BOOL doload = FALSE;
+  int temp = -1;
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    if(r->spindex != -1)
+    {
+      if((r->flags & oldbank) /* It's in the old bank */
+      && !(r->flags & newbank) /* And it's not in the new bank */
+      && (!(r->flags & REGFLAG_CONSTANT) || !newbank)) /* And it's non-constant */
+      {
+        savelist[r->regno & 15] = r; /* Then save it */
+        dosave = TRUE;
+      }
+      else if((r->flags & newbank) /* It's in the new bank */
+          && !(r->flags & oldbank)) /* And it's not in the old bank */
+      {
+        loadlist[r->regno & 15] = r; /* Then load it */
+        doload = TRUE;
+      }
+    }
+    if((r->regno >= 0) && (r->regno < 16) && (r->flags & REGFLAG_TEMPORARY) && !(r->flags & newbank))
+      temp = r->regno;
+  }
+  /* Loop round again to update the flags, and to search harder for a temp register (temp reg search needs 2nd loop as we need to know we're not about to clobber a register we need to save) */
+  FOR_EACH_REGISTER_NAME(r)
+  {
+    if(r->flags & (newbank | REGFLAG_GLOBAL | REGFLAG_USED))
+    {
+      if((r->regno & 0x80000000) && !savelist[r->regno & 15] && (loadlist[r->regno & 15] || ((r->flags & REGFLAG_TEMPORARY) && !(r->flags & oldbank))))
+        temp = r->regno & 0xff;
+      r->regno &= ~0x80000000;
+    }
+    else
+      r->regno |= 0x80000000;
+  }
+  if(dosave)
+  {
+    save_bank(wp, ws, savelist, temp, TRUE);
+  }
+  if(doload)
+  {
+    load_bank(wp, ws, loadlist);
+  }
+  IFDEBUG(tracef("switch_bank %x -> %x\n" _ oldbank _ newbank);)
+//  IFDEBUG(dump_registers(wp,ws);)
+}
+
 /**************************************************************************
 *                                                                         *
 *    Pixel format information                                             *
@@ -970,9 +1493,327 @@ static PixelFormat compute_pixelformat(int ncolour,int modeflags,int log2bpp)
 
 /**************************************************************************
 *                                                                         *
+*    Blending utility functions                                           *
+*                                                                         *
+**************************************************************************/
+
+static BlendImpl compute_blendimpl(asm_workspace *wp, workspace *ws, BOOL *use_sprite_palette)
+{
+  if(!wp->blending)
+    return BlendImpl_None;
+
+  if((ws->out_pixelformat <= PixelFormat_8bpp) && !(wp->blending & 2))
+  {
+    /* Use blend table
+       If src is true colour, use ColourTTR to convert to screen first */
+    if(wp->TTRType == TTRType_Normal+TTRType_Optional)
+    {
+      /* Ignore TTR and use sprite palette directly for a higher quality blend. */
+      wp->ColourTTR = 0; /* Nuke the pointer so that we don't attempt to allocate registers for it */
+      wp->TTRType = TTRType_None;
+      *use_sprite_palette = TRUE;
+      tracef("** ignoring ColourTTR due to BlendTable usage **\n");
+    }
+    return BlendImpl_BlendTable;
+  }
+  else if(ws->out_pixelformat >= PixelFormat_8bpp)
+  {
+    /* True colour blend */
+    if(ws->out_pixelformat == PixelFormat_8bpp)
+    {
+      if(wp->TTRType == TTRType_32K+TTRType_Optional)
+      {
+        /* Ignore TTR if we're going to use InverseTable blending method with true colour source
+           TODO - Allow to be ignored if palettised source, just need to look up via palette instead */
+        wp->ColourTTR = 0;
+        wp->TTRType = TTRType_None;
+        tracef("** ignoring ColourTTR due to InverseTable usage with true colour source **\n");
+      }
+      return BlendImpl_InverseTable;
+    }
+    else
+    {
+      return BlendImpl_True;
+    }
+  }
+  else
+  {
+    /* Screen is <= 4bpp, use lots of blendtables
+       If src is true colour, use ColourTTR to convert to screen
+       Else use palette index directly */
+    return BlendImpl_BlendTables;
+  }
+}
+
+static void blendimpl_rn(asm_workspace *wp, workspace *ws)
+{
+  (void) wp;
+
+  switch(ws->blendimpl)
+  {
+  case BlendImpl_InverseTable:
+  case BlendImpl_True:
+  case BlendImpl_BlendTables:
+    if(wp->blending & 2)
+    {
+      RN(r_alpha, -1, REGFLAG_PERPIXEL+REGFLAG_TEMPORARY, "alpha for pixel blending temporary values");
+    }
+    if(wp->blending & 1)
+    {
+      RN(r_translucency, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "sprite translucency value");
+      if(!(wp->blending & 2))
+      {
+        /* Set r_alpha == r_translucency */
+        RN(r_alpha, (int) &ws->regnames.r_translucency, REGFLAG_USED, "sprite translucency again");
+      }
+    }
+    break;
+  }
+
+  switch(ws->blendimpl)
+  {
+  default:
+    assert(0, ERROR_FATAL);
+  case BlendImpl_None:
+    break;
+  case BlendImpl_InverseTable:
+    RN(r_screenpalette, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "Screen 8bpp -> 15bpp table");
+    RN(r_inversetable, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "15bpp -> screen table");
+    /* Fall through... */
+  case BlendImpl_True:
+    assert(ws->regnames.r_outword.flags, ERROR_FATAL);
+    ws->regnames.r_outword.flags |= REGFLAG_PERPIXEL;
+    if(SOURCE_ALPHAMASK && !ISTRANS)
+    {
+      assert(ws->regnames.r_maskinword.flags, ERROR_FATAL);
+      ws->regnames.r_maskinword.flags |= REGFLAG_PERPIXEL;
+    }
+    if(DEST_32_BIT)
+    {
+      assert(ws->regnames.r_outptr.flags, ERROR_FATAL);
+      ws->regnames.r_outptr.flags |= REGFLAG_PERPIXEL;
+    }
+    break;
+  case BlendImpl_BlendTable:
+    RN(r_blendtable, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "Blend table ptr");
+    assert(ws->regnames.r_outword.flags, ERROR_FATAL);
+    ws->regnames.r_outword.flags |= REGFLAG_PERPIXEL;
+    break;
+  case BlendImpl_BlendTables:
+    RN(r_blendtable, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "Blend tables ptr");
+    assert(ws->regnames.r_outword.flags, ERROR_FATAL);
+    ws->regnames.r_outword.flags |= REGFLAG_PERPIXEL;
+    if(SOURCE_ALPHAMASK && !ISTRANS)
+    {
+      assert(ws->regnames.r_maskinword.flags, ERROR_FATAL);
+      ws->regnames.r_maskinword.flags |= REGFLAG_PERPIXEL;
+    }
+    break;
+  }
+
+  /* Extra case: Colour mapping to <=8bpp dest needs r_inversetable */
+  if((ws->blendimpl != BlendImpl_InverseTable) && (wp->TTRType == TTRType_ColourMap) && (wp->BPP <= 8))
+  {
+    RN(r_inversetable, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "15bpp -> screen table");
+  }
+}
+
+static void blendimpl_init(asm_workspace *wp, workspace *ws)
+{
+  switch(ws->blendimpl)
+  {
+  default:
+    assert(0, ERROR_FATAL);
+  case BlendImpl_None:
+  case BlendImpl_True:
+    break;
+  case BlendImpl_BlendTable:
+    LDR_WP(r_blendtable, blendtables);
+    break;
+  case BlendImpl_InverseTable:
+    LDR_WP(r_screenpalette, screenpalette);
+    LDR_WP(r_inversetable, inversetable);
+    break;
+  case BlendImpl_BlendTables:
+    MOV(R(r_blendtable), OP2R(R(wp)), "MOV     r_blendtable, wp");
+    ADD_A(r_blendtable, (((char *) wp->blendtables)-((char *) wp))-4); /* Offset by -4 so that alpha levels 1-6 index the tables */
+    break;
+  }
+
+  /* Extra case: Colour mapping to <=8bpp dest needs r_inversetable */
+  if((ws->blendimpl != BlendImpl_InverseTable) && (wp->TTRType == TTRType_ColourMap) && (wp->BPP <= 8))
+  {
+    LDR_WP(r_inversetable, inversetable);
+  }
+}
+
+static void blendimpl_gettables(asm_workspace *wp, workspace *ws, BOOL use_sprite_palette)
+{
+  _kernel_oserror *e;
+  int flags,src1,src2;
+
+  /* Protect some sensitive workspace vars which will be overwritten by recursive SpriteExtend calls */
+  int spritecode = wp->spritecode;
+
+  /* Extra case: Colour mapping to <=8bpp dest needs r_inversetable
+     In 8bpp modes this will actually be an inversetable, but in < 8bpp we use
+     ColourTrans, as InverseTable doesn't support < 8bpp  */
+  if((ws->blendimpl != BlendImpl_InverseTable) && (wp->TTRType == TTRType_ColourMap) && (wp->BPP <= 8))
+  {
+    if(wp->BPP == 8)
+    {
+      e = _swix(InverseTable_Calculate,_OUTR(0,1),&wp->screenpalette,&wp->inversetable);
+    }
+    else
+    {
+      int table[3];
+      e = _swix(ColourTrans_SelectTable,_INR(0,7),(SpriteType_New16bpp<<27)+1,-1,-1,-1,table,0,0,0);
+      wp->inversetable = table[1];
+    }
+    if(e)
+    {
+      EXIT_OSERROR(e);
+    }
+    wp->spritecode = spritecode;
+  }
+
+  if((ws->blendimpl == BlendImpl_None) || (ws->blendimpl == BlendImpl_True))
+    return;
+
+  /* As per translate_pixel(), the only time where we don't apply the TTR for a
+     BlendTable/BlendTables blend is if it's an optional normal one.
+     For BlendImpl_BlendTable any table like this will have been discarded
+     already (and use_sprite_palette set to TRUE), but for BlendImpl_BlendTables
+     we need to detect the case here.
+  */
+  if(use_sprite_palette || (wp->TTRType == TTRType_Normal+TTRType_Optional))
+  {
+    /* Generate tables for blending from sprite to screen */
+    flags = BlendTable_Lock+BlendTable_SrcSpritePointer;
+    src1 = 256;
+    src2 = (int) wp->save_sprite;
+  }
+  else
+  {
+    /* Generate tables using just the screen palette */
+    flags = BlendTable_Lock;
+    src1 = src2 = -1;
+  }    
+
+  /* Verify that recursive SpriteExtend calls aren't modifying workspace more than expected */
+#ifdef DEBUG
+  int backup[sizeof(asm_workspace)/4];
+  for(int i=0;i<sizeof(asm_workspace)/4;i++)
+    backup[i] = ((int *) wp)[i];
+#endif
+
+  switch(ws->blendimpl)
+  {
+  default:
+    assert(0, ERROR_FATAL);
+    break;
+  case BlendImpl_BlendTable:
+    e = _swix(BlendTable_GenerateTable,_INR(0,6)|_OUT(6),flags,src1,src2,-1,-1,wp->trns_flags2>>4,0,&wp->blendtables[0]);
+    if(e)
+    {
+      EXIT_OSERROR(e);
+    }
+    break;
+  case BlendImpl_InverseTable:
+    e = _swix(InverseTable_Calculate,_OUTR(0,1),&wp->screenpalette,&wp->inversetable);
+    if(e)
+    {
+      EXIT_OSERROR(e);
+    }
+    break;
+  case BlendImpl_BlendTables:
+    {
+      for(int i=1;i<7;i++)
+      {
+        e = _swix(BlendTable_GenerateTable,_INR(0,6)|_OUT(6),flags,src1,src2,-1,-1,256-i*32,0,&wp->blendtables[i-1]);
+        if(e)
+        {
+          EXIT_OSERROR(e);
+        }
+      }
+    }
+    break;
+  }
+
+  wp->spritecode = spritecode;
+#ifdef DEBUG
+  BOOL ok = TRUE;
+  for(int i=0;i<sizeof(asm_workspace)/4;i++)
+  {
+    if((backup[i] != ((int *) wp)[i]) && ((OFFSET(i*4) < WP_OFFSET(blendtables)) || (OFFSET(i*4) > WP_OFFSET(inversetable))))
+    {
+      tracef("workspace modified! offset %x was %x now %x\n" _ i*4 _ backup[i] _ ((int *) wp)[i]);
+      ok = FALSE;
+    }
+  }
+  assert(ok, ERROR_FATAL);
+#endif
+}
+
+/**************************************************************************
+*                                                                         *
 *    Register allocation                                                  *
 *                                                                         *
 **************************************************************************/
+
+static int get_expansion_mask(asm_workspace *wp, workspace *ws,const PixelFormatInfo *in_fmt,const PixelFormatInfo *out_fmt,int *shift)
+/* Work out pixel expansion mask and shift value for a given conversion */
+{
+  int pixel_expansion_mask = 0;
+  int pixel_expansion_shift = 0;
+  int uses = 0;
+  int failures = 0;
+  
+  for(int i=0;i<4;i++)
+  {
+    /* Skip alpha channel if it doesn't exist in one or the other */
+    if(!out_fmt->bits[i] || !in_fmt->bits[i])
+    {
+      assert(i == 3, ERROR_FATAL);
+      continue;
+    }
+    /* If we have 1 bit alpha, and we're wanting to expand it, it's better to store it in the PSR than to mask-and-shift (especially for this first channel)
+       The same technique is also worthwhile when we're shrinking down to 1bpp alpha. But not with any formats we currently support, so ignore that potential optimisation for now. */
+    if((i == 3) && (in_fmt->bits[i] == 1) && (out_fmt->bits[i] >= 1))
+    {
+      continue;          
+    }
+    if(in_fmt->bits[i] < out_fmt->bits[i])
+    {
+      /* This is a candidate for expansion */
+      if(!pixel_expansion_shift || (pixel_expansion_shift == in_fmt->bits[i]))
+      {
+        int bits = out_fmt->bits[i]-in_fmt->bits[i];
+        int mask = (1<<bits)-1;
+        int shift = out_fmt->top[i]-bits;
+        pixel_expansion_mask |= mask<<shift;
+        pixel_expansion_shift = in_fmt->bits[i];
+        uses++;
+      }
+      else
+        failures |= 1<<i;
+    }
+  }
+  assert(!(failures & 5), ERROR_FATAL); /* We don't cope with red or blue being unable to use it */
+  /* Was it used enough times to make setting it up worthwhile? */
+  if(uses > 1)
+  {
+    if(shift)
+      *shift = pixel_expansion_shift;
+    return pixel_expansion_mask;
+  }
+  else
+  {
+    if(shift)
+      *shift = 0;
+    return 0;
+  }
+}
 
 static int convert_pixel_rn(asm_workspace *wp, workspace *ws,PixelFormat pixelformat,const PixelFormat out_pixelformat,int need_temps)
 /* Allocate registers for translating r_pixel from pixelformat to
@@ -1111,59 +1952,34 @@ static int convert_pixel_rn(asm_workspace *wp, workspace *ws,PixelFormat pixelfo
       IFDEBUG(tracef("out format: %x { %i, %i, %i, %i }, { %i, %i, %i, %i }, %x, %x\n" _ out_fmt _ out_fmt->bits[0] _ out_fmt->bits[1] _ out_fmt->bits[2] _ out_fmt->bits[3] _ out_fmt->top[0] _ out_fmt->top[1] _ out_fmt->top[2] _ out_fmt->top[3] _ out_fmt->hints _ out_fmt->alphaimm12);)
 
       /* Work out if we need r_expansionmask, and if so, what it should be */
-      int pixel_expansion_mask = 0;
-      int pixel_expansion_shift = 0;
-      int uses = 0;
-      int failures = 0;
-      
-      for(int i=0;i<4;i++)
+      int pixel_expansion_mask;
+      pixel_expansion_mask = get_expansion_mask(wp,ws,in_fmt,out_fmt,NULL);
+      if(pixel_expansion_mask)
       {
-        /* Skip alpha channel if it doesn't exist in one or the other */
-        if(!out_fmt->bits[i] || !in_fmt->bits[i])
+        for(int i=0;i<2;i++)
         {
-          assert(i == 3, ERROR_FATAL);
-          continue;
-        }
-        /* If we have 1 bit alpha, and we're wanting to expand it, it's better to store it in the PSR than to mask-and-shift (especially for this first channel)
-           The same technique is also worthwhile when we're shrinking down to 1bpp alpha. But not with any formats we currently support, so ignore that potential optimisation for now. */
-        if((i == 3) && (in_fmt->bits[i] == 1) && (out_fmt->bits[i] >= 1))
-        {
-          continue;          
-        }
-        if(in_fmt->bits[i] < out_fmt->bits[i])
-        {
-          /* This is a candidate for expansion */
-          if(!pixel_expansion_shift || (pixel_expansion_shift == in_fmt->bits[i]))
+          if(!ws->pixel_expansion_mask[i])
           {
-            int bits = out_fmt->bits[i]-in_fmt->bits[i];
-            int mask = (1<<bits)-1;
-            int shift = out_fmt->top[i]-bits;
-            pixel_expansion_mask |= mask<<shift;
-            pixel_expansion_shift = in_fmt->bits[i];
-            uses++;
+            if(i)
+              RN(r_expansionmask2, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "constant for colour channel expansion")
+            else
+              RN(r_expansionmask1, -1, REGFLAG_PERPIXEL+REGFLAG_CONSTANT, "constant for colour channel expansion")
+            ws->pixel_expansion_mask[i] = pixel_expansion_mask;
+            break;
+          }
+          else if(ws->pixel_expansion_mask[i] == pixel_expansion_mask)
+          {
+            /* An existing mask matches, use it */
+            break;
           }
           else
-            failures |= 1<<i;
+          {
+            /* If we've run out of mask registers we're in trouble, as there's currently no fallback case */
+            assert(i != 1, ERROR_FATAL);
+          }
         }
       }
-      assert(!(failures & 5), ERROR_FATAL); /* We don't cope with red or blue being unable to use it */
-      /* Was it used enough times to make setting it up worthwhile? */
-      if(uses > 1)
-      {
-        if(!ws->pixel_expansion_mask)
-        {
-          RN(r_expansionmask, -1, "constant for colour channel expansion")
-          ws->pixel_expansion_mask = pixel_expansion_mask;
-          ws->pixel_expansion_shift = pixel_expansion_shift;
-          ws->pixel_expansion_in = in_fmt;
-          ws->pixel_expansion_out = out_fmt;
-        }
-        else
-        {
-          /* Currently we only support one set of expansion mask settings. Make sure this new conversion is an exact match for the previous one (since the code generator has no other way of knowing if the expansion should be performed or not) */
-          assert((ws->pixel_expansion_in == in_fmt) && (ws->pixel_expansion_out == out_fmt),ERROR_FATAL);
-        }
-      }
+
       /* And that should be it */
       pixelformat = out_format;
       flags = out_flags;
@@ -1177,6 +1993,136 @@ static int convert_pixel_rn(asm_workspace *wp, workspace *ws,PixelFormat pixelfo
   return need_temps;
 }
 
+static void blend_extract_alpha_rn(asm_workspace *wp, workspace *ws, PixelFormat in_pixelformat,int *alpha_top,int *alpha_bits)
+/* Extract the sprite alpha channel into r_alpha, ready for blending later on */
+{
+  const PixelFormatInfo *in_fmt = pixelformat_info(in_pixelformat);
+  if(in_fmt->bits[3] == 8)
+  {
+    assert(in_fmt->top[3] == 32, ERROR_FATAL);
+    *alpha_top = *alpha_bits = 8;
+  }
+  else
+  {
+    assert(in_fmt->top[3] == 16, ERROR_FATAL);
+    *alpha_top = 16;
+    *alpha_bits = in_fmt->bits[3];
+  }
+}
+
+static int blend_rgb_rn(asm_workspace *wp, workspace *ws, PixelFormat in_pixelformat, int alpha_top, int alpha_bits, BOOL have_dithered, int need_temps, PixelFormat *blend_pixelformat)
+{
+  UNUSED(alpha_top);
+  /* Mirror the structure of blend_rgb */
+
+  /* Work out which pixel format the blend calculation is performed in */
+  *blend_pixelformat = ws->out_pixelformat;
+  if(ws->odither && !have_dithered)
+  {
+    /* Dithering requested, blend in 32bpp */
+    *blend_pixelformat = (PixelFormat) (PixelFormat_32bpp | (ws->out_pixelformat & (PixelFormat_RGB | PixelFormat_Alpha)));
+  }
+  else if(*blend_pixelformat == PixelFormat_8bpp)
+  {
+    /* 8bpp output, blend in 15bpp ready for table lookup */
+    *blend_pixelformat = PixelFormat_15bpp;
+  }
+
+  if((alpha_bits == 1) && !(wp->blending & 1))
+  {
+    /* Special 1bpp case */
+    return convert_pixel_rn(wp,ws,in_pixelformat,*blend_pixelformat,need_temps);
+  }
+
+  /* Standard code, 2 temps needed */
+  if(need_temps < 2)
+    need_temps = 2;
+
+  return need_temps;
+}
+
+static PixelFormat apply_dither_rn(asm_workspace *wp, workspace *ws, PixelFormat pixelformat, BOOL *have_dithered, int *need_temps)
+{
+  if (ws->odither && !*have_dithered)
+  {
+    if(((pixelformat & PixelFormat_BPPMask) == PixelFormat_12bpp)
+      && (ws->out_pixelformat >= PixelFormat_4bpp))
+    {
+      /* When dithering 12bpp down to 4bpp/8bpp, we need to
+         convert to 32bpp to make it look good, and to fix
+         bugs with the dither value writing into the wrong
+         colour channels */
+      PixelFormat ditherformat = (PixelFormat) (PixelFormat_32bpp | (pixelformat & (PixelFormat_RGB | PixelFormat_Alpha)));
+      *need_temps = convert_pixel_rn(wp,ws,pixelformat,ditherformat,*need_temps);
+      pixelformat = ditherformat;
+    }
+  }
+  return pixelformat;
+}
+
+static PixelFormat apply_ttr_rn(asm_workspace *wp, workspace *ws, PixelFormat pixelformat, BOOL *have_dithered, int *need_temps)
+/* Apply the TTR, and perform any dithering if necessary */
+{
+  switch(wp->TTRType & ~TTRType_Optional)
+  {
+  case TTRType_None:
+    break;
+  case TTRType_Normal:
+    pixelformat = ws->out_pixelformat;
+    break;
+  case TTRType_Wide:
+    pixelformat = ws->out_pixelformat;
+    break;
+  case TTRType_32K:
+    /* Hack - skip if this is JPEG and we're already correct */
+    if(wp->is_it_jpeg && (pixelformat <= PixelFormat_8bpp))
+    {
+      assert(pixelformat == ws->out_pixelformat,ERROR_FATAL);
+      break;
+    }
+    /* If we're applying a 32K table, now is our last chance to perform dithering */
+    pixelformat = apply_dither_rn(wp,ws,pixelformat,have_dithered,need_temps);
+    if(pixelformat != ws->ColourTTRFormat)
+      *need_temps = convert_pixel_rn(wp,ws,pixelformat,ws->ColourTTRFormat,*need_temps);
+    pixelformat = ws->out_pixelformat;
+    break;
+  case TTRType_ColourMap:
+    if(pixelformat != ws->ColourTTRFormat)
+      *need_temps = convert_pixel_rn(wp,ws,pixelformat,ws->ColourTTRFormat,*need_temps);
+    /* 1 temp needed if we need to preserve alpha
+       However for sprtrans we claim we need two temps, as r_temp1 clashes with r12 */
+    if((ws->ColourTTRFormat & PixelFormat_Alpha) && (ws->out_pixelformat & PixelFormat_Alpha))
+    {
+      if(ISTRANS)
+        *need_temps = 2;
+      else if(!*need_temps)
+        *need_temps = 1;
+    }
+    /* 1-instruction translation from 32bpp_Hi to something closer to the output format */
+    if(((ws->out_pixelformat & ~PixelFormat_Alpha) == PixelFormat_32bpp + PixelFormat_RGB) && (wp->CPUFlags & CPUFlag_REV))
+    {
+      pixelformat = (PixelFormat) (PixelFormat_32bpp+PixelFormat_RGB);
+    }
+    else
+    {
+      pixelformat = PixelFormat_32bpp;
+    }
+    /* Apply r_inversetable if we have <=8bpp output */
+    if(wp->BPP <= 8)
+    {
+      pixelformat = apply_dither_rn(wp,ws,pixelformat,have_dithered,need_temps);
+      *need_temps = convert_pixel_rn(wp,ws,pixelformat,PixelFormat_15bpp,*need_temps);
+      pixelformat = ws->out_pixelformat;
+    }
+    break;
+  case TTRType_Palette:
+    pixelformat = PixelFormat_32bpp_Hi;
+    break;
+  }
+
+  return pixelformat;
+}
+
 static int translate_pixel_rn(asm_workspace *wp, workspace *ws, int need_temps)
 {
   /* Work out whether we need 16->32 or 32->16 transformations, with their temp registers
@@ -1184,31 +2130,142 @@ static int translate_pixel_rn(asm_workspace *wp, workspace *ws, int need_temps)
    */
 
   PixelFormat pixelformat = ws->in_pixelformat;
-  if(wp->trns_palette != 0)
+
+  BOOL ttr_before_blend = TRUE;
+  switch(ws->blendimpl)
   {
-    assert(pixelformat <= PixelFormat_8bpp, ERROR_FATAL);
-    if(wp->BPP == 16)
+  case BlendImpl_BlendTables:
+    ttr_before_blend = FALSE;
+    break;
+  }
+
+  int alpha_top = 0;
+  int alpha_bits = 0;
+  if((wp->blending & 2) && !(wp->save_mode & 0x80000000))
+  {
+    blend_extract_alpha_rn(wp,ws,pixelformat,&alpha_top,&alpha_bits);
+  }
+
+  BOOL have_dithered = FALSE;
+  if(ttr_before_blend && wp->TTRType)
+  {
+    pixelformat = apply_ttr_rn(wp,ws,pixelformat,&have_dithered,&need_temps);
+  }  
+
+  /* Blending */
+  int alpha_shift = 0;
+  switch(ws->blendimpl)
+  {
+  case BlendImpl_BlendTable:
+    /* Single blend table */
+    /* JPEG might need translating to out_pixelformat before the blend can take place */
+    if((wp->is_it_jpeg) && (pixelformat > PixelFormat_8bpp))
     {
+      pixelformat = apply_dither_rn(wp,ws,pixelformat,&have_dithered,&need_temps);
+      need_temps = convert_pixel_rn(wp,ws,pixelformat,ws->out_pixelformat,need_temps);
       pixelformat = ws->out_pixelformat;
     }
+    if(!need_temps)
+      need_temps = 1;
+    pixelformat = ws->out_pixelformat;
+    break;
+  case BlendImpl_InverseTable:
+    if(pixelformat == PixelFormat_8bpp)
+    {
+      pixelformat = PixelFormat_15bpp;
+    }
+    /* Fall through... */
+  case BlendImpl_True:
+    /* True colour blend */
+    assert(pixelformat > PixelFormat_8bpp, ERROR_FATAL);
+    need_temps = blend_rgb_rn(wp,ws,pixelformat,alpha_top,alpha_bits,have_dithered,need_temps,&pixelformat);
+    break;
+  case BlendImpl_BlendTables:
+    /* Screen is <= 4bpp, use lots of blendtables
+       If src is true colour, use ColourTTR to convert to screen
+       Else use palette index directly */
+    /* r_translucency (if used) assumed to be 0-256 alpha */
+    assert(wp->blending & 2, ERROR_FATAL);
+    if (SOURCE_ALPHAMASK)
+    {
+      /* Alpha mask */
+      if (wp->blending & 1)
+      {
+      }
+      else
+      {
+        alpha_shift = 5;
+      }
+      alpha_bits = 3;  
+    }
+    else if (alpha_bits)
+    {
+      /* Alpha channel */
+      unsigned int chan_mask = ((1<<alpha_bits)-1)<<(alpha_top-alpha_bits);
+      if (wp->blending & 1)
+      {
+        if (alpha_bits == 1)
+        {
+        }
+        else
+        {
+          assert(alpha_bits >= 4, ERROR_FATAL);
+          if(chan_mask == 0xff)
+          {
+          }
+          else
+          {
+            assert(chan_mask == 0xf000, ERROR_FATAL);
+          }  
+        }
+        alpha_bits = 3;  
+      }
+      else
+      {
+        chan_mask &= ~(chan_mask>>3);
+        alpha_shift = alpha_top-3;
+        alpha_bits = (alpha_bits>3?3:alpha_bits); /* Should be 1 or 3, asserted below */
+      }
+    }
     else
     {
-      pixelformat = PixelFormat_32bpp_Hi;
+      /* Ordinary translucent plotting */
+      /* This shouldn't happen, should be handled by single blendtable case above */
+      assert(0, ERROR_FATAL);
     }
-  }
-  if(wp->ColourTTR != 0)
-  {
-    if(wp->Log2bpp <= 3)
+
+    /* Apply TTR here, unless it's an optional normal TTR (in which case we
+       only apply for full alpha pixels) */
+    assert(!ttr_before_blend, ERROR_FATAL);
+    if(wp->TTRType != TTRType_Normal+TTRType_Optional)
     {
-      if(pixelformat != ws->ColourTTRFormat)
-        need_temps = convert_pixel_rn(wp,ws,pixelformat,ws->ColourTTRFormat,need_temps);
+      pixelformat = apply_ttr_rn(wp,ws,pixelformat,&have_dithered,&need_temps);
     }
-    else
+
+    if(alpha_bits == 3)
     {
-      assert(pixelformat <= PixelFormat_8bpp, ERROR_FATAL); /* up to 256 entries in word table */
-      assert(pixelformat == ws->ColourTTRFormat, ERROR_FATAL);
+      if(!need_temps)
+        need_temps = 1;
     }
     pixelformat = ws->out_pixelformat;
+    break;
+  }
+
+  pixelformat = apply_dither_rn(wp,ws,pixelformat,&have_dithered,&need_temps);
+
+  switch(ws->blendimpl)
+  {
+  case BlendImpl_InverseTable:
+    /* Inverse table lookup for 15bpp -> palette */
+    if(pixelformat != PixelFormat_8bpp)
+    {
+      if(pixelformat != PixelFormat_15bpp)
+      {
+        need_temps = convert_pixel_rn(wp,ws,pixelformat,PixelFormat_15bpp,need_temps);
+      }
+      pixelformat = PixelFormat_8bpp;              /* we've finished */
+    }
+    break;
   }
 
   /* Do any extra conversion necessary */
@@ -1236,51 +2293,72 @@ static void dither_expansion_init(asm_workspace *wp, workspace *ws)
  * r_oditheradd allocated if necessary
  */
 {
-  if (ws->regnames.r_expansionmask.regno != -1) /* Generate binary constant ws->pixel_expansion_mask */
+  for(int i=0;i<2;i++)
   {
+    int mask = ws->pixel_expansion_mask[i];
+    if(!mask)
+      break;
+
 #ifdef DEBUG
     char a[256];
-    do_sprintf(a,"Generate expansion mask &%x",ws->pixel_expansion_mask);
+    do_sprintf(a,"Generate expansion mask &%x",mask);
     comment(ws,a);
+    const char *regname;
 #endif
-    if(ws->pixel_expansion_mask == 0xF0F0F0F0)
+    int regno;
+    if(i)
+    {
+      regno = R(r_expansionmask2);
+      IFDEBUG(regname = "r_expansionmask2";)
+    }
+    else
+    {
+      regno = R(r_expansionmask1);
+      IFDEBUG(regname = "r_expansionmask1";)
+    }
+ 
+    if(mask == 0xF0F0F0F0)
     {
       /* We can do this in two or three instructions */
-      if(wp->CPUFlags & CPUFlag_MOVW)
+      if(wp->CPUFlags & CPUFlag_T2)
       {
-        MOVW(R(r_expansionmask), IMM16(0xF0F0),                                        "MOVW    r_expansionmask,#&f0f0");
+        IFDEBUG(do_sprintf(a,  "MOVW    %s,#&f0f0",regname);)
+        MOVW(regno, IMM16(0xF0F0),a);
       }
       else
       {
-        MOV(R(r_expansionmask), IMM(15) | IMMROR(28),                                  "MOV     r_expansionmask,#&f0");
-        ORR(R(r_expansionmask), R(r_expansionmask), OP2R(R(r_expansionmask)) | LSLI(8),"ORR     r_expansionmask,r_expansionmask, LSL #8");
+        IFDEBUG(do_sprintf(a,  "MOV     %s,#&f0",regname);)
+        MOV(regno, IMM(15) | IMMROR(28),a);
+        IFDEBUG(do_sprintf(a,  "ORR     %s,%s,LSL #8",regname,regname);)
+        ORR(regno, regno, OP2R(regno) | LSLI(8),a);
       }
-      ORR(R(r_expansionmask), R(r_expansionmask), OP2R(R(r_expansionmask)) | LSLI(16), "ORR     r_expansionmask,r_expansionmask, LSL #16");
+      IFDEBUG(do_sprintf(a,    "ORR     %s,%s,LSL #16",regname,regname);)
+      ORR(regno, regno, OP2R(regno) | LSLI(16),a);
     }
     else
     {
       /* Other masks may be anywhere between one and three instructions, do it a byte at a time */
-      assert(ws->pixel_expansion_mask & 0xff, ERROR_FATAL); /* We expect red & blue to need expansion, and for one of them to tbe in the bottom byte */
-      assert(!(ws->pixel_expansion_mask & 0xff000000), ERROR_FATAL); /* We don't expect 32bpp alpha to need expansion. We'll either be coming from 4bpp (in which case we'll use 0xF0F0F0F0) or from 1bpp (in which case we'll use TST) */
-      if(wp->CPUFlags & CPUFlag_MOVW)
+      assert(mask & 0xff, ERROR_FATAL); /* We expect red & blue to need expansion, and for one of them to tbe in the bottom byte */
+      assert(!(mask & 0xff000000), ERROR_FATAL); /* We don't expect 32bpp alpha to need expansion. We'll either be coming from 4bpp (in which case we'll use 0xF0F0F0F0) or from 1bpp (in which case we'll use TST) */
+      if(wp->CPUFlags & CPUFlag_T2)
       {
-        IFDEBUG(do_sprintf(a,                                                  "MOVW    r_expansionmask,#&%x",ws->pixel_expansion_mask & 0xffff);)
-        MOVW(R(r_expansionmask), IMM16(ws->pixel_expansion_mask),a);
+        IFDEBUG(do_sprintf(a,  "MOVW    %s,#&%x",regname,mask & 0xffff);)
+        MOVW(regno, IMM16(mask),a);
       }
       else
       {
-        IFDEBUG(do_sprintf(a,                                                  "MOV     r_expansionmask,#&%x",ws->pixel_expansion_mask & 0xff);)
-        MOV(R(r_expansionmask), IMM(ws->pixel_expansion_mask & 0xff),a);
-        if(ws->pixel_expansion_mask & 0xff00)
+        IFDEBUG(do_sprintf(a,  "MOV     %s,#&%x",regname,mask & 0xff);)
+        MOV(regno, IMM(mask & 0xff),a);
+        if(mask & 0xff00)
         {
-          IFDEBUG(do_sprintf(a,                                                "ORR     r_expansionmask,r_expansionmask,#&%x",ws->pixel_expansion_mask & 0xff00);)
-          ORR(R(r_expansionmask), R(r_expansionmask), IMM((ws->pixel_expansion_mask>>8)&0xff) | IMMROR(24),a);
+          IFDEBUG(do_sprintf(a,"ORR     %s,%s,#&%x",regname,regname,mask & 0xff00);)
+          ORR(regno, regno, IMM((mask>>8)&0xff) | IMMROR(24),a);
         }
       }
-      if(ws->pixel_expansion_mask & 0xff0000)
+      if(mask & 0xff0000)
       {
-        IFDEBUG(do_sprintf(a,                                                "ORR     r_expansionmask,r_expansionmask,#&%x",ws->pixel_expansion_mask & 0xff0000);)
-        ORR(R(r_expansionmask), R(r_expansionmask), IMM((ws->pixel_expansion_mask>>16)&0xff) | IMMROR(16),a);
+        IFDEBUG(do_sprintf(a,  "ORR     %s,%s,#&%x",regname,regname,mask & 0xff0000);)
+        ORR(regno, regno, IMM((mask>>16)&0xff) | IMMROR(16),a);
       }
     }
   }
@@ -1369,7 +2447,7 @@ static void add_ordered_dither(asm_workspace *wp, workspace *ws,PixelFormat pixe
  */
 {
   int redblue_bits_per_gun, green_bits_per_gun;
-  switch(pixelformat)
+  switch(pixelformat & PixelFormat_BPPMask)
   {
   case PixelFormat_12bpp:
     redblue_bits_per_gun = green_bits_per_gun = 4;
@@ -1382,6 +2460,11 @@ static void add_ordered_dither(asm_workspace *wp, workspace *ws,PixelFormat pixe
     green_bits_per_gun = 6;
     break;
   default:
+    assert(0, ERROR_FATAL);
+  case PixelFormat_24bpp_Grey:
+  case PixelFormat_24bpp:
+  case PixelFormat_32bpp:
+/*  case PixelFormat_32bpp_Hi: - Not supported below */
     redblue_bits_per_gun = green_bits_per_gun = 8;
     break;
   }
@@ -1418,25 +2501,22 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
     if(out_pixelformat == PixelFormat_1bpp)
     {
       comment(ws, "Creating 0 or 1 from 24bit greyscale");
-      TST(R(r_pixel), IMM(128),                                     "TST     r_pixel,#128                    ; test hi bit of R");
-      MOV(R(r_pixel), IMM(1),                                       "MOV     r_pixel,#1                      ; black");
-      MOV(R(r_pixel), NE | IMM(0),                                  "MOVNE   r_pixel,#0                      ; white");
+      MVN(R(r_pixel), OP2R(R(r_pixel)) | LSRI(7),                   "MVN     r_pixel,r_pixel,LSR #7          ; hi bit of R");
+      AND(R(r_pixel), R(r_pixel), IMM(1),                           "AND     r_pixel,r_pixel,#1              ; 0->white, 1->black");
       pixelformat = PixelFormat_1bpp;
     }
     else if(out_pixelformat == PixelFormat_2bpp)
     {
       comment(ws, "Creating 0,1,2 or 3 from 24bit greyscale");
-      MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(6),                   "MOV     r_pixel,r_pixel,LSR #6           ; hi 2 bits of R");
-      AND(R(r_pixel), R(r_pixel), IMM(3),                           "AND     r_pixel,r_pixel,#3               ; mask off everything else");
-      RSB(R(r_pixel), R(r_pixel), IMM(3),                           "RSB     r_pixel,r_pixel,#3               ; change to 0->white, 3->black");
+      MVN(R(r_pixel), OP2R(R(r_pixel)) | LSRI(6),                   "MVN     r_pixel,r_pixel,LSR #6           ; hi 2 bits of R");
+      AND(R(r_pixel), R(r_pixel), IMM(3),                           "AND     r_pixel,r_pixel,#3               ; 0->white, 3->black");
       pixelformat = PixelFormat_2bpp;
     }
     else if (out_pixelformat == PixelFormat_4bpp)
     {
       comment(ws, "Creating wimp colour in 0..7 from 24bit greyscale");
-      MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(5),                   "MOV     r_pixel,r_pixel,LSR #5           ; hi 3 bits of R");
-      AND(R(r_pixel), R(r_pixel), IMM(7),                           "AND     r_pixel,r_pixel,#7               ; mask off everything else");
-      RSB(R(r_pixel), R(r_pixel), IMM(7),                           "RSB     r_pixel,r_pixel,#7               ; change to 0->white, 7->black");
+      MVN(R(r_pixel), OP2R(R(r_pixel)) | LSRI(5),                   "MVN     r_pixel,r_pixel,LSR #5           ; hi 3 bits of R");
+      AND(R(r_pixel), R(r_pixel), IMM(7),                           "AND     r_pixel,r_pixel,#7               ; 0->white, 7->black");
       pixelformat = PixelFormat_4bpp;
     }
 #if 0 /* This case is currently impossible, 24bpp greyscale output is only produced for 8bpp if a greyscale palette is in use, and a greyscale 8bpp palette is impossible on VIDC1 */
@@ -1551,10 +2631,16 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
         pixelformat = PixelFormat_24bpp;
         break;
       case PixelFormat_32bpp_Hi:
-        /* TODO - On ARMv6+ we could use REV if we also need to red/blue swap
-           For now just shift down and deal with red/blue swapping below */
         assert(!(flags & PixelFormat_Alpha), ERROR_FATAL);
-        MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(8),                   "MOV     r_pixel,r_pixel,LSR #8           ; Convert from palette entry");
+        if((wp->CPUFlags & CPUFlag_REV) && ((flags ^ out_flags) & PixelFormat_RGB))
+        {
+          REV(R(r_pixel), R(r_pixel), 0,                              "REV     r_pixel,r_pixel                  ; Palette entry -> &00RRGGBB");
+          flags ^= PixelFormat_RGB;
+        }
+        else
+        {
+          MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(8),                 "MOV     r_pixel,r_pixel,LSR #8           ; Convert from palette entry");
+        }
         pixelformat = out_format;
         break;
       }
@@ -1589,32 +2675,52 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
           flags ^= PixelFormat_RGB;
           break;
         case PixelFormat_32bpp:
-          /* This is tricky depending on whether we have alpha or not */
-          if(flags & PixelFormat_Alpha)
-          {
-            if(out_flags & PixelFormat_Alpha)
-            {
-              /* Must preserve alpha, use the above 4-instruction sequences */
-              EOR(R(r_temp1), R(r_pixel), OP2R(R(r_pixel)) | LSLI(16),  "EOR     r_temp1,r_pixel,r_pixel,LSL #16  ; R ^ B");
-              AND(R(r_temp1), R(r_temp1), IMM(0xFF) | IMMROR(16),       "AND     r_temp1,r_temp1,#&FF0000");
-              EOR(R(r_pixel), R(r_pixel), OP2R(R(r_temp1)),             "EOR     r_pixel,r_pixel,r_temp1          ; Swap one");
-              EOR(R(r_pixel), R(r_pixel), OP2R(R(r_temp1)) | LSRI(16),  "EOR     r_pixel,r_pixel,r_temp1,LSR #16  ; Swap the other");
-              flags ^= PixelFormat_RGB;
-              break;
-            }
-            /* We're discarding alpha. Get rid of it here and then use the 3 instruction R/B swap sequence */
-            BIC(R(r_pixel), R(r_pixel), IMM(255) | IMMROR(8),         "BIC     r_pixel,r_pixel,#&FF000000       ; Discard alpha");
-            flags -= PixelFormat_Alpha;
-          }
-          /* Else fall through to 24bpp case */
         case PixelFormat_24bpp:
-          AND(R(r_temp1), R(r_pixel), IMM(255) | IMMROR(24),          "AND     r_temp1,r_pixel,#&FF00           ; G");
-          if(!(out_flags & PixelFormat_Alpha)) /* No need to mask out this byte if we know we're overwriting it later */
+          if(wp->CPUFlags & CPUFlag_REV)
           {
-            BIC(R(r_pixel), R(r_pixel), IMM(255) | IMMROR(24),        "BIC     r_pixel,r_pixel,#&FF00           ; R & B remain");
+            REV(R(r_pixel), R(r_pixel), 0,                            "REV     r_pixel,r_pixel");
+            if(out_flags & flags & PixelFormat_Alpha)
+            {
+              MOV(R(r_pixel), OP2R(R(r_pixel)) | RORI(8),             "MOV     r_pixel,r_pixel,ROR #8           ; Shift RGB down and preserve alpha");
+            }
+            else
+            {
+              MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(8),             "MOV     r_pixel,r_pixel,LSR #8           ; Shift RGB down and discard any alpha");
+              if(out_flags & PixelFormat_Alpha)
+              {
+                ORR(R(r_pixel), R(r_pixel), IMM(255) | IMMROR(8),     "ORR     r_pixel,r_pixel,#&FF000000       ; Set alpha");
+              }
+            }
+            flags = out_flags;
           }
-          ORR(R(r_pixel), R(r_temp1), OP2R(R(r_pixel)) | RORI(16),    "ORR     r_pixel,r_temp1,r_pixel,ROR #16  ; Swapped");
-          flags ^= PixelFormat_RGB;
+          else
+          {
+            /* This is tricky depending on whether we have alpha or not */
+            if(flags & PixelFormat_Alpha)
+            {
+              assert(pixelformat != PixelFormat_24bpp, ERROR_FATAL);
+              if(out_flags & PixelFormat_Alpha)
+              {
+                /* Must preserve alpha, use the above 4-instruction sequences */
+                EOR(R(r_temp1), R(r_pixel), OP2R(R(r_pixel)) | LSLI(16),  "EOR     r_temp1,r_pixel,r_pixel,LSL #16  ; R ^ B");
+                AND(R(r_temp1), R(r_temp1), IMM(0xFF) | IMMROR(16),       "AND     r_temp1,r_temp1,#&FF0000");
+                EOR(R(r_pixel), R(r_pixel), OP2R(R(r_temp1)),             "EOR     r_pixel,r_pixel,r_temp1          ; Swap one");
+                EOR(R(r_pixel), R(r_pixel), OP2R(R(r_temp1)) | LSRI(16),  "EOR     r_pixel,r_pixel,r_temp1,LSR #16  ; Swap the other");
+                flags ^= PixelFormat_RGB;
+                break;
+              }
+              /* We're discarding alpha. Get rid of it here and then use the 3 instruction R/B swap sequence */
+              BIC(R(r_pixel), R(r_pixel), IMM(255) | IMMROR(8),         "BIC     r_pixel,r_pixel,#&FF000000       ; Discard alpha");
+              flags -= PixelFormat_Alpha;
+            }
+            AND(R(r_temp1), R(r_pixel), IMM(255) | IMMROR(24),          "AND     r_temp1,r_pixel,#&FF00           ; G");
+            if(!(out_flags & PixelFormat_Alpha)) /* No need to mask out this byte if we know we're overwriting it later */
+            {
+              BIC(R(r_pixel), R(r_pixel), IMM(255) | IMMROR(24),        "BIC     r_pixel,r_pixel,#&FF00           ; R & B remain");
+            }
+            ORR(R(r_pixel), R(r_temp1), OP2R(R(r_pixel)) | RORI(16),    "ORR     r_pixel,r_temp1,r_pixel,ROR #16  ; Swapped");
+            flags ^= PixelFormat_RGB;
+          }
           break;
         }
       }
@@ -1686,19 +2792,27 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
            The same technique is also worthwhile when we're shrinking down to 1bpp alpha. But not with any formats we currently support, so ignore that potential optimisation for now. */
         if((i == 3) && (in_fmt->bits[i] == 1) && (out_fmt->bits[i] >= 1))
         {
-          IFDEBUG(do_sprintf(a,                                  "TST     r_pixel,#1<<%i                  ; check alpha",1<<(in_fmt->top[3]-1));)
+          IFDEBUG(do_sprintf(a,                                  "TST     r_pixel,#1<<%i                  ; check alpha",in_fmt->top[3]-1);)
           TST(R(r_pixel),IMM12(1<<(in_fmt->top[3]-1)),a);
           done_channels |= 1<<i;
           continue;          
         }
-        /* TODO - use UBFX if possible */
-        if((in_fmt->hints & (HINT_HIGHEST<<i)) && (out_fmt->top[i] == out_fmt->bits[i]) && (out_fmt->bits[i] <= in_fmt->bits[i]))
+        BOOL shift_down_possible = (out_fmt->top[i] == out_fmt->bits[i]) && (out_fmt->bits[i] <= in_fmt->bits[i]);
+        if(shift_down_possible && (in_fmt->hints & (HINT_HIGHEST<<i)))
         {
           /* We can merely shift this down into place */
           IFDEBUG(do_sprintf(a,                                  "MOV     r_temp2,r_pixel,LSR #%i         ; reposition %s",in_fmt->top[i]-out_fmt->top[i],COMPONENT_NAME(i));)
           MOV(R(r_temp2), OP2R(R(r_pixel)) | LSRI(in_fmt->top[i]-out_fmt->top[i]),a);
           done_channels |= 1<<i;
           break;
+        }
+        else if(shift_down_possible && (wp->CPUFlags & CPUFlag_T2))
+        {
+          /* Use UBFX to extract and shift down */
+          IFDEBUG(do_sprintf(a,                                  "UBFX    r_temp2,r_pixel,#%i,#%i     ; extract & reposition %s",in_fmt->top[i]-out_fmt->bits[i],out_fmt->bits[i],COMPONENT_NAME(i));)
+          UBFX(R(r_temp2),R(r_pixel),in_fmt->top[i]-out_fmt->bits[i],out_fmt->bits[i],0,a);
+          done_channels |= 1<<i;
+          break;          
         }
 #if 0 /* No current output formats will satisfy these conditions */
         else if((in_fmt->top[i] == in_fmt->bits[i]) && (out_fmt->top[i] == 32) && (out_fmt->bits[i] >= in_fmt->bits[i]))
@@ -1754,12 +2868,26 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
         ORR((done?R(r_pixel):R(r_temp2)), R(r_temp2), OP2R(R(r_temp1)) | (shift>=0?LSLI(shift):LSRI(-shift)), a);
       }  
       /* Apply expansion mask */
-      if((in_fmt == ws->pixel_expansion_in) && (out_fmt == ws->pixel_expansion_out))
+      int pixel_expansion_mask,pixel_expansion_shift,regno=-1;
+      IFDEBUG(const char *regname;)
+      pixel_expansion_mask = get_expansion_mask(wp,ws,in_fmt,out_fmt,&pixel_expansion_shift);
+      if(pixel_expansion_mask)
       {
-        IFDEBUG(do_sprintf(a,                                  "AND     r_temp1,r_pixel,r_expansionmask ; get expansion bits %x",ws->pixel_expansion_mask);)
-        AND(R(r_temp1), R(r_pixel), OP2R(R(r_expansionmask)), a);
-        IFDEBUG(do_sprintf(a,                                  "ORR     r_pixel,r_pixel,r_temp1,LSR #%d ; apply expansion",ws->pixel_expansion_shift);)
-        ORR(R(r_pixel), R(r_pixel), OP2R(R(r_temp1)) | LSRI(ws->pixel_expansion_shift), a);
+        if(ws->pixel_expansion_mask[0] == pixel_expansion_mask)
+        {
+          regno = R(r_expansionmask1);
+          IFDEBUG(regname = "r_expansionmask1";)
+        }
+        else
+        {
+          assert(ws->pixel_expansion_mask[1] == pixel_expansion_mask, ERROR_FATAL);
+          regno = R(r_expansionmask2);
+          IFDEBUG(regname = "r_expansionmask2";)
+        }
+        IFDEBUG(do_sprintf(a,                                  "AND     r_temp1,r_pixel,%s ; get expansion bits %x",regname,pixel_expansion_mask);)
+        AND(R(r_temp1), R(r_pixel), OP2R(regno), a);
+        IFDEBUG(do_sprintf(a,                                  "ORR     r_pixel,r_pixel,r_temp1,LSR #%d ; apply expansion",pixel_expansion_shift);)
+        ORR(R(r_pixel), R(r_pixel), OP2R(R(r_temp1)) | LSRI(pixel_expansion_shift), a);
       }
       /* Manually expand green if needed */
       if((pixelformat == PixelFormat_16bpp) && (out_format > PixelFormat_16bpp))
@@ -1771,11 +2899,10 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
       /* Set alpha if needed */
       if((out_flags & PixelFormat_Alpha) && !(flags & PixelFormat_Alpha))
       {
-        /* Note that this 'set alpha' message is different from the other one. If they are the same, norcroft doesn't seem to call do_sprintf, or somehow messes it up so completely that 'a' doesn't get updated! */
-        IFDEBUG(do_sprintf(a,                                  "ORR     r_pixel,r_pixel,#&%x      ; Set alpha (2)",PIXELFORMAT_ALPHA_MASK(out_format | out_flags));)
+        IFDEBUG(do_sprintf(a,                                  "ORR     r_pixel,r_pixel,#&%x      ; Set alpha",PIXELFORMAT_ALPHA_MASK(out_format | out_flags));)
         ORR(R(r_pixel),R(r_pixel),out_fmt->alphaimm12 | (1<<25),a);
       }
-      else if((out_fmt->bits[3] > in_fmt->bits[3]) && (in_fmt->bits[3] != ws->pixel_expansion_shift))
+      else if((out_fmt->bits[3] > in_fmt->bits[3]) && (in_fmt->bits[3] != pixel_expansion_shift))
       {
         /* Manual alpha expansion */
         if(in_fmt->bits[3] == 1)
@@ -1807,15 +2934,633 @@ static void convert_pixel(asm_workspace *wp, workspace *ws,PixelFormat pixelform
   assert(pixelformat == out_pixelformat, ERROR_FATAL); /* If this hasn't happened, we haven't completed the transformation. */
 }
 
+static void blend_extract_alpha(asm_workspace *wp, workspace *ws, PixelFormat in_pixelformat,int *alpha_top,int *alpha_bits)
+/* Extract the sprite alpha channel into r_alpha, ready for blending later on */
+{
+  IFDEBUG(char a[128];)
+  const PixelFormatInfo *in_fmt = pixelformat_info(in_pixelformat);
+  /* Basic rules for extracting alpha are:
+     * For 32bpp (i.e. alpha in top byte), shift it down
+     * For 16bpp (i.e. alpha in top bit/nibble), just mask it
+     All blending code assumes we've followed these rules!
+  */
+  if(in_fmt->bits[3] == 8)
+  {
+    assert(in_fmt->top[3] == 32, ERROR_FATAL);
+    MOV(R(r_alpha), OP2R(R(r_pixel)) | LSRI(24) | S,"MOVS    r_alpha, r_pixel, LSR #24        ; Get alpha channel");
+    *alpha_top = *alpha_bits = 8;
+  }
+  else
+  {
+    assert(in_fmt->top[3] == 16, ERROR_FATAL);
+    IFDEBUG(do_sprintf(a,"ANDS    r_alpha, r_pixel, #&%x     ; Get alpha channel",PIXELFORMAT_ALPHA_MASK(in_pixelformat));)
+    AND(R(r_alpha), R(r_pixel), in_fmt->alphaimm12 | (1<<25) | S, a);
+    *alpha_top = 16;
+    *alpha_bits = in_fmt->bits[3];
+  }
+}
+
+static PixelFormat blend_rgb(asm_workspace *wp, workspace *ws, PixelFormat in_pixelformat, int alpha_top, int alpha_bits, BOOL have_dithered)
+/* Blend true colour r_pixel with a true colour r_outword pixel.
+ *
+ * Requirements:
+ * ws->in_pixelformat valid
+ * ws->in_bpp valid
+ * ws->out_pixelformat valid
+ * r_pixel allocated
+ * r_outword allocated
+ * r_alpha allocated if necessary
+ * r_translucency allocated if necessary
+ */
+{
+  IFDEBUG(char a[128];)
+  const PixelFormatInfo *in_fmt = pixelformat_info(in_pixelformat);
+
+  /* Work out which pixel format the blend calculation is performed in */
+  PixelFormat blend_pixelformat = ws->out_pixelformat;
+  if(ws->odither && !have_dithered)
+  {
+    /* Dithering requested, blend in 32bpp */
+    comment(ws, "Blending to 32bpp for dithering");
+    blend_pixelformat = (PixelFormat) (PixelFormat_32bpp | (ws->out_pixelformat & (PixelFormat_RGB | PixelFormat_Alpha)));
+  }
+  else if(blend_pixelformat == PixelFormat_8bpp)
+  {
+    /* 8bpp output, blend in 15bpp ready for table lookup */
+    comment(ws, "Blending to 15bpp for 8bpp output");
+    blend_pixelformat = PixelFormat_15bpp;
+  }
+  else
+  {
+    comment(ws, "Blending straight to output format");
+  }
+
+  if((alpha_bits == 1) && !(wp->blending & 1))
+  {
+    /* Special case - 1bpp alpha, no translucency */
+    /* We've already tested against zero alpha, so we know this pixel has
+       full alpha. Skip the pointless blend calculation and just translate
+       straight to dest.
+       TODO - Skip converting to dither format if possible (i.e. dest is 16bpp)
+       For that to work, we'd have to know to disable dithering when this case
+       is to be taken. */
+    comment(ws, "Skipping blend calculation as we only have 1bpp alpha");
+    convert_pixel(wp,ws,in_pixelformat,blend_pixelformat);
+    return blend_pixelformat;
+  }
+
+  /* Standard code */
+  /* Calculate alpha value
+     Pull apart r_pixel and r_outword one component at a time
+     Blend them
+     TODO - Use parallel multiply where possible */
+  if(wp->blending & 2)
+  {
+    if(wp->save_mode & 0x80000000)
+    {
+      if(ISTRANS)
+      {
+        /* Transformed sprite alpha mask handling is somewhat sub-optimal */
+        LDR_SP(r_alpha,trns_comp_mask_offset)
+        LDR_SP(r_temp1,trns_comp_mask_base)
+        ins(ws, LDRB(R(r_alpha),R(r_temp1)) | INDEX(R(r_alpha),0), "LDRB    r_alpha,[r_temp1,r_alpha] ; Fetch alpha mask");
+        TST(R(r_alpha), IMM(128),                                 "TST     r_alpha, #128");
+      }
+      else
+      {
+        TST(R(r_maskinword), IMM(128),                            "TST     r_maskinword, #128");
+        AND(R(r_alpha), R(r_maskinword), IMM(255),                "AND     r_alpha, r_maskinword, #255      ; Get alpha mask");
+      }
+      ADD(R(r_alpha), R(r_alpha), IMM(1) | NE,                    "ADDNE   r_alpha, r_alpha, #1             ; Expand alpha to 0-256");
+      alpha_bits = 8;
+      if(wp->blending & 1)
+      {
+        MUL(R(r_alpha), R(r_translucency), R(r_alpha), 0,         "MUL     r_alpha, r_translucency, r_alpha ; Combine with translucency");
+        alpha_top = 16;
+      }
+      else
+        alpha_top = 8;
+    }
+    else if(alpha_bits == 1)
+    {
+      /* Test against zero will have already skipped, so must be full alpha pixel. Just use translucency value as alpha. */
+      assert(wp->blending & 1,ERROR_FATAL);
+      MOV(R(r_alpha), OP2R(R(r_translucency)),                    "MOV     r_alpha, r_translucency");
+      alpha_top = alpha_bits = 8;
+    }
+    else
+    {
+      IFDEBUG(do_sprintf(a,"TST     r_alpha, #1<<%i",alpha_top-1);)
+      TST(R(r_alpha), IMM12(1<<(alpha_top-1)),a);
+      
+      assert((alpha_bits == 8) || (alpha_bits == 4), ERROR_FATAL);
+      if(!(wp->blending & 1) && (alpha_bits == 4))
+      {
+        assert(alpha_top >= 4, ERROR_FATAL);
+        ORR(R(r_alpha), R(r_alpha), OP2R(R(r_alpha)) | LSRI(4), "ORR     r_alpha, r_alpha, r_alpha, LSR #4");
+        alpha_bits = 8;
+      }
+      
+      IFDEBUG(do_sprintf(a,"ADDNE   r_alpha, r_alpha, #1<<%i     ; Expand alpha to 0-256",alpha_top-alpha_bits);)
+      ADD(R(r_alpha), R(r_alpha), IMM12(1<<(alpha_top-alpha_bits)) | NE,a);
+      if(wp->blending & 1)
+      {
+        MUL(R(r_alpha), R(r_translucency), R(r_alpha), 0,           "MUL     r_alpha, r_translucency, r_alpha ; Combine with translucency");
+        alpha_top += 8;
+      }
+    }
+  }
+  else
+  {
+    assert(wp->blending & 1, ERROR_FATAL);
+    assert(ws->regnames.r_alpha.regno == ws->regnames.r_translucency.regno, ERROR_FATAL);
+    alpha_top = alpha_bits = 8;
+  }
+  /* Shift input down if it's going to cause problems
+     TODO - Could skip this if we were smart enough to shift the topmost src entry down instead of masking, but that would complicate the code which tracks the calculations */
+  if(in_pixelformat == PixelFormat_32bpp_Hi)
+  {
+    MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(8),                     "MOV     r_pixel, r_pixel, LSR #8         ; Shift input down to avoid overflow");
+    in_pixelformat = PixelFormat_32bpp;
+    in_fmt = pixelformat_info(in_pixelformat);
+  }
+  /* Work out which pixel format the screen is in */
+  PixelFormat screen_pixelformat = ws->out_pixelformat;
+  if(screen_pixelformat == PixelFormat_8bpp)
+  {
+    screen_pixelformat = PixelFormat_15bpp;
+  }
+  const PixelFormatInfo *blend_fmt = pixelformat_info(blend_pixelformat);
+  const PixelFormatInfo *screen_fmt = pixelformat_info(screen_pixelformat);
+  /* Perform the blend */
+  /* TODO use parallel multiply where possible */
+  /* Assuming that green is always between the red and blue channels! */
+  int topmost = MAX(in_fmt->top[0],in_fmt->top[2]);
+  int bits,mask;
+
+  /* Process red or blue first - whatever is the lowest component in dest */
+  /* TODO - if alpha shifted correctly, might be fastest to start with highest in dest? could AND to get src contribution of highest, then shifted ORR to add in lowest */ 
+  int toggle = (blend_pixelformat & PixelFormat_RGB)?2:0;
+  topmost = MAX(topmost,blend_fmt->top[toggle]);
+  bits = in_fmt->bits[toggle];
+  mask = ((1<<bits)-1)<<(in_fmt->top[toggle]-bits);
+  IFDEBUG(do_sprintf(a,  "AND     r_temp1,r_pixel,#&%x               ; Extract src %s",mask,COMPONENT_NAME(toggle));)
+  AND(R(r_temp1),R(r_pixel),IMM12(mask),a);
+
+  /* Shift alpha down to avoid overflow */
+  if(topmost+alpha_top > 32)
+  {
+    assert((alpha_top > 8) && (topmost <= 24), ERROR_FATAL);
+    IFDEBUG(do_sprintf(a,"MOV     r_alpha,r_alpha,LSR #%i ; Shift alpha to avoid overflow",alpha_top-8);)
+    MOV(R(r_alpha),OP2R(R(r_alpha)) | LSRI(alpha_top-8),a);
+    alpha_top = 8;
+  }
+
+  /* Extract the opposite component (highest in dest), compute contribution of 1st */
+  mask = ((1<<bits)-1)<<(in_fmt->top[2-toggle]-bits);
+  IFDEBUG(do_sprintf(a,  "AND     r_temp2,r_pixel,#&%x               ; Extract src %s",mask,COMPONENT_NAME(2-toggle));)
+  AND(R(r_temp2),R(r_pixel),IMM12(mask),a);
+  IFDEBUG(do_sprintf(a,  "MUL     r_temp1,r_alpha,r_temp1            ; src %s",COMPONENT_NAME(toggle));)
+  MUL(R(r_temp1),R(r_alpha),R(r_temp1),0,a);
+
+  /* Extract green */
+  bits = in_fmt->bits[1];
+  mask = ((1<<bits)-1)<<(in_fmt->top[1]-bits);
+  IFDEBUG(do_sprintf(a,  "AND     r_pixel,r_pixel,#&%x               ; Extract src green",mask);)
+  AND(R(r_pixel),R(r_pixel),IMM12(mask),a);
+
+  /* Expand r_temp1 if necessary */
+  if(in_fmt->bits[toggle] < blend_fmt->bits[toggle])
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_temp1,r_temp1,r_temp1,LSR #%i    ; Expand src %s",in_fmt->bits[toggle],COMPONENT_NAME(toggle));)
+    ADD(R(r_temp1),R(r_temp1),OP2R(R(r_temp1)) | LSRI(in_fmt->bits[toggle]),a);
+  }
+
+  /* Compute more */
+  IFDEBUG(do_sprintf(a,  "MUL     r_temp2,r_alpha,r_temp2            ; src %s",COMPONENT_NAME(2-toggle));)
+  MUL(R(r_temp2),R(r_alpha),R(r_temp2),0,a);
+
+  /* 1st component can just be shifted down, as we know it's the lowest in dest */
+  bits = in_fmt->top[toggle] + alpha_top - blend_fmt->top[toggle];
+  IFDEBUG(do_sprintf(a,  "MOV     r_temp1,r_temp1,LSR #%i            ; Shift src %s down",bits,COMPONENT_NAME(toggle))); /* TODO keep fractional components to increase accuracy */
+  MOV(R(r_temp1),OP2R(R(r_temp1)) | LSRI(bits),a);
+
+  MUL(R(r_pixel),R(r_alpha),R(r_pixel),0,"MUL     r_pixel,r_alpha,r_pixel ; src green");
+
+  /* Expand other two components if necessary */
+  if(in_fmt->bits[2-toggle] < blend_fmt->bits[2-toggle])
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_temp2,r_temp2,r_temp2,LSR #%i    ; Expand src %s",in_fmt->bits[2-toggle],COMPONENT_NAME(2-toggle));)
+    ADD(R(r_temp2),R(r_temp2),OP2R(R(r_temp2)) | LSRI(in_fmt->bits[2-toggle]),a);
+  }
+  if(in_fmt->bits[1] < blend_fmt->bits[1])
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_pixel,r_pixel,r_pixel,LSR #%i    ; Expand src green",in_fmt->bits[1]);)
+    ADD(R(r_pixel),R(r_pixel),OP2R(R(r_pixel)) | LSRI(in_fmt->bits[1]),a);
+  }
+
+  /* Add in the other two components via mask & shift */
+  bits = MIN(in_fmt->bits[2-toggle],blend_fmt->bits[2-toggle]);
+  mask = ((1<<bits)-1)<<(in_fmt->top[2-toggle]+alpha_top-bits);
+  IFDEBUG(do_sprintf(a,  "AND     r_temp2,r_temp2,#&%x               ; Mask src %s",mask,COMPONENT_NAME(2-toggle));)
+  AND(R(r_temp2),R(r_temp2),IMM12(mask),a);
+
+  bits = MIN(in_fmt->bits[1],blend_fmt->bits[1]);
+  mask = ((1<<bits)-1)<<(in_fmt->top[1]+alpha_top-bits);
+  IFDEBUG(do_sprintf(a,  "AND     r_pixel,r_pixel,#&%x               ; Mask src green",mask);)
+  AND(R(r_pixel),R(r_pixel),IMM12(mask),a);
+
+  /* Now the shift */
+  bits = in_fmt->top[2-toggle] + alpha_top - blend_fmt->top[2-toggle];
+  if(bits > 0)
+  {
+    IFDEBUG(do_sprintf(a,"ORR     r_temp2,r_temp1,r_temp2,LSR #%i    ; Add in src %s",bits,COMPONENT_NAME(2-toggle));)
+    ORR(R(r_temp2),R(r_temp1),OP2R(R(r_temp2)) | LSRI(bits),a);
+  }
+  else
+  {
+    IFDEBUG(do_sprintf(a,"ORR     r_temp2,r_temp1,r_temp2,LSL #%i    ; Add in src %s",-bits,COMPONENT_NAME(2-toggle));)
+    ORR(R(r_temp2),R(r_temp1),OP2R(R(r_temp2)) | LSLI(-bits),a);
+  }
+
+  /* Invert r_alpha ready for screen pixel calculation */
+  IFDEBUG(do_sprintf(a,  "RSBS    r_alpha,r_alpha,#1<<%i             ; Invert alpha ready for dest calculations",alpha_top);)
+  RSB(R(r_alpha),R(r_alpha),IMM12(1<<alpha_top) | S,a);
+
+  /* We have a spare register, start extracting screen pixel components */
+  if(ws->out_pixelformat == PixelFormat_8bpp)
+  {
+    /* Begin 8bpp -> 15bpp lookup */
+    AND(R(r_temp1),R(r_outword),IMM(255) | NE,"ANDNE   r_temp1,r_outword,#255");
+    ins(ws, LDR(R(r_temp1), R(r_screenpalette)) | INDEX(R(r_temp1), 2) | NE, "LDRNE   r_temp1,[r_screenpalette,r_temp1,LSL #2] ; Convert screen pixel to 15bpp");
+  }
+  else
+  {
+    /* Similar to the sprite pixel, we'll start with the lowest dest component */
+    if(DEST_32_BIT)
+    {
+      /* r_outword not normally used. Must manually load the pixel */
+      ins(ws, LDR(R(r_outword), R(r_outptr)) | OFFSET(0) | NE,"LDRNE   r_outword,[r_outptr]");
+    }
+    bits = screen_fmt->bits[toggle];
+    mask = ((1<<bits)-1)<<(screen_fmt->top[toggle]-bits);
+    IFDEBUG(do_sprintf(a,  "ANDNE   r_temp1,r_outword,#&%x             ; Extract dest %s",mask,COMPONENT_NAME(toggle));)
+    AND(R(r_temp1),R(r_outword),IMM12(mask) | NE,a);
+  }
+
+  /* Add in sprite green */
+  bits = in_fmt->top[1] + alpha_top - blend_fmt->top[1];
+  if(bits > 0)
+  {
+    IFDEBUG(do_sprintf(a,"ORR     r_pixel,r_temp2,r_pixel,LSR #%i    ; Add in src green",bits);)
+    ORR(R(r_pixel),R(r_temp2),OP2R(R(r_pixel)) | LSRI(bits),a);
+  }
+  else
+  {
+    IFDEBUG(do_sprintf(a,"ORR     r_pixel,r_temp2,r_pixel,LSL #%i    ; Add in src green",-bits);)
+    ORR(R(r_pixel),R(r_temp2),OP2R(R(r_pixel)) | LSLI(-bits),a);
+  }
+
+  /* Skip screen calculations if alpha == 0 */
+  L(blend_nodestalpha)->def = 0;
+  branch(ws, B | EQ, L(blend_nodestalpha), "BEQ     blend_nodestalpha");
+
+  if(ws->out_pixelformat == PixelFormat_8bpp)
+  {
+    /* 8bpp is a special case as we need to read from r_temp1, not r_outword
+       So start the blend calculation here and then fall through into the general code once we've read all the components */
+    AND(R(r_temp2),R(r_temp1),IMM(31),             "AND     r_temp2,r_temp1,#31                ; dest red");
+    MUL(R(r_temp2),R(r_alpha),R(r_temp2),0,        "MUL     r_temp2,r_alpha,r_temp2");
+    if(screen_fmt->bits[0] < blend_fmt->bits[0])
+    {
+      IFDEBUG(do_sprintf(a,                        "ADD     r_temp2,r_temp2,r_temp2,LSR #%i    ; Expand dest red",screen_fmt->bits[0]);)
+      ADD(R(r_temp2),R(r_temp2),OP2R(R(r_temp2)) | LSRI(screen_fmt->bits[0]),a);
+    }
+    bits = screen_fmt->top[0] + alpha_top - blend_fmt->top[0];
+    assert(bits > 0, ERROR_FATAL);
+    IFDEBUG(do_sprintf(a,                          "ADD     r_pixel,r_pixel,r_temp2,LSR #%i    ; Add in dest red",bits);)
+    ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp2)) | LSRI(bits),a);
+
+    AND(R(r_temp2),R(r_temp1),IMM(31)|IMMROR(22),  "AND     r_temp2,r_temp1,#31<<10            ; dest blue");
+    AND(R(r_temp1),R(r_temp1),IMM(31*2)|IMMROR(28),"AND     r_temp1,r_temp1,#31<<5             ; dest green");
+    MUL(R(r_temp2),R(r_alpha),R(r_temp2),0,        "MUL     r_temp2,r_alpha,r_temp2");
+    toggle = 0;
+  }
+  else
+  {
+    /* Compute contribution of 1st screen component */
+    IFDEBUG(do_sprintf(a,  "MUL     r_temp1,r_alpha,r_temp1            ; dest %s",COMPONENT_NAME(toggle));)
+    MUL(R(r_temp1),R(r_alpha),R(r_temp1),0,a);
+  
+    /* Extract opposite screen component */
+    bits = screen_fmt->bits[2-toggle];
+    mask = ((1<<bits)-1)<<(screen_fmt->top[2-toggle]-bits);
+    IFDEBUG(do_sprintf(a,  "AND     r_temp2,r_outword,#&%x             ; Extract dest %s",mask,COMPONENT_NAME(2-toggle));)
+    AND(R(r_temp2),R(r_outword),IMM12(mask),a);
+
+    /* Expand r_temp1 if necessary */
+    if(screen_fmt->bits[toggle] < blend_fmt->bits[toggle])
+    {
+      IFDEBUG(do_sprintf(a,"ADD     r_temp1,r_temp1,r_temp1,LSR #%i    ; Expand dest %s",screen_fmt->bits[toggle],COMPONENT_NAME(toggle));)
+      ADD(R(r_temp1),R(r_temp1),OP2R(R(r_temp1)) | LSRI(screen_fmt->bits[toggle]),a);
+    }
+  
+    bits = screen_fmt->top[toggle] + alpha_top - blend_fmt->top[toggle];
+    if(bits > 0)
+    {
+      IFDEBUG(do_sprintf(a,"ADD     r_pixel,r_pixel,r_temp1,LSR #%i    ; Add in dest %s",bits,COMPONENT_NAME(toggle));)
+      ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp1)) | LSRI(bits),a);
+    }
+    else
+    {
+      IFDEBUG(do_sprintf(a,"ADD     r_pixel,r_pixel,r_temp1,LSL #%i    ; Add in dest %s",-bits,COMPONENT_NAME(toggle));)
+      ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp1)) | LSLI(-bits),a);
+    }
+  
+    IFDEBUG(do_sprintf(a,  "MUL     r_temp2,r_alpha,r_temp2            ; dest %s",COMPONENT_NAME(2-toggle));)
+    MUL(R(r_temp2),R(r_alpha),R(r_temp2),0,a);
+  
+    bits = screen_fmt->bits[1];
+    mask = ((1<<bits)-1)<<(screen_fmt->top[1]-bits);
+    IFDEBUG(do_sprintf(a,  "AND     r_temp1,r_outword,#&%x             ; Extract dest green",mask);)
+    AND(R(r_temp1),R(r_outword),IMM12(mask),a);
+  }
+  
+  if(screen_fmt->bits[2-toggle] < blend_fmt->bits[2-toggle])
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_temp2,r_temp2,r_temp2,LSR #%i    ; Expand dest %s",screen_fmt->bits[2-toggle],COMPONENT_NAME(2-toggle));)
+    ADD(R(r_temp2),R(r_temp2),OP2R(R(r_temp2)) | LSRI(screen_fmt->bits[2-toggle]),a);
+  }
+
+  /* Mask & shift */
+  bits = blend_fmt->bits[2-toggle];
+  mask = ((1<<bits)-1)<<(screen_fmt->top[2-toggle]+alpha_top-bits);
+  /* Fudge - when expanding to 32bpp in order to perform dithering we
+     sometimes need to generate impossible 12bit immediate constants
+     (i.e. 0xff at an odd bit offset)
+     Deal with this by dropping the bottom bit of the mask, the effect
+     should be negligible */
+  if((bits == 8) && ((screen_fmt->top[2-toggle]+alpha_top-bits) & 1))
+  {
+    mask = mask & (mask<<1);
+  }
+  IFDEBUG(do_sprintf(a,  "AND     r_temp2,r_temp2,#&%x               ; Mask dest %s",mask,COMPONENT_NAME(2-toggle));)
+  AND(R(r_temp2),R(r_temp2),IMM12(mask),a);
+
+  MUL(R(r_temp1),R(r_alpha),R(r_temp1),0,"MUL     r_temp1,r_alpha,r_temp1 ; dest green");
+
+  bits = screen_fmt->top[2-toggle] + alpha_top - blend_fmt->top[2-toggle];
+  if(bits > 0)
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_pixel,r_pixel,r_temp2,LSR #%i    ; Add in dest %s",bits,COMPONENT_NAME(2-toggle));)
+    ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp2)) | LSRI(bits),a);
+  }
+  else
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_pixel,r_pixel,r_temp2,LSL #%i    ; Add in dest %s",-bits,COMPONENT_NAME(2-toggle));)
+    ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp2)) | LSLI(-bits),a);
+  }
+  
+  if(screen_fmt->bits[1] < blend_fmt->bits[1])
+  {
+    IFDEBUG(do_sprintf(a,"ADD     r_temp1,r_temp1,r_temp1,LSR #%i    ; Expand dest green",screen_fmt->bits[1]);)
+    ADD(R(r_temp1),R(r_temp1),OP2R(R(r_temp1)) | LSRI(screen_fmt->bits[1]),a);
+  }
+
+  bits = blend_fmt->bits[1];
+  mask = ((1<<bits)-1)<<(screen_fmt->top[1]+alpha_top-bits);
+  /* Deal with impossible constants */
+  if((bits == 8) && ((screen_fmt->top[1]+alpha_top-bits) & 1))
+  {
+    mask = mask & (mask<<1);
+  }
+  IFDEBUG(do_sprintf(a,  "AND     r_temp1,r_temp1,#&%x               ; Mask dest green",mask);)
+  AND(R(r_temp1),R(r_temp1),IMM12(mask),a);
+
+  /* Restore r_alpha if necessary */
+  if(ws->regnames.r_alpha.regno == ws->regnames.r_translucency.regno)
+  {
+    DEFINE_LABEL(blend_nodestalpha,"Skip dest blend calc");
+    IFDEBUG(do_sprintf(a,"RSB     r_alpha,r_alpha,#1<<%i             ; Restore r_alpha / r_translucency",alpha_top);)
+    RSB(R(r_alpha),R(r_alpha),IMM12(1<<alpha_top),a);    
+  }
+
+  bits = screen_fmt->top[1] + alpha_top - blend_fmt->top[1];
+  if(bits > 0)
+  {
+    IFDEBUG(do_sprintf(a,"ADDNE   r_pixel,r_pixel,r_temp1,LSR #%i    ; Add in dest green",bits);)
+    ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp1)) | LSRI(bits) | NE,a);
+  }
+  else
+  {
+    IFDEBUG(do_sprintf(a,"ADDNE   r_pixel,r_pixel,r_temp1,LSL #%i    ; Add in dest green",-bits);)
+    ADD(R(r_pixel),R(r_pixel),OP2R(R(r_temp1)) | LSLI(-bits) | NE,a);
+  }
+
+  if(!L(blend_nodestalpha)->def)
+    DEFINE_LABEL(blend_nodestalpha,"Skip dest blend calc");
+
+  if(blend_pixelformat & PixelFormat_Alpha)
+  {
+    IFDEBUG(do_sprintf(a,"ORR     r_pixel, r_pixel, #&%x",PIXELFORMAT_ALPHA_MASK(blend_pixelformat));)
+    ORR(R(r_pixel),R(r_pixel),blend_fmt->alphaimm12 | (1<<25),a);
+  }
+
+  /* And we're done! */
+
+  return blend_pixelformat;
+}
+
+static PixelFormat apply_dither(asm_workspace *wp, workspace *ws, PixelFormat pixelformat, BOOL *have_dithered)
+{
+  if(ws->odither && !*have_dithered)
+  {
+    if(((pixelformat & PixelFormat_BPPMask) == PixelFormat_12bpp)
+      && (ws->out_pixelformat >= PixelFormat_4bpp))
+    {
+      /* When dithering 12bpp down to 4bpp/8bpp, we need to
+         convert to 32bpp to make it look good, and to fix
+         bugs with the dither value writing into the wrong
+         colour channels */
+      PixelFormat ditherformat = (PixelFormat) (PixelFormat_32bpp | (pixelformat & (PixelFormat_RGB | PixelFormat_Alpha)));
+      convert_pixel(wp,ws,pixelformat,ditherformat);
+      pixelformat = ditherformat;
+    }
+    add_ordered_dither(wp, ws, pixelformat); /* do ordered dither */
+    *have_dithered = TRUE;
+  }
+  return pixelformat;
+}
+
+static PixelFormat pick_colourmap_format(asm_workspace *wp, workspace *ws, PixelFormat in_pixelformat, PixelFormat out_pixelformat)
+{
+  /* Based around input and output pixel format, pick a sensible ColourTTRFormat
+     value which will (ideally) allow us to perform a 1-instruction translation
+     to 32bpp_Hi ready for passing to the colour mapping code */
+  if((in_pixelformat & PixelFormat_Alpha) && (out_pixelformat & PixelFormat_Alpha))
+  {
+    /* Alpha needs preserving. Only sensible choice is 32bpp + alpha. */
+    return (PixelFormat) (PixelFormat_32bpp + PixelFormat_Alpha);
+  }
+  else if((wp->CPUFlags & CPUFlag_REV) && ((in_pixelformat & ~PixelFormat_Alpha) == (PixelFormat_32bpp + PixelFormat_RGB)))
+  {
+    /* If REV is available we can do a 1-instruction translation from &TTRRGGBB to 32bpp_Hi */
+    return (PixelFormat) (PixelFormat_32bpp + PixelFormat_RGB);
+  }
+  else
+  {
+    /* Just go for 32bpp, with or without alpha, as we'll shift up to discard top byte */
+    return (PixelFormat) (PixelFormat_32bpp + (in_pixelformat & PixelFormat_Alpha));
+  }
+}
+
+static PixelFormat apply_ttr(asm_workspace *wp, workspace *ws, PixelFormat pixelformat, BOOL *have_dithered)
+/* Apply the TTR, and perform any dithering if necessary */
+{
+  BOOL preserve_alpha;
+  switch(wp->TTRType & ~TTRType_Optional)
+  {
+  case TTRType_None:
+    break;
+  case TTRType_Normal:
+    assert(pixelformat == ws->ColourTTRFormat, ERROR_FATAL);
+    ins(ws, LDRB(R(r_pixel), R(r_table)) | INDEX(R(r_pixel), 0),  "LDRB    r_pixel,[r_table, r_pixel]      ; byte table lookup");
+    pixelformat = ws->out_pixelformat;
+    break;
+  case TTRType_Wide:
+    assert(pixelformat == ws->ColourTTRFormat, ERROR_FATAL);
+    ins(ws, LDR(R(r_pixel), R(r_table)) | INDEX(R(r_pixel), 2),   "LDR     r_pixel,[r_table, r_pixel, LSL #2] ; word table lookup");
+    pixelformat = ws->out_pixelformat;
+    break;
+  case TTRType_32K:
+    /* Hack - skip if this is JPEG and we're already correct */
+    if(wp->is_it_jpeg && (pixelformat <= PixelFormat_8bpp))
+    {
+      assert(pixelformat == ws->out_pixelformat,ERROR_FATAL);
+      break;
+    }
+    /* If we're applying a 32K table, now is our last chance to perform dithering */
+    pixelformat = apply_dither(wp,ws,pixelformat,have_dithered);
+    if(pixelformat != ws->ColourTTRFormat)
+      convert_pixel(wp,ws,pixelformat,ws->ColourTTRFormat);
+    ins(ws, LDRB(R(r_pixel), R(r_table)) | INDEX(R(r_pixel), 0),  "LDRB    r_pixel,[r_table, r_pixel]      ; 32K-style table lookup");
+    pixelformat = ws->out_pixelformat;
+    break;
+  case TTRType_ColourMap:
+    if(pixelformat != ws->ColourTTRFormat)
+      convert_pixel(wp,ws,pixelformat,ws->ColourTTRFormat);
+    assert(R(r_pixel) == 14, ERROR_FATAL);
+    /* Call the colour map code.. slightly nasty!
+       This would be nicer if r0 == r_pixel, but I'm not sure how much code
+       is left which assumes r_pixel == r14 (or that r14 isn't r_temp1/r_temp2)
+       */
+    comment(ws, "Performing colour mapping");
+    ins(ws, PUSH | (1<<12) | (1<<0),                    "STMDB   sp!,{r0,r12}");
+    preserve_alpha = ((ws->ColourTTRFormat & PixelFormat_Alpha) && (ws->out_pixelformat & PixelFormat_Alpha));
+    if(preserve_alpha)
+    {
+      /* Preserve alpha. Should be in top byte. */
+      assert(ws->ColourTTRFormat == PixelFormat_32bpp + PixelFormat_Alpha, ERROR_FATAL);
+      if(ISTRANS)
+      {
+        /* r_temp2 used to avoid r12 clash with hardcoded r_temp1 */
+        assert((R(r_temp2) != 0) && (R(r_temp1) == 12), ERROR_FATAL); /* Check that our hardcoding assumptions are correct */
+        AND(R(r_temp2),R(r_pixel),IMM(255)|IMMROR(8),   "AND     r_temp2,r_pixel,#&ff000000 ; Preserve alpha");
+      }
+      else
+      {
+        assert((R(r_temp1) != 0) && (R(r_temp1) < 12), ERROR_FATAL);
+        AND(R(r_temp1),R(r_pixel),IMM(255)|IMMROR(8),   "AND     r_temp1,r_pixel,#&ff000000 ; Preserve alpha");
+      }
+    }
+    if(R(r_table) == 0)
+    {
+      /* r_table may sometimes be allocated to R0, which is a bit of a pain.
+         Relocate to r12 instead.
+         TODO - Avoid this clash when allocating registers. Mainly happens with
+         sprtrans, but could conceivably happen with putscaled too.
+      */
+      MOV(12,OP2R(0),                                   "MOV     r12,r_table ; Protect r_table (r0)");
+    }
+    /* 1-instruction translation from ColourTTRFormat to 32bpp_Hi */
+    switch(ws->ColourTTRFormat)
+    {
+    case PixelFormat_32bpp:
+    case PixelFormat_32bpp + PixelFormat_Alpha:
+      MOV(0,OP2R(R(r_pixel))|LSLI(8),                   "MOV     r0,r_pixel,LSL #8 ; Convert to palette entry");
+      break;
+    case PixelFormat_32bpp + PixelFormat_RGB:
+      assert(wp->CPUFlags & CPUFlag_REV, ERROR_FATAL);
+      REV(0,R(r_pixel),0,                               "REV     r0,r_pixel ; Convert to palette entry");
+      break;
+    default:
+      assert(ws->ColourTTRFormat == PixelFormat_32bpp_Hi, ERROR_FATAL);
+      MOV(0,OP2R(R(r_pixel)),                           "MOV     r0,r_pixel");
+      break;
+    }
+    MOV(R(lr),OP2R(R(pc)),                              "MOV     lr,pc");
+    if(R(r_table) == 0)
+    {
+      ins(ws, LDMIA(12) | (1<<12)|(1<<15),              "LDMIA   r12,{r12,pc} ; Call colour mapping code");
+    }
+    else
+    {
+      ins(ws, LDMIA(R(r_table)) | (1<<12)|(1<<15),      "LDMIA   r_table,{r12,pc} ; Call colour mapping code");
+    }
+    /* 1-instruction translation from 32bpp_Hi to something closer to the output format, or at least something a bit easier to work with */
+    if(preserve_alpha)
+    {
+      if(ISTRANS)
+      {
+        ORR(R(r_pixel),R(r_temp2),0|LSRI(8),            "ORR     r_pixel,r_temp2,r0,LSR #8");
+      }
+      else
+      {
+        ORR(R(r_pixel),R(r_temp1),0|LSRI(8),            "ORR     r_pixel,r_temp1,r0,LSR #8");
+      }
+      pixelformat = (PixelFormat) (PixelFormat_32bpp+PixelFormat_Alpha);
+    }
+    else if(((ws->out_pixelformat & ~PixelFormat_Alpha) == (PixelFormat_32bpp + PixelFormat_RGB)) && (wp->CPUFlags & CPUFlag_REV))
+    {
+      REV(R(r_pixel),0,0,                               "REV     r_pixel,r0");
+      pixelformat = (PixelFormat) (PixelFormat_32bpp+PixelFormat_RGB);
+    }
+    else
+    {
+      MOV(R(r_pixel),0|LSRI(8),                         "MOV     r_pixel,r0,LSR #8");
+      pixelformat = PixelFormat_32bpp;
+    }
+    ins(ws, POP | (1<<12) | (1<<0),                     "LDMIA   sp!,{r0,r12}");
+    /* Apply r_inversetable if we have <=8bpp output */
+    if(wp->BPP <= 8)
+    {
+      pixelformat = apply_dither(wp,ws,pixelformat,have_dithered);
+      comment(ws,"Convert to 15bpp and apply inversetable");
+      convert_pixel(wp,ws,pixelformat,PixelFormat_15bpp);
+      ins(ws, LDRB(R(r_pixel), R(r_inversetable)) | INDEX(R(r_pixel), 0), "LDRB    r_pixel,[r_inversetable,r_pixel]");
+      pixelformat = ws->out_pixelformat;
+    }
+    break;
+  case TTRType_Palette:
+    assert(pixelformat == ws->ColourTTRFormat, ERROR_FATAL);
+    ins(ws, LDR(R(r_pixel), R(r_table))
+          | INDEX(R(r_pixel), 3),                     "LDR     r_pixel,[r_table, r_pixel, LSL #3] ; standard palette lookup");
+    pixelformat = PixelFormat_32bpp_Hi;
+    break;
+  }
+
+  return pixelformat;
+}
+
 static void translate_pixel(asm_workspace *wp, workspace *ws)
 /* Translate r_pixel from being a source pixel, to being a destination pixel.
  *
  * Requirements:
  * ws->in_pixelformat valid
+ * ws->in_bpp valid
  * ws->out_pixelformat valid
  * ws->gcol valid
  * ws->odither valid
- * wp->trns_palette valid
  * wp->ColourTTR valid
  * ws->ColourTTRFormat valid
  * wp->BPP valid
@@ -1824,59 +3569,313 @@ static void translate_pixel(asm_workspace *wp, workspace *ws)
  * dither_expansion_init() called
  * r_pixel allocated
  * r_table allocated if necessary
+ * r_blendtable allocated if necessary
+ * r_outword allocated if necessary
+ * r_alpha allocated if necessary
+ * r_translucency allocated if necessary
  */
 {
+  IFDEBUG(char a[128];)
   PixelFormat pixelformat = ws->in_pixelformat;
 
   if (PLOTMASK || TRANSMASK)
   {
-    if (((ws->gcol & 7) == 2) && ((pixelformat & PixelFormat_BPPMask) != PixelFormat_32bpp)) /* AND plot action */
+    if ((ws->gcol == 2) && ((pixelformat & PixelFormat_BPPMask) != PixelFormat_32bpp)) /* AND plot action */
     {
-      MOV(R(r_pixel), OP2R(R(r_pixel)) | LSLI(31-(wp->BPP)),  "MOV     r_pixel, r_pixel, LSL 31-out_bpp ;a");
+      MOV(R(r_pixel), OP2R(R(r_pixel)) | LSLI(31-(wp->BPC)),  "MOV     r_pixel, r_pixel, LSL 31-out_bpc ;a");
       ORR(R(r_pixel), R(r_pixel), IMM(2) | IMMROR(2),         "ORR     r_pixel,r_pixel,#&80000000       ;a");
-      MOV(R(r_pixel), OP2R(R(r_pixel)) | ASRI(31-(wp->BPP)),  "MOV     r_pixel, r_pixel, ASR 31-out_bpp ;a");
+      MOV(R(r_pixel), OP2R(R(r_pixel)) | ASRI(31-(wp->BPC)),  "MOV     r_pixel, r_pixel, ASR 31-out_bpc ;a");
     }
     return; /* No more transformation necessary */
   }
 
-  if (ws->odither) add_ordered_dither(wp, ws, pixelformat); /* do ordered dither */
+  switch_bank(wp, ws, REGFLAG_XLOOP,REGFLAG_PERPIXEL);
 
   comment(ws, "Perform any transformation necessary");
-  if (wp->trns_palette != 0)
+
+  /* Work out if we want to apply the ttr before or after (or during) the blend:
+     * For BlendImpl_BlendTable:
+       If we have an optional TTR for a palletised source, we never want to
+       apply it. This is currently taken care of by compute_blendimpl
+       So, if we have a table, we want to apply it now
+     * For BlendImpl_BlendTables:
+       If we have an optional TTR for a palletised source, we apply it during
+       the blend (for full alpha pixels). Partially alpha'd pixels use LUTs
+       generated from the source palette.
+       Other types of TTR are applied once we've extracted and tested the source
+       alpha.
+     * For BlendImpl_InverseTable:
+       We want to operate on true colour values, but as we have an 8bpp dest
+       any TTR we have will be designed around that. So completely ignore any
+       optional 32K table (handled in compute_blendimpl), and apply all others
+       before the blend (as we currently don't have support for reading the
+       sprite palette here)
+     * For BlendImpl_True:
+       We want to operate on true colour values, so always apply the TTR first
+       as it'll either be a palette/wide TTR or a colour map
+    */
+
+  BOOL ttr_before_blend = TRUE;
+  switch(ws->blendimpl)
   {
-    assert(pixelformat <= PixelFormat_8bpp, ERROR_FATAL);
-    if (wp->BPP == 16)
-    {
-      /* This is a special 16bpp palette created by makepalette16bpp */
-      ins(ws, LDR(R(r_pixel), R(r_table))
-            | INDEX(R(r_pixel), 2),                     "LDR     r_pixel,[r_table, r_pixel, LSL #2] ; 16bpp palette lookup");
-      pixelformat = ws->out_pixelformat;
-    }
-    else
-    {
-      ins(ws, LDR(R(r_pixel), R(r_table))
-            | INDEX(R(r_pixel), 3),                     "LDR     r_pixel,[r_table, r_pixel, LSL #3] ; standard palette lookup");
-      pixelformat = PixelFormat_32bpp_Hi;
-    }
+  case BlendImpl_BlendTables:
+    ttr_before_blend = FALSE;
+    break;
   }
 
-  /* Translation table lookup */
-  if (wp->ColourTTR != 0)
+  /* If we're performing blending using the sprite alpha channel, we must
+     extract the alpha value before applying any TTR, as the TTR will destroy
+     it. We also take this opportunity to test the pixel alpha against zero
+     and skip the rest of this code if possible.
+     TODO - Use mask skip branch address where possible.
+  */
+  if(wp->blending)
   {
-    comment(ws, "We have a translation table.");
-    if (wp->Log2bpp <= 3) /* ie BPP <= 8 */
+    L(translate_noalpha)->def = 0;
+    L(translate_noalpha2)->def = 0;
+  }
+  int alpha_top = 0;
+  int alpha_bits = 0;
+  if((wp->blending & 2) && !(wp->save_mode & 0x80000000))
+  {
+    blend_extract_alpha(wp,ws,pixelformat,&alpha_top,&alpha_bits);
+    if(wp->BPP <= 8)
     {
-      if(pixelformat != ws->ColourTTRFormat)
-        convert_pixel(wp,ws,pixelformat,ws->ColourTTRFormat);
-      ins(ws, LDRB(R(r_pixel), R(r_table)) | INDEX(R(r_pixel), 0),  "LDRB    r_pixel,[r_table, r_pixel]      ; byte table lookup");
+      AND(R(r_pixel), R(r_outword), IMM(ws->out_pixmask) | EQ, "ANDEQ   r_pixel, r_outword, #out_pixmask ; just use dest pixel if 0 alpha");
+    }
+    else if(wp->BPP == 32)
+    {
+      ins(ws, LDR(R(r_pixel), R(r_outptr)) | OFFSET(0) | EQ,   "LDREQ   r_pixel,[r_outptr]             ; just use dest pixel if 0 alpha");
     }
     else
     {
-      assert(pixelformat <= PixelFormat_8bpp, ERROR_FATAL); /* up to 256 entries in word table */
-      assert(pixelformat == ws->ColourTTRFormat, ERROR_FATAL);
-      ins(ws, LDR(R(r_pixel), R(r_table)) | INDEX(R(r_pixel), 2),   "LDR     r_pixel,[r_table, r_pixel, LSL #2] ; word table lookup");
+      assert(wp->BPP == 16, ERROR_FATAL);
+      if(wp->CPUFlags & CPUFlag_T2)
+      {
+        UBFX(R(r_pixel),R(r_outword),0,16,EQ,                  "UBFXEQ  r_pixel,r_outword,#0,#16       ; just use dest pixel if 0 alpha");
+      }
+      else
+      {
+        MOV(R(r_pixel), OP2R(R(r_outword)) | LSLI(16) | EQ,    "MOVEQ   r_pixel,r_outword,LSL #16      ; just use dest pixel if 0 alpha");
+        MOV(R(r_pixel), OP2R(R(r_pixel)) | LSRI(16) | EQ,      "MOVEQ   r_pixel,r_pixel,LSR #16");
+      }
+    }
+    branch(ws, B | EQ, L(translate_noalpha),                   "BEQ     translate_noalpha                ; and skip remaining blend code");
+  }
+
+  BOOL have_dithered = FALSE;
+  if(ttr_before_blend && wp->TTRType)
+  {  
+    pixelformat = apply_ttr(wp,ws,pixelformat,&have_dithered);
+  }  
+
+  /* Blending */
+  int alpha_shift = 0;
+  switch(ws->blendimpl)
+  {
+  case BlendImpl_BlendTable:
+    /* Single blend table */
+    /* JPEG might need translating to out_pixelformat before the blend can take place */
+    if((wp->is_it_jpeg) && (pixelformat > PixelFormat_8bpp))
+    {
+      pixelformat = apply_dither(wp,ws,pixelformat,&have_dithered);
+      convert_pixel(wp,ws,pixelformat,ws->out_pixelformat);
+      pixelformat = ws->out_pixelformat;
+    }
+    comment(ws, "Use blend table");
+    AND(R(r_temp1), R(r_outword), IMM((1<<wp->BPP)-1) | IMMROR(0),    "AND     r_temp1, r_outword, #(1<<out_bpp)-1");
+    if((wp->is_it_jpeg) || (wp->TTRType != TTRType_None))
+    {
+      /* r_pixel should have been translated by ColourTTR to output bpp */
+      assert(pixelformat == ws->out_pixelformat, ERROR_FATAL);
+      ORR(R(r_temp1), R(r_pixel), OP2R(R(r_temp1)) | LSLI(wp->BPP),   "ORR     r_temp1, r_pixel, r_temp1, LSL #out_bpp");
+    }
+    else
+    {
+      assert(pixelformat == ws->in_pixelformat, ERROR_FATAL);
+      ORR(R(r_temp1), R(r_pixel), OP2R(R(r_temp1)) | LSLI(ws->in_bpp),"ORR     r_temp1, r_pixel, r_temp1, LSL #in_bpp");
+    }
+    ins(ws, LDRB(R(r_pixel), R(r_blendtable)) | INDEX(R(r_temp1), 0), "LDRB    r_pixel, [r_blendtable, r_temp1]");
+    pixelformat = ws->out_pixelformat;
+    break;
+  case BlendImpl_InverseTable:
+    /* TODO should really use source palette for this, via makepalette16bpp */
+    if(pixelformat == PixelFormat_8bpp)
+    {
+      ins(ws, LDR(R(r_pixel), R(r_screenpalette)) | INDEX(R(r_pixel), 2),"LDR     r_pixel,[r_screenpalette,r_pixel,LSL #2] ; Convert sprite pixel to 15bpp");
+      pixelformat = PixelFormat_15bpp;
+    }
+    /* Fall through... */
+  case BlendImpl_True:
+    /* True colour blend */
+    comment(ws, "True colour blend");
+    assert(pixelformat > PixelFormat_8bpp, ERROR_FATAL);
+    pixelformat = blend_rgb(wp,ws,pixelformat,alpha_top,alpha_bits,have_dithered);
+    break;
+  case BlendImpl_BlendTables:
+    /* Screen is <= 4bpp, use lots of blendtables
+       If src is true colour, use ColourTTR to convert to screen
+       Else use palette index directly */
+    comment(ws, "Lots of blend tables");
+    /* r_translucency (if used) assumed to be 0-256 alpha */
+    assert(wp->blending & 2, ERROR_FATAL);
+    /* Calculate the alpha value and branch if 0
+       Actual blend happens later on */
+    if (SOURCE_ALPHAMASK)
+    {
+      /* Alpha mask */
+      if(ISTRANS)
+      {
+        /* Transformed sprite alpha mask handling is somewhat sub-optimal */
+        LDR_SP(r_alpha,trns_comp_mask_offset)
+        LDR_SP(r_temp1,trns_comp_mask_base)
+        ins(ws, LDRB(R(r_alpha),R(r_temp1)) | INDEX(R(r_alpha),0), "LDRB    r_alpha,[r_temp1,r_alpha]        ; Fetch alpha mask");
+      }
+      if (wp->blending & 1)
+      {
+        if(!ISTRANS)
+        {
+          AND(R(r_alpha), R(r_maskinword), IMM(255),             "AND     r_alpha, r_maskinword, #255      ; Alpha mask");
+        }
+        MUL(R(r_alpha), R(r_translucency), R(r_alpha), 0,        "MUL     r_alpha, r_translucency, r_alpha ; Combined mask + SpriteOp translucency");
+        MOV(R(r_alpha), OP2R(R(r_alpha)) | LSRI(13) | S,         "MOVS    r_alpha, r_alpha, LSR #13");
+      }
+      else
+      {
+        if(ISTRANS)
+        {
+          AND(R(r_alpha), R(r_alpha), IMM(0xE0) | S,             "ANDS    r_alpha, r_alpha, #&E0           ; Alpha mask");
+        }
+        else
+        {
+          AND(R(r_alpha), R(r_maskinword), IMM(0xE0) | S,        "ANDS    r_alpha, r_maskinword, #&E0      ; Alpha mask");
+        }
+        alpha_shift = 5;
+      }
+      alpha_bits = 3;  
+    }
+    else if (alpha_bits)
+    {
+      /* Alpha channel */
+      unsigned int chan_mask = ((1<<alpha_bits)-1)<<(alpha_top-alpha_bits);
+      if (wp->blending & 1)
+      {
+        if (alpha_bits == 1)
+        {
+          MOV(R(r_alpha), OP2R(R(r_translucency))|LSRI(5)|S,     "MOVS  r_alpha, r_translucency, LSR #5");
+        }
+        else
+        {
+          assert(alpha_bits >= 4, ERROR_FATAL);
+          if(chan_mask == 0xff)
+          {
+            MUL(R(r_alpha), R(r_translucency), R(r_alpha), 0,    "MUL     r_alpha, r_translucency, r_alpha ; Combined alpha + SpriteOp translucency");
+            MOV(R(r_alpha), OP2R(R(r_alpha)) | LSRI(13) | S,     "MOVS    r_alpha, r_alpha, LSR #13");
+          }
+          else
+          {
+            assert(chan_mask == 0xf000, ERROR_FATAL);
+            MUL(R(r_alpha), R(r_translucency), R(r_alpha), 0,    "MUL     r_alpha, r_translucency, r_alpha ; Combined alpha + SpriteOp translucency");
+            MOV(R(r_alpha), OP2R(R(r_alpha)) | LSRI(21) | S,     "MOVS    r_alpha, r_alpha, LSR #21");
+          }  
+        }
+        alpha_bits = 3;  
+      }
+      else
+      {
+        chan_mask &= ~(chan_mask>>3);
+        IFDEBUG(do_sprintf(a,"ANDS    r_alpha, r_alpha, #&%x ; Alpha channel",chan_mask);)
+        AND(R(r_alpha), R(r_alpha), IMM12(chan_mask) | S,a);
+        alpha_shift = alpha_top-3;
+        alpha_bits = (alpha_bits>3?3:alpha_bits); /* Should be 1 or 3, asserted below */
+      }
+    }
+    else
+    {
+      /* Ordinary translucent plotting */
+      /* This shouldn't happen, should be handled by single blendtable case above */
+      assert(0, ERROR_FATAL);
+    }
+    AND(R(r_pixel), R(r_outword), IMM(ws->out_pixmask) | EQ,   "ANDEQ   r_pixel, r_outword, #out_pixmask ; just use dest pixel if 0 alpha");
+    /* TODO can use mask skip branch address? */
+    branch(ws, B | EQ, L(translate_noalpha2),                  "BEQ     translate_noalpha                ; and skip remaining blend code");
+
+    /* Apply TTR here, unless it's an optional normal TTR (in which case we
+       only apply for full alpha pixels) */
+    assert(!ttr_before_blend, ERROR_FATAL);
+    if(wp->TTRType != TTRType_Normal+TTRType_Optional)
+    {
+      pixelformat = apply_ttr(wp,ws,pixelformat,&have_dithered);
+      ttr_before_blend = TRUE;
+    }
+
+    /* Assume r_alpha 0-8 or 0-1, with 8/1 case already handled with a branch */
+    if(alpha_bits == 3)
+    {
+      assert(alpha_bits == 3,ERROR_FATAL);
+      IFDEBUG(do_sprintf(a,"CMP     r_alpha,#%i<<%i",(1<<alpha_bits)-1,alpha_shift);)
+      CMP(R(r_alpha), IMM12(((1<<alpha_bits)-1)<<alpha_shift),a);
+      if (wp->TTRType == TTRType_Normal+TTRType_Optional)
+      {
+        /* Use the supplied TTR to translate any full alpha pixels */
+        ins(ws, LDRB(R(r_pixel), R(r_table)) | INDEX(R(r_pixel), 0) | HS,   "LDRHSB  r_pixel,[r_table, r_pixel]      ; byte table lookup");
+      }
+      if(alpha_shift > 2)
+      {
+        IFDEBUG(do_sprintf(a,"LDRLO   r_alpha,[r_blendtable,r_alpha,LSR #%d]",alpha_shift-2);)
+        ins(ws, LDR(R(r_alpha), R(r_blendtable)) | INDEX_LSR(R(r_alpha), alpha_shift-2) | LO, a);
+      }
+      else
+      {
+        IFDEBUG(do_sprintf(a,"LDRLO   r_alpha,[r_blendtable,r_alpha,LSL #%d]",2-alpha_shift);)
+        ins(ws, LDR(R(r_alpha), R(r_blendtable)) | INDEX(R(r_alpha), 2-alpha_shift) | LO, a);
+      }
+      AND(R(r_temp1), R(r_outword), IMM((1<<wp->BPP)-1) | IMMROR(0) | LO,   "ANDLO   r_temp1, r_outword, #(1<<out_bpp)-1");
+      if(ttr_before_blend)
+      {
+        /* r_pixel should have been translated by ColourTTR to output bpp */
+        assert(pixelformat == ws->out_pixelformat, ERROR_FATAL);
+        ORR(R(r_temp1), R(r_pixel), OP2R(R(r_temp1)) | LSLI(wp->BPP) | LO,  "ORRLO   r_temp1, r_pixel, r_temp1, LSL #out_bpp");
+      }
+      else
+      {
+        /* TTR will have been applied for full alpha pixels, but won't have been applied for these partial alpha ones */
+        assert(pixelformat == ws->in_pixelformat, ERROR_FATAL);
+        ttr_before_blend = TRUE;
+        ORR(R(r_temp1), R(r_pixel), OP2R(R(r_temp1)) | LSLI(ws->in_bpp) |LO,"ORRLO   r_temp1, r_pixel, r_temp1, LSL #in_bpp");
+      }
+      ins(ws, LDRB(R(r_pixel), R(r_alpha)) | INDEX(R(r_temp1), 0) | LO,     "LDRLOB    r_pixel, [r_alpha, r_temp1]");
+    }
+    else
+    {
+      assert(alpha_bits == 1, ERROR_FATAL);
+      if ((wp->ColourTTR != 0) && (ws->ColourTTRFormat <= PixelFormat_8bpp))
+      {
+        /* Should be impossible, 1bpp alpha only possible with 1bpp alpha channel, which means 16bpp sprite pixels */
+        assert(0, ERROR_FATAL);
+      }
     }
     pixelformat = ws->out_pixelformat;              /* we've finished */
+    break;
+  }
+
+  pixelformat = apply_dither(wp,ws,pixelformat,&have_dithered);
+
+  switch(ws->blendimpl)
+  {
+  case BlendImpl_InverseTable:
+    /* Inverse table lookup for 15bpp -> palette
+       TODO - Could potentially use ColourTTR here if it was an optional (i.e.
+       ordinary) 32K table */
+    assert(ws->out_pixelformat == PixelFormat_8bpp, ERROR_FATAL);
+    assert(pixelformat >= PixelFormat_12bpp, ERROR_FATAL);
+    if(pixelformat != PixelFormat_15bpp)
+    {
+      convert_pixel(wp,ws,pixelformat,PixelFormat_15bpp);
+    }
+    ins(ws, LDRB(R(r_pixel), R(r_inversetable)) | INDEX(R(r_pixel), 0),  "LDRB    r_pixel,[r_inversetable, r_pixel]      ; 32K-style inversetable lookup");
+    pixelformat = PixelFormat_8bpp;
+    break;
   }
 
   /* Do any extra conversion necessary */
@@ -1886,17 +3885,26 @@ static void translate_pixel(asm_workspace *wp, workspace *ws)
     pixelformat = ws->out_pixelformat;
   }
 
-  if (((ws->gcol & 7) == 2) && ((pixelformat & PixelFormat_BPPMask) != PixelFormat_32bpp)) /* AND plot action which did something stupid for 32bpp (GPS)*/
+  if(wp->blending)
   {
-    MOV(R(r_pixel), OP2R(R(r_pixel)) | LSLI(31-(wp->BPP)), "MOV     r_pixel, r_pixel, LSL 31-out_bpp");
+    DEFINE_LABEL(translate_noalpha,"Skip blend calc");
+    DEFINE_LABEL(translate_noalpha2,"Skip blend calc");
+  }
+
+  if ((ws->gcol == 2) && ((pixelformat & PixelFormat_BPPMask) != PixelFormat_32bpp)) /* AND plot action which did something stupid for 32bpp (GPS)*/
+  {
+    MOV(R(r_pixel), OP2R(R(r_pixel)) | LSLI(31-(wp->BPC)),  "MOV     r_pixel, r_pixel, LSL 31-out_bpc");
     ORR(R(r_pixel), R(r_pixel), IMM(2) | IMMROR(2),         "ORR     r_pixel,r_pixel,#&80000000 ");
-    MOV(R(r_pixel), OP2R(R(r_pixel)) | ASRI(31-(wp->BPP)),  "MOV     r_pixel, r_pixel, ASR 31-out_bpp");
+    MOV(R(r_pixel), OP2R(R(r_pixel)) | ASRI(31-(wp->BPC)),  "MOV     r_pixel, r_pixel, ASR 31-out_bpc");
   }
 
   comment(ws, "r_pixel is now a destination pixel.");
+  assert(have_dithered == (ws->odither != 0), ERROR_FATAL);
 
   if (DPIXEL_OUTPUT)
-    ORR(R(r_pixel), R(r_pixel), OP2R(R(r_pixel)) | LSLI(wp->BPP),   "ORR     r_pixel,r_pixel,r_pixel,LSL #out_bpp:SHR:1 ; double pixel output");
+    ORR(R(r_pixel), R(r_pixel), OP2R(R(r_pixel)) | LSLI(wp->BPP),   "ORR     r_pixel,r_pixel,r_pixel,LSL #out_bpp ; double pixel output");
+
+  switch_bank(wp, ws, REGFLAG_PERPIXEL,REGFLAG_XLOOP);
 
   newline();
 }
@@ -1937,17 +3945,16 @@ static int get_key_word(asm_workspace *wp, workspace *ws)
 
   key_word = ws->in_pixelformat             /* 0..5 */
                + (ws->out_pixelformat << 6) /* 6..11 */
-               + (ws->gcol << 12);          /* 12..14 */
-  if (SOURCE_MASK) key_word |= 1<<15;
-  if (SOURCE_BPPMASK) key_word |= 1<<16;
-  if (wp->trns_palette != 0) key_word |= 1<<17;
-  if (wp->ColourTTR != 0) key_word |= 1<<18;
-  if (DPIXEL_OUTPUT) key_word |= 1<<19;
-  if (DPIXEL_INPUT) key_word |= 1<<20;
-  if (PLOTMASK || TRANSMASK) key_word |= 1<<21;
-  if (ISTRANS) key_word |= 1<<22;
+               + (ws->gcol << 12)           /* 12..14 */
+               + (ws->masktype << 15)       /* 15..16 */
+               + (wp->TTRType << 17);       /* 17..20 */
+  if (DPIXEL_OUTPUT) key_word |= 1<<21;
+  if (DPIXEL_INPUT) key_word |= 1<<22;
+  if (PLOTMASK || TRANSMASK) key_word |= 1<<23;
+  if (ISTRANS) key_word |= 1<<24;
+  key_word |= (wp->blending << 25);         /* 25..26 */
 
-  /* Bits 23+ are free for putscaled/sprtrans to use as they please */
+  /* Bits 27+ are free for putscaled/sprtrans to use as they please */
 
   return key_word;
 }
@@ -1964,9 +3971,10 @@ static void compile_buffer_init(asm_workspace *wp, workspace *ws)
   ws->compile_base = &(b->code[0]);
   ws->compile_ptr = ws->compile_base;
   ws->compile_lim = ws->compile_base + BUFSIZE;
+  ws->regframeoffset = 0;
+  ws->pixel_expansion_mask[0] = ws->pixel_expansion_mask[1] = 0;
   FOR_EACH_LABEL(p) {p->def = 0; p->ref = 0;} /* zap all the labels to be undefined. */
-  FOR_EACH_REGISTER_NAME(r) r->regno = -1;
-  ws->next_free_reg = 0; /* allocate registers from 0 */
+  FOR_EACH_REGISTER_NAME(r) { r->regno = -1; r->flags = 0; r->spindex = -1; }
 #ifdef DEBUG
   tracef("Compile buffer initialised.\n");
   if(ISTRANS)
@@ -1980,23 +3988,22 @@ static void compile_buffer_init(asm_workspace *wp, workspace *ws)
       (PLOTMASK ? "PlotMaskScaled" : "PutSpriteScaled") _
       b->xadd - b->xdiv _ b->xdiv _ b->yadd _ b->ydiv _ wp->save_outoffset);
   }
-  tracef("%t20; gcol action=%i in-bpp=%i out-bpp=%i in-dpix=%s out-dpix=%s mask=%s 1bppmask=%s palette=%s table=%s\n" _
+  tracef("%t20; gcol action=%i in-bpp=%i out-bpp=%i in-dpix=%s out-dpix=%s masktype=%i table=%s\n" _
     ws->gcol _ (1<<wp->save_inlog2bpp) _ wp->BPP _
     whether(DPIXEL_INPUT) _ whether(DPIXEL_OUTPUT) _
-    whether(SOURCE_MASK) _ whether(SOURCE_BPPMASK) _
-    whether(wp->trns_palette != 0) _ whether(wp->ColourTTR != 0));
+    ws->masktype _
+    whether(wp->ColourTTR != 0));
   tracef("%t20; Src format=%x Dest format=%x\n" _ ws->in_pixelformat _ ws->out_pixelformat);
   tracef("%t20.; Generated by compiler of (%s %s)\n" _ __DATE__ _ __TIME__);
   comment(ws, "Get register and workspace definitions, turn on listing");
   tracef("%t28.GET     w.GenHdr\n");
   tracef("%t28.OPT     1\n");
 #endif
-  RN(wp, 12, "workspace pointer")
-  RN(sp, 13, "stack pointer")
-  RN(lr, 14, "link register")
-  RN(pc, 15, "program counter")
-  ws->leave_r12_alone = FALSE;  /* by default, compiled code does not have module workspace pointer */
-  UNUSED(wp);
+  RN(wp, 12, REGFLAG_GLOBAL, "workspace pointer") /* TODO - HACK - Make non-global again somehow */
+//  RN(wp, 12, (wp->is_it_jpeg?REGFLAG_GLOBAL:REGFLAG_INPUT), "workspace pointer")
+  RN(sp, 13, REGFLAG_GLOBAL, "stack pointer")
+  RN(lr, 14, REGFLAG_USED, "link register")
+  RN(pc, 15, REGFLAG_GLOBAL, "program counter")
 }
 
 static void compile_buffer_done(workspace *ws)
@@ -2020,6 +4027,71 @@ static void compile_buffer_done(workspace *ws)
   }
 #endif
   /* ws->compile_base can be used as the base of the resulting procedure. */
+}
+
+static void init_useful_constants(asm_workspace *wp, workspace *ws)
+{
+  /* Various useful constants not provided directly by wp. */
+  newline();
+  comment(ws, "Various useful constants");
+  if (DPIXEL_INPUT)
+    comment(ws, "Double-pixel input - pixels are not the same as double-pixels");
+  else
+    comment(ws, "Not double-pixel input - pixels are exactly the same as double-pixels");
+  ws->in_bpp         = 1 << wp->save_inlog2bpp;
+  ws->in_bpc         = 1 << wp->save_inlog2bpc;
+  ws->in_pixmask     = (1 << ws->in_bpp) - 1;
+  tracef("%t20.in_bpp  *       %i %t68; bits per input pixel\n" _ ws->in_bpp);
+  tracef("%t20.in_bpc  *       %i %t68; bits per input double-pixel ('character')\n" _ ws->in_bpc);
+  tracef("%t20.in_l2bpp  *     %i %t68; log base 2 of bits per input pixel\n" _ wp->save_inlog2bpp);
+  if (ws->in_bpp <= 8) tracef("%t20.in_pixmask *    %i %t68; input pixel mask\n" _ ws->in_pixmask);
+
+  if (SOURCE_MASK)
+  {
+    if (SOURCE_ALPHAMASK)
+    {
+      ws->mask_bpp     = 8;
+      ws->mask_bpc     = 8;
+      ws->mask_pixmask = 255;
+    }
+    else if (SOURCE_BPPMASK) /* a bit mask */
+    {
+      ws->mask_bpp     = 1;
+      ws->mask_bpc     = 1;
+      ws->mask_pixmask = 1;
+    }
+    else
+    {
+      ws->mask_bpp     = ws->in_bpp;
+      ws->mask_bpc     = ws->in_bpc;
+      ws->mask_pixmask = ws->in_pixmask;
+    }
+    tracef("%t20.mask_bpp *      %i %t68; bits per mask pixel\n" _ ws->mask_bpp);
+    tracef("%t20.mask_bpc *      %i %t68; bits per mask double-pixel\n" _ ws->mask_bpc);
+    tracef("%t20.mask_pixmask *  %i %t68; mask pixel mask\n" _ ws->mask_pixmask);
+  }
+  else
+    comment(ws, "No input mask");
+
+  if (DPIXEL_OUTPUT)
+    comment(ws, "Double-pixel output - pixels are not the same as double-pixels");
+  else
+    comment(ws, "Not double-pixel output - pixels are exactly the same as double-pixels");
+  ws->out_l2ppw      = 5 - wp->Log2bpc;
+  ws->out_ppw        = 1 << ws->out_l2ppw;
+  ws->out_pixmask    = (1 << wp->BPP) - 1;
+  ws->out_dpixmask   = (1 << wp->BPC) - 1;
+  tracef("%t20.out_bpp *       %i %t68; bits per output pixel\n" _ wp->BPP);
+  tracef("%t20.out_bpc *       %i %t68; bits per output double-pixel\n" _ wp->BPC);
+  tracef("%t20.out_l2bpp *     %i %t68; log base 2 of bits per output pixel\n" _ wp->Log2bpp);
+  tracef("%t20.out_l2bpc *     %i %t68; log base 2 of bits per output double-pixel\n" _ wp->Log2bpc);
+  tracef("%t20.out_ppw *       %i %t68; double-pixels per output word\n" _ ws->out_ppw);
+  tracef("%t20.out_l2ppw *     %i %t68; log base 2 of double-pixels per output word\n" _ ws->out_l2ppw);
+  if (wp->BPC <= 8)
+  {
+    tracef("%t20.out_pixmask *   %i %t68; output pixel mask\n" _ ws->out_pixmask);
+    tracef("%t20.out_dpixmask *  %i %t68; output double-pixel mask\n" _ ws->out_dpixmask);
+  }
 }
 
 /**************************************************************************

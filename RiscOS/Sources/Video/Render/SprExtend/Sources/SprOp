@@ -985,6 +985,9 @@ readspritevars
         MOVVC   R1,#VduExt_YEigFactor
         SWIVC   XOS_ReadModeVariable
         STRVC   R2,inlog2py
+        MOVVC   R1,#VduExt_ModeFlags
+        SWIVC   XOS_ReadModeVariable
+        STRVC   R2,save_inmodeflags
         Pull    "R1-R2,PC",VS
 
         MOV     R14,#1
@@ -1115,6 +1118,8 @@ getspriteaddr
         ; makepalette16bpp
         ; convert palette to 16bpp for output to 16bpp mode plotting directly from palette
         ; if this is not done, the spriteextend blitter will run out of registers!
+        ; in:  r7 = original palette
+        ; out: r7 = new palette (in newtranstable)
 makepalette16bpp
         Entry   "R1-R6"
         LDR     r1, save_inbpp
@@ -1135,9 +1140,9 @@ makepalette16bpp
         TST     r3, #ModeFlag_DataFormatSub_RGB
         ADDNE   r4, r4, #4
 
-        LDR     r2, trns_palette      ; pointer to palette data
+        MOV     r2, r7                ; pointer to palette data
         ADRL    r3, newtranstable     ; where to store altered palette
-        STR     r3, trns_palette      ; where to store altered palette
+        MOV     r7, r3
         ADD     pc, pc, r4
 
         NOP
@@ -1188,8 +1193,25 @@ diverror
         addr    r1, Title
         BL      copy_error_one          ; Always sets the V bit
 
-exitbiggie
-        Pull    "R1-R9,PC"
+exitbiggie ROUT
+        ; Release any blend tables that were claimed by the C code
+        LDR     R1, blendtables
+        TEQ     R1, #0
+        Pull    "R1-R9,PC", EQ
+        SavePSR R4
+        Push    "R0"
+        ADR     R1, blendtables
+        MOV     R3, #0
+        ADD     R2, R1, #?blendtables
+10
+        LDR     R0, [R1], #4
+        TEQ     R0, #0
+        STRNE   R3, [R1, #-4]
+        SWINE   XBlendTable_UnlockTable
+        CMP     R1, R2
+        BNE     %BT10
+        RestPSR R4
+        Pull    "R0-R9,PC"
 
 ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ; SpriteOp_PutSpriteGreyScaled
@@ -1237,7 +1259,7 @@ Go_PlotMaskScaled
 ;        R1 --> areaCBptr
 ;        R2 --> sprite name
 ;        R3,R4 = coords
-;        R5 = 0
+;        R5 = plot action + flags
 ;        R6 --> scaling factors
 ;        R7 --> pixel translation table
 ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -1252,21 +1274,16 @@ Go_PutSpriteScaled
 
 
         CLRPSR  I_bit, R14              ; re-enable interrupts
-      [ flagbit
         MOV     R14, R5, LSR #4
         STR     R14, trns_flags2        ; store flags
-      [ widetrans
+        BIC     R14, R14, #flg2_translucency
         Debug   so,"flags are ",R14
-        BICS    R14, R14, #flg2_ignorettr + flg2_widetrans + flg2_ditheron
-      |
-        BICS    R14, R14, #flg2_ignorettr + flg2_ditheron
-      ]
+        BICS    R14, R14, #flg2_ignorettr + flg2_widetrans + flg2_ditheron + flg2_colourmap
         Debug   so,"flags are ",R14
         ADRNEL  R0, ErrorBlock_BadFlags
         addr    r1, Title, NE
         BLNE    copy_error_one          ; Always sets the V bit
         BVS     exitbiggie
-      ]
         AND     R5,R5,#&0F              ; only bottom 4 bits are interesting
 
         STR     R8,calibration_table
@@ -1274,13 +1291,15 @@ Go_PutSpriteScaled
         ;
         ; Check to see if truecolour sprites should be dithered
         ;
-      [ flagbit
-        LDR     r0, trns_flags2
-        TST     r0, #flg2_ditheron
+        LDR     r14, trns_flags2
+        TST     r14, #flg2_ditheron
         MOVEQ   r0, #0
         MOVNE   r0, #1
         STR     r0, dither_truecolour
-      ]
+        TST     r14, #flg2_translucency
+        MOVEQ   r0, #0
+        MOVNE   r0, #1
+        STR     r0, blending
         ;
         ; see if reason code indicated a sprite name or sprite pointer in R2
         ;
@@ -1297,8 +1316,29 @@ Go_PutSpriteScaled
         BVS     exitbiggie
         Debug   cc,"read sprite vars",R1
 
+        LDR     R0,[R1,#spMode]
+        TST     R0,#&80000000           ; alpha mask?
+        LDREQ   R0,save_inmodeflags
+        TSTEQ   R0,#ModeFlag_DataFormatSub_Alpha ; or alpha channel?
+        LDRNEB  R0,spritecode
+        TSTNE   R5,#8                   ; and masking enabled?
+        TEQNE   R0,#SpriteReason_PlotMaskScaled ; and not plotting mask?
+        LDR     R0,blending
+        ORRNE   R0,R0,#2                ; Enable alpha mask/channel blending
+        STRNE   R0,blending
+        CMP     R0,#0                   ; blending enabled?
+        BICNE   R5,R5,#7                ; then GCOL actions not allowed
+
         ; Alternate entry point from JPEG plotting
+        ; R1 = sprite pointer
+        ; R3 = X
+        ; R4 = Y
+        ; R5 = GCOL action + mask flag
+        ; R6 = scale ptr
+        ; R7 = TTR
+        ; [blending], [trns_flags2], sprite vars initialised
 putsprscaled_frompjs
+        STR     R1,save_sprite          ; save sprite ptr so C code can use it when needed (JPEG, blend tables, etc.)
         LDR     R0,[R1,#spMode]         ; get sprite's original mode
         MOV     R0,R0,LSR #27
         STR     R0,save_spr_type
@@ -1344,35 +1384,29 @@ putsprscaled_frompjs
         Debug   so,"Checked out trans table palette"
         ;
         ; try to optimise by using existing sprite plot code
-        ; can only be done if bpp equal, no trans, no scaling and output not to sprite
+        ; can only be done if bpp & bpc equal, no trans, no scaling, output not to sprite, and no fancy blending etc.
         ;
-      [ debug
+        LDR     R7,ColourTTR
         TEQ     R7,#0
         LDREQ   R14,save_inbpp
+        ANDEQS  R7, R14, #32+16         ; If we're dealing with deep sprites then the kernel is slower!!!
         LDREQ   R0,BPP
         TEQEQ   R14,R0                  ; if same bpp, try to optimise
 
         LDR     R6,save_xmag            ; load always!
         LDR     R7,save_ymag            ; load always!
+        BNE     cantdoinOS
+        LDREQ   R0,save_inlog2bpc
+        LDREQ   R14,Log2bpc
         LDREQ   R8,save_xdiv
         LDREQ   R9,save_ydiv
+        TEQEQ   R0,R14
+        LDREQ   R0,trns_flags2
+        LDREQ   R14,blending
         TEQEQ   R6,R8
         TEQEQ   R7,R9
-        BNE     %FT87
-87
-      |
-        TEQ     R7,#0
-        LDREQ   R14,save_inbpp
-        ANDS    R7, R14, #32+16         ; If we're dealing with deep sprites then the kernel is slower!!!
-        LDREQ   R0,BPP
-        TEQEQ   R14,R0                  ; if same bpp, try to optimise
-
-        LDR     R6,save_xmag            ; load always!
-        LDR     R7,save_ymag            ; load always!
-        LDREQ   R8,save_xdiv
-        LDREQ   R9,save_ydiv
-        TEQEQ   R6,R8
-        TEQEQ   R7,R9
+        TEQEQ   R0,#0
+        TEQEQ   R14,#0
         BNE     cantdoinOS
 
       [ jpeg
@@ -1394,10 +1428,10 @@ putsprscaled_frompjs
         ORREQ   R0,R0,#SpriteReason_PlotMaskUserCoords
         LDREQ   R14,save_ecflimit       ; is this background plotting?
         BNE     cantdoinOS
-        Push    "R0"
-        LDR     R0,vdu_bgecforaeor
-        TEQ     R14,R0
-        Pull    "R0"
+        LDR     R8,vdu_bgecforaeor
+        LDR     R9,[R1,#spMode]
+        TEQ     R14,R8
+        TSTEQ   R9,#&80000000           ; OS doesn't support alpha masks
         BNE     cantdoinOS
 01
         LDMIA   R13,{R1,R2}             ; get original R1,R2
@@ -1405,7 +1439,6 @@ putsprscaled_frompjs
         BL      Go_SpriteOp             ; call the OS version if there is one
         Pull    "R1-R9,PC"
 cantdoinOS
-      ]
         Debug   so,"we can't do it in OS"
         ;
         ; convert coords to internal pixels
@@ -1419,6 +1452,7 @@ cantdoinOS
         ADD     R4,R4,R14
         LDR     R14,log2py
         MOV     R4,R4,ASR R14           ; convert to internal form
+      [ doublepixel_bodge
         ;
         ; bodge x-coords (inc. graphics window) so we can forget double-pixels
         ;
@@ -1450,6 +1484,12 @@ cantdoinOS
         ; R8, [save_ysize] <-- size of sprite in pixels (NOT double-pixels)
         ;
         LDR     R11,save_inlog2bpp      ; R11 = log2 ( bpp )
+      |
+        ;
+        ; R8, [save_ysize] <-- size of sprite in pixels (double-pixels)
+        ;
+        LDR     R11,save_inlog2bpc
+      ]
 
         LDR     R0,[R1,#spLBit]
         Debug   so, "spLBit is ? = ",R0
@@ -1564,11 +1604,13 @@ cantdoinOS
         LDR     R4,save_ycoord          ; ditto
         LDR     R5,save_xsize           ; size in output pixels
         LDR     R6,save_ysize           ; ditto
+      [ doublepixel_bodge
         LDR     R7,Log2bpc
         LDR     R8,Log2bpp
         SUBS    R7,R7,R8
         MOVNE   R3,R3,ASR R7            ; unbodge double-pixel stuff
         MOVNE   R5,R5,ASR R7
+      ]
         ADD     R5,R3,R5
         ADD     R6,R4,R6
         SUB     R5,R5,#1                ; make inclusive
@@ -1606,6 +1648,10 @@ cantdoinOS
         STR     R10,in_y
       ]
 
+        LDR     R4,[R1,#spMode]
+        TST     R4,#&80000000           ; 8bpp mask?
+        MOVNE   R9,R9,LSL #3            ; Multiply x coord by 8 so we can use the 1bpp code
+
         ; set up things for 1bpp masks too - we decide later whether to use it
         AND     R14,R9,#31              ; mask is 1bpp, and there's no lh wastage
                                         ; so this is a lot simpler!
@@ -1637,6 +1683,8 @@ cantdoinOS
         SUB     R10,R2,R10              ; R10 = no of rows from top
 
         LDR     R3,save_inputxsize      ; number of pixels(==number of bits)
+        TST     R4,#&80000000           ; 8bpp mask?
+        MOVNE   R3,R3,LSL #3            ; Pretend 8 times wider
         ANDS    R4,R3,#&1F              ; R4=number of bits
         MOVNE   R4,#1                   ; R4=1 if R3 MOD 31 is not zero
         ADD     R4,R4,R3,LSR #5         ; R4=number of words
@@ -1717,133 +1765,255 @@ cantdoinOS
         ; In:
         ;       R1 -> sprite
         ;       R7 -> user supplied translation table
+        ;       [spritecode] valid
         ;       [save_inbpp] valid
         ;       [is_it_jpeg] valid
+        ;       [trns_flags2] valid
+        ;       [BPP] valid
         ; Out:
-        ;       R7 -> translation table to use?
-        ;       R0, R8-R10 corrupt
-        ;       [trns_palette] set if using palette
-        ;       [ColourTTR] set if using TTR
+        ;       R0, R7-R10 corrupt
+        ;       [ColourTTR], [TTRType] valid
+        ;       [trns_flags2] updated
+        ;
+        ; This is effectively an implementation of the following pseudocode
+        ; for identifying/validating tables, except with extra logic added to
+        ; convert the tables to more useful formats where possible.
+        ;
+        ; switch(sourcebpp)
+        ; {
+        ; case <=8bpp:
+        ;   assert(!flg2_colourmap);
+        ;   if(flg2_ignorettr && full_palette)
+        ;     set table_optional;
+        ;   switch(destbpp)
+        ;   {
+        ;   case <=8bpp:
+        ;     if(table)
+        ;     {
+        ;       assert(table_entries_valid);
+        ;       return normal_table;
+        ;     }
+        ;     else
+        ;     {
+        ;       assert(sourcebpp == destbpp);
+        ;       return none;
+        ;     }
+        ;   case >=16bpp:
+        ;     assert(table);
+        ;     if(flg2_widetrans)
+        ;       return wide_table;
+        ;     return gcol_table;
+        ;   }
+        ; case >=16bpp:
+        ;   if(flg2_colourmap)
+        ;     return colour_mapping_descriptor;
+        ;   if(flg2_ignorettr)
+        ;     set table_optional; // extension to original spec
+        ;   switch(destbpp)
+        ;   {
+        ;   case <=8bpp:
+        ;     assert(is_32k_table);
+        ;     return 32k_table;
+        ;   case >=16bpp:
+        ;     return none;
+        ;   }
+        ; }
+        ;
+
 preparettr      ROUT
         Entry
-      [ ignore_ttr
-        ;
-        ; check for a ttr. If it's present and the sprite has a full entry palette set up to
-        ; use that instead.
-        ;
-        MOV     R14, #0
-        STR     R14, trns_palette
+        LDRB    R14,spritecode          ; R14 = bottom 8 bits of reason code
+        TEQ     R14,#SpriteReason_PlotMaskScaled
+        TEQNE   R14,#SpriteReason_PlotMaskTransformed
+        BEQ     preparettr_none         ; No table possible or required when plotting mask
 
-        LDR     R14,[R1,#spImage]
-        CMP     R14,#SpriteCBsize
-        BEQ     has_no_palette
+        LDR     R14,save_inbpp
+        MOV     R8,#0
+        CMP     R14,#8
+        LDR     R9,trns_flags2
+        BGT     preparettr_src16bpp
+
+        ; Source is <=8bpp
+
+        ; Colour mapping isn't allowed here
+        TST     R9,#flg2_colourmap
+        BNE     errtrans
+
+        ; Can we ignore the TTR?
+        TST     R9,#flg2_ignorettr
+        BEQ     preparettr_src8bpp_noignore
+
+        LDR     R10,[R1,#spImage]
+        CMP     R10,#SpriteCBsize
+        BEQ     preparettr_src8bpp_noignore
 
         LDR     R0,[R1,#spTrans]
         CMP     R0,#SpriteCBsize
-        BEQ     has_no_palette
+        BEQ     preparettr_src8bpp_noignore
 
         ;validate it (to exclude 8bpp without full palettes)
         ;test is that palette size should be 8*ncolours
 
         ;find the lower of the sprite start and mask start
-        CMP     R14,R0
-        MOVCS   R14,R0
-        SUB     R14,R14,#SpriteCBsize
+        CMP     R10,R0
+        MOVCS   R10,R0
+        SUB     R10,R10,#SpriteCBsize
 
-        MOV     R14,R14,LSR #3 ;divide by 8 for number of palette entries
         MOV     R0,#1
-        LDR     R9,save_inbpp
-        MOV     R0,R0,ASL R9
+        MOV     R10,R10,LSR #3 ;divide by 8 for number of palette entries
+        MOV     R0,R0,ASL R14
 
-        CMP     R0,R14
-        BNE     has_no_palette
+        CMP     R0,R10
+        BNE     preparettr_src8bpp_noignore
 
-      [ flagbit
-        LDR     R14, trns_flags2
-        Debug   so,"Checking ttr flag", R14
-        TST     R14, #flg2_ignorettr
+        MOV     R8,#TTRType_Optional     ; Flag TTR as optional
+        LDR     R10,BPP
+        CMP     R10,#16
+        BLT     preparettr_src8bpp_dest8bpp ; Only use the palette if >=16bpp dest
 
-        BEQ     has_no_palette   ;use ttr and ignore any palette
-
-01
-      |
-        Debug   so,"ttr flag is not set"
-        B       has_no_palette
-      ]
         Debug   so, "We're going to plot from palette"
-        LDR     R14,[R1,#spTrans]
-        ADD     R14,R1,#SpriteCBsize
-        STR     R14, trns_palette
-        LDR     R14, BPP
-        CMP     R14, #16
-        MOVEQ   r7, #0                   ; junk any translation table we were given to stop checktrans overwriting 16bpp palette
+        LDR     R7,[R1,#spTrans]
+        ADD     R7,R1,#SpriteCBsize
+        ORREQ   R8,R8,#TTRType_Wide      ; If we're converting to 16bpp it's effectively the same as a (word packed) user supplied wide table
+        ORRNE   R8,R8,#TTRType_Palette   ; Else it's a raw sprite palette
         BLEQ    makepalette16bpp
-has_no_palette
-      ]
-
-        ;
-        ; validate supplied translation table (if any)
-        ;
-        Debug   cc,"about to check trans table",R1
-        CMP     R7,#0                    ; 0 ==> no translation
-        BLNE    checktrans
-        PullEnv VS
-        BVS     exitbiggie
-        Debug   cc,"trans table is OK",R1
-      [ ignore_ttr
-        ; if doing a sprite of <16bpp to >8bpp, and it has a palette, change the ttr pointer
-        ; to point at the palette data instead of the ttr data. Note that the two are different
-        ; formats, so there is also a different plotting routine to include too...
-
-        LDR     R14, BPP                               ; output bpp
-        CMP     R14, #16
-        MOVCC   R14, #0
-        STRCC   R14, trns_palette
-        BCC     %FT45
-        LDR     R14, save_inbpp
-        CMP     R14, #16
-        MOVCS   R14, #0
-        STRCS   R14, trns_palette
-        BCS     %FT45
-        LDR     R14, trns_palette
-        TEQ     R14, #0
-        MOVNE   R7,R14
-        MOVEQ   R14,#0
-        STREQ   R14, trns_palette ;only non-zero if going to use this
-
-        ; trns_palette doubles as a pointer to the palette up this far, and then becomes a
-        ; compilation flag for the macro generation (with the value being passed in as the
-        ; ttr address)
-
-45
-      ]
 
         STR     R7,ColourTTR
+        STR     R8,TTRType
+        EXIT
+
+preparettr_src8bpp_noignore
+        ; Source is <=8bpp
+        ; TTR (if present) must be used
+        LDR     R10,BPP
+        CMP     R10,#16
+        BGE     preparettr_src8bpp_dest16bpp
+preparettr_src8bpp_dest8bpp
         CMP     R7,#0
-        BNE     notrans
+        BNE     preparettr_src8bpp_dest8bpp_checknormal
+        CMP     R10,R14
+        BNE     errtrans                 ; Source bpp != dest, and no table supplied. Error!
+        MOV     R8,#TTRType_None
+        STR     R7,ColourTTR
+        STR     R8,TTRType
+        EXIT
 
-        LDRB    R14,spritecode          ; R14 = bottom 8 bits of reason code
-        TEQ     R14,#SpriteReason_PlotMaskScaled
-        TEQNE   R14,#SpriteReason_PlotMaskTransformed
+preparettr_src8bpp_dest8bpp_checknormal
+        ; Source is <=8bpp
+        ; Dest is <=8bpp
+        ; Check that R7 is a valid normal translation table
+        ; Also check for identity tables and discard them
+        CMP     R14,R10
+        MOV     R9,#1
+        ORRNE   R8,R8,#TTRType_Normal    ; If srcbpp != destbpp then don't discard identity tables (easier this way)
+        MOV     R14,R9,LSL R14
+        MOV     R10,R9,LSL R10
+        MOV     R0,#0
+10
+        LDRB    R9,[R7,R0]
+        CMP     R9,R10
+        BHS     errtrans                 ; Invalid table
+        CMP     R9,R0
+        ORRNE   R8,R8,#TTRType_Normal
+        ADD     R0,R0,#1
+        CMP     R0,R14
+        BNE     %BT10
+        TST     R8,#TTRType_Normal
+        BEQ     preparettr_none
+        STR     R7,ColourTTR
+        STR     R8,TTRType
+        EXIT
+
+preparettr_src8bpp_dest16bpp
+        ; Source is <=8bpp
+        ; Dest is >=16bpp
+        ; This means we must either have a wide table or a GCOL table
+        ; Check for and translate as appropriate
+        ; Note that it's impossible for TTRType_Optional flag to be set here; if it was, we'd already be set up to use the sprite palette
+        CMP     R7,#0
+        BEQ     errtrans
+        MOV     R8,#TTRType_Wide
+        TST     R9,#flg2_widetrans
+        STR     R8,TTRType
+        BNE     preparettr_handlewidetrans
+        ; GCOL table
+        BL      convertGCOLtable
+50
+        STR     R7,ColourTTR
+        EXIT
+
+preparettr_handlewidetrans
+        ; Wide translation table
+        ; Repack to 32bit words if necessary
+        CMP     R10,#16
+        BNE     %BT50
+        ADRL    R8,newtranstable
+        MOV     R9,#1
+        STR     R8,ColourTTR
+        MOV     R14,R9,LSL R14
+70
+        LDR     R0,[R7],#4       ; load two values from original ctrans table
+        MOV     R9,R0,LSR #16    ; put the second value in the low 16 bits of R9
+        EOR     R0,R0,R9,LSL #16 ; and remove the second value from R0
+        SUBS    R14,R14,#2       ; decrement count by 2 src colours
+        STMIA   R8!,{R0,R9}      ; store
+        BNE     %BT70
+        EXIT
+
+preparettr_src16bpp
+        ; Source is >=16bpp
+        ; We only allow colour mapping, 32K-style tables, or nothing at all
+        TST     R9,#flg2_colourmap
+        MOVNE   R8,#TTRType_ColourMap
+        STRNE   R7,ColourTTR
+        STRNE   R8,TTRType
+        EXIT    NE
+
+        LDR     R10,BPP
+        CMP     R10,#16
+        BGE     preparettr_src16bpp_dest16bpp
+
+        ; Dest is <=8bpp
+        ; We must have a 32K style table, but it can be flagged as optional
+        CMP     R7,#0
       [ jpeg
-        LDRNE   R14,is_it_jpeg
-        CMPNE   R14,#1
-        Debug   gs,"1. is it JPEG?",R0
+        BNE     %FT80
+        ; Exception to the rule: JPEG might not have a table if we're running on an old OS
+        LDR     R0,is_it_jpeg
+        CMP     R0,#0
+        BEQ     preparettr_none
+        B       errtrans
+80
+      |
+        BEQ     errtrans
       ]
-        LDRNE   R14,save_inbpp
-        LDRNE   R0,BPP
-        TEQNE   R14,R0                  ; OK if same bpp or mask plotting
+        LDR     R0,word32k
+        LDR     R10,[R7]
+        CMP     R10,R0
+        LDREQ   R10,[R7,#8]
+        CMPEQ   R10,R0
+        BNE     errtrans
 
-        ;however, don't error if going 16>32 or 32>16
-        BEQ     notrans ;dispose of the equal case
+        TST     R9,#flg2_ignorettr
+        MOV     R8,#TTRType_32K
+        LDR     R7,[R7,#4] ; Discard the header, we don't need it
+        ORRNE   R8,R8,#TTRType_Optional
+        STR     R7,ColourTTR
+        STR     R8,TTRType
+        EXIT
 
-        CMP     R0,#16
-        CMPEQ   R14,#32
-        BEQ     notrans
+preparettr_src16bpp_dest16bpp
+preparettr_none
+        ; No table supplied, or table should be ignored
+        LDR     R14,trns_flags2
+        MOV     R7,#0
+        ASSERT  TTRType_None = 0
+        BIC     R14,R14,#flg2_widetrans + flg2_ignorettr + flg2_colourmap ; Forget irrelevant flags, increases the chances of us using an OS plot routine
+        STR     R7,ColourTTR
+        STR     R7,TTRType
+        STR     R14,trns_flags2
+        EXIT
 
-        CMP     R0,#32
-        CMPEQ   R14,#16
-        BEQ     notrans
 errtrans
         ADRL    R0,ErrorBlock_BadTranslation   ; different bpp ==> must have table
 errexitscaled
@@ -1854,125 +2024,24 @@ errexitscaled
         BVS     exitbiggie
 notrans
         EXIT
-        ;-----------------------------------------------------------------------------
-        ; Function to validate the pixel translation table, remapping as required
-        ; to take into account depth changes etc.
-        ;
-        ; in   R7 -> pixtrans table supplied to call
-        ; out  R0 -> error block (V set)
-        ;      R7 -> pixtrans table (may have been relocated!)
-        ;-----------------------------------------------------------------------------
-        
-        ; The following rules apply:
-        ;
-        ;    1/2/4/8 to 1/2/4/8 bpp   : no change
-        ;          8 to   16/32 bpp   : use mungeGCOL8toXX routine, applied here
-        ;         16 to 1/2/4/8 bpp   : CTrans 32K-style table matching the sprite format (12bpp, 15bpp, etc.)
-        ;         32 to 1/2/4/8 bpp   : only valid table is a CTrans 32K table providing 5 bit mappings
-        ;         16 to      16 bpp   : no table allowed
-        ;         32 to      32 bpp   : no table allowed
-        ;      16/32 to   32/16 bpp   : no table, but a munge function will be applied instead
-        ;                               (nb, this is called during plotting, since there's no table
-        ;                               to modify in advance)
-        ;
-        ;    ColourTrans uses the following structure for the return from Select/GenerateTable:
-        ;
-        ;    Word 0 : &33324B2E "32K."
-        ;    Word 4 : Pointer to the 32K table
-        ;    Word 8 : &33324B2E "32K."
-        ;
-checktrans Entry
-
-        LDR     LR,save_inbpp
-        MOV     R8,#1
-        MOV     R8,R8,ASL LR            ; R8 = number of input colours
-        LDR     R9,BPP                  ; R9 = output depth
-        MOV     R10,#0                  ; R10 = index / counter
-
-        CMP     LR,#16
-        BCC     checktrans1             ; branch if input is 8bpp or below
-
-        ;now check out the following:
-        ; 16 -> 16 : \                  ;
-        ; 32 -> 32 :  \__ A table should never be used, however if one is presented
-        ; 16 -> 32 :  /   it will be discarded but not faulted here.
-        ; 32 -> 16 : /
-        ; 16/32 -> 8 or lower : table must be CTrans 32K type
-
-        CMP     R9,#16
-        BCS     checktrans_ignorettr
-
-        ;this is 16/32 to 8/lower, so check for a 32K table
-      [ jpeg
-        ; JPEG possibility - might get 32bpp data into small target, with no table.
-        LDR     LR,is_it_jpeg
-        TEQ     LR,#0                     ; 0 -> not JPEG
-        BNE     checktrans_exitok
-      ]
-        LDR     LR,word32k
-        LDR     R8,[R7,#0]
-        CMP     R8,LR
-        BNE     checktrans_giveerror
-        LDR     R8,[R7,#8]
-        CMP     R8,LR
-        BNE     checktrans_giveerror
-        B       checktrans_exitok
-
-checktrans_ignorettr
-        MOVS    R7,#0
-        B       checktrans_exitok
 
 word32k =       "32K."
 
-checktrans1
-        CMP     R9,#16                  ; are we outputting to >= 16 bit per pixel
-        BLT     checktrans_old          ; if not then ignore the remapping
-
+convertGCOLtable ROUT
+        ; In:  r7 -> GCOL table
+        ; Out: r7 -> translated table
+        ;      r8-r9 corrupt
+        ;
         ; For backwards compatibility we attempt to remap the colours by taking the GCOL
         ; byte which is in VIDC 1 format and convert it to a word value sensible for this
         ; depth of display.
 
-        ; The functions which decode this byte now look for a word value which is then
-        ; combined into the scan line being rendered.
-
-        Push    "R0-R4,R9"
+        Entry   "R0-R4"
+        LDR     R8,save_inbpp
+        MOV     R9,#1
+        MOV     R8,R9,LSL R8            ; get number of input colours
         LDR     R9,Log2bpp
         SUB     R9,R9,#3                ; convert the output Log2 bpp into a sensible index for conversion
-      [ widetrans
-        ; don't need to do anything for 32bpp, for 15bpp entries need to be moved to
-        ; be word based. Problem is that CTrans produces a half word table, but the
-        ; plot code here expects them to be words
-
-        LDR     R14,trns_flags2         ; get the flag word
-        TST     R14,#flg2_widetrans     ; if set we don't need to do the expansion
-        BEQ     no_widetrans            ; skip if new bit is unset
-        TSTNE   R9,#2                   ; check for 32bpp (note the the SUB #3 above)
-        LDMNEFD R13!,{R0-R4,R9}         ; it is 32bit - reload registers...
-        BNE     checktrans_exitok       ; ...and go straight out
-
-        Debug   so,"We're gonna scribble all over newtranstable 1"
-        ;now do the expansion needed for 15bpp
-        ADR     R2,newtranstable        ; new table space
-        MOV     R8,R8,LSR #1            ; loading a word collects two entries, so
-                                        ; halve the number of colours to do
-expand_15bpp
-        SUBS    R8,R8,#1                ; decrement count
-        Pull    "R0-R4,R9",MI           ; when we go minus we've finished, reload registers...
-        ADRMI   R7,newtranstable        ; ...change the translation table pointer...
-        BMI     checktrans_exitok       ; ...and get out of here!
-
-        LDR     R0,[R7,R8,LSL #2]       ; load two values from original ctrans table
-        MOV     LR,R0,LSR #16           ; put the second value in the low 16 bits of LR
-        EOR     R0,R0,LR,LSL #16        ; and remove the second value from R0
-        MOV     R8,R8,LSL #1            ; double the output pointer cos we've two words to store
-        STR     R0,[R2,R8,LSL #2]       ; store the first word
-        ADD     R8,R8,#1                ; increment
-        STR     LR,[R2,R8,LSL #2]       ; and store the second word
-        MOV     R8,R8,LSR #1            ; and bring the output pointer back to normal
-        B       expand_15bpp            ; back to the loop to check for completion
-
-no_widetrans
-      ]
 
         ; Work out what conversion algorithm is needed
         LDR     R2,modeflags
@@ -1996,19 +2065,18 @@ no_widetrans
         AND     R2,R2,#ModeFlag_DataFormatSub_RGB+ModeFlag_DataFormatSub_Alpha
         ADD     R9,R9,R2,LSR #14 ; RGB = bit 0, alpha = bit 1
         Debug   so,"GCOL munge index=",R9
-        
-        ADR     R2,newtranstable        ; -> new translation table (passed out on exit)
+
+        MOV     R2,R7
+        ADR     R7,newtranstable        ; -> new translation table (passed out on exit)
 
 converttrans_new
         SUBS    R8,R8,#1
-        Pull    "R0-R4,R9",MI           ; preserve important registers
-        ADRMI   R7,newtranstable
-        BMI     checktrans_exitok
+        EXIT    MI
 
-        LDRB    R0,[R7,R8]
+        LDRB    R0,[R2,R8]
         MOV     LR,PC
         ADD     PC,PC,R9,LSL #2         ; call function to remap the colour byte
-        STR     R0,[R2,R8,LSL #2]       ; and store the converted value
+        STR     R0,[R7,R8,LSL #2]       ; and store the converted value
         B       converttrans_new        ; and loop back round
         B       mungeGCOLto4444_TBGR    ; index 1
         B       mungeGCOLto4444_TRGB
@@ -2166,58 +2234,6 @@ mungeGCOLto8888_TBGR mungeGCOLto32 R0,R0,R3,R4,0
 mungeGCOLto8888_TRGB mungeGCOLto32 R0,R0,R3,R4,1
 mungeGCOLto8888_ABGR mungeGCOLto32 R0,R0,R3,R4,0,&FF000000
 mungeGCOLto8888_ARGB mungeGCOLto32 R0,R0,R3,R4,1,&FF000000
-
-checktrans_old
-        SUBS    R8,R8,#1                ; loop until -ve value
-
-        BMI     checktrans_exitok       ;fix bug that was making this routine inactive! AMG
-
-        LDRB    LR,[R7,R10]             ; get a byte from the table
-        MOVS    LR,LR,LSR R9            ; if any bits are non-zero that shouldn't be then complain
-        BEQ     checktrans_old
-checktrans_giveerror
-        Debug   so, "We think the ttable is duff (XXX)"
-        ADRL    R0,ErrorBlock_BadTranslation
-        addr    R1,Title
-        BL      copy_error_one          ; returns error block with V set, for bad table
-        EXIT
-
-checktrans_exitok
-        CLRV
-        EXIT
-
-        ; some of these values used in SprTrans
-mc_gcol         *       2_00000111              ; bits 0..2 of R5
-mc_hasmask      *       2_00001000              ; bit 3 of R5
-mc_ttr          *       2_00010000              ; R7
-mc_plotmask     *       2_00100000              ; R0
-mc_transformed  *       2_01000000              ; 0 if scaled, 1 if transformed sprite plot
-
-                [ ignore_ttr
-mc_ttrispalette *       2_10000000              ; use palette instead of ttr (ttr points at it)
-                ]
-
-mcb_inbpp       *       8
-mcb_outbpp      *       16
-mcb_sprtype     *       24
-
-xxx             *       2
-
-BNE             *       &1A000000
-BCS             *       &2A000000
-BCC             *       &3A000000
-BMI             *       &4A000000
-BPL             *       &5A000000
-BVS             *       &6A000000
-BVC             *       &7A000000
-BHI             *       &8A000000
-BLS             *       &9A000000
-BGE             *       &AA000000
-BLT             *       &BA000000
-BGT             *       &CA000000
-BLE             *       &DA000000
-BAL             *       &EA000000
-BNV             *       &FA000000
 
 ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ; SpriteOp_AppendSprite
@@ -3078,10 +3094,10 @@ Go_CheckSpriteArea
         BNE     %FT99
         Debug   so," + passed if new type sprite has LBit=0"
 
-     [ {TRUE} ; Disable alpha masks until we fully support them
-        TST     r5, #&80000000
-        BNE     %FT99
-     ]
+ ;    [ {TRUE} ; Disable alpha masks until we fully support them
+ ;       TST     r5, #&80000000
+ ;       BNE     %FT99
+ ;    ]
 
         LDR     r0, [r1, #spWidth]
         LDR     r4, [r1, #spHeight]
