@@ -59,7 +59,7 @@ myjptable
         B       Go_AppendSprite         ; 35 SpriteReason_AppendSprite
         B       Go_SetPointerShape      ; 36 SpriteReason_SetPointerShape
         B       Go_CreateRemovePalette  ; 37 SpriteReason_CreateRemovePalette
-        Pull    "R10-R11, PC"
+        B       Go_CreateRemoveAlpha    ; 38 SpriteReason_CreateRemoveAlpha
         Pull    "R10-R11, PC"
         Pull    "R10-R11, PC"
         Pull    "R10-R11, PC"
@@ -406,6 +406,897 @@ bpp8    DCD     &00000000       ;  0000
         DCD     &70307000       ;  1111
 
         LTORG
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; SpriteReason_CreateRemoveAlpha
+; --------------------------------
+; Entry: R0  = 38 (SpriteReason_CreateRemoveAlpha) (+0 / 256 / 512)
+;        R1 -> sprite control block
+;        R2 -> sprite name / sprite
+;        R3 bits 0-7 = cutoff for reduction to binary mask/alpha, or 0 to only
+;                      reduce if no information will be lost (i.e. already
+;                      binary or 4bpp)
+;        R3 bit 8 = remove mask/alpha if completely unnecesary
+;        R3 bit 30-31 = 0 -> convert to 1bpp mask. Bits 0-8 relevant.
+;                       1 -> reserved
+;                       2 -> convert to 8bpp mask. Bits 0-8 ignored.
+;                       3 -> convert to alpha channel:
+;                             error if alpha not possible in mode
+;                             if 1bpp alpha, bits 0-8 fully relevant
+;                             if 4bpp alpha, bit 8 relevant, bits 0-7 zeroness
+;                                            relevant
+;                             if 8bpp alpha, only bit 8 relevant
+;
+; Exit : R3 = 0, V clear: operation completed OK
+;        R3 <> 0, V set, R0 error ptr: sprite area needs increasing by R3 bytes
+;        R3 zero, V set, R0 error ptr: some other error
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Go_CreateRemoveAlpha ROUT
+        Push    "r4-r11, lr"
+        MOV     r4,#0
+        Push    "r1-r2,r4"              ; zap returned R3 value
+
+        BL      findsprite_inarea       ; r2 -> sprite block
+        Pull    "r1-r11, PC",VS
+
+        ; Ensure it's a new format sprite (either RO 3.5 or RO 5)
+        LDR     R4, [R2, #spMode]
+        TST     R4, #15<<27
+        ADREQL  R0, ErrorBlock_InvalidSpriteMode
+        BLEQ    copy_error_one
+        Pull    "r1-r11, PC",VS
+
+        ; Assume the user didn't supply bad flags and go ahead and examine the
+        ; sprite
+        BL      ExamineAlpha
+        Pull    "r1-r11, PC",VS
+
+        Debug   so,"ExamineAlpha result R4,R6,R7,R8,R11",R4,R6,R7,R8,R11
+
+        ; Now check for bad flags and branch off to the right routine
+
+cra_cutoff        * &000000ff
+cra_canremove     * &00000100
+cra_mode          * &c0000000
+
+cra_examine_hasmask     * 3
+cra_examine_has1bppmask * 1
+cra_examine_has8bppmask * 2
+
+cra_examine_hasalpha     * (7<<2)
+cra_examine_has1bppalpha * 4
+cra_examine_has4bppalpha * 8
+cra_examine_has8bppalpha * 16
+
+cra_examine_isbinary        * 32
+cra_examine_issolid         * 64
+cra_examine_is4bpp          * 128
+
+        AND     LR, R3, #cra_mode
+        BIC     R3, R3, #cra_mode
+        CMP     R3, #cra_cutoff+cra_canremove+1
+        ADDLO   PC, PC, LR, LSR #28
+        B       %FT01 ; bad flags
+        B       %FT10 ; 00 -> 1bpp mask
+        B       %FT01 ; 01 -> reserved (-> bad flags)
+        B       %FT30 ; 10 -> 8bpp mask
+        B       %FT50 ; 11 -> alpha channel
+01
+        ADRL    R0, ErrorBlock_BadFlags
+        ADRL    R1, Title
+        BL      copy_error_one
+        Pull    "r1-r11, PC"
+
+10
+        ; Reduce to 1bpp mask
+        CMP     R4, #0 ; No mask at all?
+        EORNE   LR, R4, #cra_examine_has1bppmask
+        TSTNE   LR, #cra_examine_has1bppmask ; Or already 1bpp mask?
+        Pull    "r1-r11, PC", EQ ; Success! TODO - Convert down to RO 3.5 mode word?
+
+        TST     R3, #cra_canremove
+        TSTNE   R4, #cra_examine_issolid
+        BEQ     %FT12
+11
+        ; Remove mask altogether
+        Debug   so,"Remove mask altogether"
+        LDR     R0, =SpriteReason_RemoveMask+&200
+        SWI     XOS_SpriteOp
+        Pull    "r1-r11, PC", VS
+        LDR     R0, [R2, #spMode]
+        BIC     R0, R0, #&80000000
+        BL      GetNonAlphaEquivalent
+        STR     R0, [R2, #spMode]
+        Pull    "r1-r11, PC"
+
+12
+        ANDS    R3, R3, #cra_cutoff ; If we can only reduce if it's binary
+        MOVEQ   R3, #1 ; Set cutoff to sensible value if it was zero
+        TSTEQ   R4, #cra_examine_isbinary ; And it's not binary
+        Pull    "r1-r11, PC", EQ ; Then there's nothing we can do
+
+        TST     R4, #cra_examine_hasalpha
+        BNE     %FT20
+        ; We have an 8bpp mask, so can do an in-place reduction
+        Debug   so,"8bpp to 1bpp mask reduction"
+        ADD     R4, R8, #1+(31<<3) ; +1 to get original width in bits, /8 to get original width in pixels (i.e. destination bits), +31 for rounding up to word multiple
+        MOV     R4, R4, LSR #5+3 ; dest width in words
+        BL      TransferTo1bppMask
+        BL      ShrinkAreaR11ToR0
+        LDR     R0, [R2, #spMode]
+        BIC     R0, R0, #&80000000
+        STR     R0, [R2, #spMode]
+        Pull    "r1-r11, PC"
+
+20
+        ; We have alpha, so must first create a mask
+        Debug   so,"Creating 1bpp mask from alpha"
+        LDR     R0, [R2, #spMode]
+        BL      GetNonAlphaEquivalent
+        STR     R0, sp_mode
+        ; Work out mask size and extend sprite
+        Push    "R8"
+        LDR     R5, [R2, #spWidth]
+        LDR     R8, [R2, #spRBit]
+        BL      FindMaskWidth
+        LDR     R0, [R2, #spHeight]
+        ADD     R4, R5, #1 ; Dest width in words
+        Pull    "R8"
+        MLA     R0, R4, R0, R4
+        MOV     R0, R0, LSL #2
+        BL      ExpandMaskSizeToR0
+        STRVS   R3, [SP, #2*4]
+        Pull    "r1-r11, PC", VS
+        ; The mask should have been created at the end of the sprite, so the offset in R11 should still be valid
+        ; Go ahead and fill in the mask
+        BL      TransferTo1bppMask
+        ; Destroy src alpha
+        BL      DestroySrcAlpha
+        ; Update sprite mode word
+        LDR     R0, [R2, #spMode]
+        BL      GetNonAlphaEquivalent
+        STR     R0, [R2, #spMode]
+        Pull    "r1-r11, PC"
+
+30
+        ; Convert to 8bpp alpha mask
+        TST     R4, #cra_examine_has8bppmask
+        Pull    "r1-R11, PC", NE ; Already have one
+        ; Create 8bpp alpha mask
+        Debug   so,"Creating 8bpp mask"
+        LDR     R0, [R2, #spMode]
+        BL      GetNonAlphaEquivalent
+        ORR     R0, R0, #&80000000
+        STR     R0, sp_mode
+        Push    "R8"
+        MOV     R10, R4 ; Preserve examine result
+        LDR     R5, [R2, #spWidth]
+        LDR     R8, [R2, #spRBit]
+        BL      FindMaskWidth
+        LDR     R0, [R2, #spHeight]
+        ADD     R4, R5, #1 ; Dest width in words
+        Pull    "R8"
+        MLA     R0, R4, R0, R4
+        MOV     R0, R0, LSL #2
+        BL      ExpandMaskSizeToR0
+        STRVS   R3, [SP, #2*4]
+        Pull    "r1-r11, PC", VS
+        ; This is where things get a bit tricky
+        CMP     R10, #0
+        BEQ     %FT31 ; If no initial mask, then we're done
+        TST     R10, #cra_examine_has1bppmask
+        BNE     %FT40 ; If we had a 1bpp mask then we need a special routine which expands backwards
+        ; Else we can expand forwards
+        ; The mask should have been created at the end of the sprite, so the offset in R11 should still be valid
+        BL      TransferTo8bppMask
+        ; Destroy src alpha
+        BL      DestroySrcAlpha
+31        
+        ; Update sprite mode word
+        Debug   so, "Updating mode word for 8bpp mask"
+        LDR     R0, [R2, #spMode]
+        BL      GetNonAlphaEquivalent
+        ORR     R0, R0, #&80000000
+        STR     R0, [R2, #spMode]
+        Pull    "r1-r11, PC"
+
+40
+        ; Convert to 8bpp from 1bpp mask
+        ; R2 = sprite
+        ; R4 = dest width in words
+        ; R6 = src width in words
+        ; R8 = src width in bits - 1
+        ; R11 = src row ptr
+        Debug   so,"Converting 1bpp mask to 8bpp"
+        LDR     R0, [R2, #spTrans]
+        ADD     R0, R0, R2 ; dest row ptr
+        LDR     R5, [R2, #spHeight] ; height
+        MOV     R4, R4, LSL #2
+        MOV     R6, R6, LSL #2
+        MLA     R0, R4, R5, R0 ; last dest row
+        MLA     R11, R6, R5, R11 ; last src row
+43
+        ADD     R10, R8, #1 ; src offset
+44
+        SUB     R10, R10, #1
+        LDRB    R9, [R11, R10, LSR #3]
+        AND     R14, R10, #7
+        MOV     R9, R9, LSR R14
+        ANDS    R9, R9, #1
+        MOVNE   R9, #255
+        STRB    R9, [R0, R10]
+        CMP     R10, #0
+        BGT     %BT44
+        SUB     R11, R11, R6 ; Advance src row ptr
+        SUBS    R5, R5, #1
+        SUB     R0, R0, R4 ; Advance dest row ptr
+        BGE     %BT43
+        ; Update sprite mode word
+        LDR     R0, [R2, #spMode]
+        ORR     R0, R0, #&80000000
+        STR     R0, [R2, #spMode]
+        Pull    "r1-r11, PC"
+
+50
+        ; Convert to alpha channel
+        TST     R3, #cra_canremove ; If we can remove
+        BEQ     %FT51
+        TST     R4, #cra_examine_issolid ; And it's all solid
+        BNE     %BT11 ; Then get rid of it
+        TEQ     R4, #0 ; Or there's nothing at all
+        BEQ     %BT11
+
+51
+        TST     R4, #cra_examine_hasalpha ; If it's already got alpha
+        Pull    "r1-r11, PC", NE ; Then there's nothing to do
+
+        LDR     R0, [R2, #spMode]
+        BL      GetAlphaEquivalent
+        Pull    "r1-r11, PC", VS
+
+        TEQ     R4, #0
+        BEQ     %FT80 ; Use yet another alternate routine if we're generating alpha from nothing
+
+        LDR     R5, [R2, #spHeight]
+
+        ; Work out what we're converting to
+        CMP     R10, #4
+        BGT     %FT70
+        BEQ     %FT60
+
+        ; Convert to 1bpp alpha
+        Debug   so,"Convert to 1bpp alpha"
+        ANDS    R3, R3, #cra_cutoff ; If we can only reduce if it's binary
+        MOVEQ   R3, #1 ; Set cutoff to sensible value if it was zero
+        TSTEQ   R4, #cra_examine_isbinary ; And it's not binary
+        Pull    "r1-r11, PC", EQ ; Then there's nothing we can do
+        STR     R0, [R2, #spMode]
+        LDR     R0, [R2, #spImage]
+        ADD     R0, R0, R2
+        ADD     R0, R0, #1
+53
+        MOV     R10, #0 ; src offset
+54
+      [ NoARMv5
+        MOV     LR, PC
+        MOV     PC, R7
+      |
+        BLX     R7
+      ]
+        CMP     R9, R3
+        LDRB    R9, [R0]
+        BICLT   R9, R9, #128 ; < cutoff: make 0
+        ORRGE   R9, R9, #128 ; >= cutoff: make 1
+        STRB    R9, [R0], #2
+        CMP     R10, R8
+        BLE     %BT54
+        ADD     R11, R11, R6, LSL #2 ; Advance src row ptr
+        TST     R0, #2
+        ADDNE   R0, R0, #2
+        SUBS    R5, R5, #1
+        BGE     %BT53
+55
+        ; Get rid of the mask data
+        ; For this to work properly we need to temporarily restore the wide mask flag - the kernel calculates the mask size from the mode word instead of from the offsets
+        Debug   so,"Getting rid of mask data"
+        LDR     R5, [R2, #spMode]
+        TST     R4, #cra_examine_has8bppmask
+        ORRNE   R0, R5, #&80000000
+        STRNE   R0, [R2, #spMode]
+        LDR     R0, =SpriteReason_RemoveMask+&200
+        SWI     XOS_SpriteOp
+        STR     R5, [R2, #spMode]
+        Pull    "r1-r11, PC"
+
+
+60
+        ; Convert to 4bpp alpha
+        Debug   so,"Convert to 4bpp alpha"
+        TST     R3, #cra_cutoff ; If we can only reduce if it's 4bpp
+        TSTEQ   R4, #cra_examine_is4bpp ; And it's not 4bpp
+        Pull    "r1-r11, PC", EQ ; Then there's nothing we can do
+        STR     R0, [R2, #spMode]
+        LDR     R0, [R2, #spImage]
+        ADD     R0, R0, R2
+        ADD     R0, R0, #1
+63
+        MOV     R10, #0 ; src offset
+64
+      [ NoARMv5
+        MOV     LR, PC
+        MOV     PC, R7
+      |
+        BLX     R7
+      ]
+        AND     R9, R9, #&F0
+        LDRB    LR, [R0]
+        BIC     LR, LR, #&F0
+        ORR     LR, LR, R9
+        STRB    LR, [R0], #2
+        CMP     R10, R8
+        BLE     %BT64
+        ADD     R11, R11, R6, LSL #2 ; Advance src row ptr
+        TST     R0, #2
+        ADDNE   R0, R0, #2
+        SUBS    R5, R5, #1
+        BGE     %BT63
+        B       %BT55
+
+70
+        ; Convert to 8bpp alpha
+        Debug   so,"Convert to 8bpp alpha"
+        STR     R0, [R2, #spMode]
+        LDR     R0, [R2, #spImage]
+        ADD     R0, R0, R2
+        ADD     R0, R0, #3
+73
+        MOV     R10, #0 ; src offset
+74
+      [ NoARMv5
+        MOV     LR, PC
+        MOV     PC, R7
+      |
+        BLX     R7
+      ]
+        STRB    R9, [R0], #4
+        CMP     R10, R8
+        BLE     %BT74
+        ADD     R11, R11, R6, LSL #2 ; Advance src row ptr
+        SUBS    R5, R5, #1
+        BGE     %BT73
+        B       %BT55
+
+80
+        ; Generate alpha from nothing
+        STR     R0, [R2, #spMode]
+        CMP     R10, #1
+        MOVEQ   R11, #&8000
+        CMP     R10, #4
+        MOVEQ   R11, #&F000
+        CMP     R10, #8
+        MOVEQ   R11, #&FF000000
+        ORR     R11, R11, R11, LSL #16
+        Debug   so,"Generate alpha from nothing, mask", R11
+        LDR     R0, [R2, #spImage]
+        ADD     R0, R0, R2
+        LDR     R1, [R2, #spWidth]
+        LDR     R3, [R2, #spHeight]
+        ADD     R1, R1, #1
+        ADD     R3, R3, #1
+        MUL     R1, R3, R1
+81
+        LDR     R4, [R0]
+        ORR     R4, R4, R11
+        STR     R4, [R0], #4
+        SUBS    R1, R1, #1
+        BNE     %BT81
+        Pull    "r1-r11, PC"
+
+; In:
+;     R2 = sprite
+;     R7 = alpha read routine
+; Out:
+;     Sprite alpha channel cleared to zero
+DestroySrcAlpha ROUT
+        Entry   "R0,R1-R4"
+        LDR     LR, [R7, #-4] ; Get the mask value used to clear alpha
+        Debug   so, "DestroySrcAlpha mask",LR
+        CMP     LR, #0
+        EXIT    EQ
+        LDR     R0, [R2, #spImage]
+        ADD     R0, R0, R2
+        LDR     R1, [R2, #spWidth]
+        LDR     R3, [R2, #spHeight]
+        ADD     R1, R1, #1
+        ADD     R3, R3, #1
+        MUL     R1, R3, R1
+10
+        LDR     R4, [R0]
+        BIC     R4, R4, LR
+        STR     R4, [R0], #4
+        SUBS    R1, R1, #1
+        BNE     %BT10
+        EXIT
+
+; In:
+;     R0 = sprite mode word
+; Out:
+;     R0 = equivalent mode with an alpha channel
+;    R10 = number of alpha bits
+; OR
+;     V set, R0 -> error if alpha not possible
+GetAlphaEquivalent ROUT
+        Entry   "r1-r4"
+        Debug   so,"GetAlphaEquivalent of",R0
+        BIC     r0, r0, #&80000000
+        MOV     r1, r0, LSR #27
+        CMP     r1, #SpriteType_RISCOS5
+        BEQ     %FT10
+        ; Convert to RISC OS 5 sprite mode word
+        LDR     r3, =&1FFF
+        AND     r2, r0, r3, LSL #1
+        AND     r3, r0, r3, LSL #14
+
+        MOV     r4, #-1
+        CMP     r2, #180<<1
+        MOVEQ   r4, #0
+        CMP     r2, #90<<1
+        MOVEQ   r4, #1
+        CMP     r2, #45<<1
+        MOVEQ   r4, #2
+        CMP     r2, #23<<1
+        CMPNE   r2, #22<<1
+        MOVEQ   r4, #3
+
+        MOV     lr, #-1
+        CMP     r3, #180<<14
+        MOVEQ   lr, #0
+        CMP     r3, #90<<14
+        MOVEQ   lr, #1
+        CMP     r3, #45<<14
+        MOVEQ   lr, #2
+        CMP     r3, #23<<14
+        CMPNE   r3, #22<<14
+        MOVEQ   lr, #3
+        
+        MOV     r0, #1
+        ORR     r0, r0, r4, LSL #4
+        ORRS    r0, r0, lr, LSL #6
+        BMI     %FT90
+        ORR     r0, r0, #SpriteType_RISCOS5<<27
+        ORR     r0, r0, r1, LSL #20
+        Debug   so,"RISC OS 5 version",r0
+10
+        ; Examine RISC OS 5 sprite mode word
+        ASSERT  ModeFlag_DataFormatFamily_RGB = 0
+        TST     r0, #ModeFlag_DataFormatFamily_Mask ; Must be RGB family
+        BNE     %FT90
+        ; Is it a type which we recognise can support alpha?
+        MOV     r10, #0
+        AND     r1, r0, #127<<20
+        CMP     r1, #SpriteType_New16bpp<<20
+        MOVEQ   r10, #1
+        CMP     r1, #SpriteType_New32bpp<<20
+        MOVEQ   r10, #8
+        CMP     r1, #SpriteType_New4K<<20
+        MOVEQ   r10, #4
+        CMP     r10, #0
+        BEQ     %FT90
+        ORR     r0, r0, #ModeFlag_DataFormatSub_Alpha
+        Debug   so,"Success, result",r0
+        EXIT
+
+90
+        Debug   so,"Failed"
+        ADRL    r0, ErrorBlock_InvalidSpriteMode
+        ADRL    r1, Title
+        BL      copy_error_one
+        EXIT
+
+
+
+; In:
+;     R0 = sprite mode word
+; Out:
+;     R0 = equivalent mode without an alpha channel
+GetNonAlphaEquivalent ROUT
+        Entry   "r1-r4"
+        Debug   so,"GetNonAlphaEquivalent of",r0
+        BIC     r0, r0, #&80000000
+        MOV     r1, r0, LSR #27
+        CMP     r1, #SpriteType_RISCOS5
+        DebugIf NE,so,"Not RISC OS 5 mode word!"
+        EXIT    NE ; We assume only RISC OS 5 types support alpha
+        ; Must also be RGB family
+        ASSERT  ModeFlag_DataFormatFamily_RGB = 0
+        TST     r0, #ModeFlag_DataFormatFamily_Mask
+        TSTEQ   r0, #&E ; Also check the fields which should be zero
+        TSTEQ   r0, #&F0000
+        DebugIf NE,so,"Unrecognised mode word!"
+        EXIT    NE
+        ; Good, now all we need to do is remove the alpha flag and then demote
+        ; to a RISC OS 3.5 type if possible
+        BIC     r0, r0, #ModeFlag_DataFormatSub_Alpha
+        TST     r0, #&FF00 ; Any mode flags remaining?
+        TSTEQ   r0, #(127-15)<<20 ; Or is the sprite type too high?
+        DebugIf NE,so,"Can't demote to RO 3.5 format:", r0
+        EXIT    NE ; Yes, so we can't demote
+        AND     r1, r0, #127<<20
+        MOV     r1, r1, LSL #7
+        MOV     r2, #180
+        MOV     r3, r0, LSR #4
+        MOV     r4, r0, LSR #6
+        AND     r3, r0, #3
+        AND     r4, r0, #3
+        MOV     r3, r2, LSR r3
+        MOV     r4, r2, LSR r4
+        ORR     r0, r1, r3, LSL #1
+        ORR     r0, r0, r4, LSL #14
+        ORR     r0, r0, #1
+        Debug   so,"Demoted to RISC OS 3.5 format",r0
+        EXIT
+
+
+
+; In:
+;     R2 = sprite
+;     R3 = cutoff value
+;     R4 = dest width in words
+;     R6 = src width in words
+;     R7 = src read routine
+;     R8 = src width in bits - 1
+;     R11 = src row ptr
+; Out:
+;     R0 = end of dest
+;     R11 = end of src
+TransferTo1bppMask ROUT
+        Entry   "r1,r5,r9-r10"
+        Debug   so,"TransferTo1bppMask R2,R3,R4,R6,R7,R8,R11",R2,R3,R4,R6,R7,R8,R11
+        LDR     R0, [R2, #spTrans]
+        ADD     R0, R0, R2 ; dest row ptr
+        LDR     R5, [R2, #spHeight] ; height
+13
+        MOV     R10, #0 ; src offset
+        MOV     R1, #0 ; dest offset
+14
+      [ NoARMv5
+        MOV     LR, PC
+        MOV     PC, R7
+      |
+        BLX     R7
+      ]
+        CMP     R9, R3
+        MOV     R9, #1
+        AND     R14, R1, #7
+        MOV     R9, R9, LSL R14
+        LDRB    R14, [R0, R1, LSR #3]
+        BICLT   R14, R14, R9 ; < cutoff: make 0
+        ORRGE   R14, R14, R9 ; >= cutoff: make 1
+        STRB    R14, [R0, R1, LSR #3]
+        ADD     R1, R1, #1
+        CMP     R10, R8
+        BLE     %BT14
+        ADD     R11, R11, R6, LSL #2 ; Advance src row ptr
+        SUBS    R5, R5, #1
+        ADD     R0, R0, R4, LSL #2 ; Advance dest row ptr
+        BGE     %BT13
+        EXIT
+
+; In:
+;     R2 = sprite
+;     R4 = dest width in words
+;     R6 = src width in words
+;     R7 = src read routine
+;     R8 = src width in bits - 1
+;     R11 = src row ptr
+; Out:
+;     R0 = end of dest
+;     R11 = end of src
+TransferTo8bppMask ROUT
+        Entry   "r1,r5,r9-r10"
+        Debug   so,"TransferTo8bppMask R2,R4,R6,R7,R8,R11",R2,R4,R6,R7,R8,R11
+        LDR     R0, [R2, #spTrans]
+        ADD     R0, R0, R2 ; dest row ptr
+        LDR     R5, [R2, #spHeight] ; height
+13
+        MOV     R10, #0 ; src offset
+        MOV     R1, #0 ; dest offset
+14
+      [ NoARMv5
+        MOV     LR, PC
+        MOV     PC, R7
+      |
+        BLX     R7
+      ]
+        STRB    R9, [R0, R1]
+        ADD     R1, R1, #1
+        CMP     R10, R8
+        BLE     %BT14
+        ADD     R11, R11, R6, LSL #2 ; Advance src row ptr
+        SUBS    R5, R5, #1
+        ADD     R0, R0, R4, LSL #2 ; Advance dest row ptr
+        BGE     %BT13
+        EXIT
+
+
+; In:
+;     R2 = sprite
+; Out:
+;     R4 bit 0: has 1bpp mask
+;        bit 1: has 8bpp mask
+;        bit 2: has 1bpp alpha
+;        bit 3: has 4bpp alpha
+;        bit 4: has 8bpp alpha
+;        bit 5: is binary alpha/mask
+;        bit 6: is fully solid alpha/mask
+;        bit 7: is 4bpp alpha/mask
+;     R6 = mask/alpha width in words
+;     R7 -> mask/alpha read routine
+;     R8 = mask/alpha width in bits - 1
+;     R11 -> 1st mask/alpha row
+;     V set -> error
+ExamineAlpha    ROUT
+        Entry   "R0-R11"
+        MOV     R4, #0
+        ; Check for alpha first
+        LDR     R0, [R2, #spMode]
+        MOV     R1, #VduExt_ModeFlags
+        SWI     XOS_ReadModeVariable
+        BCS     %FT95
+        MOV     R5, R2
+        LDR     R2, [SP, #8] ; Recover sprite pointer
+        TST     R5, #ModeFlag_DataFormatSub_Alpha
+        LDR     R3, [R2, #spTrans]
+        LDR     R6, [R2, #spImage]
+        BNE     %FT30
+        ; Check for a mask
+        TEQ     R3, R6
+        BEQ     %FT89 ; No mask present
+        ; Get mask parameters so we can examine it
+        STR     R0, sp_mode
+        ADD     R11, R2, R3
+        LDR     R5, [R2, #spWidth]
+        LDR     R8, [R2, #spRBit]
+        BL      FindMaskWidth
+        TST     R0, #&80000000
+        ADREQ   R7, Get1bppMaskPixel
+        MOVEQ   R4, #cra_examine_has1bppmask + cra_examine_isbinary + cra_examine_issolid + cra_examine_is4bpp
+        ADRNE   R7, Get8bppMaskPixel
+        MOVNE   R4, #cra_examine_has8bppmask + cra_examine_isbinary + cra_examine_issolid + cra_examine_is4bpp
+10
+        LDR     R6, [R2, #spHeight]
+        ADD     R0, R5, #1 ; Width in words
+        STR     R11, [SP, #11*4]
+        STR     R0, [SP, #6*4]
+        STR     R7, [SP, #7*4]
+        ADD     R5, R8, R5, LSL #5 ; Convert to width in bits (-1)
+        STR     R5, [SP, #8*4]
+        MOV     R10, #0
+15
+        ; Load mask/alpha pixel
+      [ NoARMv5
+        MOV     LR, PC
+        MOV     PC, R7
+      |
+        BLX     R7
+      ]
+        ; Examine
+        CMP     R9, #255
+        BEQ     %FT16
+        CMP     R9, #0
+        BICGT   R4, R4, #cra_examine_isbinary
+        BIC     R4, R4, #cra_examine_issolid
+        EOR     R9, R9, R9, LSR #4
+        TST     R9, #&F
+        BICNE   R4, R4, #cra_examine_is4bpp
+        BNE     %FT90 ; If it's not 4bpp then we also know it's not binary or solid -> therefore all checks have been performed and we can skip checking the other pixels
+16
+        CMP     R10, R5
+        BLE     %BT15
+        ADD     R11, R11, R0, LSL #2 ; Advance row ptr
+        SUBS    R6, R6, #1
+        MOV     R10, #0
+        BGE     %BT15
+
+89
+        ; Get rid of any phantom 8bpp mask
+        LDR     R0, [R2, #spMode]
+        BIC     R0, R0, #&80000000
+        STR     R0, [R2, #spMode]
+90
+        STR     R4, [SP, #4*4]
+        EXIT
+
+         
+30
+        ; Make sure we don't have both a mask and alpha
+        TEQ     R3, R6 ; spTrans != spImage?
+        TSTEQ   R0, #&80000000 ; Or wide mask bit set?
+        BNE     %FT95 ; Error!
+        ; Work out if it's a 1bpp, 4bpp, or 8bpp alpha channel
+        ; We'll take some liberties here and only look for known NColour values
+        MOV     R1, #VduExt_NColour
+        SWI     XOS_ReadModeVariable
+        BCS     %FT95
+        ADDS    R7, R2, #1
+        LDR     R2, [SP, #8]
+        LDR     R5, [R2, #spWidth]
+        LDR     R8, [R2, #spRBit]
+        ADD     R11, R2, R6
+        MOVEQ   R4, #cra_examine_has8bppalpha + cra_examine_isbinary + cra_examine_issolid + cra_examine_is4bpp
+        ADREQ   R7, Get8bppAlphaPixel
+        BEQ     %BT10
+        CMP     R7, #65536
+        MOVEQ   R4, #cra_examine_has1bppalpha + cra_examine_isbinary + cra_examine_issolid + cra_examine_is4bpp
+        ADREQ   R7, Get1bppAlphaPixel
+        BEQ     %BT10
+        CMP     R7, #4096
+        BNE     %FT95
+        ; 4bpp alpha
+        MOV     R4, #cra_examine_has4bppalpha + cra_examine_isbinary + cra_examine_issolid + cra_examine_is4bpp
+        ADR     R7, Get4bppAlphaPixel
+        B       %BT10
+
+         
+95
+        ADRL    R0, ErrorBlock_InvalidSpriteMode
+        ADRL    R1, Title
+        BL      copy_error_one
+        STR     R0, [SP]
+        EXIT
+
+; Mask/alpha read functions
+; In:
+;  R11 = sprite/mask row ptr
+;  R10 = bit offset
+; Out:
+;  R9 = alpha (0-255)
+;  R10 incremented
+
+        DCD     0
+Get1bppMaskPixel ROUT
+        Entry   "R8" ; Temp register needed
+        LDRB    R9, [R11, R10, LSR #3]
+        AND     R8, R10, #7
+        MOV     R9, R9, LSR R8
+        ADD     R10, R10, #1
+        ANDS    R9, R9, #1
+        MOVNE   R9, #255
+        EXIT
+
+        DCD     0
+Get8bppMaskPixel ROUT
+        LDRB    R9, [R11, R10, LSR #3]
+        ADD     R10, R10, #8
+        MOV     PC, LR
+
+        DCD     &80008000
+Get1bppAlphaPixel ROUT
+        ADD     R10, R10, #16
+        ADD     R9, R11, R10, LSR #3
+        LDRB    R9, [R9, #-1]
+        ANDS    R9, R9, #128
+        MOVNE   R9, #255
+        MOV     PC, LR
+
+        DCD     &F000F000
+Get4bppAlphaPixel ROUT
+        ADD     R10, R10, #16
+        ADD     R9, R11, R10, LSR #3
+        LDRB    R9, [R9, #-1]
+        AND     R9, R9, #&F0
+        ORR     R9, R9, R9, LSR #4
+        MOV     PC, LR
+
+        DCD     &FF000000
+Get8bppAlphaPixel ROUT
+        ADD     R10, R10, #32
+        ADD     R9, R11, R10, LSR #3
+        LDRB    R9, [R9, #-1]
+        MOV     PC, LR
+
+
+; In:
+;     R0 = desired mask size
+;     R1 = area
+;     R2 = sprite
+; Out:
+;     Area grown and mask data reserved (and cleared to -1)
+;     Mask placed at end of sprite if not already present
+;     R0 corrupt
+; OR
+;     V set, R0 -> error block, R3 = extra space needed
+ExpandMaskSizeToR0 ROUT
+        Entry   "R4-R11"
+        ; Do we have a mask?
+        LDR     R4, [R2, #spTrans]
+        LDR     R5, [R2, #spImage]
+        Debug   so,"ExandMaskSizeToR0: R0,R1,R2,spTrans,spImage",R0,R1,R2,R4,R5
+        CMP     R4, R5
+        LDREQ   R4, [R2, #spNext] ; Create the new mask at spNext, as per Kernel
+        MOVEQ   R5, R4
+        LDRGT   R5, [R2, #spNext] ; If mask is after image, end of mask must be spNext
+        ; We now have R4 = mask start, R5 = current end of mask
+        Debug   so,"Current mask start, end:",R4,R5
+        SUB     R6, R5, R4 ; Size of current mask
+        SUB     R0, R0, R6 ; Growth needed (assumed >= 0)
+        Debug   so,"Growing by",R0
+        LDR     R8, [R1, #saEnd]
+        LDR     R10, [R1, #saFree]
+        ADD     R9, R10, R0 ; Extend area
+        SUBS    R8, R9, R8 ; Check for overflow
+        DebugIf GT,so,"Not enough room, need:",R8
+        MOVGT   R3, R8
+        ADRGTL  R0, ErrorBlock_NotEnoughRoom 
+        ADRGTL  R1, Title
+        BLGT    copy_error_one
+        EXIT VS
+        ; Grow area
+        STR     R9, [R1, #saFree]
+        ; Move memory
+        ADD     R10, R1, R9
+        ADD     R9, R2, R5
+        BL      move_memory_up
+        ; Update sprite offsets
+        LDR     R6, [R2, #spNext]
+        ADD     R6, R6, R0
+        STR     R6, [R2, #spNext]
+        STR     R4, [R2, #spTrans]
+        LDR     R7, [R2, #spImage]
+        CMP     R7, R4
+        ADDGT   R7, R7, R0
+        STRGT   R7, [R2, #spImage]
+        Debug   so,"New spNext, spImage, spTrans",R6,R7,R4
+        ; Fill R0 bytes starting from R5
+        ADD     R5, R5, R2
+        MOV     R6, #-1
+10
+        SUBS    R0, R0, #4
+        STRGE   R6, [R5], #4
+        BGT     %BT10
+        Debug   so,"Expand complete"
+        EXIT
+
+; In:
+;     R0 = copy dest
+;     R1 = area
+;     R2 = sprite
+;     R11 = copy src
+; Out:
+;     Area shrunk by moving everything after R11 down to R0
+;     R0 corrupt
+ShrinkAreaR11ToR0 ROUT
+        Entry   "R0,R4-R11"
+        Debug   so,"ShrinkAreaR11ToR0: R0,R1,R2,R11",R0,R1,R2,R11
+        MOV     R9, R0
+        LDR     R4, [R1, #saFree]
+        SUBS    R0, R11, R0 ; Get shrink amount
+        Debug   so,"Shrink amount",R0
+        EXIT    LE
+        ADD     R10, R1, R4 ; Get end of src data
+        BL      move_memory_down ; Move it
+        LDR     R5, [R2, #spNext]
+        LDR     R6, [R2, #spTrans]
+        LDR     R7, [R2, #spImage]
+        Debug   so,"Old saFree, spNext, spImage, spTrans",R4,R5,R7,R6
+        SUB     R4, R4, R0
+        STR     R4, [R1, #saFree] ; Update area size
+        SUB     R5, R5, R0
+        STR     R5, [R2, #spNext] ; Update sprite size
+        SUB     R11, R11, R2 ; Get offset into sprite of src
+        Debug   so,"Offset of src", R11
+        CMP     R6, R11
+        SUBGE   R6, R6, R0
+        STRGE   R6, [R2, #spTrans] ; Update mask offset
+        CMP     R7, R11
+        SUBGE   R7, R7, R0
+        STRGE   R7, [R2, #spImage] ; Update image offset
+        Debug   so,"New saFree, spNext, spImage, spTrans",R4,R5,R7,R6
+        EXIT
+
+        MakeSpriteErrorBlock InvalidSpriteMode
+
 
 ; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ; SpriteReason_SetPointerShape
@@ -833,7 +1724,7 @@ Go_PaintCharScaled
         STMIA   R14!,{R1-R3,R4,R5,R6-R8,R10}    ; up to spWidth
         MOV     R8,#7                   ; R8 = spHeight (no of rows - 1)
         MOV     R9,#0                   ; R9 = spLbit
-        STMIA   R14!,{R8,R9,R11}        ; R11 = spRbit
+        STMIA   R14!,{R8,R9,R11}        ; R11 = spRBit
         MOV     R8,#spriteSize
         ADD     R9,R8,#4*8              ; R9 = R8 + 8 rows of 1 word
         MOV     R11, #0                 ; mode 0 sprite
@@ -1494,7 +2385,7 @@ cantdoinOS
         LDR     R0,[R1,#spLBit]
         Debug   so, "spLBit is ? = ",R0
         LDR     R2,[R1,#spRBit]
-        Debug   so, "spRbit is ? = ",R2
+        Debug   so, "spRBit is ? = ",R2
         SUB     R2,R2,R0
         ADD     R2,R2,#1                ; make inclusive
         Debug   so, "R2 is ? = ",R2
@@ -2976,7 +3867,7 @@ maskmergeblocks
         ;       Internal routine.
         ;
         ; in:   R5 = spWidth (ie width in words-1)
-        ;       R8 = spRbit
+        ;       R8 = spRBit
         ;       sp_mode = sprite mode word
         ;
         ; out:  R5 = spWidth (words -1) for mask data
@@ -2986,8 +3877,8 @@ FindMaskWidth ROUT
         Push    "R0, LR"
         Debug   ag,"Entered GetMaskspWidth with R5,R8",R5,R8
 
-        LDR     LR, sp_mode             ; fetch the sprite mode
-        MOVS    LR, LR, LSR #27         ; isolate the sprite type and test for =0
+        LDR     R0, sp_mode             ; fetch the sprite mode
+        ANDS    LR, R0, #15<<27         ; isolate the sprite type and test for =0
 
         Pull    "R0, PC",EQ         ; if an old format sprite, return R5 unchanged
 
