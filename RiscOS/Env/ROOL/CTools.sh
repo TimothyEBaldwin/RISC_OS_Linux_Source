@@ -4,7 +4,7 @@
 # This can either be applied to the current shell using the "source" command,
 # or executed directly. In the latter case, you will want to describe a
 # a command to be executed by a subshell using the parameters to this script.
-# In either case, the working directory must be set to "RiscOS" on entry.
+# In either case, the working directory must be set to the root of your sandbox on entry.
 
 export LOCALE=UK
 export KEYBOARD=All
