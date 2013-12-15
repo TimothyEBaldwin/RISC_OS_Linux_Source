@@ -24,12 +24,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdbool.h>
 
 #include "kernel.h"
 #include "swis.h"
 #include "Global/RISCOS.h"
 #include "Global/GraphicsV.h"
 #include "Global/Services.h"
+#include "Global/VduExt.h"
 
 /* Locally defined but actually global values */
 #include "ScrModesv.h"
@@ -1066,14 +1068,44 @@ static _kernel_oserror *loadmodefile (const char *file)
     return res;
 }
 
-static void build_a_vidclist (VIDCListRef vp, ModeDescriptionRef mp, uint8_t log2bpp)
+/* List of new PixelFormats available from old GraphicsV_DisplayFeatures */
+static PixelFormat oldformats[] = {
+    {1,0,0},
+    {3,0,1},
+    {15,0,2},
+    {255,ModeFlag_FullPalette,3},
+    {65535,0,4},
+    {-1,0,5},
+};
+
+/* Convert an old pixel depth value to a PixelFormat value */
+static void pixelformat_from_depth(PixelFormatRef pf,int depth)
+{
+    pf->log2bpp = depth;
+    pf->ncolour = (1<<(1<<depth))-1;
+    pf->modeflags = (depth==3?ModeFlag_FullPalette:0);
+}
+
+/* Can this PixelFormat be represented as a pixel depth? (if so, pf->log2bpp is the value) */
+static bool is_old_format(const PixelFormatRef pf)
+{
+    if(pf->log2bpp > 5)
+        return false;
+    if(pf->ncolour != (1<<(1<<pf->log2bpp))-1)
+        return false;
+    if(pf->modeflags != (pf->log2bpp==3?ModeFlag_FullPalette:0))
+        return false;
+    return true;
+}
+
+static void build_a_vidclist (VIDCListRef vp, ModeDescriptionRef mp, const PixelFormatRef pf)
 {
     int fn;
     int ctrllistpos = 0;
 
     /* Fill in the fields */
     vp->format = 3;
-    vp->depth = log2bpp;
+    vp->depth = pf->log2bpp;
     for (fn = 0; fn < FR__COUNT; ++fn)
     {
         vp->hpar[fn] = mp->definition.hpar[fn];
@@ -1081,6 +1113,17 @@ static void build_a_vidclist (VIDCListRef vp, ModeDescriptionRef mp, uint8_t log
     }
     vp->pixelrate = mp->definition.pixel_khz;
     vp->syncpol = mp->definition.syncpol;
+
+    /* Only specify ModeFlags & NColour if necessary? */
+    if(!is_old_format(pf))
+    {
+        vp->vcparam[ctrllistpos].index = NCOLOUR_INDEX;
+        vp->vcparam[ctrllistpos].value = pf->ncolour;
+        ctrllistpos++;
+        vp->vcparam[ctrllistpos].index = MODEFLAGS_INDEX;
+        vp->vcparam[ctrllistpos].value = pf->modeflags;
+        ctrllistpos++;
+    }
 
     if (current_monitor->dpms_state != -1)
     {
@@ -1142,7 +1185,7 @@ static void build_a_vidclist (VIDCListRef vp, ModeDescriptionRef mp, uint8_t log
  * depth.  Limitations of the current video controller chip (if known)
  * are also factored in to the test.
  */
-static int mode_valid (ModeDescriptionRef mp, uint8_t depth,
+static int mode_valid (ModeDescriptionRef mp, const PixelFormatRef pf,
                        uint32_t maxdatarate /* kB/s */,
                        uint32_t maxdatasize /* bytes */)
 {
@@ -1154,22 +1197,29 @@ static int mode_valid (ModeDescriptionRef mp, uint8_t depth,
     uint32_t pixels = mx * my;
     uint32_t datarate, datasize;
 
+    /* Get true bpp value */
+    uint32_t bpp = 1<<pf->log2bpp;
+    if(pf->log2bpp == 6) /* 24bit packed formats */
+        bpp = 24;
+    else if(pf->log2bpp == 7) /* YUV formats - TODO! */
+        return 0;
+
     /* Convert from pixels to bytes: method varies according to depth */
-    if ((depth > 2) && (current_monitor->lcd_support == 1))
+    if ((bpp > 4) && (current_monitor->lcd_support == 1))
         return 0;         /** Eek! 4bpp is max for b/w panels! **/
 
-    if (depth < 3)
+    if (bpp < 8)
     {
-        uint8_t shift = 3 - depth;
+        uint8_t shift = 3 - pf->log2bpp;
         uint32_t round = (1 << shift) - 1;
         datarate = (pixrate + round) >> shift;
         datasize = (pixels + round) >> shift;
     }
     else
     {
-        uint8_t shift = depth - 3;
-        datarate = pixrate << shift;
-        datasize = pixels << shift;
+        uint8_t mult = bpp>>3;
+        datarate = pixrate * mult;
+        datasize = pixels * mult;
     }
 
     /* Check global data rate/size limits */
@@ -1177,17 +1227,47 @@ static int mode_valid (ModeDescriptionRef mp, uint8_t depth,
         return 0;
 
     /* Apply video-controller-specific checks */
-    r.r[4] = GraphicsV_DisplayFeatures;
+    int variables[2];
+    variables[0] = VduExt_CurrentGraphicsVDriver;
+    variables[1] = -1;
+    _swix(OS_ReadVduVariables,_INR(0,1),variables,variables);
+
+    r.r[4] = GraphicsV_PixelFormats | (variables[0]<<24);
     r.r[9] = GraphicsV;
     _kernel_swi (OS_CallAVector, &r, &r);
-    if ((r.r[4] == 0) && ((r.r[1] & (1<<depth)) == 0))
-        return 0;    /* Had a definitive answer from GraphicsV that this bpp is forbidden */
+    if (r.r[4] == 0)
+    {
+        int i=r.r[1];
+        PixelFormatRef formats = (PixelFormatRef) r.r[0];
+        while(i)
+        {
+            if((formats->ncolour == pf->ncolour)
+              && (formats->modeflags == pf->modeflags)
+              && (formats->log2bpp == pf->log2bpp))
+                break;
+            formats++;
+            i--;
+        }
+        if(i == 0)
+            return 0;    /* Had a definitive answer from GraphicsV that this bpp is forbidden */
+    }
+    else
+    {
+        /* Try the old DisplayFeatures call */
+        if(!is_old_format(pf))
+            return 0;    /* Not a format supported by DisplayFeatures */
+        r.r[4] = GraphicsV_DisplayFeatures | (variables[0]<<24);
+        r.r[9] = GraphicsV;
+        _kernel_swi (OS_CallAVector, &r, &r);
+        if ((r.r[4] == 0) && ((r.r[1] & (1<<pf->log2bpp)) == 0))
+            return 0;    /* Had a definitive answer from GraphicsV that this bpp is forbidden */
+    }
 
     /* Propose the resulting mode to the graphics driver */
-    build_a_vidclist (&vetlist, mp, depth);
+    build_a_vidclist (&vetlist, mp, pf);
     r.r[0] = (int)&vetlist;
     r.r[1] = NULL;
-    r.r[4] = GraphicsV_VetMode;
+    r.r[4] = GraphicsV_VetMode | (variables[0]<<24);
     r.r[9] = GraphicsV;
     _kernel_swi (OS_CallAVector, &r, &r);
     if ((r.r[4] == 0) && (r.r[0] != 0))
@@ -1273,6 +1353,7 @@ static void service_modeextension (_kernel_swi_regs *regs)
     ModeDescriptionRef mp;
     uint32_t dataratelimit, datasizelimit;
     int nmodes;
+    PixelFormat pf;
 
     /*
      * Check for being passed a mode selector as opposed to a mode
@@ -1297,6 +1378,40 @@ static void service_modeextension (_kernel_swi_regs *regs)
     sel = MODESEL(regs->r[2]);
     if (sel->bit0 != 1 || sel->format != 0)
         return;                         /* pass service on */
+
+    /*
+     * Examine the mode selector to deduce the pixel format
+     */
+    pixelformat_from_depth(&pf,sel->depth);
+    ModeParam *param = sel->param;
+    while(param->index != -1)
+    {
+        if(param->index == VduExt_ModeFlags)
+            pf.modeflags = param->value;
+        else if(param->index == VduExt_NColour)
+            pf.ncolour = param->value;
+        param++;
+    }
+
+    /* Mask out unwanted mode flags */
+    pf.modeflags &= ~(ModeFlag_NonGraphic | ModeFlag_Teletext | ModeFlag_GapMode | ModeFlag_BBCGapMode | ModeFlag_HiResMono | ModeFlag_DoubleVertical | ModeFlag_HardScrollDisabled | ModeFlag_InterlacedMode);
+
+    /* Massage flags for RGB modes a bit */
+    if((pf.modeflags & ModeFlag_DataFormatFamily_Mask) == ModeFlag_DataFormatFamily_RGB)
+    {
+        /* Detect 64 colour modes and convert to 256 colour */
+        if((pf.ncolour == 63) && (pf.log2bpp == 3))
+        {
+            pf.ncolour = 255;
+            pf.modeflags |= ModeFlag_FullPalette;
+        }
+        /* Clear the greyscale flag. TODO - keep it so greyscale-only devices can make use of it? */
+        pf.modeflags &= ~ModeFlag_GreyscalePalette;
+    }
+
+    /* Bail if we see something unexpected */
+    if(pf.modeflags & ~(ModeFlag_FullPalette | ModeFlag_64k | ModeFlag_ChromaSubsampleMode | ModeFlag_DataFormat_Mask))
+        return;
 
     /* Pick up data size limit from args to service call */
     datasizelimit = regs->r[5]; /* data size is measured in bytes */
@@ -1327,9 +1442,9 @@ static void service_modeextension (_kernel_swi_regs *regs)
     {
         /* Test whether this mode can satisfy the requirements */
         if ((sel->framerate == -1 || sel->framerate == mp->frame_hz) &&
-             mode_valid (mp, sel->depth, dataratelimit, datasizelimit))
+             mode_valid (mp, &pf, dataratelimit, datasizelimit))
         {
-            build_a_vidclist (&thevidclist, mp, sel->depth); /* use the local static structure */
+            build_a_vidclist (&thevidclist, mp, &pf); /* use the local static structure */
 
             /* And claim the service */
             regs->r[1] = 0;                 /* Service_Serviced */
@@ -1345,7 +1460,9 @@ static void service_enumeratescreenmodes (_kernel_swi_regs *regs)
 {
     ModeDescriptionRef mp;
     uint32_t dataratelimit, datasizelimit;
-    int depth;                          /* logarithmic: 0 = 1bpp .. 5 = 32bpp */
+    PixelFormatRef pf,pflist;
+    int numformats,pflistlen;
+    _kernel_swi_regs r;
 
     /*
      * See comments re. data-rate spec in service_modeextension.
@@ -1353,13 +1470,36 @@ static void service_enumeratescreenmodes (_kernel_swi_regs *regs)
     dataratelimit = restrict_bandwidth (regs->r[4]) / 1000;
     datasizelimit = regs->r[5];
 
-    /* Scan all available modes at all available pixel depths */
+    /* Get list of pixel formats supported by driver */
+    int variables[2];
+    variables[0] = VduExt_CurrentGraphicsVDriver;
+    variables[1] = -1;
+    _swix(OS_ReadVduVariables,_INR(0,1),variables,variables);
+
+    r.r[4] = GraphicsV_PixelFormats | (variables[0]<<24);
+    r.r[9] = GraphicsV;
+    _kernel_swi (OS_CallAVector, &r, &r);
+    if (r.r[4] == 0)
+    {
+        pflist = (PixelFormatRef) r.r[0];
+        pflistlen = r.r[1];
+    }
+    else
+    {
+        /* Use the old list */
+        pflist = oldformats;
+        pflistlen = sizeof(oldformats)/sizeof(oldformats[0]);
+    }
+
+
+    /* Scan all available modes at all available pixel formats */
     mp = current_monitor->modelist;
-    depth = 0;
+    pf = pflist;
+    numformats = pflistlen;
 
     for (;;)
     {
-        if (!mode_valid (mp, depth, dataratelimit, datasizelimit))
+        if (!mode_valid (mp, pf, dataratelimit, datasizelimit))
         {
             /*
              * TMD 03-Nov-93: Fix bug MED-00833
@@ -1380,27 +1520,52 @@ static void service_enumeratescreenmodes (_kernel_swi_regs *regs)
             {
                 int nlen = strlen (mp->definition.name);
                 int entrysize = 24 + ((nlen + 1 + 3) & ~3);
+                bool old_format = is_old_format(pf);
+                if (!old_format)
+                    entrysize += 8;
                 if (regs->r[6] != 0)
                 {
                     /* Enumeration case - filling in block */
                     if (regs->r[7] >= entrysize)
                     {
-                        ModeInfoBlockRef ip = (ModeInfoBlockRef)regs->r[6];
-                        int i;
+                        if(old_format)
+                        {
+                            ModeInfoBlockRef ip = (ModeInfoBlockRef)regs->r[6];
+                            int i;
 
-                        /* Copy the mode information into the supplied data buffer */
-                        ip->blocksize = entrysize;
-                        ip->format = 0;  ip->flags = 0;  ip->bit0 = 1;
-                        ip->xresol = mp->definition.xres;
-                        ip->yresol = mp->definition.yres;
-                        ip->depth = depth; /* log2 (bits/pixel) */
-                        ip->framerate = mp->frame_hz; /* integer Hz value used here */
+                            /* Copy the mode information into the supplied data buffer */
+                            ip->blocksize = entrysize;
+                            ip->format = 0;  ip->flags = 0;  ip->bit0 = 1;
+                            ip->xresol = mp->definition.xres;
+                            ip->yresol = mp->definition.yres;
+                            ip->depth = pf->log2bpp; /* log2 (bits/pixel) */
+                            ip->framerate = mp->frame_hz; /* integer Hz value used here */
 
-                        /* Copy name + 1 terminating null into block */
-                        strcpy (ip->name, mp->definition.name);
-                        /* Pad name field out with 0's to N*4 */
-                        for (i = nlen+1; (i & 3) != 0; ++i)
-                            ip->name[i] = 0;
+                            /* Copy name + 1 terminating null into block */
+                            strcpy (ip->name, mp->definition.name);
+                            /* Pad name field out with 0's to N*4 */
+                            for (i = nlen+1; (i & 3) != 0; ++i)
+                                ip->name[i] = 0;
+                        }
+                        else
+                        {
+                            ModeInfoBlock1Ref ip = (ModeInfoBlock1Ref)regs->r[6];
+                            int i;
+
+                            /* Copy the mode information into the supplied data buffer */
+                            ip->blocksize = entrysize;
+                            ip->format = 1;  ip->flags = 0;  ip->bit0 = 1;
+                            ip->xresol = mp->definition.xres;
+                            ip->yresol = mp->definition.yres;
+                            ip->pixelformat = *pf;
+                            ip->framerate = mp->frame_hz; /* integer Hz value used here */
+
+                            /* Copy name + 1 terminating null into block */
+                            strcpy (ip->name, mp->definition.name);
+                            /* Pad name field out with 0's to N*4 */
+                            for (i = nlen+1; (i & 3) != 0; ++i)
+                                ip->name[i] = 0;
+                        }
                         /* Step buffer pointer past this new entry */
                         regs->r[6] += entrysize;
                     }
@@ -1418,19 +1583,22 @@ static void service_enumeratescreenmodes (_kernel_swi_regs *regs)
         }
 
         /* Move on to next mode, if there are any left */
-        if (depth < 5)
-            ++depth;                    /* next deeper mode of current def'n */
+        if (numformats--)
+        {
+            pf++;                       /* next deeper mode of current def'n */
+        }
         else
         {
             mp = mp->next;              /* next mode in list */
             if (mp == NULL)
                 return;                 /* no more modes from this module */
-            depth = 0;                  /* start with min. depth */
+            pf = pflist;                /* start with min. depth */
+            numformats = pflistlen;
         }
     }
 }
 
-static int mode_available(uint32_t xres, uint32_t yres, int depth, int framerate)
+static int mode_available(uint32_t xres, uint32_t yres, const PixelFormatRef pf, int framerate)
 {
     ModeDescriptionRef mp;
     int nmodes;
@@ -1441,7 +1609,7 @@ static int mode_available(uint32_t xres, uint32_t yres, int depth, int framerate
     do
     {
         if ((framerate == -1 || framerate == mp->frame_hz) &&
-            mode_valid (mp, depth, INT32_MAX, INT32_MAX))
+            mode_valid (mp, pf, INT32_MAX, INT32_MAX))
         {
             return 1;
         }
@@ -1455,6 +1623,7 @@ static void service_modetranslation (_kernel_swi_regs *regs)
 {
     unsigned int flags;
     int depth;
+    PixelFormat pf;
 
     static const char pal[4]  = {  0,  8, 12, 15 };
     static const char ntsc[4] = { 44, 45, 46, 46 };
@@ -1496,12 +1665,13 @@ static void service_modetranslation (_kernel_swi_regs *regs)
         depth = 3;
 
 retry_with_4bpp:
+     pixelformat_from_depth(&pf,depth);
 
     /*
      * Check if 640x480xdepth @ 60Hz is available. If so, allow
      * kernel to do normal.
      */
-     if (mode_available(640, 480, depth, 60))
+     if (mode_available(640, 480, &pf, 60))
      {
          regs->r[1] = 0;                /* Service_Serviced */
          regs->r[2] = vga[depth];       /* substitute mode */
@@ -1512,7 +1682,7 @@ retry_with_4bpp:
       * We don't have a standard VGA mode. Let's try a PAL TV
       * mode.
       */
-     if (mode_available(640, 256, depth, 50))
+     if (mode_available(640, 256, &pf, 50))
      {
          regs->r[1] = 0;                /* Service_Serviced */
          regs->r[2] = pal[depth];       /* substitute mode */
@@ -1522,7 +1692,7 @@ retry_with_4bpp:
      /*
       * Alright then. How about a NTSC TV mode?
       */
-     if (mode_available(640, 200, depth, 60))
+     if (mode_available(640, 200, &pf, 60))
      {
          regs->r[1] = 0;                /* Service_Serviced */
          regs->r[2] = ntsc[depth];      /* substitute mode */
@@ -1532,7 +1702,7 @@ retry_with_4bpp:
      /*
       * Check if 640x480xdepth @ any rate is available.
       */
-     if (mode_available(640, 480, depth, -1))
+     if (mode_available(640, 480, &pf, -1))
      {
          regs->r[1] = 0;                /* Service_Serviced */
          regs->r[2] = vga[depth];       /* substitute mode */
