@@ -74,6 +74,7 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${EXP_HDR}.GPIODevice \
             ${EXP_HDR}.OSEntries \
             ${EXP_HDR}.OSRSI6 \
+            ${EXP_HDR}.VIDCList \
             ${C_EXP_HDR}.ModHand \
             ${C_EXP_HDR}.RISCOS \
             ${C_EXP_HDR}.HALEntries \
@@ -81,7 +82,8 @@ EXPORTS   = ${EXP_HDR}.EnvNumbers \
             ${C_EXP_HDR}.OSEntries \
             ${C_EXP_HDR}.Variables \
             ${C_EXP_HDR}.OSRSI6 \
-            ${C_EXP_HDR}.VduExt
+            ${C_EXP_HDR}.VduExt \
+            ${C_EXP_HDR}.VIDCList
 
 #
 # Generic rules:
@@ -183,6 +185,9 @@ ${EXP_HDR}.GPIODevice: hdr.GPIODevice
 ${EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
 	
+${EXP_HDR}.VIDCList: hdr.VIDCList
+	${CP} hdr.VIDCList $@ ${CPFLAGS}
+	
 ${C_EXP_HDR}.ModHand: hdr.ModHand
 	${MKDIR} ${C_EXP_HDR}
 	${PERL} Build:Hdr2H hdr.ModHand $@
@@ -215,6 +220,10 @@ ${C_EXP_HDR}.VduExt: hdr.VduExt
 	${MKDIR} ${C_EXP_HDR}
 	${PERL} Build:Hdr2H hdr.VduExt $@
 
+${C_EXP_HDR}.VIDCList: o.Global.h.VIDCList h.VIDCList
+	${CP} h.VIDCList $@ ${CPFLAGS}
+	print o.Global.h.VIDCList { >> $@ }
+
 o.Global.h.HALDevice: hdr.HALDevice
 	${MKDIR} o.Global.h
 	dir o
@@ -225,6 +234,12 @@ o.Global.h.OSEntries: hdr.OSEntries
 	${MKDIR} o.Global.h
 	dir o
 	${PERL} Build:Hdr2H ^.hdr.OSEntries Global.h.OSEntries
+	back
+
+o.Global.h.VIDCList: hdr.VIDCList
+	${MKDIR} o.Global.h
+	dir o
+	${PERL} Build:Hdr2H ^.hdr.VIDCList Global.h.VIDCList
 	back
 
 BBETYPE = kernel
