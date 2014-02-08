@@ -28,11 +28,70 @@
 # Makefile for VFPSupport
 #
 
-COMPONENT  = VFPSupport
-HEADER1    = VFPSupport
-ROM_SOURCE = GetAll.s
+# Use machine type to determine whether support code is needed
+# Can also be overridden on command line by specifying SUPPORTCODE
+DEFSUPPORTCODE = FALSE
+ifneq (,$(findstring ${MACHINE},All All32 ARM11ZF))
+DEFSUPPORTCODE = TRUE
+endif
 
-include StdTools
-include AAsmModule
+SUPPORTCODE ?= ${DEFSUPPORTCODE}
+
+COMPONENT  = VFPSupport
+ASMHDRS    = VFPSupport
+OBJS       = GetAll
+HDRS       =
+CMHGFILE   =
+ASMDEFINES += -PD "SupportCode SETL {${SUPPORTCODE}}"
+RAMASMDEFINES += -PD "standalone SETL {TRUE}" -PD "MergedMsgs SETS \"${MERGEDMSGS}\""
+
+ifeq (${SUPPORTCODE},TRUE)
+OBJS += softfloat classify
+VPATH = softfloat
+endif
+
+include CModule
+
+# We don't want to link to CLib
+CLIB =
+ROMCSTUBS =
+ABSSYM =
+
+CFLAGS += -apcs /nofp
+
+# Force -cpu 5 when building for 'all' to reduce assembler support code
+# requirements. This shouldn't pose a problem since the C code will only get hit
+# once we've verified VFP hardware is present (i.e. ARMv5+ CPU)
+ifneq (,$(findstring ${MACHINE},All All32))
+CFLAGS += -cpu 5
+endif
+
+# decgen rules
+ACTIONS = actions/common \
+          actions/ARMv7_VFP
+
+ENCODINGS = Build:decgen.encodings.ARMv7 \
+            Build:decgen.encodings.ARMv7_nASIMD \
+            Build:decgen.encodings.ARMv7_VFP
+
+DECGEN = <Tools$Dir>.Misc.decgen.decgen
+
+classify.c: $(ACTIONS) head.c $(ENCODINGS)
+	$(DECGEN) -bits=32 -e -DCDP= -DLDC_STC= -DMRC_MCR= -DVFP1=(cond:4) "-DVFP2={ne(cond,15)}" -DAS1(X)=1111001[X] -DAS2=11110100 $(ENCODINGS) -valid -a $(ACTIONS) -pre head.c -o classify.c -prefix=classify_ -name=classify -default=UNDEFINED -updatecache cache/classify -maxmaskbits=3
+
+classify.o: classify.c shared.h
+	${CC} ${CFLAGS} -o $@ classify.c
+
+classify.oz: classify.c shared.h
+	${CC} ${CFLAGS} ${C_MODULE} -o $@ classify.c
+
+shared.h: hdr.shared
+	${PERL} Build:Hdr2H hdr.shared $@
+
+softfloat.o: shared.h
+
+clean::
+	${RM} c.classify
+	${RM} h.shared
 
 # Dynamic dependencies:
