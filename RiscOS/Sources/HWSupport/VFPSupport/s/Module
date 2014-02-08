@@ -26,7 +26,7 @@
 ; POSSIBILITY OF SUCH DAMAGE.
 ; 
 
-        AREA    |!!!ModuleHeader|, CODE, READONLY, PIC
+        AREA    |!|, CODE, READONLY, PIC
 
 Module_BaseAddr
         &       0
@@ -65,6 +65,7 @@ SWINameTable
         =       "ActiveContext", 0
         =       "Version", 0
         =       "Features", 0
+        =       "ExceptionDump", 0
         =       0
         ALIGN
         
@@ -79,42 +80,78 @@ MessageFile_Open      # 4
 ActiveContext         # 4 ; Context that's actually active
 LazyContext           # 4 ; Context awaiting lazy activation (==ActiveContext if none)
 NumVFPRegs            # 1 ; Number of doubleword regs available on this hardware
-ARMVersion            # 1 ; ARM architecture version from MIDR. <7=ARMv5, 7=ARMv6, &F=ARMv7
+ARMVersion            # 1 ; ARM architecture version from MIDR. <7=ARMv5, 7=ARMv6, &F=ARMv6/ARMv7
 VFPVersion            # 1 ; VFP subarchitecture field from FPSID
-CPEnabledFlag         # 1 ; Nonzero if CP access is enabled
+CPEnabledFlag         # 1 ; 255 if CP access is enabled, 0 if disabled
 OldHandler            # 4 ; Original undefined instruction handler
 UndefinedHandler      # 4 ; Undefined instruction handler code
 LazyHandler           # 8*4 ; Code to call the lazy handler
+ [ SupportCode
+SupportHandler        # 7*4 ; Code to call the support code
+VFPSupportCodePtr     # 4 ; Pointer to arch-specific support code implementation
+ ]
 ChangeContext         # 4 ; Address of SWI_ChangeContext
-CurrentRoutine        # 4 ; OldHandler or LazyHandler
+CurrentRoutine        # 4 ; OldHandler, LazyHandler, or SupportHandler
+ [ SupportCode
+SupportHandlerPtr     # 4 ; SupportHandler if arch needs support code, else OldHandler 
+CRelocOffset          # 4 ; C relocation offset
+BadClasses            # 4 ; Instruction class flags which indicate it's not a valid VFP instruction
+ ]
 SoftFPSID             # 4 ; FPSID
 SoftMVFR0             # 4 ; MVFR0
 SoftMVFR1             # 4 ; MVFR1
+ExceptionContext      # 4
+ExceptionDump         # :INDEX:Context_RegDump+MaxDRegs*8
                       
 WSSize                * :INDEX: @
 
+
 ; Undefined instruction handler code - gets copied into workspace
 UndefinedHandlerTemplate
-        LDR     pc, UndefinedHandlerTemplateEnd+4 ; Branch to address in CurrentRoutine
-        SUB     lr, lr, #4 ; LazyHandler starts here
+
+RelocOffset * UndefinedHandlerTemplate-:INDEX:UndefinedHandler
+
+        LDR     pc, RelocOffset+:INDEX:CurrentRoutine ; Branch to address in CurrentRoutine
+        SUB     lr, lr, #4              ; LazyHandler starts here
         STMDB   r13!,{r0-r1,wp,lr}
-        ADR     wp, UndefinedHandlerTemplate-:INDEX:UndefinedHandler ; Get wp
+        ADR     wp, RelocOffset         ; Get wp
         MOV     r1, #0
         LDR     r0, LazyContext
         MOV     lr, pc
-        LDR     pc, ChangeContext ; Reuse main code for simplicity
-        LDMIA   r13!,{r0-r1,wp,pc}^ ; Restart aborting instruction
+        LDR     pc, ChangeContext       ; Reuse main code for simplicity
+        LDMIA   r13!,{r0-r1,wp,pc}^     ; Restart aborting instruction
 UndefinedHandlerTemplateEnd
 
         ASSERT  LazyHandler-UndefinedHandler+?LazyHandler = UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate
-        ASSERT  CurrentRoutine-UndefinedHandler=UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate+4
+
+ [ SupportCode
+SupportHandlerTemplate
+        Push    "r12"
+        myVMRS  ,r12,FPEXC
+        TST     r12, #FPEXC_EX+FPEXC_DEX
+        ADRNE   r12, RelocOffset        ; Get wp
+        LDRNE   pc, RelocOffset+:INDEX:VFPSupportCodePtr ; Call the support code
+        Pull    "r12"
+        LDR     pc, RelocOffset+:INDEX:OldHandler ; Not a VFP exception, pass on to next handler
+SupportHandlerTemplateEnd
+
+        ASSERT  UndefinedHandlerTemplateEnd = SupportHandlerTemplate
+        ASSERT  SupportHandlerTemplateEnd-SupportHandlerTemplate = ?SupportHandler
+ ]
 
 ; Module code
 
 InitModule
         Entry   "r7-r11"
+
+ [ SupportCode
+        IMPORT  __RelocCode
+        BL      __RelocCode
+        FRAMLDR r11                     ; Corrupted by __RelocCode
+ ]
+
  [ standalone
-        ADRL    R0,ResourceFSFiles
+        BL      Resources
         SWI     XResourceFS_RegisterFiles
         EXIT    VS
  ]
@@ -129,6 +166,14 @@ InitModule
 10      SUBS    r3, r3, #4
         STR     r0, [r12, r3]
         BNE     %BT10
+
+    [ SupportCode
+        ADR     R3, Module_BaseAddr
+        IMPORT  |!$$Base|
+        LDR     R0, =|!$$Base|
+        SUB     R3, R3, R0              ;Calculate relocation offset. Should be zero for ROM builds, but calculate anyway just in case we've been manually loaded or something.
+        STR     R3, CRelocOffset
+    ]
 
         ; Check for multiple instantiation; must be done after workspace setup
         CMP     r11, #0
@@ -145,7 +190,7 @@ InitModule
         Push    "r0"
         BL      CloseMessages
  [ standalone
-        ADRL    R0,ResourceFSFiles
+        BL      Resources
         SWI     XResourceFS_DeregisterFiles
  ] 
         Pull    "r0"
@@ -240,7 +285,7 @@ GotFPSID
         CMP     r0, #&7
         BLT     CheckFPSIDv5
         BEQ     CheckFPSIDv6
-        ; v7 version. Must be VFPv3 or above to be valid, but we currently don't allow anything other than vanilla VFPv3 with null subarchitecture due to lack of support code
+        ; v7 version. Must be VFPv3 or above to be valid, but we currently don't allow anything other than vanilla VFPv3 with null subarchitecture due to lack of appropriate support code
         AND     r3, r4, #&7F0000
         CMP     r3, #&30000
         BNE     BadVFP
@@ -249,14 +294,21 @@ GotFPSID
 CheckFPSIDv5
 CheckFPSIDv6
         ; v5/v6 version. Should be VFPv1 or VFPv2.
+      [ SupportCode
+        ; We only have fully support code for VFPv2 with subarchitecture v1
         AND     r3, r4, #&F0000
-        CMP     r3, #&20000
-        CMPNE   r3, #&10000
+        CMP     r3, #&10000
         BNE     BadVFP
         ; Currently only support implementations that use FSTMX/FLDMX standard format 1 (i.e. we can just use VLDM/VSTM)
         TST     r4, #3:SHL:21
         BNE     BadVFP
         B       GoodVFP
+      |
+        ; Support code is disabled. Refuse to run on this hardware to avoid
+        ; platforms which require support code from being used without it.
+        B       BadVFP
+      ]
+        
 
 BadVFP
 NoMVFR ; Currently we don't cope with situations where the MVFR registers are absent
@@ -305,8 +357,6 @@ HasMVFR
         ; For the moment we just disable access via the FPEXC.EN bit. This will disable everything except VMSR & VMRS from privileged modes
         MOV     r7, #0
         myVMSR  ,FPEXC, r7
-        ; Restore interrupts
-        MSR     CPSR_c, R1
         ; Store our results
         ; TODO - Calculate fake MVFR0/MVFR1 values where necessary
         MOV     r3, r3, LSR #16
@@ -316,11 +366,37 @@ HasMVFR
         STR     r6, SoftMVFR1
         ; Work out how many registers there are
         ; Assumes we've faked up MVFR0!
-        AND     r5, r5, #&F
-        CMP     r5, #2
+        AND     r3, r5, #&F
+        CMP     r3, #2
         MOVEQ   r3, #32
         MOVNE   r3, #16
+        CMP     r3, #MaxDRegs
+        BGT     BadVFP
         STRB    r3, NumVFPRegs
+      [ SupportCode
+        ; Work out BadClasses, assuming MVFR0 & MVFR1 match the ARMv7 format
+        MOV     r0, #CLASS_NOT_VFP
+        CMP     r3, #32
+        ORRLT   r0, r0, #CLASS_D32
+        LDRB    r3, VFPVersion
+        CMP     r3, #2
+        ORRLE   r0, r0, #CLASS_VFP3
+        TST     r5, #&F0
+        ORREQ   r0, r0, #CLASS_S
+        TST     r5, #&F00
+        ORREQ   r0, r0, #CLASS_D
+        TST     r5, #&F0000
+        ORREQ   r0, r0, #CLASS_DIV
+        TST     r5, #&F00000
+        ORREQ   r0, r0, #CLASS_SQRT
+        TST     r6, #&F000000
+        ORREQ   r0, r0, #CLASS_HP
+        TST     r6, #&F0000000
+        ORREQ   r0, r0, #CLASS_VFP4 ; Might need renaming so that it just covers the FMAC instructions?
+        STR     r0, BadClasses
+      ]
+        ; Restore interrupts
+        MSR     CPSR_c, R1
         Pull    "pc"
 
 InstallHandler
@@ -329,12 +405,32 @@ InstallHandler
         ADR     r0, UndefinedHandlerTemplate
         ADR     r1, UndefinedHandler
         ASSERT  UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate = 9*4
+      [ SupportCode
+        MOV     r2, r1
+        LDMIA   r0!, {r3-r11}
+        STMIA   r2!, {r3-r11}
+        ASSERT  SupportHandlerTemplate = UndefinedHandlerTemplateEnd
+        ASSERT  ?SupportHandler = 7*4
+        LDMIA   r0, {r3-r9}
+        ASSERT  VFPSupportCodePtr = SupportHandler+?SupportHandler
+        ASSERT  ChangeContext = VFPSupportCodePtr+4
+        ; Use correct support code depending on subarchitecture
+        ; Note - sub architecture V2 support is incomplete (no handling of VV,
+        ; TFV bits)
+        LDRB    r10, VFPVersion
+        CMP     r10, #1
+        ADREQL  r10, VFPSupportCode_SubArchV1
+        ADRNEL  r10, VFPSupportCode_SubArchV2
+        ADR     r11, SWI_ChangeContext
+        STMIA   r2!, {r3-r11}
+      |
         LDMIA   r0, {r2-r10}
         ASSERT  ChangeContext = UndefinedHandler+(UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate)
         ADR     r11, SWI_ChangeContext
         STMIA   r1, {r2-r11}
-        ORR     r0, r0, #1
         ADD     r2, r1, #UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate
+      ]
+        ORR     r0, r0, #1
         SWI     XOS_SynchroniseCodeAreas
         ; Install the handler. Interrupts disabled to ensure we don't get caught before we set up CurrentRoutine.
         MRS     r4, CPSR
@@ -342,8 +438,20 @@ InstallHandler
         MSR     CPSR_c, r3
         LDR     r0, =&101        
         SWI     XOS_ClaimProcessorVector
-        STRVC   r1, OldHandler
-        STRVC   r1, CurrentRoutine
+        BVS     %FT90
+        STR     r1, OldHandler
+      [ SupportCode
+        ; Set up SupportHandlerPtr as appropriate
+        ; Either a pointer to SupportHandler (if support code required) or
+        ; OldHandler (no support code required)
+        LDRB    r1, VFPVersion
+        CMP     r1, #3
+        LDREQ   r1, OldHandler
+        ADRNE   r1, SupportHandler
+        STR     r1, SupportHandlerPtr
+      ]
+        STR     r1, CurrentRoutine
+90
         MSR     CPSR_c, r4
         EXIT
 
@@ -356,7 +464,7 @@ KillModule
 
         ; Warn our clients that we're about to die
         ; TODO - If ClaimProcessorVector fails, our clients will still think we're dead
-        ADR     r0, Module_BaseAddr
+        ADRL    r0, Module_BaseAddr
         MOV     r1, #Service_ModulePostFinal
         ADRL    r2, ModuleTitle
         MOV     r3, #0 ; We only allow one instance
@@ -380,7 +488,7 @@ KillModule
         BL      CloseMessages
 
  [ standalone
-        ADRL    R0,ResourceFSFiles
+        BL      Resources
         SWI     XResourceFS_DeregisterFiles   ; ignore errors
  ]
 
@@ -402,6 +510,7 @@ JumpTable
         B       SWI_ActiveContext
         B       SWI_Version
         B       SWI_Features
+        B       SWI_ExceptionDump
 EndOfJumpTable
 
 UnknownSWI
@@ -553,13 +662,25 @@ SWI_ChangeContext
         ADRNE   r0, LazyHandler
         BNE     ChangeContext_Exit_IRQ_R2_SetHandler ; Enable lazy handler
         BL      EnableCPAccess
-        LDR     r1, OldHandler ; Disable lazy handler, it's no longer needed
+        ; Disable lazy handler, it's no longer needed
+      [ SupportCode
+        LDR     r1, SupportHandlerPtr
+      |
+        LDR     r1, OldHandler
+      ] 
         STR     r1, CurrentRoutine
         B       ChangeContext_Exit_IRQ_R0
 ChangeContext_Now
         ; Nonlazy activation
         ; Start by disabling the lazy handler
+      [ SupportCode
+        ; Install SupportHandlerPtr or OldHandler as appropriate
+        CMP     r0, #0
+        LDRNE   lr, SupportHandlerPtr
+        LDREQ   lr, OldHandler
+      |
         LDR     lr, OldHandler
+      ]
         CMP     r0, r1
         STR     r0, ActiveContext
         CMPEQ   r0, #0
@@ -656,14 +777,27 @@ SWI_ExamineContext
 20
         ADRL    r0, ErrorBlock_VFPSupport_BadContext
         B       ReturnError_LR
-        
-FormatDescriptorBlock_FPINST2
-        DCD     VFPSupport_Field_FPINST2 + Context_FPINST2<<16
-FormatDescriptorBlock_FPINST
-        DCD     VFPSupport_Field_FPINST + Context_FPINST<<16
+
+        ; We could collapse these into one list, but having separate lists for
+        ; each case causes *ShowVFPRegs to format the dump in a sensible manner
 FormatDescriptorBlock_NullSubarch
         DCD     VFPSupport_Field_FPSCR + Context_FPSCR<<16
         DCD     VFPSupport_Field_FPEXC + Context_FPEXC<<16
+        DCD     VFPSupport_Field_RegDump + Context_RegDump<<16
+        DCD     -1 
+
+FormatDescriptorBlock_FPINST
+        DCD     VFPSupport_Field_FPSCR + Context_FPSCR<<16
+        DCD     VFPSupport_Field_FPEXC + Context_FPEXC<<16
+        DCD     VFPSupport_Field_FPINST + Context_FPINST<<16
+        DCD     VFPSupport_Field_RegDump + Context_RegDump<<16
+        DCD     -1
+
+FormatDescriptorBlock_FPINST2
+        DCD     VFPSupport_Field_FPSCR + Context_FPSCR<<16
+        DCD     VFPSupport_Field_FPEXC + Context_FPEXC<<16
+        DCD     VFPSupport_Field_FPINST + Context_FPINST<<16
+        DCD     VFPSupport_Field_FPINST2 + Context_FPINST2<<16
         DCD     VFPSupport_Field_RegDump + Context_RegDump<<16
         DCD     -1 
 
@@ -700,6 +834,7 @@ SWI_Features
         B       UnknownFeature
 FeaturesJumpTable
         B       Feature_SystemRegs
+        B       Feature_VFPExceptions
 EndOfFeaturesJumpTable
 
 UnknownFeature
@@ -717,6 +852,103 @@ Feature_SystemRegs
         LDMIA  r0, {r0-r2}
         CLRV
         MOV    pc, lr
+
+Feature_VFPExceptions
+;  in: R0 = 1
+; out: R0 = mask of which VFP exceptions can be trapped
+      [ SupportCode
+        LDR    r0, SupportHandlerPtr
+        LDR    r10, OldHandler
+        EORS   r0, r0, r10
+        MOVNE  r0, #FPSCR_ENABLE_FLAGS ; Support code installed, all exceptions available
+      |
+        MOV    r0, #0
+      ]
+        CLRV
+        MOV    pc, lr
+
+SWI_ExceptionDump
+;  in: R0 = flags
+;      R1 = context (if Create)
+; out: R0 = copy of dump (if GetDump)
+;      R1 = original context (if GetContext)
+        ASSERT VFPSupport_ExceptionDump_GetDump+VFPSupport_ExceptionDump_GetContext+VFPSupport_ExceptionDump_Clear+VFPSupport_ExceptionDump_Create = &F
+        CMP     r0, #&F
+        ADRHIL  r0, ErrorBlock_VFPSupport_BadFlags
+        BHI     ReturnError_LR
+        Entry   "r0-r8"
+        MOV     r7, r0
+        ; IRQs off for atomicity
+        MRS     r8, CPSR
+        ORR     lr, r8, #I32_bit
+        MSR     CPSR_c, lr
+        ; Handle creation first
+        TST     r7, #VFPSupport_ExceptionDump_Create
+        BEQ     %FT50
+        ; Serialise the given context (plus read size)
+        MOVS    r0, r1
+        STREQ   r0, ExceptionContext    ; Treat a null pointer as a clear request
+        BEQ     %FT50
+        MOV     r1, #VFPSupport_ExamineContext_Serialise
+        BL      SWI_ExamineContext
+        STRVS   r0, [sp]
+        BVS     %FT90
+        ; Now copy it into our exception block
+        LDR     r0, [sp, #4]
+        STR     r0, ExceptionContext
+        ADR     r1, ExceptionDump
+10
+        LDR     r2, [r0], #4
+        SUBS    r4, r4, #4
+        STR     r2, [r1], #4
+        BNE     %BT10
+50
+        ; Handle examination, clearing
+        ; Clear request is checked for before calling OS_Module to ensure we
+        ; only clear the context we're returning and not any other context
+        ; that appears during the OS_Module call
+        LDR     r6, ExceptionContext
+        TST     r7, #VFPSupport_ExceptionDump_Clear
+        MOVNE   r0, #0
+        STRNE   r0, ExceptionContext
+        TST     r7, #VFPSupport_ExceptionDump_GetDump
+        BEQ     %FT80
+        TEQ     r6, #0
+        STREQ   r6, [sp, #0]
+        BEQ     %FT80
+        ; Allocate a buffer on the stack to temporarily copy the context into
+        ; This makes sure the user gets the context they want, even if another
+        ; exception fires during the OS_Module call
+        ADR     r0, ExceptionDump
+        LDR     r2, [r0, #Context_NumRegs]
+        MOV     r3, #:INDEX:Context_RegDump
+        ADD     r3, r3, r2, LSL #3
+        MOV     r5, r3
+60
+        ; Note - reversing the data here
+        LDR     r1, [r0], #4
+        SUBS    r5, r5, #4
+        Push    "r1"
+        BNE     %BT60
+        ; Allocate memory
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        STRVS   r0, [sp, r3]!
+        BVS     %FT90
+        ; Copy over, reversing the data again
+70
+        Pull    "r1"
+        SUBS    r3, r3, #4
+        STR     r1, [r2, r3]
+        BNE     %BT70
+        STR     r2, [sp]
+80
+        TST     r7, #VFPSupport_ExceptionDump_GetContext
+        STRNE   r6, [sp, #4]
+        CLRV
+90
+        MSR     CPSR_c, r8
+        EXIT
 
 EnableCPAccess
         ; Enable VFP CP access
@@ -766,28 +998,37 @@ SaveContext_R1
         myVMRS  ,r2, FPSCR
         ADD     r3, r1, #Context_RegDump
         STR     r2, [r1,#Context_FPSCR]
+      [ MaxDRegs > 16
         ADD     pc, pc, lr, LSL #4
+      |
+        ; Pack the table a bit tighter if only 16 registers are needed
+        ADD     pc, pc, lr, LSL #3
+      ]
         NOP
         EXIT ; Don't malfunction if the context we're saving has 0 regs. Used by DeleteContext to make things a bit faster.
         NOP
+      [ MaxDRegs > 16
         NOP
         NOP
+      ]
 
         ; Generate VSTM jump table
         GBLA    count
 count   SETA    1
-        WHILE   count < 33
-       [ count <= 16
+        WHILE   count <= MaxDRegs
+      [ count <= 16
         DCI     &EC830B00 + count*2 ; VSTMIA r3,{D0-Dn}
         EXIT
+       [ MaxDRegs > 16
         NOP
         NOP
-       |
+       ]
+      |
         DCI     &ECA30B20 ; VSTMIA r3!,{D0-D15} (we can only STM 16 at once)
         DCI     &ECC30B00 + (count-16)*2 ; VSTMIA r3,{D16-Dn}
         EXIT
         NOP
-       ]
+      ]
 count   SETA    count+1
         WEND
 
@@ -825,7 +1066,7 @@ LoadContext_R0
         ; Generate VLDM jump table
         GBLA    count
 count   SETA    1
-        WHILE   count < 33
+        WHILE   count <= MaxDRegs
        [ count <= 16
         DCI     &EC930B00 + count*2 ; VLDMIA r3,{D0-Dn}
         myVMSR  MI,FPEXC, r2 ; Set exception bits now that all registers are restored
@@ -843,9 +1084,7 @@ count   SETA    count+1
         LTORG
 
         [ standalone
-ResourceFSFiles
-        ResourceFile    $MergedMsgs, Resources.VFPSupport.Messages
-        DCD     0
+        IMPORT  Resources
         ]
 
         END
