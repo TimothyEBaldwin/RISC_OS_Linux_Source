@@ -67,6 +67,15 @@ MemReturn
         B       AccessPhysAddr                  ; 14
         B       ReleasePhysAddr                 ; 15
         B       MemoryAreaInfo                  ; 16
+        B       %BT20                           ; 17 |
+        B       %BT20                           ; 18 |
+        B       %BT20                           ; 19 |
+        B       %BT20                           ; 20 | Reserved for us
+        B       %BT20                           ; 21 |
+        B       %BT20                           ; 22 |
+        B       %BT20                           ; 23 |
+        B       CheckMemoryAccess               ; 24
+                                                ; 25+ reserved for ROL
 40
 
 
@@ -1197,5 +1206,377 @@ MAI_Kbuffs
         MOV     r2, #KbuffsMaxSize
         LDR     r3, =(KbuffsSize + &FFF) :AND: :NOT: &FFF
         EXIT
+
+;----------------------------------------------------------------------------------------
+;
+;        In:    r0 = flags
+;                       bit     meaning
+;                       0-7     24 (reason code)
+;                       8-31    reserved (set to 0)
+;               r1 = low address (inclusive)
+;               r2 = high address (exclusive)
+;
+;       Out:    r1 = access flags:
+;               bit 0: completely readable in user mode
+;               bit 1: completely writable in user mode
+;               bit 2: completely readable in privileged modes
+;               bit 3: completely writable in privileged modes
+;               bit 4: partially readable in user mode
+;               bit 5: partially writable in user mode
+;               bit 6: partially readable in privileged modes
+;               bit 7: partially writable in privileged modes
+;               bit 8: completely physically mapped (i.e. IO memory)
+;               bit 9: completely abortable (i.e. custom data abort handler)
+;               bits 10,11: reserved
+;               bit 12: partially physically mapped
+;               bit 13: partially abortable
+;               bits 14+: reserved
+;
+;       Return various attributes for the given memory region
+CMA_Completely_UserR   * 1<<0
+CMA_Completely_UserW   * 1<<1
+CMA_Completely_PrivR   * 1<<2
+CMA_Completely_PrivW   * 1<<3
+CMA_Partially_UserR    * 1<<4
+CMA_Partially_UserW    * 1<<5
+CMA_Partially_PrivR    * 1<<6
+CMA_Partially_PrivW    * 1<<7
+CMA_Completely_Phys    * 1<<8
+CMA_Completely_Abort   * 1<<9
+CMA_Partially_Phys     * 1<<12
+CMA_Partially_Abort    * 1<<13
+
+CMA_CheckL2PT          * 1<<31 ; Pseudo flag used internally for checking sparse areas
+
+; AP_ equivalents
+CMA_ROM  * CMA_Partially_UserR+CMA_Partially_PrivR
+CMA_Read * CMA_ROM+CMA_Partially_PrivW
+CMA_Full * CMA_Read+CMA_Partially_UserW
+CMA_None * CMA_Partially_PrivR+CMA_Partially_PrivW
+
+CheckMemoryAccess ROUT
+        Entry   "r0,r2-r10"
+        CMP     r0, #24
+        BNE     %FT99
+        LDR     r10, =ZeroPage
+        ; Set all the 'completely' flags, we'll clear them as we go along
+        LDR     r0, =&0F0F0F0F
+        ; Make end address inclusive so we don't have to worry so much about
+        ; wrap around at 4G
+        TEQ     r1, r2
+        SUBNE   r2, r2, #1
+        ; Split memory up into five main regions:
+        ; * scratchspace/zeropage
+        ; * application space
+        ; * dynamic areas
+        ; * IO memory
+        ; * special areas (stacks, ROM, HAL workspace, system heap, etc.)
+        ; All ranges are checked in increasing address order, so the
+        ; completeness flags are returned correctly if we happen to cross from
+        ; one range into another
+        ; Note that application space can't currently be checked in DA block as
+        ; (a) it's not linked to DAList/DynArea_AddrLookup
+        ; (b) we need to manually add the abortable flag
+        CMP     r1, #32*1024
+        BHS     %FT10
+        ; Check zero page
+      [ ZeroPage = 0
+        MOV     r3, #0
+        MOV     r4, #16*1024
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+      |
+        ; DebuggerSpace
+        ASSERT  DebuggerSpace < ScratchSpace
+        LDR     r3, =DebuggerSpace
+        LDR     r4, =(DebuggerSpace_Size + &FFF) :AND: &FFFFF000
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+      ]
+        ; Scratch space
+        LDR     r3, =ScratchSpace
+        MOV     r4, #16*1024
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+10
+        ; Application space
+        ; Note - checking AplWorkSize as opposed to AplWorkMaxSize to cope with
+        ; software which creates DAs within application space (e.g. Aemulor)
+        LDR     r4, [r10, #AplWorkSize]
+        CMP     r1, r4
+        BHS     %FT20
+        LDR     r3, [r10, #AMBControl_ws]
+        LDR     r3, [r3, #:INDEX:AMBFlags]
+        MOV     r5, #CMA_Full
+        TST     r3, #AMBFlag_LazyMapIn_disable :OR: AMBFlag_LazyMapIn_suspend
+        MOV     r3, #32*1024
+        ORREQ   r5, r5, #CMA_Partially_Abort
+        BL      CMA_AddRange2
+20
+        ; Dynamic areas
+        LDR     r7, [r10, #IOAllocLimit]
+        CMP     r1, r7
+        BHS     %FT30
+        ; Look through the quick lookup table until we find a valid DANode ptr
+        LDR     r6, [r10, #DynArea_ws]
+        MOV     r3, r1
+        ADD     r6, r6, #(:INDEX:DynArea_AddrLookup) :AND: &00FF
+        ADD     r6, r6, #(:INDEX:DynArea_AddrLookup) :AND: &FF00
+21
+        AND     r8, r3, #DynArea_AddrLookupMask
+        LDR     r9, [r6, r8, LSR #30-DynArea_AddrLookupBits]
+        TEQ     r9, #0
+        BNE     %FT22
+        ; Nothing here, skip ahead to next block
+        ADD     r3, r8, #DynArea_AddrLookupSize
+        CMP     r3, r2
+        BHI     %FT90 ; Hit end of search area
+        CMP     r3, r7
+        BLO     %BT21
+        ; Hit end of DA area and wandered into IO area
+        B       %FT30
+22
+        ; Now that we've found a DA to start from, walk through and process all
+        ; the entries until we hit the system heap (or any other DAs above
+        ; IOAllocLimit)
+        LDR     r3, [r9, #DANode_Base]
+        LDR     r6, [r9, #DANode_Flags]
+        CMP     r3, r7
+        BHS     %FT30
+        ; Decode AP flags
+        ANDS    lr, r6, #3
+        MOVEQ   r5, #CMA_Full
+        TEQ     lr, #1
+        MOVEQ   r5, #CMA_Read
+        CMP     lr, #2
+        MOVEQ   r5, #CMA_None
+        MOVGT   r5, #CMA_ROM
+        TST     r6, #DynAreaFlags_SparseMap
+        LDREQ   lr, [r9, #DANode_Size]
+        LDRNE   lr, [r9, #DANode_SparseHWM] ; Use HWM as bounds when checking sparse areas
+        ORRNE   r5, r5, #CMA_CheckL2PT ; ... and request L2PT check
+        TST     r6, #DynAreaFlags_DoublyMapped
+        ADD     r4, r3, lr
+        SUBNE   r3, r3, lr
+        BL      CMA_AddRange2
+        LDR     r9, [r9, #DANode_Link]
+        TEQ     r9, #0
+        BNE     %BT22
+        ; Hit the end of the list. This shouldn't happen with the current heap setup!
+30
+        ; IO memory
+        CMP     r1, #IO
+        BHS     %FT40
+        MOV     r3, r1, LSR #20
+        LDR     r4, [r10, #IOAllocPtr]
+        MOV     r3, r3, LSL #20 ; Get MB-aligned addr of first entry to check
+        CMP     r3, r4
+        LDR     r7, =L1PT
+        MOVLO   r3, r4 ; Skip all the unallocated regions
+31
+        LDR     r4, [r7, r3, LSR #20-2]
+        AND     r4, r4, #L1_AP
+        ; Decode page AP flags
+        MOV     r5, #CMA_ROM
+        CMP     r4, #AP_None*L1_APMult
+        MOVEQ   r5, #CMA_None
+        CMP     r4, #AP_Read*L1_APMult
+        MOVEQ   r5, #CMA_Read
+        CMP     r4, #AP_Full*L1_APMult
+        MOVEQ   r5, #CMA_Full
+        ADD     r4, r3, #1<<20
+        ORR     r5, r5, #CMA_Partially_Phys
+        BL      CMA_AddRange2
+        CMP     r4, #IO
+        MOV     r3, r4
+        BNE     %BT31
+40
+        ; Everything else!
+        LDR     r3, =HALWorkspace
+        LDR     r4, [r10, #HAL_WsSize]
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+        ASSERT  IRQStackAddress > HALWorkspace
+        LDR     r3, =IRQStackAddress
+        LDR     r4, =IRQStackSize
+        MOV     r5, #CMA_None
+        BL      CMA_AddRange
+        ASSERT  SVCStackAddress > IRQStackAddress
+        LDR     r3, =SVCStackAddress
+        LDR     r4, =SVCStackSize
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+        ASSERT  ABTStackAddress > SVCStackAddress
+        LDR     r3, =ABTStackAddress
+        LDR     r4, =ABTStackSize
+        MOV     r5, #CMA_None
+        BL      CMA_AddRange
+        ASSERT  UNDStackAddress > ABTStackAddress
+        LDR     r3, =UNDStackAddress
+        LDR     r4, =UNDStackSize
+        MOV     r5, #CMA_None
+        BL      CMA_AddRange
+        ASSERT  PhysicalAccess > UNDStackAddress
+        LDR     r3, =L1PT + (PhysicalAccess:SHR:18)
+        LDR     r3, [r3]
+        TEQ     r3, #0
+        BEQ     %FT50
+        LDR     r3, =PhysicalAccess
+        LDR     r4, =&100000
+        LDR     r5, =CMA_None+CMA_Partially_Phys ; Assume IO memory mapped there
+        BL      CMA_AddRange
+50
+        ASSERT  DCacheCleanAddress > PhysicalAccess
+        LDR     r4, =DCacheCleanAddress+DCacheCleanSize
+        CMP     r1, r4
+        BHS     %FT60
+        ; Check that DCacheCleanAddress is actually used
+        Push    "r0-r2,r9"
+        AddressHAL r10
+        MOV     a1, #-1
+        CallHAL HAL_CleanerSpace
+        CMP     a1, #-1
+        Pull    "r0-r2,r9"
+        BEQ     %FT60
+        SUB     r3, r4, #DCacheCleanSize
+        MOV     r4, #DCacheCleanSize
+        LDR     r5, =CMA_None+CMA_Partially_Phys ; Mark as IO, it may not be actual memory there
+        BL      CMA_AddRange
+60
+        ASSERT  KbuffsBaseAddress > DCacheCleanAddress
+        LDR     r3, =KbuffsBaseAddress
+        LDR     r4, =(KbuffsSize + &FFF) :AND: &FFFFF000
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+        ASSERT  HALWorkspaceNCNB > KbuffsBaseAddress
+        LDR     r3, [r10, #HAL_Descriptor]
+        LDR     r3, [r3, #HALDesc_Flags]
+        TST     r3, #HALFlag_NCNBWorkspace
+        BEQ     %FT70
+        LDR     r3, =HALWorkspaceNCNB
+        LDR     r4, =32*1024
+        MOV     r5, #CMA_None
+        BL      CMA_AddRange
+70
+        ASSERT  CursorChunkAddress > HALWorkspaceNCNB
+        LDR     r3, =CursorChunkAddress
+        MOV     r4, #32*1024
+        MOV     r5, #CMA_Read
+        BL      CMA_AddRange
+        ASSERT  L2PT > CursorChunkAddress
+        LDR     r3, =L2PT
+        MOV     r5, #CMA_None
+        MOV     r4, #4*1024*1024
+        ORR     r5, r5, #CMA_CheckL2PT ; L2PT contains gaps due to logical indexing
+        BL      CMA_AddRange
+        ASSERT  L1PT > L2PT
+        LDR     r3, =L1PT
+        MOV     r4, #16*1024
+        MOV     r5, #CMA_None
+        BL      CMA_AddRange
+        ; Note that system heap needs to be checked manually due to being
+        ; outside main DA address range
+        ASSERT  SysHeapChunkAddress > L1PT
+        LDR     r3, =SysHeapChunkAddress
+        LDR     r4, [r10, #SysHeapDANode + DANode_Size]
+        MOV     r5, #CMA_Full
+        BL      CMA_AddRange
+        ASSERT  CAM > SysHeapChunkAddress
+        LDR     r3, =CAM
+        LDR     r4, [r10, #SoftCamMapSize]
+        MOV     r5, #CMA_None
+        BL      CMA_AddRange
+        ASSERT  ROM > CAM
+        LDR     r3, =ROM
+        LDR     r4, =OSROM_ImageSize*1024
+        MOV     r5, #CMA_ROM
+        BL      CMA_AddRange
+        ; Finally, high processor vectors/relocated zero page
+      [ ZeroPage > 0
+        ASSERT  ZeroPage > ROM
+        MOV     r3, r10
+        LDR     r4, =16*1024
+        MOV     r5, =CMA_Read
+        BL      CMA_AddRange
+      ]
+90
+        ; If there's anything else, we've wandered off into unallocated memory
+        LDR     r3, =&0F0F0F0F
+        BIC     r1, r0, r3
+        CLRV
+        EXIT
+
+99
+        PullEnv
+        ADRL    r0, ErrorBlock_BadParameters
+        SETV
+        MOV     pc, lr
+
+        ; Add range r3..r4 to attributes in r0
+        ; Corrupts r8
+CMA_AddRange ROUT ; r3 = start, r4 = length
+        ADD     r4, r3, r4
+CMA_AddRange2 ; r3 = start, r4 = end (excl.)
+        LDR     r8, =&0F0F0F0F
+        ; Increment r1 and exit if we hit r2
+        ; Ignore any ranges which are entirely before us
+        CMP     r1, r4
+        MOVHS   pc, lr
+        ; Check for any gap at the start, i.e. r3 > r1
+        CMP     r3, r1
+        BICHI   r0, r0, r8
+        MOVHI   r1, r3 ; Update r1 for L2PT check code
+        ; Exit if the range starts after our end point
+        CMP     r3, r2
+        BHI     %FT10
+        ; Process the range
+        TST     r5, #CMA_CheckL2PT
+        BNE     %FT20
+        CMP     r3, r4 ; Don't apply any flags for zero-length ranges
+04      ; Note L2PT check code relies on NE condition here
+        ORR     r8, r5, r8
+        ORRNE   r0, r0, r5 ; Set new partial flags
+        ANDNE   r0, r0, r8, ROR #4 ; Discard completion flags which aren't for this range
+05
+        CMP     r4, r2
+        MOV     r1, r4 ; Continue search from the end of this range
+        MOVLS   pc, lr
+10
+        ; We've ended inside this range
+        MOV     r1, r0
+        CLRV
+        EXIT
+
+20
+        ; Check L2PT for sparse region r1..min(r2+1,r4)
+        ; r4 guaranteed page aligned
+        CMP     r3, r4
+        BIC     r5, r5, #CMA_CheckL2PT
+        BEQ     %BT05
+        Push    "r2,r4,r5,r8,r9,r10,lr"
+        LDR     lr, =&FFF
+        CMP     r4, r2
+        ADDHS   r2, r2, #4096
+        BICHS   r2, r2, lr
+        MOVLO   r2, r4
+        ; r2 is now page aligned min(r2+1,r4)
+        BIC     r4, r1, lr
+        LDR     r8, =L2PT
+        MOV     r10, #0
+30
+        BL      logical_to_physical
+        ORRCC   r10, r10, #1
+        ADD     r4, r4, #4096
+        ORRCS   r10, r10, #2
+        CMP     r4, r2
+        BNE     %BT30
+        CMP     r10, #2
+        ; 01 -> entirely mapped
+        ; 10 -> entirely unmapped
+        ; 11 -> partially mapped
+        Pull    "r2,r4,r5,r8,r9,r10,lr"
+        BICHS   r0, r0, r8 ; Not fully mapped, clear completion flags
+        BNE     %BT04 ; Partially/entirely mapped
+        B       %BT05 ; Completely unmapped
 
         END

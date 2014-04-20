@@ -123,7 +123,6 @@ AP_RAMDisc_SA   *       2                                       ; user none,
 AP_Duff         *       2 :OR: DynAreaFlags_NotCacheable :OR: DynAreaFlags_NotBufferable ; user none, ~C~B
 AP_FreePool     *       2 :OR: DynAreaFlags_NotCacheable        ; user none, ~CB
 AP_CursorChunk  *       1 :OR: DynAreaFlags_NotCacheable :OR: DynAreaFlags_NotBufferable :OR: PageFlags_Unavailable
-AP_PageZero     *       0
 
 AP_L2PT         *       2 :OR: DynAreaFlags_NotCacheable :OR: DynAreaFlags_NotBufferable ; user none, ~C~B
 AP_L1PT         *       AP_L2PT :OR: PageFlags_Unavailable
@@ -196,6 +195,9 @@ DynArea_NullNamePtrMeansHexString SETL {TRUE} :LAND: DynArea_QuickHandles
   [ DynArea_QuickHandles
 DynArea_MaxNameLength     * 31                      ;maximum length of DA name, excluding terminator (multiple of 4, -1)
 DynArea_NumQHandles       * 256                     ;maximum no. of non-system quick handles available simultaneously
+DynArea_AddrLookupBits    * 8                       ;LUT covers entire 4G logical space, so 4G>>8 = 16M granularity
+DynArea_AddrLookupSize    * 1<<(32-DynArea_AddrLookupBits) ; Address space covered by each entry
+DynArea_AddrLookupMask    * &FFFFFFFF-(DynArea_AddrLookupSize-1)
 ;
                           ^  0,R11
 DynArea_TreacleGuess      # 4                       ;guess for next non-quick handle to allocate, if needed, is TreacleGuess+1
@@ -227,6 +229,7 @@ DynArea_FreeQHandles      # 4                       ;index of first free quick h
 DynArea_QHandleArray      # 4*DynArea_NumQHandles   ;1 word per quick handle
                                                     ; - if free, word = index of next free quick handle (or 0 if none)
                                                     ; - if used, word = ptr to DANode (must be > DynArea_NumQHandles)
+DynArea_AddrLookup        # 4<<DynArea_AddrLookupBits ; Lookup table for fast logaddr -> dynarea lookup
 ;
 DynArea_ws_size           *  :INDEX:@               ;must be multiple of 4
 ;
@@ -1171,6 +1174,7 @@ DAC_roundup
   [ DynArea_QuickHandles
         LDR     r11, =ZeroPage
         LDR     r11, [r11, #DynArea_ws]
+        BL      AddDAToAddrLookupTable
         ;so XOS_ChangeDynamicArea can pick up the node we are still creating
         STR     r1, DynArea_CreatingHandle
         STR     r2, DynArea_CreatingPtr
@@ -1323,6 +1327,39 @@ StringNodeClaimFailed
 
         LTORG
 
+; Add a dynamic area to the quick address lookup table
+; In:
+;  R2 = DANode ptr
+;  R11 = DynArea_ws
+AddDAToAddrLookupTable
+        Entry   "r0-r1,r3,r6"
+        ADRL    r0, DynArea_AddrLookup
+        LDR     r1, [r2, #DANode_Flags]
+        LDR     r3, [r2, #DANode_MaxSize]
+        LDR     r6, [r2, #DANode_Base]
+        TST     r1, #DynAreaFlags_DoublyMapped
+        SUBNE   r6, r6, r3                      ; Get true start address
+        MOVNE   r3, r3, LSL #1
+        AND     r1, r6, #DynArea_AddrLookupMask ; Round down start address
+        ADD     lr, r6, r3
+        AND     r3, lr, #DynArea_AddrLookupMask
+        TEQ     lr, r3
+        ADDNE   r3, r3, #DynArea_AddrLookupSize ; Round up end address
+        SUB     r3, r3, r1
+        ADD     r0, r0, r1, LSR #30-DynArea_AddrLookupBits
+71
+        LDR     lr, [r0], #4
+        TEQ     lr, #0
+        STREQ   r2, [r0, #-4]
+        BEQ     %FT72
+        LDR     lr, [lr, #DANode_Base]
+        CMP     lr, r6
+        STRHI   r2, [r0, #-4]                   ; Update LUT if current entry starts after us
+72
+        SUBS    r3, r3, #DynArea_AddrLookupSize
+        BNE     %BT71
+        EXIT
+
 ;**************************************************************************
 ;
 ;       DynArea_Remove - Remove a dynamic area
@@ -1387,7 +1424,7 @@ DAR_delink
 ;
 ; delink from sorted list
 ;
-        Push    "r7,r8,r11"
+        Push    "r0-r4,r7,r8,r11"
         LDR     r11, =ZeroPage
         LDR     r11, [r11, #DynArea_ws]
         ADR     r8, DynArea_SortedList - DANode_SortLink ;so that [r8, #DANode_SortLink] addresses list header)
@@ -1401,7 +1438,44 @@ DAR_sdloop
         LDR     r8, [r8, #DANode_SortLink]
         STR     r8, [r7, #DANode_SortLink]
 DAR_sddone
-        Pull    "r7,r8,r11"
+; Delink from address lookup table
+        ADRL    r0, DynArea_AddrLookup
+        LDR     r1, [r10, #DANode_Flags]
+        LDR     r3, [r10, #DANode_MaxSize]
+        LDR     r2, [r10, #DANode_Base]
+        TST     r1, #DynAreaFlags_DoublyMapped
+        SUBNE   r2, r2, r3                      ; Get true start address
+        MOVNE   r3, r3, LSL #1
+        AND     r1, r2, #DynArea_AddrLookupMask ; Round down start address
+        ADD     lr, r2, r3
+        AND     r3, lr, #DynArea_AddrLookupMask
+        TEQ     lr, r3
+        ADDNE   r3, r3, #DynArea_AddrLookupSize ; Round up end address
+        SUB     r3, r3, r1
+        ADD     r0, r0, r1, LSR #30-DynArea_AddrLookupBits
+DAR_adloop
+        LDR     lr, [r0], #4
+        TEQ     lr, r10
+        BNE     DAR_adnext
+        ; Update to point to next DA, or null if next is outside this chunk
+        LDR     lr, [lr, #DANode_Link]
+        TEQ     lr, #0
+        STREQ   lr, [r0, #-4]
+        BEQ     DAR_adnext
+        LDR     r4, [lr, #DANode_Flags]
+        LDR     r2, [lr, #DANode_Base]
+        TST     r4, #DynAreaFlags_DoublyMapped
+        LDRNE   r4, [lr, #DANode_MaxSize]
+        SUBNE   r2, r2, r4
+        AND     r2, r2, #DynArea_AddrLookupMask
+        TEQ     r2, r1
+        MOVNE   lr, #0
+        STR     lr, [r0, #-4]
+DAR_adnext
+        SUBS    r3, r3, #DynArea_AddrLookupSize
+        ADD     r1, r1, #DynArea_AddrLookupSize
+        BNE     DAR_adloop
+        Pull    "r0-r4,r7,r8,r11"
 
   ] ;DynArea_QuickHandles
 
@@ -3009,6 +3083,16 @@ DynArea_QHinit_loop2
         STR     r2, [r1, #ChangeDyn_SysHeap:SHL:2]
         LDR     r2, =ZeroPage+FreePoolDANode
         STR     r2, [r1, #ChangeDyn_FreePool:SHL:2]
+
+; Initialise the address lookup table for the current DA's
+; Assumes we have at least one DA to start with!
+        LDR     r2, =ZeroPage+DAList
+        LDR     r2, [r2]
+DynArea_AddrLookup_loop
+        BL      AddDAToAddrLookupTable
+        LDR     r2, [r2, #DANode_Link]
+        TEQ     r2, #0
+        BNE     DynArea_AddrLookup_loop
 
   |
         ASSERT  ZeroPage = 0
