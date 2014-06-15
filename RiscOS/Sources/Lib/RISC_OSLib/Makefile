@@ -179,6 +179,8 @@ HEADERS =\
  CLIB:h.tgmath \
  CLIB:h.time \
  CLIB:h.varargs \
+ CLIB:h.wchar \
+ CLIB:h.wctype \
  RISC_OSLib:h.akbd \
  RISC_OSLib:h.alarm \
  RISC_OSLib:h.baricon \
@@ -701,6 +703,8 @@ CLIB:h.string: clib.h.string;     ${CP} clib.h.string $@ ${CPFLAGS}
 CLIB:h.tgmath: clib.h.tgmath;     ${CP} clib.h.tgmath $@ ${CPFLAGS}
 CLIB:h.time: clib.h.time;         ${CP} clib.h.time $@ ${CPFLAGS}
 CLIB:h.varargs: clib.h.varargs;   ${CP} clib.h.varargs $@ ${CPFLAGS}
+CLIB:h.wchar: clib.h.wchar;       ${CP} clib.h.wchar $@ ${CPFLAGS}
+CLIB:h.wctype: clib.h.wctype;     ${CP} clib.h.wctype $@ ${CPFLAGS}
 
 
 RISC_OSLib:h.akbd: rlib.h.akbd;              ${CP} rlib.h.akbd $@ ${CPFLAGS}
