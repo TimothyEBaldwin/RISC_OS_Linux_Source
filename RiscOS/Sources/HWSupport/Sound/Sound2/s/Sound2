@@ -282,12 +282,9 @@ FreeSize    # 0
             ^ 0
 QCodePtr    # 4
 QSize       # 4
-  [ {FALSE}   ;StrongARM - not needed with CallASWI strategy
-QSWICode    # 8 ; SWI and return...
-  |
-Qpadding    # 8 ; so we don't change size
-  ]
-QTempo      # 4
+            # 4 ; Spare padding
+QTempoInCS  # 4 ; public tempo value, measured in beats/centisecond
+QTempo      # 4 ; internal tempo value in low 16 bits, phase in high
 QLast       # 4 ; remember last incremental time...
 QBeatCount  # 4 ; (0 for beat counter off)
 QBeat       # 4
@@ -435,7 +432,9 @@ SoundQInit Entry
 
         WritePSRc I_bit :OR: SVC_mode, r10 ; turn IRQs off again
         MOV     r10, #DefaultTempo
-        STR     r10, [wp, #QTempo]
+        STR     r10, [wp, #QTempo]      ; Wipe phase value
+        STR     r10, [wp, #QTempoInCS]
+        BL      RecalcTempo
         CMP     r0, #0                  ; if not in the middle of a QInit ...
         MOV     r0, #0
         STRPL   r0, [wp, #TimeSlot]     ; ... then reset TimeSlot to normal
@@ -458,15 +457,16 @@ SoundQInit Entry
 ; This routine can be work OK even if we're in the middle of a QInit
 
 SoundQTempo ROUT
-        LDR     r11, [wp, #QTempo]
+        LDR     r11, [wp, #QTempoInCS]
         CMP     r0, #0
         BEQ     %FT20
 
         CMP     r0, #&00010000
-        MOVLT   r0, r0, LSL #16         ; 16 bits to top
-        ORRLT   r0, r0, r11, LSR #16    ; phase to bottom 16
-        MOVLT   r0, r0, ROR #16         ; swap halves
-        STR     r0, [wp, #QTempo]
+        BGE     %FT20
+        STR     r0, [wp, #QTempoInCS]
+        MOV     r10, lr
+        BL      RecalcTempo
+        MOV     lr, r10
 
 20      MOV     r0, r11, LSL #16        ; return previous value
         MOV     r0, r0, LSR #16
@@ -978,6 +978,142 @@ SoundDispatchSWI ; r1 is SWI number to execute, with parms r2, r3 (->SWI r0,r1)
         B       SoundDispatchNext
 
 ; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Calculate the correct QTempo value for the current sound system configuration
+RecalcTempo     ROUT
+        Entry   "r0-r6"
+        ; IRQs off - ensures QTempo value stays in sync with QTempoInCS (e.g.
+        ; if we get a tempo change from a scheduled call), and avoids bad
+        ; Sound_Tuning values being temporarily visible to outside code if
+        ; automatic tuning isn't supported
+        PHPSEI  r6, lr
+        ; Check if automatic tuning is enabled. If not, fall back to old behaviour.
+        LDR     r0, =&4f545541
+        MOV     r1, #0
+        SWI     XSound_Tuning
+        BVS     %FT90
+        ; If automatic tuning isn't supported, R1 will have been left unaltered
+        TEQ     r1, #0
+        BEQ     %FT80
+01
+        TEQ     r0, #2
+        BNE     %FT90
+        ; Fetch the sample rate
+        MOV     r0, #1
+        MOV     r2, #0
+        SWI     XSound_SampleRate
+        MOVVS   r2, #0
+        MOV     r5, r2 ; r5 = sample rate in 1/1024 Hz
+        ; Fetch buffer size (+ sample period)
+        MOV     r0, #0
+        MOV     r1, #0
+        MOV     r2, #0
+        MOV     r3, #0
+        MOV     r4, #0
+        SWI     XSound_Configure ; R1 = buffer size, R2 = sample period
+        BVS     %FT90
+        ORRS    r0, r1, r2
+        BEQ     %FT90
+        ; Calculate real QTempo value
+        ; If we have Sound_SampleRate:
+        ;   QTempo = QTempoInCS*bufsize*1024*100/samplerate
+        ; Otherwise:
+        ;   QTempo = QTempoInCS*bufsize*period/10000
+        TEQ     r5, #0
+        MOVNE   r2, #1024*100
+        MOVEQ   r5, #10000
+05
+        LDR     r0, [wp, #QTempoInCS]
+        ; Now calculate QTempoInCS*bufsize*r2/r5
+        ; Product will most likely be a 64 bit value
+        MUL     r3, r1, r0 ; QTempoInCS*bufsize
+      [ NoARMM
+        MOV     r4, r2, LSR #16
+        MOV     lr, r3, LSR #16
+        BIC     r2, r2, r4, LSL #16
+        BIC     r3, r3, lr, LSL #16
+        MUL     r1, r4, lr ; r2hi*r3hi
+        MUL     r0, r2, r3 ; r2lo*r3lo
+        MUL     r4, r3, r4 ; r2hi*r3lo
+        MUL     lr, r2, lr ; r2lo*r3hi
+        ADDS    r4, r4, lr
+        ADDCS   r1, r1, #1<<16
+        ADDS    r0, r0, r4, LSL #16
+        ADC     r1, r1, r4, LSR #16
+      |
+        UMULL   r0, r1, r2, r3
+      ]
+        ; Now divide r0, r1 by r5
+        MOV     r2, #64
+        MOV     r3, #0
+        ADDS    r0, r0, r0
+10
+        ADCS    r1, r1, r1
+        ADC     r3, r3, r3
+        SUBS    r2, r2, #1
+        BLT     %FT20
+        CMP     r3, r5
+        SUBCS   r3, r3, r5
+        ADCS    r0, r0, r0
+        B       %BT10
+20
+        ; r0, r1 = result
+        ; Clamp to 16 bit value
+        CMP     r1, #1
+        CMPLO   r0, #&f000
+        MOVHS   r0, #&f000
+30
+        ; Replace current QTempo, preserving phase value
+        LDR     r1, [wp, #QTempo]
+        MOV     r1, r1, LSR #16
+        ORR     r1, r1, r0, LSL #16
+        MOV     r1, r1, ROR #16
+        STR     r1, [wp, #QTempo]
+        PLP     r6
+        EXIT
+
+80
+        ; Arrive here if we attempted to query the automatic tuning state for a
+        ; version of SoundChannels which doesn't understand the call. In this
+        ; case it will have erroneously set the tuning value to &5541. Restore
+        ; the previous value by calling Sound_Tuning again.
+        SWI     XSound_Tuning
+90
+        ; Unable to perform automatic tempo calculation.
+        ; Just fall back to the assumption that 1 buffer = 1 cs
+        LDR     r0, [wp, #QTempoInCS]
+        B       %BT30
+
+RecalcTempoService ALTENTRY
+        PHPSEI  r6, lr
+        ; From Service_SoundConfigChanging
+        ; r2 = sample rate
+        ; r3 = buffer size
+        MOV     r5, r2
+        ; Check that automatic tuning is enabled
+        LDR     r0, =&4f545541
+        MOV     r1, #0
+        SWI     XSound_Tuning
+        BVS     %BT90
+        TEQ     r1, #0
+        BEQ     %BT80
+        TEQ     r0, #2
+        BNE     %BT90
+        ; It's enabled, call back into the calculation code
+        MOV     r1, r3
+        MOV     r2, #1024*100
+        B       %BT05
+
+RecalcTempoService2 ALTENTRY
+        PHPSEI  r6, lr
+        ; From Service_SoundAutoTune
+        ; r2 = auto tuning state (1=off, 2=on)
+        ; For this entry point we skip the Sound_Tuning call, which has the
+        ; benefit of allowing us to detect the auto tuning state for the case
+        ; where SoundChannels makes this service call during its initialisation
+        MOV     r0, r2
+        B       %BT01
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ; In    r0-r6 trashable
 
 Initialise_Module Entry "r10, r11"      ; Calls internal routine
@@ -1056,21 +1192,37 @@ Finalise_Module Entry "r10, r11"        ; Calls internal routine
 
 ;Ursula format
 ;
+        ASSERT  Service_Reset < Service_Sound
 UServTab
         DCD     0
         DCD     UService - Module_Base
         DCD     Service_Reset
+        DCD     Service_Sound
         DCD     0
         DCD     UServTab - Module_Base
 Intercept_Services ROUT
         MOV     r0, r0
         CMP     r1, #Service_Reset
+        CMPNE   r1, #Service_Sound
         MOVNE   pc, lr
 UService
         LDR     wp, [R12]
 
-        Entry   "r0,r10,r11"            ; Reinitialise the queue on reset
-        BL      SoundQFullInit
+        Entry   "r0,r10,r11"
+        TEQ     r1, #Service_Sound
+        BNE     %FT80
+        ; Deal with sound configuration changes
+        TEQ     r0, #Service_SoundConfigChanging
+        BLEQ    RecalcTempoService
+        ; Make automatic tempo enable/disable state match automatic tuning enable/disable state
+        TEQ     r0, #Service_SoundAutoTune
+        BLEQ    RecalcTempoService2
+        ; Disable automatic tempo if SoundChannels is dying (rather academic, sound system won't be much use in that state anyway?)
+        TEQ     r0, #Service_SoundLevel1Dying
+        BLEQ    RecalcTempo
+        EXIT
+80
+        BL      SoundQFullInit          ; Reinitialise the queue on reset
         EXIT                            ; Can't raise error from service
 
 ; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
