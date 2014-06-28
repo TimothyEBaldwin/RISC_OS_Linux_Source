@@ -14,57 +14,27 @@
 #
 # Makefile for AUN Messages Module
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 23-Feb-95  AMcC         Created.
-#
 
-#
-# Generic options:
-#
-CP       = copy
-MKDIR    = cdir
-MODGEN   = modgen
-MODSQZ   = modsqz
-RM       = remove
-SCANRES  = scanres
-PERL     = do <Perl$Dir>.perl
-WIPE     = -wipe
-
-CPFLAGS  = ~cfr~v
-WFLAGS   = ~cr~v
-
-#
-# Program specific options:
-#
 COMPONENT   = AUNMsgs
-TARGET      = rm.AUNMsgs
 MODULE_HELP = "AUN Messages"
-FILELIST    = Resources.${LOCALE}.<System>
+FILELIST    = Resources${SEP}${LOCALE}${SEP}${SYSTEM}
+CUSTOMROM   = custom
+AUN_DIRS    = rm${SEP}${MACHINE}
+AUN_MODULE  = ${AUN_DIRS}${SEP}AUNMsgMod
 
-#
-# Generic rules:
-#
-rom: ${TARGET}
-	@echo ${COMPONENT}: rom module built
+include StdTools
+include AAsmModule
 
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom module installed
+rom: ${AUN_MODULE}
+	@${ECHO} ${COMPONENT}: rom module built
 
-clean:
-	${RM} ${TARGET}
-	@echo ${COMPONENT}: cleaned
+install_rom: ${AUN_MODULE}
+	${CP} ${AUN_MODULE} ${INSTDIR}${SEP}${TARGET} ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: rom module installed
 
-${TARGET}: ${FILELIST} VersionNum
-	${PERL} build:getversion AUNMsgs$BuildV AUNMsgs$FullV AUNMsgs$Date
-	Do ${MODGEN} -date "<AUNMsgs$Date>" $@ ${COMPONENT} ${MODULE_HELP} <AUNMsgs$BuildV> -via ${FILELIST}
-
-BBETYPE = aunmsgs
-bbe-aunmsgs: bbe-generic-resources-get-alias
-	BBE_Export_File VersionNum
+${AUN_MODULE}: ${FILELIST} VersionNum
+	${MKDIR} ${AUN_DIRS}
+	${GETVERSION} AUNMsgs$BuildV AUNMsgs$FullV AUNMsgs$Date
+	${DO} ${MODGEN} -date "<AUNMsgs$Date>" $@ ${COMPONENT} ${MODULE_HELP} <AUNMsgs$BuildV> -via ${FILELIST}
 
 # Dynamic dependencies:
