@@ -37,20 +37,7 @@ LDIR       = ${RDIR}.${LOCALE}
 RESDIR = <resource$dir>.Resources.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-CP      = copy
-RM      = remove
-SQUISH  = squish
-XWIPE   = x wipe
-PERL    = do <Perl$Dir>.perl
-MODGEN  = modgen
-
-CPFLAGS = ~cfr~v
-SQFLAGS = -nolist
-WFLAGS  = ~c~v
+include StdTools
 
 FILES =\
  ${LDIR}.!Help \
@@ -67,61 +54,55 @@ RESFILES =\
 # Main rules:
 #
 all: ${FILES}
-	@echo ${COMPONENT}: Application built (Disc}
+	@${ECHO} ${COMPONENT}: Application built (Disc)
 
 rom: ${ROM_MODULE}
-	@echo ${COMPONENT}: Module built (ROM}
+	@${ECHO} ${COMPONENT}: Module built (ROM)
 
 install: ${FILES}
 	${MKDIR} ${INSTDIR}.${APP}
-	|
 	${CP} ${LDIR}.!Help      ${INSTDIR}.${APP}.!Help     ${CPFLAGS}
 	${CP} ${RDIR}.!Run       ${INSTDIR}.${APP}.!Run      ${CPFLAGS}
 	${CP} ${RDIR}.!RunImage  ${INSTDIR}.${APP}.!RunImage ${CPFLAGS}
 	${CP} ${LDIR}.Messages   ${INSTDIR}.${APP}.Messages  ${CPFLAGS}
 	${CP} ${LDIR}.Templates  ${INSTDIR}.${APP}.Templates ${CPFLAGS}
-	|
-	Access ${INSTDIR}.${APP}.* lr/r
-	|
-	@echo ${COMPONENT}: Application installed {Disc}
+	${CHMOD} -R 555 ${INSTDIR}.${APP}.*
+	@${ECHO} ${COMPONENT}: Application installed (Disc)
 
 install_rom: ${ROM_MODULE}
 	${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: Module installed {ROM}
+	@${ECHO} ${COMPONENT}: Module installed (ROM)
 
 resources: ${LDIR}.!RunLink
 	${MKDIR} ${RESAPP}
 	${MKDIR} ${RESDIR}
-	|
 	${CP} ${LDIR}.!Help      ${RESAPP}.!Help     ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Run   ${RESAPP}.!Run      ${CPFLAGS}
-	|
 	${CP} ${LDIR}.!RunLink   ${RESDIR}.!RunLink  ${CPFLAGS}
 	${CP} ${LDIR}.Messages   ${RESDIR}.Messages  ${CPFLAGS}
 	${CP} ${LDIR}.Templates  ${RESDIR}.Templates ${CPFLAGS}
-	|
-	@echo ${COMPONENT}: resource files copied to Messages module
+	@${ECHO} ${COMPONENT}: resource files copied to Messages module
 
 clean:
 	${RM} ${ROM_MODULE}
 	${RM} ${RDIR}.!RunImage
 	${RM} ${LDIR}.!RunLink
 	${XWIPE} crunched.* ${WFLAGS}
-	@echo ${COMPONENT}: cleaned
+	@${ECHO} ${COMPONENT}: cleaned
 
 #
 # Static dependencies:
 #
 
 ${ROM_MODULE}: VersionNum ${RESFILES}
-	${PERL} build:getversion Chars$BuildV Chars$FullV Chars$Date
-	do ${MODGEN} -date "<Chars$Date>" ${ROM_MODULE} !Chars !Chars <Chars$BuildV> Resources.!RunImage Resources.Chars.!RunImage
+	${GETVERSION} Chars$BuildV Chars$FullV Chars$Date
+	${DO} ${MODGEN} -date "<Chars$Date>" ${ROM_MODULE} !Chars !Chars <Chars$BuildV> Resources.!RunImage Resources.Chars.!RunImage
 
 ${RDIR}.!RunImage: crunched.!RunImage
 	${SQUISH} ${SQFLAGS} -from crunched.!RunImage -to $@
 
 crunched.!RunImage: bas.!RunImage
-	crunch.!RunImage; BASIC
+	${RUN}crunch.!RunImage; BASIC
 
 ${LDIR}.!RunLink: bas.!RunLink
 	${SQUISH} ${SQFLAGS} -from bas.!RunLink -to $@
