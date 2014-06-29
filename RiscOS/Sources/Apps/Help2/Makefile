@@ -43,23 +43,7 @@ FILELIST    = ${RDIR}.Filelist
 RESDIR = <resource$dir>.Resources.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-MODGEN  = modgen
-CC      = cc
-LD      = link
-CP      = copy
-RM      = remove
-SQZ     = squeeze
-WIPE    = x wipe
-XWIPE   = x wipe
-PERL    = do <Perl$Dir>.perl
-
-CFLAGS  = ${THROWBACK} -depend !Depend -ffa ${INCLUDES}
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
+include StdTools
 
 #
 # Libraries
@@ -73,6 +57,7 @@ WIMPLIB    = tbox:o.wimplib
 # Include files
 #
 INCLUDES = -Itbox:,C:
+CFLAGS   = ${THROWBACK} -depend !Depend -ffa ${INCLUDES}
 
 FILES =\
  ${RDIR}.!Boot \
@@ -91,24 +76,19 @@ OBJS =\
 # Rule patterns
 #
 .SUFFIXES: .o
-
-.c.o:; @echo
-	@echo Compiling $<
-	@${CC} ${CFLAGS} ${DFLAGS}        -c -o $@ $<
+.c.o:;   ${CC} ${CFLAGS} ${DFLAGS}        -c -o $@ $<
 	
 #
 # Main rules:
 #
 rom: ${MODULE}
-	@echo ${COMPONENT}: rom module built
+	@${ECHO} ${COMPONENT}: rom module built
 
 install_rom: ${MODULE}
 	${CP} ${MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom module installed
+	@${ECHO} ${COMPONENT}: rom module installed
 
 install: ${FILES}
-	 @echo
-	 @echo ${COMPONENT}: Creating application ${APP}
 	 ${MKDIR} ${INSTDIR}.${APP}
 	 ${CP} ${RDIR}.!Boot      ${INSTDIR}.${APP}.!Boot      ${CPFLAGS}
 	 ${CP} ${LDIR}.!Help      ${INSTDIR}.${APP}.!Help      ${CPFLAGS}
@@ -118,44 +98,39 @@ install: ${FILES}
 	 ${CP} ${LDIR}.Res        ${INSTDIR}.${APP}.Res        ${CPFLAGS}
 	 ${CP} ${RDIR}.!Sprites   ${INSTDIR}.${APP}.!Sprites   ${CPFLAGS}
 	 ${CP} ${RDIR}.!Sprites22 ${INSTDIR}.${APP}.!Sprites22 ${CPFLAGS}
-	 Access ${INSTDIR}.${APP}.* wr/r
-	 @echo
-	 @echo ${COMPONENT}: Application installed {Disc}
+	 ${CHMOD} -R 555 ${INSTDIR}.${APP}.*
+	 @${ECHO} ${COMPONENT}: Application installed {Disc}
 
 resources:
 	${MKDIR} ${RESAPP}
 	${MKDIR} ${RESDIR}
-	|
 	${CP} ${LDIR}.!Help         ${RESAPP}.!Help     ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Run      ${RESAPP}.!Run      ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Boot     ${RESAPP}.!Boot     ${CPFLAGS}
-	|
 	${CP} ${LDIR}.Res           ${RESDIR}.Res       ${CPFLAGS}
 	${CP} ${LDIR}.Messages      ${RESDIR}.Messages  ${CPFLAGS}
-	|
-	@echo ${COMPONENT}: resource files copied to Messages module
+	@${ECHO} ${COMPONENT}: resource files copied to Messages module
 
 clean:
 	${XWIPE} rm       ${WFLAGS}
 	${XWIPE} o.*      ${WFLAGS}
-	${XWIPE} ${APP}.* ${WFLAGS}
+	${XWIPE} ${APP}   ${WFLAGS}
 	${RM} ${MODULE}
 	${RM} ${RDIR}.!RunImage
-	${RM} ${APP}
-	@echo ${COMPONENT}: cleaned
+	@${ECHO} ${COMPONENT}: cleaned
 
 #
 # Static dependencies:
 #
 
-Resources.!RunImage: ${OBJS} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} ${CLIB}
+${RDIR}.!RunImage: ${OBJS} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} ${CLIB}
 	${LD} -o $@ ${OBJS} ${CLIB} ${EVENTLIB} ${TOOLBOXLIB} ${WIMPLIB} 
 	${SQZ} ${SQZFLAGS} $@
 
 ${MODULE}: ${FILES} VersionNum
 	   ${MKDIR} rm
-	   ${PERL} build:getversion Help2$BuildV Help2$FullV Help2$Date
-	   do ${MODGEN} -date "<Help2$Date>" $@ ${MODULE_NAME} ${MODULE_HELP} <Help2$BuildV> -via ${FILELIST}
+	   ${GETVERSION} Help2$BuildV Help2$FullV Help2$Date
+	   ${DO} ${MODGEN} -date "<Help2$Date>" $@ ${MODULE_NAME} ${MODULE_HELP} <Help2$BuildV> -via ${FILELIST}
 	
 BBETYPE = help2
 bbe-help2: bbe-generic
