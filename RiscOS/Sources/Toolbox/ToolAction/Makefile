@@ -37,7 +37,6 @@ CC      = cc
 CMHG    = cmhg
 CP      = copy
 LD      = link
-TLD     = tlink
 RM      = remove
 WIPE    = x wipe
 XWIPE   = x wipe
