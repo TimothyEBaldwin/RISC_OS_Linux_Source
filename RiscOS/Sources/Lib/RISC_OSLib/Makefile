@@ -236,13 +236,6 @@ HEADERS =\
  RISC_OSLib:h.xferrecv \
  RISC_OSLib:h.xfersend
 
-# Unfortunately these need to be exported to build Edit
-INTERNAL_HEADERS =\
- RISC_OSLib:EditIntern.h.message \
- RISC_OSLib:EditIntern.h.txtar \
- RISC_OSLib:EditIntern.h.txtfile \
- RISC_OSLib:EditIntern.h.txtoptmenu
-
 LIBRARIES =\
  Clib:o.ansilib \
  Clib:o.ansilibm \
@@ -269,8 +262,7 @@ MODWRAP   = RISC_OSLib:s.modulewrap
 OBJECT    = aof.${TARGET}
 EXPORTS   = ${MODWRAP} \
             ${EXPORTED_LIBS} \
-            ${HEADERS} \
-            ${INTERNAL_HEADERS}
+            ${HEADERS}
 
 #
 # Objects for Clib:o.ansilib
@@ -462,8 +454,6 @@ install-libraries: lib.ansilib lib.ansilibm o.overmgr lib.stubs lib.risc_oslib l
 	${CP} lib.stubs           ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
 	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h
 	${CP} RISC_OSLib:h.*      ${INSTDIR}.RISC_OSLib.h.*            ${CPFLAGS}
-	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h.EditIntern
-	${CP} rlib.EditIntern.h.* ${INSTDIR}.RISC_OSLib.h.EditIntern.* ${CPFLAGS}
 	${MKDIR}                  ${INSTDIR}.RISC_OSLib.s
 	${CP} s.modulewrap        ${INSTDIR}.RISC_OSLib.s.modulewrap   ${CPFLAGS}
 	${MKDIR}                  ${INSTDIR}.RISC_OSLib.o
@@ -536,7 +526,6 @@ dirs:
 	${MKDIR} ${LIBDIR}.CLib.o
 	${MKDIR} ${LIBDIR}.RISC_OSLib
 	${MKDIR} ${LIBDIR}.RISC_OSLib.h
-	${MKDIR} ${LIBDIR}.RISC_OSLib.EditIntern.h
 	${MKDIR} ${LIBDIR}.RISC_OSLib.s
 	${MKDIR} ${LIBDIR}.RISC_OSLib.o
 
@@ -761,11 +750,6 @@ RISC_OSLib:h.wimpt: rlib.h.wimpt;            ${CP} rlib.h.wimpt $@ ${CPFLAGS}
 RISC_OSLib:h.win: rlib.h.win;                ${CP} rlib.h.win $@ ${CPFLAGS}
 RISC_OSLib:h.xferrecv: rlib.h.xferrecv;      ${CP} rlib.h.xferrecv $@ ${CPFLAGS}
 RISC_OSLib:h.xfersend: rlib.h.xfersend;      ${CP} rlib.h.xfersend $@ ${CPFLAGS}
-
-RISC_OSLib:EditIntern.h.message:    rlib.EditIntern.h.message;    ${CP} rlib.EditIntern.h.message    $@ ${CPFLAGS}
-RISC_OSLib:EditIntern.h.txtar:      rlib.EditIntern.h.txtar;      ${CP} rlib.EditIntern.h.txtar      $@ ${CPFLAGS}
-RISC_OSLib:EditIntern.h.txtfile:    rlib.EditIntern.h.txtfile;    ${CP} rlib.EditIntern.h.txtfile    $@ ${CPFLAGS}
-RISC_OSLib:EditIntern.h.txtoptmenu: rlib.EditIntern.h.txtoptmenu; ${CP} rlib.EditIntern.h.txtoptmenu $@ ${CPFLAGS}
 
 # Libraries
 Clib:o.ansilib:          lib.ansilib;        ${CP} lib.ansilib    $@ ${CPFLAGS}
