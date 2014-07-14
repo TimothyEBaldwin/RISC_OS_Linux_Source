@@ -54,8 +54,6 @@ bbe-library: bbe-generic-resources-get-alias
 	BBE_Export_File Acorn.toansi
 	BBE_Export_File Acorn.topcc
 	BBE_Export_File Acorn.unmodsqz
-	BBE_Export_File Acorn.Vector
-	BBE_Export_File Acorn.Where
 	BBE_Export_File Acorn.xpand
 	${MKDIR} ${BBEDIR}.ToolOptions
 	BBE_Export_File ToolOptions.${APCS}
