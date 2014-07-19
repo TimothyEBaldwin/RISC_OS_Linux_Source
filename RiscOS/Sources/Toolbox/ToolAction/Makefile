@@ -12,98 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for ToolAction
+# Makefile for a Toolbox Object module
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 25-May-94  AMcC         Created.
+# $Id$
 #
+# Component specific options:
+#
+RAMMESSAGES = o.msgs
+
+COMMON_OBJ = o.modhdr o.toolact o.utils
+
+ROM_OBJS = o.mainROM ${COMMON_OBJ}
+
+RAM_OBJS = o.main ${RAMMESSAGES} ${COMMON_OBJ}
+
+DBG_OBJS = od.main ${RAMMESSAGES} o.modhdr od.toolact od.utils
+
+CINCLUDES = -IOS:
+RAM_DEPEND = h.ToolAction h.modhdr
+ROM_DEPEND = h.ToolAction h.modhdr
 
 #
-# Paths
+# Get main rules
 #
-EXP_HDR = <Cexport$dir>
-EXP_HDR1 = <export$dir>.^.Interface2
+include C:tboxlibint.TboxMake
 
 #
-# Generic options:
+# Module specific rules:
 #
-MKDIR   = do mkdir -p
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-WIPE    = x wipe
-XWIPE   = x wipe
-DEFMOD  = DefMod
-MODSQZ  = modsqz
-RESGEN  = resgen
+resources: resources-messages
+	@echo ${COMPONENT}: resource files copied to Messages module
 
-AFLAGS  = -depend !Depend -Stamp -quit
-CFLAGS  = -c -depend !Depend -zM -zps1 -ffah ${INCLUDES} ${DFLAGS} ${THROWBACK} -DNDEBUG
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
+clean: toolbox-clean
+	${RM} h.ToolAction
+	${RM} h.modhdr
+	${RM} hdr.ToolAction
+	${RM} o.ToolAction
+	@echo ${COMPONENT}: cleaned
 
-.SUFFIXES: .oz
-
-#
-# Libraries
-#
-CLIB      = CLIB:o.stubs
-RLIB      = RISCOSLIB:o.risc_oslib
-RSTUBS    = RISCOSLIB:o.rstubs
-ROMSTUBS  = RISCOSLIB:o.romstubs
-ROMCSTUBS = RISCOSLIB:o.romcstubs
-ABSSYM    = RISC_OSLib:o.AbsSym
-OSLIB     = OSLib:o.OSLib
-#
-# Include files
-#
-INCLUDES = -IOS:,C:
-
-#
-# Export Paths for Messages module
-#
-RESDIR = <resource$dir>.Resources2.${COMPONENT}
-
-#
-# Program specific options:
-#
-COMPONENT = ToolAction
-TARGET    = aof.${COMPONENT}
-BASEOBJS  = o.msgs o.utils o.toolact
-
-OBJS	= o.modhdr o.resource o.resdata o.main o.string32 ${BASEOBJS}
-ROMOBJS	= oz.modhdr oz.main oz.string32 ${BASEOBJS}
-
-EXPORTS   = h.ToolAction hdr.ToolAction o.ToolAction
-
-#
-# Rule patterns
-#
-.c.o:;      ${CC} ${CFLAGS} -o $@ $< -DROM=0
-.c.oz:;     ${CC} ${CFLAGS} -o $@ $< -DROM=1
-.cmhg.o:;   ${CMHG} -p -o $@ $< h.$* -DROM=0
-.cmhg.oz:;  ${CMHG} -p -o $@ $< h.$* -DROM=1
-.cmhg.h:;   ${CMHG} -p -o null:o.$* $< $@ -DROM=0
-.s.o:;      ${AS} ${AFLAGS} $< $@  -Predefine "ROM SETL {FALSE}"
-.s.oz:;     ${AS} ${AFLAGS} $< $@  -Predefine "ROM SETL {TRUE}"
-
-#
-# build a relocatable module:
-#
-all: rm.${COMPONENT}
-
-#
-# component build rules
-#
-
-defs: h.ToolAction hdr.ToolAction o.ToolAction
+export: h.ToolAction hdr.ToolAction o.ToolAction
+	${MKDIR} <cexport$dir>.h
+	${MKDIR} <cexport$dir>.o
+	${MKDIR} <export$dir>.Interface2
+	${CP} h.ToolAction   <cexport$dir>.h.ToolAction ${CPFLAGS}
+	${CP} o.ToolAction   <cexport$dir>.o.ToolAction ${CPFLAGS}
+	${CP} hdr.ToolAction <export$dir>.ToolAction    ${CPFLAGS}
+	@echo ${COMPONENT}: export complete
 
 h.ToolAction: Documents.def.ToolAction
 	${DEFMOD} -h > h.ToolAction < Documents.def.ToolAction
@@ -113,74 +67,9 @@ hdr.ToolAction: Documents.def.ToolAction
 
 o.ToolAction: Documents.def.ToolAction
 	${DEFMOD} -l -o DefMod < Documents.def.ToolAction
-	LibFile -c -o o.ToolAction -via viafile
+	${AR} -c -o o.ToolAction -via viafile
 	${RM} viafile
-	${WIPE} Defmod ~cr
+	${WIPE} Defmod ${WFLAGS}
 
-#
-# RISC OS ROM build rules:
-#
-rom: ${TARGET}
-	@echo ${COMPONENT}: rom module built
-
-export: ${EXPORTS}
-	${MKDIR} ${EXP_HDR}.h
-	${MKDIR} ${EXP_HDR}.o
-	${MKDIR} ${EXP_HDR1}
-	${CP} h.ToolAction ${EXP_HDR}.h.ToolAction ${CPFLAGS}
-	${CP} hdr.ToolAction ${EXP_HDR1}.ToolAction ${CPFLAGS}
-	${CP} o.ToolAction ${EXP_HDR}.o.ToolAction ${CPFLAGS}
-	@echo ${COMPONENT}: export complete
-
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom module installed
-
-install: rm.${COMPONENT}
-	${MKDIR} ${INSTDIR}
-	${CP} rm.${COMPONENT} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: installed
-
-clean:
-	${XWIPE} o.* ${WFLAGS}
-	${XWIPE} oz.* ${WFLAGS}
-	${XWIPE} rm.* ${WFLAGS}
-	${XWIPE} linked.* ${WFLAGS}
-	${RM} ${TARGET}
-	${RM} h.toolaction
-	${RM} hdr.toolaction
-	${RM} h.modhdr
-	@echo ${COMPONENT}: cleaned
-
-resources: LocalRes:Messages
-	${MKDIR} ${RESDIR}
-	TokenCheck LocalRes:Messages
-	${CP} LocalRes:Messages ${RESDIR}.Messages ${CPFLAGS}
-	@echo ${COMPONENT}: resource files copied to Messages module
-
-#
-# ROM target (re-linked at ROM Image build time)
-#
-${TARGET}: ${ROMOBJS} ${ROMCSTUBS} ${OSLIB}
-	${LD} -o $@ -aof ${ROMOBJS} ${ROMCSTUBS} ${OSLIB}
-#
-# Final link for the ROM Image (using given base address)
-#
-rom_link:
-	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${TARGET} ${ABSSYM}
-	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom_link complete
-
-rm.${COMPONENT}: ${OBJS} ${OSLIB}
-	${LD} -o $@ -module ${OBJS} ${OSLIB} ${CLIB}
-	${MODSQZ} $@
-	Access $@ WR/R
-
-o.msgs oz.msgs o.resource oz.resource o.toolact oz.toolact: h.ToolAction
-
-o.main oz.main: h.modhdr
-
-o.resdata: LocalRes:Messages
-	${RESGEN} toolaction_resources $@ LocalRes:Messages Resources.ToolAction.Messages
-
+#---------------------------------------------------------------------------
 # Dynamic dependencies:
