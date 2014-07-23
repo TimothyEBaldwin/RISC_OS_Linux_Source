@@ -94,7 +94,7 @@ install: ${FILES}
 	 ${CP} ${LDIR}.!Help      ${INSTDIR}.${APP}.!Help      ${CPFLAGS}
 	 ${CP} ${RDIR}.!Run       ${INSTDIR}.${APP}.!Run       ${CPFLAGS}
 	 ${CP} ${RDIR}.!RunImage  ${INSTDIR}.${APP}.!RunImage  ${CPFLAGS} 
-	 ${CP} ${LDIR}.Messages   ${INSTDIR}.${APP}.Messages   ${CPFLAGS}
+	 ${INSERTVERSION} ${LDIR}.Messages > ${INSTDIR}.${APP}.Messages
 	 ${CP} ${LDIR}.Res        ${INSTDIR}.${APP}.Res        ${CPFLAGS}
 	 ${CP} ${RDIR}.!Sprites   ${INSTDIR}.${APP}.!Sprites   ${CPFLAGS}
 	 ${CP} ${RDIR}.!Sprites22 ${INSTDIR}.${APP}.!Sprites22 ${CPFLAGS}
@@ -108,7 +108,7 @@ resources:
 	${CP} ${RDIR}.ROM.!Run      ${RESAPP}.!Run      ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Boot     ${RESAPP}.!Boot     ${CPFLAGS}
 	${CP} ${LDIR}.Res           ${RESDIR}.Res       ${CPFLAGS}
-	${CP} ${LDIR}.Messages      ${RESDIR}.Messages  ${CPFLAGS}
+	${INSERTVERSION} ${LDIR}.Messages > ${RESDIR}.Messages
 	@${ECHO} ${COMPONENT}: resource files copied to Messages module
 
 clean:
