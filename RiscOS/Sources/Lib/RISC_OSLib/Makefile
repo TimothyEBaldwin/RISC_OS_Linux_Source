@@ -61,9 +61,9 @@ XTENT   = ${PERL} build:xtentries >
 
 DIFF    = gnu.diff -df >null:
 
-AFLAGS  = -depend !Depend
+AFLAGS  = ${STDTOOLOPTIONS}
 # The zz switch stops library static data being placed in a zero-init area
-CFLAGS  = -c -depend !Depend ${INCLUDES} -DDDE -fK -zz10000000 -jC:
+CFLAGS  = -c ${STDTOOLOPTIONS} ${INCLUDES} -DDDE -fK -zz10000000 -jC:
 CPFLAGS = ~cfr~v
 WFLAGS  = ~c~r~v
 
@@ -596,31 +596,31 @@ lib.riscoslibm: ${RLIB_MOD_OBJS}
 	${AR} ${LIBFLAGS} $@ ${RLIB_MOD_OBJS}
 
 o.cl_stub_r: clib.s.cl_stub_r
-	${AS} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
 
 o.cl_stub2_r: clib.s.cl_stub2_r
-	${AS} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
 
 o.k_stub2_r: kernel.s.k_stub2_r
-	${AS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
 
 m_o.cl_stub_m: clib.s.cl_stub_m
-	${AS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
 
 o_rl.rl_stub_r: rlib.s.rl_stub_r
-	${AS} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
 
 rm_o.cl_stub_rm: clib.s.cl_stub_rm
-	${AS} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
 
 rm_o.cl_stub2_rm: clib.s.cl_stub2_rm
-	${AS} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
 
 rm_o.k_stub2_rm: kernel.s.k_stub2_rm
-	${AS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
 
 rm_o_rl.rl_stub_rm: rlib.s.rl_stub_rm
-	${AS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
 
 lib.stubs: o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
 	${AR} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
