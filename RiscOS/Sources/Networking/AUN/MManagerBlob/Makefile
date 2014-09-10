@@ -25,5 +25,6 @@ rom_link: rom_link-${TARGET}
 
 
 resources-MManager-UK:
-	@| End of resource export for locale UK
-
+	${MKDIR} ${RESDIR}.${TARGET}
+	${TOKENCHECK} LocalRes:Messages
+	${CP} LocalRes:Messages ${RESDIR}.${TARGET}.Messages ${CPFLAGS}
