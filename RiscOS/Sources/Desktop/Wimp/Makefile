@@ -36,7 +36,7 @@ COMPONENT = WindowManager
 TARGET   ?= Wimp
 HEADER1   = ${TARGET}
 HEADER2   = WimpSpace
-RESOURCES = manual
+CUSTOMRES = custom
 
 SA_FLAGS  =
 ASFLAGS   = -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
