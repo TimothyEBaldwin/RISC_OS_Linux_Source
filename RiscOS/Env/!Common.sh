@@ -35,7 +35,7 @@ elif [ "$APCS" == "APCS-32" ]; then
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -memaccess -L22-S22+L41"
 		OBJASM_TOOLOPTIONS="-APCS 3/32bit"
 		;;
-	'Any32')
+	'All32')
 		GCC_TOOLOPTIONS="-march=armv3 -mfpu=fpe3"
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 3 -memaccess -L22-S22-L41"
 		OBJASM_TOOLOPTIONS="-APCS 3/32bit -cpu 3"
@@ -47,18 +47,23 @@ elif [ "$APCS" == "APCS-32" ]; then
 		;;
 	'Tungsten')
 		GCC_TOOLOPTIONS="-march=armv5te -mfpu=fpe3"
-		NCC_TOOLOPTIONS="-cpu 5TE -memaccess +L22+S22+L41"
+		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 5TE -memaccess +L22+S22+L41"
 		OBJASM_TOOLOPTIONS="-APCS 3/32bit -cpu 5TE"
 		;;
+        'ARM11ZF')
+                GCC_TOOLOPTIONS="-march=armv6 -mfpu=fpe3"
+                NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 6 -memaccess +L22+S22-L41"
+                OBJASM_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 6Z --fpu VFPv2"
+                ;;
 	'CortexA8')
 		GCC_TOOLOPTIONS="-march=armv6 -mfpu=fpe3"
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 6 -memaccess +L22+S22-L41"
-		OBJASM_TOOLOPTIONS="-APCS 3/32bit -cpu 5TEJ"
+		OBJASM_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu Cortex-A8"
 		;;
 	'CortexA9')
 		GCC_TOOLOPTIONS="-march=armv6 -mfpu=fpe3"
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 6 -memaccess +L22+S22-L41"
-		OBJASM_TOOLOPTIONS="-APCS 3/32bit -cpu 5TEJ"
+		OBJASM_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu Cortex-A9"
 		;;
 	*)
 		GCC_TOOLOPTIONS="-march=armv2 -mfpu=fpe3"
