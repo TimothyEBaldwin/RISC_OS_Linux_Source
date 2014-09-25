@@ -14,65 +14,30 @@
 #
 # Makefile for FSLock
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 25-May-94  AMcC         Created.
-#
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
-
-#
-# Generic options:
-#
-MKDIR   = cdir
-AS      = aasm
-CP      = copy
-RM      = remove
-CCFLAGS = -c -depend !Depend -IC:
-ASFLAGS = -depend !Depend -Stamp -quit -module -To $@ -From
-CPFLAGS = ~cfr~v
-
-#
-# Program specific options:
-#
 COMPONENT = FSLock
-SOURCE    = FSLockSRC
-TARGET    = rm.FSLock           # Warning! - target path is wired into the source
-EXPORTS   = ${EXP_HDR}.FSLock
+HEADER1   = FSLock
+CUSTOMROM = custom
 
-#
-# Generic rules:
-#
-rom: ${TARGET}
-	@echo AMU: warning - Hard coded SWI XOS_SynchroniseCodeAreas
-	@echo ${COMPONENT}: rom module built
+include StdTools
+include AAsmModule
 
-export: ${EXPORTS}
-	@echo ${COMPONENT}: export complete
+rom_common: ${ROM_MODULE} scrambler
+	${RUN}scrambler ${ROM_MODULE}
 
-install_rom: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom module installed
+rom: rom_common
+	@${ECHO} ${COMPONENT}: rom module built & scrambled
 
-clean:
-	${RM} ${TARGET}
-	@echo ${COMPONENT}: cleaned
+install_rom: rom_common
+	${CP} ${ROM_MODULE} ${INSTDIR}.${TARGET} ${CPFLAGS}
+	${CP} ${ROM_MODULE}_gpa ${INSTDIR}.${TARGET}_gpa ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: rom module installed
 
-resources:
-	${MKDIR} ${RESDIR}.${COMPONENT}
-	${CP} Resources.${LOCALE}.Messages  ${RESDIR}.${COMPONENT}.Messages  ${CPFLAGS}
-	@echo ${COMPONENT}: resource files copied
+clean::
+	${XWIPE} od ${WFLAGS}
+	${RM} scrambler
 
-${TARGET}: ${SOURCE}
-	Run FSLockSrc
-
-${EXP_HDR}.${COMPONENT}: hdr.${COMPONENT}
-	${CP} hdr.${COMPONENT} $@ ${CPFLAGS}
+scrambler: scrambler.c
+	${MAKE} -f scrambler/mk THROWBACK=${THROWBACK}
 
 # Dynamic dependencies:
