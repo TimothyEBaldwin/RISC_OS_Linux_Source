@@ -99,13 +99,13 @@ ${ROM_MODULE}: VersionNum ${RESFILES}
 	${DO} ${MODGEN} -date "<Chars$Date>" ${ROM_MODULE} !Chars !Chars <Chars$BuildV> Resources.!RunImage Resources.Chars.!RunImage
 
 ${RDIR}.!RunImage: crunched.!RunImage
-	${SQUISH} ${SQFLAGS} -from crunched.!RunImage -to $@
+	${SQUISH} ${SQUISHFLAGS} -from crunched.!RunImage -to $@
 
 crunched.!RunImage: bas.!RunImage
 	${RUN}crunch.!RunImage; BASIC
 
 ${LDIR}.!RunLink: bas.!RunLink
-	${SQUISH} ${SQFLAGS} -from bas.!RunLink -to $@
+	${SQUISH} ${SQUISHFLAGS} -from bas.!RunLink -to $@
 
 BBETYPE = chars
 bbe-chars: bbe-generic
