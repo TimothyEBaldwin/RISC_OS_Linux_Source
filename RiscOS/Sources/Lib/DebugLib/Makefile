@@ -60,7 +60,8 @@ ROMSTUBS	= RISCOSLIB:o.romstubs
 ROMCSTUBS	= RISCOSLIB:o.romcstubs
 ABSSYM		= RISC_OSLib:o.AbsSym
 
-REMOTEDBLIB	= $(LIBDIR).debug.o.lremote
+REMOTEDBLIB	= $(LIBDIR).remotedb.o.remotedb
+REMOTEDBLIBZM	= $(LIBDIR).remotedb.o.remotedbzm
 PDEBUG		= $(LIBDIR).PDebug.o.Lib
 PDEBUGZM	= $(LIBDIR).PDebug.o.Lib_M
 TRACELIB	= $(LIBDIR).Trace.o.Trace
@@ -203,7 +204,7 @@ LIBS = \
 LIBSZ = \
  $(PDEBUGZM)\
  $(TRACELIBZM)\
- $(REMOTEDBLIB)zm\
+ $(REMOTEDBLIBZM)\
 
 # ------------------------------------------------------------------------------
 # Rule patterns
