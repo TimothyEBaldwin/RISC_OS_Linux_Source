@@ -4,6 +4,18 @@
 #
 include StdTools
 
+COMPONENT ?= BuildSys
+INSTDIR   ?= <Install$Dir>
+INSTTYPE  ?= Makefiles
+
+install_Makefiles:
+	${MKDIR} ${INSTDIR}
+	${CP} Makefiles  ${INSTDIR}.Makefiles         ${CPFLAGS}
+	${CP} VersionNum ${INSTDIR}.Makefiles.Version ${CPFLAGS}
+
+install: install_${INSTTYPE}
+	@${ECHO} ${COMPONENT}: installed ${INSTTYPE}
+
 BBETYPE = buildsys
 bbe-buildsys: bbe-generic-resources-get-alias
 	BBE_Export_Dir ImageName
