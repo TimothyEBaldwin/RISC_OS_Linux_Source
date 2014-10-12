@@ -2,20 +2,31 @@
 # Binary Build Environment Makefile
 #
 # The Library needs to participate in the generation of the BBE by exporting
-# those tools required by the BBE.
+# those tools required by the BBE. It is also a part of the DDE (CTools) build.
 #
 COMPONENT = Library
+TYPE     ?= ${INSTTYPE}
 
 include StdTools
 
 install: install_${TYPE}
 	@echo ${COMPONENT}: Install phase complete (${TYPE}).
 
+install_Dir:
+	${MKDIR} ${INSTDIR}
+
 install_:
 	${NOP}
 
-install_STB:
-	${MKDIR} ${INSTDIR}
+install_DDE: install_Dir
+	${MKDIR} ${INSTDIR}.Build
+	${CP} Build.canonical  ${INSTDIR}.canonical     ${CPFLAGS}
+	${CP} Build.stripdepnd ${INSTDIR}.stripdepnd    ${CPFLAGS}
+	${CP} Unix.chmod       ${INSTDIR}.chmod         ${CPFLAGS}
+	${CP} Unix.mkdir       ${INSTDIR}.mkdir         ${CPFLAGS}
+	${CP} Build.InstRes    ${INSTDIR}.Build.InstRes ${CPFLAGS}
+
+install_STB: install_Dir
 	${CP} Unix.chmod ${INSTDIR}.chmod ${CPFLAGS}
 	${CP} Unix.df    ${INSTDIR}.df    ${CPFLAGS}
 	${CP} Unix.du    ${INSTDIR}.du    ${CPFLAGS}
