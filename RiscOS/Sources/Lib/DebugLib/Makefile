@@ -22,6 +22,7 @@
 EXP_HDR		= <Export$Dir>
 LIBDIR		= <Lib$Dir>
 EXPORT_DIR	= <Lib$Dir>.DebugLib
+INSTDIR		?= <Install$Dir>
 
 
 # ------------------------------------------------------------------------------
@@ -283,6 +284,11 @@ export_dirs:
 	$(MKDIR) $(EXPORT_DIR)
 	$(MKDIR) $(EXPORT_DIR).h
 	$(MKDIR) $(EXPORT_DIR).o
+
+install: export_libs
+	$(MKDIR) $(INSTDIR)
+	${CP}	$(EXPORT_DIR)	$(INSTDIR).$(COMPONENT)		$(CPFLAGS)
+	@echo * $(COMPONENT): install complete
 
 # ------------------------------------------------------------------------------
 # Final link
