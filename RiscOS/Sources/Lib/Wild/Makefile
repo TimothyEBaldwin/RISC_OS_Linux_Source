@@ -43,6 +43,7 @@ COMPONENT	= Wild
 C_DEBUG_ON	= -DDesk_DEBUG
 C_DEBUG_OFF	= -DNDEBUG
 
+INSTDIR		?= <Install$Dir>
 
 
 
@@ -77,7 +78,11 @@ export_libs:
 	@amu -f MainMake $(MFLAGS) $(MAKECMDGOALS) EXTRA_C_FLAGS=$(C_DEBUG_OFF) LIBSUFFIX= EXT=o
 	@amu -f MainMake $(MFLAGS) $(MAKECMDGOALS) EXTRA_C_FLAGS=$(C_DEBUG_OFF) LIBSUFFIX=_M EXT=z
 	@echo $(COMPONENT): export complete (libs)
-	
+
+install:
+	@amu -f MainMake $(MFLAGS) $(MAKECMDGOALS) INSTDIR=$(INSTDIR) TARGET=AvoidAMUBug EXT=AvoidAMUBug
+	@echo $(COMPONENT): install complete
+
 clean:
 	@amu -f MainMake $(MFLAGS) $(MAKECMDGOALS) EXT=o
 	@amu -f MainMake $(MFLAGS) $(MAKECMDGOALS) EXT=z
