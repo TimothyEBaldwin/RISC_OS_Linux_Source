@@ -20,9 +20,10 @@ install_:
 
 install_DDE: install_Dir
 	${MKDIR} ${INSTDIR}.Build
+	${MKDIR} ${INSTDIR}.Unix
 	${CP} Build.canonical  ${INSTDIR}.canonical     ${CPFLAGS}
 	${CP} Build.stripdepnd ${INSTDIR}.stripdepnd    ${CPFLAGS}
-	${CP} Unix.chmod       ${INSTDIR}.chmod         ${CPFLAGS}
+	${CP} Unix.chmod       ${INSTDIR}.Unix.chmod    ${CPFLAGS}
 	${CP} Unix.mkdir       ${INSTDIR}.mkdir         ${CPFLAGS}
 	${CP} Build.InstRes    ${INSTDIR}.Build.InstRes ${CPFLAGS}
 
