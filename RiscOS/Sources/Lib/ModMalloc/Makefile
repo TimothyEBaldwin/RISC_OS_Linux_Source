@@ -17,6 +17,7 @@
 # This is the only project-specific part of this makefile
 #
 COMPONENT	= ModMalloc
+INSTDIR		?= <Install$Dir>
 
 # Copy is used in a number of place in the same way, so we put
 #appropriate flags into a macro:
@@ -63,6 +64,10 @@ export_libs:
 	Copy            @.o.Lib_M <Lib$Dir>.$(COMPONENT).o.Lib_M $(CopyFlags)
 	Echo		Library $(COMPONENT): 'export_libs' finished.
 
+install:
+	do mkdir -p $(INSTDIR)
+	Copy		<Lib$Dir>.$(COMPONENT)	$(INSTDIR).$(COMPONENT)	$(CopyFlags)
+	Echo		Library $(COMPONENT): 'install' finished.
 
 resources:
 	Echo		Library $(COMPONENT): 'resources' finished.
