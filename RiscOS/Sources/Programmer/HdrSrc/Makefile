@@ -38,11 +38,19 @@
 #
 # Paths
 #
-TOPDIR   = <hdr$dir>
+ifeq ("${MAKECMDGOALS}","install")
+INSTDIR ?= <Install$Dir>.Export.<APCS>
+TOPDIR   = ${INSTDIR}.Hdr
 HDRDIR   = ${TOPDIR}.Global
-HDIR     = <CExport$dir>
-LIBDIR   = <Lib$Dir>
-INSTDIR ?= <APCSExport$Dir>
+HDIR     = ${INSTDIR}.C
+LIBDIR   = ${INSTDIR}.Lib
+else
+# i.e. this is an export phase, not install
+TOPDIR  = <hdr$dir>
+HDRDIR  = ${TOPDIR}.Global
+HDIR    = <CExport$dir>
+LIBDIR  = <Lib$Dir>
+endif
 
 include StdTools
 
@@ -142,22 +150,22 @@ EXPORTS   = \
  ${HDIR}.Global.IO.h.GenericIO \
  ${HDIR}.Global.IO.h.IOMD \
 
-INSTALLS   = \
- ${INSTDIR}.Hdr.APCS.APCS-32 \
- ${INSTDIR}.Hdr.APCS.APCS-R \
- ${INSTDIR}.Hdr.APCS.Common \
- ${INSTDIR}.Hdr.CPU.Generic26 \
- ${INSTDIR}.Hdr.CPU.Generic32 \
- ${INSTDIR}.Hdr.ListOpts \
-
 #
 # Generic rules:
 #
 
 export: ${OPTIONS} ${EXPORTS} Dirs
+ifeq ("${OPTIONS}","")
 	@echo ${COMPONENT}: export complete
+else
+	@echo ${COMPONENT}: export complete (${OPTIONS})
+endif
 
 Dirs:
+	@echo TOPDIR ${TOPDIR}
+	@echo HDRDIR ${HDRDIR}
+	@echo HDIR   ${HDIR}
+	@echo LIBDIR ${LIBDIR}
 	${MKDIR} ${HDRDIR}
 	${MKDIR} ${TOPDIR}.Interface
 	${MKDIR} ${TOPDIR}.Interface2
@@ -178,20 +186,19 @@ Dirs:
 	${MKDIR} ${HDIR}.Interface.h
 	${MKDIR} ${LIBDIR}
 
-install: install_Dirs
-	${CP} hdr ${INSTDIR}.Hdr ${CPFLAGS}
-	${ERASECVS} ${INSTDIR}.Hdr
+install: ${OPTIONS} ${EXPORTS} Dirs
+ifeq ("${OPTIONS}","")
 	@echo ${COMPONENT}: installed
-
-install_Dirs:
-	${MKDIR} ${INSTDIR}
+else
+	@echo ${COMPONENT}: installed (${OPTIONS})
+endif
 
 clean:
 	@echo ${COMPONENT}: nothing to clean
 
 #
 # Special rule for exporting all ImageSize, Machine and UserIF files.
-# Trigger by invoking the export with OPTIONS=ALL.
+# Trigger by invoking the export (or install) phase with OPTIONS=ALL.
 #
 ALL: ${HDRDIR}.Machine.Machine ${HDRDIR}.UserIF.UserIF ${HDRDIR}.HALSize.<HALSize> ${HDRDIR}.ImageSize.<ImageSize> ${HDRDIR}.APCS.<APCS>
 	${CP} hdr.Machine ${HDRDIR}.Machine ${CPFLAGS}
