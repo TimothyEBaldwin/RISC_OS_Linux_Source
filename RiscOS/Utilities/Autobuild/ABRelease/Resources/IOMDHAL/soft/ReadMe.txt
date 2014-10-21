@@ -1,42 +1,62 @@
-This is a ROM softloader patch for RiscPC and A7000 machines. It includes a
-development release of the RISC OS ROM image which can be installed into
-your boot sequence as follows:
+Softloader
+==========
+
+This is a ROM softloader patch for RiscPC/A7000/A7000+ machines. 
+
+It includes the softload tool and respective RISC OS ROM image which can be 
+installed into your boot sequence as follows:
+
+* You will need a standard layout !Boot already installed on your computer
+  to try out the softload, the default HardDisc4 distribution includes one
+  suitable for the major ROM releases from RISC OS 3.10, and is available from
+    http://www.riscosopen.org/content/downloads/common
+  follow the instructions inside the archive to install this first.
 
 * Ensure you have an up to date !System containing SharedCLibrary 5.46 or
   later. An updated !System for 26 bit operating systems is available from
-    http://www.riscosopen.org/content/downloads/other-zipfiles
-  follow the instructions inside the archive to install this.
-  Remember that although RISC OS 5 runs in 32 bit mode, the early part of
-  the softloading is on the original 26 bit host operating system. 
+    http://www.riscosopen.org/content/downloads/riscpc
+  follow the instructions inside the archive to install that too.
+
+If you are using RISC OS 3
+--------------------------
 
 * Open your main hard disc (left click on the hard disc iconbar icon)
+
+* Copy the '!Boot' application from this zip file on top of your 
+  existing one, this will add the softloader to your boot time Choices
+
+* Be aware that if your boot application contains RISC OS 3 specific items
+  these will probably not be compatible with RISC OS 5, so additional manual
+  steps may be required to ensure these do not conflict - eg. when first run
+  the !Boot application copies such items into '!Boot.Choices.Boot' to match
+  the ROM operating system
+
+If you are using RISC OS 4 or later
+-----------------------------------
 
 * Run the configure application by left double-clicking '!Boot'
 
 * Left click on the 'Boot' icon to open the "Boot sequence" configuration
-  window
+  window, then left click on 'Install' to open the "Boot Merge" window
 
-* Left click on the 'Install' icon to open the "Boot Merge" window
-
-* Drag the !Boot directory from this zip file to the merge window
+* Drag the '!Boot' application from this zip file to the merge window
 
 * Click on the 'Merge' button to install the softloader
 
-You can now reboot in order to try the latest development version of RISC OS
-for the RiscPC/A7000. You will be prompted when the machine boots as to
-whether you would like to softload or continue booting with your normal
-(installed) version of RISC OS. Press 'y' or 'n' on the keyboard to indicate
-your choice when asked.
+* Be aware that if your boot application contains RISC OS 4 specific items
+  these will probably not be compatible with RISC OS 5, so additional manual
+  steps may be required to ensure these do not conflict - eg. when first run
+  the !Boot application copies such items into '!Boot.Choices.Boot' to match
+  the ROM operating system
 
-Please note: this is a development release of the operating system and is
-supplied in an entirely untested state. The softload tool is also largely
-untested at present so please send a report of any problems you encounter to
-info@riscosopen.org.
+Restarting
+----------
 
-For a list of known issues with this ROM image, please see the ROOL wiki:
-
-http://www.riscosopen.org/wiki/documentation/show/Software%20information:%20IOMD%20ROM
-
+You can now reboot in order to try out this version of RISC OS.
+You will be prompted when the machine boots as to whether you
+would like to softload or continue booting with your ROM installed (in the 
+ROM chip on the motherboard) version of RISC OS.
+Press 'y' or 'n' on the keyboard to indicate your choice when asked.
 
 Thanks!
 
