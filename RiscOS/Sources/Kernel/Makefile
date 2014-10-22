@@ -16,7 +16,14 @@
 #
 
 COMPONENT       = Kernel
+
+ifeq (${MAKECMDGOALS},install)
+EXP_HDR         = ${INSTDIR}.Hdr.Interface
+C_EXP_HDR       = ${INSTDIR}.C.Global.h
+else
 C_EXP_HDR       = <cexport$dir>.Global.h
+endif
+
 TOKHELPSRC      = ${TOKENSOURCE}
 HELPSRC         = HelpStrs
 ROM_SOURCE      = GetAll.s
@@ -47,6 +54,8 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${C_EXP_HDR}.VduExt \
                   ${C_EXP_HDR}.VIDCList
 
+CUSTOMSA=custom
+
 include StdTools
 include AAsmModule
 
@@ -65,6 +74,13 @@ install_rom: ${KERNEL_MODULE}
 	${CP} ${KERNEL_MODULE} ${INSTDIR}${SEP}${TARGET} ${CPFLAGS}
 	${CP} ${KERNEL_MODULE}_gpa ${INSTDIR}${SEP}${TARGET}_gpa ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: rom module installed
+
+inst_dirs:
+	${MKDIR} ${EXP_HDR}
+	${MKDIR} ${C_EXP_HDR}
+
+install: ${EXPORTS} inst_dirs
+	@${ECHO} ${COMPONENT}: header files installed
 
 ${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS} 
 	${MKDIR} bin
