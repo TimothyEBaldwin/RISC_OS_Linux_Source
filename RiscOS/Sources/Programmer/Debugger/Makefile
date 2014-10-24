@@ -68,9 +68,9 @@ ifeq ("${COMPONENT}","Debugger")
 include CModule
 
 # We don't want to link to CLib
-CLIB =
-ROMCSTUBS =
-ABSSYM =
+ROM_LIBS =
+SA_LIBS  =
+ROM_SYMS =
 
 CFLAGS += -apcs /nofp
 else
