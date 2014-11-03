@@ -31,7 +31,7 @@
 COMPONENT  = MD5
 INSTTYPE   = app
 OBJS       = md5 md5c mdXhl
-LIBS       = ${UNIXLIB} ${SOCK5LIB}
+LIBS       = ${UNIXLIB}
 CINCLUDES  = -ITCPIPLibs:,C:
 CDEFINES   = -DRISCOS_TWEAK
 
