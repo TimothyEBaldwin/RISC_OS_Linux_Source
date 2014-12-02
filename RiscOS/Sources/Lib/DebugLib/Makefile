@@ -63,8 +63,8 @@ ABSSYM		= RISC_OSLib:o.AbsSym
 
 REMOTEDBLIB	= $(LIBDIR).remotedb.o.remotedb
 REMOTEDBLIBZM	= $(LIBDIR).remotedb.o.remotedbzm
-PDEBUG		= $(LIBDIR).PDebug.o.Lib
-PDEBUGZM	= $(LIBDIR).PDebug.o.Lib_M
+PDEBUG		= $(LIBDIR).PDebug.o.PDebug
+PDEBUGZM	= $(LIBDIR).PDebug.o.PDebugzm
 TRACELIB	= $(LIBDIR).Trace.o.Trace
 TRACELIBZM	= $(LIBDIR).Trace.o.Trace_M
 
