@@ -19,11 +19,21 @@ COMPONENT   = AUNMsgs
 MODULE_HELP = "AUN Messages"
 FILELIST    = Resources${SEP}${LOCALE}${SEP}${SYSTEM}
 CUSTOMROM   = custom
+CUSTOMSA    = custom
+CUSTOMRES   = no
 AUN_DIRS    = rm${SEP}${MACHINE}
 AUN_MODULE  = ${AUN_DIRS}${SEP}AUNMsgMod
 
 include StdTools
 include AAsmModule
+
+standalone: ${AUN_MODULE}
+	@${ECHO} ${COMPONENT}: standalone module built
+
+install: ${AUN_MODULE}
+	${MKDIR} ${INSTDIR}
+	${CP} ${AUN_MODULE} ${INSTDIR}${SEP}${TARGET} ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: standalone module installed
 
 rom: ${AUN_MODULE}
 	@${ECHO} ${COMPONENT}: rom module built
