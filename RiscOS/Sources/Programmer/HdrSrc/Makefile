@@ -95,6 +95,7 @@ EXPORTS   = \
  ${HDRDIR}.MEMM.MEMC1 \
  ${HDRDIR}.MEMM.VMSAv6 \
  ${HDRDIR}.Machine.<Machine> \
+ ${HDRDIR}.Machine.All \
  ${HDRDIR}.Machine.All32 \
  ${HDRDIR}.Machine.Machine \
  ${HDRDIR}.Macros \
@@ -281,6 +282,7 @@ ${HDIR}.Global.h.IOCtl:      h.IOCtl;               ${CP} h.IOCtl               
 
 # Machine/UI/hardware specific headers:
 ${HDRDIR}.Machine.<Machine>: hdr.Machine.<Machine>; ${CP} hdr.Machine.<Machine>    $@ ${CPFLAGS}
+${HDRDIR}.Machine.All:       hdr.Machine.All;       ${CP} hdr.Machine.All          $@ ${CPFLAGS}
 ${HDRDIR}.Machine.All32:     hdr.Machine.All32;     ${CP} hdr.Machine.All32        $@ ${CPFLAGS}
 ${HDRDIR}.Machine.Machine:   hdr.Machine.Machine;   ${CP} hdr.Machine.Machine      $@ ${CPFLAGS}
 ${HDRDIR}.HALSize.<HALSize>: hdr.HALSize.<HALSize>; ${CP} hdr.HALSize.<HALSize>    $@ ${CPFLAGS}
