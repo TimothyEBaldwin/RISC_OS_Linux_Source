@@ -29,9 +29,11 @@ ${RESOURCEEXTRA}: VFPData
 	${MKDIR} ${RESFSDIR}
 	${CP} VFPData $@ ${CPFLAGS}
 
-VFPData: VFPLib.VFPLib VFPLib.GenData
-	${MKDIR} o
+s.VFPData: VFPLib.VFPLib VFPLib.GenData
 	BASIC { < VFPLib.GenData }
+
+VFPData: s.VFPData
+	${MKDIR} o
 	${AS} ${ASFLAGS} -PD "BuildingVFPData SETL {TRUE}" -o o.VFPData s.VFPData
 	${LD} -BIN -o $@ o.VFPData
 
