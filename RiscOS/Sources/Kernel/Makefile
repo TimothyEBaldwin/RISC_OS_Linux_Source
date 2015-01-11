@@ -32,25 +32,26 @@ ASFLAGS         = -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
+                  ${EXP_HDR}.GPIODevice \
+                  ${EXP_HDR}.HALDevice \
+                  ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
+                  ${EXP_HDR}.OSEntries \
+                  ${EXP_HDR}.OSRSI6 \
+                  ${EXP_HDR}.PL310 \
                   ${EXP_HDR}.PublicWS \
                   ${EXP_HDR}.RISCOS \
                   ${EXP_HDR}.Variables \
                   ${EXP_HDR}.VduExt \
-                  ${EXP_HDR}.HALEntries \
-                  ${EXP_HDR}.HALDevice \
-                  ${EXP_HDR}.VideoDevice \
-                  ${EXP_HDR}.GPIODevice \
-                  ${EXP_HDR}.OSEntries \
-                  ${EXP_HDR}.OSRSI6 \
                   ${EXP_HDR}.VIDCList \
-                  ${C_EXP_HDR}.ModHand \
-                  ${C_EXP_HDR}.RISCOS \
-                  ${C_EXP_HDR}.HALEntries \
+                  ${EXP_HDR}.VideoDevice \
                   ${C_EXP_HDR}.HALDevice \
+                  ${C_EXP_HDR}.HALEntries \
+                  ${C_EXP_HDR}.ModHand \
                   ${C_EXP_HDR}.OSEntries \
-                  ${C_EXP_HDR}.Variables \
                   ${C_EXP_HDR}.OSRSI6 \
+                  ${C_EXP_HDR}.RISCOS \
+                  ${C_EXP_HDR}.Variables \
                   ${C_EXP_HDR}.VduExt \
                   ${C_EXP_HDR}.VIDCList
 
@@ -96,9 +97,27 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
 	${CP} hdr.EnvNumbers $@ ${CPFLAGS}
+	
+${EXP_HDR}.GPIODevice: hdr.GPIODevice
+	${CP} hdr.GPIODevice $@ ${CPFLAGS}
+	
+${EXP_HDR}.HALDevice: hdr.HALDevice
+	${CP} hdr.HALDevice $@ ${CPFLAGS}
+	
+${EXP_HDR}.HALEntries: hdr.HALEntries
+	${CP} hdr.HALEntries $@ ${CPFLAGS}
 
 ${EXP_HDR}.ModHand: hdr.ModHand
 	${CP} hdr.ModHand $@ ${CPFLAGS}
+	
+${EXP_HDR}.OSEntries: hdr.OSEntries
+	${CP} hdr.OSEntries $@ ${CPFLAGS}
+	
+${EXP_HDR}.OSRSI6: hdr.OSRSI6
+	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
+
+${EXP_HDR}.PL310: hdr.PL310
+	${CP} hdr.PL310 $@ ${CPFLAGS}
 
 ${EXP_HDR}.PublicWS: hdr.PublicWS
 	${CP} hdr.PublicWS $@ ${CPFLAGS}
@@ -106,62 +125,47 @@ ${EXP_HDR}.PublicWS: hdr.PublicWS
 ${EXP_HDR}.RISCOS: hdr.RISCOS
 	${CP} hdr.RISCOS $@ ${CPFLAGS}
 
+${EXP_HDR}.Variables: hdr.Variables
+	${CP} hdr.Variables $@ ${CPFLAGS}
+
 ${EXP_HDR}.VduExt: hdr.VduExt
 	${CP} hdr.VduExt $@ ${CPFLAGS}
 
-${EXP_HDR}.Variables: hdr.Variables
-	${CP} hdr.Variables $@ ${CPFLAGS}
-	
-${EXP_HDR}.HALEntries: hdr.HALEntries
-	${CP} hdr.HALEntries $@ ${CPFLAGS}
-	
-${EXP_HDR}.HALDevice: hdr.HALDevice
-	${CP} hdr.HALDevice $@ ${CPFLAGS}
-	
-${EXP_HDR}.OSEntries: hdr.OSEntries
-	${CP} hdr.OSEntries $@ ${CPFLAGS}
+${EXP_HDR}.VIDCList: hdr.VIDCList
+	${CP} hdr.VIDCList $@ ${CPFLAGS}
 	
 ${EXP_HDR}.VideoDevice: hdr.VideoDevice
 	${CP} hdr.VideoDevice $@ ${CPFLAGS}
-	
-${EXP_HDR}.GPIODevice: hdr.GPIODevice
-	${CP} hdr.GPIODevice $@ ${CPFLAGS}
-	
-${EXP_HDR}.OSRSI6: hdr.OSRSI6
-	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
-	
-${EXP_HDR}.VIDCList: hdr.VIDCList
-	${CP} hdr.VIDCList $@ ${CPFLAGS}
 
-${C_EXP_HDR}.ModHand: hdr.ModHand
-	${MKDIR} ${C_EXP_HDR}
-	${HDR2H} hdr.ModHand $@
-
-${C_EXP_HDR}.RISCOS: hdr.RISCOS
-	${MKDIR} ${C_EXP_HDR}
-	${HDR2H} hdr.RISCOS $@
+${C_EXP_HDR}.HALDevice: Global.h.HALDevice h.HALDevice
+	${FAPPEND} $@ h.HALDevice Global.h.HALDevice
 
 ${C_EXP_HDR}.HALEntries: hdr.HALEntries
 	${MKDIR} ${C_EXP_HDR}
 	${HDR2H} hdr.HALEntries $@
 
-${C_EXP_HDR}.Variables: hdr.Variables
+${C_EXP_HDR}.ModHand: hdr.ModHand
 	${MKDIR} ${C_EXP_HDR}
-	${HDR2H} hdr.Variables $@
+	${HDR2H} hdr.ModHand $@
+
+${C_EXP_HDR}.OSEntries: Global.h.OSEntries h.OSEntries
+	${FAPPEND} $@ h.OSEntries Global.h.OSEntries
 
 ${C_EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${MKDIR} ${C_EXP_HDR}
 	${HDR2H} hdr.OSRSI6 $@
 
+${C_EXP_HDR}.RISCOS: hdr.RISCOS
+	${MKDIR} ${C_EXP_HDR}
+	${HDR2H} hdr.RISCOS $@
+
+${C_EXP_HDR}.Variables: hdr.Variables
+	${MKDIR} ${C_EXP_HDR}
+	${HDR2H} hdr.Variables $@
+
 ${C_EXP_HDR}.VduExt: hdr.VduExt
 	${MKDIR} ${C_EXP_HDR}
 	${HDR2H} hdr.VduExt $@
-
-${C_EXP_HDR}.HALDevice: Global.h.HALDevice h.HALDevice
-	${FAPPEND} $@ h.HALDevice Global.h.HALDevice
-
-${C_EXP_HDR}.OSEntries: Global.h.OSEntries h.OSEntries
-	${FAPPEND} $@ h.OSEntries Global.h.OSEntries
 
 ${C_EXP_HDR}.VIDCList: Global.h.VIDCList h.VIDCList
 	${FAPPEND} $@ h.VIDCList Global.h.VIDCList
