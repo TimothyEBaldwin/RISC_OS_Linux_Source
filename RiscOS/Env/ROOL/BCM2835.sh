@@ -8,7 +8,7 @@
 
 export LOCALE=UK
 export KEYBOARD=All
-export MACHINE=ARM11ZF
+export MACHINE=RPi
 export SYSTEM=Ursula
 export USERIF=Raspberry
 export DISPLAYTYPE=PAL
