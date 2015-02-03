@@ -31,7 +31,7 @@
 # Use machine type to determine whether support code is needed
 # Can also be overridden on command line by specifying SUPPORTCODE
 DEFSUPPORTCODE = FALSE
-ifneq (,$(findstring ${MACHINE},All All32 ARM11ZF))
+ifneq (,$(findstring ${MACHINE},All All32 ARM11ZF RPi))
 DEFSUPPORTCODE = TRUE
 endif
 
