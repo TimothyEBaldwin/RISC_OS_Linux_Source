@@ -30,9 +30,11 @@
 
 # Use machine type to determine whether support code is needed
 # Can also be overridden on command line by specifying SUPPORTCODE
-DEFSUPPORTCODE = FALSE
-ifneq (,$(findstring ${MACHINE},All All32 ARM11ZF RPi))
+# Assuming we're targeting a machine capable of VFP, Cortex-A8 is currently the
+# only machine type which doesn't need any support code at all 
 DEFSUPPORTCODE = TRUE
+ifneq (,$(findstring ${MACHINE},CortexA8))
+DEFSUPPORTCODE = FALSE
 endif
 
 SUPPORTCODE ?= ${DEFSUPPORTCODE}

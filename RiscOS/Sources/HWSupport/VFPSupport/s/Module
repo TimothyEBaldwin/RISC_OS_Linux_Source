@@ -81,18 +81,16 @@ ActiveContext         # 4 ; Context that's actually active
 LazyContext           # 4 ; Context awaiting lazy activation (==ActiveContext if none)
 NumVFPRegs            # 1 ; Number of doubleword regs available on this hardware
 ARMVersion            # 1 ; ARM architecture version from MIDR. <7=ARMv5, 7=ARMv6, &F=ARMv6/ARMv7
-VFPVersion            # 1 ; VFP subarchitecture field from FPSID
+VFPSubarch            # 1 ; VFP subarchitecture field from FPSID
 CPEnabledFlag         # 1 ; 255 if CP access is enabled, 0 if disabled
 OldHandler            # 4 ; Original undefined instruction handler
 UndefinedHandler      # 4 ; Undefined instruction handler code
 LazyHandler           # 8*4 ; Code to call the lazy handler
- [ SupportCode
-SupportHandler        # 7*4 ; Code to call the support code
-VFPSupportCodePtr     # 4 ; Pointer to arch-specific support code implementation
- ]
 ChangeContext         # 4 ; Address of SWI_ChangeContext
 CurrentRoutine        # 4 ; OldHandler, LazyHandler, or SupportHandler
  [ SupportCode
+VFPSupportCodePtr     # 4 ; Pointer to arch-specific support code implementation
+SupportHandler        # 12*4 ; Code to call the support code
 SupportHandlerPtr     # 4 ; SupportHandler if arch needs support code, else OldHandler 
 CRelocOffset          # 4 ; C relocation offset
 BadClasses            # 4 ; Instruction class flags which indicate it's not a valid VFP instruction
@@ -105,6 +103,13 @@ ExceptionDump         # :INDEX:Context_RegDump+MaxDRegs*8
                       
 WSSize                * :INDEX: @
 
+; VFPSubarch values
+Subarch_VFPv1_IMP     * 0 ; VFPv1 arch with implementation defined subarch
+Subarch_VFPv2_v1Sub   * 1 ; VFPv2 arch with v1 common subarch (ARM1176JZF-S)
+Subarch_VFPv3_v2Sub   * 2 ; >=VFPv3 arch with v2 common subarch (Cortex-A7)
+Subarch_VFPv3_NoSub   * 3 ; >=VFPv3 arch with no subarch (Cortex-A8, Cortex-A9)
+Subarch_VFPv3_v3Sub   * 4 ; >=VFPv3 arch with v3 common subarch (Cortex-A15)
+
 
 ; Undefined instruction handler code - gets copied into workspace
 UndefinedHandlerTemplate
@@ -112,7 +117,8 @@ UndefinedHandlerTemplate
 RelocOffset * UndefinedHandlerTemplate-:INDEX:UndefinedHandler
 
         LDR     pc, RelocOffset+:INDEX:CurrentRoutine ; Branch to address in CurrentRoutine
-        SUB     lr, lr, #4              ; LazyHandler starts here
+        ; LazyHandler starts here
+        SUB     lr, lr, #4
         STMDB   r13!,{r0-r1,wp,lr}
         ADR     wp, RelocOffset         ; Get wp
         MOV     r1, #0
@@ -125,18 +131,45 @@ UndefinedHandlerTemplateEnd
         ASSERT  LazyHandler-UndefinedHandler+?LazyHandler = UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate
 
  [ SupportCode
+RelocOffsetSup * SupportHandlerTemplate-:INDEX:SupportHandler
+
 SupportHandlerTemplate
         Push    "r12"
         myVMRS  ,r12,FPEXC
         TST     r12, #FPEXC_EX+FPEXC_DEX
-        ADRNE   r12, RelocOffset        ; Get wp
-        LDRNE   pc, RelocOffset+:INDEX:VFPSupportCodePtr ; Call the support code
+        ADRNE   r12, RelocOffsetSup        ; Get wp
+        LDRNE   pc, RelocOffsetSup+:INDEX:VFPSupportCodePtr ; Call the support code
         Pull    "r12"
-        LDR     pc, RelocOffset+:INDEX:OldHandler ; Not a VFP exception, pass on to next handler
+        LDR     pc, RelocOffsetSup+:INDEX:OldHandler ; Not a VFP exception, pass on to next handler
 SupportHandlerTemplateEnd
 
-        ASSERT  UndefinedHandlerTemplateEnd = SupportHandlerTemplate
-        ASSERT  SupportHandlerTemplateEnd-SupportHandlerTemplate = ?SupportHandler
+        ASSERT  SupportHandlerTemplateEnd-SupportHandlerTemplate <= ?SupportHandler
+
+RelocOffsetSV * SupportHandlerTemplateSV-:INDEX:SupportHandler
+
+SupportHandlerTemplateSV
+        ; Alternative support handler template for hardware which doesn't
+        ; generate exceptions via EX/DEX, and for which we want to support short
+        ; vectors.
+        ; This means that it's down to us to decide whether any individual
+        ; instruction generates exceptions or not.
+        ; Pattern to match is:
+        ; cccc 1110 ---- ---- ---- 101- ---0 ----
+        Push    "r11,r12"
+        LDR     r11, [r14, #-4]         ; N.B. assuming not Thumb mode!
+        CMP     r11, #&F0000000         ; Reject unconditional instructions
+        LDRHS   pc, RelocOffsetSV+:INDEX:OldHandler
+        AND     r12, r11, #&0F000000
+        AND     r11, r11, #&00000E10
+        TEQ     r12, #&0E000000
+        TEQEQ   r11, #&00000A00
+        ADREQ   r12, RelocOffsetSV
+        LDREQ   pc, RelocOffsetSV+:INDEX:VFPSupportCodePtr
+        Pull    "r11,r12"
+        LDR     pc, RelocOffsetSV+:INDEX:OldHandler
+SupportHandlerTemplateSVEnd
+
+        ASSERT  SupportHandlerTemplateSVEnd-SupportHandlerTemplateSV <= ?SupportHandler
  ]
 
 ; Module code
@@ -285,9 +318,28 @@ GotFPSID
         CMP     r0, #&7
         BLT     CheckFPSIDv5
         BEQ     CheckFPSIDv6
-        ; v7 version. Must be VFPv3 or above to be valid, but we currently don't allow anything other than vanilla VFPv3 with null subarchitecture due to lack of appropriate support code
+        ; v7 version. There are a few different subarchitectures which we support.
         AND     r3, r4, #&7F0000
-        CMP     r3, #&30000
+        CMP     r3, #Subarch_VFPv3_v2Sub<<16
+        CMPNE   r3, #Subarch_VFPv3_NoSub<<16
+        CMPNE   r3, #Subarch_VFPv3_v3Sub<<16
+        BNE     BadVFP
+        ; Note that for v2 & v3 subarch we currently have no support for
+        ; asynchronous exceptions (no hardware to test with). Probe to see if
+        ; FPEXC.EX is implemented so that we can discard any such hardware.
+        ;
+        ; Also note that current v2/v3 implementations only throw exceptions for
+        ; attempts to use VFP short vectors (which are no longer supported in
+        ; hardware). This means we don't need to switch support for them based
+        ; around SupportCode - so on these machines SupportCode becomes a
+        ; switch for whether we want to provide software emulation of vectors
+        ; or not.
+        MOV     r7, #FPEXC_EX
+        myVMSR  ,FPEXC,r7
+        myVMRS  ,r7,FPEXC
+        TST     r7, #FPEXC_EX
+        MOVNE   r7, #0
+        myVMSR  NE,FPEXC,r7
         BNE     BadVFP
         B       GoodVFP
 
@@ -295,9 +347,9 @@ CheckFPSIDv5
 CheckFPSIDv6
         ; v5/v6 version. Should be VFPv1 or VFPv2.
       [ SupportCode
-        ; We only have fully support code for VFPv2 with subarchitecture v1
+        ; We only have full support code for VFPv2 with subarchitecture v1
         AND     r3, r4, #&F0000
-        CMP     r3, #&10000
+        CMP     r3, #Subarch_VFPv2_v1Sub<<16
         BNE     BadVFP
         ; Currently only support implementations that use FSTMX/FLDMX standard format 1 (i.e. we can just use VLDM/VSTM)
         TST     r4, #3:SHL:21
@@ -334,7 +386,7 @@ GoodVFP
         ; r3 = FPSID subarchitecture field
         ; r4 = FPSID
         ; Read MVFR0/1 if they're available
-        CMP     r3, #&2<<16
+        CMP     r3, #Subarch_VFPv2_v1Sub<<16
         BGE     HasMVFR ; Subarchitecture 2+ is required to have them
         ; In subarchitecture 1 and below, the registers are optional.
         ; E.g. VFP9-S doesn't have them but VFP11 does, even though they're both subarchitecture 1/VFPv2.
@@ -360,7 +412,7 @@ HasMVFR
         ; Store our results
         ; TODO - Calculate fake MVFR0/MVFR1 values where necessary
         MOV     r3, r3, LSR #16
-        STRB    r3, VFPVersion
+        STRB    r3, VFPSubarch
         STR     r4, SoftFPSID
         STR     r5, SoftMVFR0
         STR     r6, SoftMVFR1
@@ -378,9 +430,9 @@ HasMVFR
         MOV     r0, #CLASS_NOT_VFP
         CMP     r3, #32
         ORRLT   r0, r0, #CLASS_D32
-        LDRB    r3, VFPVersion
-        CMP     r3, #2
-        ORRLE   r0, r0, #CLASS_VFP3
+        LDRB    r3, VFPSubarch
+        CMP     r3, #Subarch_VFPv3_v2Sub
+        ORRLT   r0, r0, #CLASS_VFP3
         TST     r5, #&F0
         ORREQ   r0, r0, #CLASS_S
         TST     r5, #&F00
@@ -399,38 +451,78 @@ HasMVFR
         MSR     CPSR_c, R1
         Pull    "pc"
 
-InstallHandler
+InstallHandler ROUT
         Entry
-        ; Copy the handler code over
+        ; Initialise UndefinedHandler + LazyHandler + ChangeContext
         ADR     r0, UndefinedHandlerTemplate
         ADR     r1, UndefinedHandler
         ASSERT  UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate = 9*4
-      [ SupportCode
-        MOV     r2, r1
-        LDMIA   r0!, {r3-r11}
-        STMIA   r2!, {r3-r11}
-        ASSERT  SupportHandlerTemplate = UndefinedHandlerTemplateEnd
-        ASSERT  ?SupportHandler = 7*4
-        LDMIA   r0, {r3-r9}
-        ASSERT  VFPSupportCodePtr = SupportHandler+?SupportHandler
-        ASSERT  ChangeContext = VFPSupportCodePtr+4
-        ; Use correct support code depending on subarchitecture
-        ; Note - sub architecture V2 support is incomplete (no handling of VV,
-        ; TFV bits)
-        LDRB    r10, VFPVersion
-        CMP     r10, #1
-        ADREQL  r10, VFPSupportCode_SubArchV1
-        ADRNEL  r10, VFPSupportCode_SubArchV2
-        ADR     r11, SWI_ChangeContext
-        STMIA   r2!, {r3-r11}
-      |
-        LDMIA   r0, {r2-r10}
+        LDMIA   r0!, {r2-r10}
         ASSERT  ChangeContext = UndefinedHandler+(UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate)
         ADR     r11, SWI_ChangeContext
         STMIA   r1, {r2-r11}
-        ADD     r2, r1, #UndefinedHandlerTemplateEnd-UndefinedHandlerTemplate
+        ADR     r2, ChangeContext
+      [ SupportCode
+        ; Work out what support code (if any) is needed.
+        ; Possible situations are:
+        ; * ARM11/VFP11: Support code required to give the hardware help with difficult instructions. Indicated by Subarch_VFPv2_v1Sub.
+        ; * Cortex-A8: Support code not required. Indicated by Subarch_VFPv3_NoSub & no response to FPEXC EX & DEX bits
+        ; * Cortex-A9: Support code required for short vector support. Indicated by Subarch_VFPv3_NoSub, no response to FPEXC EX, but response to DEX (+ MVFR0 indicates no short vector support)
+        ; * Cortex-A7: Support code required for short vector support. Indicated by Subarch_VFPv3_v2Sub, no response to FPEXC EX, but response to DEX (+ MVFR0 indicates no short vector support)
+        ; * Cortex-A15: Support code required for short vector support. Also requires special abort handler due to lack of DEX. Indicated by Subarch_VFPv3_v3Sub, no response to FPEXC EX & DEX bits (+ MVRF0 indicates no short vector support)
+        ; So logic to follow is:
+        ; * If EX or DEX supported, pick based around SubArch version
+        ; * If MVFR0 indicates no short vector support, use special abort handler
+        ; When testing for support, avoid setting both EX and DEX at once, as that's an invalid combination
+        MOV     r10, #0 ; r10 is used as our 'support handler installed' flag
+        MOV     r11, #FPEXC_EX
+        myVMSR  ,FPEXC,r11
+        myVMRS  ,r11,FPEXC
+        TST     r11, #FPEXC_EX
+        BNE     %FT20
+        MOV     r11, #FPEXC_DEX
+        myVMSR  ,FPEXC,r11
+        myVMRS  ,r11,FPEXC
+        TST     r11, #FPEXC_DEX
+        BNE     %FT20
+        ; No exceptions generated by hardware. But do we need short vector support?
+        LDR     r11, SoftMVFR0
+        TST     r11, #&F<<24
+        BNE     %FT80 ; (no support code needed at all)
+        ; Short vector support required
+        ADRL    r10, VFPSupportCode_SV
+        ADR     r0, SupportHandlerTemplateSV
+        B       %FT50
+20
+        ; Hardware generates exceptions via EX/DEX. Use subarchitecture to decide which support code is required.
+        LDRB    r11, VFPSubarch
+        myVMSR  ,FPEXC,r10 ; Reset clobbered reg
+        CMP     r11, #Subarch_VFPv2_v1Sub
+        ADREQL  r10, VFPSupportCode_SubArchV1
+        CMP     r11, #Subarch_VFPv3_v2Sub
+        CMPNE   r11, #Subarch_VFPv3_NoSub
+        CMPNE   r11, #Subarch_VFPv3_v3Sub
+        ADREQL  r10, VFPSupportCode_SubArchV2
+        ; If we've failed to find the right support code then something is wrong
+        TEQ     r10, #0
+        ADREQL  r0, ErrorBlock_VFPSupport_BadHW
+        BEQ     ReturnError_Stacked
+        ADR     r0, SupportHandlerTemplate
+50
+        ; Initialise VFPSupportCodePtr & SupportHandler using r10 & r0
+        STR     r10, VFPSupportCodePtr
+        ADR     r2, SupportHandler
+        ; Copy all 12 words even if actual handler is shorter
+        ASSERT  ?SupportHandler = 12*4
+        LDMIA   r0!, {r3-r8}
+        STMIA   r2!, {r3-r8}
+        LDMIA   r0!, {r3-r8}
+        STMIA   r2!, {r3-r8}
+        ; Assume ranged IMB from r1 to r2 will cover both handlers
+        ASSERT  SupportHandler > LazyHandler
+80
       ]
-        ORR     r0, r0, #1
+        MOV     r0, #1
         SWI     XOS_SynchroniseCodeAreas
         ; Install the handler. Interrupts disabled to ensure we don't get caught before we set up CurrentRoutine.
         MRS     r4, CPSR
@@ -444,8 +536,7 @@ InstallHandler
         ; Set up SupportHandlerPtr as appropriate
         ; Either a pointer to SupportHandler (if support code required) or
         ; OldHandler (no support code required)
-        LDRB    r1, VFPVersion
-        CMP     r1, #3
+        CMP     r10, #0
         LDREQ   r1, OldHandler
         ADRNE   r1, SupportHandler
         STR     r1, SupportHandlerPtr
@@ -812,19 +903,16 @@ SWI_FastAPI
         ADR     r2, SWI_CreateContext
         ADR     r3, SWI_DestroyContext
         ADR     r4, SWI_ChangeContext
-        CLRV
         MOV     pc, lr
 
 SWI_ActiveContext
 ; out: R0 = currently active context ID (or ID of context pending lazy activation)
         LDR     r0, LazyContext
-        CLRV
         MOV     pc, lr
 
 SWI_Version
 ; out: R0 = Module version number * 100
         MOV     r0, #Module_Version
-        CLRV
         MOV     pc, lr
 
 SWI_Features
@@ -835,6 +923,7 @@ SWI_Features
 FeaturesJumpTable
         B       Feature_SystemRegs
         B       Feature_VFPExceptions
+        B       Feature_Misc
 EndOfFeaturesJumpTable
 
 UnknownFeature
@@ -850,7 +939,6 @@ Feature_SystemRegs
         ASSERT SoftMVFR1=SoftMVFR0+4
         ADR    r0, SoftFPSID
         LDMIA  r0, {r0-r2}
-        CLRV
         MOV    pc, lr
 
 Feature_VFPExceptions
@@ -859,12 +947,34 @@ Feature_VFPExceptions
       [ SupportCode
         LDR    r0, SupportHandlerPtr
         LDR    r10, OldHandler
-        EORS   r0, r0, r10
-        MOVNE  r0, #FPSCR_ENABLE_FLAGS ; Support code installed, all exceptions available
+        EORS   r0, r0, r10              ; Is support code installed? (n.b. check should be redundant if we've correctly identified hardware on startup)
+        LDRNE  r0, SoftMVFR0
+        ANDNES r0, r0, #&F000           ; Does hardware throw trapped exceptions to support code?
+        MOVNE  r0, #FPSCR_ENABLE_FLAGS  ; All exceptions available
       |
         MOV    r0, #0
       ]
-        CLRV
+        MOV    pc, lr
+
+Feature_Misc ROUT
+;  in: R0 = 2
+; out: R0 = misc flags:
+;           bit 0: VFP short vectors supported by hardware
+;           bit 1: VFP short vectors supported by software (slow!)
+        LDR    r0, SoftMVFR0
+        ANDS   r0, r0, #&F<<24
+        MOVNE  r0, #VFPSupport_MiscFeature_VFPVectors_HW
+      [ SupportCode
+        BNE    %FT10
+        ; Our support code implementation is able to provide full emulation of
+        ; vector mode
+        LDR    r0, SupportHandlerPtr
+        LDR    r10, OldHandler
+        EORS   r0, r0, r10
+        MOVNE  r0, #VFPSupport_MiscFeature_VFPVectors_SW        
+10
+      ]
+        ; Insert new flags here
         MOV    pc, lr
 
 SWI_ExceptionDump
