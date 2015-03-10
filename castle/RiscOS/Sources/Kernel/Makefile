@@ -31,8 +31,10 @@ TOKHELPSRC      = ${TOKENSOURCE}
 HELPSRC         = HelpStrs
 ROM_OBJECTS     = GetAll.o End.o
 KERNEL_MODULE   = bin${SEP}${COMPONENT}
-ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
+ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}" -APCS 3/32bit/nofp/noswst
+CFLAGS          = -Wpn -APCS 3/32bit/nofp/noswst -IC: -I<Lib$Dir>.Linux
 CUSTOMROM       = custom
+CUSTOMSA        = custom
 CUSTOMEXP       = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${EXP_HDR}.EtherDevice \
@@ -62,7 +64,9 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${C_EXP_HDR}.VduExt \
                   ${C_EXP_HDR}.VIDCList
 
-CUSTOMSA=custom
+ifeq (${Machine},Linux)
+ROM_OBJECTS += LinuxC.o
+endif
 
 include StdTools
 include AAsmModule
