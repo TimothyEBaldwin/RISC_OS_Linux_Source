@@ -645,7 +645,6 @@ lib.clib: ${CLIB_MOD_OBJS}
 # Derived headers:
 derived.swis: o.swis
 	${LD} -bin -o $@ o.SWIs
-	stripnulls $@
 	settype $@ text
 
 o.swis: s.makehswis h.swisheader s.swioptions
