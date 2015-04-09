@@ -14,34 +14,20 @@
 #
 # Makefile for SCSI Driver
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 25-May-94  AMcC         Created.
-#
 
-COMPONENT ?= SCSIdriver
-
-#
-# Program specific options:
-#
-HEADER1   = SCSI
-HEADER2   = SCSIErr
+COMPONENT  ?= SCSIDriver
+HEADER1     = SCSI
+HEADER2     = SCSIErr
 ASMCHEADER1 = SCSIErr
-EXPORTS   = ${C_EXP_HDR}.${ASMCHEADER1}
+EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
+ROM_SOURCE  = s.${COMPONENT}
+RESOURCES   = no
 
-ROM_SOURCE = s.${COMPONENT}
+ifeq (${TARGET},SCSISoftWD33C93)
+ASFLAGS     = -pd "soft SETL {TRUE}"
+endif
 
 include StdTools
 include AAsmModule
-
-#
-# Generic rules:
-#
-clean::
-	${WIPE} o ${WFLAGS}
-	@@echo ${COMPONENT}: cleaned 
 
 # Dynamic dependencies:

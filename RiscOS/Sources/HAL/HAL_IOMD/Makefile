@@ -18,7 +18,7 @@
 COMPONENT  = IOMD HAL
 TARGET     = IOMD
 OBJS       = Top Boot ATA IIC Interrupts MachineID NVRAM \
-             Timers Video cbits KbdScan Debug Post IOMD21DMA
+             Timers Video cbits KbdScan Debug Post IOMD21DMA RTC
 HDRS       =
 CMHGFILE   =
 CUSTOMRES  = custom

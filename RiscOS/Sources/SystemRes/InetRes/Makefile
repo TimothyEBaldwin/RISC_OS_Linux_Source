@@ -70,6 +70,7 @@ DISCFILES= ${RDIR}.!Boot\
         ${SDIR}.gethost.GetHost\
         ${SDIR}.ifrconfig.IfRConfig\
         ${SDIR}.map-mbone.Map-MBone\
+        ${SDIR}.md5.MD5\
         ${SDIR}.mrinfo.MRInfo\
         ${SDIR}.mtrace.MTrace\
         ${SDIR}.pong.Pong\
@@ -89,7 +90,7 @@ DISCFILES= ${RDIR}.!Boot\
 FILES=\
         ${COMMONFILES} \
         ${DISCFILES} \
-        ${STBFILE}
+        ${STBFILES}
 
 BAREMINUTILS = \
         ${SDIR}.ifconfig.IfConfig    \
@@ -100,7 +101,6 @@ EMERGENCYUTILS = \
         ${SDIR}.arp.ARP              \
         ${SDIR}.ifconfig.IfConfig    \
         ${SDIR}.ping.Ping            \
-        ${SDIR}.pong.Pong            \
         ${SDIR}.utils.utl.CheckMem   \
         ${SDIR}.newfiler.NewFiler    \
         ${SDIR}.sysctl.SysCtl        \
@@ -113,6 +113,7 @@ NETUTILS = \
         ${SDIR}.inetstat.InetStat    \
         ${SDIR}.ipvars.IPVars        \
         ${SDIR}.map-mbone.Map-MBone  \
+        ${SDIR}.md5.MD5              \
         ${SDIR}.mrinfo.MRInfo        \
         ${SDIR}.mtrace.MTrace        \
         ${SDIR}.ping.Ping            \
@@ -185,9 +186,10 @@ install_: ${DISCFILES} dirs
         SetType ${INSTAPP}.files.AUNMap Obey
         ${CP} ${RDIR}.utils      ${INSTAPP}.utils      ${CPFLAGS}
         |
-        ${CP} ${SDIR}.map-mbone.Map-MBone   ${INSTAPP}.bin.Map-MBone    ${CPFLAGS}
         ${CP} ${SDIR}.gethost.GetHost       ${INSTAPP}.bin.GetHost      ${CPFLAGS}
         ${CP} ${SDIR}.ifrconfig.IfRConfig   ${INSTAPP}.bin.IfRConfig    ${CPFLAGS}
+        ${CP} ${SDIR}.map-mbone.Map-MBone   ${INSTAPP}.bin.Map-MBone    ${CPFLAGS}
+        ${CP} ${SDIR}.md5.MD5               ${INSTAPP}.bin.MD5          ${CPFLAGS}
         ${CP} ${SDIR}.mrinfo.MRInfo         ${INSTAPP}.bin.MRInfo       ${CPFLAGS}
         ${CP} ${SDIR}.mtrace.MTrace         ${INSTAPP}.bin.MTrace       ${CPFLAGS}
         ${CP} ${SDIR}.pong.Pong             ${INSTAPP}.bin.Pong         ${CPFLAGS}
@@ -222,6 +224,7 @@ resources-NetUtils: ${NETUTILS}
         ${CP} ${SDIR}.ipvars.IPVars         ${RESD}.bin.IPVars       ${CPFLAGS}
         ${CP} ${SDIR}.inetstat.InetStat     ${RESD}.bin.InetStat     ${CPFLAGS}
         ${CP} ${SDIR}.map-mbone.Map-MBone   ${RESD}.bin.Map-MBone    ${CPFLAGS}
+        ${CP} ${SDIR}.md5.MD5               ${RESD}.bin.MD5          ${CPFLAGS}
         ${CP} ${SDIR}.mrinfo.MRInfo         ${RESD}.bin.MRInfo       ${CPFLAGS}
         ${CP} ${SDIR}.mtrace.MTrace         ${RESD}.bin.MTrace       ${CPFLAGS}
         ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
@@ -252,7 +255,6 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${CP} ${SDIR}.arp.ARP               ${RESD}.bin.ARP          ${CPFLAGS}
         ${CP} ${SDIR}.ifconfig.IfConfig     ${RESD}.bin.IfConfig     ${CPFLAGS}
         ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
-        ${CP} ${SDIR}.pong.Pong             ${RESD}.bin.Pong         ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.CheckMem    ${RESD}.utils.CheckMem   ${CPFLAGS}
         ${CP} ${SDIR}.newfiler.NewFiler     ${RESD}.utils.NewFiler   ${CPFLAGS}
         ${CP} ${SDIR}.sysctl.SysCtl         ${RESD}.bin.SysCtl       ${CPFLAGS}
@@ -322,6 +324,14 @@ ${SDIR}.map-mbone.Map-MBone: ${SDIR}.map-mbone.c.Map-MBone \
         ${SDIR}.map-mbone.c.inet \
         ${SDIR}.map-mbone.c.kern
         dir ${SDIR}.map-mbone
+        @amu_machine
+        @up
+        @up
+
+${SDIR}.md5.MD5: ${SDIR}.md5.c.md5 \
+        ${SDIR}.md5.c.md5c \
+        ${SDIR}.md5.c.mdXhl
+        dir ${SDIR}.md5
         @amu_machine
         @up
         @up
@@ -413,90 +423,4 @@ ${SDIR}.utils.utl.X: ${SDIR}.utils.s.X
         @up
         @up
 
-BBETYPE = internet
-bbe-internet: bbe-internet-${OPTIONS}-${TYPE} bbe-generic
-        ${NOP}
-
-bbe-internet-install_common:
-        BBE_Export_File_In_Dir Sources.arp ARP
-        BBE_Export_File_In_Dir Sources.ifconfig IfConfig
-        BBE_Export_File_In_Dir Sources.inetstat InetStat
-        BBE_Export_File_In_Dir Sources.ipvars IPVars
-        BBE_Export_File_In_Dir Sources.ping Ping
-        BBE_Export_File_In_Dir Sources.route Route
-        BBE_Export_File_In_Dir Sources.showstat ShowStat
-        BBE_Export_File_In_Dir Sources.sysctl SysCtl
-        BBE_Export_File_In_Dir Sources.traceroute TraceRoute
-
-bbe-internet-STB-: bbe-internet-install_common
-        BBE_Export_File_In_Dir awk Version
-        BBE_Export_File_In_Dir Resources !Boot
-        BBE_Export_File_In_Dir Sources.pong Pong
-        BBE_Export_Dir Resources.files
-
-# assume if neither OPTIONS nor TYPE was set that it's an install build
-bbe-internet--: bbe-internet-install_common
-        BBE_Export_File_In_Dir awk Version
-        BBE_Export_File_In_Dir Resources !Boot
-        BBE_Export_File_In_Dir Resources !Run
-        BBE_Export_File_In_Dir Resources !Sprites
-        BBE_Export_File_In_Dir Resources !Sprites22
-        BBE_Export_Dir Resources.files
-        BBE_Export_Dir Resources.utils
-        BBE_Export_File_In_Dir Sources.map-mbone Map-MBone
-        BBE_Export_File_In_Dir Sources.gethost GetHost
-        BBE_Export_File_In_Dir Sources.ifrconfig IfRConfig
-        BBE_Export_File_In_Dir Sources.mrinfo MRInfo
-        BBE_Export_File_In_Dir Sources.mtrace MTrace
-        BBE_Export_File_In_Dir Sources.pong Pong
-        BBE_Export_File_In_Dir Sources.utils.utl RMFind
-        BBE_Export_File_In_Dir Sources.utils.utl CheckMem
-        BBE_Export_File_In_Dir Sources.newfiler NewFiler
-        BBE_Export_File_In_Dir Sources.utils.utl ReadCMOSIP
-        BBE_Export_File_In_Dir Sources.utils.utl TriggerCBs
-
-bbe-internet--NetUtils:
-        BBE_Export_File_In_Dir Sources.arp ARP
-        BBE_Export_File_In_Dir Sources.ifconfig IfConfig
-        BBE_Export_File_In_Dir Sources.ifrconfig IfRConfig
-        BBE_Export_File_In_Dir Sources.ipvars IPVars
-        BBE_Export_File_In_Dir Sources.inetstat InetStat
-        BBE_Export_File_In_Dir Sources.map-mbone Map-MBone
-        BBE_Export_File_In_Dir Sources.mrinfo MRInfo
-        BBE_Export_File_In_Dir Sources.mtrace MTrace
-        BBE_Export_File_In_Dir Sources.ping Ping
-        BBE_Export_File_In_Dir Sources.pong Pong
-        BBE_Export_File_In_Dir Sources.utils.utl RMFind
-        BBE_Export_File_In_Dir Sources.route Route
-        BBE_Export_File_In_Dir Sources.sysctl SysCtl
-        BBE_Export_File_In_Dir Sources.showstat ShowStat
-        BBE_Export_File_In_Dir Sources.traceroute TraceRoute
-        BBE_Export_File_In_Dir awk Version
-        BBE_Export_Dir Resources.files
-        BBE_Export_File_In_Dir Resources !Boot
-        BBE_Export_File_In_Dir Resources !Run
-        BBE_Export_File_In_Dir Resources !Sprites
-        BBE_Export_File_In_Dir Resources !Sprites22
-
-bbe-internet--EmergencyUtils:
-        BBE_Export_File_In_Dir Sources.arp ARP
-        BBE_Export_File_In_Dir Sources.ifconfig IfConfig
-        BBE_Export_File_In_Dir Sources.ping Ping
-        BBE_Export_File_In_Dir Sources.pong Pong
-        BBE_Export_File_In_Dir Sources.utils.utl CheckMem
-        BBE_Export_File_In_Dir Sources.newfiler NewFiler
-        BBE_Export_File_In_Dir Sources.sysctl SysCtl
-        BBE_Export_File_In_Dir awk Version
-        BBE_Export_Dir Resources.files
-        BBE_Export_File_In_Dir Resources !Boot
-        BBE_Export_File_In_Dir Resources !Run
-
-bbe-internet--BareMinUtils:
-        BBE_Export_File_In_Dir Sources.ifconfig IfConfig
-        BBE_Export_File_In_Dir Sources.ping Ping
-        BBE_Export_Dir Resources.files
-        BBE_Export_File_In_Dir awk Version
-        BBE_Export_File_In_Dir Resources !Boot
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

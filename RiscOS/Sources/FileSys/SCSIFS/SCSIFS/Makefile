@@ -36,8 +36,7 @@ EXPORTS   = hdr.SCSIFSErr ${C_EXP_HDR}.SCSIFSErr
 
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpText
-ROM_SOURCE = s.Hdr_fst
-RESOURCES  = No
+ROM_SOURCE = Hdr_fst.s
 
 include StdTools
 include AAsmModule
@@ -56,6 +55,5 @@ o.SCSIFSErr: s.SCSIFSErr
 clean::
 	${WIPE} o ${WFLAGS}
 	${RM} hdr.SCSIFSErr
-	@@echo ${COMPONENT}: cleaned
 
 # Dynamic dependencies:

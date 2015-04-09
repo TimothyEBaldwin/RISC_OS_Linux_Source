@@ -25,7 +25,10 @@ rom_link: rom_link-${TARGET}
 
 
 resources-Resolver-UK:
-	@| End of resource export for locale UK
+	${MKDIR} ${RESDIR}.${TARGET}
+	${TOKENCHECK} LocalRes:Messages
+	${TOKENCHECK} LocalRes:CmdHelp
+	${FAPPEND} ${RESDIR}.${TARGET}.Messages LocalRes:Messages LocalRes:CmdHelp
 
 rom_link-Resolver:
 	${MKDIR} linked

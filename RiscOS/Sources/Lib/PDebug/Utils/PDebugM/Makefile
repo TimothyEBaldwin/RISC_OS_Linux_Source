@@ -60,7 +60,7 @@ ROMCSTUBS	= RISCOSLIB:o.romcstubs
 ABSSYM		= RISC_OSLib:o.c_AbsSym
 WRAPPER		= RISC_OSLib:s.ModuleWrap
 
-PDEBUG		= ${LIBDIR}.PDebug.o.Lib_M
+PDEBUG		= ${LIBDIR}.PDebug.o.PDebugzm
 DESK		= ${LIBDIR}.Desk.o.Desk_M
 
 LIBS = \

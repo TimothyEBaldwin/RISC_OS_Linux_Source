@@ -14,8 +14,9 @@
 #
 # Makefile for mkunictype
 
+COMPONENT = mkunictype
+
 include HostTools
-#include StdRules
 include AppLibs
 include CApp
 

@@ -31,7 +31,8 @@ ASMFLAGS 	= -NoCache -depend !Depend ${THROWBACK}
 CMHGFLAGS 	= -depend !Depend ${THROWBACK} -IC:
 WIPEFLAGS 	= ~C~V
 
-PDEBUG 		= ${LIBDIR}.PDebug.o.Lib_PL
+PDEBUG 		= ${LIBDIR}.PDebug.o.PDebug
+DESKLIB 		= C:Desk.o.Desk
 
 TARGET 		= SimpleSend
 
@@ -41,6 +42,7 @@ OBJS = \
 LIBS = \
  C:o.stubs \
  ${PDEBUG} \
+ ${DESKLIB}
 
 .SUFFIXES:	.o .c
 .c.o:;		${CC} ${CFLAGS} -o $@ $<

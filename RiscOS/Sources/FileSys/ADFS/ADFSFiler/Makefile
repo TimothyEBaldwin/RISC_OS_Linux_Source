@@ -30,6 +30,21 @@ ifeq (${TEMPLATES},yes)
 PRIVATETEMPLATES = resources_templates
 endif
 
+ifeq (${TARGET},ThemeDefs)
+CUSTOMSA         = custom
+CUSTOMEXP        = custom
+
+install:
+	${MKDIR} ${INSTDIR}.${USERIF}
+	| Give the sprites for the requested theme if present
+	IfThere Resources.SCSI.${USERIF} Then ${CP} Resources.SCSI.${USERIF} ${INSTDIR}.${USERIF}.SCSIFiler ${CPFLAGS}
+	IfThere Resources.SDFS.${USERIF} Then ${CP} Resources.SDFS.${USERIF} ${INSTDIR}.${USERIF}.SDFSFiler ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: disc theme resources installed
+
+export:
+	@${ECHO} ${COMPONENT}: nothing to export when target is ${TARGET}
+endif
+
 include StdTools
 include AAsmModule
 
@@ -37,21 +52,21 @@ include AAsmModule
 # For ADFSFiler: templates + merged messages, sprites are in the Wimp pool
 #
 resources_ADFSFiler: resources_templates
-	@|
+	${NOP}
 
 #
 # For SCSIFiler: sprites + merged messages, templates shared with ADFS unless requested explicitly
 #
 resources_SCSIFiler: ${MERGEDMSGS} ${PRIVATETEMPLATES}
 	${CP} ${MERGEDMSGS} ${RESFSDIR}.Messages ${CPFLAGS}
-	${INSTRES} -I Resources.${LOCALE},Resources.UK,Resources ${RESFSDIR} SCSI.Sprites
+	${CP} Resources.SCSI.${USERIF} ${RESFSDIR}.Sprites ${CPFLAGS}
 
 #
 # For SDFSFiler: sprites + merged messages, templates shared with ADFS unless requested explicitly
 #
 resources_SDFSFiler: ${MERGEDMSGS} ${PRIVATETEMPLATES}
 	${CP} ${MERGEDMSGS} ${RESFSDIR}.Messages ${CPFLAGS}
-	${INSTRES} -I Resources.${LOCALE},Resources.UK,Resources ${RESFSDIR} SDFS.Sprites
+	${CP} Resources.SDFS.${USERIF} ${RESFSDIR}.Sprites ${CPFLAGS}
 
 #
 # Static dependencies:

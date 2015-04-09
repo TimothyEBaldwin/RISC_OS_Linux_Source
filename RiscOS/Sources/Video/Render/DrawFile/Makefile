@@ -18,7 +18,7 @@ COMPONENT   = DrawFile
 HDRS        =
 OBJS        = bbox callback declare main render riscos textarea trfm verify
 DBG_OBJS    = ${OBJS} hostfs jc_trace
-ifeq (${INTERNATIONAL_HELP},NO)
+ifeq ("${CMDHELP}","None")
 CMHGFILE    = header310
 else
 CMHGFILE    = header

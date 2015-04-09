@@ -178,27 +178,16 @@ VduInit ROUT
         STR     R0, [WsPtr, #VduSaveAreaPtr]      ; indicate no save area yet
         STR     R0, [WsPtr, #ClipBoxEnable]       ; no clip box calculating
         STRB    R0, [WsPtr, #ExternalFramestore]
+        STR     R0, [WsPtr, #GraphicsVFeatures]
+        MOV     R3, #MaxGraphicsVDrivers
+        LDR     R2, =ZeroPage+VduDriverWorkSpace+GraphicsVDrivers
+01
+        STR     R0, [R2], #4
+        SUBS    R3, R3, #1
+        BNE     %BT01
+        MOV     R0, #GraphicsVInvalid
+        STR     R0, [WsPtr, #CurrentGraphicsVDriver]
         STR     R14, [WsPtr, #TrueVideoPhysAddr]  ; init TrueVideoPhysAddr for internal RAM/VRAM framestore case
-
-        Push    "r4, r9, r12"
-        AddressHAL
-        MOV     r4, r12                       ; temp WsPtr
-        CallHAL HAL_VideoFeatures
-        ; Set bit 31 of features if HAL_VideoRender supported
-        CheckHAL HAL_VideoRender, r1
-        ORREQ   r0, r0, #1:SHL:31
-        STR     r0, [r4, #HALVideoFeatures]
- [ :LNOT:UseGraphicsV
-        CallHAL HAL_VideoPixelFormats
-        STR     r0, [r4, #HWPixelFormats]
-        CallHAL HAL_VideoBufferAlignment
-        STR     r0, [r4, #HWBufferAlign]
- ]
-        Pull    "r4, r9, r12"
-
-        ;;; sort this out!
-        ! 0, "HAL not doing anything useful with HAL_VideoBufferAlignment"
-        ! 0, "HAL not dealing with lack of h/w pointer"
 
         LDR     R0, =RangeC+SpriteReason_SwitchOutputToSprite
         STR     R0, [WsPtr, #SpriteMaskSelect]
@@ -339,10 +328,64 @@ VduInit ROUT
 ;       before printing "RISC OS ..."
 ;
 ; in:   -
-; out:  All registers may be corrupted (except R13_svc !)
+; out:  r0 = corrupt, or error pointer
+;       All other registers preserved
 ;
 
-InitialiseMode Entry
+InitialiseMode ROUT
+; if we don't have a video driver yet, now is a good time to check if the HAL
+; provides one
+        LDR     r0, =ZeroPage+VduDriverWorkSpace+CurrentGraphicsVDriver
+        LDR     r0, [r0]
+        CMP     r0, #GraphicsVInvalid
+        BEQ     VduGrafHAL_Init         ; tail-call since InitialiseMode will get called again when the HAL registers itself
+
+        Entry   "r1-r12"
+
+        ; Refresh cached features flags before we start calling this new driver
+        MOV     r4, r0, LSL #24
+        ORR     R4, R4, #GraphicsV_DisplayFeatures
+        BL      CallGraphicsV
+        VDWS    WsPtr
+        STR     r0, [WsPtr, #GraphicsVFeatures]
+
+        ; Update screen memory information
+        ASSERT  GVDisplayFeature_SeparateFramestore < 256
+        ANDS    r1, r0, #GVDisplayFeature_SeparateFramestore
+        STRB    r1, [WsPtr, #ExternalFramestore]
+        BNE     %FT20
+        ; Screen DA is in use
+        LDR     r0, =ZeroPage
+        LDR     r0, [r0, #VideoPhysAddr]
+        STR     r0, [WsPtr, #TrueVideoPhysAddr] ; Point TrueVideoPhysAddr at the base of screen DA
+        MOV     r0, #2
+        SWI     XOS_ReadDynamicArea
+        MOVVS   r1, #0                  ; shouldn't happen, but set a safe size just in case
+        STR     r1, [WsPtr, #TotalScreenSize] ; Ensure TotalScreenSize consistent with DA size
+        ; Reinitialise a few more variables which are used by the screen DA handler
+        ADD     r1, r0, r1
+        STR     r1, [WsPtr, #ScreenEndAddr]
+        STR     r0, [WsPtr, #DisplayStart]
+        BL      SetDisplayScreenStart
+        STR     r0, [WsPtr, #ScreenStart]
+        B       %FT30
+20
+        ; Driver manages memory itself
+        TST     r0, #GVDisplayFeature_VariableFramestore
+        BNE     %FT30                   ; Framestore changes with mode, we can't read its info here
+        ; Framestore is fixed, get its info and remember it (ModeChangeSub currently relies on this for VRAM limit checking)
+        LDR     r0, =ZeroPage+VduDriverWorkSpace+CurrentGraphicsVDriver
+        LDR     r0, [r0]
+        MOV     r4, r0, LSL #24
+        ORR     r4, r4, #GraphicsV_FramestoreAddress
+        BL      CallGraphicsV
+        CMP     r4, #0
+        MOVNE   r1, #0                  ; If call wasn't claimed, claim 0 screen memory. Mode change will then fail with out of memory error, which is about the best we can do.
+        STR     r0, [WsPtr, #TrueVideoPhysAddr]
+        STR     r1, [WsPtr, #TotalScreenSize]
+
+30
+
  [ SoftResets
         MOV     r0, #&FD                ; read last reset type
         MOV     r1, #0
@@ -357,12 +400,6 @@ InitialiseMode Entry
         MOV     r0, #1                  ; no need to check for soft reset,
         SWI     XOS_ReadSysInfo         ; always use configured value
  ]
-; at this stage, r0 = current screen mode either mode number or mode specifier
-; lets give the HAL a chance to be fussy.
-        AddressHAL
-        CallHAL    HAL_VideoStartupMode
-
-01
         MOV     r1, r0
 
         MOV     r0, #ScreenModeReason_SelectMode
@@ -755,18 +792,17 @@ ModeChangeSub ROUT
         AND     r1, r2, #&7F
         CMP     r1, #NumModes                ; mode number
         BHS     mchsub_3
-        Push    "r3, r4"
- [ UseGraphicsV
-        Push    "r0-r2"
-        MOV     r4, #GraphicsV_DisplayFeatures
+        Push    "r0-r4"
+        LDR     r4, [WsPtr, #CurrentGraphicsVDriver]
+        MOV     r4, r4, LSL #24
+        ORR     r4, r4, #GraphicsV_DisplayFeatures
         BL      CallGraphicsV
         TEQ     r4, #0
+        MOVNE   r0, #0
         MOVEQ   r4, r1
         MOVNE   r4, #2_111111
+        STR     r0, [WsPtr, #GraphicsVFeatures] ; refresh cached features
         Pull    "r0-r2"
- |
-        LDR     r4, [WsPtr, #HWPixelFormats] ; bits 0 to 3 set for 1,2,4,8 bpp supported
- ]
         ADR     lr, ModePromoTable           ; table of mode promotions
 mchsub_1
         MOV     r1, r1, LSL #1
@@ -823,22 +859,17 @@ mchsub_3
         RSBS    R1, R9, R11, LSL R2     ; extra amount we need
         BLS     %FT08                   ; enough memory, so skip
 
- [ UseGraphicsV
         LDRB    R0, [WsPtr, #ExternalFramestore]
         TEQ     R0, #0
         BEQ     %FT05
 
 ; External framestore in use; does driver support growing/reallocating it?
 
-        Push    "r1-r2,r4"
-        MOV     r4, #GraphicsV_DisplayFeatures
-        BL      CallGraphicsV
-        Pull    "r1-r2,r4"
-        TST     r0, #1<<5
+        LDR     R0, [WsPtr, #GraphicsVFeatures]
+        TST     r0, #GVDisplayFeature_VariableFramestore
         BNE     %FT08                   ; realloc supported, assume driver can allocate required memory since it OK'd the mode
         B       %FT06                   ; not supported, complain
 05
- ]
 
 ; try to extend the amount of screen memory
 
@@ -934,23 +965,22 @@ TV_Mode_string
         STR     R3, [WsPtr, #ScreenSize] ; store screensize BEFORE calling
                                         ; ConvertBankToAddress (was a bug!)
 
- [ UseGraphicsV
         Push    "r0-r6"
-        MOV     r4, #GraphicsV_DisplayFeatures
-        BL      CallGraphicsV
 
 ; If driver handles memory allocation, must change mode before asking for memory
 
-        TST     r0, #1<<5
+        LDR     r0, [WsPtr, #GraphicsVFeatures]
+        TST     r0, #GVDisplayFeature_VariableFramestore
         ADDNE   R0, R13, #wkwordsize+7*4        ; R0 -> VIDCList3
         BLNE    HardwareModeChange
 
-        MOV     r4, #GraphicsV_FramestoreAddress
+        LDR     r4, [WsPtr, #CurrentGraphicsVDriver]
+        MOV     r4, r4, LSL #24
+        ORR     r4, r4, #GraphicsV_FramestoreAddress
         BL      CallGraphicsV
         TEQ     r4, #0
         BNE     %FT581
 
- [ {TRUE}
 ; for mapping in, round start address down and size up to megabyte boundaries
 ; r0 = physical start, r1= size
 ; so frame buffer is wholly contained within the mapped in area
@@ -975,27 +1005,6 @@ TV_Mode_string
         STR     r3, [WsPtr, #ScreenEndAddr]     ; actual screen end
         MOV     r14, #1
         B       %FT582
-  |
-        MOV     r1, r1, LSR #20                 ; round size down to 1MB
-        MOV     r2, r1, LSL #20
-        ADD     r0, r0, #1:SHL:20               ; round addr up to 1MB
-        SUB     r0, r0, #1
-        MOV     r0, r0, LSR #20                 ; (because of OS_Memory 13 limits)
-        MOV     r1, r0, LSL #20
-        MOV     r0, #13                         ; map in permanently
-        ORR     r0, r0, #1:SHL:8                ; buffered, uncached
-        ORR     r0, r0, #1:SHL:16+1:SHL:17      ; doubly map, access permission specified
-        SWI     XOS_Memory
-        BVS     %FT581
-        ADD     r0, r1, r5                      ; reconstruct base phys address
-        STR     r0, [WsPtr, #TrueVideoPhysAddr] ; and update our copy
-        STR     r2, [WsPtr, #TotalScreenSize]
-        ADD     r3, r3, r2
-        STR     r3, [WsPtr, #ScreenEndAddr]
-        MOV     r14, #1
-        B       %FT582
-
- ]
 581
         MOV     r0, #128+2
         SWI     XOS_ReadDynamicArea
@@ -1006,7 +1015,6 @@ TV_Mode_string
 582
         Pull    "r0-r6"
         STRB    r14, [WsPtr, #ExternalFramestore]
- ]
 
         TEQ     R2, #0                  ; Shadowing or not ?
         LDR     R3, [WsPtr, #VduStatus]
@@ -1043,7 +1051,7 @@ TV_Mode_string
 
         ADD     R3, WsPtr, #VduSaveArea+InitFlag
         STR     R2, [R3]                ; indicate uninitialised (R2=0)
-        TST     R6, #Flag_Teletext
+        TST     R6, #ModeFlag_Teletext
         MOVNE   R3, #0                  ; if teletext, then no save area
         MOVEQ   R3, #1                  ; else MOS's save area
         MOV     R1, #0                  ; just in case
@@ -1082,9 +1090,8 @@ TV_Mode_string
 ; finished doing other variables
 
 ; tell hardware to change mode, unless already done
-        MOV     r4, #GraphicsV_DisplayFeatures
-        BL      CallGraphicsV
-        TST     r0, #1<<5
+        LDR     r0, [WsPtr, #GraphicsVFeatures]
+        TST     r0, #GVDisplayFeature_VariableFramestore
         ADDEQ   R0, R13, #wkwordsize            ; R0 -> VIDCList3
         BLEQ    HardwareModeChange
 
@@ -1155,9 +1162,9 @@ HardwareModeChange
         MOV     R1, R1, LSL #24          ; sign extend to 32 bits
         MOV     R1, R1, ASR #24-3        ; and multiply by 8
         LDR     R2, [WsPtr, #ModeFlags]
-        TST     R2, #Flag_GapMode        ; gap mode ?
+        TST     R2, #ModeFlag_GapMode    ; gap mode ?
         ADDNE   R1, R1, R1, ASR #2       ; add on 2 rows if so
-        TST     R2, #Flag_DoubleVertical ; if double vertical
+        TST     R2, #ModeFlag_DoubleVertical ; if double vertical
         ADDNE   R1, R1, R1               ; then double it
         LDR     R2, [R0, #VIDCList3_VertiBackPorch]
         SUBS    R2, R2, R1
@@ -1197,8 +1204,16 @@ HardwareModeChange
 
 ;kernel/HAL split - call the HAL to program video controller for mode,
 ;
-        MOV     R4, #GraphicsV_SetMode
+        LDR     R4, [WsPtr, #CurrentGraphicsVDriver]
+        MOV     R4, R4, LSL #24
+        ORR     R4, R4, #GraphicsV_SetMode
         BL      CallGraphicsV
+
+        LDR     R4, [WsPtr, #CurrentGraphicsVDriver]
+        MOV     R4, R4, LSL #24
+        ORR     R4, R4, #GraphicsV_DisplayFeatures
+        BL      CallGraphicsV
+        STR     R0, [WsPtr, #GraphicsVFeatures] ; refresh cached features just in case something's happened to change them
 
         Pull    "R0-R4, PC"
 
@@ -1372,35 +1387,27 @@ PushModeInfoCommonNoService
 
 ; it's interlaced
         LDR     r14, [r9, #wkModeFlags]
-        ORR     r14, r14, #Flag_InterlacedMode
+        ORR     r14, r14, #ModeFlag_InterlacedMode
         STR     r14, [r9, #wkModeFlags]
 58
- [ UseGraphicsV
-        Push    "r0-r2,r4"
-        MOV     r4, #GraphicsV_DisplayFeatures
-        BL      CallGraphicsV
+        Push    "r0-r2"
+        LDR     r0, [WsPtr, #GraphicsVFeatures]
+        TST     r0, #GVDisplayFeature_HardwareScroll
+        LDREQ   r14, [r9, #wkModeFlags]
+        ORREQ   r14, r14, #ModeFlag_HardScrollDisabled
+        STREQ   r14, [r9, #wkModeFlags]
   ; claim or release falsevsync vector if vsyncs supported/not supported
-        Push    "r0"
-        TST     r0, #1<<4                       ; NE = VSyncs not generated?
-        MOV     a1, #TickerV
-        LDR     a2, =FalseVsyncIRQ
-        LDR     a3, =ZeroPage+OsbyteVars
+        TST     r0, #GVDisplayFeature_NoVsyncIRQ ; are VSyncs not generated?
+        MOV     r0, #TickerV
+        LDR     r1, =FalseVsyncIRQ
+        LDR     r2, =ZeroPage+OsbyteVars
         BEQ     %ft2
         SWI     XOS_Claim
         B       %ft1
 2       SWI     XOS_Release
 1
-        Pull    "r0"
 
-        TST     r0, #1                          ; bit 0 is h/w scroll support
-        Pull    "r0-r2,r4"
- |
-        LDR     r14, [WsPtr, #HALVideoFeatures]
-        TST     r14, #1                         ; bit 0 is h/w scroll support
- ]
-        LDREQ   r14, [r9, #wkModeFlags]
-        ORREQ   r14, r14, #Flag_HardScrollDisabled
-        STREQ   r14, [r9, #wkModeFlags]
+        Pull    "r0-r2"
 
 ; hopefully, R7 is still set from up there to be NZ if no VIDC stuff necessary
 
@@ -1415,14 +1422,23 @@ PushModeInfoCommonNoService
         BEQ     %FT62
 59
         ADD     R14, R9, #wkwordsize    ; R14 -> space for VIDCList3
-        MOV     R10, #VIDCList3Size     ; its a VIDCList3, R10 is max room we have
+        ASSERT  VIDCList3BaseSize = 64
+        LDMIA   R3!, {R2,R4,R7-R11}     ; 28 bytes
+        STMIA   R14!, {R2,R4,R7-R11}
+        LDMIA   R3!, {R2,R4,R7-R11}     ; 56 bytes
+        STMIA   R14!, {R2,R4,R7-R11}
+        LDMIA   R3!, {R2,R4}            ; 64 bytes
+        STMIA   R14!, {R2,R4}
+        MOV     R10, #VIDCList3Size-(VIDCList3BaseSize+4) ; this much space left for control list items (excluding terminator)
 60
-        LDR     R8, [R3], #4            ; copy list
-        SUBS    R10, R10, #4
-        MOVEQ   R8, #-1                 ; emergency terminate (source list too long)
-        STR     R8, [R14], #4
+        LDR     R8, [R3], #4
+        SUBS    R10, R10, #8
+        MOVLT   R8, #-1                 ; emergency terminate (source list too long)
         CMP     R8, #-1
+        LDRNE   R9, [R3], #4
+        STMNEIA R14!, {R8-R9}
         BNE     %BT60
+        STR     R8, [R14]
         CLRV
         Pull    "R2-R4,R7-R11, PC"      ; done
 
@@ -1469,7 +1485,7 @@ GenerateModeSelectorVars Entry "r0,r1,r3-r8,r10-r12"
         ASSERT  ModeSelector_YRes = 8
         ASSERT  ModeSelector_PixelDepth = 12
         TST     r2, #1                          ; is it a new format sprite mode word?
-        BNE     %FT50                           ; [yes, so skip]
+        BNE     %FT10                           ; [yes, so skip]
         MOV     r0, r2
         BL      ValidateModeSelector
         BVS     %FT95                           ; invalid - return error
@@ -1546,23 +1562,84 @@ GenerateModeSelectorVars Entry "r0,r1,r3-r8,r10-r12"
 
 ; store info for new format sprite word in stack frame
 
-50
+10
         MOV     r0, #0
         STR     r0, [r9, #wkYShftFactor]        ; yshftfactor = 0
         STR     r0, [r9, #wkModeFlags]          ; modeflags = 0
 
-        MOV     r0, r2, LSR #27                 ; get type
-        CMP     r0, #SpriteType_MAX             ; check for legality - NB type 0 is illegal because r2>=&100
+        AND     r0, r2, #15<<27                 ; get type
+        CMP     r0, #SpriteType_RISCOS5<<27     ; RISC OS 5 type?
+        BEQ     %FT50
+
+        CMP     r0, #SpriteType_New64K<<27      ; 64K colour sprite?
+        MOVEQ   r0, #ModeFlag_64k
+        STREQ   r0, [r9, #wkModeFlags]          ; Make a note of it
+        MOVEQ   r0, #SpriteType_New16bpp        ; ... and treat as regular 16bpp
+        MOVNE   r0, r0, LSR #27
+
+15
+      [ NoARMT2
+        MOV     r1, r2, LSL #(31-13)
+        MOV     r1, r1, LSR #(31-13)+1          ; extract xdpi (bits 1..13)
+      |
+        UBFX    r1, r2, #1, #13                 ; extract xdpi (bits 1..13)
+      ]
+
+        TEQ     r1, #180                        ; 180 => xeig=0
+        MOVEQ   r1, #0
+        BEQ     %FT20
+
+        TEQ     r1, #22                         ; 22/23 => xeig=3
+        TEQNE   r1, #23
+        MOVEQ   r1, #3
+        BEQ     %FT20
+
+        TEQ     r1, #(45 :SHL: 2), 2            ; check if 45   (EQ,CC if so)
+        CMPNE   r1, #90                         ; or 90         (EQ,CS if so)
+        BNE     %FT85
+        MOVCC   r1, #2                          ; 45 => xeig=2
+        MOVCS   r1, #1                          ; 90 => xeig=1
+20
+        STR     r1, [r9, #wkXEigFactor]
+
+      [ NoARMT2
+        MOV     r1, r2, LSL #(31-26)
+        MOV     r1, r1, LSR #(31-26)+14         ; extract ydpi (bits 14..26)
+      |
+        UBFX    r1, r2, #14, #13                ; extract ydpi (bits 14..26)
+      ]
+
+        TEQ     r1, #180                        ; 180 => yeig=0
+        MOVEQ   r1, #0
+        BEQ     %FT21
+
+        TEQ     r1, #22                         ; 22/23 => yeig=3
+        TEQNE   r1, #23
+        MOVEQ   r1, #3
+        BEQ     %FT21
+
+        TEQ     r1, #(45 :SHL: 2), 2            ; check if 45   (EQ,CC if so)
+        CMPNE   r1, #90                         ; or 90         (EQ,CS if so)
+        BNE     %FT85
+        MOVCC   r1, #2                          ; 45 => yeig=2
+        MOVCS   r1, #1                          ; 90 => yeig=1
+21
+        STR     r1, [r9, #wkYEigFactor]
+
+
+25
+        CMP     r0, #SpriteType_MAX             ; check for legality - NB type 0 is impossible here because r2>=&100
         MOVCS   r0, #SpriteType_Substitute      ; substitute if unknown
         ADRL    lr, NSM_bpptable-4
         LDR     r0, [lr, r0, LSL #2]            ; get the bpp from table
 
-        STR     r0, [r9, #wkLog2BPC]
-        STR     r0, [r9, #wkLog2BPP]
-
         ADR     r1, NColourTable
         LDR     r1, [r1, r0, LSL #2]
         STR     r1, [r9, #wkNColour]
+
+30
+        STR     r0, [r9, #wkLog2BPC]
+        STR     r0, [r9, #wkLog2BPP]
 
         ADR     r1, PalIndexTable
         LDRB    r1, [r1, r0]
@@ -1572,50 +1649,62 @@ GenerateModeSelectorVars Entry "r0,r1,r3-r8,r10-r12"
         LDRB    r1, [r1, r0]
         STR     r1, [r9, #wkECFIndex]
 
-        MOV     r1, r2, LSL #(31-13)
-        MOV     r1, r1, LSR #(31-13)+1          ; extract xdpi (bits 1..13)
-
-        TEQ     r1, #180                        ; 180 => xeig=0
-        MOVEQ   r1, #0
-        BEQ     %FT70
-
-        TEQ     r1, #22                         ; 22/23 => xeig=3
-        TEQNE   r1, #23
-        MOVEQ   r1, #3
-        BEQ     %FT70
-
-        TEQ     r1, #(45 :SHL: 2), 2            ; check if 45   (EQ,CC if so)
-        CMPNE   r1, #90                         ; or 90         (EQ,CS if so)
-        BNE     %FT80
-        MOVCC   r1, #2                          ; 45 => xeig=2
-        MOVCS   r1, #1                          ; 90 => xeig=1
-70
-        STR     r1, [r9, #wkXEigFactor]
-
-        MOV     r1, r2, LSL #(31-26)
-        MOV     r1, r1, LSR #(31-26)+14         ; extract ydpi (bits 14..26)
-
-        TEQ     r1, #180                        ; 180 => yeig=0
-        MOVEQ   r1, #0
-        BEQ     %FT71
-
-        TEQ     r1, #22                         ; 22/23 => yeig=3
-        TEQNE   r1, #23
-        MOVEQ   r1, #3
-        BEQ     %FT71
-
-        TEQ     r1, #(45 :SHL: 2), 2            ; check if 45   (EQ,CC if so)
-        CMPNE   r1, #90                         ; or 90         (EQ,CS if so)
-        BNE     %FT80
-        MOVCC   r1, #2                          ; 45 => yeig=2
-        MOVCS   r1, #1                          ; 90 => yeig=1
-71
-        STR     r1, [r9, #wkYEigFactor]
-
         CLRV
         EXIT
 
-80
+50
+        TST     r2, #&F0000                     ; validate RO 5 sprite mode word
+        TSTEQ   r2, #&0000E
+        MOVNE   r0, #SpriteType_Substitute      ; and try substitute if bad
+        BNE     %BT15
+
+      [ NoARMT2
+        MOV     r1, r2, LSR #4
+        AND     r1, r1, #3                      ; extract XEigFactor (bits 4..5)
+      |
+        UBFX    r1, r2, #4, #2                  ; extract XEigFactor (bits 4..5)
+      ]
+        STR     r1, [r9, #wkXEigFactor]
+
+      [ NoARMT2
+        MOV     r1, r2, LSR #6
+        AND     r1, r1, #3                      ; extract YEigFactor (bits 6..7)
+      |
+        UBFX    r1, r2, #6, #2                  ; extract YEigFactor (bits 6..7)
+      ]
+        STR     r1, [r9, #wkYEigFactor]
+
+        AND     r1, r2, #&FF00                  ; extract ModeFlags
+        ; Validate ModeFlags. We only support RGB colourspace, so the only valid
+        ; bits are the RGB and alpha flags
+        TST     r1, #&FF00-(ModeFlag_DataFormatSub_RGB+ModeFlag_DataFormatSub_Alpha)
+        MOVNE   r0, #SpriteType_Substitute      ; try the substitute?
+        BNE     %BT15
+
+        MOV     r0, r2, LSR #20
+        ANDS    r0, r0, #127                    ; extract type
+        MOVEQ   r0, #SpriteType_Substitute      ; type 0 isn't valid!
+
+        CMP     r0, #SpriteType_New64K
+        ORREQ   r1, r1, #ModeFlag_64k
+        MOVEQ   r0, #SpriteType_New16bpp
+
+        CMP     r0, #SpriteType_New16bpp        ; for palettised modes
+        CMPLT   r0, r1                          ; flags must be zero
+        MOVLT   r0, #SpriteType_Substitute
+        BLT     %BT15
+
+        STR     r1, [r9, #wkModeFlags]
+
+        CMP     r0, #SpriteType_New4K
+        BNE     %BT25
+
+        LDR     r0, =4095
+        STR     r0, [r9, #wkNColour]
+        MOV     r0, #4
+        B       %BT30
+
+85
         ADR     r0, ErrorBlock_Sprite_BadDPI
 90
  [ International
@@ -1628,7 +1717,15 @@ GenerateModeSelectorVars Entry "r0,r1,r3-r8,r10-r12"
 
 NColourTable    &       NColour_0, NColour_1, NColour_2
                 &       NColour_3, NColour_4, NColour_5
-PalIndexTable   =       0, 1, 2, 3, 6, 7
+                &       NColour_5 ; CMYK sprite (not supported)
+                &       NColour_5 ; 24bpp sprite (not supported)
+                &       NColour_5 ; JPEG sprite (not supported)
+                &       NColour_4 ; 64K sprite
+                &       NColour_5, NColour_5, NColour_5, NColour_5, NColour_5 ; sprite types 11-15
+                &       4095 ; 4K sprite
+                &       NColour_5, NColour_5 ; YCbCr 422 & 420 (not supported)
+                ASSERT  . - NColourTable = (SpriteType_RO5MAX-1)*4
+PalIndexTable   =       0, 1, 2, 3, 7, 7        ; TODO get rid of palette 6 if VIDC mangling is gone for good
         ALIGN                                   ; makes ECFIndexTable more accessible
 ECFIndexTable   =       4, 2, 3, 5, 5, 5
         ALIGN
@@ -2074,25 +2171,62 @@ SetCol30
         ADD     R0, WsPtr, #(Ecf1-8)
         ADD     R0, R0, R1, LSR #1      ; else point R0 at Ecf1,2,3 or 4
 
-        LDR     R4, [WsPtr, #BitsPerPix] ; if BitsPerPix <> 'fudged' BitsPerPix
+        LDR     R4, [WsPtr, #BitsPerPix]
+        CMP     R4, #16
+        BHI     SetCol45
+        BEQ     SetCol40
         LDR     R5, [WsPtr, #BytesPerChar]
-        TEQ     R4, R5
+        TEQ     R4, R5                  ; if BitsPerPix <> 'fudged' BitsPerPix
         BNE     SetCol52                ; then double up the pixels
                                         ; else its a normal Ecf
         MOV     R3, #0                  ; col step=0, same byte each coloum
         MOV     R4, #1                  ; row step=1
 SetCol35
         MOV     R5, #8                  ; do 8 rows
-SetCol40
+SetCol36
         MOV     R6, #4                  ; of 4 columns
-SetCol50
+SetCol37
         LDRB    R7, [R0], R3            ; read from source & move by col step
         STRB    R7, [R2], #1            ; write to dest, update dest pointer
         SUBS    R6, R6, #1
-        BNE     SetCol50
+        BNE     SetCol37
         ADD     R0, R0, R4              ; step source pointer to next row
         SUBS    R5, R5, #1
-        BNE     SetCol40
+        BNE     SetCol36
+        MOV     PC, R14
+
+; Generate 1x4 pattern for 16bpp
+;
+; R0 points to Ecf(n)
+; R2 points to destination
+;
+; Uses R0,R2,R5,R6,R7
+;
+SetCol40
+        LDMIA   R0, {R0,R6}             ; Grab full pattern block
+        EOR     R5, R0, R0, ROR #16     ; &22221111 ^ &11112222
+        EOR     R7, R6, R6, ROR #16
+        EOR     R0, R0, R5, LSL #16     ; = &11111111
+        EOR     R6, R6, R7, LSL #16
+        EOR     R5, R5, R0              ; = &22222222
+        EOR     R7, R7, R6
+        STMIA   R2!,{R0,R5,R6,R7}       ; Store 4 rows
+        STMIA   R2!,{R0,R5,R6,R7}       ; 8 rows
+        MOV     PC, R14
+
+; Generate 1x2 pattern for 32bpp
+;
+; R0 points to Ecf(n)
+; R2 points to destination
+;
+; Uses R0,R2,R5,R6,R7
+;
+SetCol45
+        LDMIA   R0, {R0,R5}
+        MOV     R6,R0
+        MOV     R7,R5
+        STMIA   R2!,{R0,R5,R6,R7}
+        STMIA   R2!,{R0,R5,R6,R7}
         MOV     PC, R14
 
 ; Double up the pixels for Mode2 etc
@@ -2559,6 +2693,73 @@ SWISetColour ROUT
         ORRNE   R0, R0, #setcol_FgBgFlag
         ORR     R0, R0, #setcol_PatternFlag
         B       %BT77
+
+; *****************************************************************************
+;
+;       HandleServiceDisplayStatus
+;
+;       Called from kernel service call handler
+;
+; in:   R0 = sub-reason
+;       R1 = Service_DisplayStatus
+;       R2 = GraphicsV driver number
+;       LR = return address
+;
+; out:  R12 corrupt
+;
+HandleServiceDisplayStatus ROUT
+        ; We're only interested in DisplayStatus_Changing/DisplayStatus_Changed
+        TEQ     r0, #DisplayStatus_Changing
+        TEQNE   r0, #DisplayStatus_Changed
+        MOVNE   pc, lr
+        Entry   "r0-r4"
+
+        ; We're only interested in the current driver
+        VDWS    WsPtr
+        LDR     r1, [WsPtr, #CurrentGraphicsVDriver]
+        TEQ     r1, r2
+        BNE     %FT90
+
+        ; Translate this call into the corresponding Service_DisplayChanging calls
+        ; DisplayStatus_Changing -> DisplayChanged_PreChanging
+        ; DisplayStatus_Changed  -> DisplayChanged_Changing,
+        ;                           DisplayChanged_Changed
+        ; This may sound odd, but that's how it fits with the way the
+        ; DisplayChanged service call is designed. The ScreenModes module will
+        ; recache its mode list when it receives DisplayChanged_Changing, so we
+        ; must only issue the call once the driver has finished changing its
+        ; configuration.
+
+        TEQ     r0, #DisplayStatus_Changed
+        BEQ     %FT50
+        MOV     r0, #DisplayChanged_PreChanging
+        MOV     r1, #Service_DisplayChanged
+        MOV     r3, #DisplayChangedSub_ModeNotChanged
+        IssueService
+        EXIT
+
+50
+        ; It was a DisplayStatus_Changed call. Recache any important values
+        ; that we care about.
+        MOV     r4, r2, LSL #24
+        ORR     r4, r4, #GraphicsV_DisplayFeatures
+        BL      CallGraphicsV
+        STR     r0, [WsPtr, #GraphicsVFeatures]
+
+        ; Currently we assume that the driver's VSync ability or hardware
+        ; scroll ability won't have been changed.
+
+        ; Now issue the two DisplayChanged service calls
+        MOV     r0, #DisplayChanged_Changing
+        MOV     r1, #Service_DisplayChanged
+        FRAMLDR r2
+        MOV     r3, #DisplayChangedSub_ModeNotChanged
+        IssueService
+        MOV     r0, #DisplayChanged_Changed
+        IssueService
+90
+        EXIT
+
 
         LTORG
 

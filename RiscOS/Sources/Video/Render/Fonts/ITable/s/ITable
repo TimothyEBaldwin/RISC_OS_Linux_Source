@@ -41,7 +41,6 @@
         GET     Hdr:ListOpts
         GET     Hdr:Macros
         GET     Hdr:System
-        GET     Hdr:CPU.Arch
         GET     Hdr:ModHand
         GET     Hdr:Proc
         GET     Hdr:Services
@@ -50,7 +49,8 @@
         GET     Hdr:NewErrors
         GET     Hdr:Variables
         GET     Hdr:VduExt
-        GET     Hdr:Debug
+        GET     Hdr:ResourceFS
+        GET     Hdr:MsgTrans
         GET     Hdr:Sprite
         GET     Hdr:ColourTran
         GET     Hdr:Hourglass
@@ -58,7 +58,6 @@
         GET     Hdr:PublicWS
         GET     Hdr:HostFS
         GET     Hdr:PaletteV
-        GET     Hdr:DDVMacros
 
         GET     hdr.ITable                      ; our SWI information
         GET     VersionASM                      ; and version data
@@ -72,6 +71,10 @@
                 GBLL    hostvdu
 debug           SETL    {FALSE}
 hostvdu         SETL    {FALSE}
+      [ :LNOT::DEF:standalone
+                GBLL    standalone
+standalone      SETL    {FALSE}
+      ]
 
                                  GBLL    UseResourceTable
 UseResourceTable                 SETL    {TRUE}
@@ -81,7 +84,6 @@ UseColourTransResourceTable      SETL    {TRUE}
 CallColourTransForTable          SETL    {TRUE}
                                  GBLL    DontAssumeRedirectionIsToggling
 DontAssumeRedirectionIsToggling  SETL    {TRUE}
-
 
 ; Constants used for computing table
 
@@ -175,6 +177,7 @@ Title
 SWINames
         DCB     "InverseTable", 0               ; prefix
         DCB     "Calculate", 0
+        DCB     "SpriteTable", 0
         DCB     0
         ALIGN
 
@@ -197,6 +200,12 @@ Init    Entry   "R1-R3"
 10
         MOV     WP, R2
 
+      [ standalone
+        ADRL    R0, msg_area
+        SWI     XResourceFS_RegisterFiles
+        EXIT    VS
+      ]
+
  [ DontAssumeRedirectionIsToggling
         MOV     R0, # f_CurrentlyScreen         ; initially we're directed at the screen
         STR     R0, iFlags
@@ -217,10 +226,6 @@ Init    Entry   "R1-R3"
         BGE     %BT20
 
         Debug_Open      pipe:itable
-
- [ UseResourceTable :LAND: {FALSE}
-        BL      check_resource                  ; deliberately don't check error return
- ]
 
         BL      claim_vectors                   ; try to claim the vectors
         EXIT                                    ;   and return any possible errors
@@ -245,6 +250,10 @@ Die     Entry   "R1-R2"
 
         BL      release_area                    ; if we have a dynamic area then discard it
 
+      [ standalone
+        ADRL    R0, msg_area
+        SWI     XResourceFS_DeregisterFiles
+      ]
         Debug_Close
 
         EXIT
@@ -259,7 +268,8 @@ Die     Entry   "R1-R2"
         ASSERT  Service_Reset                   < Service_ModeChange
         ASSERT  Service_ModeChange              < Service_ResourceFSStarted
         ASSERT  Service_ResourceFSStarted       < Service_ResourceFSDying
-        ASSERT  Service_ResourceFSDying         < Service_SwitchingOutputToSprite
+        ASSERT  Service_ResourceFSDying         < Service_ResourceFSStarting
+        ASSERT  Service_ResourceFSStarting      < Service_SwitchingOutputToSprite
         ASSERT  Service_SwitchingOutputToSprite < Service_PostInit
 UServTab
         DCD     0
@@ -269,6 +279,9 @@ UServTab
   [ UseResourceTable
         DCD     Service_ResourceFSStarted
         DCD     Service_ResourceFSDying
+  ]
+  [ standalone
+        DCD     Service_ResourceFSStarting
   ]
         DCD     Service_SwitchingOutputToSprite
   [ UseResourceTable
@@ -285,6 +298,9 @@ Service ROUT
         TEQNE   R1, # Service_ResourceFSStarted
         TEQNE   R1, # Service_ResourceFSDying
         TEQNE   R1, # Service_PostInit
+ ]
+ [ standalone
+        TEQNE   R1, # Service_ResourceFSStarting
  ]
         MOVNE   PC, LR
 UService
@@ -306,9 +322,7 @@ UService
         STR     R0, iDynamicArea
         STR     R0, pInverseTable
         STR     R0, pDistanceTable
- [ UseResourceTable :LAND: {FALSE}
-        STR     R0, pResourceTable
- ]
+
         BL      claim_vectors                   ; must claim the vectors again
 
         EXIT
@@ -331,11 +345,21 @@ UService
 
 20
  ]
+ [ standalone
+        TEQ     R1, # Service_ResourceFSStarting
+        BNE     %FT30
+
+        ADRL    R0, msg_area                    ; reinstall the resource block
+        MOV     LR, PC
+        MOV     PC, R2
+        EXIT
+30
+ ]
         TEQ     R1, # Service_ModeChange
         BICEQ   R0, R0, # f_TableValid          ; mode change, therefore table bad
         TEQ     R1, # Service_SwitchingOutputToSprite
  [ DontAssumeRedirectionIsToggling
-        BNE     %FT30
+        BNE     %FT40
         ; we're changing redirection
         ORR     R0, R0, # f_SwitchInvalid       ; output gone to sprite - maybe invalid
 
@@ -346,10 +370,10 @@ UService
 
         TST     R0, # f_TableValid              ; if the table is already invalid
         TSTNE   R0, # f_CurrentlyScreen         ; ... or if we're not going to the screen now
-        BEQ     %FT30                           ; ... we don't care
+        BEQ     %FT40                           ; ... we don't care
         TST     R0, # f_TableScreen             ; is the table for the screen ?
         BICNE   R0, R0, # f_SwitchInvalid       ; if so, then the table /is/ valid again
-30
+40
  |
         EOREQ   R0, R0, # f_SwitchInvalid       ; output gone to sprite - maybe invalid
  ]
@@ -370,39 +394,64 @@ SWIDespatch ROUT
         LDR     WP, [WP]                        ; de-reference the workspace pointer
         WritePSRc SVC_mode, R10                 ;   ensure that IRQ's get re-enabled
 
+        Push    "LR"
+        BL      SWIDespatchInternal
+        Pull    "LR"
+
+      [ No32bitCode
+        ORRVSS  PC, LR, #V_bit                  ; mark that an error occurred
+        MOVS    PC, LR
+      |
+        TEQ     PC, PC                          ; preserves V
+        MOVEQ   PC, LR                          ; 32 bit exit
+        ORRVSS  PC, LR, #V_bit                  ; 26 bit error exit
+        MOVS    PC, LR
+      ]
+
+        MakeInternatErrorBlock ModuleBadSWI,,BadSWI
+
+msg_filename
+        DCB     "Resources:$.Resources.ITable.Messages", 0
+        ALIGN
+
+SWIDespatchInternal
+
         CMP     R11, #( %90-%00 ) / 4           ; is the index valid for our swi table
         ADDCC   PC, PC, R11, LSL # 2            ;   if it is then despatch
         B       %FT90
 00
         B       ITable_Calculate
+        B       ITable_SpriteTable
 90
-        ADR     R0, ErrorBlock_NaffSWI
+        ADR     R0, ErrorBlock_ModuleBadSWI
+make_error
+        Push    "R1-R7,LR"
+        SUB     SP, SP, #16                     ; temporary MessageTrans structure
+
+        MOV     R7, R0                          ; Push R0
+        MOV     R0, SP
+        ADR     R1, msg_filename
+        MOV     R2, #0
+        SWI     XMessageTrans_OpenFile
+        BVS     %FT95                           ; someone ate my messages file
+        MOV     R0, R7                          ; Pull R0
+
+        MOV     R1, SP
+        MOV     R2, #0                          ; use MessageTrans internal buffer
+        ADRL    R4, Title
+        MOV     R5, #0
+        MOV     R6, #0
+        MOV     R7, #0
+        SWI     XMessageTrans_ErrorLookup
+
+        MOV     R7, R0                          ; Push R0
+        MOV     R0, SP
+        SWI     XMessageTrans_CloseFile
+        MOV     R0, R7                          ; Pull R0
 95
-      [ No32bitCode
-        ORRS    PC, LR, #V_bit                  ; mark that an error occurred
-      |
-        MRS     R10, CPSR                       ; preserve other flags on 26-bit system
-        TST     R10, #2_11100
-        ORREQS  PC, LR, #V_bit                  ; mark that an error occurred (26-bit)
-        SETV                                    ;                             (32-bit)
-        MOV     PC, LR
-     ]
-
-err_badmode
-      [ No32bitCode
-        ADR     R0, ErrorBlock_BadMODE
-        ORRS    PC, LR, #V_bit                  ; mark that an error occurred
-      |
-        MRS     R0, CPSR                        ; take care to preserve other flags
-        ORR     R0, R0, #V_bit
-        MSR     CPSR_f, R0
-        ADR     R0, ErrorBlock_BadMODE
-        MOV     PC, LR
-      ]
-
-        MakeErrorBlock NaffSWI
-        MakeErrorBlock BadMODE
-
+        ADD     SP, SP, #16                     ; finished with the structure
+        SETV
+        Pull    "R1-R7,PC"
 
 ;; ------------------------------------------------------------------------------
 ;; Claim vectors used by the modules
@@ -453,10 +502,11 @@ palVhandler ROUT
 ;; Check on the resource file presence
 
  [ UseResourceTable
+table_filename
   [ UseColourTransResourceTable
-ResourceFile    = "Resources:$.Resources.Colours.Tables.8desktop", 0
+        DCB     "Resources:$.Resources.Colours.Tables.8desktop", 0
   |
-ResourceFile    = "Resources:$.Resources.ITable.Tables.8desktop", 0
+        DCB     "Resources:$.Resources.ITable.Tables.8desktop", 0
   ]
         ALIGN
 
@@ -469,7 +519,7 @@ check_resource
         STR     R0, pResourceTable
 
         MOV     R0, #open_read :OR: open_nopath :OR: open_nodir
-        ADR     R1, ResourceFile
+        ADR     R1, table_filename
         SWI     XOS_Find
         EXIT    VS
 
@@ -511,7 +561,7 @@ check_resource
 ;; when this == 1 then the table has been correctly cached, and therefore
 ;; does not need recomputing.
 ;;
-;  Another bit is used to indicate if output is being swithced to a sprite,
+;; Another bit is used to indicate if output is being swithced to a sprite,
 ;; this bit is toggled each time output is toggled.  Therefore if this SWI
 ;; is called and 'f_SwitchInvalid' == 1 then output it redirected to the
 ;; sprite and we must recompute the inverse table.
@@ -548,8 +598,9 @@ ITable_Calculate Entry "R2"
         MOV     R1, #VduExt_Log2BPP
         SWI     XOS_ReadModeVariable            ; read the log2 bits per pixel for this mode
         TEQ     R2, #3                          ;   if this is not 8 bit then exit
-        BLNE    err_badmode
-        BNE     %FT90
+        ADRNE   R0, ErrorBlock_BadMODE
+        BLNE    make_error
+        BVS     %FT90
 
         LDR     R2, iFlags                      ; check to see if table is valid
         TST     R2, # f_SwitchInvalid
@@ -572,6 +623,146 @@ ITable_Calculate Entry "R2"
         ADRVC   R0, iPalette555                 ; -> RGB 5,5,5 table ( index => 5,5,5 )
         LDRVC   R1, pInverseTable               ; -> inverse table (5,5,5 => colour number)
  ]
+90
+        EXIT
+
+        MakeInternatErrorBlock BadMODE,,BadMODE
+
+;;-----------------------------------------------------------------------------
+;; InverseTable_SpriteTable implementation
+;;
+;; As per InverseTable_Calculate, except we perform the conversion for a
+;; user-supplied palette, into a user-supplied destination buffer.
+;;
+;; As an optimisation we're allowed to replace the user's buffer pointers
+;; with pointers of our own if we've got the data cached already. At the
+;; moment we only bother to do this if they're requesting a table for the
+;; current mode.
+;;
+;; This SWI should only be called if the mode is == 8 bit per pixel,
+;; all other depths will result in a 'Bad MODE error'.
+;;
+;; in   R0 -> buffer to fill with index to 5,5,5 table
+;;      R1 -> buffer to fill with 5,5,5 to index table
+;;      R2 = sprite area/mode (same as R0 of ColourTrans_ReadPalette)
+;;      R3 = sprite pointer/palette (same as R1 of ColourTrans_ReadPalette)
+;;           note: No way of specifying a sprite name
+;; out  R0 -> index to 5,5,5 RGB data
+;;      R1 -> 5,5,5 RGB data to index table
+;;-----------------------------------------------------------------------------
+
+ITable_SpriteTable
+        CMP     R2, #-1
+        CMPEQ   R3, #-1
+        BEQ     ITable_Calculate                ; branch through to InverseTable_Calculate if they're interested in the current mode
+
+        Entry   "R0-R11"
+
+        MOV     R0, R2
+        MOV     R4, #0
+
+        ; Have we been given a sprite or a mode?
+        CMP     R2, #256
+        BLO     %FT10
+        TST     R2, #1
+        BNE     %FT10
+
+        ; Should be a sprite area
+        LDR     R0, [R3, #spMode]
+        MOV     R4, #1
+10
+        MOV     R1, #VduExt_Log2BPP
+        SWI     XOS_ReadModeVariable            ; read the log2 bits per pixel for this mode
+        TEQ     R2, #3                          ;   if this is not 8 bit then exit
+        ADRNE   R0, ErrorBlock_BadMODE
+        BLNE    make_error
+        STRVS   R0, [sp]
+        BVS     %FT90
+
+        ; Fetch the palette
+        LDR     R0, [sp, #8] ; Recover R2
+        MOV     R1, R3
+        LDR     R2, [sp] ; Recover R0
+        MOV     R3, #1024
+        ; R4 already initialised above
+        SWI     XColourTrans_ReadPalette
+        STRVS   R0, [sp]
+        BVS     %FT90
+
+        SWI     XHourglass_On                   ; this could take some time
+
+        ; If we're using ColourTrans, fetch the table now using the palette
+        ; we just fetched
+   [ CallColourTransForTable
+        LDR     r0, =1 :OR: (5<<27) :OR: (90<<1) :OR: (90<<14) ; source mode,
+                                                               ; resolution not relevant but should be valid
+        MOV     r1, #-1                                        ; the current palette
+        SUB     r3, r2, #1024                                  ; destination palette
+        LDR     r2, =1 :OR: (4<<27) :OR: (90<<1) :OR: (90<<14) ; destination mode (8bpp, will be treated as full palette)
+        LDR     r4, [sp, #4]                                   ; decent sized buffer for the output
+                                                               ; note: the output should be 3 words
+        MOV     r5, #0                                         ; flags
+        SWI     XColourTrans_GenerateTable
+        STRVS   r0, [sp]
+        BVS     %FT85                                          ; error is just fatal
+        ; check it's something we understand
+        LDR     r0, word_32k
+        LDMIA   r4, {r1,r2,r3}
+        TEQ     r0, r1
+        TEQEQ   r0, r3
+        BNE     %FT30                                          ; no idea what that is, do it ourselves
+
+        ; now copy it to the user's buffer
+        MOV     r0, # (colourmax * colourmax * colourmax)
+        MOV     r1, r4
+        ; r0 = entries
+        ; r1->destination
+        ; r2->source
+16
+        LDMIA   r2!, {r3,r4,r5,r6,r7,r8,r9,r10} ; 8 registers = 4*8 bytes
+        STMIA   r1!, {r3,r4,r5,r6,r7,r8,r9,r10}
+        LDMIA   r2!, {r3,r4,r5,r6,r7,r8,r9,r10} ; 16 registers = 4*16 bytes
+        STMIA   r1!, {r3,r4,r5,r6,r7,r8,r9,r10}
+        LDMIA   r2!, {r3,r4,r5,r6,r7,r8,r9,r10} ; 24 registers = 4*24 bytes
+        STMIA   r1!, {r3,r4,r5,r6,r7,r8,r9,r10}
+        LDMIA   r2!, {r3,r4,r5,r6,r7,r8,r9,r10} ; 32 registers = 4*32 bytes
+        STMIA   r1!, {r3,r4,r5,r6,r7,r8,r9,r10}
+        SUBS    r0, r0, #32*4
+        BNE     %BT16
+
+        B       %FT40
+   ]
+
+30
+
+        ; Generate the table
+        BL      claim_area                      ; The dynamic area is needed for temp storage of the distance table
+        LDMVCIA SP, {R0-R1}
+        BLVC    build_itable_core
+        STRVS   R0, [SP]
+        BVS     %FT85
+
+40
+        ; Convert the palette we fetched earlier to 555
+        LDR     R0, [sp]
+        ADD     R2, R0, #1024
+50
+        LDR     R1, [R2, #-4]!
+        AND     R3, R1, #&0000F800
+        AND     R4, R1, #&00F80000
+        MOV     R3, R3, LSR #8+3
+        AND     R5, R1, #&F8000000
+        ORR     R1, R3, R4, LSR #16+3-5
+        ORR     R1, R1, R5, LSR #24+3-10
+        CMP     R0, R2
+        STR     R1, [R2]
+        BNE     %BT50
+85
+        SavePSR LR
+        Push    "R0,LR"
+        SWI     XHourglass_Off                  ; remove hourglass
+        Pull    "R0,LR"                         ;   preserving error condition around call
+        RestPSR LR,,cf
 90
         EXIT
 
@@ -794,7 +985,7 @@ build_itable Entry "R1-R11"
         LDR     r0, =1 :OR: (5<<27) :OR: (90<<1) :OR: (90<<14) ; source mode,
                                                                ; resolution not relevant but should be valid
         MOV     r1, #-1                                        ; the current palette
-        MOV     r2, #-1                                        ; destrination mode
+        MOV     r2, #-1                                        ; destination mode
         MOV     r3, #-1                                        ; default palette for that mode
         LDR     r4, pInverseTable                              ; decent sized buffer for the output
                                                                ; note: the output should be 3 words
@@ -840,6 +1031,40 @@ word_32k
 
         ; here we start to generate the table ourselves
 17
+        LDR     R0, =scratch_palette
+        LDR     R1, pInverseTable
+        BL      build_itable_core
+85
+        LDR     LR, iFlags
+        ORR     LR, LR, # f_TableValid          ; table is now valid
+  [ DontAssumeRedirectionIsToggling
+        ; remember what this table was for - the screen or a sprite
+        TST     LR, # f_CurrentlyScreen
+        BICEQ   LR, LR, # f_TableScreen
+        ORRNE   LR, LR, # f_TableScreen
+  ]
+        STR     LR, iFlags
+90
+        SavePSR LR
+        Push    "R0,LR"
+        SWI     XHourglass_Off                  ; remove hourglass
+        Pull    "R0,LR"                         ;   preserving error condition around call
+        RestPSR LR,,cf
+
+        EXIT
+
+; Actually build a table
+;
+; On entry:
+; R0 = dest palette (as &BBGGRR00)
+; R1 = dest buffer
+; DA must exist
+; Hourglass on
+; On exit:
+; All regs corrupt
+
+build_itable_core ROUT
+        Entry   "R0-R1"
         LDR     R0, iDynamicArea
         MOV     R1, # ?da_iDistanceTable
         SWI     XOS_ChangeDynamicArea           ; expand to contain our distances table
@@ -847,7 +1072,8 @@ word_32k
 ;           satisfied; it /may/ return that only part of the claim took place - we
 ;           rely here on the fact that da_iDistanceTable is a multiple of the page
 ;           size long. fortunately, it is and we know it.
-        BVS     %FT90                           ;   if that fails then return
+        STRVS   R0, [SP]                        ;   if that fails then return
+        EXIT    VS
 
         LDR     R0, pInverseTable
         ASSERT  da_iDistanceTable > 0
@@ -870,7 +1096,7 @@ word_32k
 
         ; Compute steps and build inverse table
 
-        LDR     LR, = scratch_palette
+        LDR     LR, [SP]
         LDR     LR, [ LR, iColours, LSL # 2 ]   ; pick up RGB value
 
         AND     rDist, LR, #&FF00
@@ -906,7 +1132,7 @@ word_32k
 
         MOV     b, #0                           ; b = 0
 
-        LDR     pITable, pInverseTable
+        LDR     pITable, [SP, #4]
         LDR     pDistances, pDistanceTable      ; -> distance table
 
 blue_loop
@@ -980,24 +1206,7 @@ end_green_loop
         LDR     R0, iDynamicArea
         LDR     R1, = - ( ?da_iDistanceTable )
         SWI     XOS_ChangeDynamicArea           ; remove distance table from dynamic area
-
-85
-        LDR     LR, iFlags
-        ORR     LR, LR, # f_TableValid          ; table is now valid
-  [ DontAssumeRedirectionIsToggling
-        ; remember what this table was for - the screen or a sprite
-        TST     LR, # f_CurrentlyScreen
-        BICEQ   LR, LR, # f_TableScreen
-        ORRNE   LR, LR, # f_TableScreen
-  ]
-        STR     LR, iFlags
-90
-        SavePSR LR
-        Push    "R0,LR"
-        SWI     XHourglass_Off                  ; remove hourglass
-        Pull    "R0,LR"                         ;   preserving error condition around call
-        RestPSR LR,,cf
-
+        CLRV
         EXIT
 
  [ UseResourceTable
@@ -1069,6 +1278,11 @@ StandardPalette
         DCW     &6739,&6F7B,&77BD,&7FFF
  ]
 
+      [ standalone
+msg_area
+        ResourceFile    $MergedMsgs, Resources.ITable.Messages
+        DCD     0
+      ]
       [ debug
         InsertNDRDebugRoutines
       ]

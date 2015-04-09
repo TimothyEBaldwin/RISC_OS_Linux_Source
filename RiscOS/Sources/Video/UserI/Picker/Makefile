@@ -34,6 +34,7 @@ FULL_COMPONENT = ColourPicker
 EXP_HDR = <export$dir>
 
 VPATH=@ Support011
+WINEDIT = /Apps:!WinEdit
 
 #
 # Export Paths for Messages module
@@ -41,25 +42,7 @@ VPATH=@ Support011
 RESDIR = <resource$dir>.Resources2.${COMPONENT}
 RESFSDIR   = Resources.${COMPONENT}
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-MODSQZ  = modsqz
-WIPE    = x wipe
-CD      = dir
-TOUCH   = stamp
-WINEDIT = /Apps:!WinEdit
-PERL    = do <Perl$Dir>.perl
-
-CPFLAGS = ~cfr~v
-WFLAGS  = f~c~vr
+include StdTools
 
 #
 # Include files
@@ -152,21 +135,21 @@ icons.h.hsv_i: Resources.HSV.Templates
 # Main rules:
 #
 all: ${RAM_MODULE} o.dirs
-	@echo ${FULL_COMPONENT}: Module built (RAM)
+	@${ECHO} ${FULL_COMPONENT}: Module built (RAM)
 
 install: ${RAM_MODULE} o.dirs
 	${CP} ${RAM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${FULL_COMPONENT}: Module installed (RAM)
+	@${ECHO} ${FULL_COMPONENT}: Module installed (RAM)
 
 ramtrace: ${DBG_MODULE} o.dirs
-	@echo ${FULL_COMPONENT}: Module built (TRACE)
+	@${ECHO} ${FULL_COMPONENT}: Module built (TRACE)
 
 rom: ${ROM_MODULE} o.dirs
-	@echo ${FULL_COMPONENT}: Module built (ROM)
+	@${ECHO} ${FULL_COMPONENT}: Module built (ROM)
 
 install_rom: ${ROM_MODULE}
 	${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${FULL_COMPONENT}: Module installed (ROM)
+	@${ECHO} ${FULL_COMPONENT}: Module installed (ROM)
 
 resources: ${RESOURCEFILES}
 	${MKDIR} ${RESDIR}
@@ -182,7 +165,7 @@ resources: ${RESOURCEFILES}
 	${CP} Resources.MergedMsgs      ${RESDIR}.Messages       ${CPFLAGS}
 	${CP} Resources.Sprites         ${RESDIR}.Sprites        ${CPFLAGS}
 	${CP} Resources.Templates       ${RESDIR}.Templates      ${CPFLAGS}
-	@echo ${FULL_COMPONENT}: resources copied to Messages module
+	@${ECHO} ${FULL_COMPONENT}: resources copied to Messages module
 
 clean:
 	${WIPE} o ${WFLAGS}
@@ -194,17 +177,17 @@ clean:
 	${WIPE} linked ${WFLAGS}
 	${WIPE} icons ${WFLAGS}
 	${WIPE} Resources.MergedMsgs ${WFLAGS}
-	@echo ${FULL_COMPONENT}: cleaned
+	@${ECHO} ${FULL_COMPONENT}: cleaned
 
 export:
 	${CP} hdr.ColourPick ${EXP_HDR}.ColourPick ${CPFLAGS}
-	@echo ${FULL_COMPONENT}: export complete
+	@${ECHO} ${FULL_COMPONENT}: export complete
 
 rom_link:
 	${MKDIR} linked
 	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM}
 	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: rom_link complete
+	@${ECHO} ${COMPONENT}: rom_link complete
 
 BBETYPE = picker
 bbe-picker: bbe-generic
@@ -218,7 +201,7 @@ Resources.MergedMsgs:
 	${CP} Resources.Messages  Resources.MergedMsgs    ${CPFLAGS}
 else
 Resources.MergedMsgs:
-	FAppend Resources.MergedMsgs Resources.Messages Resources.CmdHelp
+	${FAPPEND} Resources.MergedMsgs Resources.Messages Resources.CmdHelp
 endif
 
 o.dirs:
@@ -227,10 +210,10 @@ o.dirs:
 	${MKDIR} or
 	${MKDIR} icons
 	${MKDIR} icons.h
-	create $@
+	${TOUCH} $@
 
 o.msgs: ${RESOURCEFILES}
-	resgen resourcefs_files $@ \
+	${RESGEN} resourcefs_files $@ \
  Resources.CMYK.Messages   ${RESFSDIR}.CMYK.Messages    \
  Resources.CMYK.Templates  ${RESFSDIR}.CMYK.Templates   \
  Resources.HSV.Templates   ${RESFSDIR}.HSV.Templates    \
@@ -248,7 +231,6 @@ ${RAM_MODULE}:  ${RAM_OBJS} ${CLIB} ${OSLIB} ${ICONS} ${ASMUTILS}
 	${MKDIR} rm
 	$(LD) -o $@ -rmf ${RAM_OBJS} ${CLIB} ${OSLIB} ${ASMUTILS}
 	${MODSQZ} $@
-	Access $@ RW/R
 
 ${ROM_MODULE}:  ${ROM_OBJS} ${OSLIB} ${ROMCSTUBS} ${ICONS} ${ASMUTILS}
 	${MKDIR} aof
@@ -257,6 +239,5 @@ ${ROM_MODULE}:  ${ROM_OBJS} ${OSLIB} ${ROMCSTUBS} ${ICONS} ${ASMUTILS}
 ${DBG_MODULE}:  ${DBG_OBJS} ${CLIB} ${OSLIB} ${ICONS} ${ASMUTILS}
 	${MKDIR} rm
 	$(LD) -o $@ -rmf ${DBG_OBJS} ${OSLIB} ${CLIB} ${ASMUTILS}
-	Access $@ RW/R
 
 # Dynamic dependencies:

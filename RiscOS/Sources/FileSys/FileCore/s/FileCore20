@@ -48,26 +48,17 @@
 ;   disc good, return disc rec associated with drive
 
 WhatDisc ROUT
-        Push    "r0,r4,r5,r6,r10,lr"
-        MOV     r10, #1
-        B       WhatDiscCommon
+        Push    "r0,r4,r5,r6,lr"
 
-WhatDiscType
-        Push    "r0,r4,r5,r6,r10,lr"
-        MOV     r10, #0
-        ; Drop through to WhatDiscCommon
-
-WhatDiscCommon
  [ Debug4 :LOR: DebugL
 
-        DREG    R1, "<WhatDiscCommon(Drv=",cc
-        DREG    R10, ",Opt=",cc
+        DREG    R1, "<WhatDisc(Drv=",cc
         DLINE   ")"
  ]
 
         BL      CheckDriveNumber
         BVS     %FT80
-
+05
         ; Test the disc's presence in the drive
         MOV     r0, r1
         BL      PollChange      ;(R0->LR)
@@ -88,8 +79,7 @@ WhatDiscCommon
  ]
         BL      MountDiscOnDrive                ; (r1,r4->V+r0,r1,r2,r4,r5,r6)
         BVS     %FT80
-        TEQ     r10, #0
-        BLNE    DetermineDiscType               ; (r1,r2,r4,r5,r6->V+r0,r2,r5,r6)
+        BL      DetermineDiscType               ; (r1,r2,r4,r5,r6->V+r0,r2,r5,r6)
         MOVVC   r3, r5
         MOVVC   r0, #0
         B       %FT80
@@ -108,9 +98,8 @@ WhatDiscCommon
 
 
         ; If disc hasn't been identified and we're interested in that....
-        TEQ     r10, #0
-        LDRNE   lr, [r3, #DiscFlags]
-        TSTNE   lr, #DiscNotIdentified
+        LDR     lr, [r3, #DiscFlags]
+        TST     lr, #DiscNotIdentified
         BEQ     %FT80
 
  [ DebugL
@@ -134,8 +123,19 @@ WhatDiscCommon
         DLINE   ")"
         DebugError "     WhatDisc error"
  ]
-        STRVS   r0, [sp]
-        Pull    "r0,r4,r5,r6,r10,pc"
+        BVS     %FT90
+        ; DetermineDiscType can cause the disc and drive records to become
+        ; unlinked due to the PollChanged within the DiscOps used to load the
+        ; boot block - this was designed to support ADFS floppies, but interacts
+        ; badly in particular with SDFS for removable drives with no disc detect
+        ; (e.g. Raspberry Pi B+). If this happens, loop round and try again.
+        LDRB    r0, [r3, #DiscsDrv]
+        TEQ     r0, #8
+        BEQ     %BT05
+        Pull    "r0,r4,r5,r6,pc"
+
+90      ADD     sp, sp, #4
+        Pull    "r4,r5,r6,pc"
 
 ; ================
 ; CheckDriveNumber
@@ -266,14 +266,14 @@ DetermineDiscType ROUT
         Push    "r0"
         LDR     r0, [r5, #DiscRecord_DiscType]
         DREG    r0, "Disc identified...Type=",cc
-        ASSERT  DiscId :MOD: 4 = 0
+        ASSERT  DiscRecord_DiscId :MOD: 4 = 0
         LDR     r0, [r5, #DiscRecord_DiscId]
         MOV     r0, r0, ASL #16
         MOV     r0, r0, LSR #16
         DREG    r0, " DiscId=",cc
         ADD     r0, r5, #DiscRecord_DiscName
         DSTRING r0, " name=",cc
-        LDR     r0, [r5, #DiscSize]
+        LDR     r0, [r5, #DiscRecord_DiscSize]
         DREG    r0, " DiscSize="
         DLINE   "trying to match against other records..."
         Pull    "r0"
@@ -425,7 +425,7 @@ DetermineDiscType ROUT
         ; disc is changed or not changed.
         LDRB    r0, [r5, #DiscFlags]
  [ DebugL
-        DREG    r0, "DiscFlags picked up to be "
+        DREG    r0, "DiscFlags in DetermineDiscType are "
  ]
         TST     r1, #4
         BICEQ   r0, r0, #FloppyFlag
@@ -539,15 +539,19 @@ DetermineDiscType ROUT
  ]
         LDRVS   r1, =FileType_Data
         STRVS   r1, [r5, #DiscRecord_DiscType]
+        BVS     %FT90
 
         ; Disc in drive is now certain
-        LDRVCB  r1, [r4, #DrvsDisc]
-        BICVC   r1, r1, #Uncertain
-        STRVCB  r1, [r4, #DrvsDisc]
+        ; However, there is a possibility that PollChange calls during disc
+        ; startup may have delinked the disc and drive, so make sure it's still
+        ; valid before we mark the drive as certain
+        LDRB    r1, [r4, #DrvsDisc]
+        TST     r1, #Unknown :OR: Empty :OR: Full
+        BICEQ   r1, r1, #Uncertain
+        STREQB  r1, [r4, #DrvsDisc]
 
         ; If disc remained unidentified then check read sectors cache for errors
         ; If we find an error then use that
-        BVS     %FT90
         LDR     r1, [r5, #DiscRecord_DiscType]
         LDR     lr, =FileType_Data
         TEQ     lr, r1
@@ -959,24 +963,37 @@ ReadDefectList ROUT
  ]
 
         ; It's a FileCore hard disc, read the bad block list
+        MOV     r4, #SzDefectList
         LDR     r3, DefectSpace
         ADD     r3, r3, SB
         ASSERT  SzDefectList = (1 :SHL: 9)
         ADD     r3, r3, r1, ASL #9
-        MOV     r4, #SzDefectList
-        MOV     r2, r1, ASL #(32-3)
+      [ BigSectors
+        ; For 2k and 4k sector sizes the defect list isn't on a sector boundary
+        ; any more, so read via an intermediate buffer
+        LDRB    r2, [r5, #DiscRecord_Log2SectorSize]
+        ASSERT  (DefectListDiscAdd :MOD: 1024) = 0
+        CMP     r2, #10
+        ASSERT  ?ScratchSpace >= SzDefectList
+        MOVHI   r3, #ScratchSpace
+        ASSERT  SzDefectList <= 1:SHL:11
+        MOVHI   r4, #1
+        MOVHI   r4, r4, LSL r2
+      ]
+        MOV     r2, r1, ASL #(32-3)     ; Top 3 drive bits
         MOV     r1, #DiscOp_CachedReadSecs
  [ BigDisc
         Push    "R10,R11"
-        LDRB    r11, [r5, #DiscRecord_Log2SectorSize]           ; get sector size
+        LDRB    r11, [r5, #DiscRecord_Log2SectorSize]
         MOV     r10,#DefectListDiscAdd
-        ORR     r2,r2,r10,LSR r11
+        ORR     r2,r2,r10,LSR r11       ; Offset in sectors
         Pull    "R10,R11"
  |
         ORR     r2, r2, #DefectListDiscAdd
  ]
         BL      RetryDriveOp
         BVS     %FT90                   ; Bog it, defect list didn't read
+
 
         ; Assume defect list is OK as it must have been checked in identifying the disc
 
@@ -993,6 +1010,22 @@ ReadDefectList ROUT
         ADD     r3, r3, SB
         ASSERT  SzDefectList = (1 :SHL: 9)
         ADD     r3, r3, r1, ASL #9
+
+      [ BigSectors
+        LDRB    r0, [r5, #DiscRecord_Log2SectorSize]
+        CMP     r0, #10
+        BLS     %FT10                   ; Was directly loaded
+
+        MOV     r14, #DefectListDiscAdd
+        MOV     r1, r14, LSR r0
+        SUB     r0, r14, r1, LSL r0     ; R0 := defect list addr MOD sector size
+        ADD     r0, r0, #ScratchSpace   ; src
+        MOV     r1, r3                  ; dest
+        MOV     r2, #SzDefectList       ; len
+        ASSERT  (SzDefectList :MOD: 256) = 0
+        BL      Move256n                ; (R0-R2->R0-R2)
+10
+      ]
         ADD     r3, r3, #DefectStruc
 
         ; Copy zones to our disc record
@@ -1003,7 +1036,7 @@ ReadDefectList ROUT
         STRB    r0, [r5, #DiscRecord_BigMap_NZones2]
  ]
 
-        ; If zones <> 0, then copy ZoneSpare and BitSize too for E format
+        ; If zones <> 0, then copy ZoneSpare and Log2bpmb too for E format
         TEQ     r0, #0
         LDRNEB  r0, [r3, #DiscRecord_ZoneSpare]
         STRNEB  r0, [r5, #DiscRecord_ZoneSpare]
@@ -1024,36 +1057,22 @@ ReadDefectList ROUT
         DLINE   "It's a floppy...no defect list to read"
  ]
 
- [ BigDisc
-        ; It's a FileCore floppy disc, read byte 2 to test bit 7 of it
+        ; It's a FileCore floppy disc, read sector 0 byte 2 to test bit 7 of it
         SUB     sp, sp, #4
         MOV     r3, sp                  ; read to the stack
         MOV     r4, #4                  ; 4 bytes to read
         MOV     r2, r1, ASL #(32-3)
         MOV     r1, #DiscOp_CachedReadSecs
         BL      RetryDriveOp
-        LDRB    r0, [sp,#2]
+        LDRB    r0, [sp,#FreeLink + 1]
         ADD     sp, sp, #4
- |
-        ; It's a FileCore floppy disc, read byte 2 to test bit 7 of it
-        SUB     sp, sp, #4
-        MOV     r3, sp                  ; read to the stack
-        MOV     r4, #1                  ; 1 byte to read
-        MOV     r2, r1, ASL #(32-3)
-        ADD     r2, r2, #2              ; byte 2
-        MOV     r1, #DiscOp_CachedReadSecs
-        BL      RetryDriveOp
-        LDRB    r0, [sp]
-        ADD     sp, sp, #4
- ]
 
         ; Restore r1,r2 and r4 (and r3 too, but don't care about that)
         LDMIB   sp, {r1-r4}
 
-        BVS     %FT30                   ; Byte 2 didn't read, but it is a floppy, hence it must be an E floppy
+        BVS     %FT30                   ; Byte 2 didn't read, but it is a floppy, assume it's an E floppy
 
-        ; Might be E format
-        TST     r0, #bit7
+        TST     r0, #bit7               ; Check for FreeLink end bit
         BNE     %FT30
 
         ; It's a D or L format disc
@@ -1299,7 +1318,7 @@ ReadFsMap ROUT
         ; Adjust DiscFlags in r11
         LDRB    r11, [r5, #DiscFlags]
  [ DebugL
-        DREG    r11, "DiscFlags picked up to be "
+        DREG    r11, "DiscFlags in ReadFsMap are "
  ]
 
  [ BigMaps

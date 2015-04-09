@@ -38,11 +38,19 @@
 #
 # Paths
 #
-TOPDIR   = <hdr$dir>
+ifeq ("${MAKECMDGOALS}","install")
+INSTDIR ?= <Install$Dir>.Export.<APCS>
+TOPDIR   = ${INSTDIR}.Hdr
 HDRDIR   = ${TOPDIR}.Global
-HDIR     = <CExport$dir>
-LIBDIR   = <Lib$Dir>
-INSTDIR ?= <APCSExport$Dir>
+HDIR     = ${INSTDIR}.C
+LIBDIR   = ${INSTDIR}.Lib
+else
+# i.e. this is an export phase, not install
+TOPDIR  = <hdr$dir>
+HDRDIR  = ${TOPDIR}.Global
+HDIR    = <CExport$dir>
+LIBDIR  = <Lib$Dir>
+endif
 
 include StdTools
 
@@ -87,6 +95,7 @@ EXPORTS   = \
  ${HDRDIR}.MEMM.MEMC1 \
  ${HDRDIR}.MEMM.VMSAv6 \
  ${HDRDIR}.Machine.<Machine> \
+ ${HDRDIR}.Machine.All \
  ${HDRDIR}.Machine.All32 \
  ${HDRDIR}.Machine.Machine \
  ${HDRDIR}.Macros \
@@ -120,7 +129,6 @@ EXPORTS   = \
  ${HDIR}.Global.h.DrawObj \
  ${HDIR}.Global.h.EnvNumbers \
  ${HDIR}.Global.h.FileTypes \
- ${HDIR}.Global.h.FreeWay \
  ${HDIR}.Global.h.FreewayReg \
  ${HDIR}.Global.h.FSNumbers \
  ${HDIR}.Global.h.GraphicsV \
@@ -143,22 +151,22 @@ EXPORTS   = \
  ${HDIR}.Global.IO.h.GenericIO \
  ${HDIR}.Global.IO.h.IOMD \
 
-INSTALLS   = \
- ${INSTDIR}.Hdr.APCS.APCS-32 \
- ${INSTDIR}.Hdr.APCS.APCS-R \
- ${INSTDIR}.Hdr.APCS.Common \
- ${INSTDIR}.Hdr.CPU.Generic26 \
- ${INSTDIR}.Hdr.CPU.Generic32 \
- ${INSTDIR}.Hdr.ListOpts \
-
 #
 # Generic rules:
 #
 
 export: ${OPTIONS} ${EXPORTS} Dirs
+ifeq ("${OPTIONS}","")
 	@echo ${COMPONENT}: export complete
+else
+	@echo ${COMPONENT}: export complete (${OPTIONS})
+endif
 
 Dirs:
+	@echo TOPDIR ${TOPDIR}
+	@echo HDRDIR ${HDRDIR}
+	@echo HDIR   ${HDIR}
+	@echo LIBDIR ${LIBDIR}
 	${MKDIR} ${HDRDIR}
 	${MKDIR} ${TOPDIR}.Interface
 	${MKDIR} ${TOPDIR}.Interface2
@@ -179,29 +187,19 @@ Dirs:
 	${MKDIR} ${HDIR}.Interface.h
 	${MKDIR} ${LIBDIR}
 
-install: ${INSTALLS} install_Dirs
-
-install_Dirs:
-	${MKDIR} ${INSTDIR}.Hdr.APCS
-	${MKDIR} ${INSTDIR}.Hdr.CPU
+install: ${OPTIONS} ${EXPORTS} Dirs
+ifeq ("${OPTIONS}","")
+	@echo ${COMPONENT}: installed
+else
+	@echo ${COMPONENT}: installed (${OPTIONS})
+endif
 
 clean:
 	@echo ${COMPONENT}: nothing to clean
 
 #
-# Rules for installing:
-#
-
-${INSTDIR}.Hdr.APCS.APCS-32:  hdr.APCS.APCS-32;  ${CP} hdr.APCS.APCS-32  $@ ${CPFLAGS}
-${INSTDIR}.Hdr.APCS.APCS-R:   hdr.APCS.APCS-R;   ${CP} hdr.APCS.APCS-R   $@ ${CPFLAGS}
-${INSTDIR}.Hdr.APCS.Common:   hdr.APCS.Common;   ${CP} hdr.APCS.Common   $@ ${CPFLAGS}
-${INSTDIR}.Hdr.CPU.Generic26: hdr.CPU.Generic26; ${CP} hdr.CPU.Generic26 $@ ${CPFLAGS}
-${INSTDIR}.Hdr.CPU.Generic32: hdr.CPU.Generic32; ${CP} hdr.CPU.Generic32 $@ ${CPFLAGS}
-${INSTDIR}.Hdr.ListOpts:      hdr.ListOpts;      ${CP} hdr.ListOpts      $@ ${CPFLAGS}
-
-#
 # Special rule for exporting all ImageSize, Machine and UserIF files.
-# Trigger by invoking the export with OPTIONS=ALL.
+# Trigger by invoking the export (or install) phase with OPTIONS=ALL.
 #
 ALL: ${HDRDIR}.Machine.Machine ${HDRDIR}.UserIF.UserIF ${HDRDIR}.HALSize.<HALSize> ${HDRDIR}.ImageSize.<ImageSize> ${HDRDIR}.APCS.<APCS>
 	${CP} hdr.Machine ${HDRDIR}.Machine ${CPFLAGS}
@@ -245,7 +243,6 @@ ${HDIR}.Global.h.DevNos:     hdr.DevNos;      ${HDR2H} hdr.DevNos     $@
 ${HDIR}.Global.h.DrawObj:    hdr.DrawObj;     ${HDR2H} hdr.DrawObj    $@
 ${HDIR}.Global.h.EnvNumbers: hdr.EnvNumbers;  ${HDR2H} hdr.EnvNumbers $@
 ${HDIR}.Global.h.FileTypes:  hdr.FileTypes;   ${HDR2H} hdr.FileTypes  $@
-${HDIR}.Global.h.FreeWay:    hdr.FreeWay;     ${HDR2H} hdr.FreeWay    $@
 ${HDIR}.Global.h.FreewayReg: hdr.FreewayReg;  ${HDR2H} hdr.FreewayReg $@
 ${HDIR}.Global.h.FSNumbers:  hdr.FSNumbers;   ${HDR2H} hdr.FSNumbers  $@
 ${HDIR}.Global.h.GraphicsV:  hdr.GraphicsV;   ${HDR2H} hdr.GraphicsV  $@
@@ -285,6 +282,7 @@ ${HDIR}.Global.h.IOCtl:      h.IOCtl;               ${CP} h.IOCtl               
 
 # Machine/UI/hardware specific headers:
 ${HDRDIR}.Machine.<Machine>: hdr.Machine.<Machine>; ${CP} hdr.Machine.<Machine>    $@ ${CPFLAGS}
+${HDRDIR}.Machine.All:       hdr.Machine.All;       ${CP} hdr.Machine.All          $@ ${CPFLAGS}
 ${HDRDIR}.Machine.All32:     hdr.Machine.All32;     ${CP} hdr.Machine.All32        $@ ${CPFLAGS}
 ${HDRDIR}.Machine.Machine:   hdr.Machine.Machine;   ${CP} hdr.Machine.Machine      $@ ${CPFLAGS}
 ${HDRDIR}.HALSize.<HALSize>: hdr.HALSize.<HALSize>; ${CP} hdr.HALSize.<HALSize>    $@ ${CPFLAGS}

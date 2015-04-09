@@ -61,9 +61,9 @@ XTENT   = ${PERL} build:xtentries >
 
 DIFF    = gnu.diff -df >null:
 
-AFLAGS  = -depend !Depend
+AFLAGS  = ${STDTOOLOPTIONS}
 # The zz switch stops library static data being placed in a zero-init area
-CFLAGS  = -c -depend !Depend ${INCLUDES} -DDDE -fK -zz10000000 -jC:
+CFLAGS  = -c ${STDTOOLOPTIONS} ${INCLUDES} -DDDE -fK -zz10000000 -jC:
 CPFLAGS = ~cfr~v
 WFLAGS  = ~c~r~v
 
@@ -179,6 +179,8 @@ HEADERS =\
  CLIB:h.tgmath \
  CLIB:h.time \
  CLIB:h.varargs \
+ CLIB:h.wchar \
+ CLIB:h.wctype \
  RISC_OSLib:h.akbd \
  RISC_OSLib:h.alarm \
  RISC_OSLib:h.baricon \
@@ -234,13 +236,6 @@ HEADERS =\
  RISC_OSLib:h.xferrecv \
  RISC_OSLib:h.xfersend
 
-# Unfortunately these need to be exported to build Edit
-INTERNAL_HEADERS =\
- RISC_OSLib:EditIntern.h.message \
- RISC_OSLib:EditIntern.h.txtar \
- RISC_OSLib:EditIntern.h.txtfile \
- RISC_OSLib:EditIntern.h.txtoptmenu
-
 LIBRARIES =\
  Clib:o.ansilib \
  Clib:o.ansilibm \
@@ -267,8 +262,7 @@ MODWRAP   = RISC_OSLib:s.modulewrap
 OBJECT    = aof.${TARGET}
 EXPORTS   = ${MODWRAP} \
             ${EXPORTED_LIBS} \
-            ${HEADERS} \
-            ${INTERNAL_HEADERS}
+            ${HEADERS}
 
 #
 # Objects for Clib:o.ansilib
@@ -460,8 +454,6 @@ install-libraries: lib.ansilib lib.ansilibm o.overmgr lib.stubs lib.risc_oslib l
 	${CP} lib.stubs           ${INSTDIR}.CLib.o.*                  ${CPFLAGS}
 	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h
 	${CP} RISC_OSLib:h.*      ${INSTDIR}.RISC_OSLib.h.*            ${CPFLAGS}
-	${MKDIR}                  ${INSTDIR}.RISC_OSLib.h.EditIntern
-	${CP} rlib.EditIntern.h.* ${INSTDIR}.RISC_OSLib.h.EditIntern.* ${CPFLAGS}
 	${MKDIR}                  ${INSTDIR}.RISC_OSLib.s
 	${CP} s.modulewrap        ${INSTDIR}.RISC_OSLib.s.modulewrap   ${CPFLAGS}
 	${MKDIR}                  ${INSTDIR}.RISC_OSLib.o
@@ -534,7 +526,6 @@ dirs:
 	${MKDIR} ${LIBDIR}.CLib.o
 	${MKDIR} ${LIBDIR}.RISC_OSLib
 	${MKDIR} ${LIBDIR}.RISC_OSLib.h
-	${MKDIR} ${LIBDIR}.RISC_OSLib.EditIntern.h
 	${MKDIR} ${LIBDIR}.RISC_OSLib.s
 	${MKDIR} ${LIBDIR}.RISC_OSLib.o
 
@@ -605,31 +596,31 @@ lib.riscoslibm: ${RLIB_MOD_OBJS}
 	${AR} ${LIBFLAGS} $@ ${RLIB_MOD_OBJS}
 
 o.cl_stub_r: clib.s.cl_stub_r
-	${AS} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_r -to $@
 
 o.cl_stub2_r: clib.s.cl_stub2_r
-	${AS} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub2_r -to $@
 
 o.k_stub2_r: kernel.s.k_stub2_r
-	${AS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
 
 m_o.cl_stub_m: clib.s.cl_stub_m
-	${AS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
 
 o_rl.rl_stub_r: rlib.s.rl_stub_r
-	${AS} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from rlib.s.rl_stub_r -to $@
 
 rm_o.cl_stub_rm: clib.s.cl_stub_rm
-	${AS} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_rm -to $@
 
 rm_o.cl_stub2_rm: clib.s.cl_stub2_rm
-	${AS} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub2_rm -to $@
 
 rm_o.k_stub2_rm: kernel.s.k_stub2_rm
-	${AS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
 
 rm_o_rl.rl_stub_rm: rlib.s.rl_stub_rm
-	${AS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
+	${AS} ${AFLAGS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
 
 lib.stubs: o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
 	${AR} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
@@ -654,7 +645,6 @@ lib.clib: ${CLIB_MOD_OBJS}
 # Derived headers:
 derived.swis: o.swis
 	${LD} -bin -o $@ o.SWIs
-	stripnulls $@
 	settype $@ text
 
 o.swis: s.makehswis h.swisheader s.swioptions
@@ -701,6 +691,8 @@ CLIB:h.string: clib.h.string;     ${CP} clib.h.string $@ ${CPFLAGS}
 CLIB:h.tgmath: clib.h.tgmath;     ${CP} clib.h.tgmath $@ ${CPFLAGS}
 CLIB:h.time: clib.h.time;         ${CP} clib.h.time $@ ${CPFLAGS}
 CLIB:h.varargs: clib.h.varargs;   ${CP} clib.h.varargs $@ ${CPFLAGS}
+CLIB:h.wchar: clib.h.wchar;       ${CP} clib.h.wchar $@ ${CPFLAGS}
+CLIB:h.wctype: clib.h.wctype;     ${CP} clib.h.wctype $@ ${CPFLAGS}
 
 
 RISC_OSLib:h.akbd: rlib.h.akbd;              ${CP} rlib.h.akbd $@ ${CPFLAGS}
@@ -757,11 +749,6 @@ RISC_OSLib:h.wimpt: rlib.h.wimpt;            ${CP} rlib.h.wimpt $@ ${CPFLAGS}
 RISC_OSLib:h.win: rlib.h.win;                ${CP} rlib.h.win $@ ${CPFLAGS}
 RISC_OSLib:h.xferrecv: rlib.h.xferrecv;      ${CP} rlib.h.xferrecv $@ ${CPFLAGS}
 RISC_OSLib:h.xfersend: rlib.h.xfersend;      ${CP} rlib.h.xfersend $@ ${CPFLAGS}
-
-RISC_OSLib:EditIntern.h.message:    rlib.EditIntern.h.message;    ${CP} rlib.EditIntern.h.message    $@ ${CPFLAGS}
-RISC_OSLib:EditIntern.h.txtar:      rlib.EditIntern.h.txtar;      ${CP} rlib.EditIntern.h.txtar      $@ ${CPFLAGS}
-RISC_OSLib:EditIntern.h.txtfile:    rlib.EditIntern.h.txtfile;    ${CP} rlib.EditIntern.h.txtfile    $@ ${CPFLAGS}
-RISC_OSLib:EditIntern.h.txtoptmenu: rlib.EditIntern.h.txtoptmenu; ${CP} rlib.EditIntern.h.txtoptmenu $@ ${CPFLAGS}
 
 # Libraries
 Clib:o.ansilib:          lib.ansilib;        ${CP} lib.ansilib    $@ ${CPFLAGS}

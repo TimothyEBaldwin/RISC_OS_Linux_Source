@@ -118,10 +118,8 @@ resources:
 
 ${BUILTDIR}.Messages: s.LocaleList ${SOURCE} ${DATA}.Tokenised ${DIRS} force
 	${SCANRES} ${PROCESSDIR} ${RESDATA}
-	set resdata ${RESDATA}
-	${AS} ${ASFLAGS} -o o.Messages ${SOURCE}
+	${AS} ${ASFLAGS} -o o.Messages ${SOURCE} -pd "ResData SETS \"${RESDATA}\""
 	${LD} ${LDFLAGS} -o $@ -rmf o.Messages
-	unset resdata
 
 ${BUILTDIR}.MessagesHI: s.LocaleList ${SOURCE} ${DIRS} force
 	${MKDIR} rm.${BUILD}.<Build$LocaleListNumeric>

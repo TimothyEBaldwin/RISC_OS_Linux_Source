@@ -47,14 +47,14 @@
 #include "txtscrap.h"
 #include "typdat.h"
 #include "txtedit.h"
-#include "EditIntern/txtoptmenu.h"
 #include "txtwin.h"
 #include "trace.h"
 #include "werr.h"
 #include "wimp.h"
 #include "wimpt.h"
 #include "win.h"
-#include "EditIntern/message.h"
+#include "xferrecv.h"
+#include "taskwin.h"
 #include "slist.h"
 #include "msgs.h"
 #include "msgtrans.h"
@@ -62,26 +62,23 @@
 
 #define TASKWINDOW_FIX 1
 
+#define MArcEdit_Select       3
+#define MArcEdit_Select_Mask  ((1<<2) | (1<<3) | (1<<4) | (1<<7))
+#define MArcEdit_Select_Paste 7
+#define MArcEdit_Edit         4
+
 #define round(i) (((i)+3) & 0xFFFFFFFC)
 
-#define MAXLINE 80
-
 typedef enum {
-  MNone,
-  MKill,
+  MKill = 1,
   MReconnect,
   MSuspend,
   MResume,
   MUnlink,
   MLink,
-  MTaskInput,
   MIgnoreCtl,
-/*
-  MInfo,
-*/
   MArcEdit
 } message_menuopts;
-/* Note menu options start at 1 really */
 
 /* Linked list of blocks to be sent to the task */
 typedef struct selbuffer {
@@ -96,7 +93,6 @@ int               ref,    /* The associated reference */
 typedef struct mstate {
 struct mstate *next;
 int            readline;        /* 1 if reading command, 0 if passing input to task */
-char           line[MAXLINE+2]; /* The line we're reading, valid iff readline = 1 */
 wimp_t         child;           /* The taskid of the child */
 int            sentcli;         /* 1 <=> a command has been sent but not replied to */
 int            suspended;       /* 1 <=> current task is suspended */
@@ -110,49 +106,30 @@ selbuffer_t   *buff;            /* Stuff pending to the task module */
 
 static menu message_menu;    /* = NULL */
 static message_state_t *states; /* = NULL */
-static int ignoreCtl        = 1; /* Default ignore control chars from task */
+static BOOL ignoreCtl = TRUE; /* Default ignore control chars from task */
+static int message_paste_ref = -1; /* Wimp msg reference for task input pastes */
+static message_state_t *message_importinput; /* Current state for xferrecv transaction */
 
 static const struct {
     int errnum;
     char errmess[6];
 } start_error = {100, "NoMem" };
 
-static void makehex(char *hex, unsigned int val)
-{
-unsigned int i,
-             j;
-
-*hex = ' ';
-for (i = 1; i <= 8; i++)
-{
-  j = val >> 28;
-  *++hex = (j >=10) ? j + 'A'-10 : j + '0';
-  val <<= 4;
-}; /* End for */
-hex[1] = ' ';
-hex[2] = 0;
-} /* End procedure */
-
 static os_error * message_starttask(char  *comname, /* Command by which to start task module */
                                     txt    t,       /* The txt of this window */
                                     wimp_t me       /* My task handle, passed to the task in STR$~ form */)
 {
 char * cliline;
-char   hex[11];
 int    mylength  = strlen(comname);
 
-cliline = malloc(mylength + 21);
+cliline = malloc(mylength + 1+8 + 1+8 + 1 + 1);
 if (!cliline) return msgtrans_error_lookup(&start_error, 0, 0, 0, 0, 0, 0, 0);
                                                        /* Failure message */
-strcpy(cliline, comname);
-makehex(hex, me);
-strcpy(cliline + mylength, hex);      /* Started task knows taskid of caller */
-makehex(hex, (unsigned int)t);
-strcpy(cliline + mylength + 10, hex); /* Started task knows txt of caller */
+sprintf(cliline, "%s %08X %08X ", comname, (int)me, (int)t); /* Started task knows taskid & txt of caller */
 return wimp_starttask(cliline);
 } /* End procedure */
 
-os_error * message_sendmessage(
+static os_error * message_sendmessage(
   message_action action,
   wimp_t         dest,   /* Who to, 0 => everyone, including us */
   message_data * data)   /* The data, NULL for die */
@@ -173,6 +150,25 @@ if (data)
 return wimp_sendmessage(wimp_ESEND, &msg, dest);
 } /* End procedure */
 
+
+static void message_datarequest(message_state_t *s, int x, int y)
+{
+wimp_msgstr msg;
+int *types = msg.data.datarequest.types;
+
+msg.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgdatarequest) + sizeof(int);
+msg.hdr.your_ref = 0;
+msg.hdr.action = wimp_MDATAREQUEST;
+msg.data.datarequest.w = txt_syshandle(s->t); /* As though dropped into that window */
+msg.data.datarequest.h = s; /* Handle back to state, might be useful */
+msg.data.datarequest.x = x;
+msg.data.datarequest.y = y;
+msg.data.datarequest.flags = wimp_MDATAREQUEST_flags_clipboard;
+types[0] = 0xfff; /* Our one preferred type */
+types[1] = wimp_MDATAREQUEST_types_end;
+wimpt_noerr(wimp_sendmessage(wimp_ESENDWANTACK, &msg, 0));
+message_paste_ref = msg.hdr.my_ref; /* Picked by Wimp */
+}
 
 static void message_menu_help_handler(void *handle, char *hit)
 {
@@ -195,16 +191,45 @@ static void message_menu_help_handler(void *handle, char *hit)
 static menu message_menumaker(void *a)
 {
 message_state_t *s = (message_state_t *) a;
-txt t;
+menu m;
+wimp_menustr *mstr, *smstr;
+wimp_menuitem *entry;
+int i;
 
 txtwin_setcurrentwindow(s->t);
 if (message_menu == NULL)
 {
   message_menu = menu_new(msgs_lookup("ME3"), msgs_lookup("ME4"));
-    /* "Task", "Kill,Reconnect,Suspend,Resume,Unlink,Link,TaskInput,Ignore Ctl,Edit" */
+    /* "Task", "Kill,Reconnect,Suspend,Resume,Unlink,Link,Ignore Ctl,Edit" */
   menu_submenu(message_menu, MArcEdit, txtedit_menu(s->edstate));
 }; /* End if */
-txtedit_menu(s->edstate); /* set the flags right. */
+m = txtedit_menu(s->edstate); /* set the flags right. */
+mstr = menu_syshandle(m);
+if (!s->linked || s->suspended || (s->child == 0))
+{
+  /* Task->Edit->Select->'Swap case','Indent','Cut','Delete'
+  are reevaluated based on the selection in txtedit_menu() */
+
+  /* Task->Edit->Edit */
+  entry = ((wimp_menuitem *)(mstr + 1)) + (MArcEdit_Edit - 1);
+  entry->iconflags &= ~wimp_INOSELECT;
+} else
+{
+  /* Task->Edit->Select->'Swap case','Indent','Cut','Delete' */
+  entry = ((wimp_menuitem *)(mstr + 1)) + (MArcEdit_Select - 1);
+  smstr = entry->submenu;
+  for (i = 0; i < 32; i++)
+  {
+    entry = ((wimp_menuitem *)(smstr + 1)) + i;
+    if ((1<<i) & MArcEdit_Select_Mask)
+      entry->iconflags |= wimp_INOSELECT;
+  }
+
+  /* Task->Edit->Edit */
+  entry = ((wimp_menuitem *)(mstr + 1)) + (MArcEdit_Edit - 1);
+  entry->iconflags |= wimp_INOSELECT;
+}
+
 /* Set my flags here */
 menu_setflags(message_menu, MKill, 0, !s->child);
 menu_setflags(message_menu, MSuspend, 0, !s->child || s->suspended);
@@ -212,18 +237,11 @@ menu_setflags(message_menu, MResume, 0, !s->child || !s->suspended);
 menu_setflags(message_menu, MReconnect, 0, s->child);
 menu_setflags(message_menu, MUnlink, 0, !s->linked);
 menu_setflags(message_menu, MLink, 0, s->linked);
-t = txtscrap_selectowner();
-/*
-i = (!t) ? 1 : (t != s->t) ? 0 : !(s->readline || s->suspended || !s->linked);
-*/
-menu_setflags(message_menu, MTaskInput, 0, !t); /* Can always send selection
-                                                   if it exists */
 menu_setflags(message_menu, MIgnoreCtl, ignoreCtl, 0);
 menu_setflags(message_menu, MArcEdit, 0, 0);
-/*
-  !(s->readline || s->suspended || !s->linked));
-*/
+
 help_register_handler(message_menu_help_handler, 0);
+
 return message_menu;
 }
 
@@ -266,6 +284,44 @@ data.data.datasave.leaf[0] = 0; /* Irrelevant */
 wimpt_noerr(wimp_sendmessage(wimp_ESENDWANTACK, &data, task));
 buffer->ref = data.hdr.my_ref;
 } /* End procedure */
+
+static void *queuetaskinput(const char *txtdata, message_state_t *s, int n)
+{
+  selbuffer_t *buffer;
+  int i;
+
+  buffer = (selbuffer_t *)malloc(sizeof(selbuffer_t));
+  if (buffer == NULL) return NULL;
+  buffer->next = NULL;
+  buffer->size = n;
+  buffer->bsize = 0; /* Not extensible */
+  buffer->pos = 0;
+  buffer->buffer = (char *)malloc(n);
+  if (buffer->buffer == NULL)
+  {
+    free(buffer);
+    return NULL;
+  }
+  /* Copy in the data */
+  for (i = 0; i < n; i++) buffer->buffer[i] = txtdata[i];
+  if (s->buff)
+  {
+    /* Already some pending stuff, so add mine to the end */
+    buffer->ref = 0; /* No reference yet */
+    s->buff = slist_addend(s->buff, buffer);
+  } else
+  {
+    /* Nothing pending, so send straight away */
+    s->buff = buffer; /* The only buffer so far */
+    message_datasave(buffer, s->child);
+  }
+  return (void *)buffer;
+}
+
+static BOOL queueimportinput(char **buffer, int *size)
+{
+  return queuetaskinput(*buffer, message_importinput, *size) != NULL;
+}
 
 static message_state_t *findstatefromtask(wimp_t task)
 {
@@ -327,7 +383,7 @@ static BOOL message_bkg_events(wimp_eventstr *e, void *handle)
                         return 1;
 
                         /* These must all identify the correct state with which to run */
-                        case message_output:
+                case message_output:
                         data = (message_data *)&e->data.msg.data;
                         if (s)
                         {
@@ -453,6 +509,7 @@ static BOOL message_bkg_events(wimp_eventstr *e, void *handle)
                 default:
                         tracef1("Unknown message action %i\n", e->data.msg.hdr.action);
                 } /* end message number switch */
+                break;
         } /* End event type switch */
         return 0;
 }
@@ -502,65 +559,16 @@ switch (*cmd)
   s->linked = 1;
   break;
 
-  case MTaskInput:
-  { txt t = txtscrap_selectowner();
-    int start,
-        end;
-    if (t)
-    {
-      int          n;
-/* new version using RAMTransmit */
-      selbuffer_t *buffer;
-      int          i;
-      char *       txtdata;
-
-      start = txt_selectstart(t);
-      end = txt_selectend(t);
-      while (start < end)
-      {
-        txt_arrayseg(t, start, &txtdata, &n);
-        /* Get first segment */
-        if (n > end-start) n = end-start;
-        start += n;
-        buffer = (selbuffer_t *)malloc(sizeof(selbuffer_t));
-        if (!buffer) { werr(0, msgs_lookup("ME1")); return; };
-        buffer->next = NULL;
-        buffer->size = n;
-        buffer->bsize = 0; /* Not extensible */
-        buffer->pos = 0;
-        buffer->buffer = (char *)malloc(n);
-        if (!buffer->buffer) { werr(0, msgs_lookup("ME1")); return; };
-        /* Copy in the data */
-        for (i = 0; i < n; i++) (buffer->buffer)[i] = *(txtdata++);
-        if (s->buff)
-        {
-          /* Already some pending stuff, so add mine to the end */
-          buffer->ref = 0; /* No reference yet */
-          s->buff = slist_addend(s->buff, buffer);
-        } else
-        {
-          /* Nothing pending, so send straight away */
-          s->buff = buffer; /* The only buffer so far */
-          message_datasave(buffer, s->child);
-        }; /* End if */
-      }; /* End while */
-    }; /* End if */
-  } /* End block */
-  break;
-
-/* Not done yet
-  case MInfo:
-  break;
-*/
-
   case MIgnoreCtl:
   ignoreCtl = !ignoreCtl;
   break;
 
   case MArcEdit:
-/*
-  if (s->readline || s->suspended || !s->linked)
-*/
+  if ((cmd[1] == MArcEdit_Select) && (cmd[2] == MArcEdit_Select_Paste) &&
+      s->linked && !s->suspended)
+  {
+    message_datarequest(s, 0, 0); /* Paste to task instead */
+  } else
   {
     int newNumber,
         numberOfWindows = txtwin_number(s->t);
@@ -608,7 +616,7 @@ static BOOL message_win_unknowns(wimp_eventstr *e, void *handle)
         case wimp_EGAINCARET:
                 /* --- check that we really do have the caret still! --- */
                 wimp_get_caret_pos(&caret);
-                if (caret.w == txt_syshandle(t))
+                if ((caret.w == txt_syshandle(t)) && !txt_selectset(t))
                         txt_setcharoptions(t, txt_CARET, txt_CARET);
                 return TRUE;
                 break;
@@ -625,7 +633,7 @@ static void message_obeyeventcode(txt t, message_state_t *s, txt_eventcode e)
 {
 switch (e)
 {
-  case txt_EXTRACODE + akbd_Fn + 127:
+  case txt_EXTRACODE + akbd_Fn + 127: /* From wimp_CLOSE */
   {
     int numberOfWindows = txtwin_number(s->t);
     if (numberOfWindows-- > 1)
@@ -666,6 +674,77 @@ switch (e)
   } /* End case */
   break;
 
+  case txt_EXTRACODE + akbd_Sh + akbd_Fn + 2:
+  {
+    wimp_eventstr *ee = wimpt_last_event();
+
+    if (ee->data.msg.hdr.your_ref == message_paste_ref)
+    {
+      /* Reply from message_datarequest() to paste as task input */
+      selbuffer_t *b = NULL;
+      char *filename;
+      char  input[128];
+
+      if (0xfff == xferrecv_checkinsert(&filename))
+      {
+        os_regset  f;
+        os_gbpbstr g;
+        os_error  *err;
+
+        /* From file */
+        f.r[0] = 0x40 | 8; /* OPENIN, error if not there */
+        f.r[1] = (int)filename;
+        err = os_find(&f);
+        if (err == NULL)
+        {
+          g.action = 4; /* Read bytes from PTR */
+          g.file_handle = f.r[0];
+          do
+          {
+            g.data_addr = input;
+            g.number = sizeof(input);
+            err = os_gbpb(&g);
+            if (err == NULL)
+            {
+              b = queuetaskinput(input, s, sizeof(input) - g.number);
+              if (b == NULL) werr(0, msgs_lookup("ME1"));
+            }
+          } while ((err == NULL) && (b != NULL) && (g.number == 0));
+          f.r[0] = 0; /* CLOSE */
+          f.r[1] = g.file_handle;
+          os_find(&f);
+        }
+        xferrecv_insertfileok();
+        if (err != NULL) werr(0, err->errmess);
+      } else
+      {
+        int estsize, last;
+
+        if (0xfff == xferrecv_checkimport(&estsize))
+        {
+          /* From RAM */
+          message_importinput = s;
+          last = xferrecv_doimport(input, sizeof(input), queueimportinput);
+          if (last != -1)
+          {
+            b = queuetaskinput(input, s, last);
+            if (b == NULL) werr(0, msgs_lookup("ME1"));
+          } else
+          {
+            /* Import failed, wait for a potential scrap transfer instead */
+            message_paste_ref = xferrecv_last_ref();
+          }
+        } else
+        {
+          /* Not text, ignore it */
+        }
+      }
+      break;
+    }
+    passtotxtedit(t, s, e);
+  }
+  break;
+
   default:
   if (s->readline || s->suspended || !s->linked)
   {
@@ -681,11 +760,6 @@ switch (e)
     if ((e < 0) || (e & txt_EXTRACODE))
     {
       /* Mouse button events in window come back -ve */
-      if (e & txt_MSELECT)
-      {
-        txt_setcharoptions(t, txt_CARET, 0);
-        txt_setcharoptions(t, txt_CARET, txt_CARET);
-      };
       passtotxtedit(t, s, e);
       break;
     } else
@@ -699,6 +773,18 @@ switch (e)
         passtotxtedit(t, s, e);
         break;
       }
+
+      /* If 'Ignore ctrl' is enabled filter ^C ^V to copy/paste into linked task windows */
+      if (s->linked && !s->suspended && s->child && ignoreCtl)
+      {
+        if (e == 22 /* control-V */) { message_datarequest(s, 0, 0); break; }
+        if (e == 3 /* control-C */) { passtotxtedit(t, s, e); break; }
+      }
+
+      /* Ordinarily typed characters should replace the selection, but in the context of
+         live task window we'll just clear the selection so the caret comes back. A live
+         task window here means !killed && !suspended && linked. */
+      txtscrap_setselect(t, 0, 0);
 
       n = 0;
       chbuff[n++] = e & 0xff;

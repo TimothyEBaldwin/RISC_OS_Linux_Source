@@ -18,7 +18,7 @@
 COMPONENT    = DOSFS
 OBJS         = DOSFS DOSFSctl DOSclusters DOSdirs DOSnaming Helpers MsgTrans \
                OpsArgs OpsFind OpsFunc OpsFile OpsGetPut \
-               Statics TIMEconv debug StaticDefs
+               Statics TIMEconv StaticDefs
 ROM_OBJS     = ${OBJS} init
 ROMCDEFINES  = -DROM
 RES_AREA     = dosfs_msgarea

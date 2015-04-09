@@ -2,11 +2,21 @@
 #
 # $Id$
 #
-include Makefiles:StdTools
+include StdTools
+
+COMPONENT ?= BuildSys
+INSTDIR   ?= <Install$Dir>
+INSTTYPE  ?= Makefiles
+
+install_Makefiles:
+	${MKDIR} ${INSTDIR}
+	${CP} Makefiles  ${INSTDIR}.Makefiles         ${CPFLAGS}
+	${CP} VersionNum ${INSTDIR}.Makefiles.Version ${CPFLAGS}
+
+install: install_${INSTTYPE}
+	@${ECHO} ${COMPONENT}: installed ${INSTTYPE}
 
 BBETYPE = buildsys
-# override definition of PERL for the time being - the FilterComp2 command line is too long for argument passing via the do command
-PERL = perl
 bbe-buildsys: bbe-generic-resources-get-alias
 	BBE_Export_Dir ImageName
 	${RM} ${BBEDIR}.ImageName.Version

@@ -17,8 +17,19 @@
         GBLL    DebugAborts
 DebugAborts SETL {FALSE}
 
+; Disable ProcessTransfer code pending execution.
+; If we want to reuse the code at some point in the future, be aware that it
+; needs the following work performing:
+; * Updating to cope with HiProcVecs (or special zero page handling removed)
+; * (preferablly) add support for all the 'new' load/store instructions.
+;   LDRH/STRH, LDRD/STRD, LDREX/STREX, coprocessor transfers, etc.
+; * Needs to be made aware of VMSAv6/7 page table format - currently uses old
+;   ARM600 code
+; * Needs to be aware of ARMv6+ unaligned load behaviour, and any other quirks
+;   where genuine aborts may in turn cause ProcessTransfer to inadvertantly
+;   cause an abort itself (e.g. unaligned LDM/STM)
         GBLL    UseProcessTransfer
-UseProcessTransfer SETL {FALSE} ; Needs updating to cope with HiProcVecs (for proc. vector protection) and all the ARMv6+ (ARMv3+?) load/store instructions
+UseProcessTransfer SETL {FALSE}
 
 
 ; MMU interface file - VMSAv6 version
@@ -78,7 +89,7 @@ BangCamUpdate ROUT
 
         ADD     r6, r6, r4, LSR #12             ; put back the ones which were too many
         ADD     r0, r0, r6, LSL #12             ; move on address by the number of pages left
-        LDR     r6, [r13]                       ; reload old logical address
+        LDR     r6, [sp]                        ; reload old logical address
 
 ; now we have r6 = old logical address, r2 = physical page number, r0 = physical address
 
@@ -194,7 +205,7 @@ BangL2PT                                        ; internal entry point used only
         MOV     r6, r0
 
         TST     r11, #PageFlags_Unsafe
-        BNE     %FT30
+        BNE     BangL2PT_unsafe
 
         TST     r11, #DynAreaFlags_DoublyMapped
         BNE     BangL2PT_sledgehammer           ;if doubly mapped, don't try to be clever
@@ -212,8 +223,14 @@ BangL2PT                                        ; internal entry point used only
         ARMop   MMU_ChangingUncachedEntry, NE, tailcall, r4
 
 20      STR     r6, [r1, r3, LSR #10]           ;update L2PT entry
-
-        Pull    "pc"
+        ; In order to guarantee that the result of a page table write is
+        ; visible, the ARMv6+ memory order model requires us to perform TLB
+        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
+        ; performed the write. Performing the maintenance beforehand (as we've
+        ; done traditionally) will work most of the time, but not always.
+        Pull    "lr"
+        MOV     r0, r3
+        ARMop   MMU_ChangingUncachedEntry,,tailcall,r4
 
 BangL2PT_sledgehammer
 
@@ -231,7 +248,19 @@ BangL2PT_sledgehammer
         TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
         STRNE   r6, [r1, r9, LSR #10]           ; then store entry for 2nd copy as well
         ADDNE   r3, r3, r9                      ; and point logical address back at 2nd copy
+        ; In order to guarantee that the result of a page table write is
+        ; visible, the ARMv6+ memory order model requires us to perform TLB
+        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
+        ; performed the write. Performing the maintenance beforehand (as we've
+        ; done traditionally) will work most of the time, but not always.
+        Pull    "lr"
+        ARMop   MMU_ChangingUncached,,tailcall,r4
 
+BangL2PT_unsafe
+        STR     r6, [r1, r3, LSR #10]!          ; update level 2 page table (and update pointer so we can use bank-to-bank offset
+        TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
+        STRNE   r6, [r1, r9, LSR #10]           ; then store entry for 2nd copy as well
+        ADDNE   r3, r3, r9                      ; and point logical address back at 2nd copy
         Pull    "pc"
 
 
@@ -293,27 +322,17 @@ SSETMEMC ROUT
 ; bit 11   => Sound DMA enable
 ; bit 12   => OS mode
 
- [ UseGraphicsV
         Push  "r0,r1,r4, r14"
         TST   r11, #(1 :SHL: 10)
         MOVEQ r0, #1             ; blank (video DMA disable)
         MOVNE r0, #0             ; unblank (video DMA enable)
         MOV   r1, #0             ; no funny business with DPMS
-        MOV   r4, #GraphicsV_SetBlank
+        ADD   r4, r12, #VduDriverWorkSpace
+        LDR   r4, [r4, #CurrentGraphicsVDriver]
+        MOV   r4, r4, LSL #24
+        ORR   r4, r4, #GraphicsV_SetBlank
         BL    CallGraphicsV
         Pull  "r0,r1,r4, r14"
- |
-        Push  "r0-r3, r9, r14"   ; can corrupt r12
-        TST   r11, #(1 :SHL: 10)
-        MOVEQ r0, #1             ; blank (video DMA disable)
-        MOVNE r0, #0             ; unblank (video DMA enable)
-        MOV   r1, #0             ; no funny business with DPMS
-        MOV     r0, #0
-        MOV     r1
-        AddressHAL
-        CallHAL HAL_VideoSetBlank
-        Pull  "r0-r3, r9, r14"
- ]
 
         WritePSRc SVC_mode+I_bit, r11
         ExitSWIHandler
@@ -398,6 +417,22 @@ MMUControl_ModifyControl ROUT
 
         ARMop   Cache_InvalidateAll,,,r3
 10
+        ; If I+D currently enabled, and at least one is turning off, turn off
+        ; HAL L2 cache
+        TST     r1, #MMUC_C
+        TSTNE   r1, #MMUC_I
+        BEQ     %FT11
+        TST     r2, #MMUC_C
+        TSTNE   r2, #MMUC_I
+        BNE     %FT11
+        LDR     r0, [r3, #Cache_HALDevice]
+        TEQ     r0, #0
+        BEQ     %FT11
+        Push    "r1-r3,r12"
+        MOV     lr, pc
+        LDR     pc, [r0, #HALDevice_Deactivate]
+        Pull    "r1-r3,r12"
+11
         BIC     lr, r1, r2              ; lr = bits going from 1->0
         TST     lr, #MMUC_C             ; if cache turning off then clean data cache first
         BEQ     %FT15
@@ -412,6 +447,22 @@ MMUControl_ModifyControl ROUT
         LDR     r3,=ZeroPage
         ARMop   Cache_InvalidateAll,,,r3
 20
+        ; If either I+D was disabled, and now both are turned on, turn on HAL
+        ; L2 cache
+        TST     r1, #MMUC_C
+        TSTNE   r1, #MMUC_I
+        BNE     %FT30
+        TST     r2, #MMUC_C
+        TSTNE   r2, #MMUC_I
+        BEQ     %FT30
+        LDR     r0, [r3, #Cache_HALDevice]
+        TEQ     r0, #0
+        BEQ     %FT30
+        Push    "r1-r3,r12"
+        MOV     lr, pc
+        LDR     pc, [r0, #HALDevice_Activate]
+        Pull    "r1-r3,r12"
+30
         PLP     r4                      ; restore IRQ state
         Pull    "r0,r3,r4,r5,pc"
 
@@ -560,20 +611,18 @@ DAbPreVeneer    ROUT
 
         SUB     r11, r2, #8*4                   ; r11 -> register bank
         STR     r4, [sp, #7*4]                  ; store aborter's PC in user register bank
-; B %FT90
 
  [ UseProcessTransfer
         TST     r0, #T32_bit                    ; were they in Thumb mode? if so, give up now
         BNE     %FT90
 
-;ARM 810 or StrongARM allow signed byte load or half-word load/stores - not supported at present
-;***KJB - need to think about LDRH family
+;ARMv4+ allow half-word load/stores - not supported at present
+;ARMv5TE+ allow double-word load/stores - not supported at present
+;ARMv6 allow load/store exclusive - not supported at present
         LDR     r10, [r4, #-8]!                 ; r10 = actual instruction that aborted, and r4 points to it
-        AND     r9, r10, #&0E000000
-        TEQ     r9, #&08000000                  ; test for LDM/STM
+        AND     r9, r10, #2_1110 :SHL: 24
+        TEQ     r9, #2_1000 :SHL: 24            ; test for LDM/STM
         BNE     %FT50                           ; if not LDM/STM, then it's an "easy" LDR/STR
-
-;        Write   "It's an LDM/STM"
 
  [ DebugAborts
         DLINE   "It's an LDM/STM"
@@ -699,8 +748,9 @@ DAbPreVeneer    ROUT
         LDRNE   lr, =&6000                      ; else put r13,r14 in user bank
         AND     r0, r4, lr                      ; r0 = mask of registers to put into user bank
         BIC     r4, r4, lr                      ; r4 = mask of registers to put into main bank
-        MOV     lr, #0
 34
+        MOV     lr, #0
+35
         MOVS    r4, r4, LSR #1                  ; shift bit into carry
         LDRCS   r2, [r5], #4                    ; if set bit then transfer word from stack frame
         STRCS   r2, [r11, lr, LSL #2]           ; into main register bank
@@ -709,7 +759,7 @@ DAbPreVeneer    ROUT
         STRCS   r2, [r3, lr, LSL #2]            ; into user register bank
         ADD     lr, lr, #1
         ORRS    r6, r0, r4                      ; have we finished both banks?
-        BNE     %BT34                           ; no, then loop
+        BNE     %BT35                           ; no, then loop
 
 ; If LDM with PC in list, then add 4 to it, so the exit procedure is the same as if PC not loaded
 ; Also, if it was an LDM with PC and ^, then we have to update the stacked SPSR
@@ -746,12 +796,36 @@ DAbPreVeneer    ROUT
 
 50
 
-; it's an LDR/STR - first work out offset
+; it's an LDR/STR
 
+        TEQ     r9, #2_0000 :SHL: 24            ; is it the extra load/store family?
+        BNE     %FT55                           ; no, plain LDR[B]
  [ DebugAborts
-        DLINE   "It's an LDR/STR"
+        DLINE   "It's LDR[EX|SB|H|SH|D]/STR[EX|H|D]"
  ]
+        AND     r9, r10, #2_1111 :SHL: 4
+        TEQ     r9, #2_1101 :SHL: 4
+        BNE     %FT90                           ; Abort if LDR[EX|H|SH]/STR[EX|H|D]
+        TST     r10, #1 :SHL: 20
+        BEQ     %FT90                           ; Abort if LDRD (encoded where STRSB would be)
 
+        TST     r10, #1 :SHL: 22                ; if immediate
+        BICNE   r9, r10, #2_1111 :SHL: 4
+        ORRNE   r9, r9, r9, LSR #4
+        ANDNE   r9, r9, #&FF                    ; then extract imm8 bits
+        ANDEQ   r8, r10, #&0F                   ; register offset
+        LDREQ   r9, [r11, r8, LSL #2]           ; get actual value of register
+        ORR     r10, r10, #1 :SHL: 22           ; ensure it looks like a byte access
+        B       %FT60
+        ; We've effectively reencoded the weird load/stores to look like
+        ; cccc 0zxp ubwl nnnn tttt xxxx xxxx xxxx
+        ; z = zero/sign extend     b = byte/word
+        ; p = pre/post             l = load/store
+        ; u = up/down              x = don't care from here on
+55
+ [ DebugAborts
+        DLINE   "It's an LDR[B]/STR[B]"
+ ]
         TST     r10, #1 :SHL: 25                ; if immediate
         MOVEQ   r9, r10, LSL #(31-11)           ; then extract bottom 12 bits
         MOVEQ   r9, r9, LSR #(31-11)
@@ -864,13 +938,19 @@ DAbPreVeneer    ROUT
         ADDEQ   sp, sp, #4                      ; then junk stack frame
         BEQ     %FT70                           ; and tidy up
 
-        Pull    "r6"                            ; LDR/LDRB, so get value to load into register
-        TST     r10, #1 :SHL: 22                ; if LDRB
-        ANDNE   r6, r6, #&FF                    ; then put zero in top 3 bytes of word
-        ANDEQ   r9, r9, #3                      ; else rotate word to correct position - r9 = bottom 2 bits of address
-        MOVEQ   r9, r9, LSL #3                  ; multiply by 8 to get rotation factor
-        MOVEQ   r6, r6, ROR r9                  ; rotate to correct position in register
-
+        Pull    "r6"                            ; LDR/LDRB/LDRSB: get value to load into register
+        TST     r10, #1 :SHL: 22
+        BEQ     %FT67
+        TST     r10, #1 :SHL: 26                ; LDRB: see if zero fill or sign extend is needed
+        MOVEQ   r6, r6, LSL #24
+        MOVEQ   r6, r6, ASR #24                 ; fill with b7
+        ANDNE   r6, r6, #&FF                    ; fill with zero
+        B       %FT69
+67
+        AND     r9, r9, #3                      ; LDR: rotate word to correct position - r9 = bottom 2 bits of address
+        MOV     r9, r9, LSL #3                  ; multiply by 8 to get rotation factor
+        MOV     r6, r6, ROR r9                  ; rotate to correct position in register
+69
         MOV     r5, r10, LSR #12                ; test for LDR PC
         AND     r5, r5, #&0F                    ; r5 = dest register number
         TEQ     r5, #15                         ; if PC

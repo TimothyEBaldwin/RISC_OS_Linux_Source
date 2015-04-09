@@ -2,20 +2,32 @@
 # Binary Build Environment Makefile
 #
 # The Library needs to participate in the generation of the BBE by exporting
-# those tools required by the BBE.
+# those tools required by the BBE. It is also a part of the DDE (CTools) build.
 #
 COMPONENT = Library
+TYPE     ?= ${INSTTYPE}
 
 include StdTools
 
 install: install_${TYPE}
 	@echo ${COMPONENT}: Install phase complete (${TYPE}).
 
+install_Dir:
+	${MKDIR} ${INSTDIR}
+
 install_:
 	${NOP}
 
-install_STB:
-	${MKDIR} ${INSTDIR}
+install_DDE: install_Dir
+	${MKDIR} ${INSTDIR}.Build
+	${MKDIR} ${INSTDIR}.Unix
+	${CP} Build.canonical  ${INSTDIR}.canonical     ${CPFLAGS}
+	${CP} Build.stripdepnd ${INSTDIR}.stripdepnd    ${CPFLAGS}
+	${CP} Unix.chmod       ${INSTDIR}.Unix.chmod    ${CPFLAGS}
+	${CP} Unix.mkdir       ${INSTDIR}.mkdir         ${CPFLAGS}
+	${CP} Build.InstRes    ${INSTDIR}.Build.InstRes ${CPFLAGS}
+
+install_STB: install_Dir
 	${CP} Unix.chmod ${INSTDIR}.chmod ${CPFLAGS}
 	${CP} Unix.df    ${INSTDIR}.df    ${CPFLAGS}
 	${CP} Unix.du    ${INSTDIR}.du    ${CPFLAGS}
@@ -54,8 +66,6 @@ bbe-library: bbe-generic-resources-get-alias
 	BBE_Export_File Acorn.toansi
 	BBE_Export_File Acorn.topcc
 	BBE_Export_File Acorn.unmodsqz
-	BBE_Export_File Acorn.Vector
-	BBE_Export_File Acorn.Where
 	BBE_Export_File Acorn.xpand
 	${MKDIR} ${BBEDIR}.ToolOptions
 	BBE_Export_File ToolOptions.${APCS}

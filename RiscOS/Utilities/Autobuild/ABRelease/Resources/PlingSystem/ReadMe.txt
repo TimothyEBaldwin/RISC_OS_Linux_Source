@@ -11,7 +11,8 @@ Do not use the merge dialogue in
   !Boot > Configuration > System Merge
 
 because part of the update must refresh files in a directory that the merge 
-dialogue cannot reach. Instead, a simple obey file is included call !SysMerge.
+dialogue cannot reach. Instead, a simple obey file called !SysMerge is
+included.
 
 Double click on !SysMerge.
 

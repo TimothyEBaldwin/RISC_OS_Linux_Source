@@ -142,6 +142,7 @@
                 GET     hdr:variables
                 GET     hdr:HighFSI
                 GET     hdr:FileTypes
+                GET     hdr:Squash
 
                 ;Debugging SelectTable with older versions of these macros which
                 ;call OS_CLI and hence corrupt scratchspace can cause 'interesting'
@@ -153,6 +154,13 @@ debug_noscratchspace SETL {FALSE}
 
                 GBLL    StrongARM
 StrongARM       SETL    {TRUE}
+
+                ; True if MUL is slow when given large (or negative) numbers
+                ; It seems that ARMv4 (i.e. StrongARM) is the first to have a
+                ; decent MUL implementation - ARMv3 and below suffer badly with
+                ; large numbers
+                GBLL    SlowMultiply
+SlowMultiply    SETL    NoARMv4
 
                 GET     VersionASM
 
@@ -173,8 +181,6 @@ StrongARM       SETL    {TRUE}
                 GBLL    newcalibration
                 GBLL    work_with_green
                 GBLL    immortal
-                GBLL    med_02882
-                GBLL    med_03007
 
 debug           SETL    false
 hostvdu         SETL    false
@@ -196,14 +202,6 @@ newcalibration  SETL    Module_Version > 109   ; new calibration code in V1.09 a
 checkluminance  SETL    Module_Version = 098   ; check using luminance, instead of error calculation
 work_with_green SETL    false           ; include kludges to dodge bugs in Wimp/Draw in Green
 immortal        SETL    Module_Version >= 160  ; don't die while people are using my 32K tables
-med_02882       SETL    Module_Version >= 161  ; improve 32K routine's memory usage/claiming
-med_03007       SETL    Module_Version >= 162 :LAND: med_02882 ; fix a register corruption in med_02882
-
-; this fix is required so that MessageTrans' that use the data to generate
-; hashing tables don't blow up. Plus the fact that you shouldn't be using
-; MessageTrans to unsquash files anyhow
-                         GBLL    nomessagetransfortables
-nomessagetransfortables  SETL    true
 
                 [ work_with_green
 usesetcolour    SETL    false
@@ -267,10 +265,8 @@ CachedColour            # 4     ;Colour number (now 32 bits)
 CachedGCOL              # 4     ;As are GCOL values
 CachedPattern           # 4*4   ;Pattern block as used for dithering
 
-CacheEmpty              # 1     ;flag only in first entry: no reinvaldiation if no cache entries
-CachedL2BPP             # 1     ;make word sized: also number cache on mode change
-CachedPatternValid      # 1     ;Caced ratio of colours: if =-1 then ECF info invalid
-CachedFullCLUT          # 1     ;Brain damaged mode if non-zero
+CachedPatternValid      # 1     ; =-1 if CachedPattern is invalid
+CachedSpare             # 3     ; Spare bytes in cache entries. Some get reused for module workspace!
 
                         ASSERT  (:INDEX: @)<=32
                         AlignSpace 32
@@ -280,8 +276,15 @@ CacheEntrySize          * :INDEX: @
 CacheEntries            * 64    ;Must be power of 2
 CacheTotalSize          * CacheEntries *CacheEntrySize
 
-PseudoPaletteEntry      * CacheEmpty +CacheEntrySize
-PaletteIsCached         * CachedL2BPP +CacheEntrySize
+
+; Workspace hidden in the spare cache entry bytes
+
+                        ASSERT ?CachedSpare = 3
+CacheEmpty              * CachedSpare   ; =0 if cache is fully empty, allows us to avoid needless invalidation loops
+                        ASSERT ((:INDEX: CachedModeFlags) :AND: 1)=0
+CachedModeFlags         * CachedSpare+1 ; cached bits 0-15 of mode flags
+CachedL2BPP             * CachedSpare+CacheEntrySize ; cached L2BPP of current mode
+CachedL2NColour         * CachedSpare+CacheEntrySize+1 ; cached log2 of (NColour+1)
 
 ; Define structure of font colour cache block.
 
@@ -340,6 +343,8 @@ BuildColoursL2BPP       # 4     ; Log2 value for the previous build colours
 TargetL2BPP             # 4     ; Log2 value for dest - used to dimension
                                 ; return spacing
 
+grey8bpp_palette        # 4     ; Default 8bpp greyscale palette (black -> white), in ResourceFS cache
+
                         AlignSpace 16
 ; These are for the 32K table stuff.
 anchor_resourcefs       # 4     ; Initial pointer to chain of ResourceFS palettes
@@ -350,13 +355,9 @@ temp_palette            # 4     ; Temporary pointer within 32K generation
                         AlignSpace 16
 temp_table              # 4     ; Temporary pointer within 32K generation
                         AlignSpace 16
-temp_guardtable         # 4     ; Temporary pointer within 32K generation
+temp_errortable         # 4     ; Temporary pointer within 32K generation
                         AlignSpace 16
-                        [ med_02882
 temp_gbpb               # 128   ; for gbpb calls and filename expansion
-                        |
-temp_gbpb               # 32    ; for gbpb calls
-                        ]
                         [ immortal
 persist                 # 4     ; Don't die flag
                         ]
@@ -591,7 +592,7 @@ Initialise ROUT
         Push    "R0-R2,LR"
 
       [ file
-        Debug_Open "<ColourTrans$Debug>"
+        Debug_Open "<ColourTrans$$Debug>"
       ]
 
         MOV     R0,#ColourV
@@ -658,6 +659,7 @@ validateworkspace ROUT
 
         ;set up the pointers for 32K tables
         STR     R0,[WP,#anchor_resourcefs]
+        STR     R0,[WP,#grey8bpp_palette]
 
         [ debugtable32K
         ADD     R1,WP,#anchor_resourcefs
@@ -673,7 +675,7 @@ validateworkspace ROUT
 
         STR     R0,[WP,#temp_palette]
         STR     R0,[WP,#temp_table]
-        STR     R0,[WP,#temp_guardtable]
+        STR     R0,[WP,#temp_errortable]
 
         LDR     R0,=DefaultErrorLoading ;Setup default error loading
         STR     R0,[WP,#ColourErrorLoading]
@@ -712,7 +714,7 @@ scan_resourcefs ROUT
 
         LDR     R3,[WP,#temp_gbpb+8]     ;length
         Debug   table32K,"File length",R3
-        ADD     R3,R3,#20 ;
+        ADD     R3,R3,#cachedtable_palette+16 ; 4 bytes for ROM pointer + 12 bytes extra for name
         MOV     R2,#0
         MOV     R0,#ModHandReason_Claim
         Debug   table32K,"Claiming",R3
@@ -727,33 +729,48 @@ scan_resourcefs ROUT
         STREQ   R2,[WP,#anchor_resourcefs]
         BEQ     %FT20
 21
-        LDR     R1,[R0]                  ;fetch the next pointer
+        LDR     R1,[R0,#cachedtable_next] ;fetch the next pointer
         TEQ     R1,#0
         MOVNE   R0,R1
         BNE     %BT21
 
-        STR     R2,[R0]
+        STR     R2,[R0,#cachedtable_next]
 
 20      ;now it is linked, fill it
         MOV     R0,#0
-        STR     R0,[R2]
+        STR     R0,[R2,#cachedtable_next]
         LDR     R3,[WP,#temp_gbpb+8]     ;length
-        STR     R3,[R2,#4]
+        STR     R3,[R2,#cachedtable_palsize]
+        MOV     R3,#32768 ; only 32K colour resfs tables supported atm
+        STR     R3,[R2,#cachedtable_tabsize]
 
         MOV     R0,#12
         ADRL    R4,palettepath
-        ADD     R2,R2,#8
+        ADD     R2,R2,#cachedtable_palette
         MOV     R3,#0
         ADD     R1,WP,#temp_gbpb
         ADD     R1,R1,#20
         SWI     XOS_File
         BVS     %FT30
 
+        ADD     R6,R6,#cachedtable_palette
+
+        ; If this was the default 8bpp greyscale palette, remember it so we can use elsewhere
+        LDR     R3,[WP,#temp_gbpb+20]
+        LDR     R4,grey8bpp_name
+        TEQ     R3,R4
+        LDREQ   R3,[WP,#temp_gbpb+24]
+        LDREQ   R4,grey8bpp_name+4
+        BICEQ   R3,R3,#&FF000000
+        TEQEQ   R3,R4
+        STREQ   R6,[WP,#grey8bpp_palette]
+
         LDR     R3,[WP,#temp_gbpb+8]     ;length
         ADD     R6,R6,R3
-        ADD     R6,R6,#8
 
         ;copy the name across
+        MOV     R3,#0
+        STR     R3,[R6],#4
         LDR     R3,[WP,#temp_gbpb+20]
         STR     R3,[R6],#4
         LDR     R3,[WP,#temp_gbpb+24]
@@ -770,6 +787,8 @@ scan_resourcefs ROUT
 
 palettedir     = "Resources:$.Resources.Colours.Palettes",0
 palettepath    = "Resources:$.Resources.Colours.Palettes.",0
+        ALIGN
+grey8bpp_name  = "8greys",0,0
         ALIGN
 
 ;------------------------------------------------------------------------------
@@ -811,6 +830,7 @@ Die     ROUT
         BL      Free32KChain
         MOV     R2,#0
         STR     R2,[R1,#anchor_resourcefs]
+        STR     R2,[R1,#grey8bpp_palette]
 
         LDR     R2,[R1,#temp_palette]
         BL      Free32K
@@ -822,10 +842,10 @@ Die     ROUT
         MOV     R2,#0
         STR     R2,[R1,#temp_table]
 
-        LDR     R2,[R1,#temp_guardtable]
+        LDR     R2,[R1,#temp_errortable]
         BL      Free32K
         MOV     R2,#0
-        STR     R2,[R1,#temp_guardtable]
+        STR     R2,[R1,#temp_errortable]
 
       [ fontcache
         ADD     R2,R1,#FontColourHead
@@ -875,7 +895,7 @@ Free32KChain ROUT
         TEQ     R2,#0                   ;is this a valid link ?
         Pull    "R4,PC",EQ
 
-        LDR     R4,[R2]                 ;yes, so see where it goes next
+        LDR     R4,[R2,#cachedtable_next] ;yes, so see where it goes next
         MOV     R0,#ModHandReason_Free
         SWI     XOS_Module              ;Assumes R0 contains reason code
         MOV     R2,R4                   ;Is next link non-zero ?
@@ -1017,6 +1037,7 @@ rescan_resourcefs
         MOV     R4,#0
         LDR     R2,[WP,#anchor_resourcefs]
         STR     R4,[WP,#anchor_resourcefs]
+        STR     R4,[WP,#grey8bpp_palette]
         BL      Free32KChain
 
         LDR     R2,[WP,#anchor_tables]
@@ -1261,17 +1282,41 @@ InitCache ROUT
         MOV     R1,#VduExt_ModeFlags
         SWI     XOS_ReadModeVariable    ;Attempt to read the mode flags
         MOVCS   R2,#0
-        AND     R2,R2,#Flag_FullPalette
-        STRB    R2,[WP,#CachedFullCLUT]
+      [ debug
+        Debug   xx,"Cache mode flags",R2
+      ]
+      [ NoARMv4
+        STRB    R2,[WP,#CachedModeFlags]
+        MOV     R2,R2,LSR #8
+        STRB    R2,[WP,#CachedModeFlags+1]
+      |
+        STRH    R2,[WP,#CachedModeFlags]
+      ]
 
-        Debug   xx,"Cache brain damaged flag",R2
+
+        MOV     R1,#VduExt_NColour
+        SWI     XOS_ReadModeVariable    ;Attempt to read NColour
+        MOVCS   R2,#0                   ;Is there much point handling errors here?
+        ; These code snippets will produce nonsense results for YUV modes
+      [ NoARMv5
+        MOV     R1,#0
+10
+        MOVS    R2,R2,LSR #1
+        ADDCS   R1,R1,#1
+        BCS     %BT10
+      |
+        CLZ     R1,R2
+        RSB     R1,R1,#32
+      ]
+        STRB    R1,[WP,#CachedL2NColour]
+
+        Debug   xx,"Cache L2NColour",R1
 
         LDR     R0,[WP,#PaletteAt]
         STR     R0,[WP,#PaletteCopy]    ;Mark as source of palette for cached entries
 
         MOV     R0,#0                   ;Mark as palette not cached
         STR     R0,[WP,#PaletteCacheStart]
-        STRB    R0,[WP,#PaletteIsCached]
 
         LDRB    R0,[WP,#CacheEmpty]
         CMP     R0,#0                   ;Is the cache currently empty? (clears V!)
@@ -1284,12 +1329,12 @@ InitCache ROUT
 
         LDR     R0,=(CacheEntries-1)*CacheEntrySize + CacheValid
         MOV     R1,#-1
-00
+50
         STRB    R1,[WP,R0]
         SUB     R0,R0,#CacheValid-CachedPatternValid
         STRB    R1,[WP,R0]
         SUBS    R0,R0,#CacheEntrySize+CachedPatternValid-CacheValid
-        BPL     %BT00                   ;Loop back zonking the cache
+        BPL     %BT50                   ;Loop back zonking the cache
 
         MOV     R0,#0
         STRB    R0,[WP,#CacheEmpty]     ;Mark as the cache is empty now
