@@ -22,9 +22,11 @@
 # 07-Mar-01  SNB          Recreated
 #
 
-COMPONENT = BufferManager
-TARGET    = Buffers
-HEADER1   = Buffer
+COMPONENT   = BufferManager
+TARGET      = Buffers
+HEADER1     = Buffer
+ASMCHEADER1 = Buffer
+EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
 
 include StdTools
 include AAsmModule
