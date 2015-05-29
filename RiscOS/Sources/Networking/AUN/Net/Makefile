@@ -16,14 +16,15 @@
 #
 
 COMPONENT    = Net
-VPATH        = @ gwroute
-CUSTOMRES    = custom
+VPATH        = gwroute
 LIBS         = ${UNIXLIB} ${INETLIB} ${SOCK5LIB} ${ASMUTILS}
 OBJS         = ${OBJ${TARGET}}
 CINCLUDES    = -ITCPIPLibs:,C:
-RES_OBJ      =
 HDRS         =
 CFLAGS       = -wp
+ROMCDEFINES  = -DROM
+RES_PATH     = Resources.Net.Messages
+CMHGDEPENDS  = mns mnsg mnsi
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
 endif
@@ -47,8 +48,5 @@ swis_e.o:
 
 io_e.o:
 	${CC} -DEDDS ${CFLAGS} -o $@ io.c
-
-resources:
-	@echo ${COMPONENT}: resource files are in AUNMsgs
 
 # Dynamic dependencies:
