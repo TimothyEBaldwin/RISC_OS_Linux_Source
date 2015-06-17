@@ -21,9 +21,9 @@ CMHGDEPENDS  = module
 HDRS         =
 ASMHDRS      = Freeway
 CINCLUDES    = -ITCPIPLibs:,C:
-CUSTOMRES    = custom
-RES_OBJ      =
 LIBS        += ${INETLIB} ${SOCK4LIB} ${ASMUTILS}
+ROMCDEFINES  = -DROM
+CMHGDEPENDS  = module
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
 endif
@@ -33,8 +33,4 @@ include CModule
 CFLAGS      += -wp -DAUTH32 -DCOMPAT_INET4
 CDFLAGS     += -DDEBUG -DDEBUGSER
 
-resources:
-	@echo ${COMPONENT}: Resources in AUNMsgs
-
-#
 # Dynamic dependencies:
