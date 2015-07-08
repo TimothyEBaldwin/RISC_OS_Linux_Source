@@ -157,7 +157,7 @@ the Debugger module, with a couple of key differences:
   access - in comparison to the output from the Debugger module which (for data
   aborts) will be 2 instructions ahead of the fault
 
-In some cases there will be less lines of disassembly than shown above. This
+In some cases there will be fewer lines of disassembly than shown above. This
 will happen if the instruction which caused the abort is close to a page
 boundary (the abort handler errs on the side of caution and avoids reading
 across page boundaries). However there should still be enough information to
@@ -180,8 +180,8 @@ may limit our ability to make changes to the OS in future.
 &104 - 'ESC_Status'. Software should use OS_ReadEscapeState instead.
 &108 - 'IRQsema'. Used by some software to detect if it's running in the
        'foreground' or not.
-&10C - 'MetroGnome'. This is the centisecond counter - OS_MonotonicTime should
-       be used instead.
+&10C - 'MetroGnome'. This is the centisecond counter. Use OS_ReadMonotonicTime
+       instead.
 &FE8 - 'CLibCounter'. This is used by old versions of the shared C library, and
        the statically linked version (ansilib). Update to a newer version,
        and/or switch to using the shared C library.
