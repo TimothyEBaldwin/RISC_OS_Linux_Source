@@ -27,7 +27,7 @@ old memory map. And for any page zero access which it emulates, it adds an
 entry to a log file so that the user/developer is aware of the issue.
 
 Note that ZeroPain does not trap writes to page zero, nor any attempts to
-execute code. Some reads operations (such as unaligned loads) are also not
+execute code. Some infrequently used instructions, such as LDRD, are also not
 dealt with. In these cases a data or prefetch abort will be raised as normal,
 and the program will most likely terminate with an error.
 
