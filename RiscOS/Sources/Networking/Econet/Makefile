@@ -19,7 +19,6 @@ COMPONENT   = Econet
 HEADER1     = Econet
 ASMCHEADER1 = Econet
 EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
-RESOURCES   = no
 
 include StdTools
 include AAsmModule
