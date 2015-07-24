@@ -14,128 +14,18 @@
 #
 # Makefile for Econet
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 28-Jun-94  AMcC         Created.
-# 05-Oct-99  SNB          Translates header into C header
-#
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
-C_EXP_HDR = <cexport$dir>.Interface.h
-
-#
-# Generic options:
-#
-MKDIR    = do mkdir -p
-AS       = objasm
-LD       = link
-CP       = copy
-MODGEN   = modgen
-RM       = remove
-TOKENISE = tokenise
-XWIPE    = x wipe
-PERL     = do <Perl$Dir>.perl
-
-AFLAGS   = -depend !Depend -stamp -closeexec -quit
-CPFLAGS  = ~cfr~v
-
-TOKENS   = Hdr:Tokens
-
-#
-# Program specific options:
-#
 COMPONENT   = Econet
-SOURCE      = NewOS
-SOURCE200   = OldOS
-TARGET      = rm.Econet
-TARGET200   = rm.Econet200
-HDR         = hdr.${COMPONENT}
-EXPORTS     = ${EXP_HDR}.Econet ${C_EXP_HDR}.Econet
+HEADER1     = Econet
+ASMCHEADER1 = Econet
+EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
+RESOURCES   = no
+ifeq (${TARGET},Econet200)
+ASFLAGS    += -pd "OldOs SETL {TRUE}"
+ROM_SOURCE  = Econet.s 
+endif
 
-MESSAGESMOD = rm.EconetMsgs
-MESSAGES    = Resources.${LOCALE}.Messages
-RESPATH     = Resources.Econet.Messages
-MODNAME     = EconetMessages
-MODHELP     = EconetMessages
-
-#
-# Rules:
-#
-all: ${TARGET}
-	@echo ${COMPONENT}: ${TARGET} built
-
-all200: ${TARGET200}
-	@echo ${COMPONENT}: ${TARGET200} built
-
-#
-# Generic Build rules:
-#
-rom: ${TARGET}
-	@echo ${COMPONENT}: rom module built
-
-export: ${EXPORTS}
-	@echo ${COMPONENT}: export complete
-
-install_rom: $(TARGET)
-	$(CP) $(TARGET) $(INSTDIR).$(COMPONENT) $(CPFLAGS)
-	@echo ${COMPONENT}: rom module installed
-
-install: ${TARGET}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: module installed
-
-clean:
-	${RM} ${TARGET}
-	${RM} ${TARGET200}
-	${RM} ${MESSAGESMOD}
-	${XWIPE} o ~CFR~V
-	@echo ${COMPONENT}: cleaned
-
-resources:
-	${MKDIR} ${RESDIR}.${COMPONENT}
-	${CP} Resources.${LOCALE}.Messages ${RESDIR}.${COMPONENT}.Messages ${CPFLAGS}
-	@echo ${COMPONENT}: resource files copied
-
-#
-# Assemble the Econet module
-#
-${TARGET}: ${SOURCE}
-	${MKDIR} o
-	${AS} ${SOURCE} -o o.Module ${AFLAGS}
-	${LD} -rmf -o $@ o.Module
-
-${TARGET200}: ${SOURCE200}
-	${MKDIR} o
-	${AS} ${SOURCE200} -o o.Module ${AFLAGS}
-	${LD} -rmf -o $@ o.Module
-
-#
-# Export hdr files
-#
-${EXP_HDR}.Econet: hdr.Econet
-	${CP} hdr.Econet $@ ${CPFLAGS}
-	
-${C_EXP_HDR}.Econet: hdr.Econet
-	${mkdir} ${C_EXP_HDR}
-	${PERL} Build:Hdr2H hdr.Econet $@
-
-# 
-# Generate an Econet Messages module
-# Note: need to set alias to ensure that <Version> is expanded
-#
-msgmod: ${MESSAGESMOD}
-	@echo ${COMPONENT}: messages module built
-
-${MESSAGESMOD}: ${MESSAGES} VersionNum
-	${PERL} build:getversion Econet$BuildV Econet$FullV Econet$Date
-	Do ${MODGEN} -date "<Econet$Date>" $@ ${MODNAME} ${MODHELP} <Econet$BuildV> ${MESSAGES} ${RESPATH}
-
-#---------------------------------------------------------------------------
+include StdTools
+include AAsmModule
 
 # Dynamic dependencies:
