@@ -20,10 +20,6 @@ HEADER1     = Econet
 ASMCHEADER1 = Econet
 EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
 RESOURCES   = no
-ifeq (${TARGET},Econet200)
-ASFLAGS    += -pd "OldOs SETL {TRUE}"
-ROM_SOURCE  = Econet.s 
-endif
 
 include StdTools
 include AAsmModule
