@@ -24,8 +24,7 @@ HDRS         =
 CMHGFILE     = Lanman_MH
 CMHGDEPENDS  = LanMan LLC Logon NBIP Omni
 LIBS         = ${NET4LIBS} ${ASMUTILS}
-RES_PATH     = ThirdParty.OmniClient.LanManFS
-RES_OBJ      =
+RES_PATH     = ThirdParty.OmniClient
 CUSTOMRES    = custom
 CDEFINES     = -DCOMPAT_INET4 -DLONGNAMES ${OPTIONS}
 CFLAGS       = -Wp
@@ -38,11 +37,15 @@ endif
 
 include CModule
 
+#
 # Static dependencies
+#
 o.MyResObj od.MyResObj: LocalRes:ROM.Sprites ${MERGEDMSGS}PP ${DIRS}
-	${RESGEN} ${RES_AREA} $@ ${MERGEDMSGS}PP ${RES_PATH}.Messages LocalRes:ROM.Sprites ${RES_PATH}.Sprites 
+	${RESGEN} ${RES_AREA} $@ ${MERGEDMSGS}PP ${RES_PATH}.${TARGET}.Messages LocalRes:ROM.Sprites ${RES_PATH}.${TARGET}.Sprites 
 
-${MERGEDMSGS}PP: ${MERGEDMSGS}
+${MERGEDMSGS}PP: LocalRes:Messages LocalRes:CmdHelp
+	${MKDIR} ${MERGEDRDIR}${SEP}${TARGET}
+	${FAPPEND} ${MERGEDMSGS} LocalRes:Messages LocalRes:CmdHelp
 	${INSERTVERSION} ${MERGEDMSGS} > $@
 
 # Dynamic dependencies:
