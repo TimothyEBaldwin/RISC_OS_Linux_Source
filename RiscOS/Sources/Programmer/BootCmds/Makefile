@@ -22,39 +22,20 @@ CDEFINES    += -DTRACE=0
 OBJS         = main
 LIBS        += ${OSLIB} ${CONLIB}
 HDRS         =
-RES_OBJ      =
-CUSTOMRES    = custom
+RES_AREA     = files_messages
 RAMCDEFINES += -DSTANDALONE=1
+INSTRES_FILES   = aif.Repeat
+INSTRES_DEPENDS = aif.Repeat
 
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
-SA_OBJS      = ${OBJS} msgs
-else
-SA_OBJS      = ${OBJS} msgscmd
 endif
 
 include CModule
 
 #
-# Resources need both the messages and the 'Repeat' binary
-#
-resources: resources-${CMDHELP} aif.Repeat
-	${CP} aif.Repeat ${RESFSDIR}.Repeat ${CPFLAGS}
-	@${ECHO} ${COMPONENT}: resources copied to Messages module
-
-#
 # Static dependencies
 #
-o.msgscmd: ${DIRS} LocalRes:Messages LocalRes:CmdHelp aif.Repeat
-	   ${MKDIR} ${MERGEDMDIR}
-	   FAppend ${MERGEDMSGS} LocalRes:Messages LocalRes:CmdHelp
-	   ${RESGEN} files_messages $@ ${MERGEDMSGS}     Resources.${TARGET}.Messages \
-                                       aif.Repeat        Resources.${TARGET}.Repeat
-
-o.msgs:    ${DIRS} LocalRes:Messages aif.Repeat
-	   ${RESGEN} files_messages $@ LocalRes:Messages Resources.${TARGET}.Messages \
-                                       aif.Repeat        Resources.${TARGET}.Repeat
-
 aif.Repeat: ${DIRS} repeatcmd.c
 	${CC} ${CINCLUDES} -o $@ repeatcmd.c ${CLIB} ${OSLIB}
 
