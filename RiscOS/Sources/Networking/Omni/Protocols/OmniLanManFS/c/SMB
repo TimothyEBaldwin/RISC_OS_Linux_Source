@@ -94,6 +94,7 @@
 #include "LMVars.h"
 #include "Attr.h"   /* For InvalidateDrive */
 #include "Xlate.h"  /* For string functions */
+#include "Auth.h"
 
 /* Definitions ===================================================== */
 
@@ -858,28 +859,14 @@ static err_t SMB_Negotiate( hSHARE hS )
   if ( res != OK )
     return res;
 
-#ifdef DEBUG
-  debug1("Data length on negprot is %d\n", ChainLen(pB));
-  {
-          static char buf[4096];
-          void *ptr = SMB_RxWords;
-          int len = ChainLen(pB);
-          GetData(pB, buf, len);
-          DumpBuffer(buf, len);
-          DumpStruct(ptr, (SMB_RxWords[0] >= DIALECT_NT) ? dvs_NTnegprot : dvs_negprot);
-  }
-#endif
-  FreeChain(pB);
 
   debug1("Negotiated protocol `%s'\n", SMB_Dialect(SMB_RxWords[0]));
   hS->hServer->prot = SMB_RxWords[0];
   if ( SMB_RxWords[0] >= DIALECT_LM12X002 )
   {
     if (SMB_RxWords[0] >= DIALECT_NT) {
-      unsigned char *buf = ((unsigned char *)SMB_RxWords) + 7;
-
       /* grr - different response format */
-      hS->hServer->maxTxBufferSize = (buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24));
+      hS->hServer->maxTxBufferSize = (SMB_RxWords[3] >> 8) | (SMB_RxWords[4] << 8) | (SMB_RxWords[5] << 24);
       hS->hServer->ProtFlags = PROT_RWMULTI + PROT_SETDATETIME +
          (SMB_RxWords[9] & 0x100 ? PROT_READRAW+PROT_WRITERAW : 0 ) +
          (SMB_RxWords[1] & 1 ? PROT_USERLOGON : 0 ) +
@@ -895,15 +882,17 @@ static err_t SMB_Negotiate( hSHARE hS )
         debug0("No extended security - no GUID in the data block\n");
       }
       hS->hServer->bloblen = SMB_RxWords[16] >> 8;
+      hS->hServer->Sesskey = (SMB_RxWords[7] >> 8) | (SMB_RxWords[8] << 8) | (SMB_RxWords[9] << 24);
     }
     else {
-      hS->hServer->bloblen = SMB_RxWords[11];
       hS->hServer->maxTxBufferSize = SMB_RxWords[2];
       hS->hServer->ProtFlags = PROT_RWMULTI + PROT_SETDATETIME +
          (SMB_RxWords[1] & 1 ? PROT_USERLOGON : 0 ) +
          (SMB_RxWords[1] & 2 ? PROT_ENCRYPT : 0 ) +
          (SMB_RxWords[5] & 1 ? PROT_READRAW : 0 ) +
          (SMB_RxWords[5] & 2 ? PROT_WRITERAW : 0 );
+      hS->hServer->bloblen = SMB_RxWords[11];
+      hS->hServer->Sesskey = SMB_RxWords[6] | (SMB_RxWords[7] << 16);
     }
     hS->hServer->SMB_flg = SMB_CASELESS;
 #ifdef LONGNAMES
@@ -911,7 +900,6 @@ static err_t SMB_Negotiate( hSHARE hS )
     hS->hServer->SMB_flg2 = SMB_KNOWS_LONG_NAMES; /* | SMB_IS_LONG_NAME;*/
     hS->hServer->t2flags = T2FLAGS_LONGNAMES;
 #endif
-    hS->hServer->Sesskey = SMB_RxWords[6] | (SMB_RxWords[7] << 16);
     if (hS->hServer->bloblen > 0) {
       free(hS->hServer->blob);
       hS->hServer->blob = malloc(hS->hServer->bloblen);
@@ -933,6 +921,7 @@ static err_t SMB_Negotiate( hSHARE hS )
     hS->hServer->SMB_flg2 = 0;
 #endif
   }
+  FreeChain(pB);
   debug1("%s-level security\n", hS->hServer->ProtFlags & PROT_USERLOGON ? "User" : "Share");
   return OK;
 }
@@ -949,7 +938,7 @@ static err_t SMB_SessSetup ( hSHARE hS, char *userid, char *passwd )
   SMB_TxWords[0] = 0x00FF; /* No additional command */
   SMB_TxWords[1] = 0;      /* Offset to next cmd */
   SMB_TxWords[2] = MAX_RX_BLOCK_SIZE; /* Maximum SMB message size we can receive */
-  SMB_TxWords[3] = 0;      /* Max pending requests */
+  SMB_TxWords[3] = 1;      /* Max pending requests */
   SMB_TxWords[4] = 0;      /* First & only VC */
   SMB_TxWords[5] = hS->hServer->Sesskey & 0xFFFF;
   SMB_TxWords[6] = hS->hServer->Sesskey >> 16;
@@ -980,17 +969,49 @@ static err_t SMB_SessSetup ( hSHARE hS, char *userid, char *passwd )
   }
   else {
     /* Server does not support extended security */
-    SMB_TxWords[7] = strlen ( passwd );
-    SMB_TxWords[8] = 0;
-    SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
-    SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
-    pB = AddChain(NULL, "CIFS", sizeof("CIFS"));
-    if (pB) pB = AddChain(pB, "\0RISCOS", sizeof("\0RISCOS"));
-    if (pB) pB = AddChain(pB, userid, strlen(userid) + 1);
-    if (pB) pB = AddChain(pB, passwd, strlen(passwd));
-    if (pB) pB = DumpChain(pB);
-    if (pB == NULL)
-      return EOUTOFMEM;
+    if (hS->hServer->ProtFlags & PROT_ENCRYPT)
+    {
+      unsigned char lmowfv2digest[16];
+      unsigned char challengeResponse[24];
+
+      if (strlen( passwd ) != 0)
+      {
+        Auth_LMOWFv2( (const char *)passwd, strlen( passwd ),
+                      (const char *)userid, strlen( userid ),
+                      (const char *)userid, 0, /* no domain */
+                      lmowfv2digest );
+        Auth_LMv2ChallengeResponse( lmowfv2digest, (void *)hS->hServer->blob, challengeResponse );
+        SMB_TxWords[7] = sizeof(challengeResponse);
+      }
+      else
+      {
+        SMB_TxWords[7] = 0;
+      }
+      SMB_TxWords[8] = 0;
+      SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
+      SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
+      pB = AddChain( NULL, "CIFS", sizeof("CIFS") );
+      if (pB) pB = AddChain( pB, "\0RISCOS", sizeof("\0RISCOS") );
+      if (pB) pB = AddChain( pB, userid, strlen(userid) + 1 );
+      if (pB && (SMB_TxWords[7] != 0)) pB = AddChain( pB, challengeResponse, sizeof(challengeResponse) );
+      if (pB) pB = DumpChain( pB );
+      if (pB == NULL)
+        return EOUTOFMEM;
+    }
+    else
+    {
+      SMB_TxWords[7] = strlen ( passwd );
+      SMB_TxWords[8] = 0;
+      SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
+      SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
+      pB = AddChain( NULL, "CIFS", sizeof("CIFS") );
+      if (pB) pB = AddChain( pB, "\0RISCOS", sizeof("\0RISCOS") );
+      if (pB) pB = AddChain( pB, userid, strlen(userid) + 1 );
+      if (pB) pB = AddChain( pB, passwd, strlen(passwd) );
+      if (pB) pB = DumpChain( pB );
+      if (pB == NULL)
+        return EOUTOFMEM;
+    }
     res = Do_SMB ( hS, SMBsesssetup, 13, pB, NULL );
   }
   if ( res != OK )
@@ -1598,7 +1619,7 @@ err_t SMB_CreateShare (  int sharetype_in,
     hShare->hServer = hServ;
     hShare->sharetype = sharetype_in;
     strcpy  ( hShare->sharename, uc_sharename );
-    strcpyn_upper ( hShare->password, password_in, NAME_LIMIT );
+    strcpyn ( hShare->password, password_in, NAME_LIMIT );
     Xlt_Jumble(hShare->password);
     done |= ALLOC_SHARE;
   }
@@ -1623,7 +1644,7 @@ err_t SMB_CreateShare (  int sharetype_in,
   {
     /* Set up new server details */
     strcpyn_upper ( hServ->username, username_in, NAME_LIMIT );
-    strcpyn_upper ( hServ->password, password_in, NAME_LIMIT );
+    strncpy ( hServ->password, password_in, NAME_LIMIT );
     Xlt_Jumble(hServ->password);
 
     res = ConnectServer ( hShare );

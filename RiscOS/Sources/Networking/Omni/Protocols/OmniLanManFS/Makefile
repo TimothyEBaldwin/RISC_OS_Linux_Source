@@ -18,7 +18,7 @@
 COMPONENT    = LanManFS
 OBJS         = Xlate Transact Stats SMB RPC Printers Omni NetBIOS NBIP \
                NameCache Logon LLC LanMan CoreFn buflib Attr \
-               Interface MyResObj
+               Interface Auth md5c md4c MyResObj
 CINCLUDES    = -ITCPIPLibs:,C:
 HDRS         =
 CMHGFILE     = Lanman_MH
