@@ -12,37 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for a Toolbox Object module
+# Makefile for ColourMenu module
 #
-# $Id$
-#
-# Component specific options:
-#
-RAMMESSAGES = o.msgs
 
-COMMON_OBJ = o.Modhdr_NoD o.auxiliary o.create o.delete o.events o.getstate\
- o.hide o.miscop o.show o.task
+COMPONENT     = ColourMenu
+OBJS          = auxiliary create delete events getstate\
+                hide main miscop show task
+CMHGDEPENDS   = main
+ROMCDEFINES   = -DROM
+CDFLAGS       = -Ddebugging=1
+CMHGDFLAGS    = -Ddebugging=1
+CINCLUDES     = -IC:tboxlibint,tbox:,C:
+LIBS          = ${TBOXINTLIB}
+DBG_LIBS      = ${TBOXINTDBGLIB}
 
-ROM_OBJS = o.mainROM ${COMMON_OBJ}
+include CModule
 
-RAM_OBJS = o.main ${RAMMESSAGES} ${COMMON_OBJ}
-
-DBG_OBJS = od.main ${RAMMESSAGES} o.Modhdr od.auxiliary od.create od.delete od.events od.getstate\
- od.hide od.miscop od.show od.task
-
-#
-# Get main rules
-#
-include C:tboxlibint.TboxMake
-
-#
-# Module specific rules:
-#
-resources: resources-messages
-	@echo ${COMPONENT}: resource files copied to Messages module
-
-clean: toolbox-clean
-	@echo ${COMPONENT}: cleaned
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:
