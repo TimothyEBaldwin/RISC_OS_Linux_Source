@@ -12,39 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for a Toolbox Object module
+# Makefile for TextGadgets module
 #
-# $Id$
-#
-# Component specific options:
-#
-RAMMESSAGES = o.msgs
 
-COMMON_OBJ = o.ModHdr o.glib o.glib3 o.MemMan o.riscos_uti o.Scrollbar \
- o.ScrollList o.Sizes o.TextArea o.TextMan \
- o.Font o.riscos_gra o.ScrollLisS o.TAsel_ven o.Utils ${WIMPLIB}
+COMPONENT     = Gadgets
+TARGET       ?= TextGadget
+OBJS          = glib glib3 main MemMan riscos_uti Scrollbar\
+                ScrollList Sizes TextArea TextMan Font riscos_gra\
+                ScrollLisS TAsel_ven Utils
+CMHGDEPENDS   = main
+ROMCDEFINES   = -DROM
+CINCLUDES     = -IC:tboxlibint,tbox:,C:
+LIBS          = ${TBOXINTLIB} ${WIMPLIB}
 
-ROM_OBJS = o.mainROM ${COMMON_OBJ}
+include CModule
 
-RAM_OBJS = o.main ${RAMMESSAGES} ${COMMON_OBJ}
-
-DBG_OBJS = od.main ${RAMMESSAGES} od.ModHdr od.glib od.glib3 od.MemMan od.riscos_uti od.Scrollbar \
- od.ScrollList od.Sizes od.TextArea od.TextMan \
- od.Font od.riscos_gra od.ScrollLisS od.TAsel_ven od.Utils ${WIMPLIB}
-
-#
-# Get main rules
-#
-include C:tboxlibint.TboxMake
-
-#
-# Module specific rules:
-#
-resources: resources-messages
-	@echo ${COMPONENT}: resource files copied to Messages module
-
-clean: toolbox-clean
-	@echo ${COMPONENT}: cleaned
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:
