@@ -32,6 +32,9 @@ ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
+                  ${EXP_HDR}.SPIDevice \
+                  ${EXP_HDR}.AHCIDevice \
+                  ${EXP_HDR}.EtherDevice \
                   ${EXP_HDR}.GPIODevice \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
@@ -85,7 +88,7 @@ inst_dirs:
 install: ${EXPORTS} inst_dirs
 	@${ECHO} ${COMPONENT}: header files installed
 
-${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS} 
+${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS}
 	${MKDIR} bin
 	${LD} -bin -o $@ ${ROM_OBJECT}
 	${LD} -aif -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECT}
@@ -99,25 +102,25 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
 	${CP} hdr.EnvNumbers $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.GPIODevice: hdr.GPIODevice
 	${CP} hdr.GPIODevice $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.HALDevice: hdr.HALDevice
 	${CP} hdr.HALDevice $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.HALEntries: hdr.HALEntries
 	${CP} hdr.HALEntries $@ ${CPFLAGS}
 
 ${EXP_HDR}.ModHand: hdr.ModHand
 	${CP} hdr.ModHand $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.OSEntries: hdr.OSEntries
 	${CP} hdr.OSEntries $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.OSMisc: hdr.OSMisc
 	${CP} hdr.OSMisc $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
 
@@ -138,7 +141,7 @@ ${EXP_HDR}.VduExt: hdr.VduExt
 
 ${EXP_HDR}.VIDCList: hdr.VIDCList
 	${CP} hdr.VIDCList $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.VideoDevice: hdr.VideoDevice
 	${CP} hdr.VideoDevice $@ ${CPFLAGS}
 
