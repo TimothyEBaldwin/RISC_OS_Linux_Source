@@ -23,6 +23,7 @@ ROMCDEFINES   = -DROM
 CDFLAGS       = -Ddebugging=1
 CMHGDFLAGS    = -Ddebugging=1
 CINCLUDES     = -IC:tboxlibint,tbox:,C:
+HDRS          =
 LIBS          = ${TBOXINTLIB} ${ASMUTILS}
 DBG_LIBS      = ${TBOXINTDBGLIB}
 
