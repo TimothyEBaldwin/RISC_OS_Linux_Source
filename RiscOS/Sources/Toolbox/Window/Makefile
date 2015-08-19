@@ -28,6 +28,7 @@ CDEFINES      = -D${SYSTEM} ${STYLE}
 CDFLAGS       = -Ddebugging=1
 CMHGDFLAGS    = -Ddebugging=1
 CINCLUDES     = -IC:tboxlibint,tbox:,C:
+HDRS          =
 LIBS          = ${TBOXINTLIB} ${WIMPLIB}
 DBG_LIBS      = ${TBOXINTDBGLIB}
 
