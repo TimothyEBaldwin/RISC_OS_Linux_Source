@@ -24,6 +24,7 @@ ROMCDEFINES   = -DROM
 CDFLAGS       = -Ddebugging=1
 CMHGDFLAGS    = -Ddebugging=1
 CINCLUDES     = -IC:tboxlibint,tbox:,C:
+HDRS          =
 LIBS          = ${TBOXINTLIB}
 DBG_LIBS      = ${TBOXINTDBGLIB}
 INSTRES_FILES = Res Quit.Messages:^.Quit Quit.Res:^.Quit
