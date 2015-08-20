@@ -103,6 +103,15 @@ export: ${EXPORTS}
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
 	${CP} hdr.EnvNumbers $@ ${CPFLAGS}
 
+${EXP_HDR}.SPIDevice: hdr.SPIDevice
+	${CP} hdr.SPIDevice $@ ${CPFLAGS}
+
+${EXP_HDR}.AHCIDevice: hdr.AHCIDevice
+	${CP} hdr.AHCIDevice $@ ${CPFLAGS}
+
+${EXP_HDR}.EtherDevice: hdr.EtherDevice
+	${CP} hdr.EtherDevice $@ ${CPFLAGS}
+
 ${EXP_HDR}.GPIODevice: hdr.GPIODevice
 	${CP} hdr.GPIODevice $@ ${CPFLAGS}
 
