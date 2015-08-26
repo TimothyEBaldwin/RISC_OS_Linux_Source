@@ -19,6 +19,8 @@ COMPONENT     = DCS
 OBJS          = create delete events getstate\
                 hide main miscop show task
 SA_OBJS       = ${OBJS}
+RESFSDIR      = ${RESDIR}${SEP}DCS
+CMHGFILE      = DCSHdr
 CMHGDEPENDS   = main
 ROMCDEFINES   = -DROM
 CDFLAGS       = -Ddebugging=1
