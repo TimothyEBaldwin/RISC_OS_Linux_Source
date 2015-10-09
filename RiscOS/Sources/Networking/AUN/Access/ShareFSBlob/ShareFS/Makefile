@@ -16,17 +16,15 @@ install_rom:
 
 # Resource export phases
 
-resources: resources-${TARGET}-${LOCALE}
-	@echo ${COMPONENT}: ${LOCALE} resources exported
-
+resources:
+	${MKDIR} ${RESDIR}.ShareFS
+	${CP} LocalRes:!Boot     ${RESDIR}.${TARGET}.!Boot     ${CPFLAGS}
+	${CP} LocalRes:Messages  ${RESDIR}.${TARGET}.Messages  ${CPFLAGS}
+	${CP} LocalRes:Templates ${RESDIR}.${TARGET}.Templates ${CPFLAGS}
+	@echo ${COMPONENT}: resources copied to Messages module
 
 rom_link: rom_link-${TARGET}
 	@echo ${COMPONENT}: rom_link complete
-
-
-resources-ShareFS-UK:
-	@echo ShareFS: resource export complete (Resources in AUNMsgs)
-	@| End of resource export for locale UK
 
 rom_link-ShareFS:
 	${MKDIR} linked
