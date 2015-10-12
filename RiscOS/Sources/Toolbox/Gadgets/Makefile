@@ -19,7 +19,7 @@ COMPONENT     = Gadgets
 TARGET       ?= TextGadget
 OBJS          = glib glib3 main MemMan riscos_uti Scrollbar\
                 ScrollList Sizes TextArea TextMan Font riscos_gra\
-                ScrollLisS TAsel_ven Utils
+                TAsel_ven Utils
 CMHGDEPENDS   = main
 ROMCDEFINES   = -DROM
 CINCLUDES     = -IC:tboxlibint,tbox:,C:
