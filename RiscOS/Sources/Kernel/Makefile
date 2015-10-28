@@ -35,7 +35,6 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${EXP_HDR}.SPIDevice \
                   ${EXP_HDR}.AHCIDevice \
                   ${EXP_HDR}.EtherDevice \
-                  ${EXP_HDR}.GPIODevice \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
@@ -111,9 +110,6 @@ ${EXP_HDR}.AHCIDevice: hdr.AHCIDevice
 
 ${EXP_HDR}.EtherDevice: hdr.EtherDevice
 	${CP} hdr.EtherDevice $@ ${CPFLAGS}
-
-${EXP_HDR}.GPIODevice: hdr.GPIODevice
-	${CP} hdr.GPIODevice $@ ${CPFLAGS}
 
 ${EXP_HDR}.HALDevice: hdr.HALDevice
 	${CP} hdr.HALDevice $@ ${CPFLAGS}
