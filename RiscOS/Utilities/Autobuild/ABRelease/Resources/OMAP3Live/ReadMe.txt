@@ -33,9 +33,13 @@ RISC OS Open wiki:
 An important note about CMOS RAM
 ================================
 
-The OMAP port of RISC OS now supports saving configuration settings in a CMOS memory chip so that they are kept when the power is turned off. This requires a small carrier board to be plugged in, which you can obtain for a few pounds from your favourite supplier.
+The OMAP port of RISC OS now supports saving configuration settings in a CMOS
+memory chip so that they are kept when the power is turned off. This
+requires a small carrier board to be plugged in, which you can obtain for
+a few pounds from your favourite supplier.
 
-If this carrier board is not detected it is possible to have 'read only' settings in one of two ways
+If this carrier board is not detected it is possible to have 'read only' 
+settings in one of two ways
 
   * Add a CMOS file to the SD card
     Make any configuration settings changes desired than use the *SaveCMOS
