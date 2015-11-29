@@ -34,6 +34,7 @@
 #include "Global/Services.h"
 #include "Global/VduExt.h"
 #include "Global/VIDCList.h"
+#include "Interface/ScrModes.h"
 
 #include "EDIDModes.h"
 
@@ -630,6 +631,10 @@ static void free_monitordescription (MonitorDescriptionRef description)
         ModeDescriptionRef td = md;
         md = md->next;
         free (td);
+    }
+    if (description->audio_formats)
+    {
+        free (description->audio_formats);
     }
     free (description);
 }
@@ -1261,6 +1266,7 @@ static _kernel_oserror *parse_modefile (MonitorDescriptionRef *description)
      * From here on, need to release memory on error, so do most of
      * the rest as a subroutine.
      */
+    memset(md, 0, sizeof(MonitorDescription));
     md->modelist = NULL;                                       /* to start with */
     res = read_text (md->name, sizeof(md->name), ERR_BLANKMONTITLE);
 
@@ -2549,19 +2555,235 @@ static int get_extd_type(EDIDBlockRef edidblockref, int block_no)
     }
 }
 
-/* Process a CEA type 3 extension block */
-static _kernel_oserror *process_cea_extension_type_3(EDIDExtensionBlockRef ext_block, MonitorDescriptionRef new_monitor)
+/* Add to our list of audio formats */
+static _kernel_oserror *add_audio_format(uint8_t byte1, uint8_t byte2, uint8_t byte3, MonitorDescriptionRef new_monitor)
+{
+    AudioFormat newformat;
+    newformat.format_code = (byte1 >> 3) & 0x7f;
+    newformat.max_channels = (byte1 & 7) + 1;
+    newformat.sample_rates = byte2;
+    newformat.format_specific = byte3;
+    /* Discard if bogus */
+    if ((!newformat.sample_rates) || ((newformat.format_code == 1) && !(newformat.format_specific)))
+    {
+        return NULL;
+    }
+    /* Work out where to merge it into our list
+     * CEA 861-D doesn't state what we should do if multiple descriptors are
+     * found for the same format code, so we should be conservative with how
+     * we merge blocks together
+     */
+    int i;
+    for (i=0;i<new_monitor->audio_format_count;i++)
+    {
+        AudioFormat *candidate = &new_monitor->audio_formats[i];
+        if (candidate->format_code > newformat.format_code)
+        {
+            break;
+        }
+        else if (candidate->format_code < newformat.format_code)
+        {
+            continue;
+        }
+        /* Try and merge with this entry
+         * note - currently not doing any fancy merging of the format-specific
+         * byte (could be a bit tricky for LPCM depending on what future meaning
+         * is given to the reserved bits)
+         */
+        if (newformat.format_specific == candidate->format_specific)
+        {
+            if (newformat.max_channels == candidate->max_channels)
+            {
+                /* Merge our list of sample rates into the candidate and call
+                 * it a day.
+                 */
+                candidate->sample_rates |= newformat.sample_rates;
+                return NULL;
+            }
+            else if (newformat.max_channels < candidate->max_channels)
+            {
+                /* Candidate supports more channels than us with same
+                 * format-specific settings, so ignore any sample rates which
+                 * the candidate supports.
+                 */
+                newformat.sample_rates &= ~candidate->sample_rates;
+                if (!newformat.sample_rates)
+                {
+                    return NULL;
+                }
+            }
+            else if (newformat.max_channels > candidate->max_channels)
+            {
+                /* We support more channels than the candidate, so remove
+                 * sample rates from the candidate.
+                 */
+                candidate->sample_rates &= ~newformat.sample_rates;
+                if (!candidate->sample_rates)
+                {
+                    /* Candidate can be removed completely */
+                    new_monitor->audio_formats--;
+                    memmove(candidate, candidate+1, sizeof(AudioFormat)*(new_monitor->audio_format_count-i));
+                    void *new = realloc(new_monitor->audio_formats, new_monitor->audio_format_count*sizeof(AudioFormat));
+                    if (new)
+                    {
+                        new_monitor->audio_formats = (AudioFormat*) new;
+                    }
+                    /* Everything's been shuffled down, so process this entry
+                     * again.
+                     */
+                    i--;
+                    continue;
+                }
+            }
+        }
+    }
+    /* Need to insert a new entry */
+    void *new = realloc(new_monitor->audio_formats, (new_monitor->audio_format_count+1)*sizeof(AudioFormat));
+    if (!new)
+    {
+        return error(ERR_NOSPACE, 0, 0, 0);
+    }
+    new_monitor->audio_formats = (AudioFormat*) new;
+
+    /* Shuffle following entries up */
+    memmove(new_monitor->audio_formats+i+1, new_monitor->audio_formats+i, sizeof(AudioFormat)*(new_monitor->audio_format_count-i));
+
+    new_monitor->audio_format_count++;
+    new_monitor->audio_formats[i] = newformat;
+
+    return NULL;
+}
+
+/* Process an audio data block from a CEA extension block */
+static _kernel_oserror *process_cea_audio_data_block(EDIDExtensionBlockRef ext_block, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    while (length >= 3)
+    {
+#if DODEBUG
+        printf("CEA Short Audio Descriptor %02x %02x %02x\n",block[0],block[1],block[2]);
+#endif
+        /* Ignore if any reserved bits in the first couple of bytes are set */
+        if (!(block[0] & 128) && !(block[1] & 128))
+        {
+            _kernel_oserror *err = add_audio_format(block[0], block[1], block[2], new_monitor);
+            if (err)
+            {
+                return err;
+            }
+        }
+        block += 3;
+        length -= 3;
+    }
+    return NULL;
+}
+
+/* Process a video data block from a CEA extension block */
+static _kernel_oserror *process_cea_video_data_block(EDIDExtensionBlockRef ext_block, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    /* TODO: Parse SVDs and add to mode list */
+    return NULL;
+}
+
+/* Process a speaker allocation block from a CEA extension block */
+static _kernel_oserror *process_cea_speaker_allocation_data_block(EDIDExtensionBlockRef ext_block, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    if (length == 3)
+    {
+#if DODEBUG
+        printf("CEA Speaker Allocation %02x %02x %02x\n",block[0],block[1],block[2]);
+#endif
+        new_monitor->speaker_mask = block[0] & 0x7f;
+        new_monitor->speaker_mask_provided = true;
+    }
+    return NULL;
+}
+
+/* Process a data block from a CEA extension block */
+static _kernel_oserror *process_cea_data_block(EDIDExtensionBlockRef ext_block, int tag_code, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    if (tag_code == 7)
+    {
+        /* Extended tag */
+        tag_code = *block++;
+        length--;
+#if DODEBUG
+        printf("CEA extended data block code %d data length %d\n",tag_code,length);
+#endif
+        /* TODO: Process any interesting ones */
+        return NULL;
+    }
+#if DODEBUG
+    printf("CEA data block code %d data length %d\n",tag_code,length);
+#endif
+    switch(tag_code)
+    {
+    case 1: return process_cea_audio_data_block(ext_block, length, block, new_monitor);
+    case 2: return process_cea_video_data_block(ext_block, length, block, new_monitor);
+    case 4: return process_cea_speaker_allocation_data_block(ext_block, length, block, new_monitor);
+    default: return NULL;
+    }
+}
+
+/* Process a CEA extension block */
+static _kernel_oserror *process_cea_extension(EDIDExtensionBlockRef ext_block, MonitorDescriptionRef new_monitor)
 {
     /* offset from the start of the extension block to the */
     /* first dtd in the extension block. Uses the offset from block+2. */
     const uint8_t *extdata = (uint8_t *) ext_block;
     int dtd_offset = extdata[2];
+
+    if (dtd_offset > (126 - 18))
+    {
+        /* Bogus DTD offset, ignore block */
+        return NULL;
+    }
+
+    bool basic_audio = (ext_block->revision >= 2) && (extdata[3] & 0x40);
+    if (basic_audio)
+    {
+#if DODEBUG
+        printf("Basic audio supported\n");
+#endif
+        /* 2-ch LPCM at 32kHz, 44.1kHz, 48kHz
+         * Assume 16/20/24bit supported (spec is a bit vague, but in reality it
+         * shouldn't matter that much because they all get packaged the same)
+         */
+        _kernel_oserror *err = add_audio_format(0x9, 0x7, 0x7, new_monitor);
+        if (err)
+        {
+            return err;
+        }
+    }
+
+    if ((ext_block->revision >= 3) && (dtd_offset > 4))
+    {
+        /* CEA Data Block Collection present */
+        int block_offset = 4;
+        while (block_offset < dtd_offset)
+        {
+            int tag_code = extdata[block_offset] >> 5;
+            int length = extdata[block_offset] & 0x1f;
+            block_offset++;
+            if (!tag_code || !length || (length > (dtd_offset-block_offset)))
+            {
+                /* Bad block length or invalid tag code. TODO - Should probably throw away everything we've learnt so far from this extension block. */
+                return NULL;
+            }
+            _kernel_oserror *err = process_cea_data_block(ext_block, tag_code, length, extdata+block_offset, new_monitor);
+            if (err)
+            {
+                return err;
+            }
+            block_offset += length;
+        }
+    }
+
     if (dtd_offset < 4) {
         /* No DTD's provided in this block */
         return NULL;
     }
 
-    while ((dtd_offset < (128 - 18)) &&
+    while ((dtd_offset <= (126 - 18)) &&
            (extdata[dtd_offset] != 0) && (extdata[dtd_offset+1] != 0))
     {
         ModeDescriptionRef mp;
@@ -2679,9 +2901,6 @@ static _kernel_oserror *parseedid(char *ediddata, const char *file)
     ModeDescriptionRef new_preferred_mode = NULL; /* No preferred mode */
     EDIDBlockRef edidblockref = (EDIDBlockRef) ediddata;
     int RangeBlock = -1;                          /* edid block containing timimg limits */
-    if(!EDIDEnabled) {                            /* only if needed!! */
-      return res;
-    }
 
     /* OK, commit to reading a monitor description - go allocate space */
     new_monitor = (MonitorDescriptionRef) malloc (sizeof(MonitorDescription));
@@ -2689,6 +2908,7 @@ static _kernel_oserror *parseedid(char *ediddata, const char *file)
         printf("Can't allocate space for monitor list\n");
         return error (ERR_NOSPACE, 0, 0, 0);
     }
+    memset(new_monitor, 0, sizeof(MonitorDescription));
 
     strcpy(new_monitor->name,"Display");
 
@@ -2970,9 +3190,9 @@ static _kernel_oserror *parseedid(char *ediddata, const char *file)
                 debug printf("Block %i: CEA Extension block found\n", ext_block_id);
                 debug printf("Version %i\n", ext_block->revision);
 
-                if (ext_block->revision == 0x03)
+                if (ext_block->revision != 0) /* Revision 0 doesn't exist. All othe revisions (including future ones we don't know about) should be at least partially parseable. */
                 {
-                    res = process_cea_extension_type_3(ext_block, new_monitor);
+                    res = process_cea_extension(ext_block, new_monitor);
                     if (res) {
                         return res;
                     }
@@ -4030,6 +4250,163 @@ static int we_are_preferred (void *pw)
     return (sregs.r[4] == *(int *)pw);
 }
 
+static const int samplerates[] =
+{
+     32000*1024,
+     44100*1024,
+     48000*1024,
+     88200*1024,
+     96000*1024,
+    176400*1024,
+    192000*1024,
+};
+
+static _kernel_oserror *swi_enumerateaudioformats(_kernel_swi_regs *regs)
+{
+    if (!current_monitor)
+    {
+        return error(ERR_NOMODEFILE, 0, 0, 0);
+    }
+
+    /* In:  r0 = flags:
+                 bit 0: 0 -> read raw data
+                        1 -> read friendly data
+            r1 = format code to start from (-1 = first)
+            r2 = index within format code (-1 = first)
+       Out: r1 = format code of this entry (-1 if no more formats)
+            r2 = index within format code (-1 if no more formats)
+            r3 = max channels
+            raw data:
+              r4 = audio short descriptor byte 2
+              r5 = audio short descriptor byte 3
+            friendly data:
+              r4 = sample rate (Hz*1024)
+              r5 = LPCM: bit depth
+                   codes 2-8: max bit rate in Hz
+                   other codes: not supported by this API
+
+       n.b. index values (r2) differ between raw & friendly modes
+    */
+    if (regs->r[0] & ~1)
+    {
+        return error(ERR_BADENUMAUDIO, 0, 0, 0);
+    }
+    /* Find the right index to start from */
+    AudioFormat *current = current_monitor->audio_formats;
+    int count = current_monitor->audio_format_count;
+    int format = regs->r[1];
+    int start_index = regs->r[2];
+    while (count && (current->format_code < format))
+    {
+        current++;
+        count--;
+    }
+    if (regs->r[0] & 1)
+    {
+        /* Friendly mode */
+        /* Skip formats we don't understand */
+        int my_index = 0;
+find_next_entry:;
+        int sample_rate = -1;
+        int bits = -1;
+        while (count && ((current->format_code < 1) || (current->format_code > 8)))
+        {
+            current++;
+            count--;
+        }
+        if (!count)
+        {
+            regs->r[1] = -1;
+            regs->r[2] = -1;
+            return NULL;
+        }
+        bool is_LPCM = (current->format_code == 1);
+        if (is_LPCM)
+        {
+            if ((current->format_specific & 0xf8) || !(current->format_specific & 0x7))
+            {
+                /* Weird bit depth mask for LPCM, skip entry */
+                current++;
+                count--;
+                goto find_next_entry;
+            }
+        }
+find_next_sub_entry:
+        /* Find first sample_rate & bits value */
+        while (!(current->sample_rates & (1<<sample_rate)))
+        {
+            sample_rate++;
+        }
+        if (is_LPCM)
+        {
+            while (!(current->format_specific & (1<<bits)))
+            {
+                bits++;
+            }
+        }
+        /* Skip entries as necessary */
+        if ((current->format_code == format) && (my_index <= start_index))
+        {
+            my_index++;
+            /* Step to next sample rate */
+            sample_rate++;
+            if ((1<<sample_rate) > current->sample_rates)
+            {
+                /* Step to next bit depth value */
+                sample_rate = 0;
+                bits++;
+                if (!is_LPCM || ((1<<bits) > current->format_specific))
+                {
+                    /* Step to next format list entry */
+                    current++;
+                    count--;
+                    goto find_next_entry;
+                }
+            }
+            goto find_next_sub_entry;
+        }
+        if (current->format_code > format)
+        {
+            my_index = 0;
+        }
+        regs->r[1] = current->format_code;
+        regs->r[2] = my_index;
+        regs->r[3] = current->max_channels;
+        regs->r[4] = samplerates[sample_rate];
+        regs->r[5] = is_LPCM ? (16 + 4*bits) : (current->format_specific*8000);
+
+        return NULL;
+    }
+    else
+    {
+        /* Raw mode */
+        int my_index = 0;
+        while (count && (current->format_code == format) && (my_index <= start_index))
+        {
+            current++;
+            count--;
+            my_index++;
+        }
+        if (!count)
+        {
+            regs->r[1] = -1;
+            regs->r[2] = -1;
+            return NULL;
+        }
+        if (current->format_code > format)
+        {
+            my_index = 0;
+        }
+        regs->r[1] = current->format_code;
+        regs->r[2] = my_index;
+        regs->r[3] = current->max_channels;
+        regs->r[4] = current->sample_rates;
+        regs->r[5] = current->format_specific;
+
+        return NULL;
+    }
+}
+
 
 /* EXPORTED */
 _kernel_oserror *ScreenModes_initialise(const char *cmd_tail, int podule_base, void *pw)
@@ -4136,10 +4513,24 @@ _kernel_oserror *ScreenModes_swihandler (int swi_no, _kernel_swi_regs *r, void *
         case ScreenModes_ReadInfo - ScreenModes_00:
             switch (r->r[0])    /* r0 = subreason code */
             {
-                case 0:         /* Return pointer to monitor name */
+                case ScreenModes_ReadInfo_MonitorName: /* Return pointer to monitor name */
                     if (current_monitor)
                     {
                         r->r[0] = (int) &current_monitor->name;
+                        result = NULL;
+                    }
+                    else
+                    {
+                        /* No monitor description file loaded */
+                        result = error (ERR_NOMODEFILE, 0, 0, 0);
+                    }
+                    break;
+
+                case ScreenModes_ReadInfo_SpeakerMask: /* Read monitor speaker mask */
+                    if (current_monitor)
+                    {
+                        r->r[0] = current_monitor->speaker_mask; /* Mask */
+                        r->r[1] = current_monitor->speaker_mask_provided ? 0x7f : 0; /* Validity of each bit */
                         result = NULL;
                     }
                     else
@@ -4153,6 +4544,9 @@ _kernel_oserror *ScreenModes_swihandler (int swi_no, _kernel_swi_regs *r, void *
                     result = error (ERR_BADREADINFO, 0, 0, 0);
             }
             break;
+
+        case ScreenModes_EnumerateAudioFormats - ScreenModes_00:
+            return swi_enumerateaudioformats(r);
 
         default:                /* Unknown ScreenModes SWI */
             return error_BAD_SWI;
