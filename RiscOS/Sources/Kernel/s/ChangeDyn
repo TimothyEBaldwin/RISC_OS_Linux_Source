@@ -16,13 +16,13 @@
 
         ; OS_ChangeDynamicArea optimisations:
 
-        GBLL  FastCDA_UpFront ; Do all cache/TLB maintenance upfront instead of on a per-page basis
-FastCDA_UpFront SETL {TRUE}
+        GBLL  FastCDA_Bulk ; Do all cache/TLB maintenance in bulk instead of on a per-page basis
+FastCDA_Bulk SETL {TRUE}
 
         GBLL  FastCDA_FIQs ; Don't thrash ClaimFIQ/ReleaseFIQ in DoTheGrowPagesSpecified
 FastCDA_FIQs SETL {TRUE}
 
-        GBLL  FastCDA_Unnecessary ; Avoid unnecessary MMU_ChangingEntry calls in DoTheGrowPagesSpecified
+        GBLL  FastCDA_Unnecessary ; Avoid unnecessary cache cleaning in DoTheGrowPagesSpecified
 FastCDA_Unnecessary SETL {TRUE}
 
         ; DoTheGrowPagesSpecified profiling code
@@ -38,7 +38,7 @@ FastCDA_Prof SETL {FALSE}
 FastCDA_Prof_DoTheGrowInit           # 4
 FastCDA_Prof_MarkRequired            # 4
 FastCDA_Prof_PagesUnsafe             # 4
-FastCDA_Prof_DoublyCheckCacheability # 4
+FastCDA_Prof_DoublyRemoveCacheability # 4
 FastCDA_Prof_DoublyMovePages         # 4
 FastCDA_Prof_FindSpare               # 4
 FastCDA_Prof_ClaimFIQ                # 4
@@ -51,8 +51,8 @@ FastCDA_Prof_ReleaseFIQ              # 4
 FastCDA_Prof_PagesSafe               # 4
 FastCDA_Prof_CallPreGrow             # 4
 FastCDA_Prof_CallPostGrow            # 4
-FastCDA_Prof_MMUChanging             # 4
-FastCDA_Prof_MMUChangingUncached     # 4
+FastCDA_Prof_MMUChangingCached       # 4 ; MMU_ChangingUncached followed by Cache_CleanInvalidateaAll
+FastCDA_Prof_MMUChangingUncached     # 4 ; MMU_ChangingUncached followed by nothing
 FastCDA_Prof_ChangingEntry           # 4
         ASSERT @ <= &500
       ]
@@ -447,24 +447,47 @@ Call_CAM_Mapping
         BL      BangCamUpdate
         Pull    "r0, r1, r4, r6, pc"
 
-  [ FastCDA_UpFront
-; CheckCacheabilityR0ByMinusR2
+  [ FastCDA_Bulk
+; RemoveCacheabilityR0ByMinusR2
+; Make a range of pages (temporarily) uncacheable prior to (re)moving them
+; Doesn't perform any cache/TLB maintenance
 ; in:   r0 = end of area
 ;       r2 = size of area (must be nonzero)
 ; out:  r6 has DynAreaFlags_NotCacheable set if entire region noncacheable
-;              Flag clear if at least one page is cacheable
+;              Flag clear if at least one page was cacheable
 ;       r0 points to start of area
 ;
 ;       4K page size assumed!
-CheckCacheabilityR0ByMinusR2 ROUT
-        Entry   "r2"
+RemoveCacheabilityR0ByMinusR2 ROUT
+        Entry   "r1-r5"
+        MOV     r5, #DynAreaFlags_NotCacheable
+        MOV     r1, #-1
 10
         SUB     r0, r0, #4096
         BL      GetPageFlagsForR0IntoR6
+        TST     r6, #DynAreaFlags_NotCacheable
+        BNE     %FT90
+        ; Work out required page flags - use cached flags from last page if possible
+        CMP     r1, r6
+        BEQ     %FT20
+        LDR     r3, =ZeroPage
+        MOV     r1, r6
+        LDR     r3, [r3, #MMU_PCBTrans]
+        GetTempUncache r4, r6, r3, lr
+20
+        ; Update the current L2PT entry
+        LDR     r3, =L2PT
+        LDR     lr, =TempUncache_L2PTMask
+        LDR     r5, [r3, r0, LSR #10]
+        BIC     r5, r5, lr
+        ORR     r5, r5, r4
+        STR     r5, [r3, r0, LSR #10]
+        ; Clear the flag from R5
+        MOV     r5, #0
+90
         SUBS    r2, r2, #4096
-        TSTNE   r6, #DynAreaFlags_NotCacheable
         BNE     %BT10
-        SUB     r0, r0, r2
+        MOV     r6, r5
         EXIT
   ]
 
@@ -2930,13 +2953,12 @@ PMPGrowHandler ROUT
 ;
 PMPLogOp_ChunkSize * 384 ; 384 pages = 1.5K stack, or 1.5MB of memory (larger than current max Cache_RangeThreshold - otherwise full cache clean optimisation won't be taken)
 
-                      ^ 0, sp
-PMPLogOp_PageList     # PMPLogOp_ChunkSize*4 ; List of pages to map out
-PMPLogOp_Unsafe       # 4 ; Nonzero if we've done an 'unsafe' map in
-PMPLogOp_CacheFlushed # 4 ; Nonzero if we've done a global cache flush
-PMPLogOp_TLBFlushed   # 4 ; Nonzero if we've done a global TLB flush
-                      # 4 ; Padding!
-PMPLogOp_FrameSize    # 0
+                              ^ 0, sp
+PMPLogOp_PageList             # PMPLogOp_ChunkSize*4 ; List of pages to map out
+PMPLogOp_UnsafeMapIn          # 4 ; Nonzero if we've done an 'unsafe' map in
+PMPLogOp_GlobalTLBFlushNeeded # 4 ; Nonzero if a global TLB flush needed on exit
+                              # 8 ; Padding!
+PMPLogOp_FrameSize            # 0
 
 DynArea_PMP_LogOp ROUT
         ; This is basically just a wrapper around OS_FindMemMapEntries & OS_SetMemMapEntries
@@ -2972,9 +2994,8 @@ DynArea_PMP_LogOp ROUT
         ; r11 -> DA max size
         ; r12 -> DA base
         MOV     r0, #0
-        STR     r0, PMPLogOp_Unsafe
-        STR     r0, PMPLogOp_CacheFlushed
-        STR     r0, PMPLogOp_TLBFlushed
+        STR     r0, PMPLogOp_UnsafeMapIn
+        STR     r0, PMPLogOp_GlobalTLBFlushNeeded
         MOV     r1, #0
       [ PMPDebug
         DebugReg r3, "LogOp len "
@@ -3112,11 +3133,10 @@ DynArea_PMP_LogOp ROUT
         ADD     r11, r11, r3, LSL #CAM_EntrySizeLog2
         LDR     r3, =Nowhere
         LDR     r11, [r11, #CAM_PageFlags] ; Preserve flags
-        ; We should be able to make this an unsafe op if we've already done an appropriate global invalidate
+        ; We should be able to make this an unsafe op if the page isn't cacheable. But to avoid global TLB flushes when only one or two pages are being unmapped, only make it unsafe if we've already scheduled a global flush.
         TST     r11, #DynAreaFlags_NotCacheable
-        LDRNE   r7, [sp, #:INDEX:PMPLogOp_TLBFlushed + 6*4 + 4*4]
-        LDREQ   r7, [sp, #:INDEX:PMPLogOp_CacheFlushed + 6*4 + 4*4]
-        TEQ     r7, #0
+        LDRNE   r7, [sp, #:INDEX:PMPLogOp_GlobalTLBFlushNeeded + 6*4 + 4*4]
+        TEQNE   r7, #0
         ORRNE   r11, r11, #PageFlags_Unsafe
         BL      BangCamUpdate
         Pull    "r2,r4,r6,r7"
@@ -3125,11 +3145,10 @@ DynArea_PMP_LogOp ROUT
         ORR     r6, r6, r11
 60
         ; Call BangCamUpdate
-        ; PageFlags_Unsafe will only be set if this is a map in operation
         MOV     r3, r4
         TST     r6, #PageFlags_Unsafe
         ORR     r11, r6, #DynAreaFlags_PMP
-        STRNE   pc, [sp, #:INDEX:PMPLogOp_Unsafe + 6*4]
+        STRNE   pc, [sp, #:INDEX:PMPLogOp_UnsafeMapIn + 6*4]
       [ PMPDebug
         DebugReg r11, "Actual flags "
       ]
@@ -3152,37 +3171,30 @@ DynArea_PMP_LogOp ROUT
         BLNE    LogOp_MapOut
       [ PMPDebug
         DebugReg r3, "# not processed "
-        LDR     r3, PMPLogOp_CacheFlushed
-        DebugReg r3, "CacheFlushed? "
-        LDR     r3, PMPLogOp_TLBFlushed
-        DebugReg r3, "TLBFlushed? "
-        LDR     r3, PMPLogOp_Unsafe
-        DebugReg r3, "Unsafe? "
+        LDR     r3, PMPLogOp_GlobalTLBFlushNeeded
+        DebugReg r3, "GlobalTLBFlushedNeeded? "
+        LDR     r3, PMPLogOp_UnsafeMapIn
+        DebugReg r3, "UnsafeMapIn? "
         LDR     r3, [r10, #DANode_Size]
         DebugReg r3, "Size "
       ]
-      [ MEMM_Type = "VMSAv6"
         ; Perform any necessary post maintenance
-        LDR     r0, PMPLogOp_TLBFlushed
+        LDR     r0, PMPLogOp_GlobalTLBFlushNeeded
         TEQ     r0, #0
         BEQ     %FT72
-        ; In order to guarantee that the result of a page table write is
-        ; visible, the ARMv6+ memory order model requires us to perform TLB
-        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
-        ; performed the write. Performing the maintenance beforehand (as we've
-        ; done traditionally) will work most of the time, but not always.
         ARMop   MMU_ChangingUncached
         B       %FT75
 72
-        LDR     r0, PMPLogOp_Unsafe
+      [ MEMM_Type = "VMSAv6"
+        LDR     r0, PMPLogOp_UnsafeMapIn
         TEQ     r0, #0
         BEQ     %FT75
         ; DSB + ISB required to ensure effect of page table write is fully
         ; visible (after overwriting a faulting entry)
         myDSB   ,r0
         myISB   ,r0,,y
-75
       ]
+75
         ; Release CDASemaphore
         LDR     r1, =ZeroPage
         MOV     r2, #0
@@ -3239,54 +3251,103 @@ LogOp_MapOut ROUT
         ; r0 = number of cacheable pages being unmapped
         ; r1 = number of pages being unmapped
         ; r3 -> list of physical pages to unmap
-        MOV     r5, #0
-        ; Work out if we should do a global cache/TLB flush
-        LDR     r4, [r3, #:INDEX:PMPLogOp_CacheFlushed]
-        CMP     r4, #0
-        BNE     %FT17
-        MOV     r2, r0
+        ; r10 -> DANode
+        ; First go through and make them all uncacheable
+        CMP     r0, #0
+        BEQ     %FT10
+
+        ; Work out if a global cache flush makes sense
+        MOV     r8, r1
+        MOV     r6, r0, LSL #12
         ARMop   Cache_RangeThreshold,,,r12
-        CMP     r0, r2, LSL #12
-        BHI     %FT10
-        ; Global cache flush wanted
+        CMP     r6, r0
+        ORRHI   r6, r6, #1
+
+        MOV     r7, r3
+        LDR     r12, [r12, #CamEntriesPointer]
+        LDR     r3, =Nowhere
+        LDR     r10, =L2PT
+        MOV     r9, #-1
+05
+        LDR     r2, [r7], #4
       [ PMPDebug
-        DebugTX "MMU_Changing"
+        DebugReg r2, "Uncache page "
       ]
-        ARMop   MMU_Changing,,,r12
-        STR     pc, [r3, #:INDEX:PMPLogOp_CacheFlushed]
-        B       %FT15
-10
-        ; Work out if we should do a global TLB flush
-        CMP     r2, #0 ; Only if there are no cacheable pages involved
-        BNE     %FT20
-        LDR     r4, [r3, #:INDEX:PMPLogOp_TLBFlushed]
-        CMP     r4, #0
-        BNE     %FT17
-        CMP     r1, #32 ; Arbitrary TLB size
-        BLO     %FT20
-        ; Global TLB/uncached flush wanted
+        ADD     r11, r12, r2, LSL #CAM_EntrySizeLog2
+        ASSERT  CAM_LogAddr=0
+        ASSERT  CAM_PageFlags=4
+        LDMIA   r11, {r11, lr}
+        TEQ     r11, r3                 ; Check something actually there (mainly to stop DANode_Size going out of sync if page list requests for same page to be unmapped multiple times)
+        BEQ     %FT08
+        TST     lr, #DynAreaFlags_NotCacheable
+        BNE     %FT08
+        ; Calculate required page flags
+        CMP     r9, lr
+        BEQ     %FT06
+        LDR     r1, =ZeroPage
+        LDR     r1, [r1, #MMU_PCBTrans]
+        GetTempUncache r2, lr, r1, r4
+06
+        ; Bypass BangCAM and update L2PT directly (avoids CAM gaining any unwanted temp uncacheability flags)
+        LDR     r4, =TempUncache_L2PTMask
+        LDR     lr, [r10, r11, LSR #10]
+        BIC     lr, lr, r4
+        ORR     lr, lr, r2
+        STR     lr, [r10, r11, LSR #10]
+        ; r6 bit 0 set if TLB+cache invalidation done on per-page basis
+        TST     r6, #1
+        BEQ     %FT07
+        LDR     r4, =ZeroPage
+        MOV     r0, r11
+        ARMop   MMU_ChangingUncachedEntry,,,r4
+        MOV     r0, r11
+        ADD     r1, r11, #4096
+        ARMop   Cache_CleanInvalidateRange,,,r4
+07
+        SUBS    r6, r6, #4096
+        BLS     %FT09                   ; Can stop if that was the last cacheable page
+08
+        SUBS    r8, r8, #1
+        BNE     %BT05
+
+09
+        ; Do global TLB+cache invalidate if required
+        LDR     r12, =ZeroPage
+        TST     r6, #1
+        BNE     %FT10
       [ PMPDebug
-        DebugTX "MMU_ChangingUncached"
+        DebugTX "Global cache flush"
       ]
         ARMop   MMU_ChangingUncached,,,r12
-15
-        STR     pc, [r3, #:INDEX:PMPLogOp_TLBFlushed]
-17
-        ORR     r5, r5, #PageFlags_Unsafe
+        ARMop   Cache_CleanInvalidateAll,,,r12
+
+10
+        FRAMLDR r1
+        ADD     r7, sp, #14*4
+        ; Work out if we should do a global TLB flush after the unmap
+        MOV     r5, #0
+        LDR     r4, [r7, #:INDEX:PMPLogOp_GlobalTLBFlushNeeded]
+        CMP     r4, #0
+        BNE     %FT20
+        CMP     r1, #32 ; Arbitrary TLB size
+        BLO     %FT20
+        ; Global TLB/uncached flush wanted - make BangCAM unsafe, request global flush from main code
+        MOV     r5, #PageFlags_Unsafe
+        STR     pc, [r7, #:INDEX:PMPLogOp_GlobalTLBFlushNeeded]
       [ PMPDebug
         DebugTX "Doing unsafe unmap"
       ]
 20
         ; Now process the pages
-        MOV     r7, r3
-        MOV     r8, r1
+        MOV     r8,r1
+        FRAMLDR r10
         LDR     r12, [r12, #CamEntriesPointer]
         LDR     r3, =Nowhere
         LDR     r9, [r10, #DANode_Size]
 25
         LDR     r2, [r7], #4
       [ PMPDebug
-        DebugReg r2, "Page "
+        DebugReg r2, "Umap page "
       ]
         ADD     r11, r12, r2, LSL #CAM_EntrySizeLog2
         ASSERT  CAM_LogAddr=0
@@ -4150,13 +4211,18 @@ AllocateBackingLevel2 Entry "r0-r8,r11"
         STR     lr, [r8, #8]                            ; store entry for 3rd MB
         ADD     lr, lr, #1024                           ; advance L2 pointer
         STR     lr, [r8, #12]                           ; store entry for 4th MB
-        ;;;ARM_flush_TLB r6                junk TLB(s) shouldn't be needed, would have to be ARMop now
 25
         ADD     r3, r3, #4096                           ; advance L2PT logical address
         ADD     r8, r8, #16                             ; move onto L1 for next 4M
 
         TEQ     r1, r2
         BNE     %BT20
+      [ MEMM_Type = "VMSAv6"
+        ; DSB + ISB required to ensure effect of page table write is fully
+        ; visible (after overwriting a faulting entry)
+        myDSB   ,r0
+        myISB   ,r0,,y
+      ]
 30
         CLRV
         EXIT
@@ -5001,36 +5067,44 @@ AreaShrink ROUT
         DebugReg r3, "< src size"
       ]
 
-        LDR     r1, [r12, #DANode_PMP]
         LDR     r3, [r12, #DANode_PMPSize]      ; r3 -> index of 1st extra page
 
-      [ FastCDA_UpFront
-        Push    "r0-r1"
-        BL      CheckCacheabilityR0ByMinusR2
+      [ FastCDA_Bulk
+        Push    "r0"
+        BL      RemoveCacheabilityR0ByMinusR2
         LDR     r4, [r11, #DANode_Flags]
         ADR     lr, %FT19
         TST     r4, #DynAreaFlags_DoublyMapped
         LDR     r4, =ZeroPage
         BNE     %FT18
         ; Interacting with singly-mapped region - use regular logic
-        TST     r6, #DynAreaFlags_NotCacheable
         MOV     r1, r2, LSR #12
-        ARMop   MMU_ChangingEntries, EQ, tailcall, r4
-        ARMop   MMU_ChangingUncachedEntries, NE, tailcall, r4
+        ARMop   MMU_ChangingUncached,,, r4
+        TST     r6, #DynAreaFlags_NotCacheable
+        BNE     %FT19
+        LDR     r1, [sp]
+        SUB     r0, r1, r2
+        ARMop   Cache_CleanInvalidateRange,,, r4
+        B       %FT19
 18
         ; Interacting with doubly-mapped region - use sledgehammer logic
+        LDR     r0, [r11, #DANode_Base]
+        MOV     r1, r2
+        LDR     r2, [sp, #4]                    ; Grab old source size (pushed r3)
+        BL      RemoveCacheabilityR0ByMinusR2   ; Remove cacheability for entireity of lower mapping (whole thing needs shuffling)
+        MOV     r2, r1
+        ARMop   MMU_ChangingUncached,,, r4
         TST     r6, #DynAreaFlags_NotCacheable
-        ARMop   MMU_Changing, EQ, tailcall, r4
-        ARMop   MMU_ChangingUncached, NE, tailcall, r4
+        ARMop   Cache_CleanInvalidateAll, EQ,, r4
 19
-        Pull    "r0-r1"
+        Pull    "r0"
       ]
 
         LDR     lr, =DynAreaFlags_AccessMask
         MOV     r4, r2
         LDR     r6, [r12, #DANode_Flags]        ; r6 = dst flags
         AND     r6, r6, lr
-      [ FastCDA_UpFront
+      [ FastCDA_Bulk
         ORR     r6, r6, #PageFlags_Unsafe
       ]
 20
@@ -5040,11 +5114,11 @@ AreaShrink ROUT
         DREG    r3, " to free pool index ", cc
         DREG    r6, " with PPL "
  ]
-        Push    "r1-r2"
+        Push    "r2"
         LDR     r1, =Nowhere
         BL      MovePageAtR0ToR1WithAccessR6ReturnPageNumber
         ; Update PMP association
-        Pull    "r1"
+        LDR     r1, [r12, #DANode_PMP]
         STR     r2, [r1, r3, LSL #2]            ; Store in free pool PMP
         LDR     lr, =ZeroPage
         LDR     lr, [lr, #CamEntriesPointer]
@@ -5056,15 +5130,8 @@ AreaShrink ROUT
 
         SUBS    r4, r4, r5
         BNE     %BT20
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
-        ; In order to guarantee that the result of a page table write is
-        ; visible, the ARMv6+ memory order model requires us to perform TLB
-        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
-        ; performed the write. Performing the maintenance beforehand (as we've
-        ; done traditionally) will work most of the time, but not always.
-        ; N.B. for the case of mapping in a page to an address which was
-        ; previously faulting only DSB & ISB are required. For this we rely
-        ; on the DSB + ISB performed by the ARMop for the src region
+      [ FastCDA_Bulk
+        ; Flush the TLB for the removed pages
         Push    "r0-r1,r3"
         MOV     r1, r2, LSR #12
         LDR     r3, =ZeroPage
@@ -5097,18 +5164,14 @@ AreaShrink ROUT
  [ 1 = 1
         BL      GetPageFlagsForR0IntoR6
  ]
- [ FastCDA_UpFront
+ [ FastCDA_Bulk
         ORR     r6, r6, #PageFlags_Unsafe
  ]
         BL      MovePageAtR0ToR1WithAccessR6
         SUBS    r4, r4, r5
         BNE     %BT25
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
-        ; In order to guarantee that the result of a page table write is
-        ; visible, the ARMv6+ memory order model requires us to perform TLB
-        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
-        ; performed the write. Performing the maintenance beforehand (as we've
-        ; done traditionally) will work most of the time, but not always.
+      [ FastCDA_Bulk
+        ; Flush the TLB for the shuffled pages
         Push    "r0-r1,r3"
         MOV     r1, r3, LSR #12
         LDR     r3, =ZeroPage
@@ -5700,18 +5763,16 @@ DoTheGrow ROUT
         MOVS    r4, r3                          ; amount to do
         BEQ     %FT20                           ; [none, so skip all this]
 
-      [ FastCDA_UpFront
+      [ FastCDA_Bulk
         ; Perform sledgehammer logic upfront
         Push    "r0,r2,r6"
         MOV     r0, r1
         MOV     r2, r3
-        BL      CheckCacheabilityR0ByMinusR2
+        BL      RemoveCacheabilityR0ByMinusR2
+        LDR     r2, =ZeroPage
+        ARMop   MMU_ChangingUncached,,, r2
         TST     r6, #DynAreaFlags_NotCacheable
-        LDR     r0, =ZeroPage
-        ADR     lr, %FT14
-        ARMop   MMU_Changing, EQ, tailcall, r0
-        ARMop   MMU_ChangingUncached, NE, tailcall, r0
-14
+        ARMop   Cache_CleanInvalidateAll, EQ,, r2
         Pull    "r0,r2,r6"
         ORR     r6, r6, #PageFlags_Unsafe
       ]
@@ -5726,26 +5787,25 @@ DoTheGrow ROUT
         ADD     r1, r1, r5                      ; advance dst ptr
         SUBS    r4, r4, r5                      ; one less page to move
         BNE     %BT15                           ; loop if more
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
-        ; In order to guarantee that the result of a page table write is
-        ; visible, the ARMv6+ memory order model requires us to perform TLB
-        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
-        ; performed the write. Performing the maintenance beforehand (as we've
-        ; done traditionally) will work most of the time, but not always.
-        Push    "r0-r1,r3"
-        SUB     r0, r1, r3
-        ADD     r1, r3, r2
-        MOV     r1, r1, LSR #12
+      [ FastCDA_Bulk
+        ; Flush the shuffled pages from the TLB
+        ; Note we only flush the area containing pages which have been
+        ; moved/removed; for pages which have been mapped in the only
+        ; requirement is that (for VMSAv6) we issue a DSB+ISB, which we can
+        ; assume the MMU_ChangingUnachedEntries op will do for us.
+        Push    "r3"
+        SUB     r0, r0, r3
+        MOV     r1, r3, LSR #12
         LDR     r3, =ZeroPage
         ARMop   MMU_ChangingUncachedEntries,,,r3
-        Pull    "r0-r1,r3"
+        Pull    "r3"
       ]
         Pull    "r0, r1"                        ; restore original regs
 20
         ADD     r9, r3, r2                      ; set up offset from 1st copy to 2nd copy (= new size)
 25
         ADD     r1, r1, r3                      ; r1 -> address of 1st extra page
-   [ FastCDA_UpFront
+   [ FastCDA_Bulk
         ORR     r6, r6, #PageFlags_Unsafe
    ]
         MOV     r4, #0                          ; amount done so far
@@ -5770,7 +5830,7 @@ DoTheGrow ROUT
         ADD     r4, r4, r5
         CMP     r4, r10                         ; have we done all of it?
         BNE     %BT30                           ; [no, so loop]
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
+      [ FastCDA_Bulk :LAND: (MEMM_Type = "VMSAv6")
         ; DSB + ISB required to ensure effect of page table write is fully
         ; visible (after overwriting a faulting entry)
         myDSB   ,lr
@@ -5907,35 +5967,34 @@ DoTheGrowPagesSpecified ROUT
         MOVS    r4, r3                          ; amount to do
         BEQ     %FT10                           ; [none, so skip all this]
 
-    [ FastCDA_UpFront
+    [ FastCDA_Bulk
         ; Perform sledgehammer logic upfront
         Push    "r0,r2,r6"
-        FastCDA_ProfStart DoublyCheckCacheability, r0, r6, lr
+        FastCDA_ProfStart DoublyRemoveCacheability, r0, r6, lr
         MOV     r0, r1
         MOV     r2, r3
-        BL      CheckCacheabilityR0ByMinusR2
-        FastCDA_ProfEnd DoublyCheckCacheability, r0, r2, lr
-        TST     r6, #DynAreaFlags_NotCacheable
+        BL      RemoveCacheabilityR0ByMinusR2
+        FastCDA_ProfEnd DoublyRemoveCacheability, r0, r2, lr
         LDR     r2, =ZeroPage
       [ FastCDA_Prof
-        LDREQ   lr,[r2,#FastCDA_Prof_MMUChanging]
+        TST     r6, #DynAreaFlags_NotCacheable
+        LDREQ   lr,[r2,#FastCDA_Prof_MMUChangingCached]
         LDRNE   lr,[r2,#FastCDA_Prof_MMUChangingUncached]
         MRC     p15,0,r0,c9,c13,0
         SUB     lr,lr,r0
-        STREQ   lr,[r2,#FastCDA_Prof_MMUChanging]
+        STREQ   lr,[r2,#FastCDA_Prof_MMUChangingCached]
         STRNE   lr,[r2,#FastCDA_Prof_MMUChangingUncached]
       ]
-        ADR     lr, %FT08
-        ARMop   MMU_Changing, EQ, tailcall, r2
-        ARMop   MMU_ChangingUncached, NE, tailcall, r2
-08
+        ARMop   MMU_ChangingUncached,,, r2
+        TST     r6, #DynAreaFlags_NotCacheable
+        ARMop   Cache_CleanInvalidateAll, EQ,, r2
       [ FastCDA_Prof
         MRC     p15,0,r0,c9,c13,0
         TST     r6, #DynAreaFlags_NotCacheable
-        LDREQ   lr,[r2,#FastCDA_Prof_MMUChanging]
+        LDREQ   lr,[r2,#FastCDA_Prof_MMUChangingCached]
         LDRNE   lr,[r2,#FastCDA_Prof_MMUChangingUncached]
         ADD     lr,lr,r0
-        STREQ   lr,[r2,#FastCDA_Prof_MMUChanging]
+        STREQ   lr,[r2,#FastCDA_Prof_MMUChangingCached]
         STRNE   lr,[r2,#FastCDA_Prof_MMUChangingUncached]
       ]
         Pull    "r0,r2,r6"
@@ -5954,16 +6013,12 @@ DoTheGrowPagesSpecified ROUT
         SUBS    r4, r4, r5                      ; one less page to move
         BNE     %BT09                           ; loop if more
         FastCDA_ProfEnd DoublyMovePages, r0, r9, lr
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
-        ; In order to guarantee that the result of a page table write is
-        ; visible, the ARMv6+ memory order model requires us to perform TLB
-        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
-        ; performed the write. Performing the maintenance beforehand (as we've
-        ; done traditionally) will work most of the time, but not always.
-        ; N.B. for the case of mapping in a page to an address which was
-        ; previously faulting (i.e. dest region) only DSB & ISB are required.
-        ; For this we rely on the DSB + ISB performed by the ARMop for the src
-        ; region
+      [ FastCDA_Bulk
+        ; Flush the shuffled pages from the TLB
+        ; Note we only flush the area containing pages which have been
+        ; moved/removed; for pages which have been mapped in the only
+        ; requirement is that (for VMSAv6) we issue a DSB+ISB, which we can
+        ; assume the MMU_ChangingUnachedEntries op will do for us.
         Push    "r3"
         SUB     r0, r0, r3
         MOV     r1, r3, LSR #12
@@ -6353,21 +6408,26 @@ ReplacePage_Done
         BEQ     %FT85
       [ FastCDA_Unnecessary
         ; We only need to clean the cache/TLB if the page is cacheable
-        ; For uncacheable pages, BangL2PT will flush the TLB for us just before the mapping is updated
         TST     r11, #DynAreaFlags_NotCacheable
         BNE     %FT85
       ]
-        Push    "r0, r4"
-        MOV     r0, r3
+        Push    "r0-r2, r4, r11"
+        LDR     r4, =ZeroPage
       [ FastCDA_Prof
         FastCDA_ProfStart ChangingEntry, r6, lr, r4
       ]
-        LDR     r4, =ZeroPage
-        ARMop   MMU_ChangingEntry,,,r4
+        ; Use BangCam to remove the cacheability on the needed page
+        LDR     r2, [r8, #0] ; Get page number of needed page
+        ORR     r11, r11, #1<<TempUncacheableShift ; Make temp uncache
+        BL      Call_CAM_Mapping ; This will flush the TLB for us, but won't flush the cache
+        ; So now we flush the cache manually
+        MOV     r0, r3
+        ADD     r1, r3, #4096
+        ARMop   Cache_CleanInvalidateRange,,,r4
       [ FastCDA_Prof
         FastCDA_ProfEnd ChangingEntry, r6, lr, r4
       ]
-        Pull    "r0, r4"
+        Pull    "r0-r2, r4, r11"
 85
 
         FastCDA_ProfStart MoveReplacement, r6, lr, r5
@@ -6494,18 +6554,16 @@ DoTheGrowNotSpecified ROUT
         MOVS    r4, r3                          ; amount to do
         BEQ     %FT20                           ; [none, so skip all this]
 
-      [ FastCDA_UpFront
+      [ FastCDA_Bulk
         ; Perform sledgehammer logic upfront
         Push    "r0,r2,r6"
         MOV     r0, r1
         MOV     r2, r3
-        BL      CheckCacheabilityR0ByMinusR2
+        BL      RemoveCacheabilityR0ByMinusR2
+        LDR     r2, =ZeroPage
+        ARMop   MMU_ChangingUncached,,, r2
         TST     r6, #DynAreaFlags_NotCacheable
-        LDR     r0, =ZeroPage
-        ADR     lr, %FT14
-        ARMop   MMU_Changing, EQ, tailcall, r0
-        ARMop   MMU_ChangingUncached, NE, tailcall, r0
-14
+        ARMop   Cache_CleanInvalidateAll, EQ,, r2
         Pull    "r0,r2,r6"
         ORR     r6, r6, #PageFlags_Unsafe
       ]
@@ -6520,16 +6578,12 @@ DoTheGrowNotSpecified ROUT
         ADD     r1, r1, r5                      ; advance dst ptr
         SUBS    r4, r4, r5                      ; one less page to move
         BNE     %BT15                           ; loop if more
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
-        ; In order to guarantee that the result of a page table write is
-        ; visible, the ARMv6+ memory order model requires us to perform TLB
-        ; maintenance (equivalent to the MMU_ChangingUncached ARMop) after we've
-        ; performed the write. Performing the maintenance beforehand (as we've
-        ; done traditionally) will work most of the time, but not always.
-        ; N.B. for the case of mapping in a page to an address which was
-        ; previously faulting (i.e. dest region) only DSB & ISB are required.
-        ; For this we rely on the DSB + ISB performed by the ARMop for the src
-        ; region
+      [ FastCDA_Bulk
+        ; Flush the shuffled pages from the TLB
+        ; Note we only flush the area containing pages which have been
+        ; moved/removed; for pages which have been mapped in the only
+        ; requirement is that (for VMSAv6) we issue a DSB+ISB, which we can
+        ; assume the MMU_ChangingUnachedEntries op will do for us.
         Push    "r3"
         SUB     r0, r0, r3
         MOV     r1, r3, LSR #12
@@ -6542,7 +6596,7 @@ DoTheGrowNotSpecified ROUT
         ADD     r9, r3, r2                      ; set up offset from 1st copy to 2nd copy (= new size)
 25
         ADD     r1, r1, r3                      ; r1 -> address of 1st extra page
-   [ FastCDA_UpFront
+   [ FastCDA_Bulk
         ORR     r6, r6, #PageFlags_Unsafe
    ]
         MOV     r4, #0                          ; amount done so far
@@ -6565,7 +6619,7 @@ DoTheGrowNotSpecified ROUT
         ADD     r4, r4, r5
         CMP     r4, r10                         ; have we done all of it?
         BNE     %BT30                           ; [no, so loop]
-      [ FastCDA_UpFront :LAND: (MEMM_Type = "VMSAv6")
+      [ FastCDA_Bulk :LAND: (MEMM_Type = "VMSAv6")
         ; DSB + ISB required to ensure effect of page table write is fully
         ; visible (after overwriting a faulting entry)
         myDSB   ,lr
