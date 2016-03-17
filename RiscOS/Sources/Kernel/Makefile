@@ -32,7 +32,6 @@ ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
-                  ${EXP_HDR}.SPIDevice \
                   ${EXP_HDR}.AHCIDevice \
                   ${EXP_HDR}.EtherDevice \
                   ${EXP_HDR}.HALDevice \
