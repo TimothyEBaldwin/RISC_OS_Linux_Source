@@ -247,8 +247,13 @@
         GET     Hdr:CPU.Arch
         GET     Hdr:OSRSI6
         GET     Hdr:VFPSupport
+        GET     Hdr:HighFSI
+        GET     Hdr:FileTypes
+        GET     Hdr:OSMisc
+        GET     Hdr:HALEntries
 
         GET     Hdr:Debugger
+        GET     hdr.ExcDump
 
         GET     VersionASM
 
@@ -381,6 +386,23 @@ DisReg_C        #       1               ; Prefix char for Co-pro registers
  [ UseCVFPNEON
 CRelocOffset    #       4               ; Relocation offset used by C code
  ]
+
+DumpBuffer      #       4
+DumpBufferLen   #       4
+ExceptionBusy   #       4               ; Tracks state of exception dump code to avoid re-entry:
+                                        ; 0 -> idle
+                                        ; 1 -> stage 1 busy
+                                        ; 2 -> stage 2 busy
+ROMDebugSymbols #       4
+ROMBaseAddr     #       4
+DumpOptions     #       4
+DumpOption_HAL_Raw        * 1
+DumpOption_HAL_Annotated  * 2
+DumpOption_File_Raw       * 4
+DumpOption_File_Annotated * 8
+DumpOption_Collect        * 16          ; Collect but don't report
+DumpOptions_Default       * 0           ; Default options to use on module init
+DumpOptionsStr  #       44              ; Big enough for longest string
 
 StringBuffer    #       160             ; Temp string buffer. Big enough to
                                         ; hold a disassembled instruction
@@ -620,6 +642,8 @@ Debug_Init Entry
         MOV     r3, #17
         MOV     r14, #0
         STR     r14, MessageFile_Open
+        STR     r14, ROMDebugSymbols
+        STR     r14, ROMBaseAddr
 20      STR     r14, [r1], #4
         SUBS    r3, r3, #1
         BNE     %BT20
@@ -709,6 +733,31 @@ Debug_Init Entry
 ;
 
 40
+        ; Find ROM
+        MOV     r0, #ModHandReason_LookupName
+        ADRL    r1, Where_UMod
+        SWI     XOS_Module
+        BVS     %FT42
+        MOV     r4, r3, LSR #20
+        MOV     r4, r4, LSL #20
+        STR     r4, ROMBaseAddr
+
+        ; Find ROM debug symbols
+        MOV     r0, #15
+        MOV     r1, #0
+41
+        SWI     XOS_ReadSysInfo
+        MOVVS   r1, #0
+        CMP     r1, #0
+        BEQ     %FT42
+        CMP     r2, #ExtROMFooter_DebugSymbols
+        CMPEQ   r3, #4
+        BNE     %BT41
+        LDW     r0, r1, r2, r3
+        ADD     r0, r0, r4
+        STR     r0, ROMDebugSymbols
+42
+
         ; SAR
         MOV     R3, #0
         STR     R3, DisOpts
@@ -718,6 +767,13 @@ Debug_Init Entry
 	[ standalone
 	BLVC    declareresourcefsfiles
 	]
+
+        MOV     R3, #DumpOptions_Default
+        STR     R3, DumpOptions
+        BLVC    ExcDump_CodeVar_Init
+      [ DumpOptions_Default <> 0
+        BLVC    ExcDump_Init
+      ]
 
         EXIT
 
@@ -775,6 +831,8 @@ serviceresourcefsstarting
 Debug_Die Entry
 
         LDR     wp, [r12]
+
+        BL      ExcDump_CodeVar_Shutdown
 
         BL      SwapAllBreakpoints      ; Be nice
 
@@ -2273,6 +2331,7 @@ BxTAB   DCB     "BX", 0
 BxjTAB  DCB     "BXJ",0
         ALIGN
 
+AdrTAB  DCB     "ADR",0
 BkptTAB DCB     "BKPT",0
 
         ALIGN
@@ -2570,7 +2629,6 @@ Mul16   ROUT
         B       InstructionEnd
 
 
-AdrTAB  DCB     "ADR",0
 MrsTAB  DCB     "MRS",0
 MsrTAB  DCB     "MSR",0
 BlxTAB  DCB     "BLX",0
@@ -6370,7 +6428,6 @@ Where_Code Entry "r6-r11"
         LDREQB  r0, SysIs32bit
         TEQEQ   r0, #0
         BICEQ   r7, r7, #ARM_CC_Mask
-        MOV     r8, #0                  ; No details
 
         BL      message_writes
         DCB     "M15", 0                ; "Address &"
@@ -6380,6 +6437,50 @@ Where_Code Entry "r6-r11"
         BLVC    DisplayHexWord
         SWIVC   XOS_WriteI+space
         EXIT    VS
+
+        BL      Where_Util
+        EXIT    VS
+
+        CMP     r7, #-1
+        BNE     %FT85
+        ; Say "is <somewhere vague>"
+        BL      message_write0
+        B       %FT88
+85
+        ; Say "is at offset &xx in <some area> 'detail'"
+        ; => r0 -> area name token
+        ;    r7 = offset
+        ;    r8 -> detail string
+        BL      message_writes
+        DCB     "M21", 0
+        ALIGN
+        MOVVC   r10, r7
+        BLVC    DisplayHexWord
+        SWIVC   OS_WriteI+space
+        BLVC    message_write0
+        TEQ     r8, #0                  ; NULL details? V preserved
+        BEQ     %FT88
+
+        SWIVC   OS_WriteI+space
+        SWIVC   OS_WriteI+"'"
+        MOVVC   r0, r8
+        SWIVC   OS_Write0
+        SWIVC   OS_WriteI+"'"
+88
+        SWIVC   OS_NewLine
+        EXIT
+
+
+; In:
+; r7 = address
+; Out:
+; r0 -> area name token
+; r7 = offset
+; r8 -> detail string
+; offset is -1 if unsure of location
+Where_Util      ROUT
+        Entry "r1-r6,r9-r11"
+        MOV     r8, #0                  ; No details
 
         ; Applications sometimes go pop
         MOV     r0, #-1
@@ -6467,42 +6568,43 @@ Where_Code Entry "r6-r11"
         ADRCS   r0, Where_NotMapped     ; C set, is not RAM
         ADRCC   r0, Where_Unknown       ; Somewhere, but not sure where
 80
-        ; Say "is <somewhere vague>"
-        BL      message_write0
-        B       %FT88
+        MOV     r7, #-1
+        MOV     r8, #0
 85
-        ; Say "is at offset &xx in <some area> 'detail'"
-        ; => r0 -> area name token
-        ;    r7 = offset
-        ;    r8 -> detail string
-        BL      message_writes
-        DCB     "M21", 0
-        ALIGN
-        MOVVC   r10, r7
-        BLVC    DisplayHexWord
-        SWIVC   OS_WriteI+space
-        BLVC    message_write0
-        TEQ     r8, #0                  ; NULL details? V preserved
-        BEQ     %FT88
-
-        SWIVC   OS_WriteI+space
-        SWIVC   OS_WriteI+"'"
-        MOVVC   r0, r8
-        SWIVC   OS_Write0
-        SWIVC   OS_WriteI+"'"
-88
-        SWIVC   OS_NewLine
         EXIT
 
-Where_Unknown   DCB     "M28", 0
-Where_NotMapped DCB     "M30", 0
-Where_ROM       DCB     "M34", 0
-Where_Module    DCB     "M47", 0
-Where_AppSlot   DCB     "M88", 0
-Where_DynArea   DCB     "M89", 0
-Where_Kernel    DCB     "M95", 0
-Where_SysWksp   DCB     "M96", 0
+Where_Unknown   DCB     "M28", 0 ; vague
+Where_NotMapped DCB     "M30", 0 ; vague
+Where_ROM       DCB     "M34", 0 ; offset
+Where_Module    DCB     "M47", 0 ; offset+detail
+Where_AppSlot   DCB     "M88", 0 ; offset
+Where_DynArea   DCB     "M89", 0 ; offset+detail
+Where_Kernel    DCB     "M95", 0 ; offset
+Where_SysWksp   DCB     "M96", 0 ; vague
         ALIGN
+
+; In:
+; r0 = address
+; r1 -> result buffer (area name, offset, detail string)
+        EXPORT  Where_Util_FromC
+Where_Util_FromC ROUT
+        Entry   "r1,r7,r8,r10"
+        SUB     r12, sl, #:INDEX:CRelocOffset
+        MOV     r7, r0
+        BL      Where_Util
+        ADDVS   r0, r0, #4
+        MOVVS   r7, #-1
+        MOVVS   r8, #0
+        FRAMLDR r1
+        BVS     %FT50
+        MOVS    r10, r0
+        BEQ     %FT50
+        BL      lookup_r10
+        ADDVS   r10, r0, #4
+        MOV     r0, r10
+50
+        STMIA   r1, {r0,r7,r8}
+        EXIT
 
 ; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
@@ -6534,5 +6636,6 @@ declareresourcefsfiles
       ]
         GET     Thumb.s
         GET     CodeVar.s
+        GET     ExceptionDump.s
 
         END

@@ -31,7 +31,7 @@ HELPSRC       = HelpSrc
 TOKENSOURCE   = TokHelpSrc
 TOKHELPSRC    = ${TOKENSOURCE}
 ASMHDRS       = Debugger
-OBJS          = Debugger util dis2_vfp support
+OBJS          = Debugger util dis2_vfp support exc
 HDRS          =
 CMHGFILE      =
 
@@ -116,9 +116,15 @@ dis2_vfp.o: dis2_vfp.c
 dis2_vfp.oz: dis2_vfp.c
 	${CC} ${CFLAGS} ${C_MODULE} -o $@ dis2_vfp.c
 
+excdump.h: hdr.ExcDump
+	${HDR2H} hdr.ExcDump $@
+
+exc.c: excdump.h
+
 clean::
 	${RM} c.dis2_vfp
 	${RM} c.dis2_arm
+	${RM} h.excdump
 	${RM} ${TOKENSOURCE}
 
 # Stuff from AAsmModule that's missing from CModule
