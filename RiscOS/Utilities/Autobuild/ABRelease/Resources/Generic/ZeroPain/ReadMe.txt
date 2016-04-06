@@ -49,12 +49,11 @@ does not use zero page relocation. The module will refuse to start on such a
 machine, and the provided loader in the skeleton !Boot will swallow the error
 so that it does not affect the startup of your machine.
 
-Also note that the module contains a built-in kill switch - it will only run on
-ROMs built in 2015. This ensures that, as the RISC OS 5.24 release draws near,
-we have a period of testing where the module is inactive. This will help to
-make sure that as many bugs as possible are caught prior to the release. If
-necessary, the testing period may be extended and a new version of ZeroPain
-released to cover it.
+Also note that the module contains a built-in kill switch - it will refuse to
+run on RISC OS 5.24 or later. The module is intended to be a temporary aid to
+be used while we transition the OS to having zero page relocation enabled by
+default - it is not intended to be a long-term compatibility solution for
+running old or unmaintained software.
 
 
 Use
@@ -80,49 +79,80 @@ Understanding log entries
 
 Log entries produced by ZeroPain look like the following:
 
-  Time: Sun Jun 28 19:23:18 2015
-  Location: Application space
-  Current Wimp task: Unknown
-  Last app to start: amu -E standalone
+  Time: Wed Apr  6 21:35:14 2016
+  Location: Offset 00011fe0 in module SharedCLibrary
+  Current Wimp task: TaskWindow
+  Last app to start: crashy 1 3
   
-  R0  = 00013e20 R1  = 00013e28 R2  = 00000000 R3  = 0001818c
-  R4  = 00013e20 R5  = 0001e0e6 R6  = 0003ef60 R7  = 00000000
-  R8  = 0003f02c R9  = 0003efbc R10 = 0001540c R11 = 000160bc
-  R12 = 000160c0 R13 = 000160b0 R14 = 0000d310 R15 = 0000cec0
-  DFAR = 00000008  Mode USR32  Flags nzCv if   PSR = 20000010
+  R0  = 00000001 R1  = 00000001 R2  = 00000000 R3  = ffffffff
+  R4  = 00000000 R5  = 00000001 R6  = 000097b0 R7  = 00000000
+  R8  = 00009a14 R9  = 00009c44 R10 = 0000a4fc R11 = 0000b1ac
+  R12 = 0000b1b0 R13 = 0000b18c R14 = fc18256c R15 = fc1825bc
+  DFAR = 00000000  Mode USR32  Flags Nzcv if   PSR = 80000110
   
-  0000ce78 : e51f183c : LDR     R1,&0000C644
-  0000ce7c : e590200c : LDR     R2,[R0,#12]
-  0000ce80 : e5b13008 : LDR     R3,[R1,#8]!
-  0000ce84 : e3520000 : CMP     R2,#0
-  0000ce88 : 1a000007 : BNE     &0000CEAC
-  0000ce8c : e5932008 : LDR     R2,[R3,#8]
-  0000ce90 : e580200c : STR     R2,[R0,#12]
-  0000ce94 : e5922008 : LDR     R2,[R2,#8]
-  0000ce98 : e5a32018 : STR     R2,[R3,#24]!
-  0000ce9c : e5b0200c : LDR     R2,[R0,#12]!
-  0000cea0 : e3520000 : CMP     R2,#0
-  0000cea4 : 191ba800 : LDMNEDB R11,{R11,R13,PC}
-  0000cea8 : ea000008 : B       &0000CED0
-  0000ceac : e5922000 : LDR     R2,[R2,#0]
-  0000ceb0 : e5a32008 : STR     R2,[R3,#8]!
-  0000ceb4 : e580200c : STR     R2,[R0,#12]
-  0000ceb8 * e5b21008 * LDR     R1,[R2,#8]!
-  0000cebc : e5902008 : LDR     R2,[R0,#8]
-  0000cec0 : e5a21018 : STR     R1,[R2,#24]!
-  0000cec4 : e590000c : LDR     R0,[R0,#12]
-  0000cec8 : e3500000 : CMP     R0,#0
-  0000cecc : 191ba800 : LDMNEDB R11,{R11,R13,PC}
-  0000ced0 : ebffffcf : BL      &0000CE14
-  0000ced4 : eaffffe1 : B       &0000CE60
-  0000ced8 : e1a0c00d : MOV     R12,R13
-  0000cedc : e92dd800 : STMDB   R13!,{R11,R12,R14,PC}
-  0000cee0 : e24cb004 : SUB     R11,R12,#4
-  0000cee4 : e15d000a : CMP     R13,R10
-  0000cee8 : 4b001989 : BLMI    &00013514
-  0000ceec : e51f18b0 : LDR     R1,&0000C644
-  0000cef0 : e3500001 : CMP     R0,#1
-  0000cef4 : 03a00004 : MOVEQ   R0,#4
+  fc182574 : 02012b01 : ANDEQ   R2,R1,#&0400       ; =1024
+  fc182578 : 03520000 : CMPEQ   R2,#0
+  fc18257c : 0a000015 : BEQ     &FC1825D8
+  fc182580 : e3a07000 : MOV     R7,#0
+  fc182584 : e3550000 : CMP     R5,#0
+  fc182588 : 9a00009f : BLS     &FC18280C
+  fc18258c : e5962008 : LDR     R2,[R6,#8]
+  fc182590 : e2523001 : SUBS    R3,R2,#1
+  fc182594 : e5863008 : STR     R3,[R6,#8]
+  fc182598 : 4a000005 : BMI     &FC1825B4
+  fc18259c : e4d41001 : LDRB    R1,[R4],#1
+  fc1825a0 : e5963000 : LDR     R3,[R6,#0]
+  fc1825a4 : e1a00001 : MOV     R0,R1
+  fc1825a8 : e4c31001 : STRB    R1,[R3],#1
+  fc1825ac : e5863000 : STR     R3,[R6,#0]
+  fc1825b0 : ea000002 : B       &FC1825C0
+  fc1825b4 * e4d40001 * LDRB    R0,[R4],#1
+  fc1825b8 : e1a01006 : MOV     R1,R6
+  fc1825bc : ebfffbad : BL      &FC181478
+  fc1825c0 : e3700001 : CMN     R0,#1
+  fc1825c4 : 0a00008b : BEQ     &FC1827F8
+  fc1825c8 : e2877001 : ADD     R7,R7,#1
+  fc1825cc : e1570005 : CMP     R7,R5
+  fc1825d0 : 3affffed : BCC     &FC18258C
+  fc1825d4 : ea00008c : B       &FC18280C
+  fc1825d8 : e3550000 : CMP     R5,#0
+  fc1825dc : 9a00008a : BLS     &FC18280C
+  fc1825e0 : e5963008 : LDR     R3,[R6,#8]
+  fc1825e4 : e3a07000 : MOV     R7,#0
+  fc1825e8 : e3530000 : CMP     R3,#0
+  fc1825ec : aa000011 : BGE     &FC182638
+  fc1825f0 : e2533001 : SUBS    R3,R3,#1
+  
+  R15 = fc1825bc = SharedCLibrary +11fe8 = _write +78
+  R14_usr = fc18256c = SharedCLibrary +11f98 = _write +28
+            Function call to fc173848 = SharedCLibrary +3274 = _sys_istty +0
+  
+  USR stack:
+  0000b18c : 00000015 : - R4
+  0000b190 : 00000001 : | R5
+  0000b194 : 00009460 : | R6
+  0000b198 : 00000000 : | R7
+  0000b19c : 00009a14 : | R8
+  0000b1a0 : 0000b1c0 : | R11
+  0000b1a4 : 0000b1b0 : | R12
+  0000b1a8 : fc182844 : | R14: fc182844
+           :          : | = SharedCLibrary +12270
+           :          : | = fwrite +30
+  0000b1ac : fc182550 : | APCS function: fc182548
+           :          : | = SharedCLibrary +11f74
+           :          : | = _write +4
+  0000b1b0 : 0000b7a0 : | R5
+  0000b1b4 : 0000b22c : | R11
+  0000b1b8 : 0000b1c4 : | R12
+  0000b1bc : 000085f4 : | R14: 000085f4
+           :          : | = +5f4 in application memory
+           :          : | = recurse3 +ec
+  0000b1c0 : fc18282c : | APCS function: fc182824
+           :          : | = SharedCLibrary +12250
+           :          : | = fwrite +10
+  0000b1c4 : 718021cb : | 
+  0000b1c8 : 5f947b49 : | 
+  0000b1cc : 7da0d868 : | 
 
 The timestamp is for your convenience, to help you identify how old the log
 entry is.
@@ -162,6 +192,32 @@ will happen if the instruction which caused the abort is close to a page
 boundary (the abort handler errs on the side of caution and avoids reading
 across page boundaries). However there should still be enough information to
 allow the problem code to be identified.
+
+
+Annotated stack dumps
+=====================
+
+Some ZeroPain log entries will include an annotated stack dump after the
+disassembly. This stack dump can be critical in helping to identify the real
+cause of a null pointer dereference, especially if the 'Location' in the
+summary is listed as being the Shared C Library. So when reporting a zero page
+issue on the ROOL forums or to a developer please try to include any log
+entries which contain stack dumps. However note that there is a chance that the
+stack dump may include sensitive information such as usernames and passwords,
+so you may want to exercise caution when sharing the stack dumps if you have
+been using your computer for activities such as online banking.
+
+Note that the reason that only some entries contain a stack dump is because
+there is an increased processing cost involved in generating the dump, and so
+ZeroPain places some limitations on the situations in which a dump will be
+produced. Also because the stack dumps may be very large, ZeroPain will only
+allow one stack dump to be buffered in memory at a time, compared to the 128
+summary entries that can be buffered at once.
+
+Developers or users who wish to understand more about the stack dump format and
+the different annotations should consult this reference on the ROOL wiki:
+
+https://www.riscosopen.org/wiki/documentation/show/Debugger%20Annotated%20Exception%20Dumps
 
 
 Zero page workspace emulated by ZeroPain
