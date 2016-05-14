@@ -16,7 +16,7 @@
 #
 
 COMPONENT     = ScrModes
-OBJS          = ScrModes
+OBJS          = ScrModes tables
 CMHGFILE      = ScrModesv
 HDRS          =
 ASMHDRS       = ScrModes
