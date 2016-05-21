@@ -14,52 +14,26 @@
 #
 # Makefile for SprExtend
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name    Description
-# ----       ----    -----------
-# 25-May-94  AMcC    Created.
-# 12-Aug-94  AMcC    Updated for modified SpriteExtend (JPEG support)
-# 29-Oct-94  AMcC    Exports hdr.SprExtend (SWI defs)
-#                    Data file now called CFSIjpeg (was CFSI-jpeg)
-#                    - exported to ChangeFSI at install time
-# 01-Feb-95  GPS     Now compiles with cc505
-# 13-Feb-95  GPS     CFSIjpeg now compiles with cc505
-# 15-May-01  SNB     Re-engineered to use objasm throughout, not aasm
-# 25-Sep-10  RPS     Now objasm is used, no need to postprocess C code
-#                    as assembler with 'sed', just use the linker
-#
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
-
-# To switch between making debugging and non-debugging versions of SprExtend:
-#   change the #define of DEBUG in h.commondefs
-#   change the SETL of 'debug' in sources.SprExtend.
-CDEFINES = -DRISCOS -DASMHUFF -DASMIDCT -DASMCOLOR
-CINCLUDES = -IC:
-
-#
-# Generic options:
-#
-include StdTools
-include StdRules
-include ModuleLibs
-
-#
-# Program specific options:
-#
 COMPONENT = SpriteExtend
 TARGET   ?= SprExtend
-CFLAGS   += ${C_NO_STKCHK}
 OBJS      = sources.${TARGET}
 ROM_TARGET= rm.${TARGET}
 RAM_TARGET= rm.SprExtendSA
 ROM_OBJECT= ${TARGET}.o
 RAM_OBJECT= ${TARGET}SA.o
+EXP_HDR   = <export$dir>
+
+include StdTools
+include StdRules
+include ModuleLibs
+
+# To switch between making debugging and non-debugging versions of SprExtend:
+#   change the #define of DEBUG in commondefs.h
+#   change the SETL of 'debug' in sources.SprExtend
+CDEFINES  = -DRISCOS -DAVOID_TABLES -DNO_ZERO_ROW_TEST -DLAZYDECODE
+CINCLUDES = -IC:
+CFLAGS   += ${C_NO_STKCHK}
 
 SFILES =\
  jhdr.s\
@@ -130,14 +104,15 @@ clean:
         ${RM} ${GENPALETTE}
         ${RM} ${GENYUVTABS}
         ${RM} ${GENJHDR}
-        ${XWIPE} o.* ${WFLAGS}
-        ${XWIPE} oh.* ${WFLAGS}
+        ${XWIPE} o ${WFLAGS}
+        ${XWIPE} oh ${WFLAGS}
+        ${XWIPE} od ${WFLAGS}
         ${XWIPE} s.* ${WFLAGS}
         @${ECHO} ${COMPONENT}: cleaned
 
 resources:
         ${MKDIR} ${RESDIR}.${TARGET}
-        TokenCheck LocalRes:Messages
+        ${TOKENCHECK} LocalRes:Messages
         ${CP} LocalRes:Messages  ${RESDIR}.${TARGET}.Messages  ${CPFLAGS}
         @${ECHO} ${COMPONENT}: resource files copied
 
@@ -166,14 +141,14 @@ ${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
 # Static dependencies:
 #
 ${ROM_OBJECT}: ${OBJS} ${SFILES}
-        do mkdir -p o
+        ${MKDIR} o
         ${AS} ${ASFLAGS} -o $@ ${OBJS}
 
 ${ROM_TARGET}: ${ROM_OBJECT} ${IJGFILES} asmcore.o
         ${LD} -o $@ -rmf ${ROM_OBJECT} ${IJGFILES} asmcore.o
 
 ${RAM_OBJECT}: ${OBJS} ${SFILES}
-        do mkdir -p o
+        ${MKDIR} o
         ${AS} ${ASFLAGS} -PD "standalone SETL {TRUE}" -o $@ ${OBJS}
 
 ${RAM_TARGET}: ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o 
@@ -181,13 +156,11 @@ ${RAM_TARGET}: ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o
         ${MODSQZ} $@
 
 resmsg.o: LocalRes:Messages
-        TokenCheck LocalRes:Messages
+        ${TOKENCHECK} LocalRes:Messages
+        ${MKDIR} o
         ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
 
-rojpeg.o:
-        ${CC} ${CFLAGS} -DSOURCE_IS_rojpeg $*.c
-
 asmcore.o:
-        ${CC} ${CFLAGS} -DSOURCE_IS_asmcore $*.c
+        ${CC} ${CFLAGS} $*.c
 
 # Dynamic dependencies:
