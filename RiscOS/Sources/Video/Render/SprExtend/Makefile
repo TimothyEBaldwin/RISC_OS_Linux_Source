@@ -146,7 +146,7 @@ ${GENPALETTE}: genpalette.c
 ${GENYUVTABS}: genyuvtabs.c
         ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
-${GENJHDR}: genjhdr.c jinclude.h jconfig.h jpegdata.h
+${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
         ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
