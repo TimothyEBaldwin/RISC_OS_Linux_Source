@@ -74,15 +74,23 @@ IJGFILES =\
  jdmaster.o\
  jdmainct.o\
  jdcolor.o\
- jdatasrc.o\
  jdapistd.o\
  jdapimin.o\
  jdpostct.o\
  jddctmgr.o\
  jdcoefct.o\
  jdsample.o\
- jidctfst.o\
+ jdtrans.o\
  jcomapi.o\
+ jcapimin.o\
+ jcmaster.o\
+ jchuff.o\
+ jctrans.o\
+ jcparam.o\
+ jcmarker.o\
+ jdatasrc.o\
+ jdatadst.o\
+ jidctfst.o\
  jaricom.o\
  jutils.o
  
@@ -176,7 +184,10 @@ resmsg.o: LocalRes:Messages
         TokenCheck LocalRes:Messages
         ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
 
+rojpeg.o:
+        ${CC} ${CFLAGS} -DSOURCE_IS_rojpeg $*.c
+
 asmcore.o:
-        ${CC} ${CFLAGS} $*.c
+        ${CC} ${CFLAGS} -DSOURCE_IS_asmcore $*.c
 
 # Dynamic dependencies:
