@@ -46,17 +46,15 @@ CINCLUDES = -IC:
 # Generic options:
 #
 include StdTools
-
-#
-# Libraries
-#
-CLIB = CLIB:o.stubs
+include StdRules
+include ModuleLibs
 
 #
 # Program specific options:
 #
 COMPONENT = SpriteExtend
 TARGET   ?= SprExtend
+CFLAGS   += ${C_NO_STKCHK}
 OBJS      = sources.${TARGET}
 ROM_TARGET= rm.${TARGET}
 RAM_TARGET= rm.SprExtendSA
@@ -68,6 +66,26 @@ SFILES =\
  stdpalette.s\
  yuvtabs.s
 
+IJGFILES =\
+ jdmarker.o\
+ jdhuff.o\
+ jdarith.o\
+ jdinput.o\
+ jdmaster.o\
+ jdmainct.o\
+ jdcolor.o\
+ jdatasrc.o\
+ jdapistd.o\
+ jdapimin.o\
+ jdpostct.o\
+ jddctmgr.o\
+ jdcoefct.o\
+ jdsample.o\
+ jidctfst.o\
+ jcomapi.o\
+ jaricom.o\
+ jutils.o
+ 
 # Extra utilites (generate assembler code)
 GENJHDR    = utils.genjhdr
 GENPALETTE = utils.genpalette
@@ -85,30 +103,30 @@ install_CFSIjpeg: ${CFSI-JPEG}
         ${MKDIR} ${INSTDIR}
         ${CP} ${CFSI-JPEG} ${INSTDIR}.CFSIjpeg ${CPFLAGS}
         Access ${INSTDIR}.CFSIjpeg lr/r
-        @echo ${COMPONENT}: CFSIjpeg file installed
+        @${ECHO} ${COMPONENT}: CFSIjpeg file installed
 
 install_SprExtend: ${RAM_TARGET}
         ${MKDIR} ${INSTDIR}
         ${CP} ${RAM_TARGET} ${INSTDIR}.SprExtend ${CPFLAGS}
-        @echo ${COMPONENT}: ram module installed
+        @${ECHO} ${COMPONENT}: ram module installed
 
 install_rom: ${ROM_TARGET}
         ${MKDIR} ${INSTDIR}
         ${CP} ${ROM_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
-        @echo ${COMPONENT}: rom module installed
+        @${ECHO} ${COMPONENT}: rom module installed
 
 cfsi-jpeg: ${CFSI-JPEG}
-        @echo ${COMPONENT}: CFSIjpeg file generated
+        @${ECHO} ${COMPONENT}: CFSIjpeg file generated
 
 rom: ${ROM_TARGET}
-        @echo ${COMPONENT}: rom module built
+        @${ECHO} ${COMPONENT}: rom module built
 
 standalone: ${RAM_TARGET}
-        @echo ${COMPONENT}: ram module built
+        @${ECHO} ${COMPONENT}: ram module built
 
 export: hdr.SprExtend
         ${CP} hdr.SprExtend ${EXP_HDR}.SprExtend ${CPFLAGS}
-        @echo ${COMPONENT}: export complete
+        @${ECHO} ${COMPONENT}: export complete
 
 clean:
         ${RM} ${ROM_TARGET}
@@ -120,13 +138,13 @@ clean:
         ${XWIPE} o.* ${WFLAGS}
         ${XWIPE} oh.* ${WFLAGS}
         ${XWIPE} s.* ${WFLAGS}
-        @echo ${COMPONENT}: cleaned
+        @${ECHO} ${COMPONENT}: cleaned
 
 resources:
         ${MKDIR} ${RESDIR}.${TARGET}
         TokenCheck LocalRes:Messages
         ${CP} LocalRes:Messages  ${RESDIR}.${TARGET}.Messages  ${CPFLAGS}
-        @echo ${COMPONENT}: resource files copied
+        @${ECHO} ${COMPONENT}: resource files copied
 
 #
 # Generate the SFILES:
@@ -163,15 +181,15 @@ ${ROM_OBJECT}: ${OBJS} ${SFILES}
         do mkdir -p o
         ${AS} ${ASFLAGS} -o $@ ${OBJS}
 
-${ROM_TARGET}: ${ROM_OBJECT} asmcore.o
-        ${LD} -o $@ -rmf ${ROM_OBJECT} asmcore.o
+${ROM_TARGET}: ${ROM_OBJECT} ${IJGFILES} asmcore.o
+        ${LD} -o $@ -rmf ${ROM_OBJECT} ${IJGFILES} asmcore.o
 
 ${RAM_OBJECT}: ${OBJS} ${SFILES}
         do mkdir -p o
         ${AS} ${ASFLAGS} -PD "standalone SETL {TRUE}" -o $@ ${OBJS}
 
-${RAM_TARGET}: ${RAM_OBJECT} resmsg.o asmcore.o
-        ${LD} -o $@ -rmf ${RAM_OBJECT} resmsg.o asmcore.o
+${RAM_TARGET}: ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o 
+        ${LD} -o $@ -rmf ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o 
         ${MODSQZ} $@
 
 resmsg.o: LocalRes:Messages
@@ -179,9 +197,9 @@ resmsg.o: LocalRes:Messages
         ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
 
 rojpeg.o:
-        ${CC} ${CFLAGS} ${C_NO_STKCHK} -DEMBED -DSOURCE_IS_rojpeg $*.c
+        ${CC} ${CFLAGS} -DSOURCE_IS_rojpeg $*.c
 
 asmcore.o:
-        ${CC} ${CFLAGS} ${C_NO_STKCHK} -DEMBED -DSOURCE_IS_putscaled $*.c
+        ${CC} ${CFLAGS} -DSOURCE_IS_asmcore $*.c
 
 # Dynamic dependencies:
