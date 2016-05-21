@@ -91,19 +91,10 @@ GENJHDR    = utils.genjhdr
 GENPALETTE = utils.genpalette
 GENYUVTABS = utils.genyuvtabs
 
-# Needed for ChangeFSI
-CFSI-JPEG  = data.CFSIjpeg
-
 #
 # Targets:
 #
 install: install_${TARGET}; @
-
-install_CFSIjpeg: ${CFSI-JPEG}
-        ${MKDIR} ${INSTDIR}
-        ${CP} ${CFSI-JPEG} ${INSTDIR}.CFSIjpeg ${CPFLAGS}
-        Access ${INSTDIR}.CFSIjpeg lr/r
-        @${ECHO} ${COMPONENT}: CFSIjpeg file installed
 
 install_SprExtend: ${RAM_TARGET}
         ${MKDIR} ${INSTDIR}
@@ -114,9 +105,6 @@ install_rom: ${ROM_TARGET}
         ${MKDIR} ${INSTDIR}
         ${CP} ${ROM_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
         @${ECHO} ${COMPONENT}: rom module installed
-
-cfsi-jpeg: ${CFSI-JPEG}
-        @${ECHO} ${COMPONENT}: CFSIjpeg file generated
 
 rom: ${ROM_TARGET}
         @${ECHO} ${COMPONENT}: rom module built
@@ -131,7 +119,6 @@ export: hdr.SprExtend
 clean:
         ${RM} ${ROM_TARGET}
         ${RM} ${RAM_TARGET}
-        ${RM} ${CFSI-JPEG}
         ${RM} ${GENPALETTE}
         ${RM} ${GENYUVTABS}
         ${RM} ${GENJHDR}
@@ -168,13 +155,6 @@ ${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
         ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
-# For ChangeFSI:
-#
-${CFSI-JPEG}: Sources.CFSI-JPEG jhdr.s stdpalette.s rojpeg.o
-        ${AS} ${ASFLAGS} -o cfsi-jpeg.o Sources.CFSI-JPEG
-        ${LD} -bin -o $@ cfsi-jpeg.o rojpeg.o
-
-#
 # Static dependencies:
 #
 ${ROM_OBJECT}: ${OBJS} ${SFILES}
@@ -196,10 +176,7 @@ resmsg.o: LocalRes:Messages
         TokenCheck LocalRes:Messages
         ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
 
-rojpeg.o:
-        ${CC} ${CFLAGS} -DSOURCE_IS_rojpeg $*.c
-
 asmcore.o:
-        ${CC} ${CFLAGS} -DSOURCE_IS_asmcore $*.c
+        ${CC} ${CFLAGS} $*.c
 
 # Dynamic dependencies:
