@@ -153,9 +153,15 @@ driver_handler_code ROUT
      BHS       notsupported
 
      ADR       r10, jump_table_start
+   [ NoARMv4
      LDR       r14, [ r10, SWIN, LSL #1 ]
      MOV       r14, r14, LSL #16
      ADD       pc, pc, r14, LSR #16
+   |
+     ADD       r14, r10, SWIN, LSL #1
+     LDRH      r14, [r14]
+     ADD       pc, pc, r14
+   ]
 
 jump_table_start
  DCW ReadData        - jump_table_start - 4      ; 0                 a
@@ -190,12 +196,10 @@ jump_table_start
  DCW notsupported    - jump_table_start - 4      ; 29
  DCW Identify        - jump_table_start - 4      ; 30
  DCW ReadAudio       - jump_table_start - 4      ; 31
- [ Module_Version >= 105
  DCW ReadUserData    - jump_table_start - 4      ; 32
  DCW notsupported    - jump_table_start - 4      ; 33
  DCW GetAudioParms   - jump_table_start - 4      ; 34
  DCW SetAudioParms   - jump_table_start - 4      ; 35
- ]
  [ HAL
  DCW SCSIUserOp      - jump_table_start - 4      ; 36
  ]
@@ -314,11 +318,15 @@ ReadData ROUT
 ; and then adds 16 to it - cpartington, by observation
 
      LDR           r8, buffer + 4 + 4
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
      AND           r6, r5, r8, ROR #8
      AND           r14, r5, r8
      ORR           r6, r6, r14, ROR #24
+ |
+     REV           r6, r8
+ ]
 
 ; r6 = reversed address
 ; r1 = 16
@@ -360,6 +368,7 @@ RD_HowManyBlocks
 ; Set up the CDB
 ; Swap the byte order of the start LBA and number of blocks
 
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
 
@@ -372,6 +381,11 @@ RD_HowManyBlocks
      AND           r1, r5, r2, ROR #8
      AND           r14, r5, r2
      ORR           r5, r1, r14, ROR #24
+ |
+     MOV           r2, r2, LSL #8
+     REV           r6, r1
+     REV           r5, r2
+ ]
 
 ; r0 = mode we think this is
 ; r3 -> data buffer
@@ -394,24 +408,32 @@ RD_HowManyBlocks
 ; do with two calls to READ CD. This shouldn't have a performance impact
 ; because, once CDFS sees that it's a mode 2 form 1 disc, it changes mode to
 ; internal mode 3 anyway.
+; However, other drives are very literal about READ CD and can only read
+; data from CDs and not DVDs with this command, so having worked round the
+; above problem with Panasonic drives we may end up rejecting perfectly good
+; DVDs instead, as a last attempt use READ(12) to read the data. Note that
+; READ(10) only has a 2 byte block count, which would be retrograde having
+; allowed 3 byte block counts for READ CD.
 
 ; First: trap access to mode 0 discs and treat them as 1/3 i.e. the same as
 ; READ(10) would do. If the disc is not mode 0, the read will succeed.
-; MEW tells me that CDFS never calls ReadData when mode is 0 but this is
+; MEW tells me that CDFS never calls ReadData when mode is 0 but this
 ; appears not to be the case e.g. when swapping discs
 
         TEQS    r0,#0
         ADDEQ   r0,r0,#1
 
-; set bit 31 to indicate that retry in different mode has not been done
+; use bits 31 & 30 to indicate which retry it is
+; retry 2: READ CD mode 1, else
+; retry 1: READ CD mode 2 form 1, else
+; retry 0: READ(12), else error
 
         ORR     r0,r0,#1<<31
         Push    "r0,r8"
 10
 ; r0 = expected mode 1,2,3
-; r0 bit 31 => have not yet tried alternative mode
 
-        TSTS    r0,#1                           ; mode 1 or 2 form 1?
+        TSTS    r0,#1                           ; mode 1 or mode 2 form 1?
         ORRNE   r14,r5,#2_00010000 << 24        ; flags = just user data
 
 ; internal mode 1 => expected sector type 2_010 = 2
@@ -425,7 +447,12 @@ RD_HowManyBlocks
         ORREQ   r14,r5,#2_01111000 << 24        ; flags = all headers/user/EDC/ECC
         MOVEQ   r2,#2_000 << (24 + 2)           ; any type of sector
 
-        ORR     r2,r2,#ATAPI__READ_CD << 16     ; opcode
+        MOV     r1,r0,LSR #30                   ; retry
+        CMP     r1,#1
+        ORRCS   r2,r2,#ATAPI__READ_CD << 16     ; opcode
+        ORRCC   r2,r2,#ATAPI__READ_DATA << 16
+        BICCC   r2,r2,#2_1111 << (24 + 1)       ; DPO=0 FUA=0
+        MOVCC   r14,r14,LSL #8                  ; knock out flags, make transfer length MSB=0
 
 ; r2 = opcode + expected sector type
 ; r3 -> data buffer
@@ -503,24 +530,17 @@ RD_HowManyBlocks
         Pull    "r8",NE                 ; ...restore r8
         BNE     error_handler           ; ...and branch
 
-; illegal request error
-; if mode 1 and not tried mode 3, try mode 3
-; if mode 3 and not tried mode 1, try mode 1
-; if tried both, give up
+; illegal request error, try again
 
         LDR     r0,[sp]                 ; get stacked mode
-
-; stacked r0 = mode just tried
-; stacked r0 bit 31 => have not yet tried alternative mode
-
-        TSTS    r0,#1                   ; mode 1 or 3?
-        TSTNES  r0,#1<<31               ; yes, tried other yet?
-        EORNE   r0,r0,#(1<<31) + (1<<1) ; if not, try other mode
-        STRNE   r0,[sp]                 ; overwrite stacked r0
-        BNE     %B10                    ; r0 = mode
+        TST     r0,#1                   ; internal mode 1 or 3?
+        BEQ     %FT30
+        SUBS    r0,r0,#1<<30            ; yes, tried other yet?
+        STRPL   r0,[sp]                 ; try again
+        BPL     %B10                    ; r0 = mode
 
 ; illegal request error and done all modes
-
+30
         Pull    "r0,r8"
 
   [ cdebug
@@ -572,12 +592,16 @@ SeekTo ROUT
 
 ; Swap the byte order of the start LBA and number of blocks
 
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
 
      AND           r6, r5, r1, ROR #8
      AND           r14, r5, r1
      ORR           r1, r6, r14, ROR #24
+ |
+     REV           r1, r1
+ ]
 
  [ cdebug2
         CDebug_StrReg8  "=",r1,cc
@@ -725,23 +749,6 @@ GetParameters ROUT
      MACRO__EXIT_DRIVER_OK
      ]
 
-
-
-
-;     [             Module_Version >= 108
-
-
-;; r6 -> parameter block
-;     MOV           r6, r0
-;     MOV           r3, # 5         ; inactivity timer
-;     MOV           r4, # 3         ; retry count
-;     MOV           r8, # 0         ; speed setting
-
-;     | ; old way
-
-
-
-
 ; r6 -> parameter block
      MOV           r6, r0
 
@@ -779,11 +786,8 @@ GetParameters ROUT
      ADR           r2, buffer
      BL            GP_FindModePage
 
-     [             Module_Version >= 108
      TEQ           r2, # 0
      BEQ           GP_CouldntFindPage
-     ]
-
 
      LDRB          r3, [ r2, # 3 ]
      AND           r3, r3, # 2_1111
@@ -795,10 +799,8 @@ GetParameters ROUT
      ADR           r2, buffer
      BL            GP_FindModePage
 
-     [             Module_Version >= 108
      TEQ           r2, # 0
      BEQ           GP_CouldntFindPage
-     ]
 
      LDRB          r4, [ r2, # 3 ]
 
@@ -809,20 +811,14 @@ GetParameters ROUT
      ADR           r2, buffer
      BL            GP_FindModePage
 
-     [             Module_Version >= 108
      TEQ           r2, # 0
      BEQ           GP_CouldntFindPage
-     ]
 
      LDRB          r8, [ r2, # 15 ]
      LDRB          r14, [ r2, # 14 ]
      ORR           r14, r8, r14, LSL # 8
 
-     DivRem        r8, r14, # 176, r5
-
-
-;     ]
-
+     DivRem        r8, r14, # 176, r5, norem
 
 ;----------------------------------
 ; What's the current data mode ?
@@ -837,9 +833,6 @@ GetParameters ROUT
 
      MACRO__EXIT_DRIVER_OK ; V is clear
 
-
-     [             Module_Version >= 108
-
 GP_CurrentModeSense
      DCB           ATAPI__MODE_SENSE                   ;  0 opcode
      DCB           0                                   ;  1 reserved
@@ -848,31 +841,11 @@ GP_CurrentModeSense
      DCB           0                                   ;  4 reserved
      DCB           0                                   ;  5 reserved
      DCB           0                                   ;  6 reserved
-     DCB           BUFFER_SIZE:SHR:8                   ;  8 Allocation length (MSB)
-     DCB           BUFFER_SIZE:AND:&FF                 ;  7 Allocation length (LSB)
+     DCB           BUFFER_SIZE:SHR:8                   ;  7 Allocation length (MSB)
+     DCB           BUFFER_SIZE:AND:&FF                 ;  8 Allocation length (LSB)
      DCB           0                                   ;  9 reserved
      DCB           0                                   ; 10 reserved
      DCB           0                                   ; 11 reserved
-
-
-     | ; old way
-
-GP_CurrentModeSense
-     DCB           ATAPI__MODE_SENSE                   ;  0 opcode
-     DCB           0                                   ;  1 reserved
-     DCB           (2_00:SHL:6) + &3f                  ;  2 current values + all pages
-     DCB           0                                   ;  3 reserved
-     DCB           0                                   ;  4 reserved
-     DCB           0                                   ;  5 reserved
-     DCB           0                                   ;  6 reserved
-     DCB           BUFFER_SIZE:AND:&FF                 ;  7 Allocation length (MSB)
-     DCB           BUFFER_SIZE:SHR:8                   ;  8 Allocation length (LSB)
-     DCB           0                                   ;  9 reserved
-     DCB           0                                   ; 10 reserved
-     DCB           0                                   ; 11 reserved
-
-
-     ]
 
 ; This small routine will look through 'buffer' to find page number in r1, returning a pointer
 ; in r2
@@ -883,8 +856,6 @@ GP_CurrentModeSense
 ;          r2 -> place found at (start of page)
 
 GP_FindModePage
-
-     [             Module_Version >= 108
 
      Push          "r3-r5, r14"
 
@@ -927,44 +898,6 @@ GP_Failed
 GP_CouldntFindPage
      ADRL          r0, EH__Invalid_Parameter
      B             error_handler_lookup
-
-
-     | ; old way
-
-
-     Push          "r3-r5, r14"
-
-     ADD           r2, r2, # 8
-
-; r5 = count of the number of bytes actually read in
-; this is just to prevent the hilarious 'abort on data
-; transfer' because a page is present for some reason
-; NEC where are your mandatory mode sense pages ?
-     LDRB          r3, [ r2, # 0 ]
-     LDRB          r5, [ r2, # 1 ]
-     ORR           r5, r5, r3, LSL # 8
-     SUB           r5, r5, # 8 + 2
-
-GP_FindPageLoop
-     CMP           r5, # 0
-     Pull          "r3-r5, pc", LE
-
-     LDRB          r3, [ r2, # 0 ]                     ; page number
-     AND           r3, r3, # 2_111111
-     LDRB          r4, [ r2, # 1 ]                     ; page length
-     CMP           r3, r1
-     ADDLT         r3, r4, # 2                         ; + 2 bytes to reach next page
-     ADDLT         r2, r2, r3
-     ADDLT         r5, r5, r3
-;     ADDLT         r2, r2, r4
-;     ADDLT         r2, r2, # 2                         ; + 2 bytes to reach next page
-     BLT           GP_FindPageLoop
-
-     Pull          "r3-r5, pc"
-
-
-
-     ]
 
 
 ;-----------------------------------------------------------------------------------------------
@@ -1076,10 +1009,8 @@ SP_DoneSpeed
      ADR           r2, buffer + 16
      BL            GP_FindModePage
 
-     [             Module_Version >= 108
      TEQ           r2, # 0
      BEQ           GP_CouldntFindPage
-     ]
 
 ; r2 -> page &0D (CD-ROM parameters)
 
@@ -1097,14 +1028,12 @@ SP_DoneSpeed
      ADR           r2, buffer + 16
      BL            GP_FindModePage
 
-     [             Module_Version >= 108
      TEQ           r2, # 0
      BEQ           GP_CouldntFindPage
-     ]
 
 ; r2 -> page &01 (error recovery parameters)
 
-     LDRB          r14, [ r6, # 4 ]     ; get requested retry count
+     LDRB          r14, [ r6, # 4 ]     ; get requested read retry count
      STRB          r14, [ r2, # 3 ]     ; set it
 
 ;----------------------------------------------------------------
@@ -1116,7 +1045,7 @@ SP_DoneSpeed
      MOV           r0, # writedata + ATAPIOP__COMMAND_PACKET
      MOV           r1, # 12
      SUB           r3, r2, # 8
-     MOV           r2, # 0             ; Sony requires this to be 0, what about Panasonic ?
+     MOV           r2, # 0              ; Sony requires this to be 0, what about Panasonic ?
      MOV           r4, # 0
      STMIA         r3, { r2, r4 }
      ADR           r2, SP_ModeSelectPage1
@@ -1125,7 +1054,14 @@ SP_DoneSpeed
      MOV           r8, # ATAPICONTROL__SEND_COMMAND
 
      BL            ATAPI_Control
-     BVS           error_handler
+
+     BVC           SP_Page1Written
+
+     BIC           r14, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r14, # TARGETERROR__ILLEGAL_REQUEST
+     BNE           error_handler        ; An error other than read-only
+
+SP_Page1Written
 
 ; Copy page &d over page 1
      MOV           r1, r5
@@ -1202,13 +1138,13 @@ SP_ModeSelectPageD
 SP_CurrentModeSense
      DCB           ATAPI__MODE_SENSE                   ;  0 opcode
      DCB           0                                   ;  1 reserved
-     DCB           (2_00:SHL:6) + &3f                  ;  2 changeable values + all pages
+     DCB           (2_00:SHL:6) + &3f                  ;  2 current values + all pages
      DCB           0                                   ;  3 reserved
      DCB           0                                   ;  4 reserved
      DCB           0                                   ;  5 reserved
      DCB           0                                   ;  6 reserved
-     DCB           BUFFER_SIZE:AND:&FF                 ;  7 Allocation length (MSB)
-     DCB           BUFFER_SIZE:SHR:8                   ;  8 Allocation length (LSB)
+     DCB           BUFFER_SIZE:SHR:8                   ;  7 Allocation length (MSB)
+     DCB           BUFFER_SIZE:AND:&FF                 ;  8 Allocation length (LSB)
      DCB           0                                   ;  9 reserved
      DCB           0                                   ; 10 reserved
      DCB           0                                   ; 11 reserved
@@ -1394,11 +1330,15 @@ EnquireAddress ROUT
 ; Get the LBAFormat absolute address
 ;-----------------------------------
      LDR           r2, buffer + 16 + 8
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
      AND           r6, r5, r2, ROR #8
      AND           r1, r5, r2
      ORR           r1, r6, r1, ROR #24
+ |
+     REV           r1, r2
+ ]
 
 ;---------------------------------------
 ; If caller wants return in MSF then ...
@@ -1471,14 +1411,19 @@ EnquireDataMode ROUT
 ;--------------------------
 
 ; swap byte order of LBA
+ [ NoARMv6
      MOV           r2, #&ff00
      ORR           r2, r2, r2, LSL #16
 
      AND           r14, r2, r1, ROR #8
      AND           r8, r2, r1
      ORR           r6, r14, r8, ROR #24
+ |
+     REV           r6, r1
+ ]
 
 ; Build read header command
+     ASSERT        ((EDM_CDBReadHeader - .) :AND: 3) = 0
      ADR           r2, EDM_CDBReadHeader
      ADR           r3, buffer
      LDMIA         r2, { r0, r4, r8, r14 }
@@ -1542,7 +1487,8 @@ EnquireDataMode ROUT
 ;---------------------------------------------------------------
 
 ; Build read cd command
-     ADR           r2, EDM_CDBReadCD
+     ASSERT        ((EDM_CDBReadCD - .) :AND: 3) = 2
+     ADR           r2, EDM_CDBReadCD - 2
      ADR           r3, buffer
      LDMIA         r2, { r0, r4, r8, r14 }
      STMIA         r3!, { r0, r6, r8, r14 }
@@ -1643,19 +1589,27 @@ PlayAudio ROUT
 ;------------------------------------------------
 ; Reverse start address to hi/lo
 ;------------------------------------------------
+ [ NoARMv6
      MOV           r2, #&ff00
      ORR           r2, r2, r2, LSL #16
 
      AND           r14, r2, r3, ROR #8
      AND           r8, r2, r3
      ORR           r3, r14, r8, ROR #24
+ |
+     REV           r3, r3
+ ]
 
 ;------------------------------------------------
 ; Reverse transfer length to hi/lo
 ;------------------------------------------------
+ [ NoARMv6
      AND           r14, r2, r0, ROR #8
      AND           r8, r2, r0
      ORR           r4, r14, r8, ROR #24
+ |
+     REV           r4, r0
+ ]
 
 ;------------------------------------------------
 ; Play audio
@@ -1812,6 +1766,7 @@ PT_OKLast
      LDR           r0, buffer + 12 + 8
      LDR           r1, buffer + 24 + 8
 
+ [ NoARMv6
      MOV           r2, #&ff00
      ORR           r2, r2, r2, LSL #16
 
@@ -1822,13 +1777,21 @@ PT_OKLast
      AND           r14, r2, r1, ROR #8
      AND           r8, r2, r1
      ORR           r4, r14, r8, ROR #24
+ |
+     REV           r3, r0
+     REV           r4, r1
+ ]
 
 ; Subtract the end and start address to get a transfer length, then swap to hi/lo format
      SUB           r4, r4, r3
      SUB           r4, r4, # &1
+ [ NoARMv6
      AND           r14, r2, r4, ROR #8
      AND           r8, r2, r4
      ORR           r4, r14, r8, ROR #24
+ |
+     REV           r4, r4
+ ]
 
 
 ; Get back the start address in hi/lo format
@@ -1868,7 +1831,7 @@ PT_OKLast
 PT_CDBPlayTrack
      DCB           ATAPI__READ_TOC                    ; 0 command byte
      DCB           0                                  ; 1
-     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 2 reserved
      DCB           0                                  ; 3 reserved
      DCB           0                                  ; 4 reserved
      DCB           0                                  ; 5 reserved
@@ -2064,12 +2027,16 @@ ET_OK
      ADRNE         r5, buffer + 12 + 4
      LDMNEIA       r5, { r2, r6 }
 
+ [ NoARMv6
      MOVNE         r5, #&ff00
      ORRNE         r5, r5, r5, LSL #16
 
      ANDNE         r4, r5, r6, ROR #8
      ANDNE         r3, r5, r6
      ORRNE         r3, r4, r3, ROR #24
+ |
+     REVNE         r3, r6
+ ]
 
      STRNE         r3, [ r1, #0 ]
 
@@ -2087,7 +2054,7 @@ ET_OK
 ET_CDBEnquireTrack
      DCB           ATAPI__READ_TOC                    ; 0 command byte
      DCB           0                                  ; 1 MSF bit
-     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 2 reserved
      DCB           0                                  ; 3 reserved
      DCB           0                                  ; 4 reserved
      DCB           0                                  ; 5 reserved
@@ -2152,6 +2119,7 @@ ReadSubChannel ROUT
      LDMIA    r14, { r2, r3, r4 }
 
 ; Swap byte order of LBAs
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
 
@@ -2162,6 +2130,10 @@ ReadSubChannel ROUT
      AND           r14, r5, r4, ROR #8
      AND           r6, r5, r4
      ORR           r6, r14, r6, ROR #24
+ |
+     REV           r8, r3
+     REV           r6, r4
+ ]
 
      STMIA         r1!, { r6, r8 }           ; Absolute, relative LBA
 
@@ -2348,12 +2320,16 @@ DiscUsed ROUT
 
      LDR           r3, buffer + 8
 
+ [ NoARMv6
      MOV           r5, #255
      ORR           r5, r5, r5, LSL #16
 
      AND           r2, r5, r3, ROR #24
      AND           r4, r5, r3
      ORR           r2, r2, r4, ROR #8
+ |
+     REV           r2, r3
+ ]
 
 ; Blocksize = &800
      MOV           r14, # &800
@@ -2390,7 +2366,7 @@ DiscUsed ROUT
 DU_CDBDiscUsed
      DCB           ATAPI__READ_TOC                    ; 0 command byte
      DCB           0                                  ; 1
-     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 2 reserved
      DCB           0                                  ; 3 reserved
      DCB           0                                  ; 4 reserved
      DCB           0                                  ; 5 reserved
@@ -2832,6 +2808,7 @@ ReadAudio ROUT
 ;----------------------------------
 
 ; Swap byte order of LBA and number of blocks
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
 
@@ -2845,13 +2822,19 @@ ReadAudio ROUT
      AND           r14, r5, r2, ROR #8
      AND           r8, r5, r2
      ORR           r8, r14, r8, ROR #24
+ |
+     MOV           r2, r2, LSL #8
+     REV           r6, r1
+     REV           r8, r2
+ ]
 
 
 ;---------------------------------------------
 ; Read CD-DA
 ;---------------------------------------------
 ; Build read cd command
-     ADR           r2, RA_CDBReadCD
+     ASSERT        ((RA_CDBReadCD - .) :AND: 3) = 2
+     ADR           r2, RA_CDBReadCD - 2
      LDMIA         r2, { r0, r1, r5, r14 }
      ORR           r8, r8, r5
      ADR           r2, buffer
@@ -2897,8 +2880,6 @@ RA_CDBReadCD
 
  ALIGN
 
-
- [ Module_Version >= 105
 
 ;-----------------------------------------------------------------------------------------------
 ReadUserData ROUT
@@ -3257,6 +3238,7 @@ RUD_ReadAll
 
 ; Swap the byte order of the start LBA and number of blocks
 
+ [ NoARMv6
      MOV           r5, #&ff00
      ORR           r5, r5, r5, LSL #16
 
@@ -3269,6 +3251,11 @@ RUD_ReadAll
      AND           r1, r5, r2, ROR #8
      AND           r8, r5, r2
      ORR           r8, r1, r8, ROR #24
+ |
+     MOV           r2, r2, LSL #8
+     REV           r6, r1
+     REV           r8, r2
+ ]
 
      ORR           r8, r8, # 2_11111000:SHL:24 ; all headers + user + EDC & ECC + sync
 ;     ORR           r8, r8, # 2_10000000:SHL:24 ; user
@@ -3294,9 +3281,6 @@ RUD_ReadAll
      BL            ATAPI_Control
 
      Pull          "r2-r8, pc" ; pass V flag back to caller
-
- ] ; Module_Version >= 105
-
 
 ;-----------------------------------------------------------------------------------------------
 GetAudioParms ROUT
@@ -3381,8 +3365,8 @@ GAP_AudioPage
      DCB           0                                   ;  4 reserved
      DCB           0                                   ;  5 reserved
      DCB           0                                   ;  6 reserved
-     DCB           BUFFER_SIZE:AND:&FF                 ;  7 Allocation length (MSB)
-     DCB           BUFFER_SIZE:SHR:8                   ;  8 Allocation length (LSB)
+     DCB           BUFFER_SIZE:SHR:8                   ;  7 Allocation length (MSB)
+     DCB           BUFFER_SIZE:AND:&FF                 ;  8 Allocation length (LSB)
      DCB           0                                   ;  9 reserved
      DCB           0                                   ; 10 reserved
      DCB           0                                   ; 11 reserved
