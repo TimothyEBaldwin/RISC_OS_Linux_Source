@@ -1,0 +1,184 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/HWSupport/ATA/SATADriver/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Use is subject to license terms.
+ */
+
+/** \file swi.c
+ * Implementation of star commands.
+ */
+
+#include <stdio.h>
+#include "swis.h"
+
+#include "Global/NewErrors.h"
+#include "Interface/ATA.h"
+
+#include "command.h"
+#include "globals.h"
+#include "message.h"
+#include "op.h"
+
+#define SECTOR_SIZE (512) // for now
+
+#define RETRIES (4)
+
+#define OFFSET_MODEL_NUMBER         (27)
+#define SIZE_MODEL_NUMBER           (20)
+#define OFFSET_MAX_LBA              (60)
+#define OFFSET_COMMAND_SET          (83)
+#define OFFSET_MAX_LBA48           (100)
+
+#define COMMAND_SET_MBZ   (1u<<15)
+#define COMMAND_SET_MBO   (1u<<14)
+#define COMMAND_SET_LBA48 (1u<<10)
+
+
+static void extract_model_number(const uint16_t *restrict identify_block, char *restrict buffer)
+{
+  for (size_t i = 0; i < SIZE_MODEL_NUMBER * 2; i++)
+  {
+    char c = ((char *)(identify_block + OFFSET_MODEL_NUMBER))[i ^ 1];
+    if (c < ' ' || c >= 127)
+      c = ' ';
+    buffer[i] = c;
+  }
+  buffer[SIZE_MODEL_NUMBER * 2] = '\0';
+}
+
+static _kernel_oserror *retry_op_issue(ataop_block_t *b)
+{
+  _kernel_oserror *e;
+  int32_t retries = RETRIES;
+  do
+  {
+    e = op_issue(b, false, false);
+    if (e && e->errnum == ErrorNumber_Escape)
+      break;
+  }
+  while (e != NULL && --retries >= 0);
+  return e;
+}
+
+_kernel_oserror *command_satadevices(void)
+{
+  _kernel_oserror *e;
+  uint16_t identify_block[256];
+
+  printf(message_lookup_direct("SATADevHdr"));
+  printf("\n");
+
+  spinrw_read_lock(&g_ahci_lock);
+  for (uint32_t cpid = 0; cpid < 32; cpid++)
+  {
+    ahciport_t *port = &g_ahci.port[cpid];
+    if (port->active)
+    {
+      for (uint32_t deviceid = 0; deviceid < 16; deviceid++)
+      {
+        satadevice_t *device = &port->device[deviceid];
+        if (device->valid)
+        {
+          printf("  0 %3u %3u  ", cpid, deviceid);
+          switch (device->sig)
+          {
+            case SATA_SIG_ATA:
+            {
+              ataop_param_lba28_t params = {
+                  .device = DEVICE_MAGIC,
+                  .command = ATACOMMAND_IDENTIFY_DEVICE
+              };
+              ataop_block_t identify = {
+                  .r0.bits.nodrdy = true,
+                  .r0.bits.deviceid = deviceid,
+                  .r0.bits.cpid = cpid,
+                  .r0.bits.dir = ATAOp_TransRead > ATAOp_TransShift,
+                  .r1.param_len = 7,
+                  .param.lba28 = &params,
+                  .data.block = (uint8_t *) identify_block,
+                  .data_len = sizeof identify_block,
+                  .r5.timeout = 100
+              };
+              e = retry_op_issue(&identify);
+              if (e)
+                printf("%s\n", e->errmess);
+              else
+              {
+                char name[SIZE_MODEL_NUMBER * 2 + 1];
+                extract_model_number(identify_block, name);
+                bool lba48 = (identify_block[OFFSET_COMMAND_SET] &
+                              (COMMAND_SET_MBZ | COMMAND_SET_MBO | COMMAND_SET_LBA48)) ==
+                                                (COMMAND_SET_MBO | COMMAND_SET_LBA48);
+                uint64_t capacity = lba48 ?
+                    SECTOR_SIZE * *(uint64_t *)&identify_block[OFFSET_MAX_LBA48] :
+                    SECTOR_SIZE * (uint64_t) *(uint32_t *)&identify_block[OFFSET_MAX_LBA];
+                char capacity_string[12] = "";
+                _swix(OS_ConvertVariform, _INR(0,4), &capacity, capacity_string, sizeof capacity_string, 8, 8);
+                printf("%s  %s  %s\n", message_lookup_direct("SATATypeATA"), name, capacity_string);
+              }
+              break;
+            }
+
+            case SATA_SIG_ATAPI:
+            {
+              ataop_param_lba28_t params = {
+                  .device = DEVICE_MAGIC,
+                  .command = ATACOMMAND_IDENTIFY_PACKET_DEVICE
+              };
+              ataop_block_t identify = {
+                  .r0.bits.nodrdy = true,
+                  .r0.bits.deviceid = deviceid,
+                  .r0.bits.cpid = cpid,
+                  .r0.bits.dir = ATAOp_TransRead > ATAOp_TransShift,
+                  .r1.param_len = 7,
+                  .param.lba28 = &params,
+                  .data.block = (uint8_t *) identify_block,
+                  .data_len = sizeof identify_block,
+                  .r5.timeout = 100
+              };
+              e = retry_op_issue(&identify);
+              if (e)
+                printf("%s\n", e->errmess);
+              else
+              {
+                char name[SIZE_MODEL_NUMBER * 2 + 1];
+                extract_model_number(identify_block, name);
+                printf("%s  %s\n", message_lookup_direct("SATATypeATAPI"), name);
+              }
+              break;
+            }
+
+            case SATA_SIG_PM:
+              printf("%s\n", message_lookup_direct("SATATypePM"));
+              break;
+
+            case SATA_SIG_SEMB:
+              printf("%s\n", message_lookup_direct("SATATypeSEMB"));
+              break;
+          }
+        }
+      }
+    }
+  }
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
