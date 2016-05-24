@@ -111,6 +111,7 @@ VSFLAGS =\
  -DLIB_SHARED="\"Shared \""
 
 ASFLAGS =\
+ -PD "SHARED_C_LIBRARY SETL {TRUE}"\
  ${SCL_APCS}
 
 # Setting UROM on the command-line for rlib
