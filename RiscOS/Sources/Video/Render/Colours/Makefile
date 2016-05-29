@@ -26,44 +26,32 @@
 
 COMPONENT = ColourTrans
 TARGET    = Colours
-
 ROM_SOURCE = MakeNew
 HEADER1   = ColourTran
-
-RESOURCEEXTRA = resources-colourtrans
+INSTRES_FILES = Tables.4greys:Tables   Palettes.4greys:Palettes \
+                Tables.8greys:Tables   Palettes.8greys:Palettes \
+                Tables.4desktop:Tables Palettes.4desktop:Palettes \
+                Tables.8desktop:Tables Palettes.8desktop:Palettes
+INSTRES_DEPENDS = MakeTables
 
 include StdTools
 include AAsmModule
 
-#
-# Binary build environment
-#
-# Enhance the export rule to include the Tables and MkTables directories
-BBETYPE   = local
-bbe-local: bbe-generic
-	BBE_Export_Dir Tables
-	BBE_Export_Dir MkTables
-	BBE_Export_Dir Palettes
-
-#
-# Generic rules:
-#
 clean::
 	${XWIPE} Tables.* ${WFLAGS}
 	${XWIPE} Palettes.* ${WFLAGS}
 	${XWIPE} MkTables.o.* ${WFLAGS}
 	${RM} MkTables.maketables
 
-resources-colourtrans: MkTables.maketables
+#
+# Static dependencies:
+#
+MakeTables: MkTables.maketables
 	${XWIPE} Tables.* ${WFLAGS}
 	${RUN}MkTables.maketables @
 	${SQUASH} Tables.4greys
 	${SQUASH} Tables.8greys  
 	${SQUASH} Tables.4desktop
-	${MKDIR} ${RESFSDIR}
-	${CP} Palettes ${RESFSDIR}.* ${CPFLAGS}
-	${CP} Tables   ${RESFSDIR}.* ${CPFLAGS}
-	@echo ${COMPONENT}: extra resource files copied
 
 MkTables.maketables: MkTables.c.maketables
 	${CD} MkTables
