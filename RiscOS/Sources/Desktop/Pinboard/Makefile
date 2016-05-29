@@ -21,8 +21,8 @@
 # ----       ----         -----------
 # 14-Mar-01  SNB          Recreated
 
-COMPONENT = Pinboard
-RESOURCEEXTRA = resources_templates
+COMPONENT     = Pinboard
+INSTRES_FILES = Templates
 
 include StdTools
 include AAsmModule
