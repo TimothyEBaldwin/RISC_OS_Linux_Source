@@ -26,6 +26,7 @@ COMPONENT  = DisplayManager
 TARGET     = Display
 ROM_SOURCE = GetAll.s
 INSTRES_FILES = Templates
+INSTRES_VERSION = Messages
 
 include StdTools
 include AAsmModule
