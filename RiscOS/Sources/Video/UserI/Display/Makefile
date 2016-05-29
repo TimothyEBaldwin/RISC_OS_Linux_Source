@@ -25,12 +25,7 @@
 COMPONENT  = DisplayManager
 TARGET     = Display
 ROM_SOURCE = GetAll.s
-
-#RESOURCEEXTRA = resources_templates
-RESOURCEEXTRA = resources_templrate
-
-resources_templrate ::
-	${CP} LocalRes:TemplRate ${RESFSDIR}.Templates ${CPFLAGS}
+INSTRES_FILES = Templates
 
 include StdTools
 include AAsmModule
