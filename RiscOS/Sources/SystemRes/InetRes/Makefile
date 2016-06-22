@@ -74,6 +74,7 @@ DISCFILES= ${RDIR}.!Boot\
         ${SDIR}.mrinfo.MRInfo\
         ${SDIR}.mtrace.MTrace\
         ${SDIR}.pong.Pong\
+        ${SDIR}.tftp.Tftp\
         ${SDIR}.utils.utl.RMFind\
         ${RDIR}.files.AUNMap\
         ${RDIR}.files.Hosts\
@@ -92,11 +93,6 @@ FILES=\
         ${DISCFILES} \
         ${STBFILES}
 
-BAREMINUTILS = \
-        ${SDIR}.ifconfig.IfConfig    \
-        ${SDIR}.ping.Ping            \
-        ${RDIR}.!Boot
-  
 EMERGENCYUTILS = \
         ${SDIR}.arp.ARP              \
         ${SDIR}.ifconfig.IfConfig    \
@@ -122,6 +118,7 @@ NETUTILS = \
         ${SDIR}.route.Route          \
         ${SDIR}.showstat.ShowStat    \
         ${SDIR}.sysctl.SysCtl        \
+        ${SDIR}.tftp.Tftp            \
         ${SDIR}.traceroute.TraceRoute \
         ${RDIR}.!Boot                 \
         ${LDIR}.!Run                  \
@@ -194,6 +191,7 @@ install_: ${DISCFILES} dirs
         ${CP} ${SDIR}.mtrace.MTrace         ${INSTAPP}.bin.MTrace       ${CPFLAGS}
         ${CP} ${SDIR}.pong.Pong             ${INSTAPP}.bin.Pong         ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.RMFind      ${INSTAPP}.bin.RMFind       ${CPFLAGS}
+        ${CP} ${SDIR}.tftp.Tftp             ${INSTAPP}.bin.Tftp         ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.CheckMem    ${INSTAPP}.utils.CheckMem   ${CPFLAGS}
         ${CP} ${SDIR}.newfiler.NewFiler     ${INSTAPP}.utils.NewFiler   ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.ReadCMOSIP  ${INSTAPP}.utils.ReadCMOSIP ${CPFLAGS}
@@ -234,6 +232,7 @@ resources-NetUtils: ${NETUTILS}
         ${CP} ${SDIR}.sysctl.SysCtl         ${RESD}.bin.SysCtl       ${CPFLAGS}
         ${CP} ${SDIR}.showstat.ShowStat     ${RESD}.bin.ShowStat     ${CPFLAGS}
         ${CP} ${SDIR}.traceroute.TraceRoute ${RESD}.bin.TraceRoute   ${CPFLAGS}
+        ${CP} ${SDIR}.tftp.Tftp             ${RESD}.bin.Tftp         ${CPFLAGS}
         ${AWK} -f awk.Version ${RDIR}.files.AUNMap > ${RESD}.files.AUNMap
         SetType ${RESD}.files.AUNMap Obey
         ${CP} ${RDIR}.files.Hosts           ${RESD}.files.Hosts      ${CPFLAGS}
@@ -266,18 +265,6 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${CP} ${RDIR}.files.Services        ${RESD}.files.Services   ${CPFLAGS}
         ${AWK} -f awk.Version ${LDIR}.!Run > ${RESD}.!Run
         SetType ${RESD}.!Run Obey
-
-resources-BareMinUtils: ${BAREMINUTILS}
-        ${MKDIR} ${RESD}
-        ${MKDIR} ${RESD}.bin
-        ${MKDIR} ${RESD}.files
-        ${CP} ${SDIR}.ifconfig.IfConfig     ${RESD}.bin.IfConfig     ${CPFLAGS}
-        ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
-        ${CP} ${RDIR}.files.Hosts           ${RESD}.files.Hosts      ${CPFLAGS}
-        ${CP} ${RDIR}.files.Protocols       ${RESD}.files.Protocols  ${CPFLAGS}
-        ${CP} ${RDIR}.files.Services        ${RESD}.files.Services   ${CPFLAGS}
-        ${AWK} -f awk.Version ${RDIR}.!Boot > ${RESD}.!Boot
-        SetType ${RESD}.!Boot Obey
 
 ${SDIR}.arp.ARP: ${SDIR}.arp.c.ARP
         dir ${SDIR}.arp
@@ -377,6 +364,14 @@ ${SDIR}.showstat.ShowStat:
 
 ${SDIR}.sysctl.SysCtl: ${SDIR}.sysctl.c.SysCtl
         dir ${SDIR}.sysctl
+        @amu_machine
+        @up
+        @up
+
+${SDIR}.tftp.Tftp: ${SDIR}.tftp.c.main \
+        ${SDIR}.tftp.c.tftp \
+        ${SDIR}.tftp.c.tftpsubs
+        dir ${SDIR}.tftp
         @amu_machine
         @up
         @up
