@@ -23,7 +23,7 @@ CINCLUDES    = -ITCPIPLibs:,C:
 HDRS         =
 CFLAGS       = -wp
 ROMCDEFINES  = -DROM
-RES_PATH     = Resources.Net.Messages
+RESFSDIR     = ${RESDIR}${SEP}Net
 CMHGDEPENDS  = mns mnsg mnsi
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
