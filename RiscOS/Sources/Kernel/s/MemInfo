@@ -50,7 +50,7 @@ MemReturn
         ExitSWIHandler
 
 30
-        B       MemoryConvert                   ; 0
+        B       MemoryConvertFIQCheck           ; 0
         B       %BT20                           ; Reason codes 1-5 are reserved.
         B       %BT20
         B       %BT20
@@ -60,7 +60,7 @@ MemReturn
         B       MemoryReadPhys                  ; 7
         B       MemoryAmounts                   ; 8
         B       MemoryIOSpace                   ; 9
-        B       MemoryFreePoolLock              ; 10
+        B       %BT20                           ; Reason code 10 reserved (for free pool locking)
         B       %BT20                           ; Reason code 11 reserved (for PCImapping).
         B       RecommendPage                   ; 12
         B       MapIOpermanent                  ; 13
@@ -120,7 +120,26 @@ physical_bits   *       ((physical :SHL: 4) :OR: physical)
 cacheable_bit   *       1:SHL:15
 alter_cacheable *       1:SHL:16
 
-MemoryConvert   ROUT
+; Small wrapper to make sure FIQs are disabled if we're making pages uncacheable
+; (Modern ARMs ignore unexpected cache hits, so big coherency issues if we make
+; a page uncacheable which is being used by FIQ).
+MemoryConvertFIQCheck ROUT
+        AND     r11, r0, #3:SHL:14
+        TEQ     r11, #2:SHL:14
+        BNE     MemoryConvertNoFIQCheck
+        Entry   "r0-r1"
+        MOV     r1, #Service_ClaimFIQ
+        SWI     XOS_ServiceCall
+        LDMIA   sp, {r0-r1}
+        BL      MemoryConvertNoFIQCheck
+        FRAMSTR r0
+        MRS     r11, CPSR
+        MOV     r1, #Service_ReleaseFIQ
+        SWI     XOS_ServiceCall
+        MSR     CPSR_c, r11
+        EXIT
+
+MemoryConvertNoFIQCheck   ROUT
         Entry   "r0-r11"                ; Need lots of registers!!
 
 ;        MRS     lr, CPSR
@@ -158,9 +177,12 @@ MemoryConvert   ROUT
 
         TST     r0, #physical,wanted    ; If PA not wanted
         BEQ     %FT20                   ;   then skip.
-        TST     r0, #logical,given      ; If LA not given (rotate clears C) then
-        BLEQ    ppn_to_logical          ;   get it from PN (PA wanted (not given) & LA not given => PN given).
-        BLCC    logical_to_physical     ; Get PA from LA.
+        TST     r0, #logical,given      ; If LA given (rotate clears C) then
+        ADR     lr, %FT15
+        BNE     logical_to_physical     ; Get PA from LA
+        BL      ppn_to_logical          ; Else get LA from PN (PA wanted (not given) & LA not given => PN given).
+        BLCC    ppn_to_physical         ; And get PA from PN (more accurate than getting PA from LA - page may be mapped out)
+15
         BCS     %FT80
         TST     r0, #logical,wanted
         STRNE   r4, [r1, #-8]           ; Store back LA if wanted.
@@ -195,7 +217,9 @@ MemoryConvert   ROUT
         CMP     r7, r3                  ; Make sure page number is valid (might not have done any conversion).
         BCC     %FT80
 
-        ADD     r3, r6, r3, LSL #3      ; Point to CAM entry for this page.
+        ADD     r3, r6, r3, LSL #CAM_EntrySizeLog2 ; Point to CAM entry for this page.
+        ASSERT  CAM_LogAddr=0
+        ASSERT  CAM_PageFlags=4
         LDMIA   r3, {r4,r5}             ; Get logical address and PPL.
 
         AND     lr, r5, #PageFlags_TempUncacheableBits
@@ -213,25 +237,78 @@ MemoryConvert   ROUT
         SUB     r5, r5, #1:SHL:TempUncacheableShift
         TST     r5, #PageFlags_TempUncacheableBits      ; EQ => we have to change L2.
 60
-        STR     r5, [r3, #4]            ; Write back new PPL.
+        STR     r5, [r3, #CAM_PageFlags] ; Write back new PPL.
         BNE     %BT10                   ; Do next entry if we don't have to change L2.
 
         MOV     r4, r4, LSR #12
+        LDR     r3, =ZeroPage
         ADD     r4, r8, r4, LSL #2      ; Address of L2 entry for logical address.
+ [ MEMM_Type = "VMSAv6"
+        ; VMSAv6 is hard, use XCBTable/PCBTrans
+        ASSERT  DynAreaFlags_CPBits = 7*XCB_P :SHL: 10
+        ASSERT  DynAreaFlags_NotCacheable = XCB_NC :SHL: 4
+        ASSERT  DynAreaFlags_NotBufferable = XCB_NB :SHL: 4
+        TST     r0, #cacheable_bit      ; n.b. must match EQ/NE used by ARMop calls
+        AND     lr, r5, #DynAreaFlags_NotCacheable + DynAreaFlags_NotBufferable
+        AND     r5, r5, #DynAreaFlags_CPBits
+        ORR     lr, lr, r5, LSR #10-4
+        LDR     r5, [r3, #MMU_PCBTrans]
+        ORREQ   lr, lr, #XCB_TU<<4      ; if temp uncache, set TU bit
+        LDRB    lr, [r5, lr, LSR #4]    ; convert to X, C and B bits for this CPU
+        LDR     r5, [r4]                ; Get L2 entry (safe as we know address is valid).
+        BIC     r5, r5, #(L2_C+L2_B+L2_TEX) :AND: 255 ; Knock out existing attributes (n.b. assumed to not be large page!)
+        ORR     r5, r5, lr              ; Set new attributes
+ |
         LDR     r5, [r4]                ; Get L2 entry (safe as we know address is valid).
         TST     r0, #cacheable_bit
         BICEQ   r5, r5, #L2_C           ; Disable/enable cacheability.
         ORRNE   r5, r5, #L2_C
+ ]
+        BNE     %FT63
+        ; Making page non-cacheable
+        ; There's a potential interrupt hole here - many ARMs ignore cache hits
+        ; for pages which are marked as non-cacheable (seen on XScale,
+        ; Cortex-A53, Cortex-A15 to name but a few, and documented in many TRMs)
+        ; We can't be certain that this page isn't being used by an interrupt
+        ; handler, so if we're making it non-cacheable we have to take the safe
+        ; route of disabling interrupts around the operation.
+        ; Note - currently no consideration is given to FIQ handlers.
+        ; Note - we clean the cache as the last step (as opposed to doing it at
+        ; the start) to make sure prefetching doesn't pull data back into the
+        ; cache.
+        MRS     r11, CPSR
+        ORR     lr, r11, #I32_bit       ; IRQs off
+        ; Yuck, we also need to deal with the case where we're making the
+        ; current SVC stack page uncacheable (coherency issue when calling the
+        ; ARMops if cache hits to uncacheable pages are ignored). Deal with this
+        ; by temporarily dropping into IRQ mode (and thus a different stack) if
+        ; we think this is going to happen.
+        MOV     r10, r4, LSL #10
+        SUB     r10, sp, r10
+        CMP     r10, #8192              ; Be extra cautious
+        EORLO   lr, lr, #SVC32_mode :EOR: IRQ32_mode
+        MSR     CPSR_c, lr              ; Switch mode
+        Push    "r0, lr"                ; Preserve OS_Memory flags and (potential) IRQ lr
+        STR     r5, [r4]                ; Write back new L2 entry.
+        ASSERT  (L2PT :SHL: 10) = 0     ; Ensure we can convert r4 back to the page log addr
+        MOV     r0, r4, LSL #10
+        ARMop   MMU_ChangingUncachedEntry,,,r3   ; Clean TLB
+        MOV     r0, r4, LSL #10
+        MOV     r10, r1
+        ADD     r1, r0, #4096
+        ARMop   Cache_CleanInvalidateRange,,,r3  ; Clean page from cache
+        Pull    "r5, lr"                ; Restore OS_Memory flags + IRQ lr
+        MSR     CPSR_c, r11             ; Back to original mode + IRQ state
+        MOV     r1, r10
+        B       %FT65
+63
+        ; Making page cacheable again
+        ; Shouldn't be any cache maintenance worries
         STR     r5, [r4]                ; Write back new L2 entry.
         MOV     r5, r0
-        ASSERT  (L2PT :SHL: 12) = 0     ; Ensure we can convert r4 back to the page log addr
+        ASSERT  (L2PT :SHL: 10) = 0     ; Ensure we can convert r4 back to the page log addr
         MOV     r0, r4, LSL #10
-        ; *** KJB - this assumes that uncacheable pages still allow cache hits (true on all
-        ; ARMs so far).
-        LDR     r3, =ZeroPage
-        ADR     lr, %FT65
-        ARMop   MMU_ChangingEntry,EQ,tailcall,r3         ; Clean cache & TLB
-        ARMop   MMU_ChangingUncachedEntry,NE,tailcall,r3 ; Clean TLB
+        ARMop   MMU_ChangingUncachedEntry,,,r3   ; Clean TLB
 65
         MOV     r0, r5
         B       %BT10
@@ -251,7 +328,7 @@ MemoryConvert   ROUT
         EOR     r0, r0, #cacheable_bit          ; If we made them uncacheable then make them cacheable again & v.v.
         SUB     r2, r3, r2
         SUBS    r2, r2, #1              ; Change back the entries we have changed up to (but excluding) the error entry.
-        BLNE    MemoryConvert
+        BLNE    MemoryConvertNoFIQCheck
 90
         ADRL    r0, ErrorBlock_BadAddress
 95
@@ -309,23 +386,16 @@ handle_AMBHonesty  ROUT
 ;
 ppn_to_logical
         CMP     r7, r3                  ; Validate page number.
- [ No26bitCode
         BCC     meminfo_returncs        ; Invalid so return C set.
- |
-        ORRCCS  pc, lr, #C_bit          ; Invalid so return C set.
- ]
 
-        LDR     r4, [r6, r3, LSL #3]    ; If valid then lookup logical address.
+        ASSERT  CAM_LogAddr=0
+        LDR     r4, [r6, r3, LSL #CAM_EntrySizeLog2] ; If valid then lookup logical address.
         TST     r0, #physical,given     ; If physical address was given then
         LDRNE   r9, =&FFF
         ANDNE   r9, r5, r9              ;   mask off page offset
         ORRNE   r4, r4, r9              ;   and combine with logical address.
- [ No26bitCode
         CLC
         MOV     pc, lr
- |
-        BICS    pc, lr, #C_bit          ; Return C clear.
- ]
 
 
 ;----------------------------------------------------------------------------------------
@@ -347,31 +417,19 @@ logical_to_physical
         LDR     r5, [r8, r5, LSL #2]    ; r5 = L2PT entry for L2PT entry for logical address
         EOR     r5, r5, #2_10           ; Check for valid page.
         TST     r5, #3
- [ No26bitCode
         BNE     meminfo_returncs
- |
-        ORRNES  pc, lr, #C_bit
- ]
 
         LDR     r5, [r9]                ; r5 = L2PT entry for logical address
         EOR     r5, r5, #2_10           ; Check for valid page.
         TST     r5, #3
- [ No26bitCode
         BNE     meminfo_returncs
- |
-        ORRNES  pc, lr, #C_bit
- ]
 
         LDR     r9, =&FFF               ; Valid so
         BIC     r5, r5, r9              ;   mask off bits 0-11,
         AND     r9, r4, r9              ;   get page offset from logical page
         ORR     r5, r5, r9              ;   combine with physical page address.
- [ No26bitCode
         CLC
         MOV     pc, lr
- |
-        BICS    pc, lr, #C_bit
- ]
 
 meminfo_returncs_pullr5
         Pull    "r5"
@@ -412,6 +470,34 @@ physical_to_ppn ROUT
         CLC
         MOV     pc, lr
 
+;----------------------------------------------------------------------------------------
+; ppn_to_physical
+;
+;       In:     r3 = page number
+;
+;       Out:    r9 corrupted
+;               CC => r5 = physical address
+;               CS => invalid page number, r5 corrupted
+;
+;       Convert physical page number to physical address.
+;
+ppn_to_physical ROUT
+        Push    "r3,lr"
+        LDR     r9, =ZeroPage+PhysRamTable
+10
+        LDMIA   r9!, {r5,lr}            ; Get start address and size of next block.
+        MOVS    lr, lr, LSR #12
+        BEQ     %FT20
+        CMP     r3, lr
+        SUBHS   r3, r3, lr
+        BHS     %BT10
+
+        ADD     r5, r5, r3, LSL #12
+        Pull    "r3,pc"
+20
+        SEC
+        Pull    "r3,pc"
+
 
 ;----------------------------------------------------------------------------------------
 ; Symbols used in MemoryPhysSize and MemoryReadPhys
@@ -442,7 +528,6 @@ NotAvailable    *       &88888888
 ;       Returns information about the memory arrangement table.
 ;
 MemoryPhysSize
- [ HAL
         Entry   "r0-r1,r3,sb,ip"
         AddressHAL
         MOV     r0, #PhysInfo_GetTableSize
@@ -451,11 +536,6 @@ MemoryPhysSize
         MOV     r2, #4*1024
         CLRV
         EXIT
- |
-        MOV     r1, #PhysSpaceSize :SHR: ByteShift
-        MOV     r2, #4*1024
-        MOV     pc, lr
- ]
 
 
 ;----------------------------------------------------------------------------------------
@@ -487,7 +567,7 @@ MemoryReadPhys  ROUT
         MOV     r4, #32                 ; How much more we have to shift r3 before storing it.
         LDR     r6, =ZeroPage+CamEntriesPointer
         LDR     r7, [r6]
-        ADD     r7, r7, #4              ; Point to PPL entries.
+        ADD     r7, r7, #CAM_PageFlags  ; Point to PPL entries.
         LDR     r8, [r6, #MaxCamEntry-CamEntriesPointer]
         MOV     r5, #0                  ; last block address processed + 1
         Push    "r5"
@@ -539,7 +619,7 @@ MemoryReadPhys  ROUT
         CMP     r2, r9                  ; If not reached start of block then page is not present.
         ORRCC   r3, r3, #(NotPresent :OR: NotAvailable) :SHL: 28
         BCC     %FT30
-        LDR     lr, [r7, r5, LSL #3]    ; Page is there so get PPL and determine if it's available or not.
+        LDR     lr, [r7, r5, LSL #CAM_EntrySizeLog2] ; Page is there so get PPL and determine if it's available or not.
         TST     lr, #PageFlags_Unavailable
         ORREQ   r3, r3, #DRAM_Pattern :SHL: 28
         ORRNE   r3, r3, #(DRAM_Pattern :OR: NotAvailable) :SHL: 28
@@ -615,7 +695,6 @@ fill_words
 MemoryAmounts   ROUT
         Entry   "r3"
 
- [ HAL
         BICS    lr, r0, #&FF            ; Get type of memory required (leave bits 12-31, non-zero => error).
         CMP     lr, #6:SHL:8
         ADDCC   pc, pc, lr, LSR #8-2
@@ -685,53 +764,6 @@ MemoryAmounts   ROUT
         SETV
       ]
         EXIT
- |
-        BICS    lr, r0, #&FF            ; Get type of memory required (leave bits 12-31, non-zero => error).
-        BEQ     %FT30                   ; Don't understand 0 (so the spec says).
-
-        TEQ     lr, #5:SHL:8            ; Check for soft ROM
-        BNE     %FT10
-        LDR     r1, =L1PT
-        MOV     r2, #ROM
-        ADD     r1, r1, r2, LSR #(20-2)   ; L1PT address for ROM
-        LDR     r2, [r1]
-        MOV     r2, r2, LSR #12
-        TEQ     r2, #PhysROM :SHR: 12     ; see if we have hard or soft ROM
-        MOVEQ   r1, #0                    ; no soft ROM
-        MOVNE   r1, #OSROM_ImageSize*1024 ; this much soft ROM
-        B       %FT20
-
-10
-        TEQ     lr, #4:SHL:8            ; Check for IO space.
-        LDREQ   r1, =136*1024*1024      ; Just return 136M (includes VIDC and EASI space).
-        BEQ     %FT20
-
-        TEQ     lr, #3:SHL:8            ; Check for ROM.
-        LDREQ   r1, =OSROM_ImageSize*1024
-        BEQ     %FT20
-
-        TEQ     lr, #2:SHL:8            ; Check for VRAM.
-        MOVEQ   r1, #0                  ; Return amount of VRAM.
-        LDREQ   r1, [r1, #VRAMSize]
-        BEQ     %FT20
-
-        TEQ     lr, #1:SHL:8            ; Check for DRAM.
-        BNE     %FT30
-        MOV     r1, #0
-        LDR     lr, [r1, #RAMLIMIT]
-        LDR     r1, [r1, #VRAMSize]
-        SUB     r1, lr, r1              ; Return amount of RAM - amount of VRAM.
-
-20
-        MOV     r1, r1, LSR #12         ; Return as number of pages.
-        MOV     r2, #4*1024             ; Return page size.
-        EXIT
-
-30
-        ADRL    r0, ErrorBlock_BadParameters
-        SETV
-        EXIT
- ]
 
 
 ;----------------------------------------------------------------------------------------
@@ -760,7 +792,6 @@ MemoryAmounts   ROUT
 ;       Return the location of the specified controller.
 ;
 
- [ HAL
 MemoryIOSpace   ROUT
         Entry   "r0,r2,r3,sb,ip"
         AddressHAL
@@ -771,96 +802,9 @@ MemoryIOSpace   ROUT
         STREQ   r0, [sp, #0]
         SETV    EQ
         EXIT
- |
-MemoryIOSpace   ROUT
-        Entry   "r2"
-
-        AND     r2, r1, #&FF            ; Get sequence number.
-        MOV     r1, r1, LSR #8          ; Get controller type.
-        CMP     r1, #6                  ; Make sure it's in range.
-        ADRCSL  r0, ErrorBlock_BadParameters
-        SETV    CS
-        EXIT    CS
-
-        ADR     lr, controller_types
-        LDR     r1, [lr, r1, LSL #2]    ; Get base address or offset to table.
-        TEQ     r1, #0                  ; If not present or
-        CMPNE   r1, #1024               ;    not offset to table then
-        EXIT    GE                      ;    return.
-
-        ADD     lr, lr, r1              ; Point to table indexed by sequence number.
-        LDR     r1, [lr], #4            ; Get sequence number limit.
-        CMP     r2, r1                  ; Make sure it's in range.
-        BCS     %FT20
-        LDR     r1, [lr, r2, LSL #2]    ; Get base address.
-        EXIT
-
-controller_types
-        DCD     IOMD_Base + IOMD_ECTCR  ; Expansion card timing control.
-        DCD     easi_space_table - controller_types
-        DCD     0
-        DCD     VIDC
-        DCD     IOMD_Base
-        DCD     0
-
-easi_space_table
-        DCD     8                       ; Maximum of 8 expansion cards.
-        DCD     PhysSpace + IOMD_EASI_Base0
-        DCD     PhysSpace + IOMD_EASI_Base1
-        DCD     PhysSpace + IOMD_EASI_Base2
-        DCD     PhysSpace + IOMD_EASI_Base3
-        DCD     PhysSpace + IOMD_EASI_Base4
-        DCD     PhysSpace + IOMD_EASI_Base5
-        DCD     PhysSpace + IOMD_EASI_Base6
-        DCD     PhysSpace + IOMD_EASI_Base7
- ] ; HAL
 
 ;----------------------------------------------------------------------------------------
-; MemoryFreePoolLock
-;
-;
-;       In:     r0 bits 0..7  = 10 (reason code 10)
-;               r0 bit  8     = 1 if call is by Wimp (reserved for Acorn use), 0 otherwise
-;               r0 bits 9..31 reserved (must be 0)
-;               r1 = 0  to resume any background actions that may manipulate FreePool mapping
-;                       (currently, this is just VRAMRescue)
-;                  = 1  to suspend any background actions that may manipulate FreePool mapping
-;                  all other values reserved (undefined behaviour)
-;
-;       Out:    r1 = previous state (1=suspended, 0=not suspended)
-;
-; A suspend call from the Wimp will be taken to mean that the whole FreePool is locked, and
-; memory cannot be moved (supports Wimp_ClaimFreeMemory)
-;
-; VRAM rescue doesn't happen in this Kernel, but we still support the call for the Wimp.
-;
-MemoryFreePoolLock ROUT
-        Push    "r2,r3,lr"
-        LDR     r3,=ZeroPage
-        LDRB    lr,[r3,#VRAMRescue_control]
-        TEQ     r1,#0
-        BNE     %FT10
-;flush TLB(s) for resume - needed for Wimp resume, precaution for other - no cache flush
-;since Free Pool is uncached
- [ HAL
-        Push    "r0"
-        ARMop   TLB_InvalidateAll,,,r3
-        Pull    "r0"
- |
-        ARM_flush_TLB r2
- ]
-10
-        TST     r0,#&100                    ;is it Wimp?
-        MOVEQ   r2,#VRRc_suspend
-        MOVNE   r2,#VRRc_wimp_lock
-        TEQ     r1,#0
-        AND     r1,lr,r2                    ;previous state
-        BICEQ   lr,lr,r2
-        ORRNE   lr,lr,r2
-        STRB    lr,[r3,#VRAMRescue_control] ;set/clear relevant bit
-        TEQ     r1,#0
-        MOVNE   r1,#1
-        Pull    "r2,r3,pc"
+; MemoryFreePoolLock - removed now that free pool is a PMP
 
 ;----------------------------------------------------------------------------------------
 ;PCImapping - reserved for Acorn use (PCI manager)
@@ -903,7 +847,7 @@ RecommendPage ROUT
         MOV     r3,#0            ;page number, starts at 0
         LDR     r5,=ZeroPage+CamEntriesPointer
         LDR     r5,[r5]
-        ADD     r5,r5,#4         ; [r5,<page no.>,LSL #3] addresses flags word in CAM
+        ADD     r5,r5,#CAM_PageFlags ; [r5,<page no.>,LSL #3] addresses flags word in CAM
         LDMIA   r0!,{r7,r8}      ;address,size of video chunk (skip this one)
 ;
 RP_nextchunk
@@ -930,7 +874,7 @@ RP_nextchunk
 RP_nextpage
         CMP     r9,r1
         BLO     RP_nextchunk
-        LDR     r6,[r5,r7,LSL #3]  ;page flags from CAM
+        LDR     r6,[r5,r7,LSL #CAM_EntrySizeLog2] ;page flags from CAM
         ;must not be marked Unavailable or Required
         TST     r6,#PageFlags_Unavailable :OR: PageFlags_Required
         BEQ     RP_checkotherpages
@@ -945,7 +889,7 @@ RP_checkotherpages
         ADD     r10,r7,r1,LSR #12
         SUB     r10,r10,#1         ;last page required
 RP_checkotherpagesloop
-        LDR     r6,[r5,r10,LSL #3] ;page flags from CAM
+        LDR     r6,[r5,r10,LSL #CAM_EntrySizeLog2] ;page flags from CAM
         TST     r6,#PageFlags_Unavailable :OR: PageFlags_Required
         BNE     RP_nextpagecontinue
         SUB     r10,r10,#1
@@ -975,7 +919,7 @@ RP_error
 ;       In:     r0 bits 0..7  = 13 (reason code 13)
 ;               r0 bit  8     = 1 to map bufferable space (0 is normal, non-bufferable)
 ;               r0 bit  9     = 1 to map cacheable space (0 is normal, non-cacheable)
-;               r0 bits 10..12 = 0 (reserved for cache policy)
+;               r0 bits 10..12 = cache policy
 ;               r0 bits 13..15 = 0 (reserved flags)
 ;               r0 bit  16    = 1 to doubly map
 ;               r0 bit  17    = 1 if access privileges specified
@@ -991,11 +935,23 @@ RP_error
 MapIOpermanent ROUT
         Push    "r0-r2,r12,lr"
         MOV     lr, r0
-        TST     lr, #1:SHL:8        ;test bufferable bit
-        MOVNE   r0, #L1_B
-        MOVEQ   r0, #0
-        TST     lr, #1:SHL:9        ;test cacheable bit
-        ORRNE   r0, r0, #L1_C
+        LDR     r12, =ZeroPage
+        ASSERT  XCB_NB = 1:SHL:0
+        ASSERT  XCB_NC = 1:SHL:1
+        ASSERT  XCB_P = 1:SHL:2
+        AND     r0, r0, #&1F00
+        MOV     r0, r0, LSR #8
+        LDR     r12, [r12, #MMU_PCBTrans]
+        EOR     r0, r0, #XCB_NB+XCB_NC ; Invert C+B to match XCBTable
+        LDRB    r0, [r12, r0]
+        ; Convert from L2 attributes to L1
+        ASSERT  L1_C = L2_C
+        ASSERT  L1_B = L2_B
+        ASSERT  L2_TEXShift < L1_TEXShift
+        AND     r12, r0, #L2_TEX
+        BIC     r0, r0, #L2_TEX
+        ORR     r0, r0, r12, LSL #L1_TEXShift-L2_TEXShift
+        ; Deal with other flags
         TST     lr, #1:SHL:16
         ORRNE   r0, r0, #MapInFlag_DoublyMapped
         TST     lr, #1:SHL:17
@@ -1080,6 +1036,10 @@ ReleasePhysAddr
 ;                               9=HAL workspace
 ;                               10=Kernel buffers
 ;                               11=HAL uncacheable workspace
+;                               12=Kernel 'ZeroPage' workspace
+;                               13=Processor vectors
+;                               14=DebuggerSpace
+;                               15=Scratch space
 ;                       16-31   reserved (set to 0)
 ;
 ;       Out:    r1 = base of area
@@ -1111,6 +1071,10 @@ MAI_TableStart
         B       MAI_HALWs
         B       MAI_Kbuffs
         B       MAI_HALWsNCNB
+        B       MAI_ZeroPage
+        B       MAI_ProcVecs
+        B       MAI_DebuggerSpace
+        B       MAI_ScratchSpace
 MAI_TableEnd
 
 70
@@ -1140,11 +1104,9 @@ MAI_SVCStk
         EXIT
 
 MAI_ABTStk
- [ No26bitCode
         LDR     r1, =ABTStackAddress
         MOV     r2, #ABTSTK-ABTStackAddress
         MOV     r3, r2
- ]
         EXIT
 
 MAI_UNDStk
@@ -1174,16 +1136,13 @@ MAI_L2PT
         EXIT
 
 MAI_HALWs
- [ HAL
         LDR     r0, =ZeroPage
         LDR     r1, =HALWorkspace
         MOV     r2, #HALWorkspaceSize
         LDR     r3, [r0, #HAL_WsSize]
- ]
         EXIT
 
 MAI_HALWsNCNB
- [ HAL
         LDR     r0, =ZeroPage
         LDR     r1, =HALWorkspaceNCNB
         MOV     r2, #32*1024
@@ -1191,13 +1150,43 @@ MAI_HALWsNCNB
         LDR     r3, [r3, #HALDesc_Flags]
         ANDS    r3, r3, #HALFlag_NCNBWorkspace
         MOVNE   r3, r2
- ]
         EXIT
 
 MAI_Kbuffs
         LDR     r1, =KbuffsBaseAddress
         MOV     r2, #KbuffsMaxSize
         LDR     r3, =(KbuffsSize + &FFF) :AND: :NOT: &FFF
+        EXIT
+
+MAI_ZeroPage
+        LDR     r1, =ZeroPage
+        MOV     r2, #16*1024
+        MOV     r3, #16*1024
+        EXIT
+
+MAI_ProcVecs
+      [ ZeroPage != ProcVecs
+        LDR     r1, =ProcVecs
+        MOV     r2, #4096
+        MOV     r3, #4096
+      ]
+        EXIT
+
+MAI_DebuggerSpace
+        ; Only report if DebuggerSpace is a standalone page. The debugger module
+        ; finds DebuggerSpace via OS_ReadSysInfo 6, this call is only for the
+        ; benefit of the task manager.
+      [ DebuggerSpace_Size >= &1000
+        LDR     r1, =DebuggerSpace
+        MOV     r2, #DebuggerSpace_Size
+        MOV     r3, #DebuggerSpace_Size
+      ]
+        EXIT
+
+MAI_ScratchSpace
+        LDR     r1, =ScratchSpace
+        MOV     r2, #16*1024
+        MOV     r3, #16*1024
         EXIT
 
 ;----------------------------------------------------------------------------------------
@@ -1240,6 +1229,7 @@ CMA_Partially_Phys     * 1<<12
 CMA_Partially_Abort    * 1<<13
 
 CMA_CheckL2PT          * 1<<31 ; Pseudo flag used internally for checking sparse areas
+CMA_DecodeAP           * 1<<30 ; Used with CheckL2PT to indicate AP flags should be decoded from L2PT
 
 ; AP_ equivalents
 CMA_ROM  * CMA_Partially_UserR+CMA_Partially_PrivR
@@ -1263,7 +1253,7 @@ CheckMemoryAccess ROUT
         ; * application space
         ; * dynamic areas
         ; * IO memory
-        ; * special areas (stacks, ROM, HAL workspace, system heap, etc.)
+        ; * special areas (stacks, ROM, HAL workspace, etc.)
         ; All ranges are checked in increasing address order, so the
         ; completeness flags are returned correctly if we happen to cross from
         ; one range into another
@@ -1273,6 +1263,7 @@ CheckMemoryAccess ROUT
         CMP     r1, #32*1024
         BHS     %FT10
         ; Check zero page
+        ASSERT  ProcVecs = ZeroPage
       [ ZeroPage = 0
         MOV     r3, #0
         MOV     r4, #16*1024
@@ -1313,8 +1304,11 @@ CheckMemoryAccess ROUT
         ; Look through the quick lookup table until we find a valid DANode ptr
         LDR     r6, [r10, #DynArea_ws]
         MOV     r3, r1
+        TEQ     r6, #0 ; We can get called during ROM init, before the workspace is allocated (pesky OS_Heap validating its pointers)
         ADD     r6, r6, #(:INDEX:DynArea_AddrLookup) :AND: &00FF
+        LDREQ   r9, [r10, #DAList] ; So just start at the first DA
         ADD     r6, r6, #(:INDEX:DynArea_AddrLookup) :AND: &FF00
+        BEQ     %FT22
 21
         AND     r8, r3, #DynArea_AddrLookupMask
         LDR     r9, [r6, r8, LSR #30-DynArea_AddrLookupBits]
@@ -1330,8 +1324,8 @@ CheckMemoryAccess ROUT
         B       %FT30
 22
         ; Now that we've found a DA to start from, walk through and process all
-        ; the entries until we hit the system heap (or any other DAs above
-        ; IOAllocLimit)
+        ; the entries until we hit the end of the list, or any DAs above
+        ; IOAllocLimit
         LDR     r3, [r9, #DANode_Base]
         LDR     r6, [r9, #DANode_Flags]
         CMP     r3, r7
@@ -1344,18 +1338,20 @@ CheckMemoryAccess ROUT
         CMP     lr, #2
         MOVEQ   r5, #CMA_None
         MOVGT   r5, #CMA_ROM
-        TST     r6, #DynAreaFlags_SparseMap
+        TST     r6, #DynAreaFlags_PMP
+        ORRNE   r5, r5, #CMA_DecodeAP
+        TSTEQ   r6, #DynAreaFlags_SparseMap
         LDREQ   lr, [r9, #DANode_Size]
-        LDRNE   lr, [r9, #DANode_SparseHWM] ; Use HWM as bounds when checking sparse areas
+        LDRNE   r4, [r9, #DANode_SparseHWM] ; Use HWM as bounds when checking sparse/PMP areas
         ORRNE   r5, r5, #CMA_CheckL2PT ; ... and request L2PT check
-        TST     r6, #DynAreaFlags_DoublyMapped
-        ADD     r4, r3, lr
+        ADDEQ   r4, r3, lr
+        TST     r6, #DynAreaFlags_DoublyMapped ; Currently impossible for Sparse/PMP areas - so use of lr safe
         SUBNE   r3, r3, lr
         BL      CMA_AddRange2
         LDR     r9, [r9, #DANode_Link]
         TEQ     r9, #0
         BNE     %BT22
-        ; Hit the end of the list. This shouldn't happen with the current heap setup!
+        ; Hit the end of the list
 30
         ; IO memory
         CMP     r1, #IO
@@ -1451,12 +1447,7 @@ CheckMemoryAccess ROUT
         MOV     r5, #CMA_None
         BL      CMA_AddRange
 70
-        ASSERT  CursorChunkAddress > HALWorkspaceNCNB
-        LDR     r3, =CursorChunkAddress
-        MOV     r4, #32*1024
-        MOV     r5, #CMA_Read
-        BL      CMA_AddRange
-        ASSERT  L2PT > CursorChunkAddress
+        ASSERT  L2PT > HALWorkspaceNCNB
         LDR     r3, =L2PT
         MOV     r5, #CMA_None
         MOV     r4, #4*1024*1024
@@ -1467,14 +1458,12 @@ CheckMemoryAccess ROUT
         MOV     r4, #16*1024
         MOV     r5, #CMA_None
         BL      CMA_AddRange
-        ; Note that system heap needs to be checked manually due to being
-        ; outside main DA address range
-        ASSERT  SysHeapChunkAddress > L1PT
-        LDR     r3, =SysHeapChunkAddress
-        LDR     r4, [r10, #SysHeapDANode + DANode_Size]
-        MOV     r5, #CMA_Full
+        ASSERT  CursorChunkAddress > L1PT
+        LDR     r3, =CursorChunkAddress
+        MOV     r4, #32*1024
+        MOV     r5, #CMA_Read
         BL      CMA_AddRange
-        ASSERT  CAM > SysHeapChunkAddress
+        ASSERT  CAM > CursorChunkAddress
         LDR     r3, =CAM
         LDR     r4, [r10, #SoftCamMapSize]
         MOV     r5, #CMA_None
@@ -1485,6 +1474,7 @@ CheckMemoryAccess ROUT
         MOV     r5, #CMA_ROM
         BL      CMA_AddRange
         ; Finally, high processor vectors/relocated zero page
+        ASSERT  ProcVecs = ZeroPage
       [ ZeroPage > 0
         ASSERT  ZeroPage > ROM
         MOV     r3, r10
@@ -1553,8 +1543,10 @@ CMA_AddRange2 ; r3 = start, r4 = end (excl.)
         BICHS   r2, r2, lr
         MOVLO   r2, r4
         ; r2 is now page aligned min(r2+1,r4)
-        BIC     r4, r1, lr
         LDR     r8, =L2PT
+        TST     r5, #CMA_DecodeAP
+        BIC     r4, r1, lr
+        BNE     %FT35
         MOV     r10, #0
 30
         BL      logical_to_physical
@@ -1571,5 +1563,38 @@ CMA_AddRange2 ; r3 = start, r4 = end (excl.)
         BICHS   r0, r0, r8 ; Not fully mapped, clear completion flags
         BNE     %BT04 ; Partially/entirely mapped
         B       %BT05 ; Completely unmapped
+
+35
+        ; Check L2PT, with AP decoding on a per-page basis
+40
+        LDR     r10, =&0F0F0F0F
+        BL      logical_to_physical
+        BICCS   r0, r0, r10 ; Not fully mapped, clear completion flags
+        BCS     %FT45
+        ; Get the L2PT entry and decode the flags
+        LDR     r9, [r8, r4, LSR #10]
+      [ MEMM_Type = "VMSAv6"
+        AND     r9, r9, #L2_AP
+      |
+        AND     r9, r9, #L2X_AP
+      ]
+        MOV     r5, #CMA_ROM
+        CMP     r9, #AP_None*L2X_APMult
+        MOVEQ   r5, #CMA_None
+        CMP     r9, #AP_Read*L2X_APMult
+        MOVEQ   r5, #CMA_Read
+        CMP     r9, #AP_Full*L2X_APMult
+        MOVEQ   r5, #CMA_Full
+        ORR     r10, r5, r10
+        ORR     r0, r0, r5 ; Set new partial flags
+        AND     r0, r0, r10, ROR #4 ; Discard completion flags which aren't for this range
+45
+        ADD     r4, r4, #4096
+        CMP     r4, r2
+        BNE     %BT40
+        Pull    "r2,r4,r5,r8,r9,r10,lr"
+        B       %BT05
+
+        LTORG
 
         END

@@ -28,15 +28,17 @@ TOKHELPSRC      = ${TOKENSOURCE}
 HELPSRC         = HelpStrs
 ROM_SOURCE      = GetAll.s
 KERNEL_MODULE   = bin${SEP}${COMPONENT}
-ASFLAGS         = -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
+ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
-                  ${EXP_HDR}.GPIODevice \
+                  ${EXP_HDR}.AHCIDevice \
+                  ${EXP_HDR}.EtherDevice \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
                   ${EXP_HDR}.OSEntries \
+                  ${EXP_HDR}.OSMisc \
                   ${EXP_HDR}.OSRSI6 \
                   ${EXP_HDR}.PL310 \
                   ${EXP_HDR}.PublicWS \
@@ -49,6 +51,7 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${C_EXP_HDR}.HALEntries \
                   ${C_EXP_HDR}.ModHand \
                   ${C_EXP_HDR}.OSEntries \
+                  ${C_EXP_HDR}.OSMisc \
                   ${C_EXP_HDR}.OSRSI6 \
                   ${C_EXP_HDR}.RISCOS \
                   ${C_EXP_HDR}.Variables \
@@ -83,7 +86,7 @@ inst_dirs:
 install: ${EXPORTS} inst_dirs
 	@${ECHO} ${COMPONENT}: header files installed
 
-${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS} 
+${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS}
 	${MKDIR} bin
 	${LD} -bin -o $@ ${ROM_OBJECT}
 	${LD} -aif -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECT}
@@ -97,22 +100,31 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
 	${CP} hdr.EnvNumbers $@ ${CPFLAGS}
-	
-${EXP_HDR}.GPIODevice: hdr.GPIODevice
-	${CP} hdr.GPIODevice $@ ${CPFLAGS}
-	
+
+${EXP_HDR}.SPIDevice: hdr.SPIDevice
+	${CP} hdr.SPIDevice $@ ${CPFLAGS}
+
+${EXP_HDR}.AHCIDevice: hdr.AHCIDevice
+	${CP} hdr.AHCIDevice $@ ${CPFLAGS}
+
+${EXP_HDR}.EtherDevice: hdr.EtherDevice
+	${CP} hdr.EtherDevice $@ ${CPFLAGS}
+
 ${EXP_HDR}.HALDevice: hdr.HALDevice
 	${CP} hdr.HALDevice $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.HALEntries: hdr.HALEntries
 	${CP} hdr.HALEntries $@ ${CPFLAGS}
 
 ${EXP_HDR}.ModHand: hdr.ModHand
 	${CP} hdr.ModHand $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.OSEntries: hdr.OSEntries
 	${CP} hdr.OSEntries $@ ${CPFLAGS}
-	
+
+${EXP_HDR}.OSMisc: hdr.OSMisc
+	${CP} hdr.OSMisc $@ ${CPFLAGS}
+
 ${EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${CP} hdr.OSRSI6 $@ ${CPFLAGS}
 
@@ -133,7 +145,7 @@ ${EXP_HDR}.VduExt: hdr.VduExt
 
 ${EXP_HDR}.VIDCList: hdr.VIDCList
 	${CP} hdr.VIDCList $@ ${CPFLAGS}
-	
+
 ${EXP_HDR}.VideoDevice: hdr.VideoDevice
 	${CP} hdr.VideoDevice $@ ${CPFLAGS}
 
@@ -150,6 +162,10 @@ ${C_EXP_HDR}.ModHand: hdr.ModHand
 
 ${C_EXP_HDR}.OSEntries: Global.h.OSEntries h.OSEntries
 	${FAPPEND} $@ h.OSEntries Global.h.OSEntries
+
+${C_EXP_HDR}.OSMisc: hdr.OSMisc
+	${MKDIR} ${C_EXP_HDR}
+	${HDR2H} hdr.OSMisc $@
 
 ${C_EXP_HDR}.OSRSI6: hdr.OSRSI6
 	${MKDIR} ${C_EXP_HDR}
