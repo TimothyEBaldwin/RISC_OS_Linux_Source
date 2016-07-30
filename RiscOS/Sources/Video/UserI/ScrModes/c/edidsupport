@@ -22,7 +22,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <math.h>
 #include <stdbool.h>
 
 #include "kernel.h"
@@ -39,6 +38,9 @@
 #include "modex.h"
 #include "edidsupport.h"
 #include "tables.h"
+
+#define ROUND_DIV(n,d)     (((n) + ((d) >> 1)) / (d)) /* Excel's ROUND(n/d,0) */
+#define ROUNDDOWN_DIV(n,d) ((n) / (d))                /* Excel's ROUNDDOWN(n/d,0) */
 
 /* By default we only use DMT timings; we will check for additional support later */
 static int timing_support = EDID_USE_DMT;
@@ -200,110 +202,110 @@ static void get_dtd_ascii(EDIDBlockRef edidblockref, int block_number, char *dat
     data[i] = 0;
 }
 
-static void generate_mode_using_gtf(double h_pixels, double v_lines, double ip_freq_rqd, ModeDescriptionRef mode_desc, MonitorDescriptionRef monitor)
+static void generate_mode_using_gtf(uint32_t h_pixels, uint32_t v_lines, uint32_t ip_freq_rqd, ModeDescriptionRef mode_desc, MonitorDescriptionRef monitor)
 {
-    const int margins_rqd = 0; /* Set to 1 if margins are wanted. */
-    const double margin_per = 1.8; /* Percentage size of margin (0 to 100) if reqd */
-    double v_lines_rnd = 0; /* Number of desired visible lines rounded down to */
-                            /* The nearest character cell */
-    double v_sync_rqd = 3; /* The width of the v sync in lines */
-    double h_sync_percent = 8; /* The width of the H sync as percentage of the total line period */
-    double cell_gran_rnd = 8; /* Character cell width in pixels. May be able to confirm this value in hardware but at present hardcode this to 8 (usual value), */
-    const int int_rqd = 0; /* int_rqd specifies whether the mode should be interlaced. Most modes used are not. */
-    double v_field_rate_reqd = 0; /* The actual vertical field rate after interlacing is taking into consideration */
-    double interlace = 0; /* If interlacing is used, this will be set to 0.5 */
-
-    const double min_vsync_and_bp = 550; /* The minimum time of vertical sync and back porch interval(us) */
-    const double min_porch = 1; /* Minimum front porch in lines (vertical) and character cells (horizontal) */
-    const double c = 40; /* The blanking formula offset */
-    const double m = 600; /* The blanking formula gradient */
-    const double k = 128; /* The blanking formula scaling factor */
-    const double j = 20; /* The blanking formula scaling factor weighting */
-
-    /* coefficient calculations. These should be constants in standard GTF */
-    double C = ((c-j) * k / 256) + j;
-    double M = k / 256 * m;
-
-    /* Find the refresh rate required (Hz) */
-
-    /* If interlaced, the number of vertical lines assumed by the
-     * calculation must be halved, as the computation calculates the
-     * number of vertical lines per field. In either case, the number
-     * of lines is rounded down to the nearest integer.
+    /* Based on VESA GTF spec 1.1, the variable names match those in the spec and equation
+     * numbers labelled for cross referencing.
+     * Stage 1 uses basic timing parameters and vertical frequency, then follows Stage 2.
+     * Most of the results are integer values (lines, pixels), only a few timings (탎, Hz, %)
+     * need to keep fractional bits which are suffixed "[un|signed]whole<p>fractional".
+     * The v_lines & ip_freq_rqd are as though progressive scan, eg. PAL would be 720x576 @ 25Hz.
      */
+#define GTF_MARGIN_PTHOU    18     /* 1.8% */
+#define GTF_CELL_GRAN_RND   8      /* Char cell granularity, must be a multiple of 2 */
+#define GTF_2CELL_GRAN_RND  (2*GTF_CELL_GRAN_RND)
+#define GTF_MIN_PORCH       1      /* Lines (or char cells) porch */
+#define GTF_V_SYNC_RQD      3      /* Lines */
+#define GTF_H_SYNC_PTHOU    80     /* 8% */
+#define GTF_MIN_VSYNC_BP    550uLL /* 탎 */
+#define GTF_C_PRIME         30     /* ((C - J) x (K / 256)) + J   where C=40% M=600%/kHz K=128 J=20% */
+#define GTF_M_PRIME         300    /* (K / 256) x M */
 
-    if (int_rqd == 1)
+    uint32_t h_pixels_rnd, h_blank, total_active_pixels;
+    uint32_t h_period_u8p24, h_period_est_u8p24;
+    uint32_t h_back_porch, h_sync_pixels, h_front_porch, total_pixels;
+
+    uint32_t v_field_rate_est_u8p24, v_frame_rate_u8p24, v_field_rate_u8p24;
+    uint32_t v_lines_rnd, v_sync_bp, v_field_rate_rqd;
+    uint32_t v_back_porch, v_sync_rqd, v_front_porch, total_v_lines;
+
+    uint32_t top_margin, bottom_margin, left_margin, right_margin;
+    uint32_t pixel_freq;
+    uint64_t num, den;
+    int32_t  ideal_duty_cycle_s7p24;
+    const bool int_rqd = false; /* Interlacing not propagated to mode description */
+    const bool margins_rqd = false; /* Margins currently not offered */
+
+    /* 7.3.1 horizontal pixels rounded to whole character cells */
+    h_pixels_rnd = GTF_CELL_GRAN_RND * ROUND_DIV(h_pixels, GTF_CELL_GRAN_RND);
+
+    /* 7.3.2 vertical lines per field & 7.3.3 field rate */
+    if (int_rqd)
     {
-        v_lines_rnd = round(v_lines / 2);
-        v_field_rate_reqd = ip_freq_rqd * 2;
-        interlace = 0.5;
+        v_lines_rnd = ROUND_DIV(v_lines, 2);
+        v_field_rate_rqd = ip_freq_rqd * 2;
     }
     else
     {
-        v_lines_rnd = round(v_lines);
-        v_field_rate_reqd = ip_freq_rqd;
-        /* Interlace is automatically set to 0 */
+        v_lines_rnd = v_lines;
+        v_field_rate_rqd = ip_freq_rqd;
     }
 
-    /* Round the number of pixels to the nearest character */
-    /* cell boundary */
-    double h_pixels_rnd = (round(h_pixels/cell_gran_rnd)) * cell_gran_rnd;
+    /* 7.3.4 top margin & 7.3.5 bottom margin */
+    top_margin = margins_rqd ? ROUND_DIV(v_lines_rnd * GTF_MARGIN_PTHOU, 1000)
+                             : 0;
+    bottom_margin = top_margin;
 
-    /* Determine the width of the left and right borders */
-    double left_margin = 0; /* Number of pixels in the left hand margin, rounded */
-                          /* down to the nearest character cell. If no margins */
-                          /* required this is set to 0. */
-    double right_margin = 0; /* see left_margin */
-    double top_margin = 0; /* No of lines rounded down to nearest line. */
-    double bot_margin = 0; /* See top, left, right */
-
-    if (margins_rqd == 1)
+    /* 7.3.7 estimate horizontal period in 탎 */
+    num = ((1000000uLL << 24) / v_field_rate_rqd) - (GTF_MIN_VSYNC_BP << 24);
+    den = v_lines_rnd + (2uLL * top_margin) + GTF_MIN_PORCH;
+    if (int_rqd)
     {
-        left_margin = round(h_pixels_rnd * margin_per / 100 / cell_gran_rnd) *cell_gran_rnd;
-        right_margin = left_margin;
-        top_margin = round(margin_per / 100 * v_lines_rnd);
-        bot_margin = top_margin;
+        h_period_est_u8p24 = (uint32_t)((2 * num) / ((2 * den) + 1));
     }
-
-    /* For the calculations below, refer to the VESA GTF v1.1 spec */
-
-    /* Estimate the horizontal period */
-    double h_period_est = ((1 / v_field_rate_reqd) - min_vsync_and_bp/1000000)
-             / (v_lines_rnd + (2 * top_margin) + min_porch + interlace)
-             * 1000000;
-
-    /* Find the number of lines in V sync + B Porch */
-    double vsync_and_bp = round(min_vsync_and_bp / h_period_est);
-
-    /* Find number of lines in back porch alone */
-    double v_back_porch = vsync_and_bp - v_sync_rqd;
-
-    /* Find the total number of lines in the vertical field period */
-    double total_v_lines = v_lines_rnd + top_margin + bot_margin + vsync_and_bp + interlace + min_porch;
-
-    /* Estimate the vertical field frequency */
-    double v_field_rate_est = 1/h_period_est/total_v_lines * 1000000;
-
-    /* Find the actual horizontal period */
-    double h_period = h_period_est / (v_field_rate_reqd / v_field_rate_est);
-
-    /* Find the actual vertical field frequency */
-    double v_field_rate = 1/h_period/total_v_lines * 1000000;
-
-    /* Find the vertical frame frequency */
-    if (int_rqd == 1)
+    else
     {
-        v_field_rate = v_field_rate / 2;
+        h_period_est_u8p24 = (uint32_t)(num / den);
     }
 
-    /* GTF calculates margins using a percentage here. We use actual pixels */
-    /* (and 0 always at present) */
+    /* 7.3.8 lines in vsync and vertical back porch & 7.3.9 vertical back porch alone */
+    v_sync_bp = (uint32_t)ROUND_DIV(GTF_MIN_VSYNC_BP << 24, h_period_est_u8p24);
+    v_back_porch = v_sync_bp - GTF_V_SYNC_RQD;
 
-    double total_active_pixels = h_pixels_rnd + left_margin + right_margin;
+    /* 7.3.10 lines in the field period (actually, half lines) */
+    total_v_lines = (2 * (v_lines_rnd + top_margin + bottom_margin + v_sync_bp + GTF_MIN_PORCH)) +
+                    (int_rqd ? 1 : 0);
 
-    /* Find the ideal blanking duty cycle from the blanking duty cycle equation */
-    double ideal_duty_cycle = C - (M * h_period / 1000);
-    if (ideal_duty_cycle < 0)
+    /* 7.3.11 estimate vertical field rate */
+    num = (1uLL << (24 + 24 + 1));
+    den = (uint64_t)h_period_est_u8p24;
+    num = 1000000 * (num / den);
+    v_field_rate_est_u8p24 = (uint32_t)(num / total_v_lines);
+
+    /* 7.3.12 find actual horizontal period */
+    num = (uint64_t)h_period_est_u8p24 * v_field_rate_est_u8p24;
+    den = v_field_rate_rqd;
+    h_period_u8p24 = (uint32_t)((num / den) >> 24);
+
+    /* 7.3.13 find actual vertical field rate & 7.3.14 frame rate */
+    num = (1uLL << (24 + 24 + 1));
+    den = (uint64_t)h_period_u8p24;
+    num = 1000000 * (num / den);
+    v_field_rate_u8p24 = (uint32_t)(num / total_v_lines);
+    v_frame_rate_u8p24 = int_rqd ? (v_field_rate_u8p24 / 2) : v_field_rate_u8p24;
+
+    /* 7.3.15 left margin & 7.3.16 right margin */
+    left_margin = margins_rqd ? ROUND_DIV(h_pixels_rnd * GTF_MARGIN_PTHOU, 1000 * GTF_CELL_GRAN_RND)
+                              : 0;
+    left_margin = GTF_CELL_GRAN_RND * left_margin;
+    right_margin = left_margin;
+
+    /* 7.3.17 total active pixels & 7.3.18 ideal duty cycle */
+    total_active_pixels = h_pixels_rnd + left_margin + right_margin;
+    num = (uint64_t)GTF_M_PRIME * h_period_u8p24;
+    den = 1000;
+    ideal_duty_cycle_s7p24 = (int32_t)((GTF_C_PRIME << 24) - (uint32_t)(num / den));
+    if (ideal_duty_cycle_s7p24 < 0)
     {
         IFDEBUG printf("Error - negative duty cycle\n");
         /* If this happens we should just ignore the mode */
@@ -311,75 +313,44 @@ static void generate_mode_using_gtf(double h_pixels, double v_lines, double ip_f
         return;
     }
 
-    /* Find the number of pixels in the blanking time to the nearest double */
-    /* character cell */
-    double h_blank_pixels = (round(total_active_pixels * ideal_duty_cycle / (100 - ideal_duty_cycle) / (2 * cell_gran_rnd))) * (2 * cell_gran_rnd);
+    /* 7.3.19 horizontal blanking period in pixels & 7.3.20 total pixels */
+    num = (uint64_t)total_active_pixels * ideal_duty_cycle_s7p24;
+    den = (100uLL << 24) - ideal_duty_cycle_s7p24;
+    h_blank = GTF_2CELL_GRAN_RND * ROUND_DIV((uint32_t)(num / den), GTF_2CELL_GRAN_RND);
+    total_pixels = total_active_pixels + h_blank;
 
-    /* Find the total number of pixels */
-    double total_pixels = total_active_pixels + h_blank_pixels;
+    /* 7.3.21 pixel clock (actually, kHz) */
+    num = ((1000uLL << 24) * total_pixels);
+    den = h_period_u8p24;
+    pixel_freq = (uint32_t)(num / den);
 
-    /* Find pixel clock frequency */
-    double pixel_freq = total_pixels / h_period;
+    /* 7.6.17 pixels in horizontal sync */
+    h_sync_pixels = (total_pixels * GTF_H_SYNC_PTHOU) / 1000;
+    h_sync_pixels = GTF_CELL_GRAN_RND * ROUND_DIV(h_sync_pixels, GTF_CELL_GRAN_RND);
 
-    /* Find horizontal frequency */
-    /* double h_freq = 1000 / h_period; */
+    /* 7.6.18 horizontal front porch & 7.6.19 horizontal back porch */
+    h_front_porch = (h_blank / 2) - h_sync_pixels;
+    h_back_porch = h_front_porch + h_sync_pixels;
 
-    /* From GTF spec - Using Stage 1 parameters to derive stage 2 parameters */
+    /* 7.6.36 vertical front porch */
+    v_front_porch = GTF_MIN_PORCH;
+    v_sync_rqd = GTF_V_SYNC_RQD;
 
-    /* Find addressable lines per frame */
-    double addr_lines_per_frame;
-    if (int_rqd == 1)
-    {
-        addr_lines_per_frame = v_lines_rnd * 2;
-    }
-    else
-    {
-        addr_lines_per_frame = v_lines_rnd;
-    }
-
-    /* Find the total number of lines in a frame: */
-    double total_lines_per_frame = v_lines_rnd + top_margin + bot_margin + vsync_and_bp + interlace + min_porch;
-    if (int_rqd == 1)
-    {
-        total_lines_per_frame = total_lines_per_frame * 2;
-    }
-
-    /* Find the number of pixels in the horizontal sync period */
-    double h_sync_pixels = (round(h_sync_percent/100 * total_pixels
-      / cell_gran_rnd)) * cell_gran_rnd;
-
-    /* Find the number of pixels in the horizontal front porch period */
-    double h_front_porch = (h_blank_pixels / 2) - h_sync_pixels;
-
-    double h_back_porch = h_front_porch + h_sync_pixels;
-
-    /* Find the odd front porch period (lines) (36) */
-    double v_fporch = min_porch + interlace;
-
-    mode_desc->definition.xres = (int)h_pixels;
-    mode_desc->definition.yres = (int)v_lines;
-    mode_desc->definition.hpar[FR_SYNC] = (int) h_sync_pixels;
-    mode_desc->definition.hpar[FR_BPCH] = (int) h_back_porch;
-    mode_desc->definition.hpar[FR_BDR1] = (int) left_margin;
-    mode_desc->definition.hpar[FR_DISP] = (int) h_pixels;
-    mode_desc->definition.hpar[FR_BDR2] = (int) right_margin;
-    mode_desc->definition.hpar[FR_FPCH] = (int) h_front_porch;
-    mode_desc->definition.vpar[FR_SYNC] = (int) v_sync_rqd;
-    mode_desc->definition.vpar[FR_BPCH] = (int) v_back_porch;
-    mode_desc->definition.vpar[FR_BDR1] = (int) top_margin;
-
-    if (int_rqd == 1)
-    {
-        mode_desc->definition.vpar[FR_DISP] = (int) v_lines / 2;
-    }
-    else
-    {
-        mode_desc->definition.vpar[FR_DISP] = (int) v_lines;
-    }
-
-    mode_desc->definition.vpar[FR_BDR2] = (int) bot_margin;
-    mode_desc->definition.vpar[FR_FPCH] = (int) v_fporch;
-    mode_desc->definition.pixel_khz = (int) round(pixel_freq * 1000);
+    mode_desc->definition.xres = h_pixels;
+    mode_desc->definition.yres = v_lines;
+    mode_desc->definition.hpar[FR_SYNC] = h_sync_pixels;
+    mode_desc->definition.hpar[FR_BPCH] = h_back_porch;
+    mode_desc->definition.hpar[FR_BDR1] = left_margin;
+    mode_desc->definition.hpar[FR_DISP] = h_pixels;
+    mode_desc->definition.hpar[FR_BDR2] = right_margin;
+    mode_desc->definition.hpar[FR_FPCH] = h_front_porch;
+    mode_desc->definition.vpar[FR_SYNC] = v_sync_rqd;
+    mode_desc->definition.vpar[FR_BPCH] = v_back_porch; /* Note, loss of interlacing */
+    mode_desc->definition.vpar[FR_BDR1] = top_margin;
+    mode_desc->definition.vpar[FR_DISP] = v_lines;
+    mode_desc->definition.vpar[FR_BDR2] = bottom_margin;
+    mode_desc->definition.vpar[FR_FPCH] = v_front_porch; /* Note, loss of interlacing */
+    mode_desc->definition.pixel_khz = pixel_freq;
     mode_desc->definition.external_clock = -1;
     if (timing_support == EDID_USE_GTF)
     {
@@ -389,9 +360,9 @@ static void generate_mode_using_gtf(double h_pixels, double v_lines, double ip_f
     {
         mode_desc->definition.syncpol = HSync_Positive+VSync_Negative; /* Secondary GTF */
     }
-    mode_desc->definition.interlaced = int_rqd;
+    mode_desc->definition.interlaced = int_rqd ? 1 : 0;
+    sprintf(mode_desc->definition.name, "%d x %d", h_pixels, v_lines);
 
-    sprintf(mode_desc->definition.name, "%d x %d", (int)h_pixels, (int)v_lines);
     compute_modedescription(mode_desc);
 
     if (add_proposed_mode(monitor, mode_desc) == 0)
@@ -403,57 +374,55 @@ static void generate_mode_using_gtf(double h_pixels, double v_lines, double ip_f
 #endif
 }
 
-static void generate_mode_using_cvt_rb(double h_pixels, double v_lines, double ip_freq_rqd, ModeDescriptionRef mode_desc, MonitorDescriptionRef monitor)
+/* Compute a mode using CVT, based on section 5 of VESA CVT Standard 1.2.
+ * The variable names used below are those from the standard where possible.
+ */
+static void generate_mode_using_cvt_rb(uint32_t h_pixels, uint32_t v_lines, uint32_t ip_freq_rqd, ModeDescriptionRef mode_desc, MonitorDescriptionRef monitor)
 {
-    const int int_rqd = 0; /* int_rqd specifies whether the mode should be interlaced. Most modes used are not. */
-    const int margins_rqd = 0; /* Set to 1 if margins are wanted. */
-    const double margin_per = 1.8; /* Percentage size of margin(0 to 100) if reqd */
-    double cell_gran_rnd = 8; /* Character cell width in pixels. May be able to confirm this value in hardware but at present hardcode this to 8 (usual value), */
-    double v_field_rate_reqd = 0; /* The actual vertical field rate after interlacing is taking into consideration */
-    double v_lines_rnd = 0; /* Number of desired visible lines rounded down to the nearest character cell */
-    double interlace = 0; /* If interlacing is used, this will be set to 0.5 */
-    int v_sync_rnd = 0;
-
-    /* Determine the aspect ratio and set the v_sync_rnd variable
-     * This is a slightly messy lookup table - VESA recommends the lookup
-     * approach. We match on X, but in some cases we need to also check Y if
-     * there are other modes with different heights.
+    /* Based on VESA CVT spec 1.2, the variable names match those in the spec and equation
+     * numbers labelled for cross referencing.
+     * Most of the results are integer values (lines, pixels), only a few timings (탎, Hz, %)
+     * need to keep fractional bits which are suffixed "[un|signed]whole<p>fractional".
+     * The v_lines & ip_freq_rqd are as though progressive scan, eg. PAL would be 720x576 @ 25Hz.
      */
-    if ((h_pixels == 640)  || (h_pixels == 800)  ||
-        (h_pixels == 1024) || (h_pixels == 1400) ||
-        (h_pixels == 1600) || (h_pixels == 1920) ||
-        (h_pixels == 2048) || (h_pixels == 2560) ||
-        (h_pixels == 3200) || (h_pixels == 3840))
-    {
-        v_sync_rnd = 4;
-    }
+#define CVT_MARGIN_PTHOU    18     /* 1.8% */
+#define CVT_C_PRIME         30     /* ((C - J) x (K / 256)) + J   where C=40% M=600%/kHz K=128 J=20% */
+#define CVT_CLOCK_STEP      250    /* 0.25MHz */
+#define CVT_H_SYNC_PTHOU    80     /* 8% */
+#define CVT_M_PRIME         300    /* (K / 256) x M */
+#define CVT_MIN_V_PORCH_RND 3      /* Lines */
+#define CVT_MIN_V_BPORCH    6      /* Lines */
+#define CVT_MIN_VSYNC_BP    550uLL /* 탎 */
+#define CVT_RB_H_BLANK      160    /* 탎 */
+#define CVT_RB_H_SYNC       32     /* 탎 */
+#define CVT_RB_MIN_V_BLANK  460uLL /* 탎 */
+#define CVT_RB_V_FPORCH     3      /* Lines */
+#define CVT_CELL_GRAN_RND   8      /* Char cell granularity, must be a multiple of 2 */
+#define CVT_2CELL_GRAN_RND  (2*CVT_CELL_GRAN_RND)
 
-    if ((h_pixels == 1280) && ((v_lines == 1024) || (v_lines == 768)))
-    {
-        v_sync_rnd = 7;
-    }
+    uint32_t h_pixels_rnd, h_blank, total_active_pixels;
+    uint32_t h_period_est_u8p24;
+    uint32_t h_back_porch, h_sync_pixels, h_front_porch, total_pixels;
 
-    if ((h_pixels == 848) ||
-        (h_pixels == 1064) ||
-        ((h_pixels == 1280) && (v_lines == 720)) ||
-        (h_pixels == 1360) ||
-        (h_pixels == 1704) ||
-        (h_pixels == 1864) ||
-        ((h_pixels == 1920) && (v_lines == 1080)) ||
-        (h_pixels == 2128) ||
-        (h_pixels == 2560) ||
-        (h_pixels == 2728) ||
-        (h_pixels == 3408) ||
-        (h_pixels == 4264))
-    {
-        v_sync_rnd = 5;
-    }
+    uint32_t v_lines_rnd, v_sync_bp, vbi_lines, v_field_rate_rqd;
+    uint32_t v_back_porch, v_sync_rnd = 0, v_front_porch, total_v_lines;
 
-    if ((int) (h_pixels / v_lines * 10) == 16)
-    {
-        v_sync_rnd = 6;
-    }
+    uint32_t top_margin, bottom_margin, left_margin, right_margin;
+    uint32_t pixel_freq;
+    uint64_t num, den;
+    int32_t  ideal_duty_cycle_s7p24;
+    const bool int_rqd = false; /* Interlacing not propagated to mode description */
+    const bool margins_rqd = false; /* Margins currently not offered */
 
+    /* Table 3-2 vertical sync based on the aspect ratio */
+    if (((v_lines % 3) == 0) &&
+        ((v_lines * 4 / 3) == h_pixels)) v_sync_rnd = 4; /* 4:3 */
+    if (((v_lines % 9) == 0) &&
+        ((v_lines * 16 / 9) == h_pixels)) v_sync_rnd = 5; /* 16:9 */
+    if (((v_lines % 10) == 0) &&
+        ((v_lines * 16 / 10) == h_pixels)) v_sync_rnd = 6; /* 16:10 */
+    if (((h_pixels == 1280) && (v_lines == 1024)) ||
+        ((h_pixels == 1280) && (v_lines == 768))) v_sync_rnd = 7; /* Specials */
     if (v_sync_rnd == 0)
     {
         IFDEBUG printf("Error - Cannot handle this aspect ratio\n");
@@ -462,229 +431,144 @@ static void generate_mode_using_cvt_rb(double h_pixels, double v_lines, double i
         return;
     }
 
-    /* The variable names used below are those in the VESA Coordinated Timings
-     * Standard. I've kept this code as close to the original as possible for
-     * clarity at the cost of some speed. When this works 110%, this can be
-     * optimised out.
-     */
-
-    /* Find the refresh rate required (Hz) */
-
-    /* If interlaced, the number of vertical lines assumed by the
-     * calculation must be halved, as the computation calculates the
-     * number of vertical lines per field. In either case, the number
-     * of lines is rounded down to the nearest integer.
-     */
-    if (int_rqd == 1)
+    /* 5.2.1 field rate & 5.2.5 vertical lines per field */
+    if (int_rqd)
     {
-        v_lines_rnd = floor(v_lines / 2);
-        v_field_rate_reqd = ip_freq_rqd * 2;
-        interlace = 0.5;
+        v_lines_rnd = ROUNDDOWN_DIV(v_lines, 2);
+        v_field_rate_rqd = ip_freq_rqd * 2;
     }
     else
     {
-        v_lines_rnd = floor(v_lines);
-        v_field_rate_reqd = ip_freq_rqd;
-        /* Interlace is automatically set to 0 */
+        v_lines_rnd = v_lines;
+        v_field_rate_rqd = ip_freq_rqd;
     }
 
-    /* Round the number of pixels to the nearest character cell boundary */
-    double h_pixels_rnd = (floor(h_pixels/cell_gran_rnd)) * cell_gran_rnd;
+    /* 5.2.2 horizontal pixels rounded to whole character cells */
+    h_pixels_rnd = CVT_CELL_GRAN_RND * ROUNDDOWN_DIV(h_pixels, CVT_CELL_GRAN_RND);
 
-    /* Determine the width of the left and right borders */
-    double left_margin = 0; /* Number of pixels in the left hand margin, rounded down to the nearest character cell. If no margins required this is set to 0. */
-    double right_margin = 0; /* see left_margin */
-    double top_margin = 0; /* No of lines rounded down to nearest line. */
-    double bot_margin = 0; /* See top, left, right */
+    /* 5.2.3 left margin and right margins */
+    left_margin = margins_rqd ? ROUNDDOWN_DIV(h_pixels_rnd * CVT_MARGIN_PTHOU, 1000)
+                              : 0;
+    left_margin = CVT_CELL_GRAN_RND * ROUNDDOWN_DIV(left_margin, CVT_CELL_GRAN_RND);
+    right_margin = left_margin;
 
-    if (margins_rqd == 1)
-    {
-        left_margin = floor(h_pixels_rnd * margin_per / 100 / cell_gran_rnd) *cell_gran_rnd;
-        right_margin = left_margin;
-        top_margin = floor(margin_per / 100 * v_lines_rnd);
-        bot_margin = top_margin;
-    }
+    /* 5.2.4 total active pixels */
+    total_active_pixels = h_pixels_rnd + left_margin + right_margin;
 
-    /* Minimum vertical back porch (used in both sets of calcs). */
-    const double min_v_bporch = 6;
+    /* 5.2.6 top and bottom margin */
+    top_margin = margins_rqd ? ROUNDDOWN_DIV(v_lines_rnd * CVT_MARGIN_PTHOU, 1000)
+                             : 0;
+    bottom_margin = top_margin;
 
-    /* The total number of active pixels is equal to the rounded
-     * horizontal pixels and the margins:
-     */
-    double total_active_pixels = h_pixels_rnd + left_margin + right_margin;
-
-    /* Pixel clock resolution - see CVT spec S3.2 */
-    const double clock_step = 0.25;
-
-    /* Define back porch (used in our final block) */
-    int v_back_porch;
-
-    /* Define actual pixel frequency (for final block) */
-    double act_pixel_freq;
-
-    /* H blanking period (for final block) */
-    int h_blank;
-
-    /* H sync (for final block) */
-    int h_sync;
-
-    /* V front porch (NB in CVT this is min_v_porch_rnd and in CVT-RB this is
-     * rb_v_fporch but as they are both constants declare them.
-     */
-    double v_front_porch = 3;
-
+    /* Select CRT or CRT reduced blanking */
     if (timing_support == EDID_USE_CVT)
     {
-        /* Computation of "CRT" (ie non-RB) CVT timings */
-        /* Minimum timing for vertical blanking for 'CRT' timings */
-        const double min_vsync_bp = 550;
-        /* Standard 'CRT' timing vertical front porch */
-
-        /* Estimate the horizontal period (kHz) */
-        double h_period_est = ((1 / v_field_rate_reqd) - min_vsync_bp / 1000000) / (v_lines_rnd + (2 * top_margin) + v_front_porch + interlace) * 1000000;
-        /* Find the number of lines in V sync + back porch */
-        double v_sync_bp = floor(min_vsync_bp / h_period_est) + 1;
-        if (v_sync_bp < v_sync_rnd + min_v_bporch)
+        /* 5.3.8 estimate horizontal period in 탎 */
+        num = ((1000000uLL << 24) / v_field_rate_rqd) - (CVT_MIN_VSYNC_BP << 24);
+        den = v_lines_rnd + (2uLL * top_margin) + CVT_MIN_V_PORCH_RND;
+        if (int_rqd)
         {
-            v_sync_bp = v_sync_rnd + min_v_bporch;
-        }
-
-        /* Find the number of lines in V back porch */
-        v_back_porch = (int) (v_sync_bp - v_sync_rnd);
-
-        /* Find total number of lines in vertical field period */
-        double total_v_lines = v_lines_rnd + top_margin + bot_margin + v_sync_bp + interlace + v_front_porch;
-
-        /* C_PRIME = ((C-J) * K / 256 + J (from CVT spec) */
-        const double c_prime = 30;
-
-        /* M_PRIME = K / 256 * M (from CVT spec) */
-        const double m_prime = 300;
-
-        /* Find the ideal blanking duty cycle from the blanking duty cycle equation (%): */
-        double ideal_duty_cycle = c_prime - (m_prime * h_period_est / 1000);
-
-        /* Find the number of pixels in the horizontal blanking time to the nearest double character cell
-         * (limit horizontal blanking so that it is >= 20% of the horizontal total).
-         */
-        if (ideal_duty_cycle < 20)
-        {
-            h_blank = (int) (floor(total_active_pixels * 20 / (100-20) / (2 * cell_gran_rnd)) * (2 * cell_gran_rnd));
+            h_period_est_u8p24 = (uint32_t)((2 * num) / ((2 * den) + 1));
         }
         else
         {
-            h_blank = (int) (floor(total_active_pixels * ideal_duty_cycle / (100 - ideal_duty_cycle) / (2 * cell_gran_rnd)) * (2 * cell_gran_rnd));
+            h_period_est_u8p24 = (uint32_t)(num / den);
         }
 
-        /* Find the total number of pixels in a line */
-        double total_pixels = total_active_pixels + h_blank;
+        /* 5.3.9 lines in vsync and vertical back porch & 5.3.10 vertical back porch alone */
+        v_sync_bp = (uint32_t)ROUNDDOWN_DIV(CVT_MIN_VSYNC_BP << 24, h_period_est_u8p24) + 1;
+        v_sync_bp = MAX(v_sync_bp, v_sync_rnd + CVT_MIN_V_BPORCH);
+        v_back_porch = v_sync_bp - v_sync_rnd;
 
-        /* Find pixel clock frequency (MHz): */
-        act_pixel_freq = clock_step * floor((total_pixels / h_period_est) / clock_step);
+        /* 5.3.12 ideal duty cycle */
+        num = (uint64_t)CVT_M_PRIME * h_period_est_u8p24;
+        den = 1000;
+        ideal_duty_cycle_s7p24 = (int32_t)((CVT_C_PRIME << 24) - (uint32_t)(num / den));
+        ideal_duty_cycle_s7p24 = MAX(ideal_duty_cycle_s7p24, (20 << 24));
 
-        /* Find actual horizontal frequency (kHz) */
-        double act_h_freq = 1000 * act_pixel_freq / total_pixels;
+        /* 5.3.13 horizontal blanking period in pixels & 5.3.14 total pixels */
+        num = (uint64_t)total_active_pixels * ideal_duty_cycle_s7p24;
+        den = (100uLL << 24) - ideal_duty_cycle_s7p24;
+        h_blank = CVT_2CELL_GRAN_RND * ROUNDDOWN_DIV((uint32_t)(num / den), CVT_2CELL_GRAN_RND);
+        total_pixels = total_active_pixels + h_blank;
 
-        /* Find actual field rate (Hz) */
-        double act_field_rate = 1000 * act_h_freq / total_v_lines;
+        /* 5.3.15 pixel clock (actually, kHz) */
+        num = ((1000uLL << 24) * total_pixels);
+        den = h_period_est_u8p24;
+        pixel_freq = (uint32_t)(num / den);
+        pixel_freq = CVT_CLOCK_STEP * ROUNDDOWN_DIV(pixel_freq, CVT_CLOCK_STEP);
 
-        /* Find actual refresh rate (Hz) */
-        double act_frame_rate = act_field_rate;
-        if (int_rqd == 1)
-        {
-            act_frame_rate = act_field_rate / 2;
-        }
+        /* 5.3.?? vertical front porch */
+        v_front_porch = CVT_MIN_V_PORCH_RND;
 
-        /* H sync per is the percentage of horizontal total period that
-         * defines horizontal sync width
-         */
-        const double h_sync_per = 8;
-
-        /* Calculate H sync */
-        h_sync = (int) (floor(h_sync_per / 100 * total_pixels / cell_gran_rnd) * cell_gran_rnd);
+        /* 5.3.?? horizontal sync */
+        h_sync_pixels = (total_pixels * CVT_H_SYNC_PTHOU) / 1000;
+        h_sync_pixels = CVT_CELL_GRAN_RND * ROUNDDOWN_DIV(h_sync_pixels, CVT_CELL_GRAN_RND);
     }
     else
     {
-        /* Computation of Reduced Blanking timing parameters. */
+        /* 5.4.8 estimate horizontal period in 탎 */
+        num = ((1000000uLL << 24) / v_field_rate_rqd) - (CVT_RB_MIN_V_BLANK << 24);
+        den = (uint64_t)v_lines_rnd + top_margin + bottom_margin;
+        h_period_est_u8p24 = (uint32_t)(num / den);
 
-        /* Estimate the horizontal period (kHz) */
-        const double rb_min_v_blank = 460; /* Min V blank for reduced timings */
-        double h_period_est = ((1000000/v_field_rate_reqd) - rb_min_v_blank) / (v_lines_rnd + top_margin + bot_margin);
+        /* 5.4.9 lines in vsync and vertical back porch & 5.4.10 vertical back porch alone */
+        vbi_lines = (uint32_t)ROUNDDOWN_DIV(CVT_RB_MIN_V_BLANK << 24, h_period_est_u8p24) + 1;
+        vbi_lines = MAX(vbi_lines, CVT_RB_V_FPORCH + v_sync_rnd + CVT_MIN_V_BPORCH);
+        v_back_porch = vbi_lines - v_sync_rnd - CVT_RB_V_FPORCH;
 
-        double vbi_lines = floor(rb_min_v_blank / h_period_est) + 1;
+        /* 5.4.11 lines in the field period (actually, half lines) */
+        total_v_lines = (2 * (vbi_lines + v_lines_rnd + top_margin + bottom_margin)) +
+                        (int_rqd ? 1 : 0);
 
-        /* Vertical front porch is fixed in reduced blanking */
-        v_front_porch = 3;
+        /* 5.4.?? horizontal blanking period in pixels && 5.4.12 total pixels */
+        h_blank = CVT_RB_H_BLANK;
+        total_pixels = CVT_RB_H_BLANK + total_active_pixels;
 
-        double rb_min_vbi = v_front_porch + v_sync_rnd + min_v_bporch;
+        /* 5.4.13 pixel clock (actually, kHz) */
+        num = (uint64_t)v_field_rate_rqd * total_v_lines * total_pixels;
+        den = 2 * 1000;
+        pixel_freq = (uint32_t)(num / den);
+        pixel_freq = CVT_CLOCK_STEP * ROUNDDOWN_DIV(pixel_freq, CVT_CLOCK_STEP);
 
-        double act_vbi_lines; /* Actual number of vertical blanking lines */
-        if (vbi_lines < rb_min_vbi)
-        {
-            act_vbi_lines = rb_min_vbi;
-        }
-        else
-        {
-            act_vbi_lines = vbi_lines;
-        }
+        /* 5.4.?? vertical front porch */
+        v_front_porch = CVT_RB_V_FPORCH;
 
-        double total_v_lines = act_vbi_lines + v_lines_rnd + top_margin + bot_margin + interlace;
-
-        h_sync = 32;   /* H sync is fixed in reduced blanking */
-        h_blank = 160; /* H Blank is fixed in reduced blanking */
-
-        /* Find total number of pixel clocks per line */
-        double total_pixels = h_blank + total_active_pixels;
-
-        const double clock_step = 0.25;
-
-        /* Calculate the pixel clock frequency to nearest 0.25MHz */
-        act_pixel_freq = clock_step * floor((v_field_rate_reqd * total_v_lines * total_pixels / 1000000) / clock_step);
-
-        /* Find the number of lines in V_sync + back porch: */
-        v_back_porch = (int) (act_vbi_lines - v_front_porch - v_sync_rnd);
+        /* 5.4.?? horizontal sync */
+        h_sync_pixels = CVT_RB_H_SYNC;
     }
 
-    /* Calculate front and back porch */
-    int h_back_porch = h_blank / 2;
-    int h_front_porch = h_blank - h_back_porch - h_sync;
+    /* 5.2.?? horizontal front porch & 5.2.?? horizontal back porch */
+    h_front_porch = (h_blank / 2) - h_sync_pixels;
+    h_back_porch = h_front_porch + h_sync_pixels;
 
-    /* Now populate the mode definition block */
-    mode_desc->definition.xres = (int)h_pixels;
-    mode_desc->definition.yres = (int)v_lines;
-    mode_desc->definition.hpar[FR_SYNC] = h_sync;
+    mode_desc->definition.xres = h_pixels;
+    mode_desc->definition.yres = v_lines;
+    mode_desc->definition.hpar[FR_SYNC] = h_sync_pixels;
     mode_desc->definition.hpar[FR_BPCH] = h_back_porch;
-    mode_desc->definition.hpar[FR_BDR1] = (int) left_margin;
-    mode_desc->definition.hpar[FR_DISP] = (int) h_pixels;
-    mode_desc->definition.hpar[FR_BDR2] = (int) right_margin;
+    mode_desc->definition.hpar[FR_BDR1] = left_margin;
+    mode_desc->definition.hpar[FR_DISP] = h_pixels;
+    mode_desc->definition.hpar[FR_BDR2] = right_margin;
     mode_desc->definition.hpar[FR_FPCH] = h_front_porch;
-    mode_desc->definition.vpar[FR_SYNC] = (int) v_sync_rnd;
+    mode_desc->definition.vpar[FR_SYNC] = v_sync_rnd;
     mode_desc->definition.vpar[FR_BPCH] = v_back_porch;
-    mode_desc->definition.vpar[FR_BDR1] = (int) top_margin;
-    if (int_rqd == 1)
-    {
-        mode_desc->definition.vpar[FR_DISP] = (int) v_lines / 2;
-    }
-    else
-    {
-        mode_desc->definition.vpar[FR_DISP] = (int) v_lines;
-    }
-    mode_desc->definition.vpar[FR_BDR2] = (int) bot_margin;
-    mode_desc->definition.vpar[FR_FPCH] = (int) v_front_porch;
-    mode_desc->definition.pixel_khz = (int) (act_pixel_freq * 1000);
+    mode_desc->definition.vpar[FR_BDR1] = top_margin;
+    mode_desc->definition.vpar[FR_DISP] = v_lines;
+    mode_desc->definition.vpar[FR_BDR2] = bottom_margin;
+    mode_desc->definition.vpar[FR_FPCH] = v_front_porch;
+    mode_desc->definition.pixel_khz = pixel_freq;
     mode_desc->definition.external_clock = -1;
     if (timing_support == EDID_USE_CVT)
     {
-        mode_desc->definition.syncpol = HSync_Negative+VSync_Positive;
+        mode_desc->definition.syncpol = HSync_Negative+VSync_Positive; /* CVT */
     }
     else
     {
-        /* EDID_USE_CVTRB */
-        mode_desc->definition.syncpol = HSync_Positive+VSync_Negative;
+        mode_desc->definition.syncpol = HSync_Positive+VSync_Negative; /* CVT reduced blanking */
     }
-    mode_desc->definition.interlaced = int_rqd;
+    mode_desc->definition.interlaced = int_rqd ? 1 : 0;
+    sprintf(mode_desc->definition.name, "%d x %d", h_pixels, v_lines);
 
-    sprintf(mode_desc->definition.name, "%d x %d", (int)h_pixels, (int)v_lines);
     compute_modedescription(mode_desc);
 
     if (add_proposed_mode(monitor, mode_desc) == 0)
@@ -725,7 +609,6 @@ static _kernel_oserror *generate_standard_timing(char std1, char std2, MonitorDe
             printf("(derived from DMT standard):\n");
             display_mode_parameters(mode_desc);
 #endif
-
             if (add_proposed_mode(monitor, mode_desc) == 0)
             {
                 free(mode_desc);
@@ -740,25 +623,24 @@ static _kernel_oserror *generate_standard_timing(char std1, char std2, MonitorDe
     {
         int yres = 0;
         int xres = (std1 + 31) * 8;
-        char pixel_ratio_flags = (std2 & 0xC0);
-        if (pixel_ratio_flags == 0)
-          { /* 00 = 16:10 */
-            yres = (int) ((xres * 10) / 16);
-        }
-        if (pixel_ratio_flags == (1<<6))
-        {   /* 01 = 4:3 */
-            yres = (int) ((xres * 3) / 4);
-        }
-        if (pixel_ratio_flags == (1<<7))
-        {   /* 10 = 5:4 */
-            yres = (int) ((xres * 4) / 5);
-        }
-        if (pixel_ratio_flags == ((1<<7) + (1<<6)))
-        {   /* 11 = 16:9 */
-            yres = (int) ((xres * 9) / 16);
-        }
-
         int freq = (std2 & 0x3f) + 60;
+
+        char pixel_ratio_flags = (std2 & 0xC0) >> 6;
+        switch (pixel_ratio_flags)
+        {
+            case 0:
+                yres = (xres * 10) / 16; /* 16:10 */
+                break;
+            case 1:
+                yres = (xres * 3) / 4; /* 4:3 */
+                break;
+            case 2:
+                yres = (xres * 4) / 5; /* 5:4 */
+                break;
+            case 3:
+                yres = (xres * 9) / 16; /* 16:9 */
+                break;
+        }
 
         mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
         if (mode_desc == NULL)
@@ -777,7 +659,6 @@ static _kernel_oserror *generate_standard_timing(char std1, char std2, MonitorDe
         {
             generate_mode_using_cvt_rb(xres, yres, freq, mode_desc, monitor);
         }
-
     }
     return NULL;
 }
@@ -848,16 +729,16 @@ static _kernel_oserror *generate_cvt3_timing(char cvt1, char cvt2, char cvt3, Mo
         switch (pixel_ratio_flags)
         {
             case 0:
-                xres = (int) (8 * floor((((double) yres * 4) / 3) / 8));
+                xres = 8 * ((yres * 4) / (3 * 8));
                 break;
             case 1:
-                xres = (int) (8 * floor((((double) yres * 16) / 9) / 8));
+                xres = 8 * ((yres * 16) / (9 * 8));
                 break;
             case 2:
-                xres = (int) (8 * floor((((double) yres * 16) / 10) / 8));
+                xres = 8 * ((yres * 16) / (10 * 8));
                 break;
             case 3:
-                xres = (int) (8 * floor((((double) yres * 15) / 9) / 8));
+                xres = 8 * ((yres * 15) / (9 * 8));
                 break;
         }
 
@@ -1011,8 +892,8 @@ static bool dtd_block_to_modedesc(char* dtd_data, ModeDescriptionRef mode_desc)
     {
         mode_desc->definition.yres = mode_desc->definition.yres * 2;
     }
-
     sprintf(mode_desc->definition.name, "%d x %d", mode_desc->definition.xres, mode_desc->definition.yres);
+
     compute_modedescription(mode_desc);
 #if DODEBUG
     display_mode_parameters(mode_desc);
@@ -1818,7 +1699,6 @@ static _kernel_oserror *parseedid(char *ediddata, const char *file)
         do
         {
             fprintf(f,"\n# Mode:  %d x %d @ %dHz",this->definition.xres,this->definition.yres,this->frame_hz);
-            fprintf(f,"\n# Bounds: H  %3.2fkHz, V %3.2f, DClock %3.2fMHz",((float)(this->line_hz))/1000.0f,((float)(this->frame_mhz))/1000.0f,((float)(this->definition.pixel_khz))/1000.0f);
             fprintf(f,"\nstartmode");
             fprintf(f,"\n mode_name:%d x %d",this->definition.xres,this->definition.yres);
             fprintf(f,"\n x_res:%d",this->definition.xres);
