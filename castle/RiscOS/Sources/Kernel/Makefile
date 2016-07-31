@@ -29,7 +29,7 @@ endif
 
 TOKHELPSRC      = ${TOKENSOURCE}
 HELPSRC         = HelpStrs
-ROM_SOURCE      = GetAll.s
+ROM_OBJECTS     = GetAll.o End.o
 KERNEL_MODULE   = bin${SEP}${COMPONENT}
 ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
@@ -66,6 +66,7 @@ CUSTOMSA=custom
 
 include StdTools
 include AAsmModule
+include StdRules
 
 # Override this to "TRUE" in the components file if
 # you want an odd-numbered (development) build to be
@@ -90,11 +91,13 @@ inst_dirs:
 install: ${EXPORTS} inst_dirs
         @${ECHO} ${COMPONENT}: header files installed
 
-${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS}
+${KERNEL_MODULE}: ${ROM_OBJECTS} ${DIRS}
         ${MKDIR} bin
-        ${LD} -bin -o $@ ${ROM_OBJECT}
-        ${LD} -aif -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECT}
+        ${LD} -bin -o $@ ${ROM_OBJECTS}
+        ${LD} -aif -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECTS}
         ${TOGPA} -s ${KERNEL_MODULE}_aif ${KERNEL_MODULE}_gpa
+
+GetAll.o:  ${TOKHELPSRC}
 
 #
 # Custom exports:
