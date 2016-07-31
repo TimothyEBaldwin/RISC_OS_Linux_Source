@@ -70,6 +70,7 @@ EXPORTS   = \
  ${HDRDIR}.CPU.FPA \
  ${HDRDIR}.CPU.Generic26 \
  ${HDRDIR}.CPU.Generic32 \
+ ${HDRDIR}.CPU.PVOps \
  ${HDRDIR}.DDVMacros \
  ${HDRDIR}.Debug \
  ${HDRDIR}.Devices \
@@ -294,6 +295,7 @@ ${HDRDIR}.CPU.ARM600:        hdr.CPU.ARM600;        ${CP} hdr.CPU.ARM600        
 ${HDRDIR}.CPU.FPA:           hdr.CPU.FPA;           ${CP} hdr.CPU.FPA              $@ ${CPFLAGS}
 ${HDRDIR}.CPU.Generic26:     hdr.CPU.Generic26;     ${CP} hdr.CPU.Generic26        $@ ${CPFLAGS}
 ${HDRDIR}.CPU.Generic32:     hdr.CPU.Generic32;     ${CP} hdr.CPU.Generic32        $@ ${CPFLAGS}
+${HDRDIR}.CPU.PVOps:         hdr.CPU.PVOps;         ${CP} hdr.CPU.PVOps            $@ ${CPFLAGS}
 ${HDRDIR}.FDC.FDC711:        hdr.FDC.FDC711;        ${CP} hdr.FDC.FDC711           $@ ${CPFLAGS}
 ${HDRDIR}.IO.GenericIO:      hdr.IO.GenericIO;      ${CP} hdr.IO.GenericIO         $@ ${CPFLAGS}
 ${HDRDIR}.IO.IOC:            hdr.IO.IOC;            ${CP} hdr.IO.IOC               $@ ${CPFLAGS}
