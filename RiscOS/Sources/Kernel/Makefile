@@ -37,6 +37,7 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
                   ${EXP_HDR}.OSEntries \
+                  ${EXP_HDR}.OSMem \
                   ${EXP_HDR}.OSMisc \
                   ${EXP_HDR}.OSRSI6 \
                   ${EXP_HDR}.PL310 \
@@ -50,6 +51,7 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${C_EXP_HDR}.HALEntries \
                   ${C_EXP_HDR}.ModHand \
                   ${C_EXP_HDR}.OSEntries \
+                  ${C_EXP_HDR}.OSMem \
                   ${C_EXP_HDR}.OSMisc \
                   ${C_EXP_HDR}.OSRSI6 \
                   ${C_EXP_HDR}.RISCOS \
@@ -118,6 +120,9 @@ ${EXP_HDR}.ModHand: hdr.ModHand
 ${EXP_HDR}.OSEntries: hdr.OSEntries
 	${CP} hdr.OSEntries $@ ${CPFLAGS}
 
+${EXP_HDR}.OSMem: hdr.OSMem
+	${CP} hdr.OSMem $@ ${CPFLAGS}
+
 ${EXP_HDR}.OSMisc: hdr.OSMisc
 	${CP} hdr.OSMisc $@ ${CPFLAGS}
 
@@ -158,6 +163,10 @@ ${C_EXP_HDR}.ModHand: hdr.ModHand
 
 ${C_EXP_HDR}.OSEntries: Global.h.OSEntries h.OSEntries
 	${FAPPEND} $@ h.OSEntries Global.h.OSEntries
+
+${C_EXP_HDR}.OSMem: hdr.OSMem
+	${MKDIR} ${C_EXP_HDR}
+	${HDR2H} hdr.OSMem $@
 
 ${C_EXP_HDR}.OSMisc: hdr.OSMisc
 	${MKDIR} ${C_EXP_HDR}
