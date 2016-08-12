@@ -1,0 +1,756 @@
+/*
+ * Copyright (c) 2013, Timothy Baldwin
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ */
+
+
+#define ix_SYSCALL_branch 1
+#include <syscalls.h>
+
+#include <stdlib.h>
+
+#include <asm/fcntl.h>
+#include <asm/sigcontext.h>
+#include <linux/fcntl.h>
+#include <linux/filter.h>
+#include <linux/prctl.h>
+#include <linux/ptrace.h>
+#include <linux/seccomp.h>
+#include <linux/signal.h>
+#include <linux/signalfd.h>
+#include <linux/stat.h>
+#include <linux/termios.h>
+#include <linux/time.h>
+#include <linux/wait.h>
+
+#include "header.h"
+
+struct ucontext {
+  unsigned long     uc_flags;
+  struct ucontext  *uc_link;
+  stack_t           uc_stack;
+  struct sigcontext uc_mcontext;
+  sigset_t          uc_sigmask;
+};
+
+struct termios oldTioIn, oldTioOut, newTioIn, newTioOut;
+
+static inline int ix_sigsetmask(uint64_t set) {
+  return ix_rt_sigprocmask(SIG_SETMASK, &set, 0, sizeof(set));
+}
+
+static int strlen(const char *s) {
+  int len = 0;
+  while(s[len]) ++len;
+  return len;
+}
+
+static void message(const char *s) {
+  // Write message to standard error steam, for HAL debuging.
+  ix_write(2, s, strlen(s));
+}
+
+static void printu(unsigned i) {
+  char buf[11];
+  char *p = buf + 10;
+  *p = 0;
+  do {
+    *--p = '0' + (i % 10);
+    i = i / 10;
+  } while (i);
+  message(p);
+}
+
+static int strcmp(const char *a, const char *b) {
+  while (*a && *a == *b) {
+    ++a;
+    ++b;
+  }
+  return  *a - *b;
+}
+
+
+
+
+// Miscellaneous HAL API
+
+unsigned int HAL_CleanerSpace(void) {
+  return 0xFFFFFFFF;
+}
+
+void *HAL_ControllerAddress(unsigned ignored,unsigned controller) {
+  ix_MESSAGE(2, "HAL_ControllerAddress\n");
+  return (void *)-1;
+}
+
+int HAL_DebugRX(void) {
+  // Try to read from standard input steam.
+  char c;
+  int flags = ix_fcntl(0, F_GETFL, 0);
+  ix_fcntl(0, F_SETFL, flags | O_NONBLOCK);
+  int r = ix_read(0, &c, 1);
+  ix_fcntl(0, F_SETFL, flags);
+  return r == 1 ? c : -1;
+}
+
+void HAL_DebugTX(int byte) {
+  // Try to write to standard output steam.
+  if (byte == 127) {
+    ix_write(1, "\b \b", 3);
+  } else if (byte == 10 || (byte >= 32 && byte < 128)) {
+    char c = byte;
+    ix_write(1, &c, 1);
+  }
+}
+
+void HAL_PlatformInfo(int ignored, unsigned int *flags, unsigned int *validflags) {
+  // FIXME
+  ix_MESSAGE(2, "HAL_PlatformInfo\n");
+}
+
+void HAL_Reset(int type, void *l1pt) {
+  ix_exit(type ? 100 : 0);
+}
+
+// HAL counter API
+
+unsigned int counter_resolution, counter_rate;
+
+static inline void init_counter(void) {
+  struct timespec t;
+  ix_clock_getres(CLOCK_MONOTONIC_RAW, &t);
+  counter_resolution = t.tv_nsec;
+  counter_rate = 1000000000 / counter_resolution;
+}
+
+unsigned int HAL_CounterRate(void) {
+  return counter_rate;
+}
+
+unsigned int HAL_CounterPeriod(void) {
+  return counter_rate; // Lie - one second
+}
+
+unsigned int HAL_CounterRead(void) {
+  struct timespec t;
+  ix_clock_gettime(CLOCK_MONOTONIC, &t);
+  return counter_rate - t.tv_nsec / counter_resolution;
+}
+
+void HAL_CounterDelay(unsigned int microseconds) {
+  struct timespec t;
+  ix_clock_gettime(CLOCK_MONOTONIC, &t);
+  t.tv_sec += microseconds / 1000000;
+  t.tv_nsec += (microseconds % 1000000) * 1000;
+  if (t.tv_nsec >= 1000000000) {
+    t.tv_nsec -= 1000000000;
+    t.tv_sec += 1;
+  }
+  while(ix_clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, 0));
+}
+
+
+// HAL interrupt handling
+
+static volatile int irq_pending[IRQS];
+static bool irq_enabled[IRQS];
+
+static void recalc_pending(void) {
+
+  struct vcpu* vcpu = __kuser_get_tls();
+  vcpu->irq_pending = 0;
+
+  for(int i = 0; i != IRQS; ++i)
+    if (irq_pending[i] && irq_enabled[i]) {
+      vcpu->irq_pending = PSR_I_BIT;
+      return;
+    }
+}
+
+int HAL_IRQMax(void) {
+  ix_MESSAGE(2, "HAL_IRQMax\n");
+  return IRQS;
+}
+
+void HAL_IRQClear(int device) {
+
+  if (device >= 32) {
+
+    // Decrement irq_pending[device] by one atomically.
+    unsigned old;
+    do {
+      old = irq_pending[device];
+    } while (old && __kuser_cmpxchg(old, old - 1, &irq_pending[device]));
+
+    // Check if interupts are still pending.
+    recalc_pending();
+  }
+}
+
+int HAL_IRQDisable(int device) {
+  ix_MESSAGE(2, "HAL_IRQDisable\n");
+  int ret = irq_enabled[device];
+  if (device >= 32) {
+    irq_enabled[device] = false;
+    recalc_pending();
+  }
+  return ret;
+}
+
+int HAL_IRQEnable(int device) {
+  int ret = irq_enabled[device];
+
+  irq_enabled[device] = true;
+
+  if (!ret && irq_pending[device]) {
+    struct vcpu* vcpu = __kuser_get_tls();
+    irq_pending[device] = 1; // Lose timer interrupts
+    call_irq(vcpu);
+  }
+  return ret;
+}
+
+int HAL_IRQSource(void) {
+  struct vcpu* vcpu = __kuser_get_tls();
+  vcpu->irq_pending = 0;
+
+  for(int i = 0; i != IRQS; ++i)
+    if (irq_pending[i] && irq_enabled[i]) {
+      if (i < 32) {
+        irq_pending[i] = false;
+        recalc_pending();
+      } else {
+        vcpu->irq_pending = PSR_I_BIT;
+      }
+      return i;
+    }
+  return -1;
+}
+
+int HAL_IRQStatus(int device) {
+  return irq_pending[device];
+}
+
+
+// HAL Keyboard API
+
+unsigned int HAL_KbdScan(void) {
+  return KbdFlag_Done;
+}
+
+
+// HAL NVRAM API
+
+static int nvram_fd = -1;
+
+unsigned int HAL_NVMemoryType(void) {
+  return NVMemoryFlag_HAL | NVMemoryFlag_LowRead | NVMemoryFlag_LowWrite;
+}
+
+unsigned int HAL_NVMemorySize(void) {
+  struct stat s;
+  s.st_size = 256;
+  ix_fstat(nvram_fd, &s);
+  return s.st_size;
+}
+
+uint32_t HAL_NVMemoryPageSize(void) {
+  return 256;
+}
+
+unsigned int HAL_NVMemoryProtectedSize(void) {
+  return 0;
+}
+
+int HAL_NVMemoryRead(unsigned int addr, void *buffer, unsigned int n) {
+  int c = ix_pread(nvram_fd, buffer, n, addr);
+  if (c < 0) c = 0;
+  return c;
+}
+
+int HAL_NVMemoryWrite(unsigned int addr, void *buffer, unsigned int n) {
+  int c = ix_pwrite(nvram_fd, buffer, n, addr);
+  if (c < 0) c = 0;
+  return c;
+}
+
+
+
+// HAL timer API
+
+static bool notimers;
+
+static struct {
+  timer_t id;
+  bool created;
+} timers[TIMERS];
+
+static inline void init_timer(int timer) {
+  if (!timers[timer].created) {
+    struct sigevent se = {
+      .sigev_notify = SIGEV_SIGNAL,
+      .sigev_signo = TIMER_SIGNAL,
+      .sigev_value.sival_int = timer + TIMER_IRQ_BASE,
+      .sigev_notify_thread_id = ix_gettid(),
+    };
+    ix_timer_create(CLOCK_MONOTONIC, &se, &timers[timer].id);
+    timers[timer].created = true;
+  }
+}
+
+int HAL_Timers(void) {
+  return TIMERS;
+}
+
+unsigned int HAL_TimerDevice(int timer) {
+  return timer + TIMER_IRQ_BASE;
+}
+
+void HAL_TimerSetPeriod(int timer, unsigned int period) {
+  if (notimers) return;
+  init_timer(timer);
+  struct itimerspec it;
+  it.it_interval.tv_sec = period / TIMER_GRANULARITY;
+  it.it_interval.tv_nsec = (period % TIMER_GRANULARITY) * (1000000000U / TIMER_GRANULARITY);
+
+  // FIXME: What should the intial value be?
+  it.it_value.tv_sec = it.it_interval.tv_sec / 2U;
+  it.it_value.tv_nsec = it.it_interval.tv_nsec + (it.it_interval.tv_sec % 2U) * 500000000U;
+  ix_timer_settime(timers[timer].id, 0, &it, 0);
+}
+
+unsigned int HAL_TimerGranularity(int timer) {
+  return TIMER_GRANULARITY;
+}
+
+unsigned int HAL_TimerMaxPeriod(int timer) {
+  return 0x40000000; // Some large number
+}
+
+unsigned int HAL_TimerPeriod(int timer) {
+  if (!timers[timer].created) return 0;
+  struct itimerspec it;
+  ix_timer_gettime(timers[timer].id, &it);
+  return it.it_interval.tv_sec * TIMER_GRANULARITY + it.it_interval.tv_nsec / (1000000000U / TIMER_GRANULARITY);
+}
+
+unsigned int HAL_TimerReadCountdown(int timer) {
+  if (!timers[timer].created) return 0;
+  struct itimerspec it;
+  ix_timer_gettime(timers[timer].id, &it);
+  return it.it_value.tv_sec * TIMER_GRANULARITY + it.it_value.tv_nsec / (1000000000U / TIMER_GRANULARITY);
+}
+
+#define ENTER_EXCEPTION(MODE, VECTOR, OFFSET) {                               \
+  uint32_t mode = vcpu->cpsr & 0x1F;                                          \
+  struct vmode* vmode = (struct vmode *)((char *)vcpu + vmode_offsets[mode]); \
+  vmode->r13 = r->arm_sp;                                                     \
+  vmode->r14 = r->arm_lr;                                                     \
+  r->arm_sp = vcpu->MODE.r13;                                                 \
+                                                                              \
+  vcpu->MODE.spsr = (r->arm_cpsr & ~VBITS) | vcpu->cpsr;                      \
+  vcpu->cpsr = MODE ## _MODE | PSR_I_BIT;                                     \
+                                                                              \
+  /* Call vector upon return */                                               \
+  r->arm_lr = r->arm_pc + (OFFSET);                                           \
+  r->arm_pc = vcpu->vectors[VECTOR];                                          }
+
+
+// Interrupt handling
+static void irq_signal_handler(int signal, siginfo_t *info, struct ucontext *ucontext) {
+
+  struct sigcontext * restrict r = &ucontext->uc_mcontext;
+  int irq;
+
+  if (signal == TIMER_SIGNAL) {
+    // Timer, so count the overruns, so the RISC OS gets the right number of interrupts.
+    irq = info->si_int;
+    irq_pending[irq] += 1 + info->si_overrun;
+   } else {
+    irq = signal;
+    irq_pending[irq] = 1;
+   }
+
+  if (!irq_enabled[irq]) return; // IRQ line disabled, so just return.
+
+  struct vcpu* vcpu = __kuser_get_tls();
+  vcpu->irq_pending = PSR_I_BIT;
+
+  if (r->arm_pc > (uint32_t)&__PVirt_safe_syscall && r->arm_pc < (uint32_t)&__PVirt_safe_syscall_end)
+    r->arm_pc = (uint32_t)&__PVirt_safe_syscall;
+
+  if (vcpu->cpsr & PSR_I_BIT) return;// IRQs disabled, so return.
+
+  if (r->arm_pc >= (uint32_t)&SetCPSR_Start && r->arm_pc < (uint32_t)&SetCPSR_End) {
+    // In SetCPSR_c, so don't call vector, instead back up to check if required.
+    if (r->arm_pc > (uint32_t)&SetCPSR_Restart) r->arm_pc = (uint32_t)&SetCPSR_Restart;
+    return;
+  }
+
+  if (r->arm_pc == (uint32_t)&SetCPSR_End) {
+    // At the end of SetCPSR_c
+    // LDM isn't atomic, so can't back up simply, instead complete it.
+    uint32_t *t = (uint32_t *)r->arm_r2;
+    r->arm_r0 = t[-6];
+    r->arm_r1 = t[-5];
+    r->arm_r2 = t[-4];
+    r->arm_r3 = t[-3];
+    r->arm_ip = t[-2];
+    r->arm_pc = t[-1];
+  }
+
+  ENTER_EXCEPTION(IRQ, 5, 4)
+}
+
+// Undefined instrucion handling
+static void undefined_signal_handler(int signal, siginfo_t *info, struct ucontext *ucontext) {
+
+  struct sigcontext * restrict r = &ucontext->uc_mcontext;
+  struct vcpu* vcpu = __kuser_get_tls();
+
+  ENTER_EXCEPTION(UND, 0, 4)
+}
+
+// Abort handling
+static void abort_signal_handler(int signal, siginfo_t *info, struct ucontext *ucontext) {
+
+  struct sigcontext * restrict r = &ucontext->uc_mcontext;
+  struct vcpu* vcpu = __kuser_get_tls();
+  vcpu->dfar = info->si_addr;
+  ENTER_EXCEPTION(ABT, 3, 8)
+}
+
+
+static void swi_signal_handler(int signal, siginfo_t *info, struct ucontext *ucontext) {
+  struct sigcontext * restrict r = &ucontext->uc_mcontext;
+  struct vcpu* vcpu = __kuser_get_tls();
+  uint32_t swi = *(uint32_t*)(r->arm_pc - 4);
+swi:
+  swi &= 0xFDFFFF;
+  if (false) {
+    if (swi == 0x6F) { swi = r->arm_r10; goto swi; }
+    if (swi == 0x71) { swi = r->arm_ip; goto swi; }
+    ix_MESSAGE(2,"SWI: "); printu(swi); ix_MESSAGE(2,"\n");
+  }
+  ENTER_EXCEPTION(SVC, 1, 0)
+}
+
+static void signal2(int signal, signal_handler* handler) {
+  struct sigaction2 sigact = {
+    .u.sigaction = handler,
+    .flags = SA_RESTORER | SA_SIGINFO | SA_ONSTACK | SA_RESTART,
+    .mask = ~0ULL,
+    .restorer = &signal_exit
+  };
+  ix_sigaction(signal, &sigact, 0);
+}
+
+static int signal_stack[MINSIGSTKSZ / sizeof(int) + 128];  // FIXME size?
+
+static const stack_t signal_stack_struct = {
+  .ss_sp = signal_stack,
+  .ss_size = sizeof(signal_stack),
+  .ss_flags = 0
+};
+
+unsigned interrupt_count = 0;
+
+static void hal_run(void);
+
+static const char help_text[] ="Command line options:\n"
+"  --help         Display this message\n"
+"  --nvram FILE   Filename for nvram\n"
+"  --notimers     Disable HAL timers\n"
+"  --noaborts     Disable aborts - RISC OS will die with SIGSEGV\n"
+"  --nofork       Dont't fork - for debuging\n";
+
+static char **environ;
+static bool no_aborts;
+static int sig_fd;
+
+char **__HAL_get_env(void) { return environ; }
+
+static int do_fork(void) {
+  int ppid = ix_getpid();
+  int pid = ix_fork();
+  if (pid < 0) {
+    ix_MESSAGE(2, "Unable to fork\n");
+    ix_exit(2);
+  } else if (pid == 0) {
+    ix_prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+    ix_sigsetmask(0ULL);
+    ix_close(sig_fd);
+
+    // Check if parent just died.
+    if (ix_getppid() != ppid) ix_exit(0);
+
+    hal_run(); // Doesn't return
+  }
+  return pid;
+}
+
+int main(int argc, char **argv) {
+  environ = argv + argc + 1;
+
+  // Set alternative stack for signal handlers,
+  // RISC OS stack may not exist or be usable.
+  ix_sigaltstack(&signal_stack_struct, 0);
+
+  bool nofork = false;
+
+  for(int i = 1; i != argc; ++i) {
+    if (!strcmp(argv[i], "--help")) {
+
+      // Display help text.
+      ix_MESSAGE(1, help_text);
+      return 0;
+
+    } else if (!strcmp(argv[i], "--nvram")) {
+
+      // Open NVRAM file.
+      int fd = ix_open(argv[++i], O_RDWR | O_CREAT | O_CLOEXEC, 0666); // FIXME Permissions?
+      if (fd < 0) {
+        ix_MESSAGE(2, "Unable to open NVRAM file.\n");
+        return 1;
+      }
+
+      // Read it's size.
+      struct stat s;
+      if (ix_fstat(fd, &s)) {
+        ix_MESSAGE(2, "Unable to read size of NVRAM file.\n");
+        return 1;
+      }
+
+      // Ensure it is at least 256 bytes long.
+      if (s.st_size < 256 && ix_ftruncate(fd, 256)) {
+        ix_MESSAGE(2, "Unable to enlarge NVRAM file.\n");
+        return 1;
+      }
+
+      // Set it's file type
+      unsigned attr[] = {0xFFFff200, 0};
+      ix_fsetxattr(fd, "user.RISC_OS.LoadExec", attr, sizeof(attr), 0);
+
+      nvram_fd = fd;
+
+    } else if (!strcmp(argv[i], "--noaborts")) {
+      no_aborts = true;
+    } else if (!strcmp(argv[i], "--notimers")) {
+      notimers = true;
+    } else if (!strcmp(argv[i], "--nofork")) {
+      nofork = true;
+    } else {
+
+      // Display help text.
+      ix_MESSAGE(2, "Syntax error\n");
+      ix_MESSAGE(2, help_text);
+      return 1;
+
+    }
+  }
+
+  // Check if stdout is a terminal.
+  bool isterm = !ix_ioctl(1, TCGETS, &oldTioIn);
+
+  // Get terminal status, if successful reopen terminal for input.
+  if (!ix_ioctl(0, TCGETS, &oldTioIn)) {
+    int fd = ix_open("/proc/self/fd/0", O_RDONLY, 0);
+    if (fd > 0) {
+      ix_dup2(fd, 0);
+      ix_close(fd);
+    }
+  }
+
+
+  if (nofork) hal_run(); // Doesn't return
+
+  uint64_t mask = 0;
+  mask |= 1ULL << (SIGTERM - 1);
+  mask |= 1ULL << (SIGINT  - 1);
+  mask |= 1ULL << (SIGHUP  - 1);
+  mask |= 1ULL << (SIGTSTP - 1);
+  mask |= 1ULL << (SIGTTIN - 1);
+  mask |= 1ULL << (SIGTTOU - 1);
+  mask |= 1ULL << (SIGCHLD - 1);
+  ix_sigsetmask(mask);
+  sig_fd = ix_signalfd(-1, &mask, 8);
+
+
+  // Disable terminal echo.
+  newTioIn = oldTioIn;
+  newTioIn.c_iflag &= ~IGNCR & ~INLCR;
+  newTioIn.c_cc[VMIN] = 1;
+  newTioIn.c_cc[VTIME] = 0;
+  newTioIn.c_lflag &= ~ICANON & ~ECHO;
+  ix_ioctl(0, TCSETS, &newTioIn);
+
+  int pid = do_fork();
+
+  while (true) {
+    volatile struct signalfd_siginfo s;
+    s.ssi_signo = 0;
+    ix_read(sig_fd, (void *)&s, sizeof(s));
+    switch(s.ssi_signo) {
+      case SIGTERM:
+      case SIGINT:
+      case SIGHUP:
+        ix_kill(pid, s.ssi_signo);
+        break;
+      case SIGTSTP:
+      case SIGTTIN:
+      case SIGTTOU:
+        ix_ioctl(0, TCSETS, &oldTioIn);
+        ix_kill(ix_getpid(), SIGSTOP);
+        ix_ioctl(0, TCSETS, &newTioIn);
+        break;
+      case SIGCHLD:
+        while(true) {
+          int status;
+          pid_t p = ix_waitpid(pid, &status, WNOHANG);
+          if (p <= 0) break;
+          if (status == (100 << 8)) {
+            pid = do_fork();
+          } else {
+          // Write a new line to keep output tidy.
+          if (isterm) ix_MESSAGE(1, "\n");
+
+          // Restore terminal status
+          ix_ioctl(0, TCSETS, &oldTioIn);
+
+          if (status & 0x7F) {
+            ix_sigsetmask(0);
+            //ix_raise(status & 0x7F);
+          }
+          return status >> 8;
+          }
+        }
+        break;
+    }
+  }
+}
+
+
+static void hal_run(void) {
+
+  // Set TLS pointer to vcpu struct.
+  ix_set_tls(&init_vcpu);
+
+  // For SECCOMP2
+  ix_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+  // Register SWI handler
+  signal2(SIGSYS, swi_signal_handler);
+
+  // Try SECCOMP2
+  struct sock_filter filter[] = {
+
+    // Load SWI instruction addesss
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, instruction_pointer)),
+
+    // Skip to SECCOMP_RET_TRAP return if below __PVirt_syscall
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, (unsigned)&__PVirt_syscall, 0, 3),
+
+    // Skip to SECCOMP_RET_ALLOW return if below __PVirt_safe_syscall_end
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 4 + (unsigned)&__PVirt_safe_syscall_end, 0, 3),
+
+    // Check for vectors page so that system calls by kuser helpers work.
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0xFFFF0000, 0, 1),
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, 0xFFFF1000, 0, 1),
+
+    // Raise signal, handler will call RISC OS kernel.
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+
+    // Continue as Linux system call.
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+
+  struct sock_fprog fprog = {
+    .len = sizeof(filter) / sizeof(filter[0]),
+    .filter = filter
+  };
+
+  int seccomp_result = ix_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (unsigned)&fprog, 0, 0);
+
+  // If seccomp fails try QEMU, exit on failure.
+  if (seccomp_result) {
+    ix_MESSAGE(2, "Trying QEMU SWI hack...");
+    __asm {
+      MOV     r0, &__PVirt_syscall
+      MOV     r1, &__PVirt_safe_syscall_end
+      MOV     r2, #0
+      MOV     r7, #__NR_exit  // Exit if treated as Linux syscall.
+      SWI     0xC0001, {r0, r1, r2, r7}, {}, {r0, r7, psr}
+      MOV     r0, #10
+      MOV     r7, #__NR_exit
+      SWI     0, {r0, r7}, {}, {lr, psr} // OS_WriteC or exit.
+    }
+  }
+
+  // Test SWI handling.
+  ix_MESSAGE(2, "Hello ");
+  const char *c = "World\n";
+  while(*c)   __asm {
+    MOV     r0, *c++
+    SWI     0, {r0}, {}, {lr, psr}
+  }
+
+  init_counter();
+
+  signal2(SIGUSR1, irq_signal_handler);
+  signal2(SIGUSR2, irq_signal_handler);
+  signal2(TIMER_SIGNAL, irq_signal_handler);
+  signal2(SIGIO, irq_signal_handler);
+
+  test_pvirt();
+
+  ix_raise(SIGUSR1);
+  HAL_IRQEnable(SIGUSR1);
+  ix_raise(SIGUSR1);
+  HAL_IRQDisable(SIGUSR1);
+  ix_raise(SIGUSR1);
+  HAL_IRQClear(SIGUSR1);
+
+  printu(interrupt_count);
+  ix_MESSAGE(2, " of 15 interrupts counted.\n");
+
+  signal2(SIGILL, undefined_signal_handler);
+
+  if (!no_aborts) {
+    signal2(SIGSEGV, abort_signal_handler);
+    signal2(SIGBUS, abort_signal_handler);
+  }
+
+  HAL_IRQEnable(SIGIO);
+
+  ix_MESSAGE(2, "Starting kernel...\n");
+  OSHdr *h = (void *)(ADDRESS + HALSIZE);
+  uint32_t *e = (void *)((char *)h + h->Entries);
+  ((RISCOS_Start_t)((char *)e + e[OS_Start]))(OSStartFlag_POR | OSStartFlag_NoCMOSReset | OSStartFlag_RAMCleared, h, &HAL_Header, 0);
+
+  // If RISC OS returns...
+  ix_exit(2);
+}
