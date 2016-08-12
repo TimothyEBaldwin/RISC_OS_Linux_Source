@@ -556,7 +556,7 @@ rom_link_Entries: rlib.swi kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entr
 	${XTENT} syms.C_Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2
 	print rlib.swi { >> syms.C_Entries }
 	${XTENT} syms.A_Entries1 kernel.s.k_entries clib.s.cl_entries
-	egrep -v "^(0x00000000 . )?_swix?$" < syms.A_Entries1 > syms.A_Entries
+	grep -E -v "^(0x00000000 . )?_swix?$" < syms.A_Entries1 > syms.A_Entries
 	${RM} syms.A_Entries1
 	${TOUCH} rom_link_Entries
 
