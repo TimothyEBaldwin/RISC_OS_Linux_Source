@@ -37,6 +37,7 @@ TARGET   ?= Wimp
 HEADER1   = ${TARGET}
 HEADER2   = WimpSpace
 CUSTOMRES = custom
+ROM_LIBS  = ${PVLIBS}
 
 SA_FLAGS  =
 ASFLAGS   = -NoWarn -PreDefine "Options SETS \"${OPTIONS}\""
