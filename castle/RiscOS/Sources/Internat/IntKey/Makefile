@@ -69,13 +69,15 @@ clean::
         @echo ${COMPONENT}: cleaned
 
 keygen: keygen.c throwback.c unicdata.c
+	EnsureDepends keygenDepends
         ${MKDIR} s
         ${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 keyconvert: keyconvert.c unicdata.c
+	EnsureDepends keygenDepends
         ${MKDIR} s
         ${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 install: ${LAYOUTS}
 
-# Dynamic dependencies:
+include Depends

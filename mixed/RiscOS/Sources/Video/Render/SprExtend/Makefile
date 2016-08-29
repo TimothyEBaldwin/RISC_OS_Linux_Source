@@ -132,12 +132,15 @@ jhdr.s: ${GENJHDR}
         ${RUN}${GENJHDR} > $@
 
 ${GENPALETTE}: genpalette.c
+	EnsureDepends utilDepends
         ${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
 
 ${GENYUVTABS}: genyuvtabs.c
+	EnsureDepends utilDepends
         ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
 ${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
+	EnsureDepends utilDepends
         ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
