@@ -141,4 +141,4 @@ bbe-help2: bbe-generic
 
 
 #---------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

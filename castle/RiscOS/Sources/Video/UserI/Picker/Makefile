@@ -243,4 +243,4 @@ ${DBG_MODULE}:  ${DBG_OBJS} ${CLIB} ${OSLIB} ${ICONS} ${ASMUTILS}
         ${MKDIR} rm
         $(LD) -o $@ -rmf ${DBG_OBJS} ${OSLIB} ${CLIB} ${ASMUTILS}
 
-# Dynamic dependencies:
+include Depends

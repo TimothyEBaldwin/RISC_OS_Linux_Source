@@ -34,4 +34,4 @@ HEADER1       = IIC
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

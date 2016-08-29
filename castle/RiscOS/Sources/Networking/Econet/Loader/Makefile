@@ -68,7 +68,7 @@ ${LOADER}: s.Loader
         ${AS} s.Loader $@ ${AFLAGS}
 
 #---------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends
 rm.Loader: Hdr:ListOpts
 rm.Loader: Hdr:Macros
 rm.Loader: Hdr:System

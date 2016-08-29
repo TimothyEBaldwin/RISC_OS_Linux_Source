@@ -39,4 +39,4 @@ include CApp
 
 C_WARNINGS = -wp
 
-# Dynamic dependencies:
+include Depends

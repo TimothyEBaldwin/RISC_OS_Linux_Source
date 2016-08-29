@@ -35,4 +35,4 @@ resources: ${MERGEDMSGS}
         ${CP} ${MERGEDMSGS} ${RESFSDIR}${SEP}Messages ${CPFLAGS}
         @${ECHO} ${COMPONENT}: resources copied to Messages module
 
-# Dynamic dependencies:
+include Depends

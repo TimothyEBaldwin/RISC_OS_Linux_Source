@@ -338,4 +338,4 @@ rm.!GUID: odz.ModuleWrap ${OBJSDZ} ${LIBSM} ${DIRS}
 
 
 # -----------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

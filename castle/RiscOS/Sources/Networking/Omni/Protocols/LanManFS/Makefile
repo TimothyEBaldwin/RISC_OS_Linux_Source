@@ -51,4 +51,4 @@ ${MERGEDMSGS}PP: LocalRes:Messages LocalRes:CmdHelp
         ${FAPPEND} ${MERGEDMSGS} LocalRes:Messages LocalRes:CmdHelp
         ${INSERTVERSION} ${MERGEDMSGS} > $@
 
-# Dynamic dependencies:
+include Depends

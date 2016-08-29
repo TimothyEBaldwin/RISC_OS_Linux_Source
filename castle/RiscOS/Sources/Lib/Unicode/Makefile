@@ -43,4 +43,4 @@ mkunictype: mkunictype.c
         EnsureDepends mkunictype_Depends
         ${MAKE} -f mkunictype/mk THROWBACK=${THROWBACK}
 
-# Dynamic dependencies:
+include Depends

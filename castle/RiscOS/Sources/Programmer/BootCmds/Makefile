@@ -42,4 +42,4 @@ include CModule
 aif.Repeat: ${DIRS} repeatcmd.c
         ${CC} ${CINCLUDES} -o $@ repeatcmd.c ${CLIB} ${OSLIB}
 
-# Dynamic dependencies:
+include Depends

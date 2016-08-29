@@ -126,4 +126,4 @@ ${RELOC_MOD}: ${OBJS} ${CLIB}
 ${EXP_HDR}.PCCardFS: hdr.PCCardFS
         ${CP} hdr.PCCardFS $@ ${CPFLAGS}
 
-# Dynamic dependencies:
+include Depends

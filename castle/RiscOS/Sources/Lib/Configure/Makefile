@@ -26,4 +26,4 @@ include CLibrary
 
 CINCLUDES += -ITbox:,C:
 
-# Dynamic dependencies:
+include Depends

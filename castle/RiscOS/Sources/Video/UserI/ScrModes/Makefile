@@ -30,4 +30,4 @@ RESFSDIR      = ${RESDIR}.ScreenMode
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

@@ -39,4 +39,4 @@ ASFLAGS     += -pd "PCMCIATRUE SETL {${PCMCIA}}"
 CFLAGS      += -DPCMCIA${PCMCIA}
 CDFLAGS     += -DDEBUGLIB
 
-# Dynamic dependencies:
+include Depends

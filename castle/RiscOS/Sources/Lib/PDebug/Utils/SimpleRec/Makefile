@@ -63,4 +63,4 @@ o.dirs:
 ${TARGET}: ${OBJS} ${LIBS} o.dirs
 	${LD} ${LDFLAGS} -o $@ ${OBJS} ${LIBS}
 
-# Dynamic dependencies:
+include Depends
