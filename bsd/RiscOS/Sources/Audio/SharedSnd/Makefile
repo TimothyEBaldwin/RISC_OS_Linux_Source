@@ -33,4 +33,4 @@ ROM_SOURCE = Gets.s
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

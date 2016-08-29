@@ -121,4 +121,4 @@ clean:
 	${RM} inetlibzm
 
 
-# Dynamic dependencies:
+include Depends

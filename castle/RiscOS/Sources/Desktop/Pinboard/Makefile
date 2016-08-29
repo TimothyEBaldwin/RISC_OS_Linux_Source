@@ -30,4 +30,4 @@ INSTRES_FILES = Templates
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

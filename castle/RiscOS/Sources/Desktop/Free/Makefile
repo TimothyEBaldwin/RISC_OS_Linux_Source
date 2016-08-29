@@ -34,4 +34,4 @@ EXPORTS       = ${C_EXP_HDR}.Free
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

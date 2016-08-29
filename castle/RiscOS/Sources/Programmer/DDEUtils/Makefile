@@ -25,4 +25,4 @@ HEADER1   = DDEUtils
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

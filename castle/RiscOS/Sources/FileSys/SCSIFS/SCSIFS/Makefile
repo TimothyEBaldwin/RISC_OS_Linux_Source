@@ -59,4 +59,4 @@ clean::
         ${WIPE} o ${WFLAGS}
         ${RM} hdr.SCSIFSErr
 
-# Dynamic dependencies:
+include Depends

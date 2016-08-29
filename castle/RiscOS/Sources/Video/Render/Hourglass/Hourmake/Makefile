@@ -91,4 +91,4 @@ obj.hourmake: ${OBJS} ${CLIB}
        ${LD} -o $@ ${CLIB} ${OBJS}
 
 #---------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

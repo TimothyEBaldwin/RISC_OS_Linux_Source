@@ -24,5 +24,4 @@ include HostTools
 include AppLibs
 include CApp
 
-# Dynamic dependencies:
-o.scrambler:	c.scrambler
+include Depends

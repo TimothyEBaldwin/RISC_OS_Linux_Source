@@ -48,4 +48,4 @@ ${DIRS}:
 		cdir o
 		create $@
 	
-# Dynamic dependencies:
+include Depends

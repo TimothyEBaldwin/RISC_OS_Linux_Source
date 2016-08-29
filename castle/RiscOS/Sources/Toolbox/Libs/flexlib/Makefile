@@ -157,4 +157,4 @@ ${TARGETZ}: ${OBJSZ} local_dirs
 
 
 # ------------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

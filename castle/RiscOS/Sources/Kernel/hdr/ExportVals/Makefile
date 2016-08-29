@@ -38,4 +38,4 @@ all:
         settype values text
         @echo ok
 
-# Dynamic dependencies:
+include Depends
