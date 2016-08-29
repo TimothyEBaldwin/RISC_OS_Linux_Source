@@ -33,4 +33,4 @@ INSTRES_FILES = Res
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

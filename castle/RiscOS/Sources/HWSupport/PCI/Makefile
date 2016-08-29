@@ -49,4 +49,4 @@ clean::
         ${WIPE} rm ${WFLAGS}
         @@echo ${COMPONENT}: cleaned 
 
-# Dynamic dependencies:
+include Depends

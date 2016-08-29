@@ -118,4 +118,4 @@ BBETYPE = fpasc
 bbe-fpasc: bbe-generic
         BBE_Export_File ^.VersionNum
 
-# Dynamic dependencies:
+include Depends

@@ -63,4 +63,4 @@ clean::
         ${RM} hdr.ADFSErr
         @@echo ${COMPONENT}: cleaned 
 
-# Dynamic dependencies:
+include Depends

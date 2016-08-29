@@ -39,4 +39,4 @@ CDEFINES    = -DKERNEL -DINET -DGATEWAY -DCOMPAT_43 -DCOMPAT_OLDSOCK -DDIRECTED_
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

@@ -88,7 +88,7 @@ rm.NetP: ${OBJS} cmhg.MNSHdr_p ${LCLIB}
          ${LD} -o $@ -module -map o.mnshdr_p ${OBJS} ${CLIB} > map.linkmap_p
 
 
-# Dynamic dependencies:
+include Depends
 o.mns:	c.mns
 o.mns:	C:h.kernel
 o.mns:	C:h.swis

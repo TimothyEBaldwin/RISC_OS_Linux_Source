@@ -20,4 +20,4 @@ OBJS = asm testbed
 
 include CApp
 
-# Dynamic dependencies:
+include Depends
