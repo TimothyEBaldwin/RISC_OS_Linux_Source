@@ -41,6 +41,4 @@ CMHGDEPENDS     = cmodule log config errors
 CUSTOMRES       = no
 
 include CModule
-
-
-# Dynamic dependencies:
+include Depends
