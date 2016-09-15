@@ -551,10 +551,10 @@ rom_link_Entries:
         grep -E -v "^(0x00000000 . )?_swix?$" < syms.A_Entries1 > syms.A_Entries
         ${RM} syms.A_Entries1
 
-rom_link_RISC_OSLib: ${ROM_OBJS} rom_link_Entries
+rom_link_RISC_OSLib: ${ROM_OBJS} rom_link_Entries ${PVLIBS}
         ${XTENT} syms.Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2 rlib.s.rl_entries
         print rlib.swi { >> syms.Entries }
-        ${LD} ${LDFLAGS} -o linked.RISC_OSLib ${ROM_OBJS} \
+        ${LD} ${LDFLAGS} -o linked.RISC_OSLib ${ROM_OBJS} ${PVLIBS} \
               -symdefs syms.C_Entries \
               -symdefs syms.A_Entries \
               -symdefs syms.Entries \
@@ -562,10 +562,10 @@ rom_link_RISC_OSLib: ${ROM_OBJS} rom_link_Entries
               -bin -base ${ADDRESS} \
               -map > map.${TARGET}
 
-rom_link_CLib: ${CLIB_ROM_OBJS} rom_link_Entries
+rom_link_CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS}
         ${XTENT} syms.Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2
         print rlib.swi { >> syms.Entries }
-        ${LD} ${LDFLAGS} -o linked.CLib ${CLIB_ROM_OBJS} \
+        ${LD} ${LDFLAGS} -o linked.CLib ${CLIB_ROM_OBJS} ${PVLIBS} \
               -symdefs syms.C_Entries \
               -symdefs syms.A_Entries \
               -symdefs syms.Entries \
