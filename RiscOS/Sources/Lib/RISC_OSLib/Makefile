@@ -571,11 +571,11 @@ rom_link_Entries: rlib.swi kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entr
 	${RM} syms.A_Entries1
 	${TOUCH} rom_link_Entries
 
-linked.RISC_OSLib: ${ROM_OBJS} rom_link_Entries rlib.s.rl_entries ${FORCEROMLINK}
+linked.RISC_OSLib: ${ROM_OBJS} rom_link_Entries rlib.s.rl_entries ${PVLIBS} ${FORCEROMLINK}
 	${RM} $@
 	${XTENT} syms.Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2 rlib.s.rl_entries
 	print rlib.swi { >> syms.Entries }
-	${LD} ${LDFLAGS} -o linked.RISC_OSLib ${ROM_OBJS} \
+	${LD} ${LDFLAGS} -o linked.RISC_OSLib ${ROM_OBJS} ${PVLIBS} \
               -symdefs syms.C_Entries \
               -symdefs syms.A_Entries \
               -symdefs syms.Entries \
@@ -584,11 +584,11 @@ linked.RISC_OSLib: ${ROM_OBJS} rom_link_Entries rlib.s.rl_entries ${FORCEROMLINK
               -map > map.${TARGET}
         Echo OLD_ADDRESS=${ADDRESS} { > linked.RISC_OSLib_address }
 
-linked.CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${FORCEROMLINK}
+linked.CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS} ${FORCEROMLINK}
 	${RM} $@
 	${XTENT} syms.Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2
 	print rlib.swi { >> syms.Entries }
-	${LD} ${LDFLAGS} -o linked.CLib ${CLIB_ROM_OBJS} \
+	${LD} ${LDFLAGS} -o linked.CLib ${CLIB_ROM_OBJS} ${PVLIBS} \
               -symdefs syms.C_Entries \
               -symdefs syms.A_Entries \
               -symdefs syms.Entries \
