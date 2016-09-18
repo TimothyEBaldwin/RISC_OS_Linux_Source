@@ -45,7 +45,7 @@ LIBFILE = libfile
 
 CFLAGS   = -c -depend !Depend -Wap -zps0 ${INCLUDES} -ffah ${DFLAGS}
 CFLAGSZM = -c -depend !Depend -Wap -zps1 ${INCLUDES} -ffah ${DFLAGS} -zM
-CPFLAGS  = ~cfr~v
+CPFLAGS  = ~cfr~vn
 WFLAGS   = ~c~v
 LIBFILEFLAGS = -c -o $@
 
