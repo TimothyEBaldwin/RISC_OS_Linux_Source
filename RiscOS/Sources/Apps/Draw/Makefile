@@ -261,7 +261,7 @@ ${ROM_MODULE}: oz.ModuleWrap ${OBJSZ} ${ROMSTUBS}
 	${LD} -o $@ -aof oz.ModuleWrap ${OBJSZ} ${ROMSTUBS}
 
 # final link for ROM Image (using given base address)
-rom_link:
+rom_link: ${ROM_MODULE}
 	${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM}
 	${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: rom_link complete
