@@ -162,7 +162,7 @@ ${TARGET}: ${OBJS} o.ModuleWrap ${ROMSTUBS}
 #
 # Final link for the ROM Image (using given base address)
 #
-rom_link:
+rom_link: ${TARGET}
         ${LD} -o linked.${COMPONENT} -rmf -base ${ADDRESS} ${TARGET} ${ABSSYM}
         ${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
         @echo ${COMPONENT}: rom_link complete
