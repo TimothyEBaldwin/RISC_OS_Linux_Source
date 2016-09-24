@@ -27,6 +27,7 @@ TARGET      = Buffers
 HEADER1     = Buffer
 ASMCHEADER1 = Buffer
 EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
+ROM_LIBS    = ${PVLIBS}
 
 include StdTools
 include AAsmModule
