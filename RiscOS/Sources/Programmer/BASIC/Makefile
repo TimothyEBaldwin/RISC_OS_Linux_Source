@@ -19,6 +19,7 @@ COMPONENT    ?= BASIC105
 VFPASM       ?= TRUE
 RESDIR       ?= _!_x_!_
 RESFSDIR      = ${RESDIR}.BASIC
+ROM_LIBS      = ${PVLIBS}
 
 ifeq ($(VFPASM),TRUE)
 ASFLAGS       = -PD "VFPAssembler SETL {TRUE}"
