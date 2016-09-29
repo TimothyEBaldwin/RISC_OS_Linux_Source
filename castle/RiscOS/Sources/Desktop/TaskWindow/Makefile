@@ -28,6 +28,7 @@
 COMPONENT   = TaskWindow
 ROM_SOURCE  = Taskman.s
 HEADER1     = TaskWindow
+ROM_LIBS    = ${PVLIBS}
 
 #
 # Generic rules:
