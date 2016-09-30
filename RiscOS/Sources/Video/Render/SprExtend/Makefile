@@ -161,6 +161,7 @@ resmsg.o: LocalRes:Messages
         ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
 
 asmcore.o:
+        ${MKDIR} o
         ${CC} ${CFLAGS} $*.c
 
 # Dynamic dependencies:
