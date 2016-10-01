@@ -276,11 +276,13 @@ int main(int argc, char **argv) {
       case SDL_MOUSEBUTTONDOWN:
         r.reason = report::ev_keydown;
         r.key.code = 0x70 + e.button.button - 1;
+        if (r.key.code != 0x70) r.key.code ^= 3;
         write(sockets[0], &r, sizeof(r));
         break;
       case SDL_MOUSEBUTTONUP:
         r.reason = report::ev_keyup;
         r.key.code = 0x70 + e.button.button - 1;
+        if (r.key.code != 0x70) r.key.code ^= 3;
         write(sockets[0], &r, sizeof(r));
         break;
       case SDL_MOUSEMOTION:
