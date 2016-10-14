@@ -99,8 +99,8 @@ struct keys sdl2key[] = {
   {SDL_SCANCODE_F7,  KeyNo_Function7},
   {SDL_SCANCODE_F8,  KeyNo_Function8},
   {SDL_SCANCODE_F9,  KeyNo_Function9},
-  {SDL_SCANCODE_F10, KeyNo_Function10},
-  {SDL_SCANCODE_F11, KeyNo_Function11},
+  {SDL_SCANCODE_F10, KeyNo_Function12},
+  {SDL_SCANCODE_F11, KeyNo_Function12},
   {SDL_SCANCODE_F12, KeyNo_Function12},
 };
 
