@@ -81,6 +81,7 @@ ACTIONS_ARM = actions/common \
               actions/ARMv7 \
               actions/ARMv7_ASIMD \
               actions/ARMv7_VFP \
+              actions/ARMv8_AArch32 \
               actions/FPA \
               actions/XScale_DSP
 
@@ -91,6 +92,7 @@ ACTIONS_VFP = actions/common \
 ENCODINGS = Build:decgen.encodings.ARMv7 \
             Build:decgen.encodings.ARMv7_ASIMD \
             Build:decgen.encodings.ARMv7_VFP \
+            Build:decgen.encodings.ARMv8_AArch32 \
             Build:decgen.encodings.FPA \
             Build:decgen.encodings.XScale_DSP
 
