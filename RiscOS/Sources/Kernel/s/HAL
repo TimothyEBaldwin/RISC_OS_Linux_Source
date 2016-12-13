@@ -614,7 +614,7 @@ RISCOS_Start
 ; v2 -> next address to allocate in v1 (may point at end of v1)
 ; v3 -> L1PT (or 0 if MMU on - not yet)
 
-; Set up some temporary PCBTrans and PPLTrans pointers
+; Set up some temporary PCBTrans and PPLTrans pointers, and the initial page flags used by the page tables
         ADD     a1, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
         BL      Init_PCBTrans
 
@@ -675,7 +675,9 @@ RISCOS_Start
         ; Map in L1PT
         MOV     a1, v3
         LDR     a2, =L1PT
-        LDR     a3, =AreaFlags_L1PT
+        ADD     a3, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
+        LDR     a3, [a3, #PageTable_PageFlags]
+        ORR     a3, a3, #PageFlags_Unavailable
         MOV     a4, #16*1024
         BL      Init_MapIn
 
@@ -683,7 +685,9 @@ RISCOS_Start
         MOV     a1, v3, LSR #20
         MOV     a1, a1, LSL #20                 ; megabyte containing L1PT
         LDR     a2, =PhysicalAccess
-        LDR     a3, =AreaFlags_L1PT
+        ADD     a3, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
+        LDR     a3, [a3, #PageTable_PageFlags]
+        ORR     a3, a3, #PageFlags_Unavailable
         MOV     a4, #1024*1024
         BL      Init_MapIn
 
@@ -783,11 +787,8 @@ MMU_activation_zone
 ; to the same physical address. In case the code crosses a section boundary, do the
 ; next section as well.
 ;
-; Also note, no RAM access until we've finished the operation, as we don't know it's
-; available, and we might lose it due to lack of cache cleaning.
-;
-        MOV     a1, #4_3333333333333333         ; All domain manager - in case MMU already on
-        ARM_MMU_domain a1                       ; (who knows what domains/permissions they are using)
+        MOV     a1, #4_0000000000000001                         ; domain 0 client only
+        ARM_MMU_domain a1
 
         ADR     a1, MMU_activation_zone
         MOV     a1, a1, LSR #20                 ; a1 = megabyte number (stays there till end)
@@ -807,10 +808,15 @@ MMU_activation_zone
         STMIA   lr, {a4, v4}
 
         MOV     a4, a1
+        Push    "a2,lr"
+        MOV     a1, v3
+        ADD     a2, v3, #DRAMOffset_PageZero-DRAMOffset_L1PT
+        BL      SetTTBR
+        Pull    "a2,lr"
         BL      Init_ARMarch                    ; corrupts a1 and ip
-        MOV     ip, a1 ; Remember architecture for later
-
+        MOV     ip, a1                          ; Remember architecture for later
         MOV     a1, a4
+
         MSREQ   CPSR_c, #F32_bit+I32_bit+UND32_mode ; Recover the soft copy of the CR
         MOVEQ   v5, sp
         ARM_read_control v5, NE
@@ -822,41 +828,9 @@ MMU_activation_zone
         ORR     v5, v5, #MMUC_R+MMUC_Z          ; ROM mode enable, branch predict enable
   ]
   [ MEMM_Type = "VMSAv6"
-        ; If we're using shareable pages, set the appropriate flag in the TTBR to let the CPU know the page tables themselves are shareable
-        ADD     lr, v3, #DRAMOffset_PageZero - DRAMOffset_L1PT
-        LDR     lr, [lr, #MMU_PPLTrans]
-        LDRH    lr, [lr]
-        TST     lr, #L2_S
-        ORRNE   v3, v3, #2
-  ]
-        ARM_MMU_transbase v3                    ; Always useful to tell it where L1PT is...
-  [ MEMM_Type = "VMSAv6"
-        BIC     v3, v3, #2                      ; (clear flags, the address in v3 is needed later on)
-        CMP     ip, #0
-  ]
-
-        MOV     lr, #0
-        BNE     %FT01
-        MCREQ   p15, 0, lr, c5, c0              ; MMU may already be on (but flat mapped)
-        B       %FT02
-01      MCRNE   p15, 0, lr, c8, c7              ; if HAL needed it (eg XScale with ECC)
-02                                              ; so flush TLBs now
-  [ MEMM_Type = "VMSAv6"
-        MCR     p15, 0, lr, c2, c0, 2           ; TTBCR: Ensure only TTBR0 is used
-        ; Check if security extensions are supported
-        CMP     ip, #ARMvF
-        BNE     %FT01
-        MRC     p15, 0, lr, c0, c1, 1           ; ID_PFR1
-        TST     lr, #15<<4
-        MOV     lr, #0
-        BEQ     %FT01
-        MCR     p15, 0, lr, c12, c0, 0          ; VBAR: Ensure exception vector base is 0 (security extensions)
-01
-        myISB   ,lr,,y
         ORR     v5, v5, #MMUC_XP ; Extended pages enabled (v6)
         BIC     v5, v5, #MMUC_TRE+MMUC_AFE ; TEX remap, Access Flag disabled
         BIC     v5, v5, #MMUC_EE+MMUC_TE+MMUC_VE ; Exceptions = nonvectored LE ARM
-        CMP     ip, #0
   ]
   [ NoUnaligned
         ORR     v5, v5, #MMUC_A ; Alignment exceptions on
@@ -864,7 +838,11 @@ MMU_activation_zone
   [ HiProcVecs
         ORR     v5, v5, #MMUC_V ; High processor vectors enabled
   ]
+
 MMUon_instr
+; Note, no RAM access until we've reached MMUon_nol1ptoverlap and the flat
+; logical-physical mapping of the ROM has been removed (we can't guarantee that
+; the RAM mapping hasn't been clobbered, and SP is currently bogus).
         ARM_write_control v5
   [ MEMM_Type = "VMSAv6"
         MOV     lr, #0
@@ -888,9 +866,6 @@ MMUon_instr
         MOV     lr, #0                                          ; junk MMU-off contents of I-cache
         MCR     ARM_config_cp,0,lr,ARMv4_cache_reg,C7           ; (works on ARMv3)
   ]
-
-        MOV     ip, #4_0000000000000001                         ; domain 0 client only
-        ARM_MMU_domain ip
 
 ; MMU now on. Need to jump to logical copy of ourselves. Complication arises if our
 ; physical address overlaps our logical address - in that case we need to map
@@ -1842,10 +1817,10 @@ AllocateL2PT ROUT
         TEQ     v3, #0
         LDREQ   a3, =ZeroPage
         ADDNE   a3, v3, #DRAMOffset_PageZero-DRAMOffset_L1PT
+        LDR     a2, [a3, #PageTable_PageFlags]
         LDR     a4, [a3, #MMU_PCBTrans]
         LDR     a3, [a3, #MMU_PPLTrans]
         MOV     a1, #0
-        LDR     a2, =AreaFlags_L2PT
         BL      Get4KPTE
 
         MOV     a3, a1
@@ -2287,12 +2262,7 @@ RISCOS_MapInIO_PTE ; a1 bits 0-19 = L1 section entry flags, bits 20+ = our extra
         ADD     v1, v1, #&100000                        ; next section
         CMP     a2, a3
         BLO     %BT34
-      [ MEMM_Type = "VMSAv6"
-        ; DSB + ISB required to ensure effect of page table write is fully
-        ; visible (after overwriting a faulting entry)
-        myDSB   ,a1
-        myISB   ,a1,,y
-      ]
+        PageTableSync
         LDR     v1, [ip, #IOAllocPtr]
 40
         ADD     a1, v1, v4                              ; logical address for request

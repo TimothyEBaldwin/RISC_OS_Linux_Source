@@ -380,13 +380,8 @@ DoTheGrowCommon ROUT
         STRNE   r2, [r3], #12                   ; store page number and move on
         CMP     r4, r10                         ; have we done all of it?
         BNE     %BT30                           ; [no, so loop]
-      [ FastCDA_Bulk :LAND: (MEMM_Type = "VMSAv6")
-        ; DSB + ISB required to ensure effect of page table write is fully
-        ; visible (after overwriting a faulting entry)
-        myDSB   ,lr
-        myISB   ,lr,,y
-        ; Note for non-VMSAv6 case there's nothing needed since we were only
-        ; overwriting faulting entries
+      [ FastCDA_Bulk
+        PageTableSync
       ]
 35
         LDR     r3, [r12, #DANode_Size]
@@ -503,5 +498,126 @@ DoTheShrink ROUT
 
 30
         EXIT
+
+ [ CacheablePageTables
+MakePageTablesCacheable ROUT
+        Entry   "r0,r4-r5,r8-r9"
+        BL      GetPageFlagsForCacheablePageTables
+        ; Update PageTable_PageFlags
+        LDR     r1, =ZeroPage
+        STR     r0, [r1, #PageTable_PageFlags]
+        ; Adjust the logical mapping of the page tables to use the specified page flags
+        LDR     r1, =L1PT
+        LDR     r2, =16*1024
+        BL      AdjustMemoryPageFlags
+        LDR     r1, =L2PT
+        LDR     r2, =4*1024*1024
+        BL      AdjustMemoryPageFlags
+        ; Update the TTBR
+        LDR     r4, =L1PT
+        LDR     r8, =L2PT
+        BL      logical_to_physical
+        MOV     r0, r5
+        LDR     r1, =ZeroPage
+        BL      SetTTBR
+        ; Perform a full TLB flush to make sure the new mappings are visible
+        ARMop   TLB_InvalidateAll,,,r1
+        EXIT
+
+MakePageTablesNonCacheable ROUT
+        Entry   "r0-r1,r4-r5,r8-r9"
+        ; Flush the page tables from the cache, so that when we update the TTBR
+        ; below we can be sure that the MMU will be seeing the current page
+        ; tables
+        LDR     r0, =L1PT
+        ADD     r1, r0, #16*1024
+        LDR     r4, =ZeroPage
+        ARMop   Cache_CleanRange,,,r4
+        LDR     r0, =L2PT
+        ADD     r1, r0, #4*1024*1024
+        ARMop   Cache_CleanRange,,,r4
+        ; Update the TTBR so the MMU performs non-cacheable accesses
+        LDR     r0, =AreaFlags_PageTablesAccess :OR: DynAreaFlags_NotCacheable :OR: DynAreaFlags_NotBufferable
+        STR     r0, [r4, #PageTable_PageFlags]
+        LDR     r4, =L1PT
+        LDR     r8, =L2PT
+        BL      logical_to_physical
+        MOV     r0, r5
+        LDR     r1, =ZeroPage
+        BL      SetTTBR
+        ; Perform a full TLB flush just in case
+        ARMop   TLB_InvalidateAll,,,r1
+        ; Now we can adjust the logical mapping of the page tables to be non-cacheable
+        LDR     r0, [r1, #PageTable_PageFlags]
+        LDR     r1, =L1PT
+        LDR     r2, =16*1024
+        BL      AdjustMemoryPageFlags
+        LDR     r1, =L2PT
+        LDR     r2, =4*1024*1024
+        BL      AdjustMemoryPageFlags
+        EXIT
+
+; In:
+; R0 = new page flags
+; R1 = base of area
+; R2 = size of area
+AdjustMemoryPageFlags ROUT
+        Entry   "r0-r12"
+        LDR     r8, =L2PT
+        LDR     r12, =ZeroPage
+        LDR     r7, [r12, #MaxCamEntry]
+        MOV     r4, r1
+10
+        BL      logical_to_physical ; CC if page exists, r5 = phys addr
+        BLCC    physical_to_ppn
+        BCS     %FT90
+        ; r9-r11 corrupt, r3 = page number, r5 = phys addr
+        Push    "r0,r2,r4"
+        MOV     r2, r3
+        MOV     r3, r4
+        ; Get the current page flags, so that we can retain the Unavailable flag
+        ; (L2PT is a mix of locked and unlocked pages - potentially this is
+        ; redundant and just a side-effect of ConstructCAMFromPageTables, but
+        ; for now I'll play it safe and keep the current flag setting.
+        ; N.B. If this is changed, be sure to make sure the flag is retained for
+        ; L1PT)
+        LDR     r11, [r12, #CamEntriesPointer]
+        ADD     r11, r11, #CAM_PageFlags
+        LDR     r11, [r11, r2, LSL #CAM_EntrySizeLog2]
+        AND     r11, r11, #PageFlags_Unavailable
+        ORR     r11, r0, r11
+        BL      BangCamUpdate ; r0, r1, r4, r6 corrupted
+        ; When making the pages non-cacheable, we need to be extra vigorous in
+        ; order to make sure the cache and TLB aren't left in inconsistent
+        ; states.
+        TST     r11, #DynAreaFlags_NotCacheable
+        BEQ     %FT50
+        ; The MMU will be performing non-cacheable accesses, but the CPU will
+        ; be performing cacheable accesses, so the maintenance performed by
+        ; BangCamUpdate won't have done anything useful.
+        ; So start by flushing the L2PT word from the cache.
+        ADD     r0, r8, r3, LSR #10 ; -> L2PT entry we modified
+        LDRB    r2, [r12, #Cache_Type]
+        CMP     r2, #CT_ctype_WB_CR7_Lx ; DCache_LineLen lin or log?
+        LDRB    r2, [r12, #DCache_LineLen]
+        MOVEQ   lr, #4
+        MOVEQ   r2, lr, LSL r2
+        SUB     r2, r2, #1
+        BIC     r0, r0, r2
+        ADD     r1, r0, r2
+        ADD     r1, r1, #1
+        ARMop   Cache_CleanRange,,,r12
+        ; Now that we know the page table write has gone to main memory, we can
+        ; do regular TLB+cache maintenance for the area and have it take effect
+        MOV     r0, r3
+        ARMop   MMU_ChangingEntry,,,r12
+50
+        Pull    "r0,r2,r4"
+90
+        SUBS    r2, r2, #PageSize
+        ADD     r4, r4, #PageSize
+        BNE     %BT10
+        EXIT
+ ]
 
         END
