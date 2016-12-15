@@ -105,11 +105,68 @@ MapBit_Default  *       (7 :SHL: MapForeShift)+32 ; default at start of line
 
 ; *****************************************************************************
 ;
+;       TeletextAlloc - Allocate teletext workspace for pending mode change
+;       Entered with R0 -> mode workspace
+;
+
+TeletextAlloc ROUT
+        Entry   "r1-r7"
+        ; We allocate one block from the system heap which is large enough to contain:
+        ; * TTXMap: (columns+1)*rows*4
+        ; * TTXLineStarts: rows*4
+        ; * TTXDoubleCounts: rows*1
+        LDR     R4, [R0, #wkScrRCol]
+        ADD     R4, R4, #2
+        LDR     R5, [R0, #wkScrBRow]
+        ADD     R5, R5, #1
+        MUL     R6, R4, R5
+        MOV     R6, R6, LSL #2 ; TTXMap size, TTXLineStarts offset
+        ADD     R7, R6, R5, LSL #2 ; TTXMap+TTXLineStarts size, TTXDoubleCounts offset
+        ADD     R3, R7, R5 ; Total size
+        BL      ClaimSysHeapNode
+        ; Remember new workspace pointer for later
+        STRVC   R2, [WsPtr, #TTXNewWorkspace]
+        EXIT
+
+; *****************************************************************************
+;
 ;       TeletextInit - Initialise teletext workspace
 ;       Called when MODE 7 (or 135) is selected
 ;
 
 TeletextInit ROUT
+        Entry
+        ; Calculate offsets to the different components
+        ; NOTE: TTXFastCLS relies on TTXLineStarts directly following TTXMap
+        LDR     R4, [WsPtr, #ScrRCol]
+        ADD     R4, R4, #2
+        LDR     R5, [WsPtr, #ScrBRow]
+        ADD     R5, R5, #1
+        MUL     R6, R4, R5
+        MOV     R6, R6, LSL #2 ; TTXMap size, TTXLineStarts offset
+        ADD     R7, R6, R5, LSL #2 ; TTXMap+TTXLineStarts size, TTXDoubleCounts offset
+
+        ; Claim the workspace that was previously allocated by TeletextAlloc
+        LDR     R2, [WsPtr, #TTXNewWorkspace]
+        MOV     R0, #0
+        STR     R0, [WsPtr, #TTXNewWorkspace]
+
+        ; Fill in the pointers
+        STR     R2, [WsPtr, #TTXMapPtr]
+        ADD     R6, R2, R6
+        STR     R6, [WsPtr, #TTXLineStartsPtr]
+        ADD     R7, R2, R7
+        STR     R7, [WsPtr, #TTXDoubleCountsPtr]
+
+
+        ; Initialise TTXLineStarts
+        ; Everything else is initialised later on
+01
+        STR     R2, [R6], #4
+        ADD     R2, R2, R4, LSL #2
+        TEQ     R6, R7
+        BNE     %BT01
+
         MOV     R0, #1                          ; set to flash immediately
         STR     R0, [WsPtr, #TeletextCount]
 
@@ -177,7 +234,26 @@ TeletextInit ROUT
         BNE     %BT20
       ]
 
-        MOV     PC, R14
+        EXIT
+
+; *****************************************************************************
+;
+;       TeletextFinalise - Free teletext workspace
+;       Called when switching out of teletext mode
+;
+
+TeletextFinalise ROUT
+        Entry
+        ; TTXMapPtr is the pointer to the allocated block
+        LDR     R2, [WsPtr, #TTXMapPtr]
+        CMP     R2, #0
+        BLNE    FreeSysHeapNode
+        MOV     R0, #0
+        STR     R0, [WsPtr, #TTXMapPtr]
+        STR     R0, [WsPtr, #TTXLineStartsPtr]
+        STR     R0, [WsPtr, #TTXDoubleCountsPtr]
+        CLRV
+        EXIT
 
 ; *****************************************************************************
 ;
@@ -235,9 +311,11 @@ Vdu23_18_0 ROUT
         ORR     R6, R6, R5, LSL #TTXFlag_TransModeShift
         STR     R6, [WsPtr, #TTXFlags]
 
-        ; Redraw the screen
+        ; Redraw the screen (paletted case)
         Push    "R7"
-        BL      RefreshBitmap
+        LDR     R7, [WsPtr, #Log2BPP]
+        CMP     R7, #3
+        BLLS    RefreshBitmap
         Pull    "R7"
 
         ; Deal with the opposite palette programming case (switching away from mode 0)
@@ -246,10 +324,20 @@ Vdu23_18_0 ROUT
         MOVEQ   R7, #&FF                ; and they all have a transparent border, too
         BLEQ    SetTTXPalette
 
+        ; Redraw the screen (true colour case)
+        LDR     R7, [WsPtr, #Log2BPP]
+        CMP     R7, #3
+        MOVHI   R7, #-1
+        STRHI   R7, [WsPtr, #TForeCol]  ; ensure TTXUpdateColours gets called on next char plot
+        BLHI    RefreshBitmap
+
         Pull    "PC"
 
 SetTTXPalette
         Push    "R14"
+        LDR     R0, [WsPtr, #Log2BPP]
+        CMP     R0, #3
+        BHI     %FT20
         ; Set 1st flash states
         MOV     R0, #0                  ; start at colour 0
         MOV     R1, #16                 ; program 16 colours
@@ -262,6 +350,7 @@ SetTTXPalette
         ORR     R1, R1, #18:SHL:24      ; program 2nd flash state
         MOV     R4, #paletteV_BulkWrite
         BL      CallPaletteV
+20
         ; Set up the border colour
         MOV     R0, #0                  ; logical colour 0
         MOV     R1, #24                 ; type 24 (border)
@@ -353,12 +442,13 @@ Vdu23_18_3 ROUT
 
         MOV     R0, #0                          ; start at left
         MOV     R1, #0                          ; start at top
-        ADRL    R2, TTXLineStarts
-        LDR     R2, [R2]                        ; R2 -> start of map
+        LDR     R2, [WsPtr, #TTXMapPtr]         ; R2 -> start of map
         ADD     R7, R2, #4*1                    ; R7 -> map entry for first real char
-        ADD     R5, R2, #4*40                   ; R5 -> map entry for last char on first line
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R7, R5, LSL #2              ; R5 -> map entry for last char on first line
         MOV     R11, #0                         ; R11 = top line
-        MOV     R10, #25                        ; R10 = bottom line + 1
+        LDR     R10, [WsPtr, #ScrBRow]
+        ADD     R10, R10, #1                    ; R10 = bottom line + 1
         ADR     R14, %FT50
         Push    "R14"                           ; set up return address on stack
         B       TTXScanZap2                     ; recalculate the map
@@ -375,16 +465,23 @@ Vdu23_18_3 ROUT
 ;
 
 RefreshBitmap ROUT
-        Push    "R14"
+        Entry   "R9-R11"
         MOV     R0, #0
         MOV     R1, #0
         BL      AddressR0R1             ; R2 -> top-left character in bitmap
-        MOV     R6, #0                  ; R6 is line number: 0 <= R11 <= 24
         LDR     R7, [WsPtr, #RowLength]
-        ADRL    R8, TTXLineStarts
+        LDR     R11, [WsPtr, #CharWidth]
+        LDR     R8, [WsPtr, #ScrRCol]
+        MLA     R8, R11, R8, R11
+        SUB     R7, R7, R8              ; R7 = offset from end of one row to start of next
+        LDR     R8, [WsPtr, #TTXLineStartsPtr]
+        MOV     R6, #0                  ; R6 is line number: 0 <= R11 <= 24
+        LDR     R10, [WsPtr, #ScrBRow]
 10
         LDR     R4, [R8, R6, LSL #2]    ; R4 -> map entry for magic 0th character
-        ADD     R5, R4, #40*4           ; R5 -> last map entry on line
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R5, #1
+        ADD     R5, R4, R5, LSL #2      ; R5 -> last map entry on line
 20
         LDR     R1, [R4], #4            ; load map entry for previous character
         LDR     R0, [R4]                ; load map entry for current character
@@ -396,33 +493,14 @@ RefreshBitmap ROUT
         BLCC    DoPreControl            ; [do pre-control things]
         BL      UpdateHeldBits
         BL      TTXPaintChar            ; paint it to the screen
-    [ TTX256
-        ASSERT  HiResTTX
-        ADD     R2,R2, #16
-    |
-      [ HiResTTX
-        ADD     R2, R2, #8
-      |
-        ADD     R2, R2, #4              ; move to next char on same line
-      ]
-    ]
+        ADD     R2, R2, R11
         CMP     R4, R5
         BCC     %BT20
-    [ TTX256
-        ASSERT  HiResTTX
-        SUB     R2, R2, #640
-    |
-      [ HiResTTX
-        SUB     R2, R2, #320
-      |
-        SUB     R2, R2, #160            ; move back to start of this line
-      ]
-    ]
         ADD     R2, R2, R7              ; and drop down to start of next line
         ADD     R6, R6, #1
-        CMP     R6, #24
+        CMP     R6, R10
         BLS     %BT10
-        Pull    "PC"
+        EXIT
 
  [ HiResTTX
 ; *****************************************************************************
@@ -430,12 +508,15 @@ RefreshBitmap ROUT
 ;       ComputeGraphic - Called on a character-by-character basis
 ;       Generates a graphic character on the fly
 ;
+; in:   R1 -> space to build character in
+;       R3 = character: bits 0-4,6 are block flags, bit 5 is separated flag
+;
+; out:  Character built in R1
+;       All regs preserved
+;
 
 ComputeGraphic ROUT
         Push    "R1,mask,R10,R14"
-        ; R1 -> space to build character in
-        ; R3 = character: bits 0-4,6 are block flags, bit 5 is separated flag
-        ; mask (R4), R10, R14 corrupted
         MOV     mask, #&FF000000
         ORR     mask, mask, mask, LSR #16       ; mask for setting left-hand blocks (shift for right-hand)
         MOV     R10, #&C0000000
@@ -488,16 +569,18 @@ ComputeGraphic ROUT
 ;
 
 TTXFastCLS ROUT
-        ADD     R0, WsPtr, #TTXMap      ; R0 -> map
-        ADD     R1, R0, #TTXMapSize-4   ; R1 -> last word of map
+        LDR     R0, [WsPtr, #TTXMapPtr] ; R0 -> map
+        LDR     R1, [WsPtr, #TTXLineStartsPtr] ; R1 -> end of map
         LDR     R2, =MapBit_Default     ; R2 = default status at start of line
 10
         STR     R2, [R0], #4
         CMP     R0, R1
-        BLS     %BT10
+        BLO     %BT10
 
-        ADD     R0, WsPtr, #TTXDoubleCounts   ; zero double counts on each line
-        ADD     R1, R0, #25
+        LDR     R0, [WsPtr, #TTXDoubleCountsPtr] ; zero double counts on each line
+        LDR     R1, [WsPtr, #ScrBRow]
+        ADD     R1, R1, #1
+        ADD     R1, R1, R0
         MOV     R2, #0
 20
         STRB    R2, [R0], #1
@@ -523,6 +606,36 @@ TTXUpdateColours ROUT
         MOV     fore, R5
         MOV     back, R6
         LDR     bpp, [WsPtr, #BitsPerPix]
+      [ HiResTTX
+        CMP     bpp, #8
+        BLS     %FT10
+        ; Convert colour index to pixel value
+        ADRL    R14, TTXPalette_Solid
+        LDR     R0, [R14, fore, LSL #2]
+        LDR     back, [R14, back, LSL #2]
+        SWI     XColourTrans_ReturnColourNumber
+        MOV     fore, R0
+        MOV     R0, back
+        SWI     XColourTrans_ReturnColourNumber
+        ; Fixup the supremacy/alpha channel if necessary
+        ; (ColourTrans always sets it to default!)
+        TST     R5, #8
+        TSTEQ   R6, #8
+        LDRNE   R14, [WsPtr, #TTXFlags]
+        TSTNE   R14, #TTXFlag_TransModeMask
+        BEQ     %FT09
+        Push    "fore"
+        BL      GetAlphaSupremacyBits
+        Pull    "fore"
+        TST     R5, #8
+        EORNE   fore, fore, back
+        TST     R6, #8
+        EORNE   R0, R0, back
+09
+        MOV     back, R0
+        LDR     bpp, [WsPtr, #BitsPerPix] ; (R0)
+10
+      ]
         BL      SetColours
         Pull    "R0,R2,PC"
 
@@ -536,6 +649,9 @@ TTXUpdateColours ROUT
 ;       bottomhalf contains bytes 4567
 ;       R10        contains bytes xx89
 ;       We know that at least one of MapBit_Bottom or MapBit_Double is set
+;
+; out:  tophalf, bottomhalf, R10 updated
+;       R3 corrupted
 ;
 
 PrintDoubleHeight ROUT
@@ -658,13 +774,32 @@ TTXScanFromHere
         MOV     R4, #0                          ; Xmin and
         MOV     R5, #0                          ; Xmax are irrelevant
         MOV     R10, #0                         ; Ymax always <= Y so no zap
+;
+;       TTXScanZap - Plot multiple characters from map, or plot spaces
+;
+; in:   R0 = current (initial) character
+;       R2 = current screen addr
+;       R3 = current X
+;       R4 = X min of area
+;       R5 = X max of area
+;       R10 = Y max of area
+;       R11 = current Y
+;       R12 -> VDU workspace
+;       R14 = non-zero to plot from map, zero to plot spaces
+;       Return address stacked
+;
+; out:  R0-R11 corrupt
+;
 TTXScanZap
-        ADRL    R1, TTXLineStarts               ; R1 -> table of line starts
+        LDR     R1, [WsPtr, #TTXLineStartsPtr]  ; R1 -> table of line starts
         LDR     R8, [R1, R11, LSL #2]           ; R8 -> map entry at st.of line
-        ADD     R7, R8, #40*4                   ; R7 -> end of this line
+        LDR     R7, [WsPtr, #ScrRCol]
+        ADD     R7, R7, #1
+        ADD     R7, R8, R7, LSL #2              ; R7 -> end of this line
         LDR     R1, [R8, R3, LSL #2]!           ; R1 = prev. char+attr
+        LDR     R6, [WsPtr, #CharWidth]
 08
-        ADD     R3, WsPtr, #TTXDoubleCounts
+        LDR     R3, [WsPtr, #TTXDoubleCountsPtr]
         LDRB    R9, [R3, R11]                   ; R9 = no. of dbls on this line
 10
         BIC     R1, R1, #&FF                    ; clear char bits
@@ -709,24 +844,16 @@ TTXScanZap
 
         TEQ     R3, #0                          ; if attributes different
         TEQNE   R8, R7                          ; and not at end of line
-    [ TTX256
-        ASSERT  HiResTTX
-        ADDNE   R2, R2, #16
-    |
-      [ HiResTTX
-        ADDNE   R2, R2, #8
-      |
-        ADDNE   R2, R2, #4                      ; then move to next char
-      ]
-    ]
+        ADDNE   R2, R2, R6                      ; then move to next char
         BNE     %BT10                           ; and loop
 
-        ADD     R3, WsPtr, #TTXDoubleCounts
+        LDR     R3, [WsPtr, #TTXDoubleCountsPtr]
         STRB    R9, [R3, R11]                   ; update no. of doubles
 
+        LDR     R3, [WsPtr, #ScrBRow]
+        TEQ     R11, R3
         ADD     R11, R11, #1                    ; go to next line
-        TEQ     R11, #25                        ; if off bottom of screen
-        Pull    PC, EQ                          ; then finished
+        Pull    PC, EQ                          ; if off bottom of screen then finished
 
         MOVS    R3, R9                          ; if no doubles
                                                 ; then next line is top line
@@ -747,25 +874,20 @@ TTXScanZap
 ; now compute new R2
 
         SUB     R3, R7, R8                      ; (no. of chars before eol) * 4
-        RSB     R3, R3, #160                    ; (current char number) * 4
-    [ TTX256
-        ASSERT  HiResTTX
-        SUB     R2, R2, R3, LSL #2              ; back to start of old line
-    |
-      [ HiResTTX
-        SUB     R2, R2, R3, LSL #1              ; back to start of old line
-      |
-        SUB     R2, R2, R3                      ; back to start of old line
-      ]
-    ]
+        LDR     R9, [WsPtr, #ScrRCol]
+        ADD     R9, R9, #1
+        RSB     R3, R3, R9, LSL #2              ; (current char number) * 4
+        MUL     R3, R6, R3                      ; (number of bytes) * 4
+        SUB     R2, R2, R3, LSR #2              ; back to start of old line
         LDR     R3, [WsPtr, #RowLength]
         ADD     R2, R2, R3                      ; move down a row
 
         MOV     R8, R7                          ; R8 -> dummy char on new line
-        ADD     R7, R7, #40*4                   ; R7 -> last char on new line
+        ADD     R7, R7, R9, LSL #2              ; R7 -> last char on new line
 
-        ADD     R4, R4, #41*4                   ; move Xmin to next line
-        ADD     R5, R5, #41*4                   ; move Xmax to next line
+        ADD     R9, R9, #1
+        ADD     R4, R4, R9, LSL #2              ; move Xmin to next line
+        ADD     R5, R5, R9, LSL #2              ; move Xmax to next line
 
         CMP     R11, R10                        ; if Y < Ymax
         CMPCC   R8, R5                          ; and X < Xmax
@@ -796,7 +918,7 @@ TTXClearBox
                                                 ; R1, R3, R4 corrupted
         MOV     R3, R0                          ; R3 := left
 
-        ADRL    R4, TTXLineStarts
+        LDR     R4, [WsPtr, #TTXLineStartsPtr]
         LDR     R0, [R4, R11, LSL #2]           ; R0 -> dummy(top)
         ADD     R5, R0, R5, LSL #2              ; R5 := map(topright)
         ADD     R4, R0, R3, LSL #2              ; R4 := map(topleft)-4
@@ -818,11 +940,14 @@ TTXHardScrollUp ROUT
         Push    "R0, R6, R14"                   ; and save CursorFlags
 
         MOV     R0, #1                          ; pretend rowmult = 1
-        LDR     R2, TTXLineStarts               ; R2 -> TTXMap
-        MOV     R5, #41*4                       ; R5 = no. of bytes horiz
+        LDR     R2, [WsPtr, #TTXMapPtr]         ; R2 -> TTXMap
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R5, #2
+        MOV     R5, R5, LSL #2                  ; R5 = no. of bytes horiz
         STR     R5, [WsPtr, #RowLength]         ; pretend rowlength
-        MOV     R6, #25                         ; no. of 'pixel' rows
+        LDR     R6, [WsPtr, #ScrBRow]           ; no. of 'pixel' rows
         MOV     R7, R5                          ; linelength
+        ADD     R6, R6, #1
         BL      SoftScrollUp2
 
         Pull    "R0, R6"
@@ -830,8 +955,9 @@ TTXHardScrollUp ROUT
 
 ; now 'scroll' DoubleCounts
 
-        ADD     R0, WsPtr, #TTXDoubleCounts
-        ADD     R1, R0, #24
+        LDR     R0, [WsPtr, #TTXDoubleCountsPtr]
+        LDR     R1, [WsPtr, #ScrBRow]
+        ADD     R1, R0, R1
 10
         LDRB    R2, [R0, #1]
         STRB    R2, [R0], #1
@@ -841,7 +967,7 @@ TTXHardScrollUp ROUT
 ; now see if top line was a 'bottom' row
 ; if so, we need to rescan from the top
 
-        LDR     R8, TTXLineStarts               ; R8 -> top left map
+        LDR     R8, [WsPtr, #TTXMapPtr]         ; R8 -> top left map
         LDR     R1, [R8]                        ; R1 = dummy word
         TST     R1, #MapBit_Bottom              ; if not bottom
         BEQ     %FT20                           ; then OK
@@ -852,6 +978,8 @@ TTXHardScrollUp ROUT
         MOV     R3, #0                          ; X = 0
         MOV     R11, #0                         ; Y = 0
         LDR     R2, [WsPtr, #ScreenStart]       ; screen address for top-left
+        LDR     R14, [WsPtr, #TextOffset]       ; plus the offset
+        ADD     R2, R2, R14
 
         ADR     R14, %FT20
         Push    R14
@@ -861,17 +989,22 @@ TTXHardScrollUp ROUT
 
 ; now see if new bottom line should be a 'bottom' or a 'top' line
 
-        ADRL    R0, TTXLineStarts
-        LDR     R0, [R0, #23*4]                 ; R0 -> dummy word on line 23
-        LDRB    R1, [WsPtr, #TTXDoubleCounts+23] ; no. of dbls on line 23
+        LDR     R1, [WsPtr, #ScrBRow]
+        SUB     R1, R1, #1
+        LDR     R0, [WsPtr, #TTXLineStartsPtr]
+        LDR     R0, [R0, R1, LSL #2]            ; R0 -> dummy word on line 23
+        LDR     R14, [WsPtr, #TTXDoubleCountsPtr]
+        LDRB    R1, [R14, R1]                   ; no. of dbls on line 23
         TEQ     R1, #0                          ; if R1=0 then line 24 is 'top'
         LDRNE   R1, [R0]                        ; else line 24 is opposite
         EORNE   R1, R1, #MapBit_Bottom          ; of line 23
         ANDNE   R1, R1, #MapBit_Bottom
-        LDR     R2, [R0, #41*4]                 ; R2 = dummy word on line 24
+        LDR     R14, [WsPtr, #ScrRCol]
+        ADD     R14, R14, #2
+        LDR     R2, [R0, R14, LSL #2]           ; R2 = dummy word on line 24
         BIC     R2, R2, #MapBit_Bottom          ; clear that bit
         ORR     R2, R2, R1                      ; OR in new bit
-        STR     R2, [R0, #41*4]                 ; and store back
+        STR     R2, [R0, R14, LSL #2]           ; and store back
 
         Pull    PC
 
@@ -888,7 +1021,7 @@ TTXSoftScrollUp ROUT
         LDR     R1, [WsPtr, #TWTRow]            ; top row
         LDR     R3, [WsPtr, #TWBRow]            ; bottom row
 
-        ADRL    R2, TTXLineStarts
+        LDR     R2, [WsPtr, #TTXLineStartsPtr]
         LDR     R2, [R2, R1, LSL #2]            ; R2 -> dummy char top row
         ADD     R2, R2, #4                      ; R2 -> 0th char top row
         LDR     R4, [WsPtr, #TWLCol]
@@ -905,7 +1038,9 @@ TTXSoftScrollUp ROUT
         SUB     R6, R3, R1
         ADD     R6, R6, #1                      ; R6 = no. of 'pixel' rows
 
-        MOV     R7, #41*4                       ; R7 = line length
+        LDR     R7, [WsPtr, #ScrRCol]
+        ADD     R7, R7, #2
+        MOV     R7, R7, LSL #2                  ; R7 = line length
         STR     R7, [WsPtr, #RowLength]         ; pretend row length
         MOV     R0, #1                          ; pretend rowmult =1
 
@@ -918,7 +1053,7 @@ TTXSoftScrollUp ROUT
 
 ; now clear bottom row
 
-        ADRL    R7, TTXLineStarts
+        LDR     R7, [WsPtr, #TTXLineStartsPtr]
         LDR     R7, [R7, R3, LSL #2]            ; R7 -> dummy word(bottom)
         ADD     R8, R7, R5, LSL #2              ; R8 -> char before bottom rt
         ADD     R7, R7, R4, LSL #2              ; R7 -> char before bottom left
@@ -960,11 +1095,14 @@ TTXScanZap2
 ;
 
 CountDoubles ROUT
-        ADD     R7, WsPtr, #TTXDoubleCounts
+        Entry
+        LDR     R7, [WsPtr, #TTXDoubleCountsPtr]
         ADD     R7, R7, R1                      ; R7 -> current double count
         MOV     R11, R1
+        LDR     R14, [WsPtr, #ScrRCol]
+        ADD     R14, R14, #1
 10
-        ADD     R8, R9, #40*4                   ; R8 -> dummy char next row
+        ADD     R8, R9, R14, LSL #2             ; R8 -> dummy char next row
         MOV     R10, #0                         ; count so far
 20
         LDR     R0, [R9], #4                    ; load char word
@@ -980,7 +1118,7 @@ CountDoubles ROUT
         CMP     R11, R3                         ; if <= bottom
         BLS     %BT10                           ; then loop
 
-        MOV     PC, R14
+        EXIT
 
 ; *****************************************************************************
 ;
@@ -995,20 +1133,25 @@ TTXHardScrollDown ROUT
         Push    "R0, R6, R14"                   ; and save CursorFlags
 
         MOV     R0, #1                          ; pretend rowmult = 1
-        LDR     R2, TTXLineStarts+24*4          ; R2 -> dummy char on bottom
-        MOV     R5, #41*4                       ; R5 = no. of bytes horiz
+        LDR     R6, [WsPtr, #ScrBRow]
+        LDR     R2, [WsPtr, #TTXLineStartsPtr]
+        LDR     R2, [R2, R6, LSL #2]            ; R2 -> dummy char on bottom
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R5, #2
+        MOV     R5, R5, LSL #2                  ; R5 = no. of bytes horiz
         STR     R5, [WsPtr, #RowLength]         ; pretend rowlength
-        MOV     R6, #25                         ; no. of 'pixel' rows
+        ADD     R6, R6, #1                      ; no. of 'pixel' rows
         MOV     R7, R5                          ; linelength
         BL      SoftScrollDown2
+        SUB     R14, R6, #1
 
         Pull    "R0, R6"
         STR     R0, [WsPtr, #RowLength]         ; restore RowLength
 
 ; now 'scroll' DoubleCounts
 
-        ADD     R0, WsPtr, #TTXDoubleCounts
-        ADD     R1, R0, #24
+        LDR     R0, [WsPtr, #TTXDoubleCountsPtr]
+        ADD     R1, R0, R14
 10
         LDRB    R2, [R1, #-1]
         STRB    R2, [R1], #-1
@@ -1017,7 +1160,7 @@ TTXHardScrollDown ROUT
 
 ; now make top row a 'top' row
 
-        LDR     R0, TTXLineStarts               ; R0 -> top line dummy word
+        LDR     R0, [WsPtr, #TTXMapPtr]         ; R0 -> top line dummy word
         LDR     R1, [R0]                        ; R1 = dummy word
         BIC     R1, R1, #MapBit_Bottom          ; clear 'bottom' bit
         STR     R1, [R0]                        ; and store back
@@ -1037,7 +1180,7 @@ TTXSoftScrollDown ROUT
         LDR     R1, [WsPtr, #TWTRow]            ; top row
         LDR     R3, [WsPtr, #TWBRow]            ; bottom row
 
-        ADR     R2, TTXLineStarts
+        LDR     R2, [WsPtr, #TTXLineStartsPtr]
         LDR     R2, [R2, R3, LSL #2]            ; R2 -> dummy char bottom row
         ADD     R2, R2, #4                      ; R2 -> 0th char bottom row
         LDR     R4, [WsPtr, #TWLCol]
@@ -1054,7 +1197,9 @@ TTXSoftScrollDown ROUT
         SUB     R6, R3, R1
         ADD     R6, R6, #1                      ; R6 = no. of 'pixel' rows
 
-        MOV     R7, #41*4                       ; R7 = line length
+        LDR     R7, [WsPtr, #ScrRCol]
+        ADD     R7, R7, #2
+        MOV     R7, R7, LSL #2                  ; R7 = line length
         STR     R7, [WsPtr, #RowLength]         ; pretend row length
         MOV     R0, #1                          ; pretend rowmult =1
 
@@ -1067,7 +1212,7 @@ TTXSoftScrollDown ROUT
 
 ; now clear top row
 
-        ADR     R7, TTXLineStarts
+        LDR     R7, [WsPtr, #TTXLineStartsPtr]
         LDR     R7, [R7, R1, LSL #2]            ; R7 -> dummy word(top)
         ADD     R8, R7, R5, LSL #2              ; R8 -> char before top rt
         ADD     R7, R7, R4, LSL #2              ; R7 -> char before top left
@@ -1106,8 +1251,10 @@ TTXScrollLeft ROUT
 TTXSideScroll3
         MOV     R7, R3                          ; R7 = current row
         MOV     R8, #32                         ; poke spaces
+        LDR     R10, [WsPtr, #ScrRCol]
+        ADD     R10, R10, #2
 20
-        STRB    R8, [R4], #41*4                 ; store space and move down
+        STRB    R8, [R4], R10, LSL #2           ; store space and move down
         ADD     R7, R7, #1                      ; next row
         CMP     R7, R1                          ; if row <= bottom
         BLS     %BT20                           ; then loop
@@ -1176,15 +1323,19 @@ TTXSideScroll2 ROUT
 
 ; first check char R5 on each line and decrement double count if a double
 
-        ADR     R4, TTXLineStarts
+        LDR     R4, [WsPtr, #TTXLineStartsPtr]
         LDR     R4, [R4, R3, LSL #2]            ; R4 -> map(dummy,top)
         ADD     R9, R4, #4                      ; R9 -> map(0,top)
         ADD     R4, R9, R5, LSL #2              ; R4 -> map(left or right,top)
+        Push    "R9"
 
-        ADD     R5, WsPtr, #TTXDoubleCounts
+        LDR     R9, [WsPtr, #ScrRCol]
+        ADD     R9, R9, #2
+
+        LDR     R5, [WsPtr, #TTXDoubleCountsPtr]
         MOV     R7, R3                          ; R7 = current row
 10
-        LDR     R8, [R4], #41*4                 ; get char+attr
+        LDR     R8, [R4], R9, LSL #2            ; get char+attr
         AND     R8, R8, #&7F
         TEQ     R8, #TTX_DoubleHeight           ; test if double height char
 
@@ -1198,14 +1349,15 @@ TTXSideScroll2 ROUT
 
 ; now scroll map
 
-        Push    "R0-R3, R6, R9"
+        MOV     R7, R9, LSL #2                  ; linelength
+        LDR     R9, [sp]
+        Push    "R0-R3, R6"
         SUB     R5, R2, R0                      ; R5 = right-left
         ADD     R5, R5, #1                      ; R5 = right-left+1
         MOV     R5, R5, LSL #2                  ; R5 = (right-left+1)*4
         ADD     R2, R9, R0, LSL #2              ; R2 -> map(left,top)
         SUB     R6, R1, R3                      ; R6 = bottom-top
         ADD     R6, R6, #1                      ; R6 = bottom-top+1
-        MOV     R7, #41*4                       ; linelength
         MOV     R9, #4                          ; no. of bytes to scroll by
 
         MOV     PC, R14
@@ -1239,7 +1391,7 @@ UpdateHeldBits ROUT
 ; in:   R0 = character + attributes word
 ;       R2 -> screen (for the time being)
 ;
-; out:  R0,R2 preserved
+; out:  R3, R12 corrupt
 
 TTXPaintChar ROUT
         Entry   "R1,R4-R11"
@@ -1261,9 +1413,9 @@ TTXPaintChar ROUT
         BLNE    TTXUpdateColours                ; then update colour table
 
       [ HiResTTX
-        ADR     R1, TTXHardFont-32*40           ; R1 -> base for font
+        ADRL    R1, TTXHardFont-32*40           ; R1 -> base for font
       |
-        ADR     R1, TTXHardFont-32*10           ; R1 -> base for font
+        ADRL    R1, TTXHardFont-32*10           ; R1 -> base for font
       ]
         MOVS    R3, R0, LSL #26                 ; C := bit6, N := bit5
         AND     R3, R0, #&7F                    ; R3 = char
@@ -1292,7 +1444,7 @@ TTXPaintChar ROUT
         ADD     R1, WsPtr, #TTXSoftFonts
       [ HiResTTX
         TST     R3, #&5F                        ; if a space
-        ADREQ   R1, TTXHardFont                 ; then just use the hard font, for speed
+        ADREQL  R1, TTXHardFont                 ; then just use the hard font, for speed
         BLNE    ComputeGraphic                  ; else generate the bitmap
         B       %FT40
 20
@@ -1308,7 +1460,7 @@ TTXPaintChar ROUT
         TST     R0, #MapBit_Conceal             ; concealing ?
         LDRNE   R14, [WsPtr, #TTXFlags]
         TSTNE   R14, #TTXFlag_Conceal           ; and reveal is off?
-        ADRNE   R1, TTXHardFont                 ; yes, then display as space
+        ADRNEL  R1, TTXHardFont                 ; yes, then display as space
 
  [ :LNOT: HiResTTX
 ; now load font bytes
@@ -1337,7 +1489,8 @@ TTXPaintChar ROUT
         BL      Wrch4bitTTX                     ; do 1st bank
 
         LDMFD   R13, {R0, screen}               ; restore char + scr. addr
-        ADD     screen, screen, #40*1024
+        LDR     byte, [WsPtr, #ScreenSize]
+        ADD     screen, screen, byte, LSR #1    ; point to 2nd bank
         TST     R0, #MapBit_Flash
         MOVNE   mask, #0                        ; flash => 2nd bank is space
         MOV     R0, #0
@@ -1355,38 +1508,43 @@ TTXPaintChar ROUT
 
         MOV     mask, #&FF000000
         LDR     linelen, [WsPtr, #LineLength]
-      [ TTX256
-        SUB     linelen, linelen, #8            ; adjust line offset to account for writing 2 words/line
+        LDR     byte, [WsPtr, #CharWidth]
+        SUB     linelen, linelen, byte, LSR #1  ; adjust line offset to account for performing two screen writes per row
+
         Push    "R1, screen"
-        BL      Wrch8bitTTX                     ; do 1st bank
+        BL      WrchHiResTTX                    ; do 1st bank
 
         LDMFD   R13, {R1, screen}               ; restore pointers to character and screen address
-        ADD     screen, screen, #320*1024       ; point to 2nd bank
+        LDR     byte, [WsPtr, #ScreenSize]
+        ADD     screen, screen, byte, LSR #1    ; point to 2nd bank
         TST     R0, #MapBit_Flash
         MOVNE   mask, #0                        ; flash => 2nd bank is space
-        BL      Wrch8bitTTX                     ; do 2nd bank
+        BL      WrchHiResTTX                    ; do 2nd bank
 
         Pull    "R1, screen"
-      |
-        SUB     linelen, linelen, #4            ; adjust line offset to account for writing 2 words/line
-        Push    "R1, screen"
-        BL      Wrch4bitTTX                     ; do 1st bank
-
-        LDMFD   R13, {R1, screen}               ; restore pointers to character and screen address
-        ADD     screen, screen, #160*1024       ; point to 2nd bank
-        TST     R0, #MapBit_Flash
-        MOVNE   mask, #0                        ; flash => 2nd bank is space
-        BL      Wrch4bitTTX                     ; do 2nd bank
-
-        Pull    "R1, screen"
-      ]
         EXIT
 
- [ TTX256
-Wrch8bitTTX ROUT
- |
-Wrch4bitTTX ROUT
- ]
+
+; *****************************************************************************
+;
+;       WrchHiResTTX - Write a high-res teletext char to screen
+;
+; in:   R0 = character + attributes word
+;       R1 -> character definition
+;       screen -> screen
+;       bigfont -> font definition
+;       mask = &FF000000 for normal, &0 for blank
+;       linelen = LineLength-(CharWidth/2)
+;
+; out:  tophalf, bottomhalf, byte, scrbyte, scrbyte2, R7 corrupt
+;
+
+WrchHiResTTX ROUT
+        Entry
+        LDR     R7, [WsPtr, #Log2BPP]
+        ADR     R14, WrchHiResTTXTab - 8
+        LDR     R14, [R14, R7, LSL #2]
+
         MOV     R7, #4                          ; do each plot in 5 stages; R7 holds stage number
 01      TST     R0, #MapBit_Double
         LDMEQIA R1!, {tophalf, bottomhalf}      ; single height characters, load 4 rows
@@ -1399,8 +1557,9 @@ Wrch4bitTTX ROUT
         TEQ     byte, #MapBit_Bottom            ; if single height on line below top-half double height,
         MOVEQ   tophalf, #0                     ; make it invisible
         MOVEQ   bottomhalf, #0
+        MOV     PC, R14                         ; call routine
 
- [ TTX256
+WrchHiResTTX8
         AND     byte, mask, tophalf, LSL #16
         ADD     byte, bigfont, byte, LSR #21
         LDMIA   byte, {scrbyte, scrbyte2}
@@ -1438,48 +1597,204 @@ Wrch4bitTTX ROUT
         LDMIA   byte, {scrbyte, scrbyte2}
         STMIA   screen, {scrbyte, scrbyte2}
         ADD     screen, screen, linelen
- |
-        AND     byte, mask, tophalf, LSL #16
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], #4
-        AND     byte, mask, tophalf, LSL #24
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], linelen
-        AND     byte, mask, tophalf
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], #4
-        AND     byte, mask, tophalf, LSL #8
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], linelen
-
-        AND     byte, mask, bottomhalf, LSL #16
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], #4
-        AND     byte, mask, bottomhalf, LSL #24
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], linelen
-        AND     byte, mask, bottomhalf
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], #4
-        AND     byte, mask, bottomhalf, LSL #8
-        LDR     scrbyte, [bigfont, byte, LSR #22]
-        STR     scrbyte, [screen], linelen
- ]
 
         SUBS    R7, R7, #1
         BPL     %BT01
-        MOV     PC, R14
+        EXIT
+
+WrchHiResTTX4
+        AND     byte, mask, tophalf, LSL #16
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, tophalf, LSL #24
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+        AND     byte, mask, tophalf
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, tophalf, LSL #8
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, bottomhalf, LSL #24
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+        AND     byte, mask, bottomhalf
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, bottomhalf, LSL #8
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+
+        SUBS    R7, R7, #1
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTX16
+        SUB     linelen, linelen, #16
+        AND     byte, mask, tophalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, tophalf
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, bottomhalf
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        SUBS    R7, R7, #1
+        ADD     linelen, linelen, #16
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTX32
+        SUB     linelen, linelen, #32
+        AND     byte, mask, tophalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, tophalf
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, bottomhalf
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        SUBS    R7, R7, #1
+        ADD     linelen, linelen, #32
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTXTab
+        &       WrchHiResTTX4
+        &       WrchHiResTTX8
+        &       WrchHiResTTX16
+        &       WrchHiResTTX32
  ]
 
 ; *****************************************************************************
-
-TTXLineStarts
-        GBLA    lineno
-lineno  SETA    0
-        WHILE   lineno < 25
-        &       ZeroPage+VduDriverWorkSpace+TTXMap+4*41*lineno
-lineno  SETA    lineno +1
-        WEND
 
         LTORG
 
@@ -1491,6 +1806,11 @@ lineno  SETA    lineno +1
 ; in:   R0 = new char + attributes of current previous char
 ;       R1 = new char AND &7F
 ;       (0 <= R1 <= 31)
+;       R9 = double height char counter
+;
+; out:  R0 = updated char + attributes
+;       R3 = corrupt
+;       R9 = updated
 ;
 
 DoPreControl ROUT
