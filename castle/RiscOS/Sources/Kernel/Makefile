@@ -103,6 +103,16 @@ ${KERNEL_MODULE}: ${ROM_OBJECTS} ${DIRS}
 
 GetAll.o:  ${TOKHELPSRC}
 
+
+#
+# Internal C header
+#
+o.LinuxC: h.Kernel
+
+h.Kernel: o.GenHeader
+        ${LD} -bin -o $@ o.GenHeader
+        SetType $@ FFF
+
 #
 # Custom exports:
 #
