@@ -81,7 +81,7 @@ struct file_dedupe_range {
 	__u16 dest_count;	/* in - total elements in info array */
 	__u16 reserved1;	/* must be zero */
 	__u32 reserved2;	/* must be zero */
-	struct file_dedupe_range_info info[0];
+	struct file_dedupe_range_info info[];
 };
 
 /* And dynamically-tunable limits and defaults: */
@@ -260,7 +260,7 @@ struct fscrypt_policy {
 	__u8 filenames_encryption_mode;
 	__u8 flags;
 	__u8 master_key_descriptor[FS_KEY_DESCRIPTOR_SIZE];
-} __attribute__((packed));
+};
 
 #define FS_IOC_SET_ENCRYPTION_POLICY	_IOR('f', 19, struct fscrypt_policy)
 #define FS_IOC_GET_ENCRYPTION_PWSALT	_IOW('f', 20, __u8[16])

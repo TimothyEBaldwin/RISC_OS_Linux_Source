@@ -63,7 +63,6 @@ typedef struct siginfo {
 		struct {
 			__kernel_timer_t _tid;	/* timer id */
 			int _overrun;		/* overrun count */
-			char _pad[sizeof( __ARCH_SI_UID_T) - sizeof(int)];
 			sigval_t _sigval;	/* same as below */
 			int _sys_private;       /* not to be passed to user */
 		} _timer;
@@ -99,7 +98,7 @@ typedef struct siginfo {
 				} _addr_bnd;
 				/* used when si_code=SEGV_PKUERR */
 				__u32 _pkey;
-			};
+			} u;
 		} _sigfault;
 
 		/* SIGPOLL */
