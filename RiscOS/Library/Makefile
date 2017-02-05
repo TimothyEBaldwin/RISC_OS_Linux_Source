@@ -25,6 +25,7 @@ install_DDE: install_Dir
 	${CP} Build.stripdepnd ${INSTDIR}.stripdepnd      ${CPFLAGS}
 	${CP} Unix.chmod       ${INSTDIR}.Unix.chmod      ${CPFLAGS}
 	${CP} Unix.mkdir       ${INSTDIR}.mkdir           ${CPFLAGS}
+	${CP} Build.FAppend    ${INSTDIR}.FAppend         ${CPFLAGS}
 	${CP} Build.InstRes    ${INSTDIR}.Build.InstRes   ${CPFLAGS}
 	${CP} Build.InstViaRG  ${INSTDIR}.Build.InstViaRG ${CPFLAGS}
 
