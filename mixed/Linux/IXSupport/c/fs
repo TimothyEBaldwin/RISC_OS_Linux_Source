@@ -1,0 +1,788 @@
+/*
+ * Copyright (c) 2015, Timothy Baldwin
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ */
+
+#include <stdio.h>
+#include <stdarg.h>
+#include <kernel.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "IXSupportHdr.h"
+
+// Remove RISC OS macros, so Linux ones can be used
+#undef SEEK_SET
+#undef SEEK_CUR
+#undef SEEK_END
+
+#include "header.h"
+#include <linux/stat.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/errno.h>
+#include <linux/fcntl.h>
+
+struct path_data pd1, pd2;
+
+char dirname[1024];
+static int dents_buffer[1024];
+static int dir_fd = -1;
+
+static struct linux_dirent *dents_ptr;
+static unsigned dents_pos;
+static int dents_size;
+
+struct linux_dirent {
+  unsigned long  d_ino;     /* Inode number */
+  unsigned long  d_off;     /* Offset to next linux_dirent */
+  unsigned short d_reclen;  /* Length of this linux_dirent */
+  char           d_name[];  /* Filename (null-terminated) */
+};
+
+static const char opt_data[] = {4, 'R', 'o', 'o', 't', 2};
+
+struct ro_dirent {
+  unsigned load, exec, size, attributes, type;
+  char name[];
+};
+
+struct ro_attr {
+  unsigned load, exec, attributes;
+};
+
+
+static inline void crash(void) {
+  ix_exit(20);
+}
+
+void eprintf(const char *fmt, ...) {
+  static char s[1000];
+  va_list ap;
+
+  va_start(ap, fmt);
+  int c = vsprintf(s, fmt, ap);
+  va_end(ap);
+
+  ix_write(2, s, c);
+}
+
+static _kernel_oserror not_found = {0, "File not found"};
+static _kernel_oserror unknown_error = {0, "Unknown Error"};
+static _kernel_oserror bad_path = {0, "Bad Path"};
+static _kernel_oserror not_dir = {0, "Not a directory"};
+
+_kernel_oserror *convert_error(int r) {
+  switch (-r) {
+    case ENOENT:
+      return &not_found;
+    case ENOTDIR:
+      return &not_dir;
+    default:
+      eprintf("Linux Error: %i\n", -r);
+      sprintf(unknown_error.errmess, "Unknown error %i", -r);
+      return &unknown_error;
+  }
+  return 0;
+}
+
+static inline int pd_get(struct path_data *pd) {
+  int fd = pd->fd;
+  pd->fd = -1;
+  if (pd->dir_fd >= 0 && pd->dir_fd != fd) {
+    ix_close(pd->dir_fd);
+  }
+  pd->dir_fd = -1;
+  return fd;
+}
+
+static inline void pd_close(struct path_data *pd) {
+  int fd = pd_get(pd);
+  if (fd >= 0) {
+    ix_close(fd);
+  }
+}
+
+static _kernel_oserror *pd_convert_filename(struct path_data *pd, const char *s, int openflags) {
+
+  pd_close(pd);
+
+  //eprintf("RISC OS filename = %s\n", s);
+
+  // Skip disc name
+  if (*s == ':') {
+    char c;
+    s++;
+    do {
+      c = *s++;
+    } while (c >= 32 && c != '.');
+  }
+
+  // Skip root
+  if (s[0] == '$') {
+    if (s[1] <= 32) {
+      s += 1;
+    } else if (s[1] == '.') {
+      s += 2;
+    }
+  }
+
+  int fd2, fd = ix_open("/", O_DIRECTORY | O_RDONLY, 0);
+  if (fd < 0) return convert_error(fd);
+
+  if (!*s) {
+    // Asking for the root
+    // FIXME return AT_CWD.
+    pd->name[0] = '/';
+    pd->name[1] = 0;
+    pd->dir_fd = fd;
+    pd->fd = fd;
+    return 0;
+  }
+
+
+  while(true) {
+
+    // Convert a componment, checking for "..".
+    char *leaf = pd->name + sprintf(pd->name, "/proc/self/fd/%i/", fd);
+    char *d = leaf;
+    int dots = 0;
+    //eprintf("Leaf 1: %s\n", pd->name);
+    while(*s >= 32 && *s != '.') {
+      char c = *s++;
+      if (c == '/') {
+        ++dots;
+        c = '.';
+      } else {
+        dots = 10;
+      }
+      *d++ = c;
+      if (d == pd->name + sizeof(pd->name)) goto bad;
+    }
+    *d = 0;
+    //eprintf("Leaf 2: %s\ndots = %i\n", pd->name, dots);
+    if (dots <= 2) goto bad;
+    //eprintf("Leaf 3: %s\n", pd->name);
+
+    // Try to open it
+    fd2 =  ix_openat(fd, leaf, *s == '.' ? O_DIRECTORY | O_RDONLY : openflags & ~O_CREAT, 0777);
+
+    // If not found try case insensitive suffix ignoring search
+    if (fd2 == -ENOENT) {
+      struct linux_dirent *dentry = 0;
+      static int buffer[1024];
+      int remaining = 0;
+
+      while(true) {
+        // Read more directory entries.
+        if (!remaining) {
+          remaining = ix_getdents(fd, buffer, sizeof(buffer));
+          if (remaining == 0) {
+            if (openflags & O_CREAT) break;
+            if (*s) pd->name[0] = 0; // Prevent use of incomplete name
+            pd->fd = fd2;
+            pd->dir_fd = fd;
+            return 0;
+          }
+          if (remaining < 0) {
+            ix_close(fd);
+            return convert_error(remaining);
+          }
+          dentry = (struct linux_dirent *)buffer;
+        }
+
+        char *a = leaf;
+        char *b = dentry->d_name;
+
+        while (*a && tolower(*a) == tolower(*b)) {
+          ++a;
+          ++b;
+        }
+
+        if (*a == 0 && (*b == 0 || *b == ',')) {
+          // Match found, so copy it.
+          strcpy(leaf, dentry->d_name);
+          break;
+        }
+
+        // next directory entry
+        size_t offset = dentry->d_reclen;
+        dentry = (struct linux_dirent*)(offset + (char *)dentry);
+        remaining -= offset;
+      }
+
+      // Try again.
+      fd2 =  ix_openat(fd, leaf, *s == '.' ? O_DIRECTORY | O_RDONLY : openflags, 0777);
+    }
+
+    // Return if error
+    if (fd2 < 0) {
+      ix_close(fd);
+      pd->fd = (*s == '.' && fd2 == -ENOTDIR) ? -ENOENT : fd2;
+      return convert_error(fd2);
+    }
+
+    // Out of loop if end of path.
+    if (*s < 32) break;
+
+    ++s; // Move to start of next part.
+    ix_close(fd);
+    fd = fd2;
+    if (fd < 0) goto bad;
+  }
+
+  pd->dir_fd = fd;
+  pd->fd = fd2;
+  return 0;
+
+bad:
+  ix_close(fd);
+  eprintf("Bad filename!\n");
+  return &bad_path;
+}
+
+static void pd_unname(struct path_data *pd) {
+  sprintf(pd->name, "/proc/self/fd/%i", pd->fd);
+}
+
+static _kernel_oserror *read_dent(void) {
+  if (dents_size <= 0 && dir_fd >= 0) {
+    int r = ix_getdents(dir_fd, dents_buffer, sizeof(dents_buffer));
+    if (r <= 0) {
+      ix_close(dir_fd);
+      dir_fd = -1;
+      if (r < 0) return convert_error(r);
+    }
+    dents_size = r;
+    dents_ptr = (struct linux_dirent*)dents_buffer;
+  }
+  return 0;
+}
+
+static void next_dent(void) {
+  int offset = dents_ptr->d_reclen;
+  dents_ptr = (struct linux_dirent*)(offset + (char *)dents_ptr);
+  dents_size -= offset;
+  dents_pos += 1;
+}
+
+static _kernel_oserror *open_dir(const char *n, unsigned pos) {
+  // Open directory if required and advance to pos.
+
+  _kernel_oserror *e = 0;
+
+  if (dir_fd >= 0) {
+    if (pos && dents_pos <= pos && strcmp(n, dirname) == 0) goto keep_fd;
+    ix_close(dir_fd);
+    dir_fd = -1;
+  }
+
+  *dirname = 0;
+  e = pd_convert_filename(&pd1, n, O_RDONLY | O_DIRECTORY);
+  if (e) return e;
+
+  dir_fd = pd_get(&pd1);
+  dents_pos = 0;
+  dents_size = 0;
+  if (strlen(n) < sizeof(dirname)) strcpy(dirname, n);
+
+keep_fd:
+  while(!(e = read_dent()) && dents_size && dents_pos != pos) {
+    next_dent();
+  }
+
+  return e;
+}
+
+static void convert_leafname(char *d, const char *s) {
+  char c;
+  do {
+    c = *s++;
+    if (c == '.') c = '/';
+    *d++ = c;
+  } while (c);
+}
+
+static _kernel_oserror *read_meta(struct ro_dirent *out, const char *name) {
+  struct stat s;
+  int r  = ix_stat(name, &s);
+  if (r) {
+    out->load = 0xDEADDEAD;
+    out->exec = 0xDEADDEAD;
+    out->size = 0;
+    out->type = 0;
+    out->attributes = 0;
+    return r == -ENOENT ? 0 : convert_error(r);
+  }
+
+  struct ro_attr attr;
+  attr.load = 0xFFFFFF00;
+  attr.exec = 0;
+  attr.attributes = 3;
+  r = ix_getxattr(name, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
+  if (r == -EACCES) {
+    attr.load = 0xFFFFFD00;
+  } else if (r < 0 && r != -ENOENT && r != -ENODATA && r != -EOPNOTSUPP) {
+    return convert_error(r);
+  }
+
+  unsigned long long ro_time = attr.exec | (unsigned long long)(attr.load & 0xFF) << 32;
+  unsigned long long time = ((unsigned long long)s.st_mtime + 25567ULL * 24 * 3600) * 100;
+
+  if ((attr.load & 0xFFF00000) == 0xFFF00000 && time - 300 > ro_time) {
+    out->load = (attr.load & 0xFFFFFF00U) | (time >> 32);
+    out->exec = (unsigned)time;
+  } else {
+    out->load = attr.load;
+    out->exec = attr.exec;
+  }
+  unsigned attributes = attr.attributes & ~3U;
+  if (!ix_access(name, 4)) attributes |= 1; // Have read permission?
+  if (!ix_access(name, 2)) attributes |= 2; // Have write permission?
+  out->attributes = attributes;
+  out->size = s.st_size;
+  out->type = S_ISDIR(s.st_mode) ? 2 : 1;
+  return 0;
+}
+
+#define FSEntry_Func_READ FSEntry_Func_15
+#define OUT_TYPE struct ro_dirent
+#define SIZEOF_ENTRY(X) ((sizeof(struct ro_dirent) + (X) + 4) & ~3)
+#define META 1
+#include "read_directory.c"
+
+#define FSEntry_Func_READ FSEntry_Func_14
+#define OUT_TYPE char
+#define SIZEOF_ENTRY(X) ((X) + 1)
+#define META 0
+#include "read_directory.c"
+
+
+
+_kernel_oserror *FSEntry_Func_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  _kernel_oserror *e = 0;
+  switch (r->r[0]) {
+    case 0:
+    case 7:
+      break;
+    case 8:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_PATH);
+      if (e) return e;
+      e = pd_convert_filename(&pd2, (const char *)r->r[2], O_PATH);
+      if (e) {
+        pd_close(&pd1);
+        return e;
+      }
+      r->r[1] = !!ix_rename(pd1.name, pd2.name);
+      pd_close(&pd1);
+      pd_close(&pd2);
+      break;
+    case 10:
+      _kernel_oscli("IXFSBoot");
+      break;
+    case 11:
+      memcpy((void*)r->r[2], opt_data, sizeof(opt_data));
+      break;
+    case 14:
+      return FSEntry_Func_14(r);
+    case 15:
+      return FSEntry_Func_15(r);
+    case 16:
+      ix_sync();
+    case 27:
+      // Read boot option
+      r->r[2] = 2;
+      break;
+    case 28:
+      // Write boot option
+      break;
+    default:
+      eprintf("FSEntry_Func %i\n", r->r[0]);
+      crash();
+  }
+  return 0;
+}
+
+static const char *find_leaf(const char *i) {
+  const char *leaf = i;
+  while (*i) if (*i++ == '.') leaf = i;
+  return leaf;
+}
+
+_kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+
+  struct ro_dirent out;
+  struct ro_attr attr;
+  int fd;
+  _kernel_oserror *e = 0;
+
+  switch (r->r[0]) {
+    case 0:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_RDWR | O_CREAT | O_TRUNC);
+      if (e) goto out;
+      fd = pd1.fd;
+      attr.load = r->r[2];
+      attr.exec = r->r[3];
+      attr.attributes = 3;
+      if (r->r[4] < r->r[5]) {
+        unsigned size = r->r[5] - r->r[4];
+        const char *addr = (const char *)r->r[4];
+        while(size) {
+          int res = ix_write(fd, addr, size < 0x40000000U ? size : 0x40000000U);
+          if (res < 0) {
+            ix_close(fd);
+            return convert_error(res);
+          }
+          size -= res;
+          addr += res;
+        }
+      }
+      ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0);
+      r->r[6] = (unsigned)find_leaf((const char *)r->r[1]);
+      break;
+
+    case 1:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_PATH);
+      if (e) goto out;
+      pd_unname(&pd1);
+      attr.load = r->r[2];
+      attr.exec = r->r[3];
+      attr.attributes = r->r[5];
+      ix_setxattr(pd1.name, "user.RISC_OS.LoadExec", &attr, 12, 0);
+      break;
+
+    case 5:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_PATH);
+      if (pd1.fd == -ENOENT) {
+        r->r[0] = 0;
+        e = 0;
+        goto out;
+      }
+      if (e) goto out;
+      pd_unname(&pd1);
+      e = read_meta(&out, pd1.name);
+      if (e) goto out;
+      r->r[0] = out.type;
+      r->r[2] = out.load;
+      r->r[3] = out.exec;
+      r->r[4] = out.size;
+      r->r[5] = out.attributes;
+      break;
+
+    case 6:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_PATH);
+      if (pd1.fd == -ENOENT) {
+        r->r[0] = 0;
+        e = 0;
+        goto out;
+      }
+      if (e) goto out;
+      sprintf(pd2.name, "/proc/self/fd/%i", pd1.fd);
+      e = read_meta(&out, pd2.name);
+      if (e) goto out;
+      r->r[0] = out.type;
+      r->r[2] = out.load;
+      r->r[3] = out.exec;
+      r->r[4] = out.size;
+      r->r[5] = out.attributes;
+      fd = ix_unlink(pd1.name);
+      if (fd == -EISDIR) fd = ix_rmdir(pd1.name);
+      if (fd & fd != -ENOENT) return convert_error(fd);
+      break;
+
+    case 7:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_RDWR | O_CREAT | O_TRUNC);
+      if (e) return e;
+      attr.load = r->r[2];
+      attr.exec = r->r[3];
+      attr.attributes = 3;
+      if (r->r[4] < r->r[5]) {
+        int res = ix_ftruncate(pd1.fd, r->r[5] - r->r[4]);
+        if (res) {
+          e = convert_error(res);
+          goto out;
+        }
+      }
+      ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0);
+      r->r[6] = (unsigned)find_leaf((const char *)r->r[1]);
+      break;
+
+    case 8:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_PATH);
+      if (e) goto out;
+      fd = ix_mkdir(pd1.name, 0777);
+      if (fd) {
+        e = convert_error(fd);
+        goto out;
+      }
+      attr.load = r->r[2];
+      attr.exec = r->r[3];
+      attr.attributes = 3;
+      ix_setxattr(pd1.name, "user.RISC_OS.LoadExec", &attr, 9, 0);
+      break;
+
+
+    case 255:
+      e = pd_convert_filename(&pd1, (const char *)r->r[1], O_RDONLY);
+      if (e) return e;
+      fd = pd1.fd;
+
+      pd_unname(&pd1);
+      e = read_meta(&out, pd1.name);
+      if (e) goto out;
+
+      {
+        unsigned remaining = out.size;
+        char *addr = (char *)r->r[2];
+        while (remaining) {
+          int res = ix_read(fd, addr, remaining < 0x40000000U ? remaining : 0x40000000U);
+          if (res < 0) {
+            e = convert_error(res);
+            goto out;
+          }
+          remaining -= res;
+          addr += res;
+        }
+      }
+
+      r->r[6] = (unsigned)find_leaf((const char *)r->r[1]);
+      r->r[2] = out.load;
+      r->r[3] = out.exec;
+      r->r[4] = out.size;
+      r->r[5] = out.attributes;
+      break;
+
+
+    default:
+      eprintf("FSEntry_File %i\n", r->r[0]);
+      crash();
+  }
+out:
+  pd_close(&pd1);
+  return e;
+}
+
+_kernel_oserror *FSEntry_Open_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  _kernel_oserror *e = 0;
+  int flags;
+  unsigned info = 1U<<30;
+  info |= 1U<<28; // Use FSEntry_GBPB
+
+  switch (r->r[0]) {
+    case 0:
+      flags = O_RDONLY;
+      break;
+    case 1:
+      flags = O_RDWR | O_CREAT | O_TRUNC;
+      info |= 1U<<31;
+      break;
+    case 2:
+      flags = O_RDWR;
+      info |= 1U<<31;
+      break;
+    default:
+      eprintf("FSEntry_Open %i\n", r->r[0]);
+      crash();
+      break;
+  }
+
+  e = pd_convert_filename(&pd1, (const char *)r->r[1], flags);
+
+  int fd = pd_get(&pd1);
+  if (fd == -ENOENT) {
+    // File does not exist.
+    r->r[1] = 0;
+    return 0;
+  }
+
+  // Some other error
+  if (e) return e;
+
+  struct stat s;
+  int res = ix_fstat(fd, &s);
+  if (res) {
+    ix_close(fd);
+    return convert_error(res);
+  }
+
+  if (S_ISDIR(s.st_mode)) info |= 1U<<27;
+  // FIXME Test for ttys.
+
+  r->r[0] = info;
+  r->r[1] = fd;
+  r->r[2] = 0; // Unbuffered
+  r->r[3] = s.st_size;
+  r->r[4] = s.st_size;
+  return 0;
+}
+
+_kernel_oserror *FSEntry_Args_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  struct ro_dirent out;
+  _kernel_oserror *e = 0;
+  int res;
+  struct stat s;
+  switch (r->r[0]) {
+    case 0:
+      res = ix_lseek(r->r[1], 0, SEEK_CUR);
+      if (res < 0) return convert_error(res);
+      r->r[2] = res;
+      break;
+    case 1:
+      res = ix_lseek(r->r[1], r->r[2], SEEK_SET);
+      if (res < 0) return convert_error(res);
+      break;
+    case 2:
+      res = ix_fstat(r->r[1], &s);
+      if (res) return convert_error(res);
+      r->r[2] = s.st_size;
+      break;
+    case 3:
+      res = ix_ftruncate(r->r[1], r->r[2]);
+      if (res) return convert_error(res);
+      break;
+    case 4:
+      res = ix_fstat(r->r[1], &s);
+      if (res) return convert_error(res);
+      r->r[2] = s.st_blocks * 512;
+      break;
+    case 5: // EOF Check
+      res = ix_fstat(r->r[1], &s);
+      if (res) return convert_error(res);
+      res = ix_lseek(r->r[1], 0, SEEK_CUR);
+      if (res < 0) return convert_error(res);
+      r->r[2] = res >= s.st_size ? -1 : 0;
+      break;
+    case 6:
+      // Ignore flushes
+      break;
+    case 9:
+      sprintf(pd1.name, "/proc/self/fd/%i", r->r[1]);
+      e = read_meta(&out, pd1.name);
+      if (e) return e;
+      r->r[2] = out.load;
+      r->r[3] = out.exec;
+      break;
+    default:
+      eprintf("FSEntry_Args %i\n", r->r[0]);
+      crash();
+  }
+  return 0;
+}
+
+_kernel_oserror *FSEntry_GBPB_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  int fd = r->r[1], pos, moved;
+
+  switch(r->r[0]) {
+
+    case 1: // Write at specified pointer
+      pos = r->r[4];
+      moved = ix_pwrite(fd, (const char *)r->r[2], r->r[3], pos);
+      if (moved < 0) return convert_error(moved);
+      pos = ix_lseek(fd, pos + moved, SEEK_SET);
+      if (pos < 0) return convert_error(pos);
+      break;
+
+    case 2: // Write at current pointer
+      pos = ix_lseek(fd, 0, SEEK_CUR);
+      if (pos < 0) return convert_error(pos);
+      moved = ix_write(fd, (const char *)r->r[2], r->r[3]);
+      if (moved < 0) return convert_error(moved);
+      pos += moved;
+      break;
+
+    case 3: // Read from specified pointer
+      pos = r->r[4];
+      moved = ix_pread(fd, (char *)r->r[2], r->r[3], pos);
+      if (moved < 0) return convert_error(moved);
+      pos = ix_lseek(fd, pos + moved, SEEK_SET);
+      if (pos < 0) return convert_error(pos);
+      break;
+
+    case 4: // Read from current pointer
+      pos = ix_lseek(fd, 0, SEEK_CUR);
+      if (pos < 0) return convert_error(pos);
+      moved = ix_read(fd, (char *)r->r[2], r->r[3]);
+      if (moved < 0) return convert_error(moved);
+      pos += moved;
+      break;
+
+    default:
+      crash();
+      break;
+  }
+
+  r->r[2] += moved;
+  r->r[3] -= moved;
+  r->r[4] = pos;
+  return 0;
+}
+
+_kernel_oserror *FSEntry_GetBytes_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  r->r[0] = 0;
+  int res = ix_read(r->r[1], &r->r[0], 1);
+  if (res == 0) {
+    r->r[0] = -1;
+  } else if (res < 0) {
+    return convert_error(res);
+  }
+  return 0;
+}
+
+_kernel_oserror *FSEntry_PutBytes_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  int res = ix_write(r->r[1], &r->r[0], 1);
+  if (res < 0) {
+    return convert_error(res);
+  }
+  return 0;
+}
+
+_kernel_oserror *FSEntry_Close_handler(_kernel_swi_regs *r, void *pw) {
+  (void)pw;
+
+  int fd = r->r[1];
+
+  //eprintf("FSEntry_Close\n");
+
+  if (r->r[2] || r->r[3]) {
+    //eprintf("FSEntry_Close stamp\n");
+    struct ro_attr attr;
+    attr.attributes = 3;
+    ix_fgetxattr(fd, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
+    attr.load = r->r[2];
+    attr.exec = r->r[3];
+    ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0);
+  }
+  ix_close(fd);
+  return 0;
+}

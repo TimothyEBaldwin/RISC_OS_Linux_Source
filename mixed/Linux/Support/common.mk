@@ -1,3 +1,12 @@
+sdl: mixed/Linux/Support/sdl.cpp mixed/Linux/IXSupport/h/protocol sdlkey.h
+	g++ -Wall -pthread -g `sdl2-config --cflags --libs` --std=c++11 mixed/Linux/Support/sdl.cpp  -o sdl
+
+sdlkey.h: sdlkey
+	./sdlkey > sdlkey.h
+
+sdlkey: mixed/Linux/Support/sdlkey.c
+	gcc -std=gnu99 -Wall `sdl2-config --cflags --libs` mixed/Linux/Support/sdlkey.c -o sdlkey
+
 comma2attr: mixed/Linux/Support/comma2attr.c
 	gcc -std=gnu99 -g `pwd`/mixed/Linux/Support/comma2attr.c -o comma2attr
 
