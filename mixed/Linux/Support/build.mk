@@ -61,6 +61,7 @@ build: run ${LINUX_ROM} comma2attr stamp-prepare
 	PRINT TIME$$
 	TIME$$="$(shell date --utc "+%a,%0e %b %Y.%T")"
 	QUIT
+	*BASIC -quit mixed.Linux.Support.LockWriteC
 	*Obey -c mixed.Linux.Support.Build Linux ${TARGET} ${PHASES}
 	*BASIC
 	SYS "IXSupport_LinuxSyscall",2,,,,,,,1
