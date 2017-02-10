@@ -1,0 +1,693 @@
+; This source code in this file is licensed to You by Castle Technology
+; Limited ("Castle") and its licensors on contractual terms and conditions
+; ("Licence") which entitle you freely to modify and/or to distribute this
+; source code subject to Your compliance with the terms of the Licence.
+; 
+; This source code has been made available to You without any warranties
+; whatsoever. Consequently, Your use, modification and distribution of this
+; source code is entirely at Your own risk and neither Castle, its licensors
+; nor any other person who has contributed to this source code shall be
+; liable to You for any loss or damage which You may suffer as a result of
+; Your use, modification or distribution of this source code.
+; 
+; Full details of Your rights and obligations are set out in the Licence.
+; You should have received a copy of the Licence with this source code file.
+; If You have not received a copy, the text of the Licence is available
+; online at www.castle-technology.co.uk/riscosbaselicence.htm
+; 
+        TTL     => NewIRQs
+
+; *****************************************************************************
+;
+; Main IRQ routine:
+;     Push  workregs,lr
+;     IRQsema -> TOS
+;     stack -> IRQsema
+;     call IRQ1V
+;     IRQs off
+;     TOS ->IRQsema
+;     process callback, pulling workregs,pc at some point
+;
+; *****************************************************************************
+
+        ALIGN 32
+
+Initial_IRQ_Code ROUT
+        SUB     lr, lr, #4
+        Push    "r0, lr"
+        MRS     lr, SPSR
+        Push    "r1-r3, r11, r12, lr"
+; ** For Pete's sake remember to change the heap manager if you change the above
+; ** register list!!!!!!! And the [sp_irq, #4*5] below
+
+        LDR     r12, =ZeroPage
+        LDR     r0, [r12, #IRQsema]
+        Push    r0
+        STR     sp_irq, [r12, #IRQsema]
+        MOV     lr, pc
+        LDR     pc, [r12, #IRQ1V]
+
+; IRQ1V called with r0-r3,r11,r12 trashable. r12=0
+
+; Stu has a theory that 1N cycle can be saved by the default IRQ1V pointing
+; at a location containing a branch to our code; we then do something like
+;  LDR R0, [R12, #IRQ1V]
+;  CMP R0, #OurIRQ1V
+;  BNE somebodysonIRQ1V
+;  .... fall into default IRQ1V code
+
+        Push     "r10"
+        MOV      r10, #UnthreadV
+        BL       CallVector
+        Pull     "r10"
+
+        LDR      r11, =ZeroPage
+        Pull     r0
+        STR      r0, [r11, #IRQsema]
+
+        LDRB     r11, [r11, #CallBack_Flag]
+        TEQ      r11, #0
+        BNE      %FT10
+05
+        MyCLREX  r0, r1
+        Pull     "r1-r3, r11, r12, lr"
+        MSR      SPSR_cxsf, lr
+        Pull     "r0, pc",, ^
+
+10
+        TST      r11, #CBack_Postpone
+        LDREQ    lr, [sp_irq, #4*5]     ; get SPSR off stack
+        TSTEQ    lr, #I32_bit :OR: &0F  ; check we came from USR26 or USR32 mode, with IRQs enabled
+        BNE      %BT05
+
+; Do a CallBack: asked for, not postponed, and we're returning into USR26/32 mode.
+
+        ASSERT   IRQ32_mode :AND: SVC32_mode = IRQ32_mode ; so the following dodgy ops work
+
+        Pull     "r1-r3, r11, r12"
+        MRS      r0, CPSR
+        ORR      r0, r0, #SVC32_mode
+        MSR      CPSR_c, r0
+        Push     "r10-r12"                               ; push r10-r12 onto the SVC stack
+        BIC      r0, r0, #IRQ32_mode :EOR: SVC32_mode
+        MSR      CPSR_c, r0
+        Pull     "r10-r12"                      ; SPSR, R0, LR really
+        ORR      r0, r0, #SVC32_mode
+        MSR      CPSR_c, r0
+        Push     r12                            ; Save the return address
+        MOV      r14, r10                       ; SPSR into R14
+        MOV      r0, r11                        ; restore original R0
+        LDR      r10, =ZeroPage
+        LDRB     r11, [r10, #CallBack_Flag]
+        B        Do_CallBack_postpone_already_clear
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Default IRQ1V: despatch on interrupting device
+
+; Now copied to RAM, together with vector entries and device tables
+
+                  ^ 0
+IRQDesp_Link      # 4
+IRQDesp_R12Val    # 4
+IRQDesp_CallAddr  # 4
+
+IRQDesp_Link_Unshared * 1       ; flag in Link (for _this_ node)
+
+       ASSERT   IRQDesp_CallAddr = IRQDesp_R12Val + 4
+
+DefaultIRQ1Vcode ROUT
+
+        Push    "r9,lr"
+      [ ZeroPage = 0
+        MOV     r9, #0
+      |
+        LDR     r9, %FT02
+      ]
+        AddressHAL r9                   ; modifies r9
+        CallHAL HAL_IRQSource
+        Pull    "r9"
+        ADR     r2, Devices
+        ADD     r1, r0, r0, LSL #1      ; multiply by 3
+        ADD     r11, r2, r1, LSL #2     ; so table contains DevNo * 3
+01      MOV     lr, pc
+        LDMIA   r11, {r11, r12, pc}
+        TST     r11, #IRQDesp_Link_Unshared
+        BEQ     %BT01
+        Pull    pc
+      [ ZeroPage <> 0
+02
+        DCD     ZeroPage
+      ]
+
+; ******* IRQ device handlers entered with r0-r3,r11,r12,r14 trashable *******
+;   r0  =  device number (if HAL)
+;   r3  -> IOC (not in HAL world, unless IOMD HAL is helpful)
+;   r12 =  what they asked for
+;   r14 =  return address to MOS IRQ exit sequence
+
+DefaultIRQ1Vcode_end
+
+Devices * DefaultIRQ1Vcode_end + 12
+
+NoInterrupt     * -1
+
+DevicesEnd * Devices + MaxInterrupts * 12
+
+        ASSERT  DevicesEnd - DefaultIRQ1Vcode <= DefIRQ1Vspace
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+InitialiseIRQ1Vtable
+
+        Push    "v1-v3,sb,lr"
+; copy IRQ handler: not done with rest of copying
+; because soft break needs the info to free any claimed blocks.
+
+        LDR     a1, =DefaultIRQ1V
+        ADRL    a2, DefaultIRQ1Vcode
+        ADRL    a3, DefaultIRQ1Vcode_end
+CopyDefaultIRQ1V
+        LDR     a4, [a2], #4
+        STR     a4, [a1], #4
+        CMP     a2, a3
+        BNE     CopyDefaultIRQ1V
+
+        AddressHAL
+        ADD     v1, a1, #12
+        ADD     a3, v1, #MaxInterrupts*12
+        MOV     a2, #0
+        MOV     a4, #-1
+        LDR     ip, =IRQ
+FillInDefaultIRQ1VDevices
+        STMIA   a1!, {a2, a4, ip}
+        ADD     a4, a4, #1
+        CMP     a1, a3
+        BNE     FillInDefaultIRQ1VDevices
+
+; Now fill in our basic device handlers. First the timer.
+        MOV     a1, #0
+        CallHAL HAL_TimerDevice
+        LDR     a2, =ZeroPage+OsbyteVars
+        LDR     a3, =TickOne
+        ADD     a1, a1, a1, LSL #1
+        ADD     a1, v1, a1, LSL #2
+        STMIB   a1, {a2, a3}
+        
+1
+ [ NumberOfPodules > 0
+; Now Podule bits
+        MOV     a1, #IRQDesp_Link_Unshared
+        LDR     a2, =ZeroPage+PFIQasIRQ_Chain - (PodDesp_Link-PodDesp_R12Val)
+        ADR     a3, PFIQasIRQ_Despatch
+        ADD     lr, v1, #PFIQasIRQ_DevNo*12
+        STMIA   lr, {a1, a2, a3}
+        LDR     a2, =ZeroPage+PIRQ_Chain - (PodDesp_Link-PodDesp_R12Val)
+        ADR     a3, PIRQ_Despatch
+        ADD     lr, v1, #Podule_DevNo*12
+        STMIA   lr, {a1, a2, a3}
+ ]
+
+; Now IIC - if any
+        LDR     v2, =ZeroPage+IICBus_Base
+        MOV     v3, #0
+80
+        LDR     a1, [v2, #IICBus_Type]
+        TST     a1, #IICFlag_HighLevel
+        TSTNE   a1, #IICFlag_Background
+        BEQ     %FT90
+        MOV     a1, v3
+        CallHAL HAL_IICDevice
+; I think it's safe to call A SWI here...
+        LDR     r1, =IICIRQ
+        MOV     r2, v3
+        SWI     XOS_ClaimDeviceVector
+90
+        ADD     v2, v2, #IICBus_Size
+        ADD     v3, v3, #1
+        CMP     v3, #IICBus_Count
+        BNE     %BT80
+
+        Pull    "v1-v3,sb,pc"
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Specialist despatchers for podules
+
+                  ^  0
+PodDesp_Address   #  4     ; address of IRQ status byte
+PodDesp_Mask      #  4     ; for use on above
+PodDesp_R12Val    #  4
+PodDesp_CallAddr  #  4     ; address to call if (?Address EOR (Mask>>8)) AND Mask <> 0
+PodDesp_Link      #  4     ; next node
+PodDesp_NodeSize  #  0
+
+; In    r12 =    PFIQasIRQ_Chain - (PodDesp_Link-PodDesp_R12Val)
+;             or PIRQ_Chain - (PodDesp_Link-PodDesp_R12Val)     from despatcher
+
+PFIQasIRQ_Despatch ROUT
+PIRQ_Despatch ; All the same thing now
+
+01      LDR     r12, [r12, #PodDesp_Link-PodDesp_R12Val]
+        LDMIA   r12!, {r1, r2}           ; address and mask
+
+; TMD 09-Jun-89: Don't corrupt r0 - it's needed by the default IRQ2 routine
+        LDRB    r1, [r1]
+        EOR     r1, r1, r2, LSR #8
+        ANDS    r1, r1, r2
+        BEQ     %BT01
+        LDMIA   r12, {r12, pc}
+
+Default_PIRQHandler_Node
+Default_PFIQasIRQHandler_Node
+        &       .+4                     ; address we know has non-zero value!
+        &       -1                      ; mask
+        &       0                       ; handler r12
+        &       IRQ                     ; handler code
+        &       0                       ; null link for naff release checking
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Claim of device vectors
+
+; r0 = Device number
+; r1 = call address
+; r2 = r12 value
+; r3 = interrupt location      } when podules are
+; r4 = interrupt mask/polarity } supported and r0 = podule device number
+
+CDV_Flags * &FF000000
+CDV_Shared * 1:SHL:31
+
+DeviceVector_Claim ROUT
+
+        Push    "r0-r3, lr"
+
+01      SWI     XOS_ReleaseDeviceVector ; Release until bored
+        BVC     %BT01
+
+        LDR     r0, [sp]
+        BIC     r0, r0, #CDV_Flags
+        LDR     lr, =ZeroPage
+        LDR     lr, [lr, #IRQMax]
+        CMP     r0, lr
+        BHS     DV_Fail_NaffDevNo
+
+ [ NumberOfPodules > 0
+        ! 0,    "ClaimDeviceVector has podule IRQ/FIQs assembled in"
+        CMP     r0, #Podule_DevNo
+        CMPNE   r0, #PFIQasIRQ_DevNo
+        BEQ     PoduleChainClaim
+ ]
+        MOV     r3, #12
+        BL      ClaimSysHeapNode
+        BVS     DV_Exit
+        LDR     r11, [sp]
+        BIC     r0, r11, #CDV_Flags
+        ADD     r0, r0, r0, LSL #1      ; *3
+        LDR     r1, =DefaultIRQ1V-DefaultIRQ1Vcode+Devices
+        ADD     r1, r1, r0, LSL #2
+        WritePSRc SVC_mode+I_bit, r10   ; IRQs off for update (on again on SWI exit)
+        LDMIA   r1, {r0, r3, r10}
+        STMIA   r2, {r0, r3, r10}       ; copy current head into node
+        MOV     r10, r2
+        TST     r11, #CDV_Shared
+        ORREQ   r10, r10, #IRQDesp_Link_Unshared
+        LDR     r11, [sp, #4*2]         ; r12 value
+        LDR     r12, [sp, #4*1]         ; call address
+        STMIA   r1, {r10-r12}           ; copy given info into head
+
+
+DV_Exit STRVS   r0, [sp]                ; Common exit for both claim + release
+        Pull    "r0-r3, lr"
+        B       SLVK_TestV
+
+
+DV_Fail_NaffDevNo
+        ADR     r0, ErrorBlock_NaffDevNo
+      [ International
+        BL      TranslateError
+      |
+        SETV
+      ]
+        B       DV_Exit
+
+        MakeErrorBlock NaffDevNo
+
+ [ NumberOfPodules > 0
+PoduleChainClaim
+        MOV     r3, #PodDesp_NodeSize
+        BL      ClaimSysHeapNode
+        BVS     DV_Exit
+        MOV     r10, r2
+        LDMFD   sp, {r0-r3}
+        STR     r1, [r10, #PodDesp_CallAddr]
+        STR     r2, [r10, #PodDesp_R12Val]
+        STR     r3, [r10, #PodDesp_Address]
+        STR     r4, [r10, #PodDesp_Mask]
+        CMP     r0, #Podule_DevNo
+        LDREQ   r0, =ZeroPage+PIRQ_Chain
+        LDRNE   r0, =ZeroPage+PFIQasIRQ_Chain
+        WritePSRc SVC_mode+I_bit, r1    ; IRQs off for update
+        LDR     r1, [r0]
+        STR     r1, [r10, #PodDesp_Link]
+        STR     r10, [r0]
+        B       DV_Exit
+ ]
+
+; .............................................................................
+; Release of device vectors
+
+; r0 = Device number
+; r1 = call address
+; r2 = r12 value
+; r0 = PFIQ|PIRQ devno -> r3 = interrupt location (LDRB always used)
+;                         r4 = interrupt mask
+
+DeviceVector_Release ROUT
+
+        Push    "r0-r3, lr"             ; Ensure same regset as above
+        BIC     r0, r0, #CDV_Flags
+        LDR     lr, =ZeroPage
+        LDR     lr, [lr, #IRQMax]
+        CMP     r0, lr
+        BHS     DV_Fail_NaffDevNo
+
+        WritePSRc SVC_mode + I_bit, r12 ; IRQs off while holding context
+ [ NumberOfPodules > 0
+        ! 0,    "ReleaseDeviceVector has podule IRQ/FIQs assembled in"
+        CMP     r0, #Podule_DevNo
+        CMPNE   r0, #PFIQasIRQ_DevNo
+        BEQ     PoduleChainRelease
+ ]
+
+        ADD     r0, r0, r0, LSL #1      ; *3
+        LDR     r12, =DefaultIRQ1V-DefaultIRQ1Vcode+Devices
+        ADD     r12, r12, r0, LSL #2    ; address of node
+        MOV     r11, #-1                ; "fudge" predecessor node
+
+01      LDMIB   r12, {r3, r10}
+        CMP     r3, r2
+        CMPEQ   r10, r1
+        BEQ     %FT02                   ; found it
+        MOV     r11, r12
+        LDR     r12, [r12, #IRQDesp_Link]
+        BICS    r12, r12, #IRQDesp_Link_Unshared
+        BNE     %BT01
+
+11      ADR     r0, ErrorBlock_BadDevVecRel
+      [ International
+        BL      TranslateError
+      |
+        SETV
+      ]
+        B       DV_Exit
+
+        MakeErrorBlock BadDevVecRel
+
+
+02      CMP     r11, #-1
+        BEQ     %FT03
+        MOV     r2, r12
+        LDR     r12, [r2, #IRQDesp_Link]
+        LDR     r14, [r11, #IRQDesp_Link]       ; preserve r11's "unshared" flag
+        BIC     r12, r12, #IRQDesp_Link_Unshared
+        AND     r14, r14, #IRQDesp_Link_Unshared
+        ORR     r12, r12, r14
+        STR     r12, [r11, #IRQDesp_Link] ; node delinked
+        B       %FT04
+
+03      LDR     r2, [r12, #IRQDesp_Link]; freeable = nextnode
+        BIC     r2, r2, #IRQDesp_Link_Unshared
+        LDMIA   r2,  {r0, r1, r3}       ; copy next node into head posn
+        STMIA   r12, {r0, r1, r3}
+
+04
+        BL      FreeSysHeapNode         ; free block
+        B       DV_Exit
+
+ [ NumberOfPodules > 0
+PoduleChainRelease
+        CMP     r0, #Podule_DevNo
+        LDREQ   r0, =ZeroPage+PIRQ_Chain-PodDesp_Link
+        LDRNE   r0, =ZeroPage+PFIQasIRQ_Chain-PodDesp_Link
+
+10      LDR     r12, [r0, #PodDesp_Link]
+        CMP     r12, #0
+        BEQ     %BT11
+        LDR     r11, [r12, #PodDesp_Address]
+        CMP     r11, r3
+        LDREQ   r11, [r12, #PodDesp_Mask]
+        CMPEQ   r11, r4
+        LDREQ   r11, [r12, #PodDesp_CallAddr]
+        CMPEQ   r11, r1
+        LDREQ   r11, [r12, #PodDesp_R12Val]
+        CMPEQ   r11, r2
+        MOVNE   r0, r12
+        BNE     %BT10
+
+        LDR     r11, [r12, #PodDesp_Link]
+        STR     r11, [r0,  #PodDesp_Link]
+        MOV     r2, r12
+        B       %BT04
+ ]
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Default device owner for IRQ not recognised by system: pass to IRQ2V
+
+IRQ ROUT
+
+        Push    "r10, lr"
+        MOV     r10, #IrqV
+        BL      CallVector
+
+        Pull    "r10, lr"
+        Pull    "pc"                    ; new-style CDV - pull return address
+
+; *****************************************************************************
+; Default IRQ2V:
+;   r0  must still have devno in it
+;   r12 is 0 (from vector)
+
+; Clear mask, clear IRQ as appropriate/possible
+
+NOIRQ ROUT
+
+        TEQ     r0, #0
+        Pull    pc, MI
+        MOV     r11, r9
+        AddressHAL
+        CallHAL HAL_IRQDisable
+        MOV     r9, r11
+        Pull    pc              ; claim vector
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; The following bits have been appropriated from source.pmf.oseven to make
+; sure Tim's old code doesn't overwrite us when he gets back!
+
+; SWI OS_GenerateEvent: call event vector if enabled
+
+GenEvent ROUT
+
+        Push    lr
+        WritePSRc SVC_mode+I_bit, lr    ; Disable IRQs. MUST call these ones
+        BL      OSEVEN                  ; in SVC mode as people expect it
+        Pull    lr
+        B       SLVK
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Subroutine call version
+
+; In    r0 = event type
+;       r1,r2 parameters
+
+; Out   C=0 => event was enabled, or was >= 32 anyway
+;       C=1 => event was disabled, so vector not called
+
+OSEVEN ROUT
+
+        Push    lr
+
+        CMP     r0, #31                 ; Events >= 32 are ALWAYS raised. SKS
+                                        ; flags are HI if so, ie. NE
+      [ ZeroPage = 0
+        LDRLSB  r14, [r0, #OsbyteVars + :INDEX: EventSemaphores]
+      |
+        LDRLS   r14, =ZeroPage+OsbyteVars+:INDEX:EventSemaphores
+        LDRLSB  r14, [r0, r14]
+      ]
+                                        ; get semaphore for this event 0..31
+        CMPLS   r14, #0                 ; non-zero => enabled
+        Pull    pc, EQ                  ; if disabled, exit with C=1
+
+        Push    "r0-r3, r10-r12" ; r3 excessive ???
+        MOV     r10, #EventV            ; call event vector
+        BL      CallVector
+        CLC                             ; indicate event enabled
+        Pull    "r0-r3, r10-r12, pc"
+
+; ...................... default owner of EventV ..............................
+; Call Event handler
+
+; In    r12 = EvtHan_ws
+
+DefEvent ROUT
+
+        MOV     lr, pc                  ; link with all the bits
+        LDMIA   r12, {r12, pc}          ; call EventHandler, returns to ...
+
+        TEQ     r12, #1
+        Pull    pc,NE
+
+      [ ZeroPage = 0
+        LDRB    r14, [r12, #CallBack_Flag-1] ; IRQs are still disabled
+        ORR     r14, r14, #CBack_OldStyle
+        STRB    r14, [r12, #CallBack_Flag-1]
+      |
+        LDR     r12, =ZeroPage
+        LDRB    r14, [r12, #CallBack_Flag] ; IRQs are still disabled
+        ORR     r14, r14, #CBack_OldStyle
+        STRB    r14, [r12, #CallBack_Flag]
+      ]
+
+        Pull    pc                      ; claim EventV
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Process timer zero IRQ device (100Hz clock)
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ALIGN 32
+
+TickOne ROUT
+
+        ; Don't push r14 - we're using new interface, and claim the vector
+        Push    "r0,r9,r12"
+        AddressHAL
+        
+        ; In some chips, Timer0 is latched in the timer block instead of,
+        ; or as well as in the interrupt controller
+        MOV     R0, #0 ; clear latch for Timer0
+        CallHAL HAL_TimerIRQClear
+        
+        Pull    "r0" ; get device number back
+        CallHAL HAL_IRQClear
+        Pull    "r9,r12"
+
+        LDR     R1, =ZeroPage
+        LDR     R0, [R1, #MetroGnome]
+        ADD     R0, R0, #1
+        STR     R0, [R1, #MetroGnome]
+
+        LDRB    R0, CentiCounter        ; Counter for VDU CTRL timing
+        SUBS    R0, R0, #1
+        STRCSB  R0, CentiCounter        ; decrement if not zero
+
+        LDR     R0, IntervalTimer +0
+        ADDS    R0, R0, #1              ; Increment the low 4 bytes
+        STR     R0, IntervalTimer +0
+
+        LDREQB  R0, IntervalTimer +4
+        ADDEQ   R0, R0, #1              ; and carry into 5th byte if necessary
+        STREQB  R0, IntervalTimer +4
+
+        Push    "R4,R12"                ; R0-R3 already pushed
+
+        TEQEQ   R0, #&100               ; has interval timer crossed zero ?
+        MOVEQ   R0, #Event_IntervalTimer ; Event ITCZ
+        BLEQ    OSEVEN
+
+        BL      CentiSecondTick         ; Notify keyboard of a centisecond
+
+        Pull    "R4,R12"
+
+        LDR     R0, RealTime +0         ; Increment 5-byte real time
+        ADDS    R0, R0, #1
+        STR     R0, RealTime +0
+        LDRCSB  R0, RealTime +4
+        ADDCS   R0, R0, #1              ; Won't wrap until 2248 and then it
+        STRCSB  R0, RealTime +4         ; all falls over anyway
+
+        LDRB    R0, TimerState          ; get switch state
+        TEQ     R0, #5                  ; toggles between 5 and 10
+
+        LDREQ   R1, TimerAlpha +0       ; either load from one
+        LDREQB  R2, TimerAlpha +4
+
+        LDRNE   R1, TimerBeta +0        ; or the other
+        LDRNEB  R2, TimerBeta +4
+
+        ADREQ   R3, TimerBeta +0        ; and point to t'other
+        ADRNE   R3, TimerAlpha +0
+
+        ADDS    R1, R1, #1              ; increment
+        ADC     R2, R2, #0              ; with carry
+
+        STR     R1, [R3]                ; and store back
+        STRB    R2, [R3, #4]
+
+        EOR     R0, R0, #&0F            ; 5 <-> 10
+        STRB    R0, TimerState
+
+        Push    R10
+
+        MOV     R10, #TickerV           ; call 100Hz vector
+        BL      CallVector              ; IRQ's still disabled
+
+        BL      ProcessTickEventChain   ; Re-enables IRQs
+
+        Pull    "R10,PC"
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Process VSync IRQ device
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        ALIGN 32
+FalseVsyncIRQ ROUT
+        LDR     R1, =ZeroPage
+        LDR     R0, [R1, #MetroGnome]
+        TST     R0, #1
+        MOVEQ   pc, lr
+        Push    "lr"
+        ; Fall through...
+
+VsyncIRQ_ExtEntry ROUT
+        LDRB    R0, CFStime             ; decrement 'CFS' timer !
+        SUB     R0, R0, #1
+        STRB    R0, CFStime
+
+        VDWS    WsPtr                   ; Do our stuff before issuing VSYNC event
+        BL      VsyncCall
+        BYTEWS  WsPtr
+
+        MOV     R0, #Event_VSync        ; VSYNC event number
+        BL      OSEVEN
+
+        LDRB    R1, FlashCount
+        SUBS    R1, R1, #1
+        Pull    PC, CC                  ; was zero, so frozen
+        STRNEB  R1, FlashCount          ; else if now non-zero, store it back
+        Pull    PC, NE                  ; not time to flash yet
+
+        LDRB    R1, FlashState          ; Get the state and
+        EORS    R1, R1, #1              ; flip to the other one (setting flags)
+        STRB    R1, FlashState
+
+        LDREQB  R2, SpacPeriod          ; get appropriate new period
+        LDRNEB  R2, MarkPeriod
+        STRB    R2, FlashCount          ; and put into counter
+
+        VDWS    WsPtr
+        Push    R4
+        BEQ     dothesecondflash
+
+dothefirstflash
+        BL      DoFirstFlash
+        Pull    "R4, PC"
+
+dothesecondflash
+        BL      DoSecondFlash
+        Pull    "R4, PC"
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        END

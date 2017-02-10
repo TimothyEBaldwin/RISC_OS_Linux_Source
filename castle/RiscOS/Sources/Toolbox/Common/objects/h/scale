@@ -1,0 +1,131 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/* File:    scale.h
+ * Purpose: Scale Objects
+ * Author:  Timothy G Roddis
+ * History: 15-Feb-94: TGR: created
+ *
+ */
+
+#ifndef __Scale_h
+#define __Scale_h
+
+#ifndef __os_h
+#include "os.h"
+#endif
+
+#ifndef __window_h
+#include "objects/window.h"
+#endif
+
+#ifndef __wimp_h
+#include "twimp.h"
+#endif
+
+/* Scale SWI calls *******************************************************************************/
+
+#define Scale_SWIChunkBase    0x82c00
+#define Scale_ObjectClass     Scale_SWIChunkBase
+#define Scale_ClassSWI        (Scale_SWIChunkBase + 0)
+#define Scale_PostFilter      (Scale_SWIChunkBase + 1)
+#define Scale_PreFilter       (Scale_SWIChunkBase + 2)
+
+/* Scale Templates *******************************************************************************/
+
+/* flags */
+
+#define Scale_GenerateShowEvent    0x00000001
+#define Scale_GenerateHideEvent    0x00000002
+#define Scale_IncludeScaleToFit    0x00000004
+
+/* templates */
+
+typedef struct
+{
+        int        flags;
+        int        min_value;
+        int        max_value;
+        int        step_size;
+        char      *title;
+        int        max_title;
+        char      *window;
+        int        std_value[4];
+
+} ScaleTemplate;
+
+/* component IDs */
+
+#define Scale_ComponentIDBase              (Scale_SWIChunkBase<<4)
+
+#define Scale_NumberRange_Scale             (Scale_ComponentIDBase + 0)
+#define Scale_ActionButton_StdValue(A)      (Scale_ComponentIDBase + (A+1)) /* Valid for 1 <= A <= 3 */
+#define Scale_ActionButton_Cancel           (Scale_ComponentIDBase + 5)
+#define Scale_ActionButton_Scale            (Scale_ComponentIDBase + 6)
+#define Scale_ActionButton_ScaleToFit       (Scale_ComponentIDBase + 9) /* why this isn't 7 as I originally had it, I don't know */
+
+/* Scale Methods *********************************************************************************/
+
+#define Scale_GetWindowID           0
+#define Scale_SetValue              1
+#define Scale_GetValue              2
+#define Scale_SetBounds             3
+#define Scale_GetBounds             4
+#define Scale_SetTitle              5
+#define Scale_GetTitle              6
+
+/* Scale Toolbox Events **************************************************************************/
+
+#define Scale_AboutToBeShown     Scale_SWIChunkBase
+#define Scale_DialogueCompleted  (Scale_SWIChunkBase + 1)
+#define Scale_ApplyFactor        (Scale_SWIChunkBase + 2)
+
+typedef struct {
+   ToolboxEventHeader hdr;
+   int                show_type;
+   union {
+      struct {
+         int                x,y;
+      } coords;
+      WindowShowObjectBlock full;
+
+   } info;
+
+} Scale_AboutToBeShown_Event;
+
+typedef struct {
+   ToolboxEventHeader hdr;
+} Scale_DialogueCompleted_Event;
+
+typedef struct {
+   ToolboxEventHeader hdr;
+   unsigned int       factor;
+} Scale_ApplyFactor_Event;
+
+
+/* Scale Errors **********************************************************************************/
+
+#define Scale_ErrorBase           (Program_Error | 0x0080B700)
+
+#define Scale_AllocFailed        (Scale_ErrorBase+0x01)
+#define Scale_ShortBuffer        (Scale_ErrorBase+0x02)
+#define Scale_NoSuchTask         (Scale_ErrorBase+0x11)
+#define Scale_NoSuchMethod       (Scale_ErrorBase+0x12)
+#define Scale_NoSuchMiscOpMethod (Scale_ErrorBase+0x13)
+#define Scale_TasksActive        (Scale_ErrorBase+0x00)
+
+#endif

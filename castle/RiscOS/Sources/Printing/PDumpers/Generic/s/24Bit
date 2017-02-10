@@ -1,0 +1,98 @@
+; This source code in this file is licensed to You by Castle Technology
+; Limited ("Castle") and its licensors on contractual terms and conditions
+; ("Licence") which entitle you freely to modify and/or to distribute this
+; source code subject to Your compliance with the terms of the Licence.
+; 
+; This source code has been made available to You without any warranties
+; whatsoever. Consequently, Your use, modification and distribution of this
+; source code is entirely at Your own risk and neither Castle, its licensors
+; nor any other person who has contributed to this source code shall be
+; liable to You for any loss or damage which You may suffer as a result of
+; Your use, modification or distribution of this source code.
+; 
+; Full details of Your rights and obligations are set out in the Licence.
+; You should have received a copy of the Licence with this source code file.
+; If You have not received a copy, the text of the Licence is available
+; online at www.castle-technology.co.uk/riscosbaselicence.htm
+; 
+; > New24Bit
+
+        [ Medusa
+
+;24Bit extra bits assuming the new PDumperSupport
+;WARNING TO DUMPER WRITERS...IF YOU OVERRIDE
+;Commom.ColourSet IN YOUR DUMPER YOU MUST
+;MAKE SURE THAT ColourSet_ColourXXX WORKS
+;FOR Multi,16Bit and 24Bit STRIPS
+
+OutputStrip_Multi
+OutputStrip_16Bit
+OutputStrip_24Bit
+;Fundamentally this is copied from OutputStrip_Colour256
+;However it is more general, and could in fact replace
+;OutputStrip_Colour256
+;It makes use of the relationship....
+;preptype_XXX=(StripType-1)*2+Diffused
+;Note the slight redefinition of entry values...
+; in    R0 ->strip
+;       R1 file handle
+;       R2 strip type
+;       R3 width of the strip in pixels
+;       R4 height of the strip
+;       R5 row width in PIXELS I.E. (R3+3)AND NOT 3 <<<<<<<<<<<
+;       R6 halftone information
+;       R7 ->job workspace
+;       R8 ->private word for job
+; 
+; out   V =1 => R0 -> error block
+
+
+        PDumper_Entry "R0-R9"
+
+        STR     R1,FileHandle
+                    
+        PDumper_Reset
+
+; Fiddle factor. On the last strip of a page, we are given an R4 of the
+; correct size, but the sprite buffer ;  actually can contain more data down
+; to the bottom of a dump_depth strip. This area must be cleared (or printed).
+; We do this by halftoning or error-diffusing the full area.
+
+        Push    "R0-R4"
+
+        MOV     R1,R0
+        MOV     R0,R8                   ;Setup pointer to the strip and then the anchor word
+
+        LDRB    R2,[R7,#pd_dump_depth]                
+        DivRem  R9,R4,R2,LR             ;= height DIV dump_depth_height
+        CMP     R4,#0
+        ADDNE   R9,R9,#1
+        MUL     R4,R9,R2
+                  
+        AND     R2,R6,#255              ;Get the horizontal halftone resolution
+        CMP     R2,#1                   ;Is it silly?
+
+        LDR     R2,[SP,#8]              ;Get back the strip-type
+        AND     R2,R2,#&FF              ;Chop off pass stuff
+        SUB     R2,R2,#1                ;Subtract one
+        MOV     R2,R2,LSL#1             ;Double it
+        ADDLE   R2,R2,#1                ;And add the number you first thought of
+	
+        SWI     XPDumper_PrepareStrip
+        PDumper_Error                   ;Trap any errors coming back 
+
+        MOV     R9,R1                   ;Keep the output buffer pointer
+
+        Pull    "R0-R4"                 ;Restore original depth
+
+        MOV     R0,R9                   ;And get back actual buffer
+
+        BL      output_colour_sprite
+        PDumper_EmptyBuffer
+
+        ;Debug   Dump,"Exiting the full-colour dump routine"
+
+        PDumper_Exit
+        ]
+
+        END

@@ -1,0 +1,91 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+
+/*
+ * Title: akbd.c
+ * Purpose: Access to Archimedes keyboard under the Wimp.
+ * History: IDJ: 05-Feb-92: prepared for source release
+ */
+
+#include "os.h"
+#include "trace.h"
+#include "akbd.h"
+
+/* see page 58 of Programmer's Reference Manual, OSBYTE &81 (129) */
+
+#pragma -s1
+int akbd_pollsh(void)
+{
+  int x = -1;
+  int y = 255;
+  (void) os_byte(129, &x, &y);
+  tracef2("PollSh returns %i %i\n", x, y);
+  return(x==255 && y==255);
+}
+
+int akbd_pollctl(void)
+{
+  int x = -2;
+  int y = 255;
+  (void) os_byte(129, &x, &y);
+  tracef2("PollCtl returns %i %i\n", x, y);
+  return(x==255 && y==255);
+}
+
+int akbd_pollkey(int *keycode /*out*/)
+{
+  int x = 0;
+  int y = 0;
+  (void) os_byte(129, &x, &y);
+  tracef2("PollKey returns %i %i.\n", x, y);
+  if ((x + y) == 0)
+  {
+    /* it's a function key: 0, followed by the actual code. */
+    (void) os_byte(129, &x, &y);
+    if (y==0 && x>=128)
+    {
+      /* bona fide function key */
+      *keycode = 256 + x;
+    } else {
+      /* he's typing ahead with a control-@: sorry boy, you lose
+      the next key. */
+      *keycode = 0;
+    }
+    return(1);
+  } else {
+    *keycode = x;
+    return(y==0);
+  }
+}
+#pragma -s0
+
+/* end */

@@ -1,0 +1,192 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/* signal.c: ANSI draft (X3J11 Oct 86) library code, section 4.7 */
+/* Copyright (C) Codemist Ltd, 1988                              */
+/* version 0.01d */
+
+/* N.B. machine dependent messages (only) below. */
+
+#include "hostsys.h"
+#include <signal.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>                             /* for exit()            */
+#include <errno.h>
+#include "kernel.h"
+
+extern int _fprintf_lf(FILE *fp, const char *fmt, ...);
+extern int _sprintf_lf(char *buff, const char *fmt, ...);
+
+extern int _SignalNumber(int errnum);
+extern _kernel_oserror *_kernel_peek_last_oserror(void);
+
+#define SIGLAST 11  /* one after highest signal number (see <signal.h>) */
+
+static void (*_signalvector[SIGLAST+1])(int);
+
+/* HIDDEN EXPORTS - for compatibility with previous shared C libraries */
+extern void __ignore_signal_handler(int sig);
+extern void __error_signal_marker(int sig);
+extern void __default_signal_handler(int sig);
+
+extern void __ignore_signal_handler(int sig)
+{
+    /* do this in case called because of SharedCLibrary botch... */
+    signal(sig, SIG_IGN);
+}
+
+static void _real_default_signal_handler(int sig)
+{
+    char *s = NULL, v[128];
+    _kernel_oserror *e = _kernel_peek_last_oserror();
+
+    if (((sig == SIGSEGV || sig == SIGILL) && _SignalNumber(e->errnum) == sig) ||
+        sig == SIGFPE || sig == SIGOSERROR)
+    {
+        _postmortem(e->errmess, *((int *)"mesg"));
+        return;
+    }
+
+    switch (sig)
+    {
+case SIGABRT:
+#ifdef DEFAULT_TEXT
+        s = "Abnormal termination (e.g. abort() function)";
+#endif
+        s = _kernel_getmessage(s, "C39");
+        break;
+case SIGILL:
+#ifdef DEFAULT_TEXT
+#ifdef __arm
+        s = "Illegal instruction (call to non-function/code corrupted) [is the floating point emulator loaded?]";
+#else
+        s = "Illegal instruction (call to non-function/code corrupted)";
+#endif
+#endif
+        s = _kernel_getmessage(s, "C40");
+        break;
+case SIGINT:
+#ifdef DEFAULT_TEXT
+        s = "Interrupt received from user - program terminated";
+#endif
+        _sys_msg(_kernel_getmessage(s, "C41"));
+        exit(EXIT_FAILURE);
+        break;
+case SIGSEGV:
+#ifdef DEFAULT_TEXT
+        s = "Illegal address (e.g. wildly outside array bounds)";
+#endif
+        s = _kernel_getmessage(s, "C42");
+        break;
+case SIGTERM:
+#ifdef DEFAULT_TEXT
+        s = "Termination request received";
+#endif
+        s = _kernel_getmessage(s, "C43");
+        break;
+default:
+#ifdef DEFAULT_TEXT
+        s = "Unknown signal number %d";
+#endif
+        s = _kernel_getmessage(s, "C44");
+        break;
+    }
+    _sprintf_lf(v, s, sig);
+    _postmortem(v, *((int *)"mesg"));
+}
+
+#pragma -s1
+
+#if 0
+/* Stack overflow is either a normal exception in which case it should just
+ * exit with an error return or a fatal system error in which case it shoul
+ * generate an external error. I choose the latter. ECN
+ */
+static void _default_sigstak_handler()
+{
+    char *s = "Stack overflow\n\r";
+    while (*s!=0) _kernel_oswrch(*s++);
+    _kernel_setreturncode(100);
+    _kernel_exit(100);
+}
+#else
+extern void _default_sigstak_handler(void);
+#endif
+
+extern void __default_signal_handler(int sig)
+{
+    if (_kernel_processor_mode() & 0xF)
+        _kernel_exit((int)(_kernel_last_oserror()));
+    else if (sig==SIGSTAK)
+      _default_sigstak_handler();
+    else
+      _real_default_signal_handler(sig);
+}
+
+extern void __error_signal_marker(int sig)
+/* This function should NEVER be called - its value is used as a marker     */
+/* return from signal (SIG_ERR).   If someone manages to use pass this      */
+/* value back to signal and thence get it invoked we make it behave as      */
+/* if signal got SIG_DFL:                                                   */
+{
+    __default_signal_handler(sig);
+}
+
+int raise(int sig)
+{
+    void (*handler)(int);
+    if (sig<=0 || sig>=SIGLAST) return (errno = ESIGNUM);
+    handler = _signalvector[sig];
+    /* Mustn't call default_signal_handler via _kernel_call_client unless */
+    /* it really is on the other side of the compatibility veneer.        */
+    if (handler==__SIG_DFL)
+        (*__default_signal_handler)(sig);
+    else if (handler!=__SIG_IGN)
+    {   _signalvector[sig] = __SIG_DFL;
+        /* And this will fail for old clients setting SIG_IGN across */
+        /* the compatibility veneer... Oh yuk yuk yuk...             */
+        _call_client_1(handler, sig);
+    }
+    return 0;
+}
+
+int _signal_real_handler(int sig)
+{
+    if (sig<=0 || sig>=SIGLAST) return 0;
+    return (_signalvector[sig]!=__SIG_DFL);
+}
+
+#pragma -s0
+
+void (*signal(int sig, void (*func)(int)))(int)
+{
+    void (*oldf)(int);
+    if (sig<=0 || sig>=SIGLAST) return __SIG_ERR;
+    oldf = _signalvector[sig];
+    _signalvector[sig] = func;
+    return oldf;
+}
+
+void _signal_init(void)
+{
+    int i;
+    /* do the following initialisation explicitly so code restartable */
+    for (i=1; i<SIGLAST; i++) signal(i, __SIG_DFL);
+}
+
+/* end of signal.c */

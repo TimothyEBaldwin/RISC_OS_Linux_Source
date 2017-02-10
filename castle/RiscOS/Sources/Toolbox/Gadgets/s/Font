@@ -1,0 +1,184 @@
+; This source code in this file is licensed to You by Castle Technology
+; Limited ("Castle") and its licensors on contractual terms and conditions
+; ("Licence") which entitle you freely to modify and/or to distribute this
+; source code subject to Your compliance with the terms of the Licence.
+; 
+; This source code has been made available to You without any warranties
+; whatsoever. Consequently, Your use, modification and distribution of this
+; source code is entirely at Your own risk and neither Castle, its licensors
+; nor any other person who has contributed to this source code shall be
+; liable to You for any loss or damage which You may suffer as a result of
+; Your use, modification or distribution of this source code.
+; 
+; Full details of Your rights and obligations are set out in the Licence.
+; You should have received a copy of the Licence with this source code file.
+; If You have not received a copy, the text of the Licence is available
+; online at www.castle-technology.co.uk/riscosbaselicence.htm
+; 
+; Font SWI veneers
+; History: PW: 01-Jul-96: Created
+
+	AREA    |C$$code|, CODE, READONLY
+
+	GET	hdr:ListOpts
+	GET	hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Font
+        GET     Hdr:APCS.<APCS>
+
+; APCS compliant
+; SVC mode compatible (a4/r3 used as link register)
+
+; Finds a font
+; Prototype:	_kernel_oserror *font_find_font(const char *font,
+;			unsigned int width, unsigned int height,
+;			int x_res, int y_res,
+;			unsigned int *font_handle)
+; On entry:	a1 = pointer to font name
+;		a2 = width
+;		a3 = height
+;		a4 = x_res
+;		sp + 0 = y_res
+;		sp + 4 = pointer to font handle buffer
+font_find_font
+	EXPORT	font_find_font
+        MOV     ip, sp
+        FunctionEntry "r0-r6"
+        Pull    "r1-r4" ; transfer R0-R3 -> R1-R4
+        LDMIA   ip, {r5, r6}
+        SWI     XFont_FindFont
+        Return  "r4-r6",,VS
+
+        TEQ     r6, #0
+        STRNE   r0, [r6]
+
+        MOV     r0, #0
+        Return  "r4-r6"
+
+; font_lose_font -----------------------------------------------------------
+; Loses a font
+; Prototype:	_kernel_oserror *font_lose_font(unsigned int font_handle)
+; On entry:	a1 = font_handle
+; On exit:	v1-v6 preserved
+font_lose_font
+	EXPORT	font_lose_font
+
+	MOV	ip, lr
+
+	SWI	XFont_LoseFont
+	MOVVC	r0, #0
+
+        Return  ,LinkNotStacked,,ip
+
+; font_paint ---------------------------------------------------------------
+; Paints some text in the current font
+;
+; Prototype:	_kernel_oserror *font_paint(unsigned int font_handle,
+;			const char *text, unsigned int plot_type,
+;			int x, int y, FontCoord *coord,
+;			FontTransform *transform, unsigned int length)
+;
+; On entry:	r0 = font handle
+;		r1 = pointer to text
+;		r2 = plot type
+;		r3 = int x
+;		[sp, #0] = int y
+;		[sp, #4] = pointer to coord block
+;		[sp, #8] = pointer to transform block
+;		[sp, #12] = string length
+;
+; On exit:	v1-v6 preserved
+font_paint
+	EXPORT	font_paint
+
+	MOV	ip, sp
+        FunctionEntry "r4-r7"
+
+	LDMIA	ip, {r4-r7}
+
+	SWI	XFont_Paint
+
+	MOVVC	r0, #0
+        Return  "r4-r7"
+
+; font_convert_to_points ---------------------------------------------------
+;
+; Prototype:	_kernel_oserror *font_convert_to_points(int x, int y,
+;				int *new_x, int *new_y)
+;
+; On entry:	r0 = x
+;		r1 = y
+;		r2 = new_x
+;		r3 = new_y
+;
+; On exit:	v1-v6 preserved
+font_convert_to_points
+	EXPORT	font_convert_to_points
+
+        FunctionEntry   "r0-r4"
+        Pull    "r1-r4" ; transfer R0-R3 -> R1->R4
+	SWI	XFont_Converttopoints
+        Return  "r4",,VS
+
+	TEQ	r3, #0
+	STRNE	r1, [r3]
+
+	TEQ	r4, #0
+	STRNE	r2, [r4]
+
+	MOV	r0, #0
+
+        Return  "r4"
+
+; font_scan_string ---------------------------------------------------------
+;
+; Prototype:	_kernel_oserror *font_scan_string(unsigned int font_handle,
+;		const char *text, unsigned int plot_type,
+;		int x, int y, void *coords, FontTransform *transform,
+;		unsigned int length, char **pos,
+;		int *new_x, int *new_y, unsigned int *count);
+;
+; On entry:	r0 = font handle
+;		r1 = pointer to text
+;		r2 = plot type
+;		r3 = int x
+;		[sp, #0] = int y
+;		[sp, #4] = pointer to coord block
+;		[sp, #8] = pointer to transform block
+;		[sp, #12] = string length
+;		[sp, #16] = char **pos
+;		[sp, #20] = int *new_x
+;		[sp, #24] = int *new_y
+;		[sp, #28] = unsigned int *count
+;
+; On exit:	v1-v6 preserved
+font_scan_string
+	EXPORT	font_scan_string
+
+	mov	ip, sp
+        FunctionEntry "r4-r7"
+
+	ldmia	ip!, {r4-r7}
+	; ip now points to [orig_sp, #16]
+
+	swi	XFont_ScanString
+        Return  "r4-r7",,VS
+
+	ldmia	ip, {r0, r2, r5, r6}	; Convenient spare regs
+
+	teq	r0, #0
+	strne	r1, [r0]
+	movne	r0, #0
+
+	teq	r2, #0
+	strne	r3, [r2]
+
+	teq	r5, #0
+	strne	r4, [r5]
+
+	teq	r6, #0
+	strne	r7, [r6]
+
+        Return  "r4-r7"
+
+	END

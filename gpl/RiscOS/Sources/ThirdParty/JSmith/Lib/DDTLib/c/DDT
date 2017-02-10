@@ -1,0 +1,523 @@
+/* 
+ * Copyright Julian Smith.
+ * 
+ * This file is part of DDT.
+ * 
+ * DDT is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version.
+ * 
+ * DDT is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General
+ * Public License for more details.
+ * 
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with DDT.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "kernel.h"
+
+#include "Desk/Debug.h"
+#include "Desk/Error.h"
+
+#include "DDTLib/AIFHeader.h"
+#include "DDTLib/DDT.h"
+#include "DDTLib/DDT2.h"
+
+#include "defs.h"
+
+
+
+
+
+
+DDT_section*	DDT_GetEnclosingSection( char* instruction, DDT_debugareadata* ddtdata)
+{
+	DDT_section*	section;
+	DDT_section*	bestsection		= NULL;
+	int		bestsection_language	= -1;
+
+	for	(
+		section = (DDT_section*) ddtdata->data;
+		(char*) section - ddtdata->data < ddtdata->size;
+		section = (DDT_section*) (((char*) section) + section->debugsize)
+		)
+	{
+		Desk_Debug4_Printf( Desk_error_PLACE "Section at 0x%p [0x%p]\n", section, FILEADDRESS( section));
+
+		while ( section->header.itemkind != 1)
+		{	// Not a section
+			section = (DDT_section*) (((char*) section) + section->header.itemlength);
+			Desk_Debug3_Printf( Desk_error_PLACE "section = 0x%p [0x%p]\n", section, FILEADDRESS( section));
+			if ( (char*) section - ddtdata->data >= ddtdata->size)	{
+				Desk_Debug_Printf( Desk_error_PLACE "Run beyond debug area while skipping non-sections\n");
+				break;
+			}
+		}
+
+		Desk_Debug4_Printf( Desk_error_PLACE "Section size %i\n", section->debugsize);
+
+		if ( section->flags.data.debugversion != 3 && section->flags.data.debugversion != 2)
+		{
+			Desk_Debug4_Printf( Desk_error_PLACE "ASD Version %i - skipping\n", section->flags.data.debugversion);
+			continue;	// We only understand ASD 3
+		}
+
+		#ifdef Desk_DEBUG
+			if ( Desk_debug_level > 5)
+			{
+				char	filename[ 256];
+				DDT_CopySectionFilename( filename, 256, section);
+				Desk_Debug_Printf( Desk_error_PLACE "Section %p - itemkind=%i, ASD %i, code 0x%p-0x%p (%i), filename='%s'\n",
+					section,
+					section->header.itemkind,
+					section->flags.data.debugversion,
+					section->codeaddr,
+					(char*) section->codeaddr + section->codesize,
+					section->codesize,
+					filename
+					);
+			}
+		#endif
+
+		Desk_Debug_Assert( section->header.itemkind == 1);
+		if ( instruction >= section->codeaddr && instruction < section->codeaddr+section->codesize)
+		{
+			#ifdef Desk_DEBUG
+			{
+				Desk_Debug_Printf( Desk_error_PLACE "An enclosing section is:\n");
+				Desk_Debug_Printf( Desk_error_PLACE "    language    = %i\n", section->flags.data.language);
+				Desk_Debug_Printf( Desk_error_PLACE "    debuglines  = %i\n", section->flags.data.debuglines);
+				Desk_Debug_Printf( Desk_error_PLACE "    debugvars   = %i\n", section->flags.data.debugvars);
+				Desk_Debug_Printf( Desk_error_PLACE "    -unused-    = %i\n", section->flags.data.spare);
+				Desk_Debug_Printf( Desk_error_PLACE "    debugversion= %i\n", section->flags.data.debugversion);
+				Desk_Debug_Printf( Desk_error_PLACE "\n");
+				Desk_Debug_Printf( Desk_error_PLACE "    codestart   = 0x%p\n", section->codeaddr);
+				Desk_Debug_Printf( Desk_error_PLACE "    datastart   = 0x%p\n", section->dataaddr);
+				Desk_Debug_Printf( Desk_error_PLACE "    codesize    =   %i\n", section->codesize);
+				Desk_Debug_Printf( Desk_error_PLACE "    datasize    =   %i\n", section->datasize);
+				Desk_Debug_Printf( Desk_error_PLACE "    fileinfo    =   %i\n", section->fileinfo);
+				Desk_Debug_Printf( Desk_error_PLACE "    debugsize   =   %i\n", section->debugsize);
+				Desk_Debug_Printf( Desk_error_PLACE "\n");
+
+				if ( 0==section->flags.data.language)
+				{	// This section only contains low level info.
+					int		i;
+					DDT_symbol*	syms = (DDT_symbol*) (section+1);
+
+					Desk_Debug_Printf( Desk_error_PLACE " Low-level only. numsyms = %i\n", section->name_or_nsyms.nsyms);
+					for ( i=0; i<section->name_or_nsyms.nsyms; i++)
+					{
+						Desk_Debug5_Printf( Desk_error_PLACE "sym %i: stridx=%i, global=%i, symboltype=%i\n",
+							i, syms[i].flags.stridx, syms[i].flags.global, syms[i].flags.symboltype
+							);
+					}
+					Desk_Debug_Printf( Desk_error_PLACE "\n");
+				}
+			}
+			#endif
+
+			if ( section->flags.data.language > bestsection_language)
+			{
+				Desk_Debug_Printf( Desk_error_PLACE "Replacing old best section language %i, with language %i\n",
+					bestsection_language, section->flags.data.language
+					);
+				bestsection_language	= section->flags.data.language;
+				bestsection		= section;
+			}
+
+			//return section;
+		}
+	}
+
+	return bestsection;
+}
+
+
+
+
+
+DDT_ddtinfo_handle	DDT_LoadDDTInfo( void)
+{
+	char*	cl  = _kernel_command_string();
+	char	filename[ 256] = "";
+	char*	firstspace;
+
+	strncat( filename, cl, 255);
+	firstspace = strchr( filename, ' ');
+	if ( firstspace)	*firstspace = 0;
+
+	Desk_Debug2_Printf( "Filename is '%s'\n", filename);
+	return DDT_LoadDDTInfoForFile( filename);
+}
+
+
+
+DDT_ddtinfo_handle	DDT_global_lastddtinfohandle = 0;
+
+
+DDT_ddtinfo_handle	DDT_GetDDTInfo( const void* ddtinfo, int len)
+{
+	DDT_debugareadata*	ddtdata;
+
+	if ( !ddtinfo || len==0)	return 0;
+
+	ddtdata = (DDT_debugareadata*) malloc( sizeof( DDT_debugareadata));
+	if ( !ddtdata)
+	{
+		Desk_Debug_Printf( Desk_error_PLACE "malloc failed\n");
+		return NULL;
+	}
+
+	ddtdata->loaded = Desk_bool_TRUE;
+	ddtdata->data = (char*) ddtinfo;
+	ddtdata->size = len;
+
+	Desk_Debug2_Printf( "DDT info is stored in memory 0x%p-0x%p (%i)\n",
+		ddtdata->data,
+		(char*) ddtdata->data + ddtdata->size,
+		ddtdata->size
+		);
+
+	DDT_global_lastddtinfohandle = (DDT_ddtinfo_handle) ddtdata;
+
+	return (DDT_ddtinfo_handle) ddtdata;
+}
+
+
+DDT_ddtinfo_handle	DDT_LoadDDTInfoForFile( const char* filename)
+{
+	/*
+	DDT_AIFHeader_block*	aifheader = (DDT_AIFHeader_block*) 0x8000;
+	char*			ddtinfo = ((char*) aifheader) +   global_ddtdata.aifheader.size_ro +   global_ddtdata.aifheader.size_rw;
+	*/
+	FILE*	file;
+	int	DDT_offset;
+	DDT_debugareadata*	ddtdata = (DDT_debugareadata*) malloc( sizeof( DDT_debugareadata));
+
+	if ( !ddtdata)
+	{
+		Desk_Debug_Printf( Desk_error_PLACE "malloc failed\n");
+		return NULL;
+	}
+
+	ddtdata->loaded = Desk_bool_TRUE;
+
+	Desk_Debug2_Printf( "Filename is '%s'\n", filename);
+	file = fopen( filename, "rb");
+
+	if (!file)
+	{
+		/*fprintf( stderr, "Couldn't read image file '%s'\n", filename);*/
+		return NULL;
+
+	}
+
+	/* Load AIF header from !RunImage	*/
+	fread( &ddtdata->aifheader, 1, sizeof( DDT_AIFHeader_block), file);
+
+
+	if ( ddtdata->aifheader.size_debug == 0)
+	{
+		Desk_Debug2_Printf( "DDT_LoadDDTInfo - no debugging data in file\n");
+		return NULL;
+	}
+
+	DDT_offset		=  ddtdata->aifheader.size_ro +  ddtdata->aifheader.size_rw;
+	ddtdata->file_address	= (char*) DDT_offset + 0x8000;
+	//DDT_global_file_address	= ddtdata->file_address;	// For global use in diagnostics.
+
+	Desk_Debug2_Printf( "DDT_offset is %i\n", DDT_offset);
+
+	if ( 0 != fseek( file, (long int) DDT_offset, SEEK_SET))
+	{
+		/*fprintf( stderr, "Couldn't find debug info\n");*/
+		return NULL;
+	}
+
+
+	ddtdata->data = (char*) malloc(  ddtdata->aifheader.size_debug);
+	if (!ddtdata->data)
+	{
+		/*fprintf( stderr, "Couldn't malloc space for debug info - %i bytes\n",  global_ddtdata.aifheader.size_debug);*/
+		return NULL;
+	}
+
+	ddtdata->size =  ddtdata->aifheader.size_debug;
+
+	Desk_Debug2_Printf( "DDT info is stored in memory 0x%p-0x%p (%i)\n",
+		ddtdata->data,
+		(char*) ddtdata->data + ddtdata->aifheader.size_debug,
+		ddtdata->aifheader.size_debug
+		);
+
+	fread( ddtdata->data, 1,  ddtdata->aifheader.size_debug, file);
+	fclose( file);
+
+	DDT_global_lastddtinfohandle = (DDT_ddtinfo_handle) ddtdata;
+
+	return (DDT_ddtinfo_handle) ddtdata;
+}
+
+
+
+
+void	DDT_DDTInfo( DDT_instruction_info* block, void* ptr)
+{
+	DDT_FindDDTInfoForInstruction( DDT_global_lastddtinfohandle, block, ptr);
+}
+
+
+
+
+void	DDT_FindDDTInfoForInstruction( DDT_ddtinfo_handle handle, DDT_instruction_info* block, void* ptr)
+{
+	DDT_debugareadata*	areadata = (DDT_debugareadata*) handle;
+	DDT_instruction_info2	info2;
+
+	DDT_FindDDTInfoForInstruction2( areadata, &info2, ptr);
+	block->instruction	= info2.instruction;
+	block->linenumber	= info2.pos.linenumber;
+	block->column		= info2.pos.linepos;
+	strcpy( block->filename, info2.filename);
+}
+#if 0
+{
+	DDT_section*	section;
+
+	block->instruction	= ptr;
+	block->filename[0]	= 0;
+	block->linenumber	= -1;
+	block->column		= -1;
+
+	if ( !areadata)	return;
+
+	if (!areadata->loaded)
+	{
+		/*Debug_Printf( "DDT_DDTInfo - DDT_LoadDDTInfo not previously called.\n");
+		*/
+		return;
+	}
+
+
+	Desk_Debug2_Printf( "DDT_DDTInfo: ddtinfo = %p\n", areadata->data);
+
+	if (!areadata->data)
+	{
+		Desk_Debug2_Printf( "DDT_DDTInfo: No debugging data...\n");
+		return;
+	}
+
+	Desk_Debug2_Printf( "CheckDDTInfo\n");
+	Desk_Debug2_Printf( "debug size is %i\n",  areadata->aifheader.size_debug);
+	Desk_Debug2_Printf( "debug data is at %p\n", areadata->data);
+	Desk_Debug2_Printf( "debug type is %i\n",  areadata->aifheader.debug_type);
+	Desk_Debug2_Printf( "ddtinfo is loaded at address %p\n", areadata);
+
+	/* Scan through all sections looking for code with address 'ptr'	*/
+	section = DDT_GetEnclosingSection( (char*) ptr, areadata);
+	if (!section)
+	{
+		Desk_Debug_Printf( "PrintDDTInfo couldn't find enclosing section for instruction %p\n", ptr);
+		return;
+	}
+
+	#ifdef Desk_DEBUG
+	{
+		Desk_Debug_Printf( Desk_error_PLACE "Enclosing section is:\n");
+		Desk_Debug_Printf( Desk_error_PLACE "    language    = %i\n", section->flags.data.language);
+		Desk_Debug_Printf( Desk_error_PLACE "    debuglines  = %i\n", section->flags.data.debuglines);
+		Desk_Debug_Printf( Desk_error_PLACE "    debugvars   = %i\n", section->flags.data.debugvars);
+		Desk_Debug_Printf( Desk_error_PLACE "    -unused-    = %i\n", section->flags.data.spare);
+		Desk_Debug_Printf( Desk_error_PLACE "    debugversion= %i\n", section->flags.data.debugversion);
+		Desk_Debug_Printf( Desk_error_PLACE "\n");
+		Desk_Debug_Printf( Desk_error_PLACE "    codestart   = 0x%p\n", section->codeaddr);
+		Desk_Debug_Printf( Desk_error_PLACE "    datastart   = 0x%p\n", section->dataaddr);
+		Desk_Debug_Printf( Desk_error_PLACE "    codesize    =   %i\n", section->codesize);
+		Desk_Debug_Printf( Desk_error_PLACE "    datasize    =   %i\n", section->datasize);
+		Desk_Debug_Printf( Desk_error_PLACE "    fileinfo    =   %i\n", section->fileinfo);
+		Desk_Debug_Printf( Desk_error_PLACE "    debugsize   =   %i\n", section->debugsize);
+		Desk_Debug_Printf( Desk_error_PLACE "\n");
+
+		if ( 0==section->flags.data.language)
+		{	// This section only contains low level info.
+			int		i;
+			DDT_symbol*	syms = (DDT_symbol*) (section+1);
+
+			Desk_Debug_Printf( Desk_error_PLACE " Low-level only. numsyms = %i\n", section->name_or_nsyms.nsyms);
+			for ( i=0; i<section->name_or_nsyms.nsyms; i++)
+			{
+				Desk_Debug_Printf( Desk_error_PLACE "sym %i: stridx=%i, global=%i, symboltype=%i\n",
+					syms[i].flags.stridx, syms[i].flags.global, syms[i].flags.symboltype
+					);
+			}
+			Desk_Debug_Printf( Desk_error_PLACE "\n");
+		}
+	}
+	#endif
+
+	if (!section->fileinfo)
+	{
+		Desk_Debug2_Printf( "No file debugging info\n");
+		return;
+	}
+
+	else
+	{
+		DDT_fileinfo*	fileinfo = (DDT_fileinfo*) (((char*) section) + section->fileinfo);
+		/*
+		int			filenamespace = (fileinfo->filename.length + 3) & (~3);
+		*/
+		int			i;
+		char*			c		= &fileinfo->filename.first3[0] + fileinfo->filename.length;
+		DDT_fileinfo_data*	fileinfodata	= (DDT_fileinfo_data*) (((int) c+3) & (~3));
+		DDT_fragment*	fragment	= (DDT_fragment*) ( fileinfodata+1);
+
+		/*Desk_Debug2_Printf( "filenamespace is %i\n", filenamespace);*/
+		Desk_Debug2_Printf( "PrintDDTI fo: section for instruction %p is %p [0x%p]\n", ptr, section, FILEADDRESS( section));
+
+		block->filename[0]=0;
+		strncat( block->filename, fileinfo->filename.first3, fileinfo->filename.length);
+
+		Desk_Debug2_Printf( "\nFilename '%s'\n\n", block->filename);
+
+		Desk_Debug2_Printf( "PrintDDTInfo: fileinfo for this section is at offset %i (%p [0x%p]), with %i fragments\n",
+			section->fileinfo, fileinfo, FILEADDRESS( fileinfo), fileinfodata->n
+			);
+		Desk_Debug2_Printf( "Searching file fragments...\n");
+
+		for	(
+			i=0;
+			i < fileinfodata->n;
+			i++
+			)
+		{
+			DDT_fragment*	fragend		= (DDT_fragment*) (((char*) fragment) + fragment->fragmentsize);
+
+			Desk_Debug_Printf( "fragment 0x%p [0x%p], code=0x%p-0x%p, codesize=%i, fragment size=%i\n",
+				fragment,
+				FILEADDRESS( fragment),
+				fragment->codeaddr,
+				fragment->codeaddr+fragment->codesize,
+				fragment->codesize,
+				fragment->fragmentsize
+				);
+
+			if ( (char*) ptr >= fragment->codeaddr && (char*) ptr < fragment->codeaddr+fragment->codesize)
+			{
+				int			line		= fragment->firstline;
+				int			column		= 1;
+				char*			code		= fragment->codeaddr;
+				/*DDT_lineinfo*	lineinfo	= (DDT_lineinfo*) (fragment+1);
+				*/
+				char*			lineinfo	= (char*) (fragment+1);
+
+				Desk_Debug2_Printf( "fragment contains ptr\n");
+
+				/* Search through line info for our code pointer	*/
+				for ( ; lineinfo < (char*) fragend; )
+				{
+
+					/*DDT_lineinfo*	nextlineinfo;*/
+					char*	nextlineinfo;
+					int	lineinc;
+					int	colinc;
+					int	codeinc;
+
+					Desk_Debug3_Printf( "DDT_lineinfo at %p [0x%p] is is codeinc %i, lineinc %i\n",
+						lineinfo, FILEADDRESS( lineinfo), lineinfo[0], lineinfo[1]
+						);
+
+					if ( lineinfo[0]==0 && lineinfo[1]==0)
+					{
+						/* 3 half-word form	*/
+						/*DDT_lineinfo2*	lineinfo2 = (DDT_lineinfo2*) lineinfo;
+						*/
+						short int*	lineinfo2 = (short int*) lineinfo;
+						Desk_Debug4_Printf( "Found 3 half-word line info\n");
+
+						lineinc = lineinfo2[1];
+						codeinc = lineinfo2[2];
+						colinc	= -column;
+						nextlineinfo = lineinfo + 6;
+					}
+
+					else if (lineinfo[0]==0 && lineinfo[1]==64)
+					{
+						/* 4 half-word form	*/
+						/*DDT_lineinfo3*	lineinfo3 = (DDT_lineinfo3*) lineinfo;
+						*/
+						short int*	lineinfo3 = (short int*) lineinfo;
+						Desk_Debug4_Printf( "Found 4 half-word line info\n");
+
+						lineinc = lineinfo3[1];
+						codeinc = lineinfo3[2];
+						colinc	= lineinfo3[3] - column;
+						nextlineinfo = lineinfo + 8;
+					}
+
+					else
+					{
+						Desk_Debug4_Printf( "Normal lineinfo.\n");
+
+						lineinc = 0;
+						if (lineinfo[1]<64)
+						{
+							Desk_Debug5_Printf( "No column change...\n");
+
+							lineinc	= lineinfo[1];
+							colinc	= 1-column;
+						}
+						else
+						{
+							colinc	= lineinfo[1]-64;
+							lineinc	= 0;
+							Desk_Debug5_Printf( "Column change %i\n", colinc);
+
+						}
+						codeinc	= lineinfo[0];
+						nextlineinfo = lineinfo+2;
+					}
+
+					if ( (char*) ptr >= code && (char*) ptr < code+codeinc)
+					{
+						Desk_Debug2_Printf(	"Instruction at %p is line number %i, column %i\n",
+							ptr, line, column
+							);
+
+						block->linenumber	= line;
+						block->column		= column;
+						break;
+					}
+
+					Desk_Debug2_Printf( "line %i, column %i, code %p\n", line, column, code);
+
+					Desk_Debug2_Printf( "lineinc=%i, columninc=%i, codeinc=%i\n", lineinc, colinc, codeinc);
+
+					line	+= lineinc;
+					column	+= colinc;
+					code	+= codeinc;
+					lineinfo = nextlineinfo;
+					/*Desk_Debug2_Printf( "\n");*/
+				}
+
+				if ( (char*) lineinfo >= (char*) fragend)
+				{
+					fprintf( stderr, "Couldn't find source pos for ptr %p\n", ptr);
+				}
+
+				break;
+			}
+
+			fragment = fragend;
+		}
+
+		if ( i == fileinfodata->n)	Desk_Debug_Printf( "Couldn't find instruction\n");
+	}
+}
+#endif

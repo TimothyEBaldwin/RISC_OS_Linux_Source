@@ -1,0 +1,1123 @@
+; This source code in this file is licensed to You by Castle Technology
+; Limited ("Castle") and its licensors on contractual terms and conditions
+; ("Licence") which entitle you freely to modify and/or to distribute this
+; source code subject to Your compliance with the terms of the Licence.
+; 
+; This source code has been made available to You without any warranties
+; whatsoever. Consequently, Your use, modification and distribution of this
+; source code is entirely at Your own risk and neither Castle, its licensors
+; nor any other person who has contributed to this source code shall be
+; liable to You for any loss or damage which You may suffer as a result of
+; Your use, modification or distribution of this source code.
+; 
+; Full details of Your rights and obligations are set out in the Licence.
+; You should have received a copy of the Licence with this source code file.
+; If You have not received a copy, the text of the Licence is available
+; online at www.castle-technology.co.uk/riscosbaselicence.htm
+; 
+        TTL  => Utility
+
+; *****************************************************************************
+; Arthur Utility commands
+
+SysModules_Info ROUT     ; start of ROM modules chain
+        &       EndOfKernel-SysModules_Info
+
+UtilityMod
+        &       StartSuper-UtilityMod
+        &       0                               ; no initialisation
+        &       Util_Die-UtilityMod
+        &       Util_Service-UtilityMod         ; code to register printer buffer with Buffer manager
+        &       UtilModTitle-UtilityMod
+        &       UtilHelpStr-UtilityMod
+        &       UtilHelpTab-UtilityMod
+        &       &F00000
+        &       Util_SWI-UtilityMod
+        &       Util_SWITab-UtilityMod
+        &       0
+ [ International_Help <> 0
+        &       MessageFileName-UtilityMod
+ |
+        &       0
+ ]
+        &       UtilFlags-UtilityMod
+
+Util_SWITab
+        =       "ARM",0
+        =       "IMB",0
+        =       "IMBRange",0
+        =       0
+        ALIGN
+
+Module_BaseAddr SETA UtilityMod
+
+  [ ChocolateService
+    ;service table
+    ;
+        ASSERT Service_MessageFileClosed < Service_BufferStarting
+        ASSERT Service_BufferStarting    < Service_TerritoryStarted
+        ASSERT Service_TerritoryStarted  < Service_DeviceFSCloseRequest
+        ASSERT Service_DeviceFSCloseRequest < Service_DisplayStatus
+    ;
+
+Util_ChocServTab
+        DCD    0                            ;flags word
+        DCD    Util_ChocService-UtilityMod  ;offset to handler
+   [ CacheCommonErrors
+        DCD    Service_MessageFileClosed
+   ]
+        DCD    Service_BufferStarting       ;service 1
+   [ CacheCommonErrors
+        DCD    Service_TerritoryStarted
+   ]
+        DCD    Service_DeviceFSCloseRequest ;service 2
+        DCD    Service_DisplayStatus
+        DCD    0                            ;terminator
+        DCD    Util_ChocServTab-UtilityMod  ;table anchor
+  ]
+Util_Service ROUT
+  [ ChocolateService
+        MOV     r0, r0   ;magic instruction for new service table format
+  ]
+        TEQ     r1, #Service_BufferStarting
+        TEQNE   r1, #Service_DeviceFSCloseRequest
+  [ CacheCommonErrors
+        TEQNE   r1, #Service_TerritoryStarted
+        TEQNE   r1, #Service_MessageFileClosed
+  ]
+        TEQNE   r1, #Service_DisplayStatus
+        MOVNE   pc, lr
+  [ ChocolateService
+    ;entry point excluding pre-rejection code
+Util_ChocService
+  ]
+  [ CacheCommonErrors
+        TEQ     r1, #Service_TerritoryStarted
+        TEQNE   r1, #Service_MessageFileClosed
+        BEQ     CacheCommonErrorsReinit
+  ]
+        TEQ     r1, #Service_DeviceFSCloseRequest
+        BEQ     %FT10
+        TEQ     r1, #Service_DisplayStatus
+        BEQ     HandleServiceDisplayStatus
+        ; Else must be Service_BufferStarting
+        Push    "r0-r3,lr"
+
+; Register buffers with buffer manager in order of speed - first is fast
+
+        MOV     r0, #BufferFlags_GenerateInputFull
+        LDR     r1, =MouseBuff
+        LDR     r2, =MouseBuff + MouseBuffSize
+        MOV     r3, #Buff_Mouse
+        SWI     XBuffer_Register                ; register mouse input buffer
+        MOV     r0, #BufferFlags_GenerateInputFull :OR: BufferFlags_SendThresholdUpCalls
+        LDR     r1, =RS423InBuff
+        LDR     r2, =RS423InBuff + RS423InBuffSize
+        MOV     r3, #Buff_RS423In
+        SWI     XBuffer_Register                ; register serial input buffer
+
+        MOV     r0, #BufferFlags_GenerateOutputEmpty
+        LDR     r1, =RS423OutBuff
+        LDR     r2, =RS423OutBuff + RS423OutBuffSize
+        MOV     r3, #Buff_RS423Out
+        SWI     XBuffer_Register                ; register serial output buffer
+
+        LDR     r0, =ZeroPage                   ; used as index to PrinterBufferThing
+        LDR     r1, [r0, #PrinterBufferAddr]    ; r1 -> start of buffer
+        LDR     r2, [r0, #PrinterBufferSize]    ; r2 = size
+        ADD     r2, r2, r1                      ; r2 -> end+1 of buffer
+        MOV     r3, #Buff_Print
+        MOV     r0, #BufferFlags_GenerateOutputEmpty
+        SWI     XBuffer_Register                ; register the MOS's printer buffer
+
+        Pull    "r0-r3,pc"
+
+; service DeviceFSCloseRequest
+; in:   r2 = handle we are requested to close
+;       if r2 = PrinterActive (word) or SerialInHandle (byte) or SerialOutHandle (byte)
+;       then zero appropriate variable and close file, then claim service
+;       NB there is a disadvantage to doing it for SerialInHandle, in that it won't get
+;       opened again, but we assume they accidentally left it in an fx2,2 state
+;
+
+10
+        Push    "r0,r1,lr"
+        LDR     lr, =ZeroPage
+        MOV     r0, #0
+        LDR     r1, [lr, #OsbyteVars + :INDEX: PrinterActive]
+        TEQ     r1, r2
+        STREQ   r0, [lr, #OsbyteVars + :INDEX: PrinterActive]
+        BEQ     %FT20
+        LDRB    r1, [lr, #OsbyteVars + :INDEX: SerialInHandle]
+        TEQ     r1, r2
+        STREQB  r0, [lr, #OsbyteVars + :INDEX: SerialInHandle]
+        BEQ     %FT20
+        LDRB    r1, [lr, #OsbyteVars + :INDEX: SerialOutHandle]
+        TEQ     r1, r2
+        Pull    "r0,r1,pc",NE                   ; if not any of these then exit preserving everything
+        STRB    r0, [lr, #OsbyteVars + :INDEX: SerialOutHandle]
+20
+        SWI     XOS_Find                        ; close file, ignore errors (if we get an error it's closed anyway)
+        LDR     r0, [sp], #8                    ; restore r0, junk r1
+        MOV     r1, #Service_Serviced           ; indicate we closed it
+        LDR     pc, [sp], #4                    ; exit
+
+
+Util_Die   ROUT
+           CMP   R10, #0
+           MOVEQ PC, lr      ; non-fatal : can cope
+           ADR   R0, %FT01
+ [ International
+           Push  "lr"
+           BL    TranslateError
+           Pull  "pc"
+ |
+           RETURNVS
+ ]
+
+01
+           &     ErrorNumber_CantKill
+ [ International
+           =    "CantKill", 0
+ |
+           =    "Deleting the utility module is foolish", 0
+ ]
+
+
+UtilModTitle =  "UtilityModule", 0
+
+UtilHelpStr  =  "MOS Utilities", 9, "$VersionNo", 0
+
+  [ Oscli_HashedCommands
+;
+;***WARNING*** if commands are added or changed, UtilHashedCmdTab MUST be updated correspondingly
+;
+  ]
+UtilHelpTab
+           Command   Break,              0,  0, International_Help   ; just help
+           Command   Cache,              1,  0, International_Help
+           Command   ChangeDynamicArea,255,  0, International_Help
+           Command   Configure,        255,  0, Help_Is_Code_Flag :OR: International_Help
+           Command   Commands,           0,  0, Help_Is_Code_Flag :OR: International_Help
+           Command   Echo,             255,  0, International_Help
+           Command   Error,            255,  1, International_Help
+           Command   Eval,             255,  1, International_Help
+           Command   FileCommands,       0,  0, Help_Is_Code_Flag :OR: International_Help
+           Command   GOS,                0,  0, International_Help
+           Command   IF,               255,  2, International_Help
+           Command   Ignore,             1,  0, International_Help
+           Command   Modules,            0,  0, Help_Is_Code_Flag :OR: International_Help
+           Command   PowerOn,            0,  0, International_Help   ; just help
+           Command   Reset,              0,  0, International_Help   ; just help
+           Command   RMClear,            0,  0, International_Help
+           Command   RMEnsure,         255,  2, International_Help
+           Command   RMFaster,           1,  1, International_Help
+           Command   RMInsert,           2,  1, International_Help
+           Command   RMKill,             1,  1, International_Help
+           Command   RMLoad,           255,  1, International_Help
+           Command   RMReInit,         255,  1, International_Help
+           Command   RMRun,            255,  1, International_Help
+           Command   RMTidy,             0,  0, International_Help
+           Command   ROMModules,         0,  0, International_Help
+           Command   Set,              255,  2, International_Help
+           Command   SetEval,          255,  2, International_Help
+           Command   SetMacro,         255,  2, International_Help
+           Command   Show,               1,  0, International_Help   ; *show = *show *
+           Command   Status,           255,  0, International_Help
+           Command   Syntax,             0,  0, International_Help
+           Command   Time,               0,  0, International_Help
+           Command   Unplug,             2,  0, International_Help
+           Command   Unset,              1,  1, International_Help
+           =   0
+
+  [ Oscli_HashedCommands
+;
+; - Hashing table is 32 wide
+; - Hashing function is:
+;
+;      hash = (sum of all chars of command, each upper-cased) & 0x1f
+;
+; - Order of commands in each hashed list is chosen as 'most common' first
+
+; Table MUST be reorganised if hashing function changed, or command set altered
+;
+           ALIGN
+UtilHashedCmdTab
+;
+;    ! 0,"UtilHashedCmdTab  at ":CC::STR:(UtilHashedCmdTab)
+;
+;First, 1 word per table entry, giving offset to hashed list on each hash value
+;
+           DCD       0                        ;null list on this hash value
+           DCD       UHC_hash01 - UtilityMod
+           DCD       UHC_hash02 - UtilityMod
+           DCD       0
+           DCD       UHC_hash04 - UtilityMod
+           DCD       0
+           DCD       UHC_hash06 - UtilityMod
+           DCD       UHC_hash07 - UtilityMod
+           DCD       UHC_hash08 - UtilityMod
+           DCD       UHC_hash09 - UtilityMod
+           DCD       UHC_hash0A - UtilityMod
+           DCD       UHC_hash0B - UtilityMod
+           DCD       UHC_hash0C - UtilityMod
+           DCD       0
+           DCD       0
+           DCD       UHC_hash0F - UtilityMod
+           DCD       0
+           DCD       UHC_hash11 - UtilityMod
+           DCD       0
+           DCD       0
+           DCD       UHC_hash14 - UtilityMod
+           DCD       0
+           DCD       0
+           DCD       0
+           DCD       0
+           DCD       UHC_hash19 - UtilityMod
+           DCD       0
+           DCD       UHC_hash1B - UtilityMod
+           DCD       0
+           DCD       0
+           DCD       UHC_hash1E - UtilityMod
+           DCD       UHC_hash1F - UtilityMod
+;
+; Now the hashed lists
+;
+UHC_hash01
+           Command   Show,               1,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash02
+           Command   Configure,        255,  0, Help_Is_Code_Flag :OR: International_Help
+           =   0
+           ALIGN
+UHC_hash04
+           Command   ChangeDynamicArea,255,  0, International_Help
+           Command   RMFaster,           1,  1, International_Help
+           Command   Status,           255,  0, International_Help
+           Command   Ignore,             1,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash06
+           Command   RMClear,            0,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash07
+           Command   ROMModules,         0,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash08
+           Command   Eval,             255,  1, International_Help
+           =   0
+           ALIGN
+UHC_hash09
+           Command   GOS,                0,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash0A
+           Command   RMReInit,         255,  1, International_Help
+           Command   Error,            255,  1, International_Help
+           =   0
+           ALIGN
+UHC_hash0B
+           Command   RMKill,             1,  1, International_Help
+           =   0
+           ALIGN
+UHC_hash0C
+           Command   Set,              255,  2, International_Help
+           =   0
+           ALIGN
+UHC_hash0F
+           Command   IF,               255,  2, International_Help
+           Command   Unset,              1,  1, International_Help
+           Command   Time,               0,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash11
+           Command   RMEnsure,         255,  2, International_Help
+           =   0
+           ALIGN
+UHC_hash14
+           Command   SetEval,          255,  2, International_Help
+           Command   RMRun,            255,  1, International_Help
+           Command   RMInsert,           2,  1, International_Help
+           Command   Cache,              1,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash19
+           Command   Modules,            0,  0, Help_Is_Code_Flag :OR: International_Help
+           Command   RMTidy,             0,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash1B
+           Command   Unplug,             2,  0, International_Help
+           =   0
+           ALIGN
+UHC_hash1E
+           Command   SetMacro,         255,  2, International_Help
+           =   0
+           ALIGN
+UHC_hash1F
+           Command   RMLoad,           255,  1, International_Help
+           Command   Echo,             255,  0, International_Help
+           =   0
+           ALIGN
+
+  ] ;Oscli_HashedCommands
+
+Configure_Syntax     * Module_BaseAddr
+Commands_Code        * Module_BaseAddr
+Commands_Syntax      * Module_BaseAddr
+Syntax_Code          * Module_BaseAddr
+Syntax_Syntax        * Module_BaseAddr
+Echo_Syntax          * Module_BaseAddr
+Status_Syntax        * Module_BaseAddr
+FileCommands_Code    * Module_BaseAddr
+FileCommands_Syntax  * Module_BaseAddr
+Reset_Code           * Module_BaseAddr
+Reset_Syntax         * Module_BaseAddr
+Break_Code           * Module_BaseAddr
+Break_Syntax         * Module_BaseAddr
+PowerOn_Code         * Module_BaseAddr
+PowerOn_Syntax       * Module_BaseAddr
+
+RMFaster_Code
+           Push "lr"
+           MOV R1, R0
+           MOV R0, #ModHandReason_LookupName
+           SWI XOS_Module
+           Pull "PC", VS
+           CMP   R3, #ROM                 ; HS if R3 >= ROM
+           BLO   RMFast_notinROM
+ [ :LNOT:ROMatTop
+           CMP   R3, #ROMLimit
+           BHS   RMFast_notinROM
+ ]
+           MOV   R1, R3
+           LDR   R2, [R1, #-4]
+           MOV   R0, #ModHandReason_CopyArea
+           SWI   XOS_Module
+           Pull  PC
+
+RMFast_notinROM
+           ADRL R0, ErrorBlock_RMNotFoundInROM
+         [ International
+           BL   TranslateError
+         ]
+           Pull lr
+           RETURNVS
+
+RMKill_Code
+           MOV R6, #ModHandReason_Delete
+
+Rmcommon   Push "lr"
+           MOV r1, r0
+           MOV r0, r6
+           SWI   XOS_Module
+           Pull "PC"
+
+RMLoad_Code
+           MOV R6, #ModHandReason_Load
+           B   Rmcommon
+
+RMRun_Code
+           MOV R6, #ModHandReason_Run
+           B   Rmcommon
+
+RMTidy_Code
+           MOV R6, #ModHandReason_Tidy
+           B   Rmcommon
+
+RMClear_Code
+           MOV R6, #ModHandReason_Clear
+           B   Rmcommon
+
+RMReInit_Code
+           MOV R6, #ModHandReason_ReInit
+           B   Rmcommon
+
+Modules_Help   ROUT
+          Push  "r2, r3, lr"
+          LDR   r2, =ZeroPage                      ; Try our own message file before Global.
+          LDR   r0, [r2, #KernelMessagesBlock]
+          TEQ   r0, #0
+          ADDNE r0, r2, #KernelMessagesBlock+4
+          ADRL  r1, modules_help1
+        [ ZeroPage <> 0
+          MOV   r2, #0
+        ]
+          SWI   XMessageTrans_Lookup
+          SWIVC XMessageTrans_Dictionary
+          MOVVC r1, r0
+          MOVVC r0, r2
+          SWIVC XOS_PrettyPrint
+          Pull  "r2, r3, PC", VS
+          LDR    R1, =ZeroPage+Module_List
+03        LDR    R1, [R1]
+          CMP    R1, #0
+          BEQ    %FT05
+          LDR    R0, [R1, #Module_code_pointer]
+          BL     PrintTitle
+          BVC    %BT03
+05        MOVVC  R0, #0
+          Pull  "r2, r3, PC"
+
+PrintTitle ; of module at R0 : corrupts R0
+        Push  "R1, lr"
+        LDR    R1, [R0, #Module_HelpStr]
+        CMP    R1, #0
+        ADREQ  R0, NoRIT
+      [ International
+        BLEQ   Write0_Translated
+        ADDNE  R0, R1, R0
+        SWINE  XOS_PrettyPrint
+      |
+        ADDNE  R0, R1, R0
+        SWI    XOS_PrettyPrint
+      ]
+        SWIVC  XOS_NewLine
+        Pull  "R1, PC"
+
+Modules_Code ROUT
+        Push   "R7, lr"
+
+      [ International
+        BL     WriteS_Translated
+        =      "Modules:No. Position Workspace Name", 10, 13, 0
+        ALIGN
+      |
+        SWI     XOS_WriteS
+        =      "No. Position Workspace Name", 10, 13, 0
+        ALIGN
+      ]
+        Pull   "R7, PC", VS
+
+        MOV     R1, #0
+        MOV     R2, #0
+        MOV     R6, #0
+        MOV     R7, #0
+06
+        SWI     XOS_ReadEscapeState
+        Pull    "R7, lr", CS
+        BCS     AckEscape
+        MOV     R0, #ModHandReason_GetNames
+        SWI     XOS_Module
+        BVC     %FT07
+        CLRV
+        Pull   "R7, pc"              ; back, clearing V
+
+07
+        Push   "R1, R2"
+        CMP     R6, #0
+        MOVNE   R1, #0
+        BNE     %FT02
+        ADD     R7, R7, #1
+        MOV     R0, R7
+        LDR     R1, =GeneralMOSBuffer
+        MOV     R2, #256
+        SWI     XOS_ConvertCardinal2
+        SUB     R1, R1, R0          ; characters in buffer
+02      CMP     R1, #3
+        SWILT   XOS_WriteI+" "
+        BVS     %FT03
+        ADDLT   R1, R1, #1
+        BLT     %BT02
+03
+        Pull   "R1, R2"
+        BVS     %FT04
+        CMP     R6, #0
+        SWIEQ   XOS_Write0
+        SWIVC   XOS_WriteI+" "
+        MOV     R0, R3
+        BLVC    HexR0LongWord
+        SWIVC   XOS_WriteI+" "
+        MOV     R0, R4
+        BLVC    HexR0LongWord
+        SWIVC   XOS_WriteI+" "
+        SWIVC   XOS_WriteI+" "
+        BLVC    %FT01         ; title out
+        SWIVC   XOS_NewLine
+        BVC     %BT06
+04
+        Pull   "R7, PC"
+01
+        Push   "lr"
+        LDR     R0, [R3, #Module_TitleStr]
+        CMP     R0, #0
+        ADDNE   R0, R3, R0
+        ADREQ   R0, NoRIT
+      [ International
+        BLEQ    Write0_Translated
+        SWINE   XOS_Write0
+      |
+        SWI     XOS_Write0
+      ]
+        Pull   "PC", VS
+        CMP     R6, #0
+        CMPEQ   R2, #0
+        MOV     R6, R2
+        Pull   "PC", EQ       ; only one incarnation
+        SWI     XOS_WriteI + Postfix_Separator
+        MOV     R0, R5
+        SWIVC   XOS_Write0
+        Pull   "PC"
+
+      [ International
+NoRIT   =   "Untitled:<Untitled>", 0
+      |
+NoRIT   =   "<Untitled>", 0
+      ]
+starstr =   "*", 13
+        ALIGN
+
+
+
+Show_Code
+        CMP     r1, #0                  ; *show only?
+        ADREQ   r0, starstr
+        Entry   "r0,r7",8+256
+        MRS     r7, CPSR
+
+        ADD     r6, sp, #8              ; initial buffer for var expansions
+        MOV     lr, #256+4
+        STR     lr, [sp, #4]            ; fake heap block size
+        MOV     lr, #&ffffffff
+        STR     lr, [sp, #0]            ; inhibit page mode off on exit
+
+        ; Read current VDU status and save it away
+        MOVVC   r0, #117
+        SWIVC   XOS_Byte
+        STRVC   R1, [sp, #0]
+        SWIVC   XOS_WriteI+14           ; paged mode on.
+        BVS     ShowBang
+
+        MOV     r3, #0          ; enumeration pointer
+01
+        LDR     r0, [sp, #Proc_RegOffset + 0*4]        ; wildcard
+10
+        MOV     r1, r6          ; 'heap' block
+        LDR     r2, [r6, #-4]   ; block size
+        SUB     r2, r2, #4
+        MOV     r4, #0          ; no expansion
+        SWI     XOS_ReadVarVal
+        BVS     Show_ErrorReading
+
+        ; Varname
+        MOV     r0, r3
+        SWI     XOS_Write0
+        BVS     ShowBang
+
+        ; (Number) or (Macro) as appropriate
+        CMP     R4, #VarType_String
+        BEQ     skipvalprt
+      [ :LNOT: International
+        SWI     XOS_WriteS
+        =       " (", 0
+        ALIGN
+        BVS     ShowBang
+      ]
+        CMP     R4, #VarType_Number
+        MOVEQ   R2, #256
+        LDREQ   R0, [R1]
+        SWIEQ   XOS_BinaryToDecimal
+        ADREQ   R0, %FT02
+        ADRHI   R0, %FT03
+      [ International
+        BLVC    Write0_Translated
+      |
+        SWIVC   XOS_Write0
+        SWIVC   XOS_WriteI+")"
+      ]
+        BVS     ShowBang
+skipvalprt
+        ; " : "
+        SWI     XOS_WriteS
+        =       " : ", 0
+        ALIGN
+        BVS     ShowBang
+
+        ; Now output the value's value
+        MOV     R5, #-1
+05      ADD     R5, R5, #1
+        CMP     R5, R2
+        BEQ     %FT06
+        SWI     XOS_ReadEscapeState
+        BLCS    AckEscape
+        BVS     ShowBang
+        LDRB    R0, [R1, R5]
+        CMP     R0, #&7F
+        MOVEQ   R0, #"?"-"@"
+        CMP     R0, #31
+        ADDLE   R0, R0, #"@"
+        SWILE   XOS_WriteI+"|"
+        BVS     ShowBang
+
+        CMP     R0, #"|"
+        CMPNE   R0, #""""
+        CMPNE   R0, #"<"
+        SWINE   XOS_WriteC
+        BVS     ShowBang
+        BNE     %BT05
+
+        CMP     R4, #VarType_Macro
+        SWINE   XOS_WriteI+"|"
+        SWIVC   XOS_WriteC
+        BVC     %BT05
+ShowBang
+        STR     r0, [sp, #Proc_RegOffset + 0*4]
+        ORR     r7, r7, #V_bit                          ; CPSR in
+
+Show_Exit
+        ; Release buffer if necessary
+        ADD     lr, sp, #8              ; stack buffer
+        TEQ     r6, lr
+        MOVNE   r0, #ModHandReason_Free
+        MOVNE   r2, r6
+        SWINE   XOS_Module
+
+        ; Switch paged mode off if necessary
+        LDR     lr, [sp, #0]
+        TST     lr, #5
+        SWIEQ   XOS_WriteI+15  ; paged mode off
+
+        MSR     CPSR_f, r7
+        EXIT
+
+06      SWI     XOS_NewLine
+        BVS     ShowBang
+        B       %BT01
+
+      [ International
+02
+        =       "Number:(Number)", 0
+03
+        =       "Macro:(Macro)", 0
+      |
+02
+        =       "Number", 0
+03
+        =       "Macro", 0
+      ]
+        ALIGN
+
+Show_ErrorReading
+        ; Error from OS_ReadVarVal:
+        ; VarCantFind - end of *show
+        ; BuffOverflow - try and extend buffer
+        ; other - return as error
+        LDR     r5, [r0]
+        LDR     lr, =ErrorNumber_VarCantFind
+        TEQ     r5, lr
+        BEQ     Show_Exit
+        LDR     lr, =ErrorNumber_BuffOverflow
+        TEQ     r5, lr
+        BNE     ShowBang
+
+        ; try and extend the buffer
+        CLRV
+        MOV     r1, r3                  ; actual name so retry gets this node exactly
+        ADD     lr, sp, #8              ; stack buffer
+        TEQ     r6, lr
+        MOV     r0, #ModHandReason_Free
+        MOV     r2, r6
+        MOV     r6, lr                  ; to prevent any attempt at freeing in ShowBang
+        SWINE   XOS_Module
+        BVS     ShowBang
+
+        MOV     r0, r1
+        MOV     r1, #ARM_CC_Mask
+        MOV     r2, #-1                 ; To sence size
+        MOV     r3, #0                  ; 1st var
+        MOV     r4, #0                  ; unexpanded
+        SWI     XOS_ReadVarVal
+        CLRV                            ; error will be buffer overflow
+        MOV     r1, r3                  ; varname again
+        MVN     r3, r2
+        ADD     r3, r3, #&ff            ; round up to 256 byte boundary
+        BIC     r3, r3, #&ff
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        BVS     ShowBang
+        MOV     r6, r2
+        MOV     r0, r1
+        MOV     r3, #0                  ; restart from that node
+        B       %BT10
+
+Set_Code ROUT
+        MOV    R4, #VarType_String
+01
+        Push  "lr"
+
+        ; space terminated name in R0
+
+        ; Skip name in R1
+        MOV    R1, R0
+02      LDRB   R2, [R1], #1
+        CMP    R2, #" "
+        BNE    %BT02
+
+        ; Then skip spaces
+03      LDRB   R2, [R1], #1
+        CMP    R2, #" "
+        BEQ    %BT03
+        SUB    R1, R1, #1
+
+        ; r2 +ve to set, r3 = 0 for 1st var
+        MOV    R2, #1
+        MOV    R3, #0
+        SWI    XOS_SetVarVal
+        Pull  "PC"
+
+        LTORG
+
+SetMacro_Code MOV    R4, #VarType_Macro
+        B  %BT01
+
+SetEval_Code MOV    R4, #VarType_Expanded
+        B  %BT01
+
+Unset_Code ROUT
+        Push  "lr"
+        MOV    R2, #-1
+        MOV    R3, #0
+01      SWI    XOS_SetVarVal
+        BVC    %BT01
+        CLRV
+        Pull  "pc"
+
+Echo_Code ROUT
+        Push  "lr"
+        MOV    R2, #GS_NoQuoteMess
+        SWI    XOS_GSInit
+01      SWI    XOS_GSRead
+        BVS    %FT02
+        MOVCC  R3, R0
+        MOVCC  R0, R1
+        SWICC  XOS_WriteC
+        BVS    %FT02
+        MOVCC  R0, R3
+        BCC    %BT01
+        SWI    XOS_NewLine
+02
+        Pull  "PC"
+
+Commands_Help  ROUT
+        Push  "R0, lr"         ; keep buffer pointer
+        ADRL   R0, commands_helpstr
+        MOV    R1, #0
+KeyHelpCommon                  ; also used by *Configure
+        Push   r1
+; R2 & R3 can be junked here?
+        MOV    r1, r0
+        LDR    r2, =ZeroPage   ; Try our own message file before Global.
+        LDR    r0, [r2, #KernelMessagesBlock]
+        TEQ    r0, #0
+        ADDNE  r0, r2, #KernelMessagesBlock+4
+      [ ZeroPage <> 0
+        MOV    r2, #0
+      ]
+        SWI    XMessageTrans_Lookup
+        SWIVC  XMessageTrans_Dictionary
+        MOVVC  r1, r0
+        MOVVC  r0, r2
+        SWIVC  XOS_PrettyPrint
+        Pull   "r1,r3"         ; restore r1 and get buffer pointer
+        Pull   "pc", VS        ; if error, exit
+        MOV    r0, #0
+        ADRL   R2, SysCommsModule
+        BL     OneModuleK
+        BVS    %FT10
+        LDR    R6, =ZeroPage+Module_List
+12      LDR    R6, [R6]
+        CMP    R6, #0
+        BEQ    %FT10
+        LDR    R2, [R6, #Module_code_pointer]
+        BL     OneModuleK
+        BVC    %BT12
+10      MOVVC  R0, #0
+        Pull  "PC"
+
+FileCommands_Help
+        Push  "R0, lr"
+        ADRL   R0, fscommands_helpstr
+        MOV    R1, #FS_Command_Flag
+        B      KeyHelpCommon
+
+; take module code pointer in r2
+;                    flags in r1
+;    HelpBufferSize buffer in r3
+;          string to print in r0
+
+OneModuleK     ROUT
+        Push  "r2-r7, lr"
+        LDR    R4, [R2, #Module_HC_Table]
+        CMP    R4, #0
+        Pull  "r2-r7, PC", EQ       ; no table
+        MOV    R7, #&80000000       ; flag
+        MOV    R5, #0               ; buffer offset
+
+        ADD    R2, R2, R4           ; point at table start.
+03      MOV    R6, R2
+        LDRB   R4, [R2]
+        CMP    R4, #0
+        BEQ    %FT06
+
+04      LDRB   R4, [R6], #1
+        CMP    R4, #0
+        BNE    %BT04
+        ADD    lr, R6, #3
+        BIC    lr, lr, #3           ; align but leave r6 at end of command for below (05)
+        LDR    R4, [lr, #0]         ; code offset
+        CMP    r1, #-1              ; fudge?
+        BEQ    %FT78
+        CMP    R4, #0
+        ADDEQ  R2, lr, #16
+        BEQ    %BT03
+        LDRB   R4, [lr, #7]
+        BIC    R4, R4, #(Help_Is_Code_Flag:OR:International_Help) :SHR: 24
+        CMP    R4, R1, LSR #24      ; move flags into bottom byte
+79      ADDNE  R2, lr, #16
+        BNE    %BT03
+        TST    R7, #&80000000
+        BEQ    %FT05
+        SWI    XOS_NewLine
+        SWIVC  XOS_NewLine
+        BVS    %FT77
+        MOV    r4, r0
+        CMP    r0, #0
+        BEQ    OneModuleK_PrintTitle ; Don't trust MessageTrans to preserve Z
+        SWI    XMessageTrans_Dictionary
+        Push   "r1"
+        MOVVC  r1, r0
+        MOVVC  r0, r4
+        SWIVC  XOS_PrettyPrint
+        Pull   "r1"
+        B      %FT77
+OneModuleK_PrintTitle
+        LDR    r0, [stack]
+        BL     PrintTitle
+77
+        MOVVC  r0, r4
+        Pull  "r2-r7, PC", VS
+        BIC    R7, R7, #&80000000
+05
+        SUB    lr, r6, r2
+        RSB    r4, r5, #HelpBufferSize
+        CMP    r4, lr                   ; have we got enough space for command+tab
+        BCS    %FT07
+        MOV    r4, #0                   ; no, so 0 terminate what we've got and print it
+        SUB    r5, r5, #1               ; write 0 over trailing tab
+        STRB   r4, [r3, r5]
+        MOV    r4, r0
+        MOV    r0, r3
+        SWI    XOS_PrettyPrint
+        SWIVC  XOS_NewLine
+        Pull   "r2-r7,pc",VS
+        MOV    r0, r4
+        MOV    r5, #0                   ; start again with empty buffer
+07
+        LDRB   r4, [r2], #1             ; copy command
+        CMP    r4, #0
+        STRNEB r4, [r3, r5]
+        ADDNE  r5, r5, #1
+        BNE    %BT07
+        MOV    r4, #TAB                 ; add tab
+        STRB   r4, [r3, r5]
+        ADD    r5, r5, #1
+        ADD    r2, r2, #3+16            ; align and move on to next command
+        BIC    r2, r2, #3
+        B      %BT03
+
+78      CMP    r4, #0
+        B      %BT79
+
+06      TST    R7, #&80000000
+        Pull  "r2-r7, PC", NE
+        Push  "R0"
+        MOV    R0, #0
+        SUB    R5, R5, #1
+        STRB   R0, [R5, R3]
+        MOV    R0, R3
+        SWI    XOS_PrettyPrint
+        STRVS  r0, [stack]
+        Pull  "R0, r2-r7, PC"
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+GOS_Code
+        Push    lr
+        MOV     r2, r0
+        addr    R1, UtilModTitle
+        MOV     R0, #ModHandReason_Enter
+        SWI     XOS_Module
+        Pull    pc
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+; Deal with UtilityModule SWIs.
+;
+; The UtilityModule provides "OS-independent" SWIs. At present these are:
+;
+; SWI &F00000 (ARM_IMB)
+; SWI &F00001 (ARM_IMBRange)
+;
+; as specified by the ARMv5 ARM (section 2.7.4 Prefetching and self-modifying
+; code)
+
+Util_SWI
+        CMP     r11, #1
+        BLO     SyncCodeAreasFull       ; (00) will do tail-call return from SWI
+        BHI     Util_SWINotKnown        ; (02..3F)
+
+; Ranged wotsit                           (01)
+        Push    "r1,r2,lr"
+        SUB     r2, r1, #4              ; convert from exclusive to inclusive
+        MOV     r1, r0
+        BL      SyncCodeAreasRange
+        Pull    "r1,r2,pc"
+
+Util_SWINotKnown
+        ADR     r0, ErrorBlock_ModuleBadSWI
+      [ International
+        addr    r4, UtilModTitle
+        B       TranslateError_UseR4
+      |
+        RETURNVS
+      ]
+
+        MakeErrorBlock ModuleBadSWI
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; ChangeDynamicArea - moved here from the Task Manager as embedded devices
+; tend not to have the Task Manager
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+rmaarea         *       1               ; RMA area
+screenarea      *       2               ; screen area
+spritearea      *       3               ; sprite area
+fontarea        *       4               ; font cache dynamic area number
+ramfsarea       *       5               ; RAM disc area
+
+                ^       0
+vec_fontsize    #       4               ; fields in output vector
+vec_spritesize  #       4
+vec_ramfssize   #       4
+vec_rmasize     #       4
+vec_screensize  #       4
+ss_outputvec    *       &100
+
+Keydef  DCB     "FontSize/K,SpriteSize/K,RamFSSize/K,RMASize/K,ScreenSize/K"
+        DCB     0
+        ALIGN
+
+; NB: R12 -> private word (don't use workspace, as it may not be present)
+
+ChangeDynamicArea_Code  ROUT
+        Push    "R11,LR"
+        MOV     R11,sp                  ; remember stack for later
+;
+        SUB     sp,sp,#ss_outputvec     ; local workspace
+;
+; scan the comand line by calling OS_ReadArgs
+;
+        MOV     R1,R0                   ; R1 = input string
+        ADR     R0,Keydef               ; R0 = key defion string
+        MOV     R2,sp                   ; R2 = output vector
+        MOV     R3,#ss_outputvec        ; R3 = max output vector length
+        SWI     XOS_ReadArgs
+;
+; scan the resulting vector for known fields
+;
+        MOVVC   R0,#rmaarea
+        LDRVC   R1,[sp,#vec_rmasize]
+        BLVC    changeR0R1              ; R0 = area number, R1 = size required
+
+        MOVVC   R0,#screenarea
+        LDRVC   R1,[sp,#vec_screensize]
+        BLVC    changeR0R1              ; R0 = area number, R1 = size required
+
+        MOVVC   R0,#fontarea
+        LDRVC   R1,[sp,#vec_fontsize]
+        BLVC    changeR0R1              ; R0 = area number, R1 = size required
+
+        MOVVC   R0,#spritearea
+        LDRVC   R1,[sp,#vec_spritesize]
+        BLVC    changeR0R1              ; R0 = area number, R1 = size required
+
+        MOVVC   R0,#ramfsarea           ; NB: do RAMFS last so others get done if it fails
+        LDRVC   R1,[sp,#vec_ramfssize]
+        BLVC    changeR0R1              ; R0 = area number, R1 = size required
+
+        MOV     sp,R11                  ; restore stack
+        Pull    "R11,PC"
+
+; In    R0 = dynamic area number
+;       R1 -> string specifying size required (<=0 => don't bother)
+; Out   calls OS_ChangeDynamicArea, which gives Service_MemoryMoved
+;       this is intercepted, and sets [memoryupdated]
+;       this causes a pollword event:
+;           which calls set_memory for all memory slots
+;           if the RAM disc slot size changes to/from 0
+;               [ramfsflag] is set
+;               unless dragging the ram slot bar:
+;                   reramfsfiler re-ialises the RAMFSFiler
+;                   otherwise it waits till the bar is dropped
+
+changeR0R1      ROUT
+        Push    "R0-R3,LR"
+
+        CMP     R1,#0
+        Pull    "R0-R3,PC",EQ
+
+        SWI     XOS_ReadDynamicArea     ; R1 = current size of area
+        MOVVC   R3,R1
+
+        LDRVC   R1,[sp,#1*4]
+        BLVC    getK                    ; R1 = new amount required
+
+        LDRVC   R0,[sp,#0*4]
+        SUBVC   R1,R1,R3                ; R1 = change required
+        SWIVC   XOS_ChangeDynamicArea
+
+        STRVS   R0,[sp]
+        Pull    "R0-R3,PC"
+
+
+; In    R1 --> string
+; Out   R1 = parameter value (number)
+; Errors: "Bad number"
+;
+
+getK    ROUT
+        Push    "R2-R3,LR"
+;
+        MOV     R0,#10
+        SWI     XOS_ReadUnsigned
+        Pull    "R2-R3,PC",VS
+;
+        LDRB    R3,[R1]
+        UpperCase R3, R14
+        TEQ     R3,#"K"                 ; if terminator is "K" or "k",
+        ADDEQ   R1,R1,#1
+        MOVEQ   R2,R2,LSL #10           ; multiply by 1024
+        TEQ     R3,#"M"                 ; if terminator is "M" or "m",
+        ADDEQ   R1,R1,#1
+        MOVEQ   R2,R2,LSL #20           ; multiply by 1048576
+        TEQ     R3,#"G"                 ; if terminator is "G" or "g",
+        ADDEQ   R1,R1,#1
+        MOVEQ   R2,R2,LSL #30           ; multiply by 1073741824
+;
+        LDRB    R14,[R1]                ; check terminator
+        RSBS    R14,R14,#" "+1          ; ensure GT set if OK
+        ADRLEL  R0,ErrorBlock_BadNumb   ; "Number not recognised"
+      [ International
+        BLLE    TranslateError
+      ]
+;
+        MOVVC   R1,R2                   ; R1 = answer
+        Pull    "R2-R3,PC"
+
+
+UtilFlags DCD ModuleFlag_32bit
+
+        END

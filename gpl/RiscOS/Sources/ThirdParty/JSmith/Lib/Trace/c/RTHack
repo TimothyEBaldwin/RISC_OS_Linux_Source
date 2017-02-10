@@ -1,0 +1,677 @@
+/* 
+ * Copyright Julian Smith.
+ * 
+ * This file is part of Trace.
+ * 
+ * Trace is free software: you can redistribute it and/or modify it under
+ * the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or (at your
+ * option) any later version.
+ * 
+ * Trace is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General
+ * Public License for more details.
+ * 
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with Trace.  If not, see <http://www.gnu.org/licenses/>.
+ */
+/*
+$Id: RTHack,v 1.2 2015/01/10 10:24:17 rsprowson Exp $
+*/
+
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <stdarg.h>
+
+/*
+Need to do the following to prevent DDE's swis.h from #including DDE's
+kernel.h in UnixLib builds.
+ */
+#ifdef USE_UNIXLIB
+	#include "kernel.h"
+	#define	__kernel_h
+#endif
+
+#include "swis.h"
+
+#include "Desk/File.h"
+#include "Desk/Debug.h"
+
+#include "DDTLib/AIFHeader.h"
+#include "Wild/Wild.h"
+#include "ModMalloc/ModMalloc.h"
+
+#include "Trace/Trace.h"
+
+#include "RT_Fn2.h"
+#include "IntTrace.h"
+
+
+#define	Trace_Printf	Trace__Printf
+
+static int	Trace__Printf( const char* fmt, ...)
+	{
+	va_list	va;
+	int	n;
+	va_start( va, fmt);
+	n = vfprintf( stderr, fmt, va);
+	va_end( va);
+	return n;
+	}
+
+/*
+#undef Desk_Debug_Printf
+#define	Desk_Debug_Printf printf
+*/
+
+
+
+static int	global_usermaforcode = 0;
+
+void	Trace_SetUseRMA( int yes)
+{
+	global_usermaforcode	= yes;
+	if ( yes)	atexit( ModMalloc_FreeAll);
+}
+
+static void*	MallocCode( size_t size)
+{
+	void*	ptr;
+	if ( global_usermaforcode)	ptr = ModMalloc_Malloc( size);
+	else				ptr = malloc( size);
+	if ( (char*) ptr >= (char*) (1<<26))
+	{
+		Trace_Printf( "malloc returned address > 2^26. You should use Trace_SetUseRMA( 1)\n");
+		Trace_Printf( "userrmaformorcode=%i, ptr=0x%p\n", global_usermaforcode, ptr);
+		exit( 1);
+	}
+	return ptr;
+}
+
+static void	FreeCode( void* ptr)
+{
+	if ( global_usermaforcode)	ModMalloc_Free( ptr);
+	else				free( ptr);
+}
+
+
+
+
+
+
+typedef struct	{
+	int	num_ignorestrings;
+	char**	ignore_strings;
+	}
+	Trace_rthack_block;
+
+static Trace_rthack_block	rthack_globals = { 0, NULL	};
+
+
+
+static Desk_bool	Trace_StringStartsWith( const char* string, const char* start)
+	{
+	return ( 0==strncmp( string, start, strlen( start))) ? Desk_bool_TRUE : Desk_bool_FALSE;
+	}
+
+
+
+typedef struct	{
+	unsigned int	length	: 24;
+	unsigned int	ff_code	:  8;
+	}
+	fnname_info;
+
+/*
+#define	Function2_FirstInstruction1		(12/4)
+#define	Function2_B_Foo1			(16/4)
+#define	Function2_BL_Trace__StartClock2	(32/4)
+#define	Function2_FirstInstruction2		(44/4)
+#define	Function2_B_Foo2			(48/4)
+#define	Function2_BL_Trace__StopClock2	(60/4)
+*//*
+Offsets (in words) of various important instructions in the Function2
+code.
+ */
+
+
+
+typedef struct	{
+	int		offset	: 24;
+	unsigned int	instr	:  8;
+	}
+	relocatable_instruction;
+
+
+static void	Trace__Relocate( void* instruction, void* oldptr, void* newptr)
+/*
+instruction is taken to be a branch (or similar) to oldptr, which we
+want to make point to newptr.
+ */
+	{
+	relocatable_instruction*	reloc_instruct		= (relocatable_instruction*)	instruction;
+	unsigned int*			old_uintptr		= (unsigned int*)		oldptr;
+	unsigned int*			new_uintptr		= (unsigned int*)		newptr;
+
+	reloc_instruct->offset += new_uintptr - old_uintptr;
+	}
+
+static void	Trace__MoveRelocateInstruction( int* new, const int* old)
+/*
+instruction at 'old' is taken to be a branch (or similar) of which we
+want to make a duplicate at 'new'.
+ */
+	{
+	relocatable_instruction*	reloc_old		= (relocatable_instruction*)	old;
+	relocatable_instruction*	reloc_new		= (relocatable_instruction*)	new;
+
+	reloc_new->instr	= reloc_old->instr;
+	reloc_new->offset	= reloc_old->offset + (old-new);
+	}
+
+
+#define	instruction_BNE		0x1a000000
+#define	instruction_BL		0xeb000000
+#define	instruction_B		0xea000000
+#define	instruction_MOV_R0_R0	0xe1a00000
+
+#define	InstructionIs( instruction, shouldbe)	( (instruction&0xff000000) == shouldbe)
+
+#define	InstructionIsMOV_R0_R0( instruction)	( instruction==0xe1a00000)
+#define	InstructionIsMOV_PC_LR( instruction)	( instruction==0xe1a0f00e)
+#define	InstructionIsMOVS_PC_LR( instruction)	( instruction==0xe1b0f00e)
+#define	InstructionIsAnyBranch( instruction)	( (instruction&0x0e000000)==0x0a000000)
+#define	InstructionIsSWI( instruction)		( (instruction&0x0f000000)==0x0f000000)
+#define	InstructionUsesPC( instruction)		( (instruction&0x0000f000)==0x0000f000)
+
+
+
+
+#if 0
+	typedef struct	{
+		unsigned int	op2		: 12;
+		unsigned int	rd		:  4;
+		unsigned int	rn		:  4;
+		unsigned int	s		:  1;
+		unsigned int	opcode		:  4;
+		unsigned int	immediate	:  1;
+		unsigned int	zero		:  2;
+		unsigned int	cond		:  4;
+		}
+		dataprocess_instruction;
+
+
+	static int	Trace_DataProcessInstructionUsesPC( unsigned int instruction)
+	/* return non-zero if instruction is a data-processing instruction and uses pc	*/
+	{
+	dataprocess_instruction	dpi = * (dataprocess_instruction*) &instruction;
+
+	int	op2_reg	= -1;
+	int	rn_reg	= -1;
+
+	if (dpi.zero!=0)	return 0;	/* Not a data-process instruction...	*/
+
+	if ( dpi.immediate==0)	op2_reg = dpi.op2 & 15;	/* op2 is a register...	*/
+	if ( dpi.opcode==13 || dpi.opcode==15)	{	/* MOV or MVN	*/
+		/* Ignore op2	*/
+		op2_reg = -1;
+		}
+
+	rn_reg = dpi.rn;
+
+	Desk_Debug3_Printf( "instruction 0x%x has Rn=%i, Op2 reg=%i\n", instruction, rn_reg, op2_reg);
+
+	if ( rn_reg==15 || op2_reg==15)	return 1;
+	return 0;
+	}
+
+
+	#define	BIT( x, bit)	((x & (1<<bit)) >> bit)
+#endif
+
+
+
+
+static const char*	Trace_InstructionUsesPC( const int* instruction)
+/* Returns pointer to instruction disassembly if it uses pc	*/
+	{
+	char*	text;
+
+	#define	Desk_Debugger_Disassemble	0x40380
+	_swix( Desk_Debugger_Disassemble, _INR(0,1)|_OUT(1), *instruction, instruction, &text);
+
+	Desk_Debug3_Printf( "Checking instruction '%s'\n", text);
+
+	if ( strstr( text, ",PC"))	{
+		Desk_Debug3_Printf( "- contains '*,PC'.\n");
+		return text;
+		}
+
+	else if ( strstr( text, "ADR"))
+	{
+		Desk_Debug3_Printf( "- contains 'ADR'.\n");
+		return text;
+	}
+
+	else if ( Trace_StringStartsWith( text, "LDR") || Trace_StringStartsWith( text, "STR"))	{
+		if ( strstr( text, ",&"))	{
+			Desk_Debug3_Printf( "- contains LD/STR*,&*\n");
+			/* PC-relative load or store.	*/
+			return text;
+			}
+
+		if ( strstr( text, ",[PC,"))	{
+			Desk_Debug3_Printf( "- contains LD/STR*,[PC,");
+			return text;
+			}
+
+		}
+
+	return NULL;
+	}
+
+
+static void	Trace__MakeB( int* instruction, int* callee)
+	{
+	relocatable_instruction*	reloc_instr = (relocatable_instruction*) instruction;
+
+	reloc_instr->instr	= 0xea;
+	reloc_instr->offset	= (callee - (instruction+2/*pipeline*/));
+	}
+
+
+
+
+static int	Trace__CopyInstruction( int* new, const int* old, const char* name)
+/*
+Returns non-zero if can't copy instruction properly - ie the instruction
+refers to pc (eg LDR a1, pc, #24).
+ */
+	{
+	const char*	dis;
+
+	/* Copy instruction, relocating if necessary...	*/
+
+	if ( InstructionIsAnyBranch( *old))	{
+		Trace__MoveRelocateInstruction( new, old);
+		Desk_Debug3_Printf( "Trace__CopyInstruction( %p, %p), relocating branch\n", new, old);
+		return 0;
+		}
+
+	dis = Trace_InstructionUsesPC( old);
+
+	if (dis)	{
+		if ( name)	Trace_Printf( "Trace can't intercept function '%s'.\n", name);
+		else		Trace_Printf( "Trace can't intercept instruction at 0x%p\n", old);
+		Trace_Printf( "First instruction 0x%x '%s'\n", *old, dis);
+		Trace_Printf( "at address %p refers to pc.\n\n", old);
+		return 1;
+		}
+
+
+	else 	{
+		*new = *old;
+		return 0;
+		}
+	}
+
+
+
+static void*	Trace__RedirectFunction( int* fn, const char* name)
+/*
+Makes small wrapper code for function starting at 'fn', and modifies
+first instruction of fn to B directly to this wrapper code.
+
+If the first instruction of fn (ie fn[0]) refers to pc, the function
+can't be intercepted, and we return NULL.
+ */
+	{
+	int*		wrapcode;
+	int		wrapcode_size;
+	int		error = 0;
+	Desk_bool	fn_is_single_instruction = Desk_bool_FALSE;
+
+
+	Desk_Debug3_Printf( "Trace__RedirectFunction called\n");
+
+	/* See whether we have already redirected this function	*/
+	if (0)	{
+		static int**	redirected_functions		= NULL;
+		static int	num_redirected_functions	= 0;
+		int		i;
+		int**		temp;
+
+		for ( i=0; i<num_redirected_functions; i++)	{
+			if ( fn == redirected_functions[i])	{
+				Trace_Printf( "Trace__RedirectFunction called twice for %p, %s\n", fn, name);
+				return NULL;
+				}
+			}
+		temp = (int**) realloc( redirected_functions, num_redirected_functions+1);
+		if (!temp)	return NULL;
+
+		temp[ num_redirected_functions] = fn;
+		num_redirected_functions++;
+		redirected_functions = temp;
+		}
+
+	if	(
+		InstructionIs( *fn, instruction_B)
+		|| InstructionIsMOV_PC_LR( *fn)
+		|| InstructionIsMOVS_PC_LR( *fn)
+		)
+		{
+		fn_is_single_instruction = Desk_bool_TRUE;
+		Desk_Debug3_Printf( "instruction %x is single-instruction function\n", *fn);
+		}
+	/*
+	See whether the first instruction in fn is a B, or a MOV(S) pc,xx. If
+	so, we won't branch to the second instruction of the function after
+	calling Trace_StartClock2.
+	 */
+
+	wrapcode_size = Trace__Function2_codesize + strlen( name) + 1;
+
+	wrapcode = (int*) MallocCode( wrapcode_size);
+	if ( !wrapcode)	{
+		Trace_Printf(
+			"Trace can't intercept function '%s' at 0x%p - not enough memory\n",
+			name, fn
+			);
+		return NULL;
+		}
+
+	memcpy( wrapcode, Trace__Function2_chars, Trace__Function2_codesize);
+	/* CC warns about cast between function pointer and non-pointer object	*/
+
+	strcpy( (char*) wrapcode + Trace__Function2_codesize, name);
+	/* CC warns twice about cast between function pointer and non-pointer object	*/
+
+
+	Desk_Debug_Assert( InstructionIsMOV_R0_R0( wrapcode[ Trace__Function2_offset_relocated_instruction1/4	]));
+	Desk_Debug_Assert( InstructionIsMOV_R0_R0( wrapcode[ Trace__Function2_offset_relocated_instruction2/4	]));
+
+	Desk_Debug_Assert( InstructionIs( wrapcode[ Trace__Function2_offset_B_back1/4	], instruction_B	));
+	Desk_Debug_Assert( InstructionIs( wrapcode[ Trace__Function2_offset_B_back2/4	], instruction_B	));
+	Desk_Debug_Assert( InstructionIs( wrapcode[ Trace__Function2_offset_BL_starthandler/4	], instruction_BL 	));
+	Desk_Debug_Assert( InstructionIs( wrapcode[ Trace__Function2_offset_BL_stophandler/4	], instruction_BL 	));
+
+
+	error |= Trace__CopyInstruction( &wrapcode[ Trace__Function2_offset_relocated_instruction1/4], fn, name);
+	error |= Trace__CopyInstruction( &wrapcode[ Trace__Function2_offset_relocated_instruction2/4], fn, name);
+
+	Trace__Relocate( &wrapcode[ Trace__Function2_offset_BL_starthandler/4	], wrapcode, (void*) Trace__StartHandler);	// CC warns
+	Trace__Relocate( &wrapcode[ Trace__Function2_offset_BL_stophandler/4	], wrapcode, (void*) Trace__StopHandler);	// CC warns
+
+	if ( !fn_is_single_instruction)	{
+		Trace__Relocate( &wrapcode[ Trace__Function2_offset_B_back1/4], wrapcode, fn+1);
+		Trace__Relocate( &wrapcode[ Trace__Function2_offset_B_back2/4], wrapcode, fn+1);
+		}
+	else	{
+		wrapcode[ Trace__Function2_offset_B_back1/4] = instruction_MOV_R0_R0;
+		wrapcode[ Trace__Function2_offset_B_back2/4] = instruction_MOV_R0_R0;
+		}
+	/*
+	If function is a single instruction, we don't want to branch to the
+	second instruction after duplicating the first instruction locally...
+	 */
+
+	if (error)	{
+		/* Diagnostics ill have been printed by Trace__CopyInstruction	*/
+		FreeCode( wrapcode);
+		wrapcode = NULL;
+		return wrapcode;
+		}
+
+	Desk_Debug_Assert( !error);
+
+	Trace__MakeB( fn, wrapcode);
+
+	if ( Trace__verbose)	printf( "Trace__RedirectFunction redirected '%s' at 0x%p to %p\n", name, fn, wrapcode);
+
+	/* Save wrap code to unique file	*/
+	/*
+		{
+		char		filename[ 256];
+		static int	count = 0;
+		sprintf( filename, "<Wimp$ScrapDir>.wrap%i", count);
+		File_SaveMemory( filename, wrapcode, wrapcode_size);
+		count++;
+		Desk_Debug_Printf( "Wrap code for function '%s' at 0x%p is at 0x%p\n", name, fn, wrapcode);
+		}
+	*/
+	return wrapcode;
+	}
+
+
+
+int	Trace__InterceptFunction( Trace__genericfn fn, const char* name)
+	{
+	void*	wrapcode;
+	Desk_Debug_SetLevel( 9);
+	wrapcode = Trace__RedirectFunction( (int*) fn, name);	// cc warns
+	_swix( 0x6e, _IN(0), 0);	// sync code areas on StrongARM.
+	if (wrapcode)	return 0;
+	return	1;
+	}
+
+
+
+
+static Desk_bool	Trace_FunctionMatchesIgnore( const char* name)
+	{
+	int	i;
+
+	Desk_Debug_Printf( Desk_error_PLACE "Trace_FunctionMatchesIgnore, name='%s'\n", name);
+
+	for ( i=0; i<rthack_globals.num_ignorestrings; i++)	{
+
+		char*	c=rthack_globals.ignore_strings[ i];
+
+		Desk_Debug_Printf( Desk_error_PLACE "Trace_FunctionMatchesIgnore ignore string='%s'\n", c);
+
+		/* Look at each sub-string...	*/
+		for (;;)	{
+			char	old;
+			char*	c2;
+			wild_match	match;
+
+			while ( isspace( *c) && *c)	c++;
+
+			if ( *c==0)	break;	// Stop when we have reached end of string. 30 Jul 1997
+
+			for ( c2=c; *c2 && !isspace(*c2); c2++)	;
+
+			old = *c2;
+			*c2=0;
+
+			Desk_Debug3_Printf( "Spec is '%s'\n", c);
+			match = Wild_StringMatches( name, c);
+			*c2 = old;
+
+			if ( match == wild_match_YES)	{
+				Desk_Debug3_Printf( "Name '%s' matches '%s'\n",
+					name, rthack_globals.ignore_strings[ i]
+					);
+				return Desk_bool_TRUE;
+				}
+
+			if ( old==0)	break;
+
+			c = c2;
+			}
+		}
+
+	return Desk_bool_FALSE;
+
+	}
+
+
+
+int	Trace_IgnoreFunctions( char* names)
+	{
+	char**	temp;
+
+	Desk_Debug_Printf( Desk_error_PLACE "Trace_IgnoreFunctions called with '%s'\n", names);
+
+	temp = (char**) realloc(
+		rthack_globals.ignore_strings,
+		(1+rthack_globals.num_ignorestrings) * sizeof( char*)
+		);
+
+	if (!temp)	{
+		fprintf( stderr, "Trace_IgnoreFunctions '%s': realloc failed\n", names);
+		return 1;
+		}
+
+	rthack_globals.ignore_strings = temp;
+	rthack_globals.ignore_strings[ rthack_globals.num_ignorestrings] = names;
+	rthack_globals.num_ignorestrings++;
+
+	return 0;
+
+	}
+
+
+
+
+int	Trace_InterceptAllFunctions( void)
+/*
+Searches through code part of AIF, and munges each function.
+ */
+	{
+	fnname_info*	code;
+	int		numfns = 0;
+	#if 0
+	static char	name[MAXDBUF];
+	#endif
+
+	Desk_Debug3_Printf( "ro_base = %p, ro_limit = %p\n",
+				(fnname_info*) DDT_AIFHeader_ro_base,
+				(fnname_info*) DDT_AIFHeader_ro_limit);
+
+	for	(
+		code = (fnname_info*) DDT_AIFHeader_ro_base;
+		code < (fnname_info*) DDT_AIFHeader_ro_limit;
+		code++
+		)
+		{
+		if ( code->ff_code==0xff)	{
+			char *	name = ((char*) code) - code->length;
+			char*	s = (char*) (code-1);
+
+			if ( code->length > 256)	{
+				Desk_Debug3_Printf( "length %i is > 256\n", code->length);
+				continue;
+				}
+
+			if ( s[0]!=0 && s[1]!=0 && s[2]!=0 && s[3]!=0)	{
+				Desk_Debug3_Printf( "No terminator\n");
+				continue;
+				}
+
+			Desk_Debug_Printf( "Found name '%s' at address %p\n", name, code);
+
+			if	(
+				Trace_StringStartsWith( name, "Trace_")
+				//|| Trace_StringStartsWith( name, "Timer1_")
+				//|| Trace_StringStartsWith( name, "Timer1b_")
+				#ifdef Desk_DEBUG
+					|| Trace_StringStartsWith( name, "Desk_Debug_")
+				#endif
+				|| Trace_FunctionMatchesIgnore( name)
+				)
+				{
+				Desk_Debug3_Printf( "Ignoring function '%s'\n", name);
+				}
+
+			else	{
+				Desk_Debug3_Printf( "Redirecting function '%s'\n", name);
+				Trace__RedirectFunction( (int*) (code+1), name);
+				numfns++;
+				}
+			}
+		}
+
+	Desk_Debug3_Printf( "Syncronising code areas\n");
+	_swix( 0x6e, _IN(0), 0);	// sync code areas on StrongARM.
+	return numfns;
+	}
+
+
+
+static Trace_addresshandler	global_addresshandler = NULL;
+
+void	Trace_SetAddressHandler( Trace_addresshandler handler)
+	{
+	global_addresshandler = handler;
+	}
+
+static void	Trace__AddressVHandler( void* address)
+	{
+	Desk_Debug_Printf( Desk_error_PLACE "Trace__AddressVHandler called for address 0x%p\n", address);
+	if ( global_addresshandler)	global_addresshandler( address);
+	}
+
+static int	Trace__InterceptAddress( void* address)
+	{
+	int	wrapcode_size = Trace__AddressV_codesize;
+	int*	wrapcode = (int*) MallocCode( wrapcode_size);
+	int	error = 0;
+
+	if ( !wrapcode)	{
+		Trace_Printf( "Can't interceptaddress 0x%p - not enough memory\n", address);
+		return 1;
+		}
+
+	memcpy( wrapcode, Trace__AddressV_codechars, Trace__AddressV_codesize);	// cc warns
+
+	Desk_Debug_Assert( InstructionIsMOV_R0_R0( wrapcode[ Trace__AddressV_offset_relocated_instruction/4]));
+
+	Desk_Debug_Assert( InstructionIs( wrapcode[ Trace__AddressV_offset_BL_AddressVHandler/4	], instruction_BL	));
+	Desk_Debug_Assert( InstructionIs( wrapcode[ Trace__AddressV_offset_B_back/4		], instruction_B 	));
+
+	Trace__Relocate( &wrapcode[ Trace__AddressV_offset_BL_AddressVHandler/4	], wrapcode, (void*) Trace__AddressVHandler);	// cc warns
+	Trace__Relocate( &wrapcode[ Trace__AddressV_offset_B_back/4		], wrapcode, ((int*) address) + 1);
+	wrapcode[ Trace__AddressV_offset_address/4] = (int) address;
+	error |= Trace__CopyInstruction( &wrapcode[ Trace__AddressV_offset_relocated_instruction/4], address, NULL);
+
+	if (error)	{
+		/* Diagnostics will have been printed by Trace__CopyInstruction	*/
+		FreeCode( wrapcode);
+		wrapcode = NULL;
+		return 1;
+		}
+
+	Desk_Debug_Assert( !error);
+
+	// Uncomment this to make it work...
+	Trace__MakeB( address, wrapcode);
+
+	Desk_Debug3_Printf( "Trace__InterceptAddress redirected 0x%p to %p\n", address, wrapcode);
+
+	/* Save wrap code to unique file	*/
+	#ifdef Desk_DEBUG
+		if ( Desk_debug_level > 3)	{
+			char		filename[ 256];
+			static int	count = 0;
+			sprintf( filename, "<Wimp$ScrapDir>.wrap%i", count);
+			Desk_File_SaveMemory( filename, wrapcode, wrapcode_size);
+			count++;
+			Desk_Debug_Printf( "Wrap code for address 0x%p is at 0x%p\n", address, wrapcode);
+			}
+	#endif
+
+	return 0;
+	}
+
+int	Trace_InterceptAddress( void* address)
+	{
+	int	e = Trace__InterceptAddress( address);
+	_swix( 0x6e, _IN(0), 0);	// sync code areas on StrongARM.
+	return e;
+	}

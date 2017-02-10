@@ -1,0 +1,216 @@
+; This source code in this file is licensed to You by Castle Technology
+; Limited ("Castle") and its licensors on contractual terms and conditions
+; ("Licence") which entitle you freely to modify and/or to distribute this
+; source code subject to Your compliance with the terms of the Licence.
+; 
+; This source code has been made available to You without any warranties
+; whatsoever. Consequently, Your use, modification and distribution of this
+; source code is entirely at Your own risk and neither Castle, its licensors
+; nor any other person who has contributed to this source code shall be
+; liable to You for any loss or damage which You may suffer as a result of
+; Your use, modification or distribution of this source code.
+; 
+; Full details of Your rights and obligations are set out in the Licence.
+; You should have received a copy of the Licence with this source code file.
+; If You have not received a copy, the text of the Licence is available
+; online at www.castle-technology.co.uk/riscosbaselicence.htm
+; 
+; > Sources.Mouse
+
+;---------------------------------------------------------------------------
+; Mouse_Click
+;
+;       In:     r1 -> mouse data block
+;       Out:    r0 corrupted
+;
+;       Handle mouse clicks.
+;
+Mouse_Click
+        Entry   "r1-r6"
+
+        LDMIA   r1, {r2-r6}             ; Load x,y,buttons,window,icon.
+
+        TST     r4, #button_left + button_right
+        BNE     click_select
+
+        TST     r4, #button_middle
+        EXIT    EQ
+
+
+click_menu
+        CMP     r5, #-2	                ; If it's the icon bar menu then
+        ADREQ   r1, m_iconbarmenu
+	SUBEQ   r2, r2, #64             ;   adjust x position
+        MOVEQ   r3, #96 + 2*44          ;   set y position
+	BEQ     show_menu               ;   and display it.
+
+        LDR     lr, display_handle
+        TEQ     r5, lr                  ; If it's not the main display window then
+        EXIT    NE                      ;   nothing to do.
+
+	TEQ     r6, #ic_display_colbutton
+        BNE     %FT05
+        BL      set_icon_xy
+	ADR     r1, m_coloursmenu
+        B       show_menu
+
+05	TEQ     r6, #ic_display_resbutton
+        BNE     %FT08
+        BL      set_icon_xy
+        LDR     r1, m_resolutionmenu
+        B       show_menu
+08
+ [ SelectFrameRate
+        TEQ     r6, #ic_display_ratebutton
+        EXIT    NE
+
+        BL      Menu_Rate
+        EXIT    VS
+        LDRB    lr, flags
+        TST     lr, #f_ratemenuvalid
+        EXIT    EQ
+        BL      set_icon_xy
+        LDR     r1, m_ratemenu
+ |
+        EXIT    NE
+ ]
+
+show_menu
+        TEQ     r1, #0
+        BLNE    Menu_Show
+
+        EXIT
+
+
+click_select
+        CMP     r5, #-2                 ; If it's not the icon bar then
+        BNE     %FT10                   ;   must be on a window icon.
+
+        BL      Mode_Init               ; Initialise for current mode.
+        LDR     r0, display_handle      ; Open window at top of stack.
+        STR     r0, [r1]
+        BL      Window_Close
+        MOV     r1, #-1
+	SUB     r2, r2, #64             ; Adjust x position.
+        MOV     r3, #136                ; Set y position.
+        BL      Window_OpenBehind
+        EXIT
+
+10
+        LDR     lr, display_handle
+        TEQ     r5, lr                  ; If it's not the main display window then
+        BNE     %FT20                   ;   try another.
+
+        TEQ     r6, #ic_display_colbutton
+        TSTEQ   r4, #button_right       ; Only show menu for select.
+        BNE     %FT12
+        BL      set_icon_xy
+        ADR     r1, m_coloursmenu
+        B       show_menu
+
+12      TEQ     r6, #ic_display_resbutton
+        TSTEQ   r4, #button_right       ; Only show menu for select.
+        BNE     %FT13
+        BL      set_icon_xy
+        LDR     r1, m_resolutionmenu
+        B       show_menu
+13
+ [ SelectFrameRate
+        TEQ     r6, #ic_display_ratebutton
+        TSTEQ   r4, #button_right       ; Only show menu for select.
+        BNE     %FT15
+
+        BL      Menu_Rate
+        EXIT    VS
+        LDRB    lr, flags
+        TST     lr, #f_ratemenuvalid
+        EXIT    EQ
+        BL      set_icon_xy
+        LDR     r1, m_ratemenu
+        B       show_menu
+15
+ ]
+
+        TEQ     r6, #ic_display_ok      ; If not OK then try next.
+        BNE     %FT18
+
+        BL      Mode_ChangeMode         ; Try to change mode.
+        EXIT    VS                      ; Always leave window open after error.
+
+        TST     r4, #button_right
+        ADREQ   r1, user_data           ; If select used then close dialogue.
+        STREQ   r5, [r1]
+        BLEQ    Window_Close
+        EXIT
+18
+        TEQ     r6, #ic_display_cancel  ; If not Cancel then don't care what it was.
+        EXIT    NE
+
+        TST     r4, #button_right
+        BNE     %FT19
+        ADR     r1, user_data           ; Select used on Cancel so close dialogue.
+        STR     r5, [r1]
+        BL      Window_Close
+        EXIT
+
+19      BL      Mode_Init               ; Adjust used on Cancel so restore icons.
+        BLVC    Icon_Refresh
+        EXIT
+
+20
+        LDR     lr, mode_handle
+        TEQ     r5, lr                  ; If it's not the mode window
+        TEQEQ   r6, #ic_mode_ok         ;   or it is but it's not the OK button then
+        EXIT    NE                      ;   give up.
+
+        BL      Mode_WimpCommand        ; Change mode.
+
+        SavePSR r2                      ; Ensure any error is preserved for return
+        Push    "r0", VS
+        TST     r4, #button_right       ; If adjust clicked then
+        LDRNE   r1, menu_handle         ;   show menu again
+        MOVEQ   r1, #0                  ; else remove menu and dialogue.
+        STREQ   r1, menu_handle
+        MOVEQ   r1, #-1
+        SWI     XWimp_CreateMenu
+        RestPSR r2,,f
+        Pull    "r0", VS
+
+        EXIT
+
+
+;---------------------------------------------------------------------------
+; set_icon_xy
+;
+;       In:     r5 = window
+;               r6 = icon
+;
+;       Out:    r2 = x coord of icon top right
+;               r3 = y coord of icon top right
+;
+;       Return x,y coords for pop up menu.
+;
+set_icon_xy
+        Entry   "r0,r1,r4,r5"
+
+        ADR     r1, user_data
+        STMIA   r1, {r5,r6}
+        SWI     XWimp_GetIconState
+        BVS     %FT95
+
+        ADD     r1, r1, #16
+        LDMIA   r1, {r4,r5}
+
+        ADR     r1, user_data
+        SWI     XWimp_GetWindowInfo
+
+        LDRVC   r2, [r1, #4]
+        LDRVC   r3, [r1, #16]
+        ADDVC   r2, r2, r4
+        ADDVC   r3, r3, r5
+95
+        CLRV
+        EXIT
+
+
+        END

@@ -1,0 +1,96 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/******	error.h ***********************************************************\
+
+Project:	Ursula (RISC OS for Risc PC II)
+Component:	Modular Configure
+Purpose:	Application error handling code, shared by multiple plug-ins
+
+History:
+Date		Who	Change
+----------------------------------------------------------------------------
+08/12/1997	BJGA	Renamed functions to error_foo convention
+			Added these headers
+
+\**************************************************************************/
+
+/*** For more info, see Error.h ***/
+
+
+
+/* Clib */
+#include <stdlib.h>
+#include <setjmp.h>
+#include <signal.h>
+#include "kernel.h"
+#include "swis.h"
+/* Toolbox */
+#include "wimplib.h"
+#include "toolbox.h"
+
+extern jmp_buf restart_buf;
+extern int init_state;
+extern MessagesFD messages;
+
+void error_sighandler (int sig)
+{
+  int b;
+  char Quit[32] = "Quit";
+  MessagesFD cb;
+  
+  BOOL no_messages = FALSE;
+  char taskname[32] = "Error", spritename[12] = "switcher";
+
+  if (_swix (MessageTrans_OpenFile, _INR(0,2), (int) &cb, (int) "WindowManager:Messages", 0) == NULL) {
+    _swix (MessageTrans_Lookup, _INR(0,7), (int) &cb, (int) "Quit", (int) Quit, sizeof (Quit), 0, 0, 0, 0);
+    _swix (MessageTrans_Lookup, _INR(0,7), (int) &cb, (int) "Error", (int) taskname, sizeof (taskname), 0, 0, 0, 0);
+  }
+  _swix (MessageTrans_CloseFile, _IN(0), (int) &cb);
+
+  if (_swix (MessageTrans_Lookup, _INR(0,7), (int) &messages, (int) "_TaskName", (int) taskname, sizeof (taskname), 0, 0, 0, 0) != NULL) no_messages = TRUE;
+  _swix (MessageTrans_Lookup, _INR(0,7), (int) &messages, (int) "_ConfigSprite", (int) spritename, sizeof (spritename), 0, 0, 0, 0);
+
+  b = wimp_report_error (_kernel_last_oserror(),
+    (init_state >= 1 ? Wimp_ReportError_OK : 0) | (no_messages ? Wimp_ReportError_NoAppName : 0) | 1u << 8 | 2u << 9,
+    taskname, spritename, (void *) 1, Quit);
+
+  if (b == 1 && init_state >= 1) { /* OK clicked */
+    signal(sig, error_sighandler);
+    longjmp(restart_buf, 1);
+  }
+  exit(1);
+}
+
+void error_initialise (void)
+{
+  int i, h, a, b;
+
+#define UNDEFINED_INSTRUCTION ((int) 0x1u)
+#define ADDRESS_EXCEPTION ((int) 0x4u)
+
+  for (i = UNDEFINED_INSTRUCTION; i <= ADDRESS_EXCEPTION; i++) {
+    if (_swix (OS_ReadDefaultHandler, _IN(0)|_OUTR(1,3), i, &h, &a, &b) == NULL)
+      _swix (OS_ChangeEnvironment, _INR(0,3), i, h, a, b);
+  }
+
+  signal(SIGFPE, error_sighandler);
+  signal(SIGILL, error_sighandler);
+  signal(SIGSEGV, error_sighandler);
+  signal(SIGSTAK, error_sighandler);
+  signal(SIGOSERROR, error_sighandler);
+}

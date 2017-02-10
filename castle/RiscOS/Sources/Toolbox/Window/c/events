@@ -1,0 +1,798 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/* Title:   events.c
+ * Purpose: filters registered with the Toolbox.  Events are delivered here.
+ * Author:  IDJ
+ * History: 7-Oct-93: IDJ: created
+ *         16-Mar-99: EPW: Now return the component id in Wimp_KeyPressed's
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "string32.h"
+#include "messages.h"
+#include "style.h"
+
+#include "objects/toolbox.h"
+#include "objects/window.h"
+
+#include "object.h"
+#include "events.h"
+#include "task.h"
+#include "gadgets.h"
+#include "show.h"
+#include "hide.h"
+#include "veneers.h"
+
+#include "events.h"
+
+
+
+/* NOTE: currently (3-Feb-94) it seems best to express interest in all events which
+ * can happen on Wimp windows, and set up the id block to contain the id of this
+ * Toolbox Window.
+ */
+
+
+static WindowAboutToBeShownEvent about_to_be_shown_event;
+static WindowInternal           *window_about_to_be_shown = NULL;
+static void ( *GadgetNeedsPrefilter)(void) = NULL;
+
+extern void postfilter_callback(void);
+
+void gadget_prefilter_state(void (* state)(void))
+{
+        GadgetNeedsPrefilter=state;
+}
+
+
+static WindowInternal *events__find_window (WindowInternal *w, int window_handle)
+{
+    while (w != NULL)
+    {
+        if (w->wimp_window_handle == window_handle)
+            break;
+        w = w->next;
+    }
+    return w;
+}
+
+
+
+static WindowInternal *events__find_window_from_id (WindowInternal *w, ObjectID window_id)
+{
+    while (w != NULL)
+    {
+        if (w->id == window_id)
+            break;
+        w = w->next;
+    }
+    return w;
+}
+
+extern _kernel_oserror *events_send_help(char *help,wimp_PollBlock *poll_block)
+{
+         wimp_Message     reply;
+         int i,m=strlen(help);
+
+         string_copy_chk (reply.data.help_reply.text,help, wimp_MAX_MSG_DATA_SIZE);
+         reply.hdr.your_ref = poll_block->msg.hdr.my_ref;
+         reply.hdr.action   = wimp_MHELP_REPLY;
+         reply.hdr.size     = (m + 4 +sizeof(wimp_MsgHdr)) & ~3;
+         if (reply.hdr.size>256) reply.hdr.size = 256;
+
+         for (i=m;(i<(m+5)) && (i<wimp_MAX_MSG_DATA_SIZE);i++)
+            reply.data.help_reply.text[i] =0;
+         return wimp_send_message (wimp_ESEND, &reply,poll_block->msg.hdr.task_handle,0,0);
+}
+
+static _kernel_oserror *events__open_window (WindowInternal *w, wimp_OpenWindow *open_block,int *st)
+{
+    _kernel_oserror *e = NULL;
+
+    if (w->flags & Window_AutoOpen)
+    {
+
+        if (w->panes)
+           e = show_with_panes(w, (wimp_NestedOpenWindow *) open_block, 0, 0, 0);
+        else
+           e = wimp_open_window(open_block);
+
+        *st =-1;    /* claim event */
+    }
+    else *st =1;
+
+    return e;
+}
+
+
+
+static _kernel_oserror *events__close_window (WindowInternal *w, wimp_CloseWindowRequest *close,int *st)
+{
+    _kernel_oserror *e = NULL;
+
+    if (w->flags & Window_AutoClose)
+    {
+        e = wimp_close_window (&close->window_handle);
+
+        if (!e) {
+           if (w->show_balance <= 0) w->show_balance = 1;
+           _hide_raise_hidden(w);
+           close_panes(w);
+        }
+        *st =-1;
+    }
+    else *st =1;
+    return e;
+}
+
+
+static char events__pointer_ttab[] = "\0\1\2\3\0\1\2\3\0\1\2\3\0\1\2\3";
+
+
+_kernel_oserror *events_pointer_over_window (WindowInternal *w)
+{
+    _kernel_oserror *e = NULL;
+    _kernel_swi_regs regs;
+    int oldptr;
+
+    /*
+     * if the window has a pointer shape defined, then we need to set the
+     * RISC OS shape 2 pointer to this shape, and then install this as the
+     * current pointer shape (OS_Byte 106).  First we try the client's
+     * sprite area, then the Wimp sprite pool.
+     */
+
+    DEBUG debug_output ("pointer", "Ptr entering window\n");
+
+    if (w->pointer_shape != NULL)
+    {
+        /*
+         * get the client's sprite area pointer
+         */
+
+        regs.r[0] = Toolbox_GetSysInfo_SpriteArea;
+        if ((e = _kernel_swi (Toolbox_GetSysInfo, &regs, &regs)) != NULL)
+            goto end;
+
+
+        /*
+         * try to set pointer shape 2, from client's sprite area
+         */
+
+        DEBUG debug_output ("pointer", "Ptr shape %s\n", w->pointer_shape);
+
+        regs.r[1] = regs.r[0];                 /* user sprite area */
+        regs.r[0] = 36 + 256;                  /* set pointer shape (from user area) */
+        regs.r[2] = (int)w->pointer_shape;     /* sprite name */
+        regs.r[3] = 2;                         /* shape 2 */
+        regs.r[4] = w->pointer_x_hot;          /* pointer x hot spot */
+        regs.r[5] = w->pointer_y_hot;          /* pointer y hot spot */
+        regs.r[6] = 0;                         /* scale for mode */
+        regs.r[7] = (int)events__pointer_ttab; /* fixed translation table */
+
+        if ((regs.r[1] == 1) || (_kernel_swi (OS_SpriteOp, &regs, &regs) != NULL))
+        {
+            DEBUG debug_output ("pointer", "Try wimp sprite pool (for %s)\n", w->pointer_shape);
+
+            /* regs have been preserved (except R0) */
+            regs.r[0] = 36;                  /* try to set pointer shape again */
+
+            if ((e = _kernel_swi (Wimp_SpriteOp, &regs, &regs)) != NULL)
+                goto end;
+        }
+
+
+        /*
+         * set pointer shape 2 (the one we've just defined)
+         * If the pointer was previously off, turn it off again
+         */
+
+        e = _swix (OS_Byte, _INR(0,1)|_OUT(1), 106, 2, &oldptr);
+        if (!e && (oldptr & 0x7f) == 0)
+            _swix (OS_Byte, _INR(0,1), 106, oldptr);
+    }
+
+end:
+    DEBUG if (e) debug_output ("pointer", "Set pointer failed (%s)\n", e->errmess);
+
+    return e;
+}
+
+_kernel_oserror *events_pointer_leaving_window (WindowInternal *w)
+{
+    _kernel_oserror *e = NULL;
+
+    /*
+     * if the window has a pointer defined, then we need to restore the default
+     * RISC OS pointer shape (shape 1).
+     */
+
+    if (w->pointer_shape != NULL)
+    {
+        int oldptr;
+
+        e = _swix(OS_Byte, _INR(0,1)|_OUT(1), 106, 1, &oldptr);
+        if (!e && (oldptr & 0x7f) == 0)
+            _swix(OS_Byte, _INR(0,1), 106, oldptr);
+    }
+
+    return e;
+}
+
+
+static int events__user_message (WindowInternal *w, wimp_PollBlock *poll_block, IDBlock *id_block)
+{
+    return gadgets_user_message (w, poll_block, id_block);
+}
+
+
+static _kernel_oserror *events__toolbox_event (WindowInternal *w, ToolboxEvent *event, IDBlock *id_block)
+{
+    /*
+     * If it's a Window_AboutToBeShown event, then we need to remember the id of the window, so that
+     * we can show it in the prefilter for this task (also we remember the values passed in
+     * R2 and R3).
+     */
+
+
+
+    if (event->hdr.event_code == Window_AboutToBeShown)
+    {
+        window_about_to_be_shown = w;
+        about_to_be_shown_event  = *((WindowAboutToBeShownEvent *)event);
+    }
+    else
+        return gadgets_toolbox_event (w, event, id_block);
+
+    return NULL;
+}
+
+
+static _kernel_oserror *events__show_menu (WindowInternal *w, int x, int y)
+{
+    /*
+     * This function shows the Menu attached to a Window in its
+     * Style Guide compliant place (offset from pointer)
+     * x and y give mouse pointer coords.
+     */
+
+    _kernel_swi_regs regs;
+    TopLeft          buffer;
+
+    IGNORE(y);
+
+    DEBUG debug_output ("events", "Showing Menu\n");
+
+
+    /*
+     * display menu in Style Guide compliant place
+     *
+     */
+
+    buffer.x = x - style_MENU_OFFSET;
+    buffer.y = y;
+
+    DEBUG debug_output ("events", "Show at (%d,%d)\n", buffer.x, buffer.y);
+
+    regs.r[0] = 0x00000001;         /* transient */
+    regs.r[1] = (int)w->menu;
+    regs.r[2] = Toolbox_ShowObject_TopLeft;
+    regs.r[3] = (int)&buffer;
+    regs.r[4] = (int)w->id;
+    regs.r[5] = -1;                  /* no component id */
+
+    return _kernel_swi (Toolbox_ShowObject, &regs, &regs);
+}
+
+
+static _kernel_oserror *events__keyboard_shortcut (WindowInternal *w, int key_code, int *claimed)
+{
+    int ki;
+    _kernel_swi_regs regs;
+    _kernel_oserror *e;
+
+    for (ki = 0; ki < w->num_keyboard_shortcuts; ki++)
+    {
+        if (w->keyboard_shortcuts[ki].wimp_key_code == key_code)
+        {
+            ToolboxEvent event;
+
+            /*
+             * raise associated toolbox event if defined
+             */
+
+            if (w->keyboard_shortcuts[ki].key_event != 0)
+            {
+                *claimed = TRUE;
+
+                event.hdr.size = sizeof(ToolboxEventHeader) + sizeof(int);
+                event.hdr.event_code = w->keyboard_shortcuts[ki].key_event;
+                event.hdr.flags =0;
+
+                regs.r[0] = 0;
+                regs.r[1] = (int)w->id;
+                regs.r[2] = -1;
+                regs.r[3] = (int)&event;
+                if ((e = _kernel_swi (Toolbox_RaiseToolboxEvent, &regs, &regs)) != NULL)
+                    return e;
+            }
+
+
+            /*
+             * if an object is attached, show it either centred, or in the
+             * default place.
+             */
+
+            if (w->keyboard_shortcuts[ki].key_show != 0)
+            {
+                *claimed = TRUE;
+
+                regs.r[0] = (w->keyboard_shortcuts[ki].flags & KeyBoardShortcut_ShowAsTransient)?Toolbox_ShowObject_AsMenu:0;
+                regs.r[1] = (int)w->keyboard_shortcuts[ki].key_show;
+                if (w->keyboard_shortcuts[ki].flags & KeyBoardShortcut_ShowInCentre)
+                    regs.r[2] = Toolbox_ShowObject_Centre;
+                else if (w->keyboard_shortcuts[ki].flags & KeyBoardShortcut_ShowAtPointer)
+                    regs.r[2] = Toolbox_ShowObject_AtPointer;
+                else
+                    regs.r[2] = Toolbox_ShowObject_Default;
+                regs.r[3] = 0;
+                regs.r[4] = (int)w->id;
+                regs.r[5] = -1;
+
+                if ((e = _kernel_swi (Toolbox_ShowObject, &regs, &regs)) != NULL)
+                    return e;
+            }
+
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+
+
+extern _kernel_oserror *events_postfilter (_kernel_swi_regs *r)
+{
+
+    /*
+     * called from the main Toolbox postfilter, when an event happens which
+     * this module has expressed an interest in.
+     * R0 = Wimp event reason code
+     * R1 ->client's Wimp event block
+     * R2 = Task Descriptor of task interested in the event
+     * R3 ->6-word "ID block" as passed to Toolbox_Initialise
+     *
+     */
+
+    /*
+     * This function gets a pointer to the task interested in the event in
+     * R2 (since this was the value passed to Toolbox_RegisterPostFilter).
+     * If the event is dealt with by this module (eg ID block gets updated).
+     * then set R0 to non-null before return.
+     */
+
+    int event_code              = r->r[0];
+    TaskDescriptor  *t          = (TaskDescriptor *)r->r[2];
+    IDBlock         *id_block   = (IDBlock *)r->r[3];
+    wimp_PollBlock  *poll_block = (wimp_PollBlock *)r->r[1];
+    WindowInternal  *w;
+    _kernel_oserror *e          = NULL;
+
+
+    r->r[0] = 0;   /* default is that we haven't updated id block */
+
+
+    /*
+     * for safety if no task decriptor, just return
+     */
+
+    if (t == NULL)
+        return NULL;
+
+
+    /*
+     * NOTE: for each event, we look to see if it is for one of our windows
+     */
+
+    switch (event_code)
+    {
+        case wimp_EREDRAW:
+            if ((w = events__find_window (t->object_list, poll_block->redraw_window_request.window_handle)) == NULL)
+                return NULL;
+
+            id_block->self_id = w->id;
+            id_block->self_component = -1;
+
+            r->r[0] = 1;  /* updated id block */
+
+            break;
+
+
+        case wimp_EOPEN:
+            if ((w = events__find_window (t->object_list, poll_block->open_window_request.open_block.window_handle)) == NULL)
+                return NULL;
+            else
+            {
+                e = events__open_window (w, &poll_block->open_window_request.open_block,&(r->r[0]));
+
+                id_block->self_id = w->id;
+                id_block->self_component = -1;
+
+            }
+            break;
+
+
+        case wimp_ECLOSE:
+            if ((w = events__find_window (t->object_list, poll_block->close_window_request.window_handle)) == NULL)
+                return NULL;
+            else
+            {
+                e = events__close_window (w, &poll_block->close_window_request, &(r->r[0]));
+
+                id_block->self_id = w->id;
+                id_block->self_component = -1;
+
+            }
+            break;
+
+
+        case wimp_EPTR_ENTER:
+            if ((w = events__find_window (t->object_list, poll_block->pointer_entering_window.window_handle)) == NULL)
+                return NULL;
+            else
+            {
+                e = events_pointer_over_window (w);
+
+                id_block->self_id = w->id;
+                id_block->self_component = -1;
+
+                r->r[0] = 1;  /* updated id block */
+            }
+            break;
+
+
+        case wimp_EPTR_LEAVE:
+            if ((w = events__find_window (t->object_list, poll_block->pointer_leaving_window.window_handle)) == NULL)
+                return NULL;
+            else
+            {
+                e = events_pointer_leaving_window (w);
+
+                id_block->self_id = w->id;
+                id_block->self_component = -1;
+
+                r->r[0] = 1;  /* updated id block */
+            }
+            break;
+
+
+        case wimp_EBUT:
+            {
+                int claimed = FALSE;
+
+                if ((w = events__find_window (t->object_list, poll_block->mouse_click.window_handle)) == NULL)
+                    return NULL;
+
+                id_block->self_id = w->id;
+
+                /*
+                 * try gadgets first, and if not claimed, deal with it ourselves.
+                 * We are only interested in Menu clicks.
+                 */
+
+                e = gadgets_mouse_click (w, poll_block, &claimed, id_block);
+
+                if (!claimed) {
+                  if ((poll_block->mouse_click.buttons & wimp_MENU_BUTTON) && (w->menu != NULL) && (e == NULL)) {
+                    e = events__show_menu (w, poll_block->mouse_click.x, poll_block->mouse_click.y);
+                  }
+                }
+                r->r[0] = 1;  /* updated id block */
+            }
+
+            break;
+
+        case wimp_EUSER_DRAG:
+
+                e = gadgets_user_drag(poll_block);
+                break;
+
+
+        case wimp_EKEY:
+            {
+                /* there are three cases we have to deal with here:
+                    - if the key bit in the poll mask was clear (ie. the task wanted
+                      key presses, then we must tell the toolbox to claim it (in wimp
+                      terms) as otherwise the task will do a Wimp_ProcessKey (as it
+                      probably doesn't need it)
+                    - if the mask bit was set (ie. the task didn't want key presses)
+                      then either:
+                        - we use the key and tell the toolbox we've done so.
+                        - we do a Wimp_ProcessKey
+                 */
+
+                int claimed = FALSE;
+                IDBlock blk = * id_block;
+
+                DEBUG debug_output ("events", "Received key %d for task %8X (key mask %d)\n",
+                    poll_block->key_pressed.key_code ,t, t->mask & wimp_EMKEY);
+
+                if ((w = events__find_window (t->object_list, poll_block->key_pressed.caret.window_handle)) != NULL)
+                    {
+
+
+                       if (w->num_keyboard_shortcuts > 0) {
+                          e = events__keyboard_shortcut (w, poll_block->key_pressed.key_code, &claimed);
+                       }
+                       if (!claimed && (e == NULL)) {
+                          e = gadgets_key_pressed (w, poll_block, &claimed, id_block);
+                       }
+                    }
+
+                if ((!claimed) && (t->mask & wimp_EMKEY)) {
+                   switch (poll_block->key_pressed.key_code ) {
+                      /* only pass on if not a special key */
+                    case 13: /* return */
+                    case 8: /* delete */
+                    case 27: /* escape */
+                    case 0x18a: case 0x18b: case 0x18c: case 0x18d: case 0x18e: case 0x18f: /* arrows */
+                    case 0x19a: case 0x19b: case 0x19c: case 0x19d: case 0x19e: case 0x19f: /* arrows */
+                    case 0x1aa: case 0x1ab: case 0x1ac: case 0x1ad: case 0x1ae: case 0x1af: /* arrows */
+                    case 0x1ba: case 0x1bb: case 0x1bc: case 0x1bd: case 0x1be: case 0x1bf: /* arrows */
+
+                      break;
+                    default:
+                      DEBUG debug_output ("events", "Passing on key %d\n",poll_block->key_pressed.key_code);
+                      wimp_process_key(poll_block->key_pressed.key_code );
+                   }
+                }
+
+                if (!(t->mask & wimp_EMKEY)) {
+                   if (claimed) {
+                     r->r[0] =-1;
+                     *id_block = blk;
+                   }
+                   else {
+                     id_block->self_id = w->id;
+                     /* We now return the component id, if there is one */
+                     if ((poll_block->key_pressed.caret.icon_handle >= 0) &&
+                         (poll_block->key_pressed.caret.icon_handle <
+                                      w->num_icon_mappings))
+                         id_block->self_component =
+                                 w->icon_mappings[
+                                 poll_block->key_pressed.caret.icon_handle]->
+                                 gadget_hdr.component_id;
+                     else
+                         id_block->self_component = -1;
+                     r->r[0] = 1;  /* updated id block */
+                   }
+                }
+            }
+
+            break;
+
+
+        case wimp_ESCROLL:
+            if ((w = events__find_window (t->object_list, poll_block->scroll_request.open_block.window_handle)) == NULL)
+                return NULL;
+
+            id_block->self_id = w->id;
+            id_block->self_component = -1;
+
+            r->r[0] = 1;  /* updated id block */
+
+            break;
+
+
+        case wimp_ELOSE_CARET:
+            if ((w = events__find_window (t->object_list, poll_block->lose_caret.caret.window_handle)) == NULL)
+                return NULL;
+
+            id_block->self_id = w->id;
+            id_block->self_component = -1;
+
+            r->r[0] = 1;  /* updated id block */
+
+            break;
+
+
+        case wimp_EGAIN_CARET:
+            if ((w = events__find_window (t->object_list, poll_block->gain_caret.caret.window_handle)) == NULL)
+                return NULL;
+
+            id_block->self_id = w->id;
+            id_block->self_component = -1;
+
+            r->r[0] = 1;  /* updated id block */
+
+            break;
+
+
+        case wimp_ESEND:
+        case wimp_ESEND_WANT_ACK:
+            if (poll_block->msg.hdr.action == wimp_MHELP_REQUEST)
+            {
+                if ((w = events__find_window (t->object_list, poll_block->msg.data.help_request.window_handle)) == NULL)
+                    return NULL;
+
+                /*
+                 * try the gadgets first, and if not claimed, send help if we have some.
+                 */
+
+                if (gadgets_help_message (w, poll_block, id_block))
+                    r->r[0] = 1;
+                else
+                {
+                    if (w->help_message != NULL)
+                    {
+                        if ((e = events_send_help(w->help_message,poll_block)) != NULL)
+                            break;
+
+                    }
+
+                    id_block->self_id = w->id;
+                    id_block->self_component = -1;
+                    r->r[0] = 1;
+                }
+            }
+            else if(poll_block->msg.hdr.action == wimp_MMENUS_DELETED)
+            {
+                  DEBUG debug_output("events", "wimp_MENUS_DELETED (%08x)\n", poll_block->msg.data.words[0]);
+                  hide_raise_hidden(poll_block->msg.data.words[0]);
+                  DEBUG debug_output("events", "about to leave\n");
+
+            }
+            else if(poll_block->msg.hdr.action == wimp_MMENU_WARNING)
+            {
+                  raise_if_become_hidden();
+
+            }
+            else
+            {
+                w = t->object_list;
+
+                while (w != NULL)
+                {
+                    if (events__user_message (w, poll_block, id_block) != FALSE)
+                        break;
+                    w = w->next;
+                }
+
+                if (w != NULL)
+                    r->r[0] = 1;
+            }
+            break;
+
+
+        case wimp_ETOOLBOX_EVENT:
+            if ((w = events__find_window_from_id (t->object_list, id_block->self_id)) != NULL)
+                 e = events__toolbox_event (w, &poll_block->toolbox_event, id_block);
+            else {
+
+                /* event isn't from a window, so could be from menu, in which case need
+                   to pass round all windows! YUK */
+
+                w = t->object_list;
+
+                while (w != NULL)
+                {
+                    e = events__toolbox_event (w, &poll_block->toolbox_event, id_block);
+                    w = w->next;
+                }
+
+             }
+
+            break;
+
+
+        default:
+            break;
+    }
+
+    return e;
+}
+
+
+
+extern _kernel_oserror *events_prefilter (_kernel_swi_regs *r)
+{
+
+    /*
+     * called from the main Toolbox prefilter, when Wimp_Poll is called.
+     * R0 = mask passed to Wimp_Poll
+     * R1 ->client's poll block passed to Wimp_Poll
+     * R2 = Task Descriptor.
+     *
+     */
+
+    /*
+     * This function gets a pointer to the current task in
+     * R2 (since this was the value passed to Toolbox_RegisterPreFilter).
+     * This function can enable additional events by zero-ing bits in
+     * r->r[0]
+     */
+
+    extern int ReFindFonts;
+    _kernel_oserror *e = NULL;
+    TaskDescriptor  *t          = (TaskDescriptor *)r->r[2];
+
+    /* has there been a mode change ? */
+
+    if (ReFindFonts) {
+       ReFindFonts = 0;
+
+       DEBUG debug_output("fonts","Prefilter, need to look for new fonts\n");
+
+       task_refind_fonts();
+
+    }
+
+    /* remember the mask - needed so that we can decide what to do with key presses */
+
+    t->mask = r->r[0];
+
+    /*
+     * Enable most events, 'cos we are interested in them!
+     */
+
+    r->r[0] &= ~(wimp_EMREDRAW       |
+                 wimp_EMOPEN         |
+                 wimp_EMCLOSE        |
+                 wimp_EMPTR_LEAVE    |
+                 wimp_EMPTR_ENTER    |
+                 wimp_EMBUT          |
+                 wimp_EMKEY          |
+                 wimp_EMUSER_DRAG    |
+                 wimp_EMSCROLL       |
+                 wimp_EMLOSE_CARET   |
+                 wimp_EMGAIN_CARET   |
+                 wimp_EMSEND         |
+                 wimp_EMSEND_WANT_ACK);
+    /*
+     * If we have received a warning before showing a Window, then we actually
+     * do the show now.
+     */
+
+    if (window_about_to_be_shown != NULL)
+    {
+        e = show_do_the_show (window_about_to_be_shown,
+                                   about_to_be_shown_event.hdr.flags,
+                                   about_to_be_shown_event.r2,
+                                   (void *)&about_to_be_shown_event.r3);
+
+        window_about_to_be_shown = NULL;
+    }
+
+    if (GadgetNeedsPrefilter != NULL) (*GadgetNeedsPrefilter)();
+
+    return e;
+}
+

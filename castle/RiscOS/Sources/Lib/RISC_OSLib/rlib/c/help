@@ -1,0 +1,184 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/*
+ * title: help.c
+ * purpose: giving interactive help
+ * History: IDJ: 06-Feb-92: prepared for source release
+ *
+ */
+
+
+#include <string.h>
+#include "os.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "trace.h"
+#include "event.h"
+#include "dbox.h"
+#include "msgs.h"
+#include "help.h"
+#include "swis.h"
+
+static           void *help__handle = 0;
+static event_menu_proc help__handler = 0;
+
+void help_register_handler(event_menu_proc handler, void *handle)
+{
+  help__handle = handle;
+  help__handler = handler;
+}
+
+BOOL help_process(wimp_eventstr *e)
+{
+  if (help__handler == 0) return(FALSE);
+  if (e->e != wimp_ESENDWANTACK || e->data.msg.hdr.action != wimp_MHELPREQUEST)
+    return(FALSE);
+  else
+  {
+    /* some interactive help - perhaps menu help? */
+    wimp_w w = e->data.msg.data.helprequest.m.w;
+    wimp_i i = e->data.msg.data.helprequest.m.i;
+    int buffer[25];
+
+    wimpt_complain(
+      os_swi4(
+        os_X | Wimp_GetMenuState,
+        1,              /* Fill up buffer with menu depth, terminate with -1 */
+        (int) &buffer[0],
+        w,              /* Fill only up to this window/icon */
+        i));
+
+    if (buffer[0] == -1)
+    {
+      return(FALSE);
+    }
+    else
+    {
+      int i;
+      char a[20];
+      for (i = 0; buffer[i] != -1; i++) {a[i] = 1 + buffer[i];}
+      a[i] = 0;
+      help__handler(help__handle, a);
+      return(TRUE);
+    }
+  }
+}
+
+static char help__encode(int i)
+/* Take a small number >= 0 and encode it as a printing character. */
+{
+  char c;
+  if (i <= 9) c = '0' + i;
+  else if (i <= 35) c = 'a' + i - 10;
+  else c = 'z';
+  return(c);
+}
+
+void help_reply(char *m)
+/* Reply to the help message in wimpt_last_event() with (already translated)
+   message m. */
+{
+  wimp_eventstr *e = wimpt_last_event();
+
+  e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+  e->data.msg.hdr.action = wimp_MHELPREPLY;
+  e->data.msg.hdr.size = 256; /* be generous! */
+  strcpy(e->data.msg.data.helpreply.text, m);
+  wimpt_noerr(
+   wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task));
+}
+
+BOOL help_genmessage(char *prefix, char *hit)
+{
+  int prefixlen = strlen(prefix);
+  char tag[50];
+  char *message;
+  int i = 0;  /* to get past "help", below */
+
+  /* werr(FALSE, "help_genmessage %i %i %i.", hit[0], hit[1], hit[2]); */
+
+  strcpy(tag, prefix); /* Menu Interactive Help - 3 characters */
+  while (hit[i] > 0 && i < 25) {tag[i + prefixlen] = help__encode(hit[i] - 1); i++;}
+  tag[i + prefixlen] = 0; /* terminate the string */
+  message = msgs_lookup(tag);
+  /* werr(FALSE, "try interactive help tag '%s'.", tag); */
+
+  if (strcmp(message, tag) != 0)
+  {
+    help_reply(message);
+    return(TRUE);
+  }
+  else
+  { /* no pre-canned message */
+    return(FALSE);
+  }
+}
+
+void help_simplehandler(void *handle, char *hit)
+{
+  help_genmessage((char*) handle, hit);
+}
+
+BOOL help_dboxrawevents(dbox d, void *event, void *handle)
+{
+  wimp_eventstr *e = wimpt_last_event();
+
+  if (
+       (e->e == wimp_ESEND || e->e == wimp_ESENDWANTACK)
+       &&
+       e->data.msg.hdr.action == wimp_MHELPREQUEST
+     )
+  {
+    wimp_i icon = e->data.msg.data.helprequest.m.i;
+    char tag[50];
+    int taglen = strlen((char*) handle);
+    char *message;
+
+    d = d; /* to prevent compiler warning */
+    event = event; /* to prevent compiler warning */
+    strcpy(tag, (char*) handle);
+    tag[taglen] = help__encode(icon);
+    tag[taglen + 1] = 0;
+    message = msgs_lookup(tag);
+    if (strcmp(message, tag) != 0) help_reply(message);
+    else
+    {
+      tag[taglen] = 0;
+      message = msgs_lookup(tag);
+      if (strcmp(message, tag) != 0) help_reply(message);
+    }
+    return(TRUE); /* message has been handled. */
+  }
+  else
+    return(FALSE);
+}

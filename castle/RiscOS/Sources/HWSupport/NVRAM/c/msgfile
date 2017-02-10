@@ -1,0 +1,224 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/* > msgfile.c
+ *
+ *	General purpose message lookup code adapted for use with our
+ *      Tags file. If in the future we want to lookup our own errors
+ *	too then this code should be enhanced to provide multiple
+ *	open message files.
+ */
+
+#include <stddef.h>
+#include <stdarg.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "module.h"
+#include "nvram.h"
+#include "msgfile.h"
+#include "error.h"
+
+#include "trace.h"
+
+
+/* [ might be useful whilst debugging ] */
+/* #define MSGFILE_NAME	"Tags" */
+
+
+/****************************************************************************
+ * Static functions.
+ */
+
+
+/* Read up to 4 parameters using varargs, lastparm points to the last parameter
+ * before the varargs and lastsize gives its size. The result is 4 character
+ * pointers in p[] (some of which may be NULL).
+ */
+static void
+GetParameters( char *lastparm, int lastsize, char *p[] )
+{
+	va_list args;
+	int i;
+
+	/* Can't use va_start as pointer to parameters has been passed in. */
+	*args = lastparm + lastsize;
+	for ( i = 0; i < 4; i++ )
+		if ( (p[i] = va_arg(args, char *)) == NULL ) break;
+	va_end( args );
+	while ( ++i < 4 ) p[i] = NULL;
+}
+
+
+/****************************************************************************
+ * msgfile_open
+ *
+ *	In:	fname = pointer to file name of message file
+ *		buffer = optional buffer to open file into (can be NULL)
+ *
+ *	Opens the given message file. Any currently open file will be closed.
+ */
+_kernel_oserror *
+msgfile_open( msgtransblock *mb, char *buffer)
+{
+        _kernel_oserror *e;
+
+        if ( mb->open ) msgfile_close( mb );
+
+        TRACE( "msgfile_open: opening '%s'\n" _ mb->filename );
+
+        e = _swix( MessageTrans_OpenFile, _INR(0,2), mb->msgblock, mb->filename, buffer );
+        if ( !e )
+	{
+		TRACE( "Messagefile opened\n" );
+        	mb->open = 1;
+	}
+        return e;
+}
+
+
+/****************************************************************************
+ * msgfile_lookup
+ *
+ *	In:	token = pointer to token to look up
+ *		buffer = optional buffer to look up string into (can be NULL)
+ *		bufsz = size of buffer if buffer != NULL
+ *		... up to 4 substitution parameters
+ *
+ *	Out:	returns the looked up string (or NULL if not found)
+ *
+ *	Looks up the given token in the currently open message file.
+ */
+char *
+msgfile_lookup( msgtransblock *mb, char *token, char *buffer, int bufsz, ... )
+{
+	char *p[4];
+	char *result;
+	int length;
+        _kernel_oserror *e;
+
+        if ( !mb->open ) msgfile_open( mb, NULL );
+
+	GetParameters( (char *)&bufsz, sizeof(bufsz), p );
+
+	TRACE( "msgfile_lookup: looking up '%s'\n" _ token );
+
+        e = _swix( MessageTrans_Lookup, _INR(0,7)|_OUTR(2,3), mb->msgblock, token, buffer, bufsz,
+                        p[0], p[1], p[2], p[3], &result, &length );
+
+        TRACEIF( e != NULL, "msgfile_lookup: MessageTrans_Lookup returned '%s'\n" _ e->errmess );
+
+        if ( (e == NULL) && (buffer != NULL) )
+	{
+		result[length] = '\0';
+
+		TRACE( "msgfile_lookup: lookup returned '%s'\n" _ result );
+
+		return result;
+	}
+
+	return NULL;
+}
+
+
+/****************************************************************************
+ * msgfile_error_lookup
+ *
+ *	In:	err = pointer to error token block
+ *
+ *	Out:	returns an expanded error
+ *
+ *	Looks up the given error token block and returns the resulting error.
+ */
+_kernel_oserror *
+msgfile_error_lookup( msgtransblock *mb, _kernel_oserror *err, ... )
+{
+        TRACE("msgfile_error_lookup have we got an error? ");
+	if ( err != NULL )
+	{
+                TRACE( " - is it one of ours? - " );
+		if ( err->errnum & ERROR_LOOKUP_BIT )
+		{
+			char *p[4];
+
+                        /* A copy of the error (in RAM) that we can modify */
+                        _kernel_oserror *e;
+
+			TRACE( "msgfile_error_lookup: looking up error '%s'\n" _ err->errmess );
+
+			GetParameters( (char *)&err, sizeof(err), p );
+
+                        if( !mb->open ) msgfile_open( mb, NULL );
+
+			/* Remove lookup flag and return the error. */
+                        e = _swix( MessageTrans_ErrorLookup, _INR(0,7), err, mb->msgblock, 0, 0, p[0], p[1], p[2], p[3] );
+                        e->errnum &= ~ERROR_LOOKUP_BIT;
+                        return e;
+		}
+	}
+	return err;
+}
+
+
+/****************************************************************************
+ * msgfile_enumerate
+ *
+ *	In:	token = pointer to wildcarded token
+ *		buffer = pointer to buffer for result
+ *		bufsz = size of buffer
+ *		index = pointer to index variable
+ *
+ *	Out:	returns buffer filled and index set to next index if successful
+ *
+ *	Enumerates massage file tokens.
+ */
+_kernel_oserror *
+msgfile_enumerate( msgtransblock *mb, char *token, char *buffer, int bufsz, int *index )
+{
+        _kernel_oserror *e = NULL;
+
+        if ( !mb->open ) e = msgfile_open( mb, NULL );
+
+        if ( mb->open )
+        {
+                e = _swix( MessageTrans_EnumerateTokens, _INR(0,4)|_OUT(2)|_OUT(4),
+                                mb->msgblock, token, buffer, bufsz, *index, &bufsz, index );
+
+                TRACEIF( e != NULL, "msgfile_enumerate: returned error '%s'\n" _ e->errmess );
+
+		if ( bufsz == 0 ) *index = 0;
+	}
+        return e;
+}
+
+
+/****************************************************************************
+ * msgfile_close
+ *
+ *	  Closes the currently open message file.
+ */
+void
+msgfile_close( msgtransblock *mb )
+{
+        if ( mb->open )
+	{
+		TRACE( "msgfile_close: closing file\n" );
+
+                (void)_swix( MessageTrans_CloseFile, _IN(0), mb->msgblock );
+                mb->open = 0;
+        }
+}

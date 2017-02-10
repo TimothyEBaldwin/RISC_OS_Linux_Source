@@ -1,0 +1,1142 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/*
+ * Copyright (c) 1995 Acorn Computers Ltd., Cambridge, England
+ *
+ * Pong - a program to send packets to the internal inetd daemon
+ * services.  Note that the current version has been *quickly*
+ * hacked from the original, UDP only, version to also support
+ * TCP services; this may have introduced unwanted unpleasantries,
+ * which are of no consequence at the moment, since the emphasis is
+ * on gaining a workable tool as quickly as possible.
+ *
+ */
+#if defined(TOOL_RCS) && !defined(lint)
+static char RcsId[] = "$Header: /dev/fd/8/mixed/RiscOS/Sources/SystemRes/Internet/Sources/pong/c/Pong,v 1.6 2003/12/03 18:17:23 bavison Exp $";
+#endif
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+/*
+ * YUCK YUCK YUCK
+ *
+ * define __time_t here to avoid duplicate
+ * definition in "sys/types.h"
+ */
+#define __time_t
+
+#ifdef __riscos
+#include "riscos.h"
+#include "kernel.h"
+#define OS_Upcall (0x33)
+#endif
+#include "sys/errno.h"
+#include "netdb.h"
+
+#include "sys/types.h"
+#include "sys/time.h"
+#include "sys/param.h"
+#include "sys/socket.h"
+#include "sys/file.h"
+#include "sys/ioctl.h"
+
+#include "net/if.h"
+
+#include "netinet/in.h"
+#include "netinet/in_systm.h"
+#include "netinet/ip.h"
+#include "netinet/ip_icmp.h"
+#include "netinet/udp.h"
+
+#include "inetlib.h"
+#include "socklib.h"
+#include "unixlib.h"
+
+#ifdef __riscos
+# define DIRSEP	'.'
+#else
+# define DIRSEP '/'
+#endif
+
+/*
+ * RISC OS uses socketioctl(), but
+ * RISC iX uses ioctl().
+ */
+#ifdef __unix
+# define socketioctl(s,t,a)	ioctl((s), (t), (a))
+#endif
+
+int read_pack(struct sockaddr_in *from, int *fromlen);
+int pr_icmp(void);
+
+#define MAXPACKET	4096
+#define MINDATALEN	sizeof(struct timeval)
+#define MAXARG	        4		/* max. no of switches with
+					 * arguments following */
+#ifndef MAXHOSTNAMELEN
+#define MAXHOSTNAMELEN	64
+#endif
+
+#ifndef max
+#define max(x,y)	((x > y) ? x : y)
+#endif
+
+struct host
+{
+    char *hs_addr;
+    char *hs_name;
+};
+
+typedef struct
+{
+    char *service;
+    void (*handle_reply)();
+} Services;
+
+static u_char packet[MAXPACKET];
+static int sock = -1;			/* IP socket */
+static int icmp_sock = -1;		/* ICMP socket */
+static struct sockaddr whereto;		/* who to pong */
+static struct sockaddr localaddr;	/* local machine binding */
+static struct servent *sv;		/* service required */
+
+static int Broadcast = 0;		/* broadcast to all machines? */
+
+static char errmsg[81];
+static char *progname;
+static char *dest = NULL;
+
+char *type_string(), *dcode_string();
+
+int broad_pack(), send_pack();
+
+static void usage();
+void init_pack(), bld_pack(), echo_reply(), chargen_reply(),
+    time_reply(), daytime_reply(), handle_broadcast_replies();
+
+struct host *get_src();
+
+static enum Transports
+{
+    TRANSPORT_UDP,
+    TRANSPORT_TCP
+} transport = TRANSPORT_UDP;
+
+static Services ServList[] =
+{
+{ "echo",    echo_reply },
+{ "discard", NULL },
+{ "chargen", chargen_reply },
+{ "time",    time_reply },
+{ "daytime", daytime_reply }
+};
+static int nserv = sizeof(ServList) / sizeof(ServList[0]);
+
+static struct timezone zone;
+static int PongTrace = 0;
+
+/**********************************************************************/
+
+#ifdef __riscos
+/*
+ * have to have dedicated catcher to close the socket because
+ * the bleedin' OS does not do it for us.  Oh, the joys of
+ * RISC OS on a dark winter night...
+ */
+static void tidyup(void)
+{
+    if( sock >= 0 )
+    {
+	close(sock);
+	sock = -1;
+    }
+
+    if( icmp_sock >= 0 )
+    {
+	close(icmp_sock);
+	icmp_sock = -1;
+    }
+}
+#endif
+
+/**********************************************************************/
+
+static void usage(void)
+{
+    fprintf(stderr, "Usage:   pong [-t|-u] [-bslrd <arguments>] <dest>\n");
+    fprintf(stderr, "         send responses to echo request packets\n");
+    fprintf(stderr, "Options: -u  use UDP as transport (the default)\n");
+    fprintf(stderr, "         -t  use TCP as transport\n");
+    fprintf(stderr, "         -b  broadcast packet (udp only)\n");
+    fprintf(stderr, "         -s  use next arg as service required\n");
+    fprintf(stderr, "         -l  use next arg as length of output packet\n");
+    fprintf(stderr, "         -r  use next arg as repeat count (0 = forever)\n");
+    fprintf(stderr, "         -d  use next arg as repeat delay in u-secs\n");
+    fprintf(stderr, "         -S  lists available services\n");
+    exit(1);
+}
+
+/**********************************************************************/
+
+int main(int argc, char **argv)
+{
+    int len;
+    int servreq = -1;
+    int datalen = -1;
+    int repeat_count = -1;
+    int repeat_delay = 0;
+    u_char continuous = 0;
+    struct sockaddr_in *local = (struct sockaddr_in *)(&localaddr);
+    struct sockaddr_in *to = (struct sockaddr_in *)(&whereto);
+    struct sockaddr_in from;
+    int locallen = sizeof(*local);
+    int fromlen = sizeof(from);
+    struct protoent *proto;
+    struct host *reply_src;
+    void (*repfunc)();
+
+    /*
+     * construct program name & id
+     */
+    if( (progname = rindex(*argv, DIRSEP)) == NULL )
+	progname = *argv;
+    else
+	++progname;
+
+    /* scan over command line switches */
+    while( **(++argv) == '-' && --argc )
+    {
+	int i = 0, j;
+	char options[MAXARG];
+
+	if( !(*++(*argv)) )
+	    /* '-' with no switches */
+	    --argc;
+	else
+	    /* reset index into options array */
+	    i = 0;
+
+	/* have got at least one argument */
+	do
+	{
+	    switch( **argv )
+	    {
+	      case 'S':
+	        {
+		    /* list services available */
+		    int i;
+		    fprintf(stderr, "Services available:\n");
+		    for( i = 0; i < nserv; ++i )
+			fprintf(stderr,"%s%s",
+				i ? ", " : "", ServList[i].service);
+		    fputc('\n', stderr);
+		    exit(0);
+		}
+		    break;
+
+		  case 'b':
+		    /*
+		     * It appears that anybody is now allowed to broadcast
+		     * packets, so this restriction may be removed.
+		     */
+		    Broadcast = 1;
+		    break;
+
+		  case 's':
+		  case 'l':
+		  case 'r':
+		  case 'd':
+		    if( i == MAXARG )
+		    {
+			fprintf(stderr, "Duplicate arguments\n");
+			usage();
+		    }
+		    else
+			options[i++] = **argv;
+		    break;
+
+		  case 't':
+		    transport = TRANSPORT_TCP;
+		    break;
+
+		  case 'u':
+		    transport = TRANSPORT_UDP;
+		    break;
+
+		  default:
+		    fprintf(stderr, "Unknown argument `%c'\n",
+			    **argv);
+		    usage();
+		    break;
+		}
+	} while( *++(*argv) );
+
+	/* now process the switches found */
+	for( j = 0; j < i; ++j )
+	{
+	    /*
+	     * move argument pointers along & test
+	     */
+	    ++argv;
+	    if( !(--argc) )
+	    {
+		fprintf(stderr, "missing field for -%c\n",
+			options[j]);
+		usage();
+	    }
+	    else
+	    {
+		switch( options[j] )
+		{
+		  case 's':
+		    if( servreq != -1 )
+		    {
+			fprintf(stderr,
+				"%s: duplicate definition of service\n",
+				progname);
+			exit(1);
+		    }
+		    else
+		    {
+			register int k;
+
+			for( k = 0; k < nserv; ++k )
+			    if( !strcmp(*argv, ServList[k].service) )
+				break;
+
+			if( k == nserv )
+			{
+			    fprintf(stderr,
+				    "%s: unknown service `%s'\n",
+				    progname, *argv);
+			    exit(1);
+			}
+			else
+			    servreq = k;
+		    }
+		    break;
+
+		  case 'l':
+		    if( datalen != -1 )
+		    {
+			/* already set a valid length */
+			fprintf(stderr,
+				"%s: duplicate definition of length\n",
+				progname);
+			exit(1);
+		    }
+
+		    if( (datalen = atoi(*argv)) <= MINDATALEN
+		       || datalen > MAXPACKET )
+		    {
+			fprintf(stderr, "%s: bad data length `%s'\n",
+				progname, *argv);
+			exit(1);
+		    }
+		    break;
+
+		  case 'r':
+		    if( repeat_count != -1 )
+		    {
+			/* already set a valid repeat count */
+			fprintf(stderr,
+				"%s: duplicate definition of repeat count\n",
+				progname);
+			exit(1);
+		    }
+
+		    if( (repeat_count = atoi(*argv)) <= 0 && **argv != '0' )
+		    {
+			fprintf(stderr, "%s: bad repeat count `%s'\n",
+				progname, *argv);
+			exit(1);
+		    }
+		    else if( repeat_count == 0 )
+			/* flag continuous operation */
+			continuous = 1;
+
+		    break;
+
+		  case 'd':
+		    if( repeat_delay != 0 )
+		    {
+			/* already set a valid repeat count */
+			fprintf(stderr,
+				"%s: duplicate definition of repeat delay\n",
+				progname);
+			exit(1);
+		    }
+
+		    if( (repeat_delay = atoi(*argv)) <= 0 )
+		    {
+			fprintf(stderr, "%s: bad repeat delay `%s'\n",
+				progname, *argv);
+			exit(1);
+		    }
+
+		    break;
+
+		  default:
+		    fprintf(stderr, "%s: internal parsing error\n",
+			    progname);
+		    exit(10);
+		    break;
+		}
+	    }
+	}
+    }
+
+    if( !Broadcast )
+    {
+	/*
+	 * get the destination address
+	 */
+	if( !(--argc) )
+	{
+	    fprintf(stderr,"No destination given\n");
+	    usage();
+	}
+	else
+	    dest = *argv;
+    }
+    else if( transport == TRANSPORT_TCP )
+    {
+	/*
+	 * can't broadcast TCP packets
+	 */
+	fprintf(stderr,
+		"%s: quite how do you expect me broadcast TCP packets?\n",
+		progname);
+	exit(1);
+    }
+
+    if( servreq == -1 )
+	/* use a default */
+	servreq = 0;
+
+    if( datalen == -1 )
+	datalen = MINDATALEN;
+
+    if( repeat_count == -1 )
+	repeat_count = 1;
+
+    /*
+     * get protocol for ICMP monitor socket
+     */
+    if( (proto = getprotobyname("icmp")) == NULL )
+    {
+	sprintf(errmsg, "%s: cannot get ICMP protocol number",
+		progname);
+	perror(errmsg);
+	exit(3);
+    }
+
+    /*
+     * set exit handler to close the socket if necessary
+     */
+#ifdef __riscos
+    if( atexit(tidyup) != 0 )
+    {
+	fprintf(stderr, "pong: cannot set exit handler\n");
+	exit(1);
+    }
+#endif
+
+    if( transport == TRANSPORT_UDP )
+    {
+	/*
+	 * get the port for required udp service from inetd
+	 */
+	if( (sv = getservbyname(ServList[servreq].service, "udp")) == NULL )
+	{
+	    sprintf(errmsg, "%s: cannot get UDP service %s",
+		    progname, ServList[servreq].service);
+	    perror(errmsg);
+	    exit(3);
+	}
+
+	/*
+	 * got the service - create the socket
+	 */
+	if( (sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0 )
+	{
+	    sprintf(errmsg, "%s: inet socket", progname);
+	    perror(errmsg);
+	    exit(3);
+	}
+
+	/*
+	 * get permission to broadcast on inet socket
+	 */
+	if( setsockopt(sock, SOL_SOCKET, SO_BROADCAST,
+		       &Broadcast, sizeof(Broadcast)) < 0 )
+	{
+	    sprintf(errmsg, "%s: setsockopt(SO_BROADCAST)", progname);
+	    perror(errmsg);
+	    exit(3);
+	}
+    }
+    else
+    {
+	/*
+	 * get the port for required tcp service from inetd
+	 */
+	if( (sv = getservbyname(ServList[servreq].service, "tcp")) == NULL )
+	{
+	    sprintf(errmsg, "%s: cannot get TCP service %s",
+		    progname, ServList[servreq].service);
+	    perror(errmsg);
+	    exit(3);
+	}
+
+	/*
+	 * got the service - create the socket
+	 */
+	if( (sock = socket(AF_INET, SOCK_STREAM, 0)) < 0 )
+	{
+	    sprintf(errmsg, "%s: inet socket", progname);
+	    perror(errmsg);
+	    exit(3);
+	}
+    }
+
+    /*
+     * all OK - create the icmp socket
+     */
+    if( (icmp_sock = socket(AF_INET, SOCK_RAW, proto->p_proto)) < 0 )
+    {
+	sprintf(errmsg, "%s: icmp socket", progname);
+	perror(errmsg);
+	exit(3);
+    }
+
+#ifdef __riscos
+    {
+        int one = 1;
+        (void) ioctl(icmp_sock, FIOSLEEPTW, &one);
+        (void) ioctl(sock, FIOSLEEPTW, &one);
+    }
+#endif
+
+    if( !Broadcast )
+    {
+	/*
+	 * build the dest address only once - saves time, & the
+	 * library routines appear to have a storage leak
+	 */
+	struct hostent *hp;
+
+	to->sin_family = AF_INET;
+	if( (to->sin_addr.s_addr = inet_addr(dest)) == -1 )
+	{
+	    if( (hp = gethostbyname(dest)) )
+	    {
+		to->sin_family = hp->h_addrtype;
+		bcopy(hp->h_addr, (caddr_t)(&to->sin_addr), hp->h_length);
+	    }
+	    else
+	    {
+		fprintf(stderr, "%s: unknown host `%s'\n",
+			progname, dest);
+		exit(1);
+	    }
+	}
+
+	/* set the destination port */
+	to->sin_port = sv->s_port;
+
+	if( connect(sock, (struct sockaddr *)to, sizeof(*to)) < 0 )
+	{
+	    perror("connect");
+	    exit(4);
+	}
+	else if( getsockname(sock, (struct sockaddr *)local, &locallen) < 0 )
+	{
+	    perror("getsockname");
+	    exit(4);
+	}
+    }
+
+    /*
+     * get the function to handle replies & initialise the packet
+     */
+    repfunc = ServList[servreq].handle_reply;
+    init_pack(datalen);
+
+    /*
+     * loop until repeat count is exhausted
+     */
+    while( continuous || repeat_count-- > 0 )
+    {
+	/*
+	 * build & send the packet, then deal with any replies
+	 */
+	bld_pack();
+
+	if( PongTrace )
+	{
+	    register int i;
+	    printf("Dump of data packet:\n");
+	    for( i = 0; i < datalen; )
+	    {
+		printf("%02x ", packet[i]);
+		if( !(++i % 16) )
+		    printf("\n");
+	    }
+	    if( i % 16 )
+		printf("\n");
+	}
+
+	if( Broadcast )
+	{
+	    /* do not broadcast if no replies are expected */
+	    if( repfunc == (void (*)())NULL )
+	    {
+		fprintf(stderr,
+			"%s: cannot broadcast when no replies are expected\n",
+			progname);
+		exit(2);
+	    }
+
+	    if( !broad_pack(datalen) )
+		continue;
+
+	    repfunc = handle_broadcast_replies;
+
+	    /*
+	     * loop, reading many packets
+	     *
+	     * NOTE: this loop will not break on a return code of -1
+	     * from read_pack(), which indicates an ICMP message from
+	     * somebody
+	     *
+	     */
+	    while( (len = read_pack(&from, &fromlen)) )
+		if( len > 0 )
+		{
+		    reply_src = get_src(&from);
+		    (*repfunc)(len, reply_src);
+		}
+	}
+	else
+	{
+	    if( !send_pack(datalen, to) )
+		continue;
+
+	    /*
+	     * read the reply if a routine exists to deal with it
+	     */
+	    if( (repfunc != (void (*)())NULL) &&
+	       (len = read_pack(&from, &fromlen)) > 0 )
+	    {
+		/*
+		 * got something - we are assured of the source
+		 * if connected via TCP, else use from
+		 */
+		reply_src = get_src((transport == TRANSPORT_TCP) ?
+				    to : &from);
+		(*repfunc)(len, reply_src);
+	    }
+	}
+
+	/*
+	 * delay if required
+	 */
+	if( repeat_delay )
+	{
+	    struct timeval dc;
+
+	    dc.tv_sec = repeat_delay / 1000000;
+	    dc.tv_usec = repeat_delay % 1000000;
+#ifdef __riscos
+            {
+                struct timeval tc;
+	        gettimeofday(&tc, NULL);
+                dc.tv_usec += tc.tv_usec;
+                dc.tv_sec += tc.tv_sec + (dc.tv_usec / 1000000);
+                dc.tv_usec = dc.tv_usec % 1000000;
+                while (tc.tv_sec < dc.tv_sec ||
+                       (tc.tv_sec == dc.tv_sec && tc.tv_usec < dc.tv_usec)) {
+                               _kernel_swi_regs r = { 6 };
+                               (void) _kernel_swi(OS_Upcall, &r, &r);
+                               gettimeofday(&tc, NULL);
+                }
+            }
+#else
+	    (void)select(0, NULL, NULL, NULL, &dc);
+#endif
+	}
+    }
+
+    /* finished */
+    exit(0);
+}
+
+/**********************************************************************/
+
+void init_pack(int datalen)
+{
+    register int i;
+
+    if( datalen > MINDATALEN )
+	/* pad the rest of the packet */
+	for( i = MINDATALEN; i < datalen; ++i )
+	    packet[i] = i;
+}
+
+/**********************************************************************/
+
+void bld_pack(void)
+{
+    register struct timeval *txtime = (struct timeval *)packet;
+
+    /*
+     * build the current time into packet head
+     */
+    gettimeofday(txtime, &zone);
+}
+
+/**********************************************************************/
+
+int broad_pack(int datalen)
+{
+    struct ifconf ifc;
+    struct ifreq *ifr;
+    struct sockaddr_in *to = (struct sockaddr_in *)(&whereto);
+    int i;
+    char ifcbuf[400];		/* support a max. of 4 interfaces */
+    char Found = 0, Sent = 0;
+
+    /*
+     * read host's interface configuration
+     */
+#if 0
+    ifc.ifc_len = sizeof(ifcbuf);
+#else
+    ifc.ifc_len = 400;
+#endif
+    ifc.ifc_buf = ifcbuf;
+    if( socketioctl(sock, SIOCGIFCONF, (char *)(&ifc)) < 0 )
+    {
+	sprintf(errmsg, "%s: ioctl(SIOCGIFCONF)", progname);
+	perror(errmsg);
+	exit(3);
+    }
+
+    if( (i = ifc.ifc_len / sizeof(*ifr)) == 0 )
+    {
+	fprintf(stderr,"%s: no interfaces configured\n",progname);
+	exit(3);
+    }
+
+    /*
+     * loop over all interfaces, transmitting on the interesting ones
+     */
+    for( ifr = ifc.ifc_req; i > 0; --i, ++ifr )
+    {
+	/* ignore unwanted address families */
+	if( ifr->ifr_addr.sa_family != AF_INET )
+	    continue;
+	else
+	    /* read the flags for this interface */
+	    if( socketioctl(sock, SIOCGIFFLAGS, (char *)ifr) < 0 )
+	    {
+		sprintf(errmsg, "%s: ioctl(SIOCGIFFLAGS)", progname);
+		perror(errmsg);
+		exit(3);
+	    }
+
+	/* only try to talk to useful interfaces */
+	if( !(ifr->ifr_flags & IFF_UP) ||
+	   (ifr->ifr_flags & IFF_LOOPBACK) ||
+	   !(ifr->ifr_flags & (IFF_BROADCAST | IFF_POINTOPOINT)) )
+	    /* cannot get anything out on this interface */
+	    continue;
+
+	/* is this a point to point? */
+	if( ifr->ifr_flags & IFF_POINTOPOINT )
+	{
+	    /* get singular destination address */
+	    if( socketioctl(sock, SIOCGIFDSTADDR, (char *)ifr) < 0 )
+	    {
+		sprintf(errmsg, "%s: ioctl(SIOCGIFDSTADDR)", progname);
+		perror(errmsg);
+		exit(3);
+	    }
+	    else
+		bcopy((char *)(&ifr->ifr_dstaddr), (char *)to,
+		      sizeof(ifr->ifr_dstaddr));
+	}
+	else
+	{
+	    if( socketioctl(sock, SIOCGIFBRDADDR, (char *)ifr) < 0 )
+	    {
+		sprintf(errmsg, "%s: ioctl(SIOCGIFBRDADDR)", progname);
+		perror(errmsg);
+		exit(3);
+	    }
+	    else
+		bcopy((char *)(&ifr->ifr_broadaddr), (char *)to,
+		      sizeof(ifr->ifr_broadaddr));
+	}
+
+	/* found somewhere to go, now try to send the packet */
+	Found = 1;
+	to->sin_port = sv->s_port;
+	if( sendto(sock, (char *)packet, datalen,
+		   0, (struct sockaddr *)to, sizeof(*to)) < 0 )
+	{
+	    perror("sendto (broadcast)");
+	    continue;
+	}
+	Sent = 1;
+    }
+
+    if( !Found )
+	fprintf(stderr, "%s: all interfaces unavailable for broadcast\n",
+		progname);
+
+    return(Sent);
+}
+
+/**********************************************************************/
+
+int send_pack(int datalen)
+{
+    if( send(sock, (char *)packet, datalen, 0) < 0 )
+    {
+	perror("send");
+	return(0);
+    }
+    else
+	return(1);
+}
+
+/**********************************************************************/
+
+int read_pack(struct sockaddr_in *from, int *fromlen)
+{
+    int retc, nbytes;
+    fd_set readset;
+    struct timeval timeout;
+    int fd_max = max(sock, icmp_sock) + 1;
+
+    /*
+     * loop indefinitely until someone decides to return something
+     */
+    for(;;)
+    {
+	/* use select to test for reply packets */
+	FD_ZERO(&readset);
+	FD_SET(sock, &readset);
+	FD_SET(icmp_sock, &readset);
+	timeout.tv_sec = 5;
+	timeout.tv_usec = 0;
+	if( (retc = select(fd_max, &readset, NULL, NULL, &timeout)) == -1 )
+	{
+	    perror("select");
+	    exit(3);
+	}
+	else if( retc == 0 )
+	{
+	    /* timed out */
+	    if( !Broadcast )
+		/* print timeout message */
+		fprintf(stderr, "%s: %s timed out\n",
+			progname, dest);
+
+	    return(0);
+	}
+	else
+	{
+	    if( FD_ISSET(icmp_sock, &readset) )
+	    {
+		if( pr_icmp() )
+		    /* this message is all we can expect */
+		    return(-1);
+		else
+		    /* carry on */
+		    --retc;
+	    }
+
+	    if( retc && FD_ISSET(sock, &readset) )
+	    {
+		if( (nbytes = recvfrom(sock, (char *)packet, sizeof(packet), 0,
+				       (struct sockaddr *)from, fromlen)) < 0 )
+		{
+		    perror("recv");
+		    exit(4);
+		}
+		else
+		    return(nbytes);
+	    }
+	}
+    }
+
+    /* this is never reached, but must keep the compiler happy */
+    return(0);
+}
+
+/**********************************************************************/
+
+void echo_reply(int nbytes, struct host *reply_src)
+{
+    struct timeval *txtime, rxtime;
+
+    /* test reply length */
+    if( nbytes < sizeof(*txtime) )
+    {
+	printf("echo reply from %s (%s) is too short\n",
+	       reply_src->hs_addr, reply_src->hs_name);
+	return;
+    }
+
+    /* get the current time */
+    gettimeofday(&rxtime, &zone);
+
+    /*
+     * now compute the difference between this & the transmit
+     * time held in the returned packet
+     */
+    txtime = (struct timeval *)packet;
+    rxtime.tv_usec -= txtime->tv_usec;
+    if( rxtime.tv_usec < 0 )
+    {
+	rxtime.tv_usec += 1000000;
+	rxtime.tv_sec -= (txtime->tv_sec + 1);
+    }
+    else
+	rxtime.tv_sec -= txtime->tv_sec;
+
+    printf("Response time from %s (%s) = %ld.%03ld seconds\n",
+	   reply_src->hs_addr, reply_src->hs_name,
+	   rxtime.tv_sec, rxtime.tv_usec / 1000);
+}
+
+/**********************************************************************/
+
+void chargen_reply(int nbytes, struct host *reply_src)
+{
+    int i;
+
+    /* print out the bytes as from the packet */
+    printf("%s (%s) chargen reply:\n",
+	   reply_src->hs_addr, reply_src->hs_name);
+
+    for( i = 0; i < nbytes; )
+    {
+	printf("%02x ", packet[i]);
+	if( !(++i % 16) )
+	    putchar('\n');
+    }
+    if( i % 16 )
+	putchar('\n');
+}
+
+/**********************************************************************/
+
+void time_reply(int nbytes, struct host *reply_src)
+{
+    time_t *thetime = (time_t *)packet;
+    u_long raw;
+
+    if( nbytes != sizeof(*thetime) )
+    {
+	printf("time_reply: incorrect number of data "
+	       "from %s (%s) (nbytes (%d) != %d)\n",
+	       reply_src->hs_addr, reply_src->hs_name,
+	       nbytes, sizeof(*thetime));
+
+	return;
+    }
+
+    /*
+     * time is in network order, re-order & convert count
+     * which is from Jan 1 1900 to Jan 1 1970
+     */
+    *thetime = ntohl(*thetime);
+    raw = *thetime;
+    *thetime -= (60 * 60 * 24 * ( 365 * (1970 - 1900) + ((1970 - 1900) / 4)));
+
+    printf("Time on %s (%s) = %s"
+	   "                 (raw = %lx)\n",
+	   reply_src->hs_addr, reply_src->hs_name,
+	   ctime(thetime), raw);
+}
+
+/**********************************************************************/
+
+void daytime_reply(int nbytes, struct host *reply_src)
+{
+    /* null terminate the string & print it */
+    packet[nbytes] = '\0';
+    printf("Time on %s (%s) = %s",
+	   reply_src->hs_addr, reply_src->hs_name, packet);
+}
+
+/**********************************************************************/
+
+void handle_broadcast_replies(int nbytes, struct host *reply_src)
+{
+    printf("Reply received from %s (%s)\n",
+	   reply_src->hs_addr, reply_src->hs_name);
+
+    /* keep the compiler happy */
+    nbytes = nbytes;
+}
+
+/**********************************************************************/
+
+int pr_icmp(void)
+{
+    struct ip *ip;
+    struct icmp *icmp;
+    struct udphdr *udphdr;
+    struct host *msg_src;
+    struct sockaddr_in from;
+    struct sockaddr_in *name = (struct sockaddr_in *)(&localaddr);
+    char icmp_msg[MAXPACKET];
+    int nbytes, hdrlen;
+    int fromlen = sizeof(from);
+
+    if( (nbytes = recvfrom(icmp_sock, icmp_msg, MAXPACKET,
+			   0, (struct sockaddr *)&from, &fromlen)) < 0 )
+    {
+	perror("dump_icmp: recvfrom");
+	exit(3);
+    }
+
+    /* get the message source */
+    msg_src = get_src(&from);
+
+    /* check packet length */
+    ip = (struct ip *)icmp_msg;
+    hdrlen = ip->ip_hl << 2;
+    if( nbytes < (hdrlen + ICMP_MINLEN) )
+    {
+	fprintf(stderr, "received a runt ICMP packet from %s (%s)\n",
+		msg_src->hs_addr, msg_src->hs_name);
+	return(0);
+    }
+    else
+    {
+	nbytes -= hdrlen;
+	icmp = (struct icmp *)(icmp_msg + hdrlen);
+    }
+
+    /* set a pointer to the data area within the packet */
+    ip = &(icmp->icmp_ip);
+    hdrlen = ip->ip_hl << 2;
+    udphdr = (struct udphdr *)(((char *)ip) + hdrlen);
+
+    /* ignore packets not on our port */
+    if( name->sin_port != udphdr->uh_sport )
+    {
+	/* TRACE */
+	printf("Picked up an icmp `%s' message from %s (%s)\n",
+	       type_string(icmp->icmp_type),
+	       msg_src->hs_addr, msg_src->hs_name);
+	return(0);
+    }
+
+    /*
+     * treat dest unreachable stuff separately
+     */
+    printf("ICMP `%s' from %s (%s)\n", (icmp->icmp_type == ICMP_UNREACH) ?
+	   dcode_string(icmp->icmp_code) : type_string(icmp->icmp_type),
+	   msg_src->hs_addr, msg_src->hs_name);
+
+    return(1);
+}
+
+/**********************************************************************/
+
+char *type_string(int type)
+{
+    static char *icmp_types[] =
+    {
+	"Echo Reply",
+	"<UNDEF> 1",
+	"<UNDEF> 2",
+	"Destination Unreachable",
+	"Source Quench",
+	"Redirect",
+	"<UNDEF> 6",
+	"<UNDEF> 7",
+	"Echo Request",
+	"<UNDEF> 9",
+	"<UNDEF> 10",
+	"Time Exceeded",
+	"Parameter Problem",
+	"Timestamp",
+	"Timestamp Reply",
+	"Info Request",
+	"Info Reply",
+	"Address Mask Request",
+	"Address Mask Reply"
+	};
+    static int n_icmp_types = sizeof(icmp_types) / sizeof(icmp_types[0]);
+
+    return((type < n_icmp_types) ?
+	   icmp_types[type] : "UNKNOWN TYPE");
+}
+
+/**********************************************************************/
+
+char *dcode_string(int code)
+{
+    static char *dest_codes[] =
+    {
+	"network unreachable",
+	"host unreachable",
+	"protocol unreachable",
+	"port unreachable",
+	"fragmentation required",
+	"source route failed"
+	};
+    static int n_dest_codes = sizeof(dest_codes) / sizeof(dest_codes[0]);
+
+    return((code < n_dest_codes) ?
+	   dest_codes[code] : "UNKNOWN CODE");
+}
+
+/**********************************************************************/
+
+struct host *get_src(struct sockaddr_in *from)
+{
+    static struct host retc;
+    struct hostent *details;
+    char **src_addr = &(retc.hs_addr);
+
+    *src_addr = inet_ntoa(from->sin_addr);
+
+    if( (details = gethostbyaddr((char *)&(from->sin_addr.s_addr),
+				 4, AF_INET)) == NULL )
+	retc.hs_name = "???";
+    else
+	retc.hs_name = details->h_name;
+
+    return(&retc);
+}
+
+/**********************************************************************/
+
+/* EOF pong.c */
