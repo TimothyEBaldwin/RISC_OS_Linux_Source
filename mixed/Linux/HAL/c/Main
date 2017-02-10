@@ -59,6 +59,12 @@ struct ucontext {
 
 struct termios oldTioIn, oldTioOut, newTioIn, newTioOut;
 
+static struct {
+  timer_t id;
+  volatile unsigned pending_irqs;
+  bool created;
+} timers[TIMERS];
+
 static inline int ix_sigsetmask(uint64_t set) {
   return ix_rt_sigprocmask(SIG_SETMASK, &set, 0, sizeof(set));
 }
@@ -258,54 +264,48 @@ void HAL_CounterDelay(unsigned int microseconds) {
 static volatile unsigned irq_pending[IRQS];
 static bool irq_enabled[IRQS];
 
-static void recalc_pending(void) {
-
-  struct vcpu* vcpu = __kuser_get_tls();
-  vcpu->irq_pending = 0;
-
-  for(int i = 0; i != IRQS; ++i)
-    if (irq_pending[i] && irq_enabled[i]) {
-      vcpu->irq_pending = PSR_I_BIT;
-      return;
-    }
-}
-
 int HAL_IRQMax(void) {
   return IRQS;
 }
 
 void HAL_IRQClear(int device) {
-
-  if (device < SIGNAL_IRQ_BASE) {
-
-    // Decrement irq_pending[device] by one atomically.
-    unsigned old;
+  if (device >= TIMER_IRQ_BASE) {
+    volatile unsigned *p = &timers[device - TIMER_IRQ_BASE].pending_irqs;
+    unsigned old, new;
     do {
-      old = irq_pending[device];
-    } while (old && __kuser_cmpxchg(old, old - 1, &irq_pending[device]));
-
-    // Check if interupts are still pending.
-    recalc_pending();
+      old = *p;
+      new = old - 1;
+    } while (old && __kuser_cmpxchg(old, new, p));
+    if (new) return;
   }
+  irq_pending[device] = 0;
+  HAL_IRQSource();
 }
 
 int HAL_IRQDisable(int device) {
   int ret = irq_enabled[device];
-  if (device < SIGNAL_IRQ_BASE) {
-    irq_enabled[device] = false;
-    recalc_pending();
-  }
+  irq_enabled[device] = false;
+  HAL_IRQSource();
   return ret;
 }
 
 int HAL_IRQEnable(int device) {
   int ret = irq_enabled[device];
-
   irq_enabled[device] = true;
+
+  if (device < SIGNAL_IRQ_BASE) {
+    ix_fcntl(device, F_SETOWN, ix_getpid());
+    ix_fcntl(device, F_SETSIG, IO_SIGNAL);
+    ix_fcntl(device, F_SETFL, ix_fcntl(device, F_GETFL, 0) | O_ASYNC | O_NONBLOCK);
+  }
+
+  if (device >= TIMER_IRQ_BASE) {
+    timers[device - TIMER_IRQ_BASE].pending_irqs = !!timers[device - TIMER_IRQ_BASE].pending_irqs;
+  }
 
   if (!ret && irq_pending[device]) {
     struct vcpu* vcpu = __kuser_get_tls();
-    irq_pending[device] = 1; // Lose timer interrupts
+    vcpu->irq_pending = PSR_I_BIT;
     call_irq(vcpu);
   }
   return ret;
@@ -317,12 +317,7 @@ int HAL_IRQSource(void) {
 
   for(int i = 0; i != IRQS; ++i)
     if (irq_pending[i] && irq_enabled[i]) {
-      if (i >= SIGNAL_IRQ_BASE) {
-        irq_pending[i] = false;
-        recalc_pending();
-      } else {
-        vcpu->irq_pending = PSR_I_BIT;
-      }
+      vcpu->irq_pending = PSR_I_BIT;
       return i;
     }
   return -1;
@@ -381,17 +376,12 @@ int HAL_NVMemoryWrite(unsigned int addr, void *buffer, unsigned int n) {
 
 static bool notimers;
 
-static struct {
-  timer_t id;
-  bool created;
-} timers[TIMERS];
-
 static inline void init_timer(int timer) {
   if (!timers[timer].created) {
     struct sigevent se = {
       .sigev_notify = SIGEV_SIGNAL,
       .sigev_signo = TIMER_SIGNAL,
-      .sigev_value.sival_int = timer + TIMER_IRQ_BASE,
+      .sigev_value.sival_int = timer,
       .sigev_notify_thread_id = ix_gettid(),
     };
     ix_timer_create(CLOCK_MONOTONIC, &se, &timers[timer].id);
@@ -442,6 +432,9 @@ unsigned int HAL_TimerReadCountdown(int timer) {
   return it.it_value.tv_sec * TIMER_GRANULARITY + it.it_value.tv_nsec / (1000000000U / TIMER_GRANULARITY);
 }
 
+
+// Exception Handling
+
 #define ENTER_EXCEPTION(MODE, VECTOR, OFFSET) {                                      \
   uint32_t mode = vcpu->cpsr & 0x1F;                                                 \
   struct vmode* vmode = (struct vmode *)((char *)vcpu + __PVirt_VModeOffsets[mode]); \
@@ -465,12 +458,16 @@ static void irq_signal_handler(int signal, siginfo_t *info, struct ucontext *uco
 
   if (signal == TIMER_SIGNAL) {
     // Timer, so count the overruns, so the RISC OS gets the right number of interrupts.
-    irq = info->si_int;
-    irq_pending[irq] += 1 + info->si_overrun;
+    int timer = info->si_int;
+    timers[timer].pending_irqs += 1 + info->si_overrun;
+    irq = timer + TIMER_IRQ_BASE;
+  } else if (signal == IO_SIGNAL) {
+    irq = info->si_fd;
    } else {
     irq = SIGNAL_IRQ_BASE + signal;
-    irq_pending[irq] = 1;
    }
+
+  irq_pending[irq] = 1;
 
   if (!irq_enabled[irq]) return; // IRQ line disabled, so just return.
 
@@ -896,7 +893,7 @@ static void hal_run(unsigned startFlags) {
   signal2(SIGUSR1, irq_signal_handler);
   signal2(SIGUSR2, irq_signal_handler);
   signal2(TIMER_SIGNAL, irq_signal_handler);
-  signal2(SIGIO, irq_signal_handler);
+  signal2(IO_SIGNAL, irq_signal_handler);
 
   test_pvirt();
 
@@ -916,7 +913,6 @@ static void hal_run(unsigned startFlags) {
     signal2(SIGSEGV, abort_signal_handler);
     signal2(SIGBUS, abort_signal_handler);
   }
-
 
   ix_MESSAGE(2, "Starting kernel...\n");
   init_vcpu.cpsr |= PSR_I_BIT;
