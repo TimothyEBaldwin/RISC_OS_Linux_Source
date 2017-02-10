@@ -30,6 +30,7 @@ HEADER3   = BMUDevice
 ASMCHEADER1 = Portable
 CHEADER1 = CPUClkDevice
 EXPORTS = ${C_EXP_HDR}.${ASMCHEADER1} ${C_EXP_HDR}.${CHEADER1}
+ROM_LIBS = ${PVLIBS}
 
 include StdTools
 include AAsmModule
