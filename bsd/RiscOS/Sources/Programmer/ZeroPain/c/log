@@ -1,0 +1,354 @@
+/*
+ * Copyright (c) 2015, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+#include <stdarg.h>
+#include <errno.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/ModHand.h"
+#include "Global/Services.h"
+
+#include "log.h"
+#undef Module_Title
+#include "modhead.h"
+#include "config.h"
+
+#define LOG_MAX 128
+#define LOGFILE_MAX (1024*1024) /* Log entries are about 2K each */
+#define LOG_DETAIL_SIZE (128*1024) /* One 128K buffer for storing a single detailed log */
+
+static int log_count;
+static bool callback_pending;
+static logentry_t log[LOG_MAX];
+static char last_command[256];
+static char detail_buffer[LOG_DETAIL_SIZE];
+static bool detail_inuse = false;
+char log_file[256];
+
+extern void *private_word;
+
+void log_add(const context_t *c)
+{
+	/* Note: Don't call any SWIs. We don't know if the system is in a sane state, and the assembler code doesn't preserve SPSR! */
+	if (log_count == LOG_MAX)
+	{
+		return;
+	}
+	int myindex = log_count++; /* Take copy of log_count to protect against log entries being corrupted by recursive aborts in log_detailed */
+	log[myindex].context = *c;
+	uint32_t pc = c->r[15]-8;
+	for(int i=0;i<32;i++)
+	{
+		uint32_t addr = pc+(i-16)*4;
+		/* Play it safe and avoid crossing page boundaries */
+		if ((pc>>12) == (addr>>12))
+		{
+			log[myindex].code[i] = *((uint32_t *) addr);
+		}
+	}
+	log[myindex].domainid = *rsi6vals[DomainId];
+	log[myindex].time = *rsi6vals[MetroGnome];
+	strcpy(log[myindex].command,last_command);
+	log[myindex].detailed = NULL;
+	if (!detail_inuse)
+	{
+		detail_inuse = true; /* Set flag prematurely to protect against recursion */
+		if (log_detailed(c, detail_buffer, sizeof(detail_buffer), rsi6vals[VecPtrTab]))
+		{
+			log[myindex].detailed = detail_buffer;
+		}
+		else
+		{
+			detail_inuse = false;
+		}
+	}
+}
+
+void log_flush(void)
+{
+	if ((!log_count) || (callback_pending))
+	{
+		return;
+	}
+
+	callback_pending = !_swix(OS_AddCallBack,_INR(0,1),log_callback_entry,private_word);
+}
+
+_kernel_oserror *log_flush_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+
+	log_flush();
+	return NULL;
+}
+
+static bool safe_read(uint32_t *out,uint32_t addr)
+{
+	uint32_t flags;
+	if ((addr & 3) || (_swix(OS_Memory,_INR(0,2)|_OUT(1),24,addr,addr+4,&flags)))
+	{
+		return false;
+	}
+	if (flags & (1<<2))
+	{
+		*out = *((uint32_t*)addr);
+		return true;
+	}
+	return false;
+}
+
+static uint32_t domainid_to_taskhandle(uint32_t domainid)
+{
+	/* Find the Wimp's workspace */
+	uint32_t workspace;
+	if (_swix(OS_Module,_INR(0,1)|_OUT(4),ModHandReason_LookupName,"WindowManager",&workspace))
+	{
+		return 0;
+	}
+	/* Get task block */
+	uint32_t taskblock,flags;
+	if (safe_read(&taskblock,workspace+domainid))
+	{
+		/* Lookup task flag word */
+		if (safe_read(&flags,taskblock))
+		{
+			/* Return full task handle */
+			return domainid | ((flags>>21)<<21);
+		}
+	}
+	return 0;
+}
+
+static void report(char *fmt,...)
+{
+	char buf[512];
+	time_t now = time(NULL);
+	va_list args;
+	va_start(args,fmt);
+	vsprintf(buf+strftime(buf,16,"%H:%M:%S",localtime(&now)),fmt,args);
+	va_end(args);
+	_swix(0x54c80 /* Report_Text0 */,_IN(0),buf);
+}
+
+_kernel_oserror *log_callback_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+
+#ifdef ROM_MODULE
+	/* We need to wait until the boot sequence has started before we're able to work out the log path */
+	if (!log_file[0] && config_read(NULL))
+	{
+		report(" " Module_Title ": Failed to write log file: Unable to determine log location\n");
+		return NULL;
+	}
+#endif
+
+	uint32_t type,load,exec,length;
+	callback_pending = false;
+	_kernel_oserror *e = _swix(OS_File,_INR(0,1)|_OUT(0)|_OUTR(2,4),17,log_file,&type,&load,&exec,&length);
+	if (e)
+	{
+		report(" " Module_Title ": Failed to write log file: Error %x %s\n",e->errnum,e->errmess);
+		return NULL;
+	}
+	if (((type != 0) && (type != 1)) || ((type == 1) && (load < 0xffffff00)))
+	{
+		report(" " Module_Title ": Failed to write log file: Not a text file\n");
+		return NULL;
+	}
+	if ((type == 1) && (length >= LOGFILE_MAX))
+	{
+		report(" " Module_Title ": Failed to write log file: Size limit reached\n");
+		return NULL;
+	}
+	FILE *f = fopen(log_file,"a");
+	if (!f)
+	{
+		report(" " Module_Title ": Failed to write log file: Error %s\n",strerror(errno));
+		return NULL;
+	}
+	uint32_t applimit;
+	_swix(Wimp_ReadSysInfo,_IN(0)|_OUT(0),11,&applimit);
+
+	/* Work out time offset */
+	time_t time_offset = time(NULL) - (*rsi6vals[MetroGnome]/100);
+
+	for(int i=0;i<log_count;i++)
+	{
+		logentry_t *l = &log[i];
+
+		/* Work out timestamp */
+		time_t crash_time = time_offset + (l->time/100);
+		fprintf(f,"Time: %s",ctime(&crash_time));
+
+		uint32_t pc = l->context.r[15]-8;
+
+		if(pc < applimit)
+		{
+			fputs("Location: Application space\n",f);
+		}
+		else
+		{
+			/* Look for a module */
+			int number=0,instance=0;
+			uint32_t pointer;
+			bool found = false;
+			while (!_swix(OS_Module,_INR(0,2)|_OUTR(1,3),ModHandReason_GetNames,number,instance,&number,&instance,&pointer))
+			{
+				if (pc-pointer < ((uint32_t*)pointer)[-1])
+				{
+					fprintf(f,"Location: Offset %08x in module %s\n",pc-pointer,(char *) (pointer+((uint32_t*)pointer)[4]));
+					found = true;
+					break;
+				}
+			}
+			/* Try other areas */
+			if (!found && !_swix(OS_DynamicArea,_INR(0,1)|_OUTR(0,1),20,pc,&number,&instance))
+			{
+				const char *name = NULL;
+				static char const* const system_areas[] =
+				{
+					"Cursor/system/sound",
+					"IRQ stack",
+					"SVC stack",
+					"ABT stack",
+					"UND stack",
+					"Soft CAM",
+					"L1PT",
+					"L2PT",
+					"HAL workspace",
+					"Kernel buffers",
+					"HAL noncacheable workspace",
+				};
+				if ((number == 0) && !_swix(OS_DynamicArea,_INR(0,1)|_OUT(8),2,instance,&name))
+				{
+					fprintf(f,"Location: %s\n",name);
+					found = true;
+				}
+				else if ((number == 1) && (instance > 0) && (instance-1 < sizeof(system_areas)/sizeof(system_areas[0])))
+				{
+					fprintf(f,"Location: %s\n",system_areas[instance-1]);
+					found = true;
+				}
+			}
+			if (!found)
+			{
+				fputs("Location: Unknown\n",f);
+			}
+		}
+
+		const char* str = "Unknown";
+		_swix(TaskManager_TaskNameFromHandle,_IN(0)|_OUT(0),domainid_to_taskhandle(l->domainid),&str);
+		fputs("Current Wimp task: ",f);
+		/* String is control-terminated! */
+		while (*str >= ' ')
+		{
+			fputc(*str++,f);
+		}
+		fprintf(f,"\nLast app to start: %s\n\n",l->command);
+
+		for(int j=0;j<16;j++)
+		{
+			fprintf(f,"R%-2d = %08x%c",j,l->context.r[j],((j&3)==3)?'\n':' ');
+		}
+		fprintf(f,"DFAR = %08x  Mode %s  Flags %c%c%c%c %c%c   PSR = %08x\n\n",
+			l->context.dfar,
+			(l->context.psr & 3)?"SVC32":"USR32",
+			(l->context.psr & (1u<<31))?'N':'n',
+			(l->context.psr & (1<<30))?'Z':'z',
+			(l->context.psr & (1<<29))?'C':'c',
+			(l->context.psr & (1<<28))?'V':'v',
+			(l->context.psr & (1<<7))?'I':'i',
+			(l->context.psr & (1<<6))?'F':'f',
+			l->context.psr);
+
+		for(int j=0;j<32;j++)
+		{
+			uint32_t addr = pc+(j-16)*4;
+			if ((pc>>12) == (addr>>12))
+			{
+				const char* str = "???";
+				_swix(Debugger_Disassemble,_INR(0,1)|_OUT(1),l->code[j],addr,&str);
+				char c = ((addr==pc)?'*':':');
+				fprintf(f,"%08x %c %08x %c %s\n",addr,c,l->code[j],c,str);
+			}
+		}
+		if (l->detailed)
+		{
+			fputs("\n",f);
+			fputs(l->detailed,f);
+			detail_inuse = false;
+		}
+		fputs("\n--------------------------------------------------------------------------------\n\n",f);
+	}
+
+	fflush(f);
+
+	if(ferror(f) != 0)
+	{
+		/* No way of getting error message? */
+		fclose(f);
+		report(" " Module_Title ": Failed writing to log file\n");
+		return NULL;
+	}
+
+	fclose(f);
+
+	/* Notify via Reporter */
+	report(" " Module_Title ": %d new log file entr%s\n",log_count,(log_count==1?"y":"ies"));
+
+	log_count = 0;
+	return NULL;
+}
+
+void module_services(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	if (service_number != Service_NewApplication)
+	{
+		return;
+	}
+	/* Grab the command line */
+	char *c;
+	if(_swix(OS_GetEnv,_OUT(0),&c))
+	{
+		return;
+	}
+	int len = 0;
+	while (c && (*c >= ' ') && (len < sizeof(last_command)-1))
+	{
+		last_command[len++] = *c++;
+	}
+	last_command[len] = 0;
+}

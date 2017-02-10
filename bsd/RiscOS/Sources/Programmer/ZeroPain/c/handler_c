@@ -1,0 +1,297 @@
+/*
+ * Copyright (c) 2015, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "handler.h"
+#include "log.h"
+
+uint32_t *rsi6vals[RSI6Count];
+static const uint32_t zeropageaddrs[RSI6Count] =
+{
+	/* PublicWS not exported as a C header. Just hardcode. */
+	[DomainId] = 0xff8,
+	[IRQsema] = 0x108,
+	[MetroGnome] = 0x10c,
+	[CLibCounter] = 0xfe8,
+	[RISCOSLibWord] = 0xfec,
+	[CLibWord] = 0xff0,
+	[ESC_Status] = 0x104,
+};
+
+#ifdef DEBUG
+#include <stdarg.h>
+#include <stdio.h>
+
+void (*dadwritec)(char);
+
+static void dprintf(const char *fmt,...)
+{
+	if (!dadwritec)
+		return;
+
+	char buf[128];
+	va_list args;
+	va_start(args,fmt);
+	vsprintf(buf,fmt,args);
+	va_end(args);
+	char *c = buf;
+	while(*c)
+		(dadwritec)(*c++);
+}
+
+#define DPRINTF dprintf
+#else
+#define DPRINTF(...) (void) 0
+#endif
+
+static uint32_t mem(uint32_t addr)
+{
+	DPRINTF("mem %08x\n",addr);
+	/* TODO: Deal with addresses outside zero page? */
+	if (addr)
+	{
+		for(int i=0;i<RSI6Count;i++)
+		{
+			if(addr == zeropageaddrs[i])
+			{
+				return *rsi6vals[i];
+			}
+		}
+	}
+	return 0;
+}
+
+bool handler_do(context_t *context, uint32_t sctlr)
+{
+	/* Examine the instruction to work out if it's one we handle:
+	   LDR[B], immediate	cccc 010P UBW1 --Rn --Rt ---- ---- -imm
+	   LDR[B], register	cccc 011P UBW1 --Rn --Rt --im m-t0 --Rm
+	   LDM			cccc 100P U0W1 --Rn ---- ---- ---- regs
+	*/
+
+#define W (1<<21)
+#define B (1<<22)
+#define U (1<<23)
+#define P (1<<24)
+
+#define SCTLR_A (1<<1)
+#define SCTLR_U (1<<22)
+
+	const uint32_t pc = context->r[15]-8;
+	const uint32_t instr = *((uint32_t *) pc);
+
+	DPRINTF("pc %08x instr %08x dfar %08x\n",pc,instr,context->dfar);
+
+	if (instr >= 0xf0000000)
+	{
+		return false; /* Unconditional instruction */
+	}
+
+	const uint32_t Rn = (instr >> 16) & 0xf;
+
+	DPRINTF("Rn %d\n",Rn);
+
+	if (Rn == 15)
+	{
+		return false; /* There's not really any way this can end well */
+	}
+
+	uint32_t addr = context->r[Rn];
+
+	DPRINTF("addr %08x\n",addr);
+
+	if ((instr & 0x0e500000) == 0x08100000)
+	{
+		/* LDM */
+		if (addr & 3)
+		{
+			/* Unaligned. Disallow if ARMv7 unaligned load behaviour or alignment exceptions enabled. */
+			if (sctlr & (SCTLR_U | SCTLR_A))
+			{
+				return false;
+			}
+			else
+			{
+				/* Rotated load mode, ignore bottom two bits */
+				addr &= ~3;
+			}
+		}
+		if (instr & (1<<15))
+		{
+			/* We don't simulate things well enough that a load of PC will do any good */
+			return false;
+		}
+		/* Instruction looks good, emulate it */
+		log_add(context);
+		if (instr & U)
+		{
+			/* LDMIA/LDMIB */
+			if (instr & P)
+			{
+				addr += 4;
+			}
+			for (int i=0;i<14;i++)
+			{
+				if (instr & (1<<i))
+				{
+					context->r[i] = mem(addr);
+					addr += 4;
+				}
+			}
+			if (instr & W)
+			{
+				context->r[Rn] = ((instr & P) ? addr-4 : addr);
+				DPRINTF("wback %08x\n",context->r[Rn]);
+			}
+		}
+		else
+		{
+			/* LDMDA/DB */
+			if (instr & P)
+			{
+				addr -= 4;
+			}
+			for (int i=14;i>=0;i--)
+			{
+				if (instr & (1<<i))
+				{
+					context->r[i] = mem(addr);
+					addr -= 4;
+				}
+			}
+			if (instr & W)
+			{
+				context->r[Rn] = ((instr & P) ? addr+4 : addr);
+				DPRINTF("wback %08x\n",context->r[Rn]);
+			}
+		}
+		/* Update PC */
+		context->r[15] = pc+4;
+		return true;
+	}
+	else if ((instr & 0x0c100000) == 0x04100000)
+	{
+		/* LDR[B] */
+		const uint32_t Rt = (instr >> 12) & 0xf;
+		DPRINTF("Rt %d\n",Rt);
+		if (Rt == 15)
+		{
+			return false;
+		}
+		int32_t offset;
+		if (instr & (1<<25))
+		{
+			/* Register offset */
+			if (instr & 0x10)
+			{
+				return false;
+			}
+			const uint32_t Rm = instr & 0xf;
+			if (Rm == 15)
+			{
+				return false;
+			}
+			const uint32_t Rmval = context->r[Rm];
+			const uint32_t shift = (instr >> 7) & 31;
+			const uint32_t type = (instr >> 5) & 3;
+			switch (type)
+			{
+			default:
+			case 0: /* LSL */
+				offset = Rmval << shift;
+				break;
+			case 1: /* LSR, with special encoding of LSR #32 */
+				offset = (shift ? (Rmval >> shift) : 0);
+				break;
+			case 2: /* ASR, with special encoding of ASR #32 */
+				offset = (shift ? (((int32_t) Rmval) >> shift) : ((int32_t) Rmval) >> 31);
+				break;
+			case 3: /* ROR, with special encoding of RRX */
+				if (shift)
+				{
+					offset = (Rmval >> shift) | (Rmval << (32-shift));
+				}
+				else
+				{
+					offset = (Rmval>>1) | ((context->psr & (1<<29)) << 2);
+				}
+				break;
+			}
+		}
+		else
+		{
+			/* Immediate offset */
+			offset = (instr & 0xfff);
+		}
+		if (!(instr & U))
+		{
+			offset = -offset;
+		}
+		DPRINTF("offset %08x\n",offset);
+		if (instr & P)
+		{
+			addr += offset;
+		}
+		const bool unaligned = !(instr & B) && (addr & 3);
+		if (unaligned && (sctlr & SCTLR_A))
+		{
+			/* Unaligned with alignment exceptions enabled */
+			return false;
+		}
+		/* Instruction looks good, emulate it */
+		log_add(context);
+		uint32_t val = mem(addr & ~3);
+		const uint32_t rotate = (addr & 3)<<3;
+		uint32_t val2 = val;
+		if (unaligned && (sctlr & SCTLR_U))
+		{
+			/* ARMv7 unaligned load, grab the next word */
+			val2 = mem((addr+4) & ~3);
+		}
+		val = (val >> rotate) | (val2 << (32-rotate));
+		if (instr & B)
+		{
+			val &= 255;
+		}
+		context->r[Rt] = val;
+		if (!(instr & P))
+		{
+			addr += offset;
+		}
+		if ((instr & W) || !(instr & P))
+		{
+			context->r[Rn] = addr;
+			DPRINTF("wback %08x\n",context->r[Rn]);
+		}
+		/* Update PC */
+		context->r[15] = pc+4;
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
