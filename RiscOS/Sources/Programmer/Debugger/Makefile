@@ -67,10 +67,10 @@ endif
 ifeq ("${COMPONENT}","Debugger")
 include CModule
 
-# We don't want to link to CLib
+# We don't want to link to CLib (but link to Linux HAL)
 ROM_LIBS =
 SA_LIBS  =
-ROM_SYMS =
+ROM_SYMS = ${PVLIBS}
 
 CFLAGS += -apcs /nofp
 else
