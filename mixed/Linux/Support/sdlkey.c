@@ -102,6 +102,15 @@ struct keys sdl2key[] = {
   {SDL_SCANCODE_F10, KeyNo_Function10},
   {SDL_SCANCODE_F11, KeyNo_Function11},
   {SDL_SCANCODE_F12, KeyNo_Function12},
+  {SDL_SCANCODE_MINUS,          KeyNo_Minus},
+  {SDL_SCANCODE_EQUALS,         KeyNo_Equals},
+  {SDL_SCANCODE_LEFTBRACKET,    KeyNo_OpenSquare},
+  {SDL_SCANCODE_RIGHTBRACKET,   KeyNo_CloseSquare},
+  {SDL_SCANCODE_BACKSLASH,      KeyNo_BackSlash},
+  {SDL_SCANCODE_SEMICOLON,      KeyNo_SemiColon},
+  {SDL_SCANCODE_APOSTROPHE,     KeyNo_Tick},
+  {SDL_SCANCODE_GRAVE,          KeyNo_BackTick},
+  {SDL_SCANCODE_NONUSBACKSLASH, KeyNo_NotFittedLeft}
 };
 
 int out[SDL_NUM_SCANCODES];
