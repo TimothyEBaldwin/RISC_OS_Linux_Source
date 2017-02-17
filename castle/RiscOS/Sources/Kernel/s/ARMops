@@ -3290,6 +3290,9 @@ ICache_InvalidateAll_WB_CR7_Lx ROUT
 ; cache maintenance ops. Currently they're only used on Cortex-A9 systems, so
 ; may need modifications to work with other systems.
 ; Specifically, the code assumes the PL310 is being used in non-exclusive mode.
+;
+; To make the code fully re-entrant and MP-safe, we avoid using the background
+; operations (INV_WAY, CLEAN_WAY, CLEAN_INV_WAY).
 
         MACRO
         PL310Sync $regs, $temp
@@ -3301,16 +3304,13 @@ ICache_InvalidateAll_WB_CR7_Lx ROUT
         MOV     $temp, #0
         STREQ   $temp, [$regs, #PL310_REG7_CACHE_SYNC_753970]
         STRNE   $temp, [$regs, #PL310_REG7_CACHE_SYNC]
-10
-        LDR     $temp, [$regs, #PL310_REG7_CACHE_SYNC]
-        TST     $temp, #1
-        BNE     %BT10
         MEND
 
 PL310Threshold * 1024*1024 ; Arbitrary threshold for full clean
 
 Cache_CleanInvalidateAll_PL310 ROUT
         ; Errata 727915 workaround - use CLEAN_INV_INDEX instead of CLEAN_INV_WAY
+        ; Also, CLEAN_INV_WAY is a background op, while CLEAN_INV_INDEX is atomic.
         Entry   "a2-a4"
         LDR     a2, =ZeroPage
         LDR     a2, [a2, #Cache_HALDevice]
@@ -3326,70 +3326,50 @@ Cache_CleanInvalidateAll_PL310 ROUT
         LDR     a4, =&FF<<5
         ORR     a3, a3, #7<<28          ; a3 = max way number (inclusive)
         ORR     a4, a4, a4, LSL a1      ; a4 = max index number (inclusive)
-        ; Ensure no operation currently in progress
-05
-        LDR     lr, [a2, #PL310_REG7_CLEAN_INV_INDEX]
-        TST     lr, #1
-        BNE     %BT05
 10
         ORR     a1, a3, a4
 20
         STR     a1, [a2, #PL310_REG7_CLEAN_INV_INDEX]
-30
-        LDR     lr, [a2, #PL310_REG7_CLEAN_INV_INDEX]
-        TST     lr, #1
-        BNE     %BT30
         SUBS    a1, a1, #1<<28          ; next way
         BCS     %BT20                   ; underflow?
         SUBS    a4, a4, #1<<5           ; next index
         BGE     %BT10
-        ; Sync PL310
-        PL310Sync a2, a1
+        ; Ensure the ops are actually complete
+        DSB
         ; Clean & invalidate ARM caches
         PullEnv
         B       Cache_CleanInvalidateAll_WB_CR7_Lx
 
 Cache_CleanAll_PL310 ROUT
-        Entry   "a2"
+        Entry   "a2-a4"
         LDR     a2, =ZeroPage
         LDR     a2, [a2, #Cache_HALDevice]
         LDR     a2, [a2, #HALDevice_Address]
         ; Clean ARM caches
         BL      Cache_CleanAll_WB_CR7_Lx
-        ; Clean PL310
+        ; Determine PL310 way, index count        
         LDR     a1, [a2, #PL310_REG1_AUX_CONTROL]
-        TST     a1, #1<<16
-        MOV     a1, #&FF
-        ORRNE   a1, a1, #&FF00          ; Mask of all ways
-        STR     a1, [a2, #PL310_REG7_CLEAN_WAY]
+        AND     a3, a1, #1<<16
+        AND     a1, a1, #7<<17
+        MOV     a3, a3, LSL #15
+        MOV     a1, a1, LSR #17
+        LDR     a4, =&FF<<5
+        ORR     a3, a3, #7<<28          ; a3 = max way number (inclusive)
+        ORR     a4, a4, a4, LSL a1      ; a4 = max index number (inclusive)
 10
-        LDR     a1, [a2, #PL310_REG7_CLEAN_WAY]
-        TEQ     a1, #0
-        BNE     %BT10
-        ; Sync PL310
-        PL310Sync a2, a1
+        ORR     a1, a3, a4
+20
+        STR     a1, [a2, #PL310_REG7_CLEAN_INDEX]
+        SUBS    a1, a1, #1<<28          ; next way
+        BCS     %BT20                   ; underflow?
+        SUBS    a4, a4, #1<<5           ; next index
+        BGE     %BT10
+        ; Ensure the ops are actually complete
+        DSB
         EXIT
 
-Cache_InvalidateAll_PL310 ROUT
-        Entry   "a2"
-        LDR     a2, =ZeroPage
-        LDR     a2, [a2, #Cache_HALDevice]
-        LDR     a2, [a2, #HALDevice_Address]
-        ; Invalidate PL310
-        LDR     a1, [a2, #PL310_REG1_AUX_CONTROL]
-        TST     a1, #1<<16
-        MOV     a1, #&FF
-        ORRNE   a1, a1, #&FF00          ; Mask of all ways
-        STR     a1, [a2, #PL310_REG7_INV_WAY]
-10
-        LDR     a1, [a2, #PL310_REG7_INV_WAY]
-        TEQ     a1, #0
-        BNE     %BT10
-        ; Sync PL310
-        PL310Sync a2, a1
-        ; Invalidate ARM caches
-        PullEnv
-        B       Cache_InvalidateAll_WB_CR7_Lx
+; This op will be rarely (if ever) used, just implement as clean + invalidate
+Cache_InvalidateAll_PL310 * Cache_CleanInvalidateAll_PL310
 
 Cache_RangeThreshold_PL310 ROUT
         MOV     a1, #PL310Threshold
@@ -3431,8 +3411,8 @@ DSB_ReadWrite_PL310 ROUT
         DSB     SY
         ; Drain PL310 write buffer
         PL310Sync lr, a1
-        ; Additional barrier necessary here, to prevent reads from occuring before the PL310Sync has completed. DMB should be sufficient, rather than DSB.
-        DMB     SY
+        ; Ensure the PL310 sync is complete
+        DSB     SY
         EXIT
 
 DSB_Write_PL310 ROUT
@@ -3444,7 +3424,8 @@ DSB_Write_PL310 ROUT
         DSB     ST
         ; Drain PL310 write buffer
         PL310Sync lr, a1
-        ; Assume that no barrier needed here (we don't care about reads, and there's surely no such thing as a speculative write)
+        ; Ensure the PL310 sync is complete
+        DSB     ST
         EXIT
 
 DMB_ReadWrite_PL310 ROUT
@@ -3456,7 +3437,7 @@ DMB_ReadWrite_PL310 ROUT
         DMB     SY
         ; Drain PL310 write buffer
         PL310Sync lr, a1
-        ; Additional barrier necessary here, to prevent reads from occuring before the PL310Sync has completed
+        ; Ensure the PL310 sync is complete
         DMB     SY
         EXIT
 
@@ -3469,7 +3450,8 @@ DMB_Write_PL310 ROUT
         DMB     ST
         ; Drain PL310 write buffer
         PL310Sync lr, a1
-        ; Assume that no barrier needed here (we don't care about reads, and there's surely no such thing as a speculative write)
+        ; Ensure the PL310 sync is complete
+        DMB     ST
         EXIT
 
 MMU_Changing_PL310 ROUT
@@ -3550,11 +3532,6 @@ Cache_CleanInvalidateRange_PL310 ROUT
         LDR     a1, =ZeroPage
         LDR     a2, [a1, #Cache_HALDevice]
         LDR     a2, [a2, #HALDevice_Address]
-        ; Ensure we haven't re-entered an in-progress op
-40
-        LDR     lr, [a2, #PL310_REG7_CLEAN_INV_PA]
-        TST     lr, #1
-        BNE     %BT40
         ; Clean & invalidate each line/index of the pages
 50
         ; Convert logical addr to physical.
@@ -3573,10 +3550,6 @@ Cache_CleanInvalidateRange_PL310 ROUT
         BIC     a1, a1, #&01F
 60
         STR     a1, [a2, #PL310_REG7_CLEAN_INV_PA]
-70
-        LDR     lr, [a2, #PL310_REG7_CLEAN_INV_PA]
-        TST     lr, #1
-        BNE     %BT70
         TST     a1, #&FE0
         SUB     a1, a1, #1<<5           ; next index
         BNE     %BT60
@@ -3584,7 +3557,7 @@ Cache_CleanInvalidateRange_PL310 ROUT
         CMP     a4, a3
         BNE     %BT50
         ; Sync
-        PL310Sync a2, a1
+        DSB
         ; Clean & invalidate ARM
         SUB     a1, a3, v1
         MOV     a2, a3
@@ -3637,11 +3610,6 @@ Cache_CleanRange_PL310 ROUT
         LDR     a1, =ZeroPage
         LDR     a2, [a1, #Cache_HALDevice]
         LDR     a2, [a2, #HALDevice_Address]
-        ; Ensure we haven't re-entered an in-progress op
-40
-        LDR     lr, [a2, #PL310_REG7_CLEAN_INV_PA]
-        TST     lr, #1
-        BNE     %BT40
         ; Clean & invalidate each line/index of the pages
 50
         ; Convert logical addr to physical.
@@ -3660,10 +3628,6 @@ Cache_CleanRange_PL310 ROUT
         BIC     a1, a1, #&01F
 60
         STR     a1, [a2, #PL310_REG7_CLEAN_PA]
-70
-        LDR     lr, [a2, #PL310_REG7_CLEAN_PA]
-        TST     lr, #1
-        BNE     %BT70
         TST     a1, #&FE0
         SUB     a1, a1, #1<<5           ; next index
         BNE     %BT60
@@ -3671,7 +3635,7 @@ Cache_CleanRange_PL310 ROUT
         CMP     a4, a3
         BNE     %BT50
         ; Sync
-        PL310Sync a2, a1
+        DMB
         EXIT
 
 90        
