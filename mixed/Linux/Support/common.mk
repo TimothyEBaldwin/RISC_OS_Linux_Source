@@ -1,17 +1,22 @@
 sdl: mixed/Linux/Support/sdl.cpp mixed/Linux/IXSupport/h/protocol sdlkey.h
 	g++ -Wall -pthread -g `sdl2-config --cflags --libs` --std=c++11 mixed/Linux/Support/sdl.cpp  -o sdl
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
 
 sdlkey.h: sdlkey
 	./sdlkey > sdlkey.h
 
 sdlkey: mixed/Linux/Support/sdlkey.c
 	gcc -std=gnu99 -Wall `sdl2-config --cflags --libs` mixed/Linux/Support/sdlkey.c -o sdlkey
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
 
 comma2attr: mixed/Linux/Support/comma2attr.c
 	gcc -std=gnu99 -g `pwd`/mixed/Linux/Support/comma2attr.c -o comma2attr
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
 
 mixed/Linux/Support/RISC_OS: mixed/Linux/Support/RISC_OS.xz
+	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 mixed/Linux/Support/RISC_OS.xz || true
 	xz --decompress --keep mixed/Linux/Support/RISC_OS.xz
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 
 rpcemu/stamp: ${RPCEMU}
 	rm -rf rpcemu rpcemu-0.8.15 || true
@@ -60,15 +65,20 @@ boot_iomd_rom: ${IOMD}
 	echo '18d56d246fea44e856f11b1173b1f132950e8e8aa145a8cf83836e28061b8544 *${IOMD}' | sha256sum -c
 	unzip -p '${IOMD}' "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > boot_iomd_rom
 	echo '222f7e5443e48071e1b41a1c8098071c6afc9a39973dfe17374aa1a2580df6a3 *boot_iomd_rom' | sha256sum -c
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 
 ${HARDDISC4}:
 	sh mixed/Linux/Support/download.sh '${HARDDISC4}' "https://www.riscosopen.org/zipfiles/platform/common/HardDisc4.5.22.zip?1429452894" "2b5c2eadb4b4d5cff1ae5dfbce1159c15b41720ef89dcf735062d86074f34083"
+	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${IOMD}:
 	sh mixed/Linux/Support/download.sh '${IOMD}' "https://www.riscosopen.org/zipfiles/platform/riscpc/IOMD-Soft.5.22.zip?1429651024" "18d56d246fea44e856f11b1173b1f132950e8e8aa145a8cf83836e28061b8544"
+	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${QEMU_SRC}:
 	sh mixed/Linux/Support/download.sh '${QEMU_SRC}' "http://wiki.qemu-project.org/download/qemu-2.8.0.tar.bz2" "dafd5d7f649907b6b617b822692f4c82e60cf29bc0fc58bc2036219b591e5e62"
+	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 $@ || true
 
 ${RPCEMU}:
 	sh mixed/Linux/Support/download.sh '${RPCEMU}' "http://www.marutan.net/rpcemu/cgi/download.php?sFName=0.8.15/rpcemu-0.8.15.tar.gz" "3f092e6000b5d50984e63768a74cdc9a40284d55c984e26df44c7d5875ced6e9"
+	setfattr -n user.RISC_OS.LoadExec -v 0x0089ffff00000000 $@ || true
