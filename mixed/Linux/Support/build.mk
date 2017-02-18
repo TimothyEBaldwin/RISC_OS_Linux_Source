@@ -58,7 +58,7 @@ all: ${QEMU} ${LINUX_ROM} comma2attr stamp-prepare
 	' )
 endif
 	chmod +x "Images/${TARGET}_rom"
-	ln -sfn Images/Linux_rom RISC_OS || true
+	ln -f Images/Linux_rom RISC_OS || true
 
 ifeq (${TARGET}, IOMD32)
 check: rpcemu/rpcemu HardDisc4/stamp all
