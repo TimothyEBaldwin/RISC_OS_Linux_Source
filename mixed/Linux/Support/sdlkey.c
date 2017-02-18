@@ -115,6 +115,6 @@ int main() {
   for(int i = 0; i < SDL_NUM_SCANCODES; ++i)
     printf("  %i,\n", out[i]);
 
-  printf("};\n");
+  printf("};\n#define KeyNo_Function12 (%i)\n", KeyNo_Function12);
 
 }

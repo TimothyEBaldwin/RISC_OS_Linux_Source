@@ -60,6 +60,7 @@ static const int mode_change = 5555;
 static const int screen_update = 5554;
 static const size_t screen_size = 1024*1024*100;
 static int sig_fd, sockets[2];
+static bool swapmouse;
 
 static inline off_t get_file_size(int fd) {
   struct stat s;
@@ -93,6 +94,20 @@ void refresh() {
 }
 
 int main(int argc, char **argv) {
+
+  if (argc > 1 && !strcmp(argv[1], "--chromebook")) {
+    --argc;
+    ++argv;
+    sdl2key[SDL_SCANCODE_F10] = KeyNo_Function12;
+    sdl2key[SDL_SCANCODE_F11] = KeyNo_Function12;
+  }
+
+  if (argc > 1 && !strcmp(argv[1], "--swapmouse")) {
+    --argc;
+    ++argv;
+    swapmouse = true;
+  }
+
   {
     sigset_t sigset;
     sigemptyset(&sigset);
@@ -276,11 +291,13 @@ int main(int argc, char **argv) {
       case SDL_MOUSEBUTTONDOWN:
         r.reason = report::ev_keydown;
         r.key.code = 0x70 + e.button.button - 1;
+        if (swapmouse && r.key.code != 0x70) r.key.code ^= 3;
         write(sockets[0], &r, sizeof(r));
         break;
       case SDL_MOUSEBUTTONUP:
         r.reason = report::ev_keyup;
         r.key.code = 0x70 + e.button.button - 1;
+        if (swapmouse && r.key.code != 0x70) r.key.code ^= 3;
         write(sockets[0], &r, sizeof(r));
         break;
       case SDL_MOUSEMOTION:
