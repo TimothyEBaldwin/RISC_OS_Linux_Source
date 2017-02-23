@@ -23,11 +23,21 @@ VFPASM       ?= TRUE
 RESDIR       ?= _!_x_!_
 RESFSDIR      = ${RESDIR}.BASIC
 
+# Build during install_rom phase to avoid race conditions.
+CUSTOMROM     = TRUE
+install_rom: install_rom${CUSTOMROM}
+rom:
+	@${NOP}
+
 ifeq ($(VFPASM),TRUE)
 ASFLAGS       = -PD "VFPAssembler SETL {TRUE}"
 SA_DEPEND     = VFPData
+
+# Only BASIC105 provides resources to avoid race conditions.
+ifeq (${COMPONENT},BASIC105)
 INSTRES_FILES = VFPData
 INSTRES_DEPENDS = VFPData
+endif
 
 s.VFPData: VFPLib.VFPLib VFPLib.GenData
 	BASIC { < VFPLib.GenData }
