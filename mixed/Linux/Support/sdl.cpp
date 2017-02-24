@@ -53,7 +53,7 @@ using std::cerr;
 using std::endl;
 
 
-#include "../IXSupport/h/protocol"
+#include "../SocketKVM/h/protocol"
 #include "../../../sdlkey.h"
 
 static const int mode_change = 5555;
