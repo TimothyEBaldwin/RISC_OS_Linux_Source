@@ -47,7 +47,7 @@ all: ${QEMU} ${LINUX_ROM} comma2attr stamp-prepare
 	rm "Images/${TARGET}_rom" || true
 	find * -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
 	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ${QEMU} ${LINUX_ROM} --nofork \
-	${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<${ACORN_CPP} 4< <(
+	${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<'${ACORN_CPP}' 4< <(
 	echo '*BASIC
 	*FX 3 2
 	*Dir IXFS:$$.dev.fd.${fd_BUILD_DIR}
@@ -76,7 +76,7 @@ endif
 fast: PHASES=install_rom join
 fast: check
 
-stamp-prepare:
+stamp-prepare: mixed/Linux/Support/build.mk
 	ln -sfn  mixed/RiscOS/Library
 	ln -sfn  mixed/RiscOS/Modules
 	ln -sfn castle/RiscOS/Env
@@ -84,12 +84,15 @@ stamp-prepare:
 	cp -a castle/RiscOS/Export .
 	mkdir -p Apps
 	(cd Apps && ln -sfn ../*/RiscOS/Apps/\!* .)
-	for i in amu c++ cc cfront cmhg link decaof libfile objasm ResGen; do \
-	  ln -sfn "/proc/self/fd/${fd_ACORN_CPP}/!SetPaths/Lib32/$$i,ff8" Library/Acorn/$$i,ff8; \
+	exec ${fd_ACORN_CPP}<'${ACORN_CPP}'
+	ac='/proc/self/fd/${fd_ACORN_CPP}'
+	for i in amu c++ cc cfront cmhg link decaof libfile objasm ResGen
+	do
+	  find $$ac/  \( -ipath "$$ac/!SetPaths/Lib32/$$i" -or -ipath "$$ac/!SetPaths/Lib32/$$i,???" \) -exec ln -sfn '{}' Library/Acorn/$$i,ff8 \;
 	done
 	mkdir -p Export/APCS-32/Lib/CLib/o
-	ln -sfn '/proc/self/fd/${fd_ACORN_CPP}/Libraries/c++lib' Export/APCS-32/Lib/c++lib
-	ln -sfn '/proc/self/fd/${fd_ACORN_CPP}/Libraries/CLib/o/stubs,ffd' Export/APCS-32/Lib/CLib/o/stubs_bootstrap
+	find $$ac/ \( -ipath "$$ac/Libraries/c++lib" -or -ipath "$$ac/Export/APCS-32/Lib/c++lib" \) -exec ln -sfn '{}' Export/APCS-32/Lib/c++lib \;
+	find $$ac/ \( -ipath "$$ac/Libraries/CLib/o/stubs*" -or -ipath "$$ac/Export/APCS-32/Lib/CLib/o/stubs*" \) -exec ln -sfn '{}' Export/APCS-32/Lib/CLib/o/stubs_bootstrap \;
 	touch stamp-prepare
 
 include mixed/Linux/Support/common.mk
