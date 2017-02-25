@@ -15,7 +15,8 @@ comma2attr: mixed/Linux/Support/comma2attr.c
 
 mixed/Linux/Support/RISC_OS: mixed/Linux/Support/RISC_OS.xz
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 mixed/Linux/Support/RISC_OS.xz || true
-	xz --force --decompress --keep mixed/Linux/Support/RISC_OS.xz
+	xz --force --decompress --stdout mixed/Linux/Support/RISC_OS.xz >$@
+	chmod +x $@
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 
 rpcemu/stamp: ${RPCEMU}
