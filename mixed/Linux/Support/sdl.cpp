@@ -54,7 +54,7 @@ using std::endl;
 
 
 #include "../SocketKVM/h/protocol"
-#include "../../../sdlkey.h"
+#include "sdlkey.h"
 
 static const int mode_change = 5555;
 static const int screen_update = 5554;
@@ -291,13 +291,13 @@ int main(int argc, char **argv) {
       case SDL_MOUSEBUTTONDOWN:
         r.reason = report::ev_keydown;
         r.key.code = 0x70 + e.button.button - 1;
-        if (swapmouse && r.key.code != 0x70) r.key.code ^= 3;
+        if (swapmouse && r.key.code != 0x70) r.key.code = r.key.code ^ 3;
         write(sockets[0], &r, sizeof(r));
         break;
       case SDL_MOUSEBUTTONUP:
         r.reason = report::ev_keyup;
         r.key.code = 0x70 + e.button.button - 1;
-        if (swapmouse && r.key.code != 0x70) r.key.code ^= 3;
+        if (swapmouse && r.key.code != 0x70) r.key.code = r.key.code ^ 3;
         write(sockets[0], &r, sizeof(r));
         break;
       case SDL_MOUSEMOTION:

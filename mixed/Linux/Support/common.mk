@@ -1,12 +1,12 @@
-sdl: mixed/Linux/Support/sdl.cpp mixed/Linux/SocketKVM/h/protocol sdlkey.h
-	g++ -Wall -pthread -g `sdl2-config --cflags --libs` --std=c++11 mixed/Linux/Support/sdl.cpp  -o sdl
+sdl: mixed/Linux/Support/sdl.cpp mixed/Linux/SocketKVM/h/protocol mixed/Linux/Support/sdlkey.h
+	g++ -Wall -pthread -g -O2 `sdl2-config --cflags --libs` --std=c++11 mixed/Linux/Support/sdl.cpp  -o sdl
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
 
-sdlkey.h: sdlkey
-	./sdlkey > sdlkey.h
+mixed/Linux/Support/sdlkey.h: mixed/Linux/Support/sdlkey
+	mixed/Linux/Support/sdlkey > $@
 
-sdlkey: mixed/Linux/Support/sdlkey.c
-	gcc -std=gnu99 -Wall `sdl2-config --cflags --libs` mixed/Linux/Support/sdlkey.c -o sdlkey
+mixed/Linux/Support/sdlkey: mixed/Linux/Support/sdlkey.c
+	gcc -std=gnu99 -Wall `sdl2-config --cflags --libs` mixed/Linux/Support/sdlkey.c -o $@
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
 
 comma2attr: mixed/Linux/Support/comma2attr.c
