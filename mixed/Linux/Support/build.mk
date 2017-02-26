@@ -26,12 +26,14 @@ SHELL=/bin/bash
 
 .ONESHELL:
 .DELETE_ON_ERROR:
-.PHONY: all clean
+.PHONY: all build check fast
 
 # *Set Alias$$Obey %%Obey -v %%*0\n
 
+all: build
+
 ifeq (${METHOD}, rpcemu)
-all: rpcemu/rpcemu boot_iomd_rom stamp-prepare
+build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 	rm "Images/${TARGET}_rom" || true
 	test ! -f done* || rm done*
 	echo '*Obey mixed.Linux.Support.Build rpcemu ${TARGET} ${PHASES}' > '!Boot,fea'
@@ -43,7 +45,7 @@ all: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 	rm done*
 	mv "Images/${TARGET}_rom",??? "Images/${TARGET}_rom" || true
 else
-all: ${QEMU} ${LINUX_ROM} comma2attr stamp-prepare
+build: ${QEMU} ${LINUX_ROM} comma2attr stamp-prepare
 	rm "Images/${TARGET}_rom" || true
 	find * -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
 	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ${QEMU} ${LINUX_ROM} --nofork \
