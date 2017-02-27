@@ -73,7 +73,7 @@ check: rpcemu/rpcemu HardDisc4/stamp all
 	test -f HardDisc4/done*
 else
 check: all ${QEMU}
-	printf '*BASIC\n*ChangeDynamicArea -ramfssize 8M\nREPEAT:UNTIL TIME>10:SYS "IXSupport_LinuxSyscall",,,,,,,,1\n!0=0\n' | timeout -sKILL 10 ${QEMU} "Images/${TARGET}_rom" --noaborts --nofork
+	mixed/Linux/Tests/runner.sh ${QEMU} ./RISC_OS
 endif
 
 fast: PHASES=install_rom join
