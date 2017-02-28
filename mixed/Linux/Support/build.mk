@@ -30,7 +30,7 @@ SHELL=/bin/bash
 
 # *Set Alias$$Obey %%Obey -v %%*0\n
 
-all: build
+all: check
 
 ifeq (${METHOD}, rpcemu)
 build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
