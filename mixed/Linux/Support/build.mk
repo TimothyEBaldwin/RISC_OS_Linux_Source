@@ -64,20 +64,23 @@ endif
 	$(MAKE) sdl || true
 
 ifeq (${TARGET}, IOMD32)
-check: rpcemu/rpcemu HardDisc4/stamp all
+check: rpcemu/rpcemu HardDisc4/stamp
 	echo "Create HostFS:$$.done" > HardDisc4/\!Boot/Choices/Boot/Tasks/ZZZ,feb
 	test ! -f HardDisc4/done* || rm HardDisc4/done*
 	timeout -sKILL 20 rpcemu/rpcemu ${fd_BOOT_IOMD_ROM}<"Images/${TARGET}_rom" ${fd_BUILD_DIR}<HardDisc4 || true
 	sleep 1
 	rm HardDisc4/\!Boot/Choices/Boot/Tasks/ZZZ,feb
 	test -f HardDisc4/done*
-else
-check: all ${QEMU}
+endif
+
+ifeq (${TARGET}, Linux)
+check: ${QEMU}
 	mixed/Linux/Tests/runner.sh ${QEMU} ./RISC_OS
 endif
 
 fast: PHASES=install_rom join
 fast: check
+check: build
 
 stamp-prepare: mixed/Linux/Support/build.mk
 	ln -sfn  mixed/RiscOS/Library
