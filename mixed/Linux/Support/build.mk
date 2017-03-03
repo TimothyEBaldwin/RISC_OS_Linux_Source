@@ -52,13 +52,12 @@ build: ${QEMU} ${LINUX_ROM} comma2attr stamp-prepare
 	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ${QEMU} ${LINUX_ROM} --nofork \
 	${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<'${ACORN_CPP}' 4< <(
 	echo '*BASIC
-	*FX 3 2
 	*SetEval ROOL$$MaxJobs ${JOBS}
 	*Dir IXFS:$$.dev.fd.${fd_BUILD_DIR}
 	PRINT TIME$$
 	TIME$$="$(shell date --utc "+%a,%0e %b %Y.%T")"
 	QUIT
-	*BASIC -quit mixed.Linux.Support.LockWriteC
+	*BASIC -quit mixed.Linux.Support.BufferWriteC
 	*Obey -c mixed.Linux.Support.Build Linux ${TARGET} ${PHASES}
 	' )
 endif
