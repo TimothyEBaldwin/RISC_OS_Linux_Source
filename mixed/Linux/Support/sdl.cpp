@@ -37,6 +37,7 @@
 #include <iostream>
 #include <cstring>
 
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -143,7 +144,10 @@ int main(int argc, char **argv) {
   pid_t pid = fork();
   if (!pid) {
     prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
-    dup2(sockets[1], 31);
+    int socket = fcntl(sockets[1], F_DUPFD, 31); // 31 for compatibilty with early RISC OS
+    char s[40];
+    sprintf(s, "RISC_OS_SocketKVM_Socket=%i", socket);
+    putenv(s);
 
     sigset_t sigset;
     sigemptyset(&sigset);
@@ -152,6 +156,7 @@ int main(int argc, char **argv) {
     if (getppid() == self) execvp(argv[1], argv + 1);
     _exit(1);
   }
+  close(sockets[1]);
 
   new std::thread {refresh};
   //new std::thread {watcher};
