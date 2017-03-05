@@ -8,7 +8,7 @@ IOMD=${HOME}/Downloads/IOMD-Soft.5.22.zip
 LINUX_ROM=mixed/Linux/Support/bin/!Boot/Linux/RISC_OS
 ACORN_CPP=../DDE/AcornC.C++
 
-QEMU=$(shell uname -m | grep -q arm || echo qemu/arm-linux-user/qemu-arm)
+QEMU=$(shell if uname -m | grep -q -E 'arm|aarch64'; then which env; else echo qemu/arm-linux-user/qemu-arm; fi)
 
 TARGET=Linux
 METHOD=Linux
@@ -45,10 +45,10 @@ build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 	rm done*
 	mv "Images/${TARGET}_rom",??? "Images/${TARGET}_rom" || true
 else
-build: ${QEMU} ${LINUX_ROM} comma2attr stamp-prepare
+build: run ${LINUX_ROM} comma2attr stamp-prepare
 	rm "Images/${TARGET}_rom" || true
 	find * -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
-	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ${QEMU} ${LINUX_ROM} --nofork \
+	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ./run ${LINUX_ROM} --nofork \
 	${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<'${ACORN_CPP}' 4< <(
 	echo '*BASIC
 	*FX 3 2
@@ -94,5 +94,8 @@ stamp-prepare: mixed/Linux/Support/build.mk
 	find $$ac/ \( -ipath "$$ac/Libraries/c++lib" -or -ipath "$$ac/Export/APCS-32/Lib/c++lib" \) -exec ln -sfn '{}' Export/APCS-32/Lib/c++lib \;
 	find $$ac/ \( -ipath "$$ac/Libraries/CLib/o/stubs*" -or -ipath "$$ac/Export/APCS-32/Lib/CLib/o/stubs*" \) -exec ln -sfn '{}' Export/APCS-32/Lib/CLib/o/stubs_bootstrap \;
 	touch stamp-prepare
+
+run: ${QEMU}
+	ln -sfn ${QEMU} run
 
 include mixed/Linux/Support/common.mk
