@@ -62,6 +62,8 @@ build: run ${LINUX_ROM} comma2attr stamp-prepare
 	TIME$$="$(shell date --utc "+%a,%0e %b %Y.%T")"
 	QUIT
 	*Obey -c mixed.Linux.Support.Build Linux ${TARGET} ${PHASES}
+	*BASIC
+	SYS "IXSupport_LinuxSyscall",2,,,,,,,1
 	END
 endif
 	chmod +x "Images/${TARGET}_rom"
