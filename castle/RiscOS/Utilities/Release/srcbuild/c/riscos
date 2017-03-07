@@ -1,0 +1,705 @@
+/* This source code in this file is licensed to You by Castle Technology
+ * Limited ("Castle") and its licensors on contractual terms and conditions
+ * ("Licence") which entitle you freely to modify and/or to distribute this
+ * source code subject to Your compliance with the terms of the Licence.
+ * 
+ * This source code has been made available to You without any warranties
+ * whatsoever. Consequently, Your use, modification and distribution of this
+ * source code is entirely at Your own risk and neither Castle, its licensors
+ * nor any other person who has contributed to this source code shall be
+ * liable to You for any loss or damage which You may suffer as a result of
+ * Your use, modification or distribution of this source code.
+ * 
+ * Full details of Your rights and obligations are set out in the Licence.
+ * You should have received a copy of the Licence with this source code file.
+ * If You have not received a copy, the text of the Licence is available
+ * online at www.castle-technology.co.uk/riscosbaselicence.htm
+ */
+/************************************************************************/
+/*                  Copyright 1996 Acorn Computers Ltd                  */
+/*                                                                      */
+/*  This material is the confidential trade secret and proprietary      */
+/*  information of Acorn Computers. It may not be reproduced, used      */
+/*  sold, or transferred to any third party without the prior written   */
+/*  consent of Acorn Computers. All rights reserved.                    */
+/*                                                                      */
+/************************************************************************/
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <errno.h>
+
+#include "host.h"
+#include "wholefls.h"
+#include "hash.h"
+
+#ifdef RISCOS
+#  include "kernel.h"
+#  include "swis.h"
+#  include "Global/Services.h"
+#else
+#  include "sys/wait.h"
+#endif
+
+#include "srcbuild.h"
+#include "riscos.h"
+#include "parse.h"
+
+/*
+ * contains all non-portable functions
+ */
+
+/*
+ * globals
+ */
+int spooling = FALSE;
+
+
+#ifdef RISCOS
+#else
+enum {
+  max_env_vars = 2000 /* Remember this includes all the territory mappings! */
+};
+static HashTable env;
+static HashId vars[max_env_vars];
+static int env_hwm = 0;
+static FILE *logfile;
+#endif
+
+/*
+ * change working directory
+ */
+int
+sb_chdir(const char *dir)
+{
+#ifdef RISCOS
+  return -!!_swix(OS_FSControl, _INR(0,1), 0, dir);
+#else
+  return chdir(dir);
+#endif
+}
+
+/*
+ * make directory
+ */
+int
+sb_mkdir(const char *dir, int mode)
+{
+#ifdef RISCOS
+  (void) mode;
+  return -!!_swix(OS_File, _INR(0,1)|_IN(4), 8, dir, 0);
+#else
+  int result = mkdir(dir, mode);
+  if (result == -1 && errno == EEXIST) result = 0;
+  return result;
+#endif
+}
+
+/*
+ * make directory (recursive if necessary)...
+ */
+int
+sb_mkdir_p(const char *dir, int mode)
+{
+  char buffer[BUFFER_LEN];
+
+#ifdef RISCOS
+  (void) mode;
+  sprintf(buffer, "mkdir -p %s", dir);
+#else
+  sprintf(buffer, "mkdir -m %o -p %s", mode, dir);
+#endif
+  return -!!sb_system(buffer);
+}
+
+/*
+ * open a spool session
+ */
+void
+spool_open(char *file)
+{
+  char *filename;
+  char buffer[BUFFER_LEN];
+#ifdef RISCOS
+  _kernel_swi_regs reg;
+
+  reg.r[0] = 199; /* OS_Byte reason code to read/write the spool file handle */
+  reg.r[1] = 0;
+  reg.r[2] = 255; /* read and don't change */
+  if (_kernel_swi(OS_Byte, &reg, &reg)) {
+    error(0, "failed to read spooling filehandle.");
+    return;
+  }
+
+  /* Were we already spooling? (either ourselves or somebody higher up!) */
+  if (reg.r[1] != 0)
+    return;
+
+  strcpy(buffer, "spool ");
+  filename = strchr(buffer, '\0');
+#else
+  if (logfile)
+    return;
+
+  filename = buffer;
+#endif
+
+  strcpy(buffer, "spool ");
+  sb_buildfilename(BUFFER_LEN, filename, build_dir, BUILDSYS_DIR, LOGS_DIR, file, NULL);
+
+  if (verbose)
+    sb_printf("Opening log file '%s'.\n", filename);
+
+#ifdef RISCOS
+  reg.r[0] = (int) buffer;
+  if (_kernel_swi(OS_CLI, &reg, &reg))
+    error(0, "failed to open log file %s.", filename);
+  else
+    spooling = TRUE;
+#else
+  /* Connect stdout and stderr to the logfile */
+  logfile = fopen(filename, "w");
+  if (logfile)
+    spooling = TRUE;
+  else
+    error(0, "unable to open log file %s.", filename);
+#endif
+}
+
+/*
+ * close a spool session
+ */
+void
+spool_close(char *file)
+{
+  char filename[BUFFER_LEN];
+  char tmp_filename[BUFFER_LEN];
+#ifdef RISCOS
+  _kernel_swi_regs reg;
+  FILE *fh = NULL;
+  FILE *fhtmp = NULL;
+  char c;
+
+  if (!spooling)
+    return;
+
+  sb_buildfilename(BUFFER_LEN, filename, build_dir, BUILDSYS_DIR, LOGS_DIR, file, NULL);
+
+  if (verbose)
+    sb_printf("Closing log file '%s'.\n", filename);
+
+  reg.r[0] = (int) "spool";
+  if (_kernel_swi(OS_CLI, &reg, &reg))
+    error(1, "cannot close spool to file '%s'", filename);
+
+  spooling = FALSE;
+
+  if ((fh = fopen(filename, "r")) == NULL)
+    error(1, "cannot open log file '%s'.", filename);
+
+  strcpy(tmp_filename, tmpnam(NULL));
+  if ((fhtmp = fopen(tmp_filename, "w")) == NULL)
+    error(1, "cannot open temp log file '%s'.", tmp_filename);
+
+  while (!feof(fh)) {
+    c = fgetc(fh);
+    if (!feof(fh)) {
+      if (c == 0x0d) {
+        c = fgetc(fh);
+        if (c != 0x0a)
+          fputc(0x0d, fhtmp);
+      } else if (c == 0x0a) {
+        c = fgetc(fh);
+        if (c != 0x0d)
+          fputc(0x0a, fhtmp);
+        else
+          c = 0x0a;
+      }
+      fputc(c, fhtmp);;
+    }
+  }
+
+  fclose(fh);
+  fclose(fhtmp);
+
+  remove(filename);
+  if (wf_rename(tmp_filename, filename))
+    error(1, "moving log file '%s'.", file);
+#else
+  if (spooling) {
+    /* close the file descriptors and re-attach to stdout/stderr */
+    fclose(logfile);
+    logfile = NULL;
+  }
+#endif
+}
+
+/*
+ * return the size of a file in bytes
+ */
+long
+sb_file_size(const char *file)
+{
+  return (long) wf_filesize((char *)file);
+}
+
+/*
+ * set an environment variable
+ */
+int
+sb_setenv(const char *name, const char *value)
+{
+#ifdef RISCOS
+  return (_kernel_setenv(name, value) == NULL) ? 0 : -1;
+#else
+  HashId varval;
+
+  if (!hash_enter(env, name, &varval)) {
+    free(hash_value(env, varval));
+  }
+
+  hash_assoc(env, varval, sb_strdup(value));
+  return 0;
+#endif
+}
+
+/*
+ * get an environment variable
+ */
+char *
+sb_getenv(const char *name)
+{
+#ifdef RISCOS
+  return getenv(name);
+#else
+  HashId varval;
+  char *val;
+
+  if (hash_enter(env, name, &varval)) {
+    if (env_hwm == max_env_vars) {
+      error(1, "out of environment information data space");
+    }
+    val = sb_strdup(getenv(name));
+    hash_assoc(env, varval, val);
+    vars[env_hwm++] = varval;
+  }
+  else {
+    val = hash_value(env, varval);
+  }
+
+  return hash_value(env, varval);
+#endif
+}
+
+/* Declare the environment ready to launch a new program (not RISC OS)
+ */
+char **sb_putenv(void)
+{
+#ifdef RISCOS
+  return NULL;
+#else
+  char **environment = malloc(sizeof(char *) * (env_hwm + 1));
+  int i, j;
+
+  for (i=j=0; i<env_hwm; ++i) {
+    char *key, *val;
+
+    key = hash_key(env, vars[i]);
+    val = hash_value(env, vars[i]);
+    if (val) {
+      /* printf("%s => %s\n", key, val); */
+      environment[j] = malloc(strlen(key) + 1 + strlen(val) + 1 + 2);
+      if (!environment[j]) {
+        error(1, "out of memory building the environment");
+      }
+      sprintf(environment[j], "%s=%s", key, val);
+      ++j;
+    }
+  }
+
+  environment[j] = NULL;
+
+  return environment;
+#endif
+}
+
+static void sb_preload_env(void)
+{
+#ifdef RISCOS
+  /* nothing to do */
+#else
+  extern char **environ;
+  char **envp;
+
+  for (envp = environ; *envp; ++envp) {
+    char *dup = sb_strdup(*envp);
+    dup[strcspn(dup,"=")] = '\0';
+    sb_getenv(dup);
+    free(dup);
+  }
+#endif
+}
+
+/*
+ * return the country code number of a passed in country.
+ * Returns -1 if it is not a valid country.
+*/
+int sb_return_country_number(const char* country)
+{
+  char *env = malloc(strlen(country) + sizeof(TERR_NUM_PFX));
+  char *val;
+  int result = -1;
+
+  if (env) {
+    sprintf(env, "%s%s", TERR_NUM_PFX, country);
+    val = sb_getenv(env);
+    free(env);
+    if (val) {
+      result = (int) strtoul(val, NULL, 0);
+      if (result == 0) result = -1;
+    }
+  }
+  else {
+    error(1, "out of memory in return_country_number");
+  }
+
+#ifdef RISCOS
+  if (result == -1) {
+    int unclaimed;
+
+    /* Service_International, sub-reason code 0 */
+    if (_swix(OS_ServiceCall, _INR(1,4)|_OUT(1)|_OUT(4),
+        Service_International, 0, country, 0,
+        &unclaimed, &result)
+        || unclaimed)
+          result = -1;
+  }
+#endif
+
+  return result;
+}
+
+/*
+ * copy objects (possibly an entire directory tree, possibly just a file)
+ */
+int sb_copy_objects(const char *destination, const char *source)
+{
+#ifdef RISCOS
+  return !!_swix(OS_FSControl, _INR(0,3), 26, source, destination, 1<<1 /* force */);
+#else
+  char buffer[BUFFER_LEN];
+  sprintf(buffer, "cp -r %s %s", source, destination);
+  system(buffer);
+  return 0;
+#endif
+}
+
+/*
+ * delete objects (possibly an entire directory tree, possibly just a file)
+ */
+
+int sb_wipe_objects(const char *source, int recurse)
+{
+#ifdef RISCOS
+  return !! _swix(OS_FSControl, _INR(0,1)|_IN(3), 27, source, (recurse?1:0)|(1<<1) /* recurse, force */);
+#else
+  char buffer[BUFFER_LEN];
+  sprintf(buffer, "rm -%sf %s", recurse ? "r" : "", source);
+  system(buffer);
+  return 0;
+#endif
+}
+
+
+/*
+ * Build up a filename from components, terminated by NULL
+ */
+int sb_buildfilename(int bufsize, char *buffer, ...)
+{
+  char *p = buffer, *arg;
+  va_list ap;
+
+  host_init();
+  va_start(ap, buffer);
+  while ((arg = va_arg(ap, char *)) != NULL) {
+    size_t length = strlen(arg) + 1;  /* includes dir sep or zero terminator */
+    if (length >= bufsize) break;
+    if (buffer != p) *p++ = host_dir_sep_char();
+    memcpy(p, arg, length - 1);
+    p += length - 1;
+    bufsize -= length - 1;
+  }
+  va_end(ap);
+
+  *p = '\0';
+  return p - buffer;
+}
+
+static void sb_init_territories(void)
+{
+  char temporary[32]; /* Magic - longer than all the following strings */
+
+  /* If you really do want to update this list of defaults, then you should probably
+   * use MkDefaults BASIC program in the docs directory to pull the current set out
+   * of the machine you are using (after softloading an updated International module
+   * of course.
+   */
+
+  (void) parse_territory_entry(strcpy(temporary, "1=UK"));
+  (void) parse_territory_entry(strcpy(temporary, "4=Italy"));
+  (void) parse_territory_entry(strcpy(temporary, "5=Spain"));
+  (void) parse_territory_entry(strcpy(temporary, "6=France"));
+  (void) parse_territory_entry(strcpy(temporary, "7=Germany"));
+  (void) parse_territory_entry(strcpy(temporary, "8=Portugal"));
+  (void) parse_territory_entry(strcpy(temporary, "9=Esperanto"));
+  (void) parse_territory_entry(strcpy(temporary, "10=Greece"));
+  (void) parse_territory_entry(strcpy(temporary, "11=Sweden"));
+  (void) parse_territory_entry(strcpy(temporary, "12=Finland"));
+  (void) parse_territory_entry(strcpy(temporary, "14=Denmark"));
+  (void) parse_territory_entry(strcpy(temporary, "15=Norway"));
+  (void) parse_territory_entry(strcpy(temporary, "16=Iceland"));
+  (void) parse_territory_entry(strcpy(temporary, "17=Canada1"));
+  (void) parse_territory_entry(strcpy(temporary, "18=Canada2"));
+  (void) parse_territory_entry(strcpy(temporary, "19=Canada"));
+  (void) parse_territory_entry(strcpy(temporary, "20=Turkey"));
+  (void) parse_territory_entry(strcpy(temporary, "22=Ireland"));
+  (void) parse_territory_entry(strcpy(temporary, "24=Russia"));
+  (void) parse_territory_entry(strcpy(temporary, "26=Israel"));
+  (void) parse_territory_entry(strcpy(temporary, "27=Mexico"));
+  (void) parse_territory_entry(strcpy(temporary, "28=LatinAm"));
+  (void) parse_territory_entry(strcpy(temporary, "29=Australia"));
+  (void) parse_territory_entry(strcpy(temporary, "30=Austria"));
+  (void) parse_territory_entry(strcpy(temporary, "31=Belgium"));
+  (void) parse_territory_entry(strcpy(temporary, "32=Japan"));
+  (void) parse_territory_entry(strcpy(temporary, "33=MiddleEast"));
+  (void) parse_territory_entry(strcpy(temporary, "34=Netherlands"));
+  (void) parse_territory_entry(strcpy(temporary, "35=Switzerland"));
+  (void) parse_territory_entry(strcpy(temporary, "36=Wales"));
+  (void) parse_territory_entry(strcpy(temporary, "48=USA"));
+  (void) parse_territory_entry(strcpy(temporary, "49=Wales2"));
+  (void) parse_territory_entry(strcpy(temporary, "50=China"));
+  (void) parse_territory_entry(strcpy(temporary, "51=Brazil"));
+  (void) parse_territory_entry(strcpy(temporary, "52=SAfrica"));
+  (void) parse_territory_entry(strcpy(temporary, "70=DvorakUK"));
+  (void) parse_territory_entry(strcpy(temporary, "71=DvorakUSA"));
+  (void) parse_territory_entry(strcpy(temporary, "80=ISO1"));
+}
+
+void sb_init(void)
+{
+#ifdef RISCOS
+#else
+  logfile = NULL;
+  env = hash_cinew(max_env_vars);
+  /* Now call sb_getenv(varname) for each variable you want to pass to the
+   * child tasks or use in this task explicitly, so that we can cache it
+   * in-process.
+   */
+#endif
+  sb_preload_env();
+  sb_init_territories();
+}
+
+#ifndef RISCOS
+static char **sb_makeargv(char *command)
+{
+  char **args, *space;
+  int arg_count = 0;
+
+  for (space = command; *space; ++arg_count) {
+    space += strcspn(space, " \t");
+    while (*space && isspace(*space)) ++space;
+  }
+
+  args = malloc(sizeof(char *) * (arg_count + 1));
+  if (!args) {
+    error(1, "out of memory allocating argv array");
+  }
+
+  for (space = command, arg_count = 0; *space; ++arg_count) {
+    args[arg_count] = space;
+    space += strcspn(space, " \t");
+    if (*space) *space++ = '\0';
+    while (*space && isspace(*space)) ++space;
+  }
+
+  args[arg_count] = NULL;
+
+  return args;
+}
+#endif
+
+#ifndef RISCOS
+static char *sb_resolve_path(char *command)
+{
+  char *path = sb_getenv("PATH"), *next;
+  char dir_sep = host_dir_sep_char();
+  char sep_str[4];
+  char buffer[BUFFER_LEN];
+
+  sep_str[0] = host_env_var_sep_char();
+  sep_str[1] = '\0';
+
+  while (*path) {
+    const size_t seg_len = strcspn(path, sep_str);
+    memcpy(buffer, path, seg_len);
+    buffer[seg_len] = dir_sep;
+    strcpy(buffer + seg_len + 1, command);
+    if (wf_filesize(buffer) > 0) return sb_strdup(buffer);
+    if (path[seg_len]) ++path;
+    path += seg_len;
+  }
+
+  return command;
+}
+#endif
+
+int sb_system(char *command)
+{
+#ifdef RISCOS
+  return system(command);
+#else
+  /* UNIX builds will fork() and exec() the child process.  Note that this function
+   * is written carefully to avoid building the environment in the parent process,
+   * avoid building the argument list in the parent process, avoid resolving the
+   * path in the parent process, and avoid destroying the command parameter in the
+   * parent process.
+   *
+   * With care, this routine could be extended to not wait() for children immediately
+   * but to simply remember the child PID and allow sb_system_sync to reap the children.
+   * It may even be preferable to create a signal handler to sit and wait for SIGCHLD.
+   */
+  pid_t pid;
+  int status = -1;
+  char **argv, **env, *path;
+  char buf[256];
+
+  fflush(stdout);
+  fflush(stderr);
+
+  pid = fork();
+  switch (pid) {
+    case -1:
+      error(1, "unable to fork()");
+      break;
+    case  0:
+       /* I am the child process and must never return */
+
+      if (getcwd(buf, sizeof(buf))) {
+        sb_setenv("PWD", buf);
+      }
+
+      argv = sb_makeargv(command); /* updates command to 0-terminate the filename */
+      env = sb_putenv();
+      path = sb_resolve_path(command);
+
+      /*
+      for (status = 0; argv[status]; ++status) printf("ARG: %s\n", argv[status]);
+      for (status = 0; env[status]; ++status) printf("ENV: %s\n", env[status]);
+      printf("flushing, and called execve ...\n");
+      fflush(stderr);
+      fflush(stdout);
+      */
+
+      close(2);
+      dup(1);
+      if (logfile) {
+        fclose(logfile);
+      }
+      execve(path, argv, env);
+      /* Must NOT allow the C library to interfere with the termination */
+      _exit(errno);
+      _exit(ENOEXEC);
+      break;
+    default:
+      /* I am the parent, pid is the child's PID */
+      wait(&status); /* return value should equal child's pid */
+      if ((status & 0xFF) == 0) {
+        status = (status & 0xFF00) >> 8;
+      }
+      break;
+  }
+
+  return status;
+#endif
+}
+
+void sb_system_sync(void)
+{
+#ifndef RISCOS
+  /* Nothing to do.  If we allow sb_system to fork and leave the task running in
+   * the background, we need to wait() for all the child processes to terminate
+   * here before returning.
+   */
+#endif
+}
+
+/* Function to duplicate a string (allocate memory and copy bytewise)
+ *
+ * Originally: sbrodie
+ *
+ * Parameters: const char *s1 - source string
+ * Result: char * - duplicate string (or NULL on failure or s1 NULL)
+ *
+ *
+ * Problems: None known
+ *
+ */
+
+char *sb_strdup(const char *s1)
+{
+  if (s1 == NULL) {
+    return NULL;
+  }
+  else {
+    const size_t length = strlen(s1) + 1;
+    char *const s2 = malloc(length);
+
+    if (s2 == NULL) return NULL;
+    return memcpy(s2, s1, length);
+  }
+}
+
+
+/* sb_printf/sb_fprintf - srcbuild's interfaces to these standard library
+ * routines takes into account the log file and copies the data to that too.
+ */
+int sb_printf(const char *fmt, ...)
+{
+  int result;
+
+  va_list ap;
+  va_start(ap, fmt);
+  result = vprintf(fmt, ap);
+  va_end(ap);
+#ifndef RISCOS
+  if (logfile) {
+    va_start(ap, fmt);
+    vfprintf(logfile, fmt, ap);
+    va_end(ap);
+  }
+#endif
+
+  return result;
+}
+
+int sb_fprintf(FILE *f, const char *fmt, ...)
+{
+  int result;
+
+  va_list ap;
+  va_start(ap, fmt);
+  result = vfprintf(f, fmt, ap);
+  va_end(ap);
+#ifndef RISCOS
+  if (logfile && f != logfile) {
+    va_start(ap, fmt);
+    vfprintf(logfile, fmt, ap);
+    va_end(ap);
+  }
+#endif
+
+  return result;
+}
