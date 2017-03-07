@@ -36,7 +36,7 @@ CINCLUDES = -IC:CLX -IC:
 CDEFINES  = -DRISCOS
 CFLAGS    = -Wc
 
-include StdTools
+include HostTools
 
 #
 # Libraries
