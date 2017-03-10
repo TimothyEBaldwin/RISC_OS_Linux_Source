@@ -30,26 +30,14 @@
 COMPONENT    = SocketKVM
 OBJS = main
 RESOURCES   = no
-CUSTOMROM=custom
 CUSTOMEXP=no
 CUSTOMRES=no
-
 CMHGDEPENDS = main
 
 include StdTools
 include CModule
 
-${DIRS} ::
-	${MKDIR} h
-
+ROM_SYMS += ${PVLIBS}
 CFLAGS += -Wpn -I<Lib$Dir>.Linux
-
-rom: ${ROM_OBJS_} ${DIRS}
-	@${ECHO} ${COMPONENT}: rom module built
-
-rom_link: ${ROM_OBJS_} ${ROM_LIBS} ${ROMCSTUBS} ${FORCEROMLINK} ${DIRS} ${ROM_DEPEND}
-	${LD} ${LDFLAGS} ${LDLINKFLAGS} -o ${LINKDIR}.${TARGET} -rmf -base ${ADDRESS} ${ROM_OBJS_} <Lib$Dir>.Linux.o.HALSyms ${ROM_LIBS} ${ROMCSTUBS} ${ABSSYM} -Symbols ${LINKDIR}.${TARGET}_sym
-
-
 
 include Depends
