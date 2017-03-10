@@ -104,9 +104,11 @@ ${TARGET_ROM}: o.fpe_rom
         ${LD} -rmf -o $@ o.fpe_rom
 
 o.fpe_ram: s.${MACHINE}
+	${MKDIR} o
         ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR_RAM}\"" s.${MACHINE} $@
 
 o.fpe_rom: s.${MACHINE}
+	${MKDIR} o
         ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR}\"" s.${MACHINE} $@
 
 ${EXP_HDR}.FPEmulator: hdr.FPEmulator
