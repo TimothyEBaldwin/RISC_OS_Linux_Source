@@ -64,4 +64,9 @@ resources: ;
 install_rom: HAL_Linux
 	${CP} HAL_Linux ${INSTDIR}.${TARGET} ${CPFLAGS}
 
+h.version:
+	Echo { > h.version }
+
+o.Main: h.version
+
 include Depends
