@@ -51,7 +51,7 @@ build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 else
 build: run ${LINUX_ROM} comma2attr stamp-prepare
 	rm "Images/${TARGET}_rom" || true
-	find '${ACORN_CPP}' * -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
+	find '${ACORN_CPP}' ./* -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
 	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ./run ${LINUX_ROM} --nofork \
 	  ${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<'${ACORN_CPP}' 4<< 'END'
 	*BASIC
