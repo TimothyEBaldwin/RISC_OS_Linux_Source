@@ -1,0 +1,389 @@
+/*
+ * Copyright (c) 2015, Timothy Baldwin
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "SocketKVMHdr.h"
+
+#define ix_SYSCALL_branch 1
+#include "ix/syscalls.h"
+#include "ix/SocketKVM_Protocol.h"
+
+#include <stdbool.h>
+
+#include "swis.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Keyboard.h"
+#include "Global/Pointer.h"
+#include "Global/VduExt.h"
+#include "Global/GraphicsV.h"
+#include "Global/OSMem.h"
+#include "Global/HALEntries.h"
+#include "Global/ModHand.h"
+#include "Global/VIDCList.h"
+
+#include "oslib/wimp.h"
+
+static int socket = -1;
+static int gv_id;
+static volatile bool mode_sync;
+static unsigned currentX, currentY;
+static volatile int poll_word;
+
+#define POLL_CLOSE 1
+#define POLL_RESIZE 2
+
+// Used for new wimp mode
+// Written by interrupt handler, read by wimp task
+static struct mode_block {
+  unsigned flags;
+  volatile unsigned x, y;
+  unsigned log2bpp, frame_rate;
+  unsigned ex_id, ex, ey_id, ey;
+  int end;
+} mode = {
+  .flags = 1,
+  .frame_rate = 50,
+  .ex_id = VduExt_XEigFactor,
+  .ey_id = VduExt_YEigFactor,
+  .end = -1
+};
+
+static struct {
+  int x, y, end;
+} EigFactor;
+
+static int state;
+
+int main(int argc, char *argv[]) {
+  {
+    state = 3;
+    _swi(Wimp_Initialise, _INR(0, 3), 380, 0x4B534154, "SocketKVM Resize", 0);
+    struct close_ctl c = {c_close_ctl, 1};
+    ix_write(socket, &c, sizeof(c));
+    state = 4;
+  }
+  union wimp_block block;
+  unsigned mask = wimp_MASK_NULL | wimp_GIVEN_POLLWORD;
+  while(true) {
+    int reason = _swi(Wimp_Poll, _INR(0, 1) | _IN(3) | _RETURN(0), mask, &block, &poll_word);
+    switch (reason) {
+      case wimp_USER_MESSAGE:
+      case wimp_USER_MESSAGE_RECORDED: {
+        state = 0;
+        struct close_ctl c = {c_close_ctl, 0};
+        ix_write(socket, &c, sizeof(c));
+        return 0;
+      }
+
+      case  wimp_POLLWORD_NON_ZERO: {
+
+        // FIXME Be careful about race conditions
+        int poll_word2 = poll_word;
+        poll_word = 0;
+
+        if (poll_word2 & POLL_CLOSE) {
+          _swi(0x42682, _IN(0), 1 << 6); // Call TaskManger_Shutdown
+        }
+
+        if (poll_word2 & POLL_RESIZE && (currentX != mode.x || currentY != mode.y)) {
+          // Tell display process to disable screen updates until screen redrawn
+          struct suspend s = {c_suspend, 1000};
+          ix_write(socket, &s, sizeof(s));
+
+          // Change wimp mode
+          mode.ex = EigFactor.x;
+          mode.ey = EigFactor.y;
+          _swix(Wimp_SetMode, _IN(0), &mode);
+          mask = 0;
+        }
+        break;
+      }
+
+      case wimp_NULL_REASON_CODE: {
+        struct suspend s = {c_suspend, 0};
+        ix_write(socket, &s, sizeof(s));
+        mask = wimp_MASK_NULL | wimp_GIVEN_POLLWORD;
+        break;
+      }
+    }
+  }
+}
+
+void sc_handler(int service_number, _kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  switch(service_number) {
+    case Service_StartWimp:
+      if (state == 0) {
+        state = 1;
+        r->r[0] = (unsigned)"Desktop_SocketKVM";
+        r->r[1] = 0;
+      }
+      break;
+
+    case Service_StartedWimp:
+      if (state < 4) state = 0;
+      break;
+
+    case Service_Memory:
+      if (state == 3) r->r[1] = 0;
+      break;
+
+    case Service_ModeExtension: {
+      if (r->r[2] <= 255 || (r->r[2] & 3)) break;
+      struct {
+        unsigned flags, x, y, log2bpp, frame_rate;
+      } *mode = (void*)r->r[2];
+      static VIDCList3 vl;
+      vl.Type = 3;
+      vl.PixelDepth = mode->log2bpp;
+      vl.HorizDisplaySize = mode->x;
+      vl.VertiDisplaySize = mode->y;
+      vl.PixelRate = mode->x * mode->y * mode->frame_rate;
+      vl.ControlList[0].index = -1;
+      r->r[1] = 0;
+      r->r[3] = (unsigned)&vl;
+      r->r[4] = 0;
+      break;
+    }
+  }
+}
+
+_kernel_oserror *start(const char *arg_string, int argc, int cmd_no, void *pw) {
+  state = 2;
+  _kernel_oscli("WimpSlot 16K 16K");
+  return _swix(OS_Module, _INR(0, 2), ModHandReason_Enter, Module_Title, "");
+}
+
+_kernel_oserror *init(const char *cmd_tail, int podule_base, void *pw) {
+  const char *s = getenv("SocketKVM$Socket");
+  if (s) socket = atoi(s);
+
+  if (socket) {
+    _swi(OS_Claim, _INR(0, 2), KEYV, &Keyv, pw);
+    _swi(OS_CallAVector, _INR(0, 2) | _IN(9), 0, 2, 0x4E6F4B64, KEYV);
+  } else {
+    socket = -1;
+  }
+  return 0;
+}
+
+_kernel_oserror *final(int fatal, int podule, void *pw) {
+  (void)pw;
+  _kernel_oserror *e = 0;
+  return e;
+}
+
+int Keyv_handler(_kernel_swi_regs *regs, void *pw) {
+  (void)regs;
+  (void)pw;
+  if (regs->r[0] == 4) {
+    if (socket != -1) {
+      _swi(OS_ClaimDeviceVector, _INR(0, 2), socket, Socket_Ready, pw);
+      _swi(OS_Hardware, _IN(0) | _INR(8, 9), socket, 0, EntryNo_HAL_IRQEnable);
+      struct version v;
+      v.reason = c_version;
+      v.version = 2;
+      ix_write(socket, &v, sizeof(v));
+    }
+    _swi(OS_ScreenMode, _INR(0, 2) | _OUT(0), ScreenModeReason_RegisterDriver, 0, "Linux Socket Video", &gv_id);
+    _swi(OS_Claim, _INR(0, 2), GraphicsV, &Graphics, pw);
+    _swi(OS_ScreenMode, _INR(0, 2), ScreenModeReason_StartDriver, gv_id, "Linux Socket Video");
+  }
+  return 1;
+}
+
+int Socket_Ready_handler(_kernel_swi_regs *regs, void *pw) {
+  (void)regs;
+  (void)pw;
+
+  _swi(OS_Hardware, _IN(0) | _INR(8, 9), socket, 0, EntryNo_HAL_IRQClear);
+
+  char *c;
+  union report r;
+  while(ix_recv(socket, &r, sizeof(r), ix_MSG_DONTWAIT) > 1) {
+    switch(r.reason) {
+      case ev_mouse:
+        _swix(OS_CallAVector, _INR(0, 4) | _IN(9), PointerReason_Report, 3, r.mouse.x << EigFactor.x, (currentY - r.mouse.y - 1) << EigFactor.y, 0x6f736241, PointerV);
+        break;
+
+      case ev_keydown:
+        _swix(OS_CallAVector, _INR(0, 1) | _IN(9), KeyV_KeyDown, r.key.code, KEYV);
+        break;
+
+      case ev_keyup:
+        _swix(OS_CallAVector, _INR(0, 1) | _IN(9), KeyV_KeyUp, r.key.code, KEYV);
+        break;
+
+      case ev_mode_sync:
+        mode_sync = false;
+        break;
+
+      case ev_resize:
+        mode.x = r.mouse.x;
+        mode.y = r.mouse.y;
+        poll_word |= POLL_RESIZE;
+        break;
+
+      case ev_close:
+        poll_word |= POLL_CLOSE;
+        break;
+    }
+  }
+  return 0;
+}
+
+
+static const unsigned formats[] = {
+  0xFF, ModeFlag_FullPalette, 3,
+  0xFFFF, 0, 4,
+  0xFFFFFFFF, 0, 5,
+};
+
+struct shape_t {
+  uint8_t width;      /* unpadded width in bytes (see notes) */
+  uint8_t height;     /* in pixels */
+  uint8_t padding[2]; /* 2 bytes of padding for field alignment */
+  void   *buffLA;     /* logical address of buffer holding pixel data */
+  void   *buffPA;     /* corresponding physical address of buffer */
+  uint8_t active_x;
+  uint8_t active_y;
+};
+
+int Graphics_handler(_kernel_swi_regs *r, void *pw) {
+  //eprintf("In GraphicsV %02x %08x\n", gv_id, r->r[4]);
+
+  if (((unsigned)r->r[4]) >> 24 != gv_id) return 1;
+  switch(r->r[4] & 0xFFFFFF) {
+
+    case GraphicsV_DisplayFeatures:
+      r->r[0] = GVDisplayFeature_HardwarePointer | GVDisplayFeature_NoVsyncIRQ;
+      r->r[1] = 0x38;
+      r->r[2] = 2;
+      r->r[4] = 8;
+      break;
+
+    case GraphicsV_SetDMAAddress:
+      switch (r->r[0]) {
+        case 0: {
+            struct activescreen activescr;
+            activescr.reason= c_activescreen;
+            activescr.address = (r->r[1]);
+            ix_write(socket, &activescr, sizeof(activescr));
+          }
+          break;
+        case 1: {
+            struct startscreen st;
+            st.reason = c_startscreen;
+            st.address = (r->r[1]);
+            ix_write(socket, &st, sizeof(st));
+          }
+          break;
+        default:
+          break;
+      }
+      r->r[4] = 0;
+      break;
+
+    case GraphicsV_VetMode: {
+      int *v = (int*)r->r[0];
+      r->r[0] = v[0] != 3 || v[1] < 3 || v[1] > 5;
+      r->r[4] = 0;
+      break;
+    }
+
+    case GraphicsV_SetMode: {
+      int *v = (int*)r->r[0];
+      mode.log2bpp = v[1];
+      currentX = v[5];
+      currentY = v[11];
+      int i = 16;
+      while(v[i] != -1) i += 2;
+      int x = c_mode_change;
+      struct ix_iovec iov[] = {
+        {&x, sizeof(x)},
+        {v, (i + 1) * 4},
+      };
+      struct ix_cmsghdr_fd cmsg = {
+        .cmsg_len = sizeof(cmsg),
+        .cmsg_level = 1, // SOL_SOCKET
+        .cmsg_type = 1, // SCM_RIGHTS
+      };
+      _swi(OS_DynamicArea, _INR(0, 2) | _OUT(3), DAReason_AlterFile, 2, -1, &cmsg.fd);
+      struct ix_msghdr msg = {
+        .msg_iov = iov,
+        .msg_iovlen = 2,
+        .msg_control = &cmsg,
+        .msg_controllen = sizeof(cmsg),
+      };
+      if (socket != -1) {
+        mode_sync = true;
+        ix_sendmsg(socket, &msg, 0);
+        while(mode_sync);
+      }
+      r->r[4] = 0;
+      EigFactor.x = VduExt_XEigFactor;
+      EigFactor.y = VduExt_YEigFactor;
+      EigFactor.end = -1;
+      _swi(OS_ReadVduVariables, _INR(0,1), &EigFactor, &EigFactor);
+      break;
+    }
+
+    case GraphicsV_WritePaletteEntry: {
+      struct palette p;
+      p.reason = c_set_palette;
+      p.type = r->r[0];
+      p.colour = r->r[1];
+      p.index = r->r[2];
+      ix_write(socket, &p, sizeof(p));
+      r->r[4] = 0;
+      break;
+    }
+
+    case GraphicsV_PixelFormats:
+      r->r[0] = (unsigned)formats;
+      r->r[1] = sizeof(formats) / 12;
+      r->r[4] = 0;
+      break;
+
+    case GraphicsV_UpdatePointer:
+      if (r->r[0] & 2) {
+        struct shape_t *s = (void*) r->r[3];
+        struct pointer p = {
+          c_pointer,
+          s->width,
+          s->height,
+          s->active_x,
+          s->active_y,
+          r->r[0] & 1,
+        };
+        struct ix_iovec iov[] = {
+          {&p, sizeof(p)},
+          {s->buffLA, 8 * s->height},
+        };
+        ix_writev(socket, iov, 2);
+      }
+      break;
+
+    default:
+      //eprintf("In GraphicsV %i\n", r->r[4] & 0xFFFFFF);
+      break;
+  }
+  return 1;
+}
