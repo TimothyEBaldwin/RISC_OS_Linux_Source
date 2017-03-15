@@ -8,6 +8,7 @@ IOMD=${HOME}/Downloads/IOMD-Soft.5.22.zip
 LINUX_ROM=mixed/Linux/Support/bin/!Boot/Linux/RISC_OS
 ACORN_CPP=../DDE/AcornC.C++
 
+#JOBS=$(shell getconf _NPROCESSORS_ONLN)
 QEMU=$(shell if uname -m | grep -q -E 'arm|aarch64'; then which env; else echo qemu/arm-linux-user/qemu-arm; fi)
 
 TARGET=Linux
@@ -56,6 +57,7 @@ build: run ${LINUX_ROM} comma2attr stamp-prepare
 	*BASIC
 	*Set Run$$Path IXFS:$$.dev.fd.${fd_ACORN_CPP}.!SetPaths.Lib32.,<Run$$Path>
 	*Set C$$Path IXFS:$$.dev.fd.${fd_ACORN_CPP}.Export.APCS-32.Lib.c++lib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Libraries.c++lib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Export.APCS-32.Lib.CLib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Libraries.CLib.
+	*SetEval ROOL$$MaxJobs ${JOBS}
 	*Dir IXFS:$$.dev.fd.${fd_BUILD_DIR}
 	PRINT TIME$$
 	TIME$$="$(shell date --utc "+%a,%0e %b %Y.%T")"
