@@ -79,6 +79,11 @@ check: rpcemu/rpcemu HardDisc4/stamp
 	test -f HardDisc4/done*
 endif
 
+ifeq (${TARGET}, Linux)
+check: run comma2attr
+	mixed/Linux/Tests/runner.sh ./run ./RISC_OS
+endif
+
 fast: PHASES=install_rom join
 fast: check
 check: build
