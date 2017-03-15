@@ -13,3 +13,13 @@ timeout --foreground -sKILL 30 $* --nofork --noaborts << 'END'
 RUN
 !0=0
 END
+
+(
+cat << 'END'
+*AppSlot 10M
+*ChangeDynamicArea -ramfssize 8M
+*BASIC
+END
+cat -n < mixed/Linux/Tests/Lib
+cat < mixed/Linux/Tests/Exec,ffe
+) | timeout --foreground -sKILL 60 $* --nofork 3>/dev/null 2>&1
