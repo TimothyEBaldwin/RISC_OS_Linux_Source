@@ -9,17 +9,9 @@ timeout --foreground -sKILL 30 $* --nofork --noaborts << 'END'
 3 *ChangeDynamicArea -ramfssize 8M
 4 TIME=0
 5 REPEAT:UNTIL TIME>10
-6 A%=0:H%=1:CALL &33000050
+6 SYS "IXSupport_LinuxSyscall",,,,,,,,1
 RUN
 !0=0
 END
 
-(
-cat << 'END'
-*AppSlot 10M
-*ChangeDynamicArea -ramfssize 8M
-*BASIC
-END
-cat -n < mixed/Linux/Tests/Lib
-cat < mixed/Linux/Tests/Exec,ffe
-) | timeout --foreground -sKILL 60 $* --nofork 3>/dev/null 2>&1
+RISC_OS_Alias_IXFSBoot="Exec IXFS:$.proc.self.cwd.mixed.Linux.Tests.Exec" timeout --foreground -sKILL 60 $* --nofork 3>/dev/null 2>&1
