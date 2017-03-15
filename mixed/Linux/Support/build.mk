@@ -36,7 +36,10 @@ ifeq (${METHOD}, rpcemu)
 build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 	rm "Images/${TARGET}_rom" || true
 	test ! -f done* || rm done*
-	echo '*Obey mixed.Linux.Support.Build rpcemu ${TARGET} ${PHASES}' > '!Boot,fea'
+	ln -sfn /dev/fd/${fd_ACORN_CPP} AcornC.C++
+	echo '*Set Run$$Path HostFS:$$.AcornC/C++.!SetPaths.Lib32.,<Run$$Path>
+	*Set C$$Path HostFS:$$.AcornC/C++.Export.APCS-32.Lib.c++lib.,HostFS:$$.AcornC/C++.Libraries.c++lib.,HostFS:$$.AcornC/C++.Export.APCS-32.Lib.CLib.,HostFS:$$.AcornC/C++.Libraries.CLib.
+	*Obey mixed.Linux.Support.Build rpcemu ${TARGET} ${PHASES}' > '!Boot,fea'
 	rpcemu/rpcemu ${fd_BOOT_IOMD_ROM}< boot_iomd_rom \
 	  ${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<${ACORN_CPP} &
 	until test -f done*; do sleep 1; done
@@ -47,11 +50,13 @@ build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 else
 build: run ${LINUX_ROM} comma2attr stamp-prepare
 	rm "Images/${TARGET}_rom" || true
-	find * -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
+	find '${ACORN_CPP}' * -depth -exec ./comma2attr -- '{}' + ${fd_ACORN_CPP}<${ACORN_CPP} || true
 	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ./run ${LINUX_ROM} --nofork \
 	  ${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<'${ACORN_CPP}' 4<< 'END'
 	*BASIC
 	*FX 3 2
+	*Set Run$$Path IXFS:$$.dev.fd.${fd_ACORN_CPP}.!SetPaths.Lib32.,<Run$$Path>
+	*Set C$$Path IXFS:$$.dev.fd.${fd_ACORN_CPP}.Export.APCS-32.Lib.c++lib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Libraries.c++lib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Export.APCS-32.Lib.CLib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Libraries.CLib.
 	*Dir IXFS:$$.dev.fd.${fd_BUILD_DIR}
 	PRINT TIME$$
 	TIME$$="$(shell date --utc "+%a,%0e %b %Y.%T")"
@@ -77,6 +82,7 @@ fast: check
 check: build
 
 stamp-prepare: mixed/Linux/Support/build.mk
+	test -f Makefile || ln -s mixed/Linux/Support/build.mk Makefile
 	ln -sfn  mixed/RiscOS/Library
 	ln -sfn  mixed/RiscOS/Modules
 	ln -sfn castle/RiscOS/Env
@@ -84,15 +90,6 @@ stamp-prepare: mixed/Linux/Support/build.mk
 	cp -a castle/RiscOS/Export .
 	mkdir -p Apps
 	(cd Apps && ln -sfn ../*/RiscOS/Apps/\!* .)
-	exec ${fd_ACORN_CPP}<'${ACORN_CPP}'
-	ac='/proc/self/fd/${fd_ACORN_CPP}'
-	for i in amu c++ cc cfront cmhg link decaof libfile objasm ResGen
-	do
-	  find $$ac/  \( -ipath "$$ac/!SetPaths/Lib32/$$i" -or -ipath "$$ac/!SetPaths/Lib32/$$i,???" \) -exec ln -sfn '{}' Library/Acorn/$$i,ff8 \;
-	done
-	mkdir -p Export/APCS-32/Lib/CLib/o
-	find $$ac/ \( -ipath "$$ac/Libraries/c++lib" -or -ipath "$$ac/Export/APCS-32/Lib/c++lib" \) -exec ln -sfn '{}' Export/APCS-32/Lib/c++lib \;
-	find $$ac/ \( -ipath "$$ac/Libraries/CLib/o/stubs*" -or -ipath "$$ac/Export/APCS-32/Lib/CLib/o/stubs*" \) -exec ln -sfn '{}' Export/APCS-32/Lib/CLib/o/stubs_bootstrap \;
 	touch stamp-prepare
 
 run: ${QEMU}

@@ -46,8 +46,8 @@ rpcemu/rpcemu: rpcemu/src/Makefile
 	wWSZGWgP+EUYGJb8FXD8z5jIIAgV+0CMRm5GBgYTBgYAXYSkcwABAAA= | base64 -d | gzip -d > rpcemu/cmos.ram
 	cp mixed/Linux/Support/rpcemu.cfg rpcemu/rpc.cfg
 	rm -rf rpcemu/hostfs || true
-	ln -sfn /proc/self/fd/${fd_BUILD_DIR} rpcemu/hostfs
-	ln -sfn /proc/self/fd/${fd_BOOT_IOMD_ROM} rpcemu/roms/ROM
+	ln -sfn /dev/fd/${fd_BUILD_DIR} rpcemu/hostfs
+	ln -sfn /dev/fd/${fd_BOOT_IOMD_ROM} rpcemu/roms/ROM
 
 qemu/stamp: ${QEMU_SRC}
 	rm -rf qemu qemu-2.8.0
