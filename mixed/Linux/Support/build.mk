@@ -54,14 +54,13 @@ build: run ${LINUX_ROM} comma2attr stamp-prepare
 	RISC_OS_Alias_IXFSBoot='Exec IXFS:$$.dev.fd.4' ./run ${LINUX_ROM} --nofork \
 	  ${fd_BUILD_DIR}<. ${fd_ACORN_CPP}<'${ACORN_CPP}' 4<< 'END'
 	*BASIC
-	*FX 3 2
 	*Set Run$$Path IXFS:$$.dev.fd.${fd_ACORN_CPP}.!SetPaths.Lib32.,<Run$$Path>
 	*Set C$$Path IXFS:$$.dev.fd.${fd_ACORN_CPP}.Export.APCS-32.Lib.c++lib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Libraries.c++lib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Export.APCS-32.Lib.CLib.,IXFS:$$.dev.fd.${fd_ACORN_CPP}.Libraries.CLib.
 	*Dir IXFS:$$.dev.fd.${fd_BUILD_DIR}
 	PRINT TIME$$
 	TIME$$="$(shell date --utc "+%a,%0e %b %Y.%T")"
 	QUIT
-	*BASIC -quit mixed.Linux.Support.LockWriteC
+	*BASIC -quit mixed.Linux.Support.BufferWriteC
 	*Obey -c mixed.Linux.Support.Build Linux ${TARGET} ${PHASES}
 	*BASIC
 	SYS "IXSupport_LinuxSyscall",2,,,,,,,1
