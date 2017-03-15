@@ -33,6 +33,7 @@
 
 #include <asm/fcntl.h>
 #include <asm/sigcontext.h>
+#include <linux/errno.h>
 #include <linux/fcntl.h>
 #include <linux/filter.h>
 #include <linux/prctl.h>
@@ -454,6 +455,76 @@ swi:
   ENTER_EXCEPTION(SVC, 1, 0)
 }
 
+#define WIFSTOPPED(status) (((status) & 0xff) == 0x7f)
+#define WSTOPSIG(status)   (((status) & 0xff00) >> 8)
+
+static inline bool do_syscall(int child, struct vcpu* restrict vcpu) {
+  unsigned r[18];
+
+  // Read registers
+  ix_ptrace(PTRACE_GETREGS, child, 0, (int)r);
+
+  if (r[15] != 4+(unsigned)&__PVirt_syscall && r[15] < 0xFFFFF000) {
+
+    // Switch to SVC mode
+    uint32_t mode = vcpu->cpsr & 0x1F;
+    struct vmode* vmode = (struct vmode *)((char *)vcpu + __PVirt_VModeOffsets[mode]);
+    vmode->r13 = r[13];
+    vmode->r14 = r[14];
+    r[13] = vcpu->SVC.r13;
+    r[14] = vcpu->SVC.r14;
+
+    vcpu->SVC.spsr = (r[16] & ~VBITS) | vcpu->cpsr;
+    vcpu->cpsr = SVC_MODE | PSR_I_BIT;
+
+    // Call SWI vector upon return
+    r[14] = r[15];
+    r[15] = vcpu->vectors[1];
+
+    // Don't enter Linux system call.
+    ix_ptrace(PTRACE_SET_SYSCALL, child, 0, -1);
+
+    // Set registers
+    ix_ptrace(PTRACE_SETREGS, child, 0, (int)r);
+    return false;
+  }
+
+  return true;
+}
+
+void do_ptrace(int child) {
+  struct vcpu* vcpu = __kuser_get_tls();
+  int status;
+
+  // Set options
+  ix_waitpid(child, &status, __WALL);
+  ix_ptrace(PTRACE_SETOPTIONS, child, 0, PTRACE_O_TRACESYSGOOD);
+
+  bool in_syscall = false;
+  int signal = 0;
+  while(1) {
+
+    // Continue until SWI call (or signal).
+    ix_ptrace(PTRACE_SYSCALL, child, 0, signal);
+    ix_waitpid(child, &status, __WALL);
+
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80)) {
+      if (in_syscall) {
+        // SWI exit
+        in_syscall = false;
+      } else {
+        // SWI entry
+        in_syscall = do_syscall(child, vcpu);
+      }
+      signal = 0;
+    } else if (WIFSTOPPED(status)) {
+      signal = WSTOPSIG(status);
+    } else {
+      ix_exit(status >> 8);
+    }
+  }
+}
+
 static void signal2(int signal, signal_handler* handler) {
   struct sigaction2 sigact = {
     .u.sigaction = handler,
@@ -649,10 +720,7 @@ int main(int argc, char **argv) {
 }
 
 
-static void hal_run(void) {
-
-  // Set TLS pointer to vcpu struct.
-  ix_set_tls(&init_vcpu);
+static inline void init_swi(void) {
 
   // For SECCOMP2
   ix_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -685,12 +753,23 @@ static void hal_run(void) {
     .filter = filter
   };
 
-  int seccomp_result = ix_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (unsigned)&fprog, 0, 0);
+  if (ix_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (unsigned)&fprog, 0, 0) == 0) return;
 
-  // If seccomp fails try QEMU, exit on failure.
-  if (seccomp_result) {
-    ix_MESSAGE(2, "Trying QEMU SWI hack...");
-    __asm {
+  // If seccomp fails try ptrace.
+  if (ix_ptrace(PTRACE_CONT, ix_gettid(), 0, 0) != -ENOSYS) {
+    ix_MESSAGE(2, "Seccomp-bpf not available so using ptrace - This is slow.\n");
+    int ppid = ix_getpid();
+    start_ptrace();
+    ix_prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+    if (ix_getppid() != ppid) ix_exit(0);
+    ix_ptrace(PTRACE_TRACEME, 0, 0, 0);  // This is the child, start tracing.
+    ix_raise(SIGTRAP);
+    return;
+  }
+
+  // If seccomp and ptrace fail try QEMU, exit on failure.
+  ix_MESSAGE(2, "Seccomp-bpf and ptrace not available so trying QEMU SWI hack...");
+  __asm {
       MOV     r0, &__PVirt_syscall
       ADD     r1, r0, #4
       MOV     r2, #0
@@ -699,8 +778,15 @@ static void hal_run(void) {
       MOV     r0, #10
       MOV     r7, #__NR_exit
       SWI     0, {r0, r7}, {}, {lr, psr} // OS_WriteC or exit.
-    }
   }
+}
+
+static void hal_run(void) {
+
+  // Set TLS pointer to vcpu struct.
+  ix_set_tls(&init_vcpu);
+
+  init_swi();
 
   // Test SWI handling.
   ix_MESSAGE(2, "Hello ");
