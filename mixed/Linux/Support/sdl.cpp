@@ -50,6 +50,8 @@
 #include <sys/uio.h>
 #include <poll.h>
 
+#include <getopt.h>
+
 using std::cerr;
 using std::endl;
 
@@ -96,17 +98,23 @@ void refresh() {
 
 int main(int argc, char **argv) {
 
-  if (argc > 1 && !strcmp(argv[1], "--chromebook")) {
-    --argc;
-    ++argv;
-    sdl2key[SDL_SCANCODE_F10] = KeyNo_Function12;
-    sdl2key[SDL_SCANCODE_F11] = KeyNo_Function12;
-  }
+  struct option opts[] = {
+    {"chromebook", no_argument, nullptr, 'c'},
+    {"swapmouse", no_argument, nullptr, 's'},
+    {nullptr, 0, nullptr, 0}
+  };
 
-  if (argc > 1 && !strcmp(argv[1], "--swapmouse")) {
-    --argc;
-    ++argv;
-    swapmouse = true;
+  int opt;
+  while ((opt = getopt_long(argc, argv, "+cs", opts, nullptr)) != -1) {
+    switch (opt) {
+      case 's':
+        swapmouse = true;
+        break;
+      case 'c':
+        sdl2key[SDL_SCANCODE_F10] = KeyNo_Function12;
+        sdl2key[SDL_SCANCODE_F11] = KeyNo_Function12;
+        break;
+    }
   }
 
   {
@@ -153,7 +161,7 @@ int main(int argc, char **argv) {
     sigemptyset(&sigset);
     sigprocmask(SIG_SETMASK, &sigset, nullptr);
 
-    if (getppid() == self) execvp(argv[1], argv + 1);
+    if (getppid() == self) execvp(argv[optind], argv + optind);
     _exit(1);
   }
   close(sockets[1]);
