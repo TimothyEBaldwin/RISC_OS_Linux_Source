@@ -74,6 +74,6 @@ This following items will be download to ~/Downloads if needed:
 - [ ] Implement PMP dynamic areas.
 - [ ] Replace the changes that are labeled "Hack" 
 - [ ] Fix the race condition that causes !Edit to crash when loading growing files, it reliably crashes when trying to load it's own WimpSlot.
-- [ ] Replace the branch table at the beginning of the HAL.
+- [x] Replace the branch table at the beginning of the HAL.
 - [ ] Write test cases for VFP errors.
 - [ ] Implement VFPSupport.
