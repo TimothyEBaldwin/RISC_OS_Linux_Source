@@ -125,6 +125,26 @@ int main(int argc, char **argv) {
     sig_fd = signalfd(-1, &sigset, SFD_CLOEXEC | SFD_NONBLOCK);
   }
 
+  socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
+
+  pid_t self = getpid();
+  pid_t pid = fork();
+  if (!pid) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+    int socket = fcntl(sockets[1], F_DUPFD, 31); // 31 for compatibilty with early RISC OS
+    char s[40];
+    sprintf(s, "RISC_OS_SocketKVM_Socket=%i", socket);
+    putenv(s);
+
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigprocmask(SIG_SETMASK, &sigset, nullptr);
+
+    if (getppid() == self) execvp(argv[optind], argv + optind);
+    _exit(1);
+  }
+  close(sockets[1]);
+
   SDL_Init(SDL_INIT_VIDEO);
   SDL_Window *window = SDL_CreateWindow("RISC OS", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 
@@ -145,26 +165,6 @@ int main(int argc, char **argv) {
 
   SDL_Surface *screen = nullptr;
   SDL_Palette *palette = SDL_AllocPalette(256);
-
-  socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
-
-  pid_t self = getpid();
-  pid_t pid = fork();
-  if (!pid) {
-    prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
-    int socket = fcntl(sockets[1], F_DUPFD, 31); // 31 for compatibilty with early RISC OS
-    char s[40];
-    sprintf(s, "RISC_OS_SocketKVM_Socket=%i", socket);
-    putenv(s);
-
-    sigset_t sigset;
-    sigemptyset(&sigset);
-    sigprocmask(SIG_SETMASK, &sigset, nullptr);
-
-    if (getppid() == self) execvp(argv[optind], argv + optind);
-    _exit(1);
-  }
-  close(sockets[1]);
 
   new std::thread {refresh};
   //new std::thread {watcher};
