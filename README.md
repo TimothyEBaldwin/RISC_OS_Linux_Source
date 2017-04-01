@@ -60,7 +60,7 @@ This following items will be download to ~/Downloads if needed:
 ## To do List
 
 - [ ] Complete the key map.
-- [ ] Fix the realtime clock.
+- [x] Fix the realtime clock.
 - [x] Make data aborts raise errors.
 - [ ] Support writing timestamps in IXFS.
 - [ ] Officially allocate names and SWI numbers etc.
