@@ -28,7 +28,7 @@
 
 COMPONENT = HAL_Linux
 TARGET = HAL_Linux
-OBJS = o.Top o.Main o.CLib o.PVOps o.Tests
+OBJS = o.Top o.Main o.PVOps o.Tests
 
 include Makefiles:StdTools
 include Makefiles:StdRules
