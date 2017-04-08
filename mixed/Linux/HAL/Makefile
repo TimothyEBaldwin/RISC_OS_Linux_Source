@@ -65,7 +65,8 @@ install_rom: HAL_Linux
 	${CP} HAL_Linux ${INSTDIR}.${TARGET} ${CPFLAGS}
 
 h.version:
-	Echo { > h.version }
+	Create h.version 0
+	SetType h.version FFF
 
 o.Main: h.version
 
