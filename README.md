@@ -63,7 +63,7 @@ This following items will be download to ~/Downloads if needed:
 - [x] Fix the realtime clock.
 - [x] Make data aborts raise errors.
 - [x] Support writing timestamps in IXFS.
-- [ ] Support reading timestamps in IXFS to centisecond resolution.
+- [x] Support reading timestamps in IXFS to centisecond resolution.
 - [ ] Test timestamps.
 - [ ] Officially allocate names and SWI numbers etc.
 - [ ] Fix failure to truncate of unbuffered files when opened for output, and associated race condition.
