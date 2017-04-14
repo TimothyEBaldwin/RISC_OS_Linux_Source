@@ -29,6 +29,8 @@ HEADER1   = DeviceFS
 ASMCHEADER1  = DeviceFS
 EXPORTS      = ${C_EXP_HDR}.${ASMCHEADER1}
 
+ROM_LIBS     = ${PVLIBS}
+
 include StdTools
 include AAsmModule
 
