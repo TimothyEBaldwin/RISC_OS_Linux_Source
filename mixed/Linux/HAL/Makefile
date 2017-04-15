@@ -40,7 +40,7 @@ o._dirs:
 	${MKDIR} o
 	${TOUCH} $@
 
-HAL_Linux: ${OBJS} o._dirs
+HAL_Linux: ${OBJS} HALSyms o._dirs
 	${MKDIR} <Lib$Dir>.Linux.o
 	${MKDIR} <Lib$Dir>.Linux.s
 	${CP} HALSyms <Lib$Dir>.Linux.o.HALSyms F~C~N~V
