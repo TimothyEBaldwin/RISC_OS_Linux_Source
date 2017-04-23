@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 
 struct ro_attr {
   unsigned load, exec, attributes;
@@ -49,6 +50,7 @@ static int return_code = 0;
 static bool strip = false;
 static bool suffix_priority = false;
 static bool write_suffix = false;
+static bool recurse = false;
 
 static bool is_suffix(const char *end) {
   if (end[-4] != ',') return false;
@@ -59,9 +61,31 @@ static bool is_suffix(const char *end) {
   return true;
 }
 
-static void process(char *source) {
+static void process(int dirfd, char *source) {
   int r;
   int filetype = -1;
+
+  struct stat s;
+  r = fstatat(dirfd, source, &s, 0);
+  if (r) {
+    fprintf(stderr, "Unable to stat: %s\n", source);
+    return_code |= 2;
+    return;
+  }
+
+  if (recurse && S_ISDIR(s.st_mode)) {
+    int fd = openat(dirfd, source, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd >= 0) {
+      DIR *dir = fdopendir(fd);
+      struct dirent *e;
+      while(e = readdir(dir)) {
+        if (e->d_name[0] != '.' || (e->d_name[1] && (e->d_name[1] != '.' || e->d_name[2]))) process(fd, e->d_name);
+      }
+      closedir(dir);
+    }
+  }
+
+  fchdir(dirfd);
 
   if (strlen(source) > sizeof(dest)) {
     fprintf(stderr, "Name too long: %s\n", source);
@@ -70,14 +94,6 @@ static void process(char *source) {
   }
 
   char *end = stpcpy(dest, source);
-
-  struct stat s;
-  r = stat(source, &s);
-  if (r) {
-    fprintf(stderr, "Unable to stat: %s\n", source);
-    return_code |= 2;
-    return;
-  }
 
   struct ro_attr attr;
   int attr_len = getxattr(source, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
@@ -130,10 +146,13 @@ static void process(char *source) {
 int main(int argc, char **argv) {
   int opt;
 
-  while ((opt = getopt(argc, argv, "pws")) != -1) {
+  while ((opt = getopt(argc, argv, "prws")) != -1) {
     switch (opt) {
     case 'p':
       suffix_priority = true;
+      break;
+    case 'r':
+      recurse = true;
       break;
     case 'w':
       write_suffix = true;
@@ -153,13 +172,6 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  while(optind != argc) {
-    int r = fchdir(dirfd);
-    if (r) {
-      fprintf(stderr, "Unable to set CSD\n");
-      return 1;
-    }
-    process(argv[optind++]);
-  }
+  while(optind != argc) process(dirfd, argv[optind++]);
   return return_code;
 }
