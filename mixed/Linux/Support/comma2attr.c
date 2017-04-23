@@ -47,8 +47,8 @@ struct ro_attr {
 static char dest[PATH_MAX];
 static int return_code = 0;
 static bool strip = false;
-static bool attr2comma = false;
-static bool implicit_text = false;
+static bool suffix_priority = false;
+static bool write_suffix = false;
 
 static bool is_suffix(const char *end) {
   if (end[-4] != ',') return false;
@@ -61,7 +61,7 @@ static bool is_suffix(const char *end) {
 
 static void process(char *source) {
   int r;
-  int filetype = 0xFFF;
+  int filetype = -1;
 
   if (strlen(source) > sizeof(dest)) {
     fprintf(stderr, "Name too long: %s\n", source);
@@ -71,66 +71,57 @@ static void process(char *source) {
 
   char *end = stpcpy(dest, source);
 
-  if (attr2comma) {
+  struct stat s;
+  r = stat(source, &s);
+  if (r) {
+    fprintf(stderr, "Unable to stat: %s\n", source);
+    return_code |= 2;
+    return;
+  }
 
-    if (is_suffix(end)) {
-      end -= 4;
-    }
+  struct ro_attr attr;
+  int attr_len = getxattr(source, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
+  if (attr_len < 0  && errno != ENOATTR) {
+    fprintf(stderr, "Unable to read attribute: %s\n", source);
+    return_code |= 4;
+    return;
+  }
 
-    struct ro_attr attr;
-    r = getxattr(source, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
-    if (r < 0  && errno != ENOATTR) {
-      fprintf(stderr, "Unable to read attribute: %s\n", source);
-      return_code |= 4;
-      return;
-    }
+  bool suffixed = is_suffix(end);
 
-    if (r >= 8 && (attr.load & 0xFFF00000) == 0xFFF00000)
-      filetype = (attr.load >> 8) & 0xFFF;
+  if (attr_len >= 8 && (attr.load & 0xFFF00000) == 0xFFF00000) {
+    filetype = (attr.load >> 8) & 0xFFF;
+  }
 
-    if (filetype != 0xFFF) {
-      end += sprintf(end, ",%03x" , filetype);
-    }
-  } else {
-
-    struct stat s;
-    int r = stat(source, &s);
-    if (r) {
-      fprintf(stderr, "Unable to stat: %s\n", source);
-      return_code |= 2;
-      return;
-    }
-
-    if (is_suffix(end)) {
+  if (suffixed && (filetype == -1 || suffix_priority)) {
       filetype = strtoul(end - 3, 0, 16);
-      if (strip) end -= 4;
-    } else {
-      if (!implicit_text) return;
-    }
+  }
 
-    if (filetype == 0xFFF) {
-      r = removexattr(source, "user.RISC_OS.LoadExec");
-    } else {
-      uint64_t time = ((uint64_t)s.st_mtime + 25567ULL * 24 * 3600) * 100;
-      struct ro_attr attr;
-      attr.load = 0xFFF00000U | (time >> 32) | (filetype << 8);
-      attr.exec = (uint32_t)(time);
-      r = setxattr(source, "user.RISC_OS.LoadExec", &attr, 8, 0);
-    }
-    if (r && errno != ENODATA) {
-      fprintf(stderr, "Unable to set attribute: %s\n", source);
-      return_code |= 8;
-      return;
+  if (strip) {
+    if (suffixed) end -= 4;
+
+    if (write_suffix && filetype <= 0xFFF && !((s.st_mode & 0111) && filetype == 0xFE6))
+      end += sprintf(end, ",%03x" , filetype);
+
+    *end = 0;
+    if (strcmp(source, dest)) {
+      r = rename(source, dest);
+      if (r) {
+        fprintf(stderr, "Unable to rename: %s\n", source);
+        return_code |= 16;
+        return;
+      }
     }
   }
 
-  *end = 0;
-
-  if (strcmp(source, dest)) {
-    int r = rename(source, dest);
-    if (r) {
-      fprintf(stderr, "Unable to rename: %s\n", source);
-      return_code |= 16;
+  if (filetype >= 0) {
+    uint64_t time = ((uint64_t)s.st_mtime + 25567ULL * 24 * 3600) * 100;
+    attr.load = 0xFFF00000U | (time >> 32) | (filetype << 8);
+    attr.exec = (uint32_t)(time);
+    r = setxattr(source, "user.RISC_OS.LoadExec", &attr, 8, 0);
+    if (r && errno != ENODATA) {
+      fprintf(stderr, "Unable to set attribute: %s\n", source);
+      return_code |= 8;
       return;
     }
   }
@@ -139,16 +130,16 @@ static void process(char *source) {
 int main(int argc, char **argv) {
   int opt;
 
-  while ((opt = getopt(argc, argv, "sri")) != -1) {
+  while ((opt = getopt(argc, argv, "pws")) != -1) {
     switch (opt) {
+    case 'p':
+      suffix_priority = true;
+      break;
+    case 'w':
+      write_suffix = true;
+      // Fall though
     case 's':
       strip = true;
-      break;
-    case 'r':
-      attr2comma = true;
-      break;
-    case 'i':
-      implicit_text = true;
       break;
     default:
       fprintf(stderr, "usage\n");
