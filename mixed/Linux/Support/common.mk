@@ -47,7 +47,12 @@ rpcemu/stamp: ${RPCEMU}
 	touch rpcemu/stamp
 
 rpcemu/src/Makefile: rpcemu/stamp
-	(cd rpcemu/src && ./configure `uname -m | grep -E -q 'x86|i386' && echo --enable-dynarec` CFLAGS="-no-pie -fno-pie")
+	cd rpcemu/src
+	if uname -m | grep -E -q 'x86|i386'; then
+	  ./configure --enable-dynarec CFLAGS="-no-pie -fno-pie"
+	else
+	  ./configure
+	fi
 
 rpcemu/rpcemu: rpcemu/src/Makefile
 	$(MAKE) -C rpcemu/src
