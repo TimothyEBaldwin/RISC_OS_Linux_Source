@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <getopt.h>
 
 struct ro_attr {
   unsigned load, exec, attributes;
@@ -146,7 +147,15 @@ static void process(int dirfd, char *source) {
 int main(int argc, char **argv) {
   int opt;
 
-  while ((opt = getopt(argc, argv, "prws")) != -1) {
+  struct option opts[] = {
+    {"suffix-priority", no_argument, NULL, 'p'},
+    {"recurse", no_argument, NULL, 'r'},
+    {"write-suffix", no_argument, NULL, 'w'},
+    {"strip", no_argument, NULL, 's'},
+    {NULL, 0, NULL, 0}
+  };
+
+  while ((opt = getopt_long(argc, argv, "prws", opts, NULL)) != -1) {
     switch (opt) {
     case 'p':
       suffix_priority = true;
