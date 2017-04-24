@@ -556,14 +556,25 @@ aof.CLib: ${CLIB_ROM_OBJS}
 #
 # Final link for the ROM Image {using given base address}
 #
-rom_link_Entries:
+
+include $(wildcard OLD_ADDRESS-${TARGET})
+
+ifneq (${ADDRESS},${OLD_ADDRESS})
+FORCEROMLINK = FORCE
+endif
+
+FORCE: ; ${NOP}
+
+rom_link_Entries: rlib.swi kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2
         ${XTENT} syms.C_Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2
         print rlib.swi { >> syms.C_Entries }
         ${XTENT} syms.A_Entries1 kernel.s.k_entries clib.s.cl_entries
         grep -E -v "^(0x00000000 . )?_swix?$" < syms.A_Entries1 > syms.A_Entries
         ${RM} syms.A_Entries1
+        ${TOUCH} rom_link_Entries
 
-rom_link_RISC_OSLib: ${ROM_OBJS} rom_link_Entries ${PVLIBS}
+linked.RISC_OSLib: ${ROM_OBJS} rom_link_Entries rlib.s.rl_entries ${PVLIBS}
+        ${RM} $@
         ${XTENT} syms.Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2 rlib.s.rl_entries
         print rlib.swi { >> syms.Entries }
         ${LD} ${LDFLAGS} -o linked.RISC_OSLib ${ROM_OBJS} ${PVLIBS} \
@@ -573,8 +584,10 @@ rom_link_RISC_OSLib: ${ROM_OBJS} rom_link_Entries ${PVLIBS}
               -symbols syms.${TARGET} \
               -bin -base ${ADDRESS} \
               -map > map.${TARGET}
+        Echo OLD_ADDRESS=${ADDRESS} { > OLD_ADDRESS-${TARGET} }
 
-rom_link_CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS}
+linked.CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS}
+        ${RM} $@
         ${XTENT} syms.Entries kernel.s.k_entries kernel.s.k_entries2 clib.s.cl_entries clib.s.cl_entry2
         print rlib.swi { >> syms.Entries }
         ${LD} ${LDFLAGS} -o linked.CLib ${CLIB_ROM_OBJS} ${PVLIBS} \
@@ -584,8 +597,9 @@ rom_link_CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS}
               -symbols syms.${TARGET} \
               -bin -base ${ADDRESS} \
               -map > map.${TARGET}
+        Echo OLD_ADDRESS=${ADDRESS} { > OLD_ADDRESS-${TARGET} }
 
-rom_link: rom_link_${TARGET}
+rom_link: linked.${TARGET}
         ${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
         ${CP} syms.${TARGET} ${LINKDIR}.${TARGET}_sym ${CPFLAGS}
         |
