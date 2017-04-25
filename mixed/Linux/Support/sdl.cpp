@@ -145,6 +145,7 @@ int main(int argc, char **argv) {
   }
   close(sockets[1]);
 
+  SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
   SDL_Init(SDL_INIT_VIDEO);
   SDL_Window *window = SDL_CreateWindow("RISC OS", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 
