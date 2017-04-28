@@ -59,19 +59,35 @@ using std::endl;
 #include "protocol.h"
 #include "sdlkey.h"
 
-static const int mode_change = 5555;
-static const int screen_update = 5554;
-static const size_t screen_size = 1024*1024*100;
-static int sig_fd, sockets[2];
-static bool swapmouse;
+namespace {
 
-static inline off_t get_file_size(int fd) {
+const int refresh_period = 50;
+const int mode_change = 5555;
+const int screen_update = 5554;
+const size_t screen_size = 1024*1024*100;
+int sig_fd, sockets[2];
+bool swapmouse;
+int log2bpp = 3;
+int height = 480;
+int width = 640;
+int screen_fd = -1;
+int no_updates = 0;
+SDL_Window *window;
+SDL_Surface *screen;
+
+inline off_t get_file_size(int fd) {
   struct stat s;
   s.st_size = 0;
   fstat(fd, &s);
   return s.st_size;
 }
 
+void update_screen() {
+  if (no_updates <= 0 && get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
+    SDL_BlitSurface(screen, nullptr, SDL_GetWindowSurface(window), nullptr);
+    SDL_UpdateWindowSurface(window);
+  }
+}
 
 void watcher() {
   SDL_Event e;
@@ -92,8 +108,9 @@ void refresh() {
   e.type = screen_update;
   while (true) {
     SDL_PushEvent(&e);
-    SDL_Delay(50);
+    SDL_Delay(refresh_period);
   }
+}
 }
 
 int main(int argc, char **argv) {
@@ -147,7 +164,7 @@ int main(int argc, char **argv) {
 
   SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
   SDL_Init(SDL_INIT_VIDEO);
-  SDL_Window *window = SDL_CreateWindow("RISC OS", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+  window = SDL_CreateWindow("RISC OS", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 640, 480, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 
 
   int cursor_active_x = 0;
@@ -157,14 +174,7 @@ int main(int argc, char **argv) {
   SDL_Cursor* cursor = nullptr;
 
   void *pixels = mmap(0, screen_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  //std::cerr << pixels << std::endl;
 
-  int log2bpp = 3;
-  int height = 480;
-  int width = 640;
-  int screen_fd = -1;
-
-  SDL_Surface *screen = nullptr;
   SDL_Palette *palette = SDL_AllocPalette(256);
 
   new std::thread {refresh};
@@ -173,8 +183,6 @@ int main(int argc, char **argv) {
   uint32_t buttons = 0;
   while(true) {
     report r;
-    SDL_Event e;
-    SDL_WaitEvent(&e);
 
     {
       struct signalfd_siginfo s;
@@ -218,7 +226,7 @@ int main(int argc, char **argv) {
           height = c.mode.vidc[11];
           width = c.mode.vidc[5];
           log2bpp = c.mode.vidc[1];
-          //cerr << "Set mode " << log2bpp << endl;
+          //cerr << "Set mode " << log2bpp << ' ' << height << ' ' << width << endl;
           SDL_FreeSurface(screen);
           switch (log2bpp) {
             case 3:
@@ -235,6 +243,10 @@ int main(int argc, char **argv) {
           SDL_SetWindowSize(window, width, height);
           r.reason = report::ev_mode_sync;
           write(sockets[0], &r.reason, sizeof(r.reason));
+          break;
+        case command::c_suspend:
+          no_updates = c.suspend.delay;
+          update_screen();
           break;
         case command::c_set_palette: {
           SDL_Palette *p;
@@ -271,7 +283,6 @@ int main(int argc, char **argv) {
         update_cursor: {
           SDL_Cursor* cursor2 = SDL_CreateColorCursor(cursor_surface, cursor_active_x, cursor_active_y);
           SDL_SetCursor(cursor2);
-          //cerr << SDL_GetError() << endl;
           SDL_FreeCursor(cursor);
           cursor = cursor2;
           break;
@@ -279,13 +290,22 @@ int main(int argc, char **argv) {
       }
     }
 
+    SDL_Event e;
+    SDL_WaitEvent(&e);
     switch(e.type) {
       case mode_change:
         break;
       case screen_update:
-        if (get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
-          SDL_BlitSurface(screen, nullptr, SDL_GetWindowSurface(window), nullptr);
-          SDL_UpdateWindowSurface(window);
+        if (no_updates >= 0) no_updates -= refresh_period;
+        update_screen();
+        break;
+      case SDL_WINDOWEVENT:
+        if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
+          r.reason = report::ev_resize;
+          r.mouse.x = e.window.data1;
+          r.mouse.y = e.window.data2;
+          write(sockets[0], &r, sizeof(r));
+          if (no_updates < 200) no_updates = 200;
         }
         break;
       case SDL_QUIT:
@@ -323,7 +343,6 @@ int main(int argc, char **argv) {
         write(sockets[0], &r, sizeof(r));
         //std::cerr << "Motion " << r.x << ' ' << r.y << ' ' << r.buttons << std::endl;
         break;
-
     }
   }
 }
