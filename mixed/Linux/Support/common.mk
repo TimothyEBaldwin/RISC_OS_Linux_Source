@@ -1,5 +1,5 @@
 sdl: mixed/Linux/Support/sdl.cpp mixed/Linux/SocketKVM/h/protocol mixed/Linux/Support/sdlkey.h
-	g++ -Wall -pthread -g -O2 `sdl2-config --cflags --libs` --std=c++11 mixed/Linux/Support/sdl.cpp  -o sdl
+	g++ -Wall -pthread -g -O2 --std=c++11 mixed/Linux/Support/sdl.cpp  `sdl2-config --cflags --libs` -o sdl
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
 
 mixed/Linux/Support/sdlkey.h: mixed/Linux/Support/sdlkey
