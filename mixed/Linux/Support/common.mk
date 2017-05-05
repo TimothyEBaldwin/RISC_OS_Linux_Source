@@ -56,14 +56,14 @@ rpcemu/src/Makefile: rpcemu/stamp
 
 rpcemu/rpcemu: rpcemu/src/Makefile
 	$(MAKE) -C rpcemu/src
-	rm rpcemu/poduleroms/SyncClock,ffa
+	rm rpcemu/poduleroms/SyncClock,ffa || true
 	touch rpcemu/rpcemu
 	echo H4sIAISQCFUCA2NgYDNTuO7MAAdlTAEM+Q4MDgwaNgxoQABdgOHVGoZ/DK8ZZoJlQxQ4uHQmMDGw\
 	wWSZGWgP+EUYGJb8FXD8z5jIIAgV+0CMRm5GBgYTBgYAXYSkcwABAAA= | base64 -d | gzip -d > rpcemu/cmos.ram
 	cp mixed/Linux/Support/rpcemu.cfg rpcemu/rpc.cfg
 	rm -rf rpcemu/hostfs || true
-	ln -sfn /dev/fd/${fd_BUILD_DIR} rpcemu/hostfs
-	ln -sfn /dev/fd/${fd_BOOT_IOMD_ROM} rpcemu/roms/ROM
+	ln -sfn /dev/fd/8 rpcemu/hostfs
+	ln -sfn /dev/fd/7 rpcemu/roms/ROM
 
 qemu/stamp: ${QEMU_SRC}
 	rm -rf qemu qemu-2.11.0
@@ -84,7 +84,7 @@ HardDisc4/stamp: ${HARDDISC4} boot_iomd_rom rpcemu/rpcemu
 	echo '2b5c2eadb4b4d5cff1ae5dfbce1159c15b41720ef89dcf735062d86074f34083 *${HARDDISC4}' | sha256sum -c
 	rm -rf HardDisc4 || true
 	unzip -F '${HARDDISC4}' 'HardDisc4/*'
-	timeout -sKILL 20 rpcemu/rpcemu ${fd_BOOT_IOMD_ROM}<boot_iomd_rom ${fd_BUILD_DIR}<HardDisc4 || true
+	timeout -sKILL 20 rpcemu/rpcemu 7<boot_iomd_rom 8<HardDisc4 || true
 	touch HardDisc4/stamp
 
 boot_iomd_rom: ${IOMD}
