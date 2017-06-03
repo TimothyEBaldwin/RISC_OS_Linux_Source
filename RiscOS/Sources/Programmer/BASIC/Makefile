@@ -42,4 +42,8 @@ endif
 include StdTools
 include AAsmModule
 
+ifeq ($(COMPONENT),BASICVFP)
+AS            = ObjAsmVFP
+endif
+
 # Dynamic dependencies:
