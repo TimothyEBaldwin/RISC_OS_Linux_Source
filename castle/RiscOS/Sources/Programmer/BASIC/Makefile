@@ -46,4 +46,8 @@ endif
 include StdTools
 include AAsmModule
 
+ifeq ($(COMPONENT),BASICVFP)
+AS            = ObjAsmVFP
+endif
+
 include Depends
