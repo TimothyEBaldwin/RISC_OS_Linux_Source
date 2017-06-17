@@ -43,7 +43,7 @@
 /* Timeouts are in cs */
 #define PORT_IDLE_TIMEOUT      (50)  // AHCI spec 10.1.2 advocates half-second wait for PxCMD.CR to clear after deasserting PxCMD.ST
 #define COMRESET_ASSERT_TIME   (5)   // AHCI spec only advocates 1 millisecond, though
-#define COMRESET_RECOVERY_TIME (250)
+#define COMRESET_RECOVERY_TIME (50)
 #define PM_PSCR_TIMEOUT        (50)
 #define DEVICE_CONTROL_OP_TIMEOUT    (50)
 #define SOFTWARE_RESET_ASSERT_TIME   (1) /* really only needs 5us */
@@ -848,6 +848,74 @@ static bool software_reset(ahciport_t *port, uint32_t deviceid, bool error_recov
   return true;
 }
 
+static bool op_rescan_pmp_ports(ahciport_t *port, bool error_recovery)
+{
+  /* Do a COMRESET on all PM ports in parallel to save time */
+#define SCONTROL_CLEAR_BITS (SCONTROL_DET_MASK | SCONTROL_IPM_NO_PARTIAL | SCONTROL_IPM_NO_SLUMBER | SCONTROL_IPM_NO_DEVSLEEP | SCONTROL_PMP_MASK)
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
+        ~SCONTROL_CLEAR_BITS, SCONTROL_DET_COMRESET, error_recovery))
+      return false;
+  }
+  delay(COMRESET_ASSERT_TIME, port, error_recovery);
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
+        ~SCONTROL_CLEAR_BITS, SCONTROL_DET_NOOP, error_recovery))
+      return false;
+  }
+  delay(COMRESET_RECOVERY_TIME, port, error_recovery);
+
+  /* Clear any outstanding errors that may have been generated */
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_write_pmp_reg(port, deviceid, PM_PSCR_SERROR, -1u, error_recovery))
+      return false;
+  }
+
+  /* No command list override needed here, I believe */
+
+  /* Check each PM port's SStatus to see if the link is up */
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    uint32_t sstatus;
+    if (!op_read_pmp_reg(port, deviceid, PM_PSCR_SSTATUS, &sstatus, error_recovery))
+      return false;
+    dprintf("SStatus for PMP %u = %08X\n", deviceid ,sstatus);
+    port->device[deviceid].valid = (sstatus & SSTATUS_DET_MASK) == SSTATUS_DET_DEV;
+  }
+
+  /* For each PM port with a valid link, send a software reset to fetch a
+   * device signature. These have to be done sequentially because the
+   * signature is delivered via a device to host register FIS. */
+  bool result = true;
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (port->device[deviceid].valid)
+    {
+      port->device[deviceid].tfd = STATUS_DRDY; /* assumed */
+      if (!software_reset(port, deviceid, error_recovery))
+      {
+        dprintf("Signature for PMP %u not returned\n", deviceid);
+        port->device[deviceid].sig = (sata_sig_t) 0;
+        result = false;
+
+        /* For errors during error recovery, give up */
+        if (error_recovery)
+          break;
+      }
+      else
+      {
+        dprintf("Signature for PMP %u = %08X\n", deviceid, port->pr->pxsig);
+        port->device[deviceid].sig = (sata_sig_t) port->pr->pxsig;
+      }
+    }
+  }
+
+  return result; /* When true all ports with link up gave signatures */
+}
+
 bool op_rescan_port(ahciport_t *port, bool error_recovery)
 {
   /* Must stop command list processing to issue top-level COMRESET */
@@ -916,56 +984,23 @@ bool op_rescan_port(ahciport_t *port, bool error_recovery)
     for (uint32_t deviceid = port->pmp_ports; deviceid < PM_CONTROL_PORT; deviceid++)
       port->device[deviceid].valid = false;
 
-    /* Do a COMRESET on all PM ports in parallel to save time */
-#define SCONTROL_CLEAR_BITS (SCONTROL_DET_MASK | SCONTROL_IPM_NO_PARTIAL | SCONTROL_IPM_NO_SLUMBER | SCONTROL_IPM_NO_DEVSLEEP | SCONTROL_PMP_MASK)
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
-          ~SCONTROL_CLEAR_BITS, SCONTROL_DET_COMRESET, error_recovery))
-        return false;
-    }
-    delay(COMRESET_ASSERT_TIME, port, error_recovery);
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
-          ~SCONTROL_CLEAR_BITS, SCONTROL_DET_NOOP, error_recovery))
-        return false;
-    }
-    delay(COMRESET_RECOVERY_TIME, port, error_recovery);
+    if (error_recovery)
+      return op_rescan_pmp_ports(port, error_recovery); /* No retries during error recovery */
 
-    /* Clear any outstanding errors that may have been generated */
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+    for (uint32_t retries = 0; retries < COMRESET_RETRIES; retries++)
     {
-      if (!op_write_pmp_reg(port, deviceid, PM_PSCR_SERROR, -1u, error_recovery))
-        return false;
-    }
+      /* Review which have established a PHY link, and try to read the signature.
+       * If the PHY locked, but at an unsupported speed, there will be no response to
+       * the software reset which gets the signature. In that case it's worth
+       * another COMRESET to relock and try the signature again at a different speed. */
+      dprintf("Retry (%d)\n", retries);
+      if (op_rescan_pmp_ports(port, error_recovery))
+        return true;
 
-    /* No command list override needed here, I believe */
-
-    /* Check each PM port's SStatus to see if the link is up */
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      uint32_t sstatus;
-      if (!op_read_pmp_reg(port, deviceid, PM_PSCR_SSTATUS, &sstatus, error_recovery))
-        return false;
-      dprintf("SStatus for PMP %u = %08X\n", deviceid ,sstatus);
-      port->device[deviceid].valid = (sstatus & SSTATUS_DET_MASK) == SSTATUS_DET_DEV;
+      /* Error recovery marks the top level port inactive, force it on again */
+      port->active = true;
     }
-
-    /* For each PM port with a valid link, send a software reset to fetch a
-     * device signature. These have to be done sequentially because the
-     * signature is delivered via a device to host register FIS. */
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      if (port->device[deviceid].valid)
-      {
-        port->device[deviceid].tfd = STATUS_DRDY; /* assumed */
-        if (!software_reset(port, deviceid, error_recovery))
-          return false;
-        dprintf("Signature for PMP %u = %08X\n", deviceid, port->pr->pxsig);
-        port->device[deviceid].sig = (sata_sig_t) port->pr->pxsig;
-      }
-    }
+    return false; /* After COMRESET_RETRIES still not got all signatures */
   }
 
   return true;
