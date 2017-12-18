@@ -66,10 +66,10 @@ rpcemu/rpcemu: rpcemu/src/Makefile
 	ln -sfn /dev/fd/${fd_BOOT_IOMD_ROM} rpcemu/roms/ROM
 
 qemu/stamp: ${QEMU_SRC}
-	rm -rf qemu qemu-2.9.0
-	echo "00bfb217b1bb03c7a6c3261b819cfccbfb5a58e3e2ceff546327d271773c6c14 *${QEMU_SRC}" | sha256sum -c
-	tar jxf "${QEMU_SRC}"
-	mv qemu-2.9.0 qemu
+	rm -rf qemu qemu-2.11.0
+	echo "c9d34a79024eae080ce3853aa9afe503824520eefb440190383003081ce7f437 *${QEMU_SRC}" | sha256sum -c
+	tar Jxf "${QEMU_SRC}"
+	mv qemu-2.11.0 qemu
 	(cd qemu && patch -p1 < ../mixed/Linux/Support/qemu_swi.diff)
 	touch qemu/stamp
 
@@ -102,7 +102,7 @@ ${IOMD}:
 	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${QEMU_SRC}:
-	sh mixed/Linux/Support/download.sh '${QEMU_SRC}' "http://download.qemu-project.org/qemu-2.9.0.tar.xz" "00bfb217b1bb03c7a6c3261b819cfccbfb5a58e3e2ceff546327d271773c6c14"
+	sh mixed/Linux/Support/download.sh '${QEMU_SRC}' "https://download.qemu.org/qemu-2.11.0.tar.xz" "c9d34a79024eae080ce3853aa9afe503824520eefb440190383003081ce7f437"
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 $@ || true
 
 ${RPCEMU}:

@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
 HARDDISC4=${HOME}/Downloads/HardDisc4.5.22.zip
-QEMU_SRC=${HOME}/Downloads/qemu-2.9.0.tar.bz2
+QEMU_SRC=${HOME}/Downloads/qemu-2.11.0.tar.xz
 RPCEMU=${HOME}/Downloads/rpcemu-0.8.15.tar.gz
 IOMD=${HOME}/Downloads/IOMD-Soft.5.22.zip
 
