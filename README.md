@@ -64,9 +64,9 @@ This following items will be download to ~/Downloads if needed:
 - [x] Make data aborts raise errors.
 - [x] Support writing timestamps in IXFS.
 - [x] Support reading timestamps in IXFS to centisecond resolution.
-- [ ] Test timestamps.
+- [x] Test timestamps.
 - [ ] Officially allocate names and SWI numbers etc.
-- [ ] Fix failure to truncate of unbuffered files when opened for output, and associated race condition.
+- [x] Fix failure to truncate of unbuffered files when opened for output, and associated race condition.
 - [ ] Fix spurious calls of FSEntry_Args 6 (flush file to disc) when files are closed.
 - [ ] Perform proper error handling in IXFS.
 - [x] Split video keyboard and mouse driver into separate module.
