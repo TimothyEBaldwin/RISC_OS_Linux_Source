@@ -48,10 +48,10 @@ ifeq (${METHOD}, rpcemu)
 	until test -f done,ffd; do sleep 1; done; kill $$!; sleep 1
 	sh done,ffd
 	rm done,ffd
-	mv "Images/${TARGET}_rom",??? "Images/${TARGET}_rom" || true
 else
 	RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.4.Build Linux IXFS:$$.dev.fd.8 IXFS:$$.dev.fd.9 ${TARGET} ${PHASES}' ./run ${LINUX_ROM} --nofork 4<mixed/Linux/Support 8<. 9<'${ACORN_CPP}'
 endif
+	mv "Images/${TARGET}_rom",??? "Images/${TARGET}_rom" || true
 	chmod +x "Images/${TARGET}_rom"
 	ln -f Images/Linux_rom RISC_OS || true
 	$(MAKE) sdl || true
