@@ -37,8 +37,10 @@ build: run ${LINUX_ROM} stamp-prepare
 endif
 	uname -a
 	echo Building GIT commit: $$(git rev-parse HEAD)
+ifeq (${TARGET}, Linux)
 	echo '#define VERSION "GIT commit: '$$(git rev-parse HEAD)'\n"' > mixed/Linux/HAL/h/version1
 	cmp --quiet mixed/Linux/HAL/h/version1 mixed/Linux/HAL/h/version || cp mixed/Linux/HAL/h/version1 mixed/Linux/HAL/h/version
+endif
 	rm done* || true
 	rm "Images/${TARGET}_rom"* || true
 ifeq (${METHOD}, rpcemu)
@@ -60,7 +62,7 @@ ifeq (${TARGET}, IOMD32)
 check: rpcemu/rpcemu HardDisc4/stamp
 	echo "Create HostFS:$$.done" > HardDisc4/\!Boot/Choices/Boot/Tasks/ZZZ,feb
 	rm HardDisc4/done* || true
-	timeout -sKILL 60 rpcemu/rpcemu 7<"Images/${TARGET}_rom" 8<HardDisc4 || true
+	timeout --foreground -sKILL 60 rpcemu/rpcemu 7<"Images/${TARGET}_rom" 8<HardDisc4 || true
 	sleep 1
 	rm HardDisc4/\!Boot/Choices/Boot/Tasks/ZZZ,feb
 	test -f HardDisc4/done,ffd
