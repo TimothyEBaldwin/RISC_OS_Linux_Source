@@ -935,13 +935,15 @@ WinIDEStartTransfer     ROUT
 ; it was a data out op
 ; R8 -> scatter list
 ; R9 = bytes we want from/for first sector
-; Wait for DRQ to become asserted: according to CAM 2.1, this can
-; take as long as 700us although Conner drives appear to assert it
-; immediately. This loop is inaccurate because the resolution of
-; the delay routine is only 0.5us but it is good enough for this.
-; NOTE: if this is part of a background op (except for the first part
-; which is started in foreground), IRQs are disabled.
-; DRIVES THAT TAKE A LONG TIME TO ASSERT DRQ WILL RUIN INTERRUPT LATENCY
+; We need to wait for DRQ to be asserted before we can send the first sector of
+; data. However the drive won't raise an interrupt - we must poll the
+; controller.
+; Early versions of the ATA spec state that it can take up to 700us before DRQ
+; is asserted, but later versions of the spec have dropped this limit. We might
+; be in an IRQ, so we can't wait here forever, as that would ruin interrupt
+; latency. Most drives will respond within 700us, so go for a compromise of
+; waiting here for up to 700us, with a fallback of polling from TickerV for
+; drives that take longer.
 
         MOV     R1,#700                         ; counter for loop
 80
@@ -956,9 +958,7 @@ WinIDEStartTransfer     ROUT
 ; have got DRQ or are giving up waiting
 
         CMPS    R1,#0                           ; giving up?
-        MOVEQ   R0,#WinIDEErrNoDRQ              ; if so, return error
-        SETV    EQ
-        Pull    "R1-R6,R8-R9,PC",VS
+        BEQ     %FT81
 
 ; got DRQ so write data
 
@@ -985,6 +985,19 @@ WinIDEStartTransfer     ROUT
 
         CLRV
         Pull    "R1-R6,R8-R9,PC"
+
+81
+; set up the TickerV DRQ poll routine
+        PHPSEI  LR
+        LDR     R1, WinTickCount                ; preserve current timeout
+        STR     R1, WinIDEDRQTimeout
+        MOV     R1, #1
+        STR     R1, WinTickCount
+        ADR     R1, WinIDEDRQPoll
+        STR     R1, WinTickCallAddress
+        PLP     LR
+        Pull    "R1-R6,R8-R9,PC"
+
         LTORG
 
 ;*********************************************************************
@@ -1846,6 +1859,95 @@ WinIDETimeout   ROUT
 ; R7 = IDE command code
 ; Branch to IRQ handler which will tidy up and call the callback.
 
+        B       WinIDEIRQError
+
+;*********************************************************************
+
+WinIDEDRQPoll   ROUT
+;
+; Called every centisecond from TickerV when we're waiting for DRQ for the
+; first sector of a write op.
+;
+; Entry:
+;    SB -> static workspace
+;    MODE: IRQ or SVC
+;    IRQs disabled
+;
+; Exit:
+;    All registers preserved
+
+; Switch to SVC mode as will join main thread of IRQ
+
+        Push    "$WinIDEIRQRegsA,LR"    ; same regs as IRQHandler
+        WritePSRc SVC_mode :OR: I_bit,LR,,R0
+        NOP
+
+; Now in SVC mode - save main regs
+
+        Push    "$WinIDEIRQRegsB,LR"    ; same regs as IRQHandler
+
+; Set up registers suitable for branching to IRQ code
+
+ [ TwinIDEHardware
+        LDR     R9,WinIDECurrentHW
+ |
+        sbaddr  R9,WinIDEHardware
+ ]
+ [ HAL
+        ASSERT  WinIDECtrlPtr = 0
+        ASSERT  WinIDEPtr = 4
+        LDMIA   R9,{IDECtrl,IDE}        ; IDE -> IDE hardware
+ |
+        LDR     IDE,[R9,#WinIDEPtr]
+ ]
+
+; Check for timeout
+        LDR     R2,WinIDEDRQTimeout
+        SUBS    R2,R2,#1
+        BEQ     %FT95
+
+; Check for DRQ
+        LDRB    R0,IDERegAltStatus
+        TST     R0,#IDEStatusDRQ
+        STREQ   R2,WinIDEDRQTimeout
+        MOVEQ   R2,#1
+        BEQ     %FT90
+
+; got DRQ so write data
+
+        LDR     R1,WinIDETmpScatterEntry        ; R1 -> buffer
+        LDR     R0,WinIDEBlockSize              ; R0 = max bytes to move
+
+; R0 = length to transfer (up to 512 bytes will be moved)
+; R1 -> buffer
+; Call data write routine
+
+        MOV     LR,PC                           ; set link
+        LDR     PC,[R9,#WinIDEWritePtr]         ; (R0,R1,IDE->R0,R1)
+                                                ; returns here
+
+; Restore standard ticker routine
+        ADR     R2,WinIDETimeout
+        STR     R2,WinTickCallAddress
+        
+90
+        STR     R2,WinTickCount
+; First restore SVC regs and switch back to original mode
+
+        Pull    "$WinIDEIRQRegsB,LR"
+
+        RestPSR R0,,c
+        NOP
+
+; Now back in original mode
+
+        Pull    "$WinIDEIRQRegsA,PC"
+
+95
+        MOV     R0,#WinIDEErrNoDRQ      ; R0 = error code
+        LDR     R2,WinIDEDiscAddress    ; R2 = disc address of start of op
+        LDR     R3,WinIDEScatterPtr     ; R3 -> scatter list
+        LDRB    R7,WinIDECommandCode    ; R7 = IDE command code
         B       WinIDEIRQError
 
 ;*********************************************************************

@@ -35,8 +35,7 @@ LIBS         = ${ASMUTILS}
 include CModule
 
 DBG_LIBS    += ${NET5LIBS}
-ASFLAGS     += -pd "PCMCIATRUE SETL {${PCMCIA}}"
-CFLAGS      += -DPCMCIA${PCMCIA}
+CFLAGS      += -DNONFLOPPIES
 CDFLAGS     += -DDEBUGLIB
 
 # Dynamic dependencies:

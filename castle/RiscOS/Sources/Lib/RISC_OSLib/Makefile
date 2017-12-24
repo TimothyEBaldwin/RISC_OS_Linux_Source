@@ -193,7 +193,6 @@ HEADERS =\
  RISC_OSLib:h.colourpick \
  RISC_OSLib:h.colourtran \
  RISC_OSLib:h.coords \
- RISC_OSLib:h.ctl \
  RISC_OSLib:h.dbox \
  RISC_OSLib:h.dboxfile \
  RISC_OSLib:h.dboxquery \
@@ -401,7 +400,7 @@ ROM_OBJS =\
 #
 RLIB_OBJS =\
  o_rl.akbd o_rl.alarm o_rl.baricon o_rl.bastxt o_rl.bbc o_rl.colourmenu \
- o_rl.colourtran o_rl.coords o_rl.ctl o_rl.dbox o_rl.dboxfile o_rl.dboxquery \
+ o_rl.colourtran o_rl.coords o_rl.dbox o_rl.dboxfile o_rl.dboxquery \
  o_rl.dboxtcol o_rl.dragasprit o_rl.drawcheck o_rl.drawfdiag o_rl.drawfiles \
  o_rl.drawfobj o_rl.drawmod o_rl.drawtextc o_rl.event o_rl.fileicon o_rl.flex \
  o_rl.font o_rl.fontlist o_rl.fontselect o_rl.heap o_rl.help o_rl.jpeg o_rl.magnify o_rl.menu \
@@ -416,7 +415,7 @@ RLIB_OBJS =\
 #
 RLIB_MOD_OBJS =\
  m_o_rl.akbd m_o_rl.alarm m_o_rl.baricon m_o_rl.bastxt m_o_rl.bbc \
- m_o_rl.colourmenu m_o_rl.colourtran m_o_rl.coords m_o_rl.ctl m_o_rl.dbox \
+ m_o_rl.colourmenu m_o_rl.colourtran m_o_rl.coords m_o_rl.dbox \
  m_o_rl.dboxfile m_o_rl.dboxquery  m_o_rl.dboxtcol m_o_rl.dragasprit \
  m_o_rl.drawcheck m_o_rl.drawfdiag m_o_rl.drawfiles m_o_rl.drawfobj m_o_rl.drawmod \
  m_o_rl.drawtextc m_o_rl.event m_o_rl.fileicon m_o_rl.flex m_o_rl.font \
@@ -707,7 +706,6 @@ RISC_OSLib:h.colourmenu: rlib.h.colourmenu;  ${CP} rlib.h.colourmenu $@ ${CPFLAG
 RISC_OSLib:h.colourpick: rlib.h.colourpick;  ${CP} rlib.h.colourpick $@ ${CPFLAGS}
 RISC_OSLib:h.colourtran: rlib.h.colourtran;  ${CP} rlib.h.colourtran $@ ${CPFLAGS}
 RISC_OSLib:h.coords: rlib.h.coords;          ${CP} rlib.h.coords $@ ${CPFLAGS}
-RISC_OSLib:h.ctl: rlib.h.ctl;                ${CP} rlib.h.ctl $@ ${CPFLAGS}
 RISC_OSLib:h.dbox: rlib.h.dbox;              ${CP} rlib.h.dbox $@ ${CPFLAGS}
 RISC_OSLib:h.dboxfile: rlib.h.dboxfile;      ${CP} rlib.h.dboxfile $@ ${CPFLAGS}
 RISC_OSLib:h.dboxquery: rlib.h.dboxquery;    ${CP} rlib.h.dboxquery $@ ${CPFLAGS}

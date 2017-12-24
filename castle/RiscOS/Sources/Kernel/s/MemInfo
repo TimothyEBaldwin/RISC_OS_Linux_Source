@@ -72,10 +72,10 @@ MemReturn
         B       MemoryAreaInfo                  ; 16
         B       MemoryAccessPrivileges          ; 17
         B       FindAccessPrivilege             ; 18
-        B       %BT20                           ; 19 |
-        B       %BT20                           ; 20 | Reserved for us
+        B       %BT20                           ; Reason code 19 reserved (for DMAPrep, on SMP branch)
+        B       ChangeCompatibility             ; 20
         B       %BT20                           ; 21 |
-        B       %BT20                           ; 22 |
+        B       %BT20                           ; 22 | Reserved for us
         B       %BT20                           ; 23 |
         B       CheckMemoryAccess               ; 24
                                                 ; 25+ reserved for ROL
@@ -1032,6 +1032,7 @@ ReleasePhysAddr
 ;                               13=Processor vectors
 ;                               14=DebuggerSpace
 ;                               15=Scratch space
+;                               16=Compatibility page
 ;                       16-31   reserved (set to 0)
 ;
 ;       Out:    r1 = base of area
@@ -1067,6 +1068,7 @@ MAI_TableStart
         B       MAI_ProcVecs
         B       MAI_DebuggerSpace
         B       MAI_ScratchSpace
+        B       MAI_CompatibilityPage
 MAI_TableEnd
 
 70
@@ -1177,6 +1179,17 @@ MAI_ScratchSpace
         LDR     r1, =ScratchSpace
         MOV     r2, #16*1024
         MOV     r3, #16*1024
+        EXIT
+
+MAI_CompatibilityPage
+      [ CompatibilityPage
+        MOV     r1, #0
+        MOV     r2, #4096
+        LDR     r0, =ZeroPage
+        LDRB    r3, [r0,#CompatibilityPageEnabled]
+        CMP     r3, #0
+        MOVNE   r3, #4096
+      ]
         EXIT
 
 ;----------------------------------------------------------------------------------------
@@ -1327,6 +1340,110 @@ FindAccessPrivilege ROUT
 
         MakeErrorBlock AccessPrivilegeNotFound
 
+
+;----------------------------------------------------------------------------------------
+;
+;       In:     r0 = flags
+;                       bit     meaning
+;                       0-7     20 (reason code)
+;                       8-31    reserved (set to 0)
+;               r1 = 0 to disable compatibility page
+;                    1 to enable compatibility page
+;                    -1 to read state
+;
+;       Out:    r1 = new/current state:
+;                    0 if disabled
+;                    1 if enabled
+;                    -1 if not supported
+;
+;       Controls the page zero compatibility page located at &0
+;
+;       If the compatibility page isn't supported, attempts to enable it will
+;       silently fail, with a result of r1 = -1
+;
+ChangeCompatibility ROUT
+        CMP     r1, #-1
+        CMPNE   r1, #1
+        CMPLS   r0, #255
+        BHI     MemoryBadParameters
+ [ :LNOT: CompatibilityPage
+        MOV     r1, #-1
+        MOV     pc, lr
+ |
+        Entry   "r0-r11", DANode_NodeSize
+        LDR     r12, =ZeroPage
+        LDRB    r0, [r12, #CompatibilityPageEnabled]
+        FRAMSTR r0,,r1 ; return pre-change state in r1 (will be updated later, as necessary)
+        CMP     r1, #-1
+        CMPNE   r0, r1
+        EXIT    EQ
+        ; If we're attempting to enable it, make sure nothing else has mapped itself in to page zero
+        LDR     r8, =L2PT
+        CMP     r1, #0
+        LDRNE   r0, [r8]
+        CMPNE   r0, #0
+        MOVNE   r1, #-1
+        FRAMSTR r1,NE
+        EXIT    NE
+        ; Set up temp DANode on the stack so we can use a Batcall to manage the mapping
+        MOV     r2, sp
+        MOV     r0, #DynAreaFlags_NotCacheable
+        STR     r0, [r2, #DANode_Flags]
+        MOV     r0, #0
+        STR     r0, [r2, #DANode_Base]
+        STR     r0, [r2, #DANode_Handler]
+        CMP     r1, #1
+        STREQ   r0, [r2, #DANode_Size]
+        MOV     r0, #4096
+        STRNE   r0, [r2, #DANode_Size]
+        STR     r0, [r2, #DANode_MaxSize]
+        MOV     r0, #ChangeDyn_Batcall
+        MOV     r1, #4096
+        RSBNE   r1, r1, #0
+        SWI     XOS_ChangeDynamicArea
+        FRAMSTR r0,VS
+        EXIT    VS
+        ; If we just enabled the page, fill it with the special value and then change it to read-only
+        FRAMLDR r1
+        RSBS    r1, r1, #1 ; invert returned state, to be correct for the above action
+        STRB    r1, [r12, #CompatibilityPageEnabled] ; Also update our state flag
+        FRAMSTR r1
+        EXIT    EQ
+        MOV     r0, #0
+        ADR     r1, %FT20
+10
+        CMP     r0, #%FT30-%FT20
+        LDRLO   r2, [r1, r0]
+        STR     r2, [r0], #4
+        CMP     r0, #4096
+        BNE     %BT10
+        LDR     r7, [r12, #MaxCamEntry]
+        MOV     r4, #0
+        BL      logical_to_physical
+        BL      physical_to_ppn
+        ; r9-r11 corrupt, r3 = page number, r5 = phys addr
+        MOV     r0, #OSMemReason_FindAccessPrivilege
+        MOV     r1, #2_100100
+        MOV     r2, #2_100100
+        SWI     XOS_Memory ; Get AP number for read-only access (will make area XN on ARMv6+)
+        ORRVC   r11, r0, #DynAreaFlags_NotCacheable
+        MOVVC   r2, r3
+        MOVVC   r3, #0
+        BLVC    BangCamUpdate
+        EXIT
+
+20
+        ; Pattern to place in compatibility page
+        DCD     &FDFDFDFD ; A few of words of invalid addresses, which should also be invalid instructions on ARMv5 (ARMv6+ will have this page non-executable, ARMv4 and lower can't have high processor vectors)
+        DCD     &FDFDFDFD
+        DCD     &FDFDFDFD
+        DCD     &FDFDFDFD
+        = "!!!!NULL.POINTER.DEREFERENCE!!!!", 0 ; Readable message if interpretered as a string. Also, all words are unaligned pointers.
+        ALIGN
+        DCD     0 ; Fill the rest with zero (typically, most of ZeroPage is zero)
+30
+ ]
+
 ;----------------------------------------------------------------------------------------
 ;
 ;        In:    r0 = flags
@@ -1392,19 +1509,32 @@ CheckMemoryAccess ROUT
         BHS     %FT10
         ; Check zero page
         ASSERT  ProcVecs = ZeroPage
-      [ ZeroPage = 0
+     [ ZeroPage = 0
         MOV     r3, #0
         MOV     r4, #16*1024
         LDR     r5, =CMA_ZeroPage
         BL      CMA_AddRange
-      |
+     |
+      [ CompatibilityPage
+        ; Zero page compatibility page
+        LDR     r3, =ZeroPage
+        LDRB    r3, [r3, #CompatibilityPageEnabled]
+        CMP     r3, #0
+        BEQ     %FT05
+        MOV     r3, #0
+        MOV     r4, #4096
+        ; This represents our ideal access flags; it may not correspond to reality
+        LDR     r5, =CMA_Partially_UserR+CMA_Partially_PrivR
+        BL      CMA_AddRange
+05
+      ]
         ; DebuggerSpace
         ASSERT  DebuggerSpace < ScratchSpace
         LDR     r3, =DebuggerSpace
         LDR     r4, =(DebuggerSpace_Size + &FFF) :AND: &FFFFF000
         LDR     r5, =CMA_DebuggerSpace
         BL      CMA_AddRange
-      ]
+     ]
         ; Scratch space
         LDR     r3, =ScratchSpace
         MOV     r4, #16*1024

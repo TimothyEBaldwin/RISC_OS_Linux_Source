@@ -20,6 +20,7 @@
  */
 /*
  * Copyright 2015 Ben Avison.  All rights reserved.
+ * Portions Copyright 2017 Jeffrey Lee
  * Use is subject to license terms.
  */
 
@@ -39,11 +40,12 @@
 #include "register.h"
 #include "swi.h"
 #include "util.h"
+#include "dmaprep.h"
 
 /* Timeouts are in cs */
 #define PORT_IDLE_TIMEOUT      (50)  // AHCI spec 10.1.2 advocates half-second wait for PxCMD.CR to clear after deasserting PxCMD.ST
 #define COMRESET_ASSERT_TIME   (5)   // AHCI spec only advocates 1 millisecond, though
-#define COMRESET_RECOVERY_TIME (75)
+#define COMRESET_RECOVERY_TIME (50)
 #define PM_PSCR_TIMEOUT        (50)
 #define DEVICE_CONTROL_OP_TIMEOUT    (50)
 #define SOFTWARE_RESET_ASSERT_TIME   (1) /* really only needs 5us */
@@ -54,14 +56,6 @@
 
 #define FATAL_ERRORS (IRQ_HBF | IRQ_HBD | IRQ_IF | IRQ_TFE)
 #define FATAL_INTERFACE_ERRORS (SERROR_DIAG_T | SERROR_DIAG_S | SERROR_DIAG_H | SERROR_DIAG_C | SERROR_DIAG_D | SERROR_DIAG_B | SERROR_DIAG_I | SERROR_DIAG_N | SERROR_ERR_E | SERROR_ERR_P | SERROR_ERR_C | SERROR_ERR_T)
-
-/** FileCore scatter list threshold */
-#define SCATTER_THRESHOLD (0xFFFF0000u)
-
-#define PAGE_SIZE 4096
-
-/* Circular dependencies requires pre-declaration of the following: */
-static _kernel_oserror *for_scatter_list(ahciop_t *op, size_t limit, _kernel_oserror *(*callback)(ahciop_t *, size_t, size_t *, void *), void *context);
 
 static void do_op_callback(ahciop_t *op)
 {
@@ -125,173 +119,6 @@ static uint32_t identify_running_command(ahciport_t *port)
   return ccs;
 }
 
-static _kernel_oserror *mark_uncacheable(void *log, paddr_t *phys)
-{
-  uint32_t buffer[3];
-  buffer[1] = (uintptr_t) log;
-  _kernel_oserror *e = _swix(OS_Memory, _INR(0,2), (1u<<9) | (1u<<13) | (2u<<14), buffer, 1);
-  *phys = (paddr_t) buffer[2];
-  return e;
-}
-
-static void mark_cacheable(void *log)
-{
-  uint32_t buffer[3];
-  buffer[1] = (uintptr_t) log;
-  _swix(OS_Memory, _INR(0,2), (1u<<9) | (3u<<14), buffer, 1);
-}
-
-static _kernel_oserror *postprocess_bounce(ahciop_t *restrict op, size_t byte_index, size_t *restrict advance_by, void *context)
-{
-  /* A bounced operation has completed */
-  /* Assume we're only called in the read case - nothing to do otherwise */
-  uint8_t *bounce_buffer = context;
-  memcpy(op->list->address, bounce_buffer + byte_index, *advance_by);
-  return NULL;
-}
-
-static _kernel_oserror *preprocess_bounce(ahciop_t *restrict op, size_t byte_index, size_t *restrict advance_by, void *context)
-{
-  /* A bounced operation has completed */
-  /* Assume we're only called in the write case - nothing to do otherwise */
-  uint8_t *bounce_buffer = context;
-  memcpy(bounce_buffer + byte_index, op->list->address, *advance_by);
-  return NULL;
-}
-
-static _kernel_oserror *postprocess_direct(ahciop_t *restrict op, size_t byte_index, size_t *restrict advance_by, void *context)
-{
-  /* We've finished a direct operation (or it never started) so restore page state */
-  (void) byte_index;
-  (void) context;
-  size_t bytes_to_page_boundary = PAGE_SIZE - (((uintptr_t) op->list->address + op->scatter_offset) & (PAGE_SIZE - 1));
-  *advance_by = MIN(*advance_by, bytes_to_page_boundary);
-  mark_cacheable(op->list->address + op->scatter_offset);
-  return NULL;
-}
-
-typedef struct
-{
-  ahci_prdt_entry_t *prdt_entry;
-  ataop_block_t     *b;
-  scatter_t         *list_start;
-}
-preprocess_direct_context_t;
-
-/** Magic error pointer used to halt iteration through a scatter list once we've
- *  determined that we have to use a bounce buffer */
-#define ESCAPE_FROM_SCATTER_LIST_ITERATOR ((_kernel_oserror *) 1)
-
-static _kernel_oserror *preprocess_direct(ahciop_t *restrict op, size_t byte_index, size_t *restrict advance_by, void *context)
-{
-  _kernel_oserror *e = NULL;
-  ahci_prdt_entry_t *p;
-  size_t bytes_to_page_boundary;
-  paddr_t paddr;
-
-  if (((uintptr_t) op->list->address & 1) != 0 ||
-      (*advance_by & 1) != 0)
-  {
-    /* DMA system can only cope with 16-bit transfers of an even number of bytes */
-    goto failed;
-  }
-
-  /* Mark pages as temporarily uncached and build the PRDT at the same time */
-  p = ((preprocess_direct_context_t *)context)->prdt_entry;
-  bytes_to_page_boundary = PAGE_SIZE - (((uintptr_t) op->list->address + op->scatter_offset) & (PAGE_SIZE - 1));
-  *advance_by = MIN(*advance_by, bytes_to_page_boundary);
-  if ((e = mark_uncacheable(op->list->address + op->scatter_offset, &paddr)) != NULL)
-  {
-    /* Considering FileSwitch has already validated the addresses, the most
-     * likely reason for OS_Memory 0 to have failed is that the memory block
-     * is ROM or IO (e.g. screen buffers on some platforms). We have to handle
-     * these using the bounce buffer, just as for unaligned RAM transfers.
-     * Some earlier scatter list entries may have been OK, so we'll have to
-     * restore their cacheability before returning even for error-free case */
-    goto failed;
-  }
-  /* Look to see if we can merge this into the previous PRDT entry */
-  if (p != op->prdt &&
-      paddr == (paddr_t) p[-1].dba + p[-1].dbc + 1 &&
-      *advance_by < AHCI_DBC_MAX - (p[-1].dbc + 1))
-  {
-    p[-1].dbc += *advance_by;
-    return NULL;
-  }
-  /* Check for PRDT overflow */
-  if (p == op->prdt + AHCI_MAX_PRDT_ENTRIES)
-  {
-    goto failed;
-  }
-  /* Extend PRDT by one entry */
-  p->dba = paddr;
-  p->dbc = *advance_by - 1;
-  ((preprocess_direct_context_t *)context)->prdt_entry = ++p;
-  return NULL;
-
-failed:
-  /* Unless the transfer is already for 4K or less, we'll need the caller to
-   * truncate the transfer to the next-smallest multiple of 4K (to achieve a
-   * wholly aligned transfer to/from RAM) or to 4K (to achieve an unaligned/ROM/IO
-   * transfer that uses the bounce buffer only once). It has to be the caller's
-   * responsibility to do this because we don't understand the contents of the
-   * parameter block at this level. */
-  if (op->total_length <= BOUNCE_BUFFER_SIZE)
-  {
-    op->use_bounce_buffer = true;
-    e = ESCAPE_FROM_SCATTER_LIST_ITERATOR;
-  }
-  else
-  {
-    ataop_block_t *b = ((preprocess_direct_context_t *)context)->b;
-    b->data_len = byte_index &~ (BOUNCE_BUFFER_SIZE - 1);
-    if (b->data_len == 0)
-      b->data_len = BOUNCE_BUFFER_SIZE;
-    e = MESSAGE_ERRORLOOKUP(true, TooComplex, 0);
-  }
-  /* Need to undo any cacheability changes up to this point */
-  op->list = ((preprocess_direct_context_t *)context)->list_start;
-  for_scatter_list(op, byte_index, postprocess_direct, NULL);
-  return e;
-}
-
-static void advance_scatter_pointer(ahciop_t *op)
-{
-  do
-  {
-    if (op->list->length == 0 && (uintptr_t) op->list->address >= SCATTER_THRESHOLD)
-      op->list = (scatter_t *) ((uintptr_t) op->list + (uintptr_t) op->list->address);
-    else
-      op->list++;
-    op->scatter_offset = 0;
-  }
-  while (op->scatter_offset >= op->list->length);
-}
-
-static _kernel_oserror *for_scatter_list(ahciop_t *op, size_t limit, _kernel_oserror *(*callback)(ahciop_t *, size_t, size_t *, void *), void *context)
-{
-  _kernel_oserror *e = NULL;
-  size_t byte_index = 0;
-  size_t advance_by;
-  scatter_t *list_start = op->list; // so we can restore it on exit
-  op->scatter_offset = 0;
-  while (byte_index < limit)
-  {
-    if (op->scatter_offset >= op->list->length)
-      advance_scatter_pointer(op);
-    advance_by = MIN(op->list->length - op->scatter_offset, limit - byte_index);
-    if ((e = callback(op, byte_index, &advance_by, context)) != NULL)
-    {
-      op->list = list_start;
-      return e;
-    }
-    op->scatter_offset += advance_by;
-    byte_index += advance_by;
-  }
-  op->list = list_start;
-  return NULL;
-}
-
 static void halt_command_list(ahciport_t *port, uint32_t ccs)
 {
   port->pr->pxcmd &= ~PXCMD_ST;
@@ -322,8 +149,7 @@ static void halt_command_list(ahciport_t *port, uint32_t ccs)
     }
     index = 31 - index;
     ahciop_t *op = port->op_for_command[index];
-    if (!op->use_bounce_buffer)
-      for_scatter_list(op, op->total_length, postprocess_direct, NULL);
+    dmaprep_on_abort(op);
     op->e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
     do_op_callback(op);
     op->slot = -1u;
@@ -380,10 +206,7 @@ static void clean_up_completed_op(void *context, uint32_t index)
     *p++ = rfis.device;
     *p++ = rfis.command_status;
   }
-  if (op->use_bounce_buffer && (op->description_info & COMMANDHDR_W) == 0)
-    for_scatter_list(op, op->length_done, postprocess_bounce, port->bounce_buffer); /* can't error */
-  else if (!op->use_bounce_buffer)
-    for_scatter_list(op, op->length_done + op->total_length, postprocess_direct, NULL);
+  dmaprep_on_complete(op, port);
 }
 
 static void clean_up_and_callback_completed_op(void *context, uint32_t index)
@@ -629,8 +452,7 @@ static void op_poll(ahciport_t *port)
         spin_lock(&port->state_lock);
         if (op->state == CMD_STATE_READY)
         {
-          if (!op->use_bounce_buffer)
-            for_scatter_list(op, op->total_length, postprocess_direct, NULL);
+          dmaprep_on_abort(op);
           op->e = MESSAGE_ERRORLOOKUP(true, ATA_CmdBusy, 0);
           do_op_callback(op);
           op->state = CMD_STATE_RETIRED;
@@ -644,8 +466,7 @@ static void op_poll(ahciport_t *port)
         spin_lock(&port->state_lock);
         if (op->state == CMD_STATE_READY)
         {
-          if (!op->use_bounce_buffer)
-            for_scatter_list(op, op->total_length, postprocess_direct, NULL);
+          dmaprep_on_abort(op);
           op->e = MESSAGE_ERRORLOOKUP(true, ATA_CmdNotRdy, 0);
           do_op_callback(op);
           op->state = CMD_STATE_RETIRED;
@@ -655,8 +476,7 @@ static void op_poll(ahciport_t *port)
       }
     }
 
-    if (op->use_bounce_buffer && (op->description_info & COMMANDHDR_W) != 0)
-      for_scatter_list(op, op->total_length, preprocess_bounce, port->bounce_buffer); /* can't error */
+    dmaprep_on_queue(op, port);
 
     (*port->command_list)[slot].description_info = op->description_info;
     (*port->command_list)[slot].prdbc = 0; // starts at 0, incremented by controller until it reaches op->total_length
@@ -664,8 +484,6 @@ static void op_poll(ahciport_t *port)
     memcpy(&port->command_table->cfis, &op->cfis, sizeof op->cfis);
     if (op->op_type == OP_ATAPI)
       memcpy(&port->command_table->acmd, &op->acmd, sizeof op->acmd);
-    memcpy(&port->command_table->prdt, &op->prdt,
-        sizeof (ahci_prdt_entry_t) * ((op->description_info & COMMANDHDR_PRDTL_MASK) >> COMMANDHDR_PRDTL_SHIFT));
 
     spin_lock(&port->state_lock);
     if (op->state == CMD_STATE_READY)
@@ -848,6 +666,74 @@ static bool software_reset(ahciport_t *port, uint32_t deviceid, bool error_recov
   return true;
 }
 
+static bool op_rescan_pmp_ports(ahciport_t *port, bool error_recovery)
+{
+  /* Do a COMRESET on all PM ports in parallel to save time */
+#define SCONTROL_CLEAR_BITS (SCONTROL_DET_MASK | SCONTROL_IPM_NO_PARTIAL | SCONTROL_IPM_NO_SLUMBER | SCONTROL_IPM_NO_DEVSLEEP | SCONTROL_PMP_MASK)
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
+        ~SCONTROL_CLEAR_BITS, SCONTROL_DET_COMRESET, error_recovery))
+      return false;
+  }
+  delay(COMRESET_ASSERT_TIME, port, error_recovery);
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
+        ~SCONTROL_CLEAR_BITS, SCONTROL_DET_NOOP, error_recovery))
+      return false;
+  }
+  delay(COMRESET_RECOVERY_TIME, port, error_recovery);
+
+  /* Clear any outstanding errors that may have been generated */
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_write_pmp_reg(port, deviceid, PM_PSCR_SERROR, -1u, error_recovery))
+      return false;
+  }
+
+  /* No command list override needed here, I believe */
+
+  /* Check each PM port's SStatus to see if the link is up */
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    uint32_t sstatus;
+    if (!op_read_pmp_reg(port, deviceid, PM_PSCR_SSTATUS, &sstatus, error_recovery))
+      return false;
+    dprintf("SStatus for PMP %u = %08X\n", deviceid ,sstatus);
+    port->device[deviceid].valid = (sstatus & SSTATUS_DET_MASK) == SSTATUS_DET_DEV;
+  }
+
+  /* For each PM port with a valid link, send a software reset to fetch a
+   * device signature. These have to be done sequentially because the
+   * signature is delivered via a device to host register FIS. */
+  bool result = true;
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (port->device[deviceid].valid)
+    {
+      port->device[deviceid].tfd = STATUS_DRDY; /* assumed */
+      if (!software_reset(port, deviceid, error_recovery))
+      {
+        dprintf("Signature for PMP %u not returned\n", deviceid);
+        port->device[deviceid].sig = (sata_sig_t) 0;
+        result = false;
+
+        /* For errors during error recovery, give up */
+        if (error_recovery)
+          break;
+      }
+      else
+      {
+        dprintf("Signature for PMP %u = %08X\n", deviceid, port->pr->pxsig);
+        port->device[deviceid].sig = (sata_sig_t) port->pr->pxsig;
+      }
+    }
+  }
+
+  return result; /* When true all ports with link up gave signatures */
+}
+
 bool op_rescan_port(ahciport_t *port, bool error_recovery)
 {
   /* Must stop command list processing to issue top-level COMRESET */
@@ -916,56 +802,23 @@ bool op_rescan_port(ahciport_t *port, bool error_recovery)
     for (uint32_t deviceid = port->pmp_ports; deviceid < PM_CONTROL_PORT; deviceid++)
       port->device[deviceid].valid = false;
 
-    /* Do a COMRESET on all PM ports in parallel to save time */
-#define SCONTROL_CLEAR_BITS (SCONTROL_DET_MASK | SCONTROL_IPM_NO_PARTIAL | SCONTROL_IPM_NO_SLUMBER | SCONTROL_IPM_NO_DEVSLEEP | SCONTROL_PMP_MASK)
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
-          ~SCONTROL_CLEAR_BITS, SCONTROL_DET_COMRESET, error_recovery))
-        return false;
-    }
-    delay(COMRESET_ASSERT_TIME, port, error_recovery);
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
-          ~SCONTROL_CLEAR_BITS, SCONTROL_DET_NOOP, error_recovery))
-        return false;
-    }
-    delay(COMRESET_RECOVERY_TIME, port, error_recovery);
+    if (error_recovery)
+      return op_rescan_pmp_ports(port, error_recovery); /* No retries during error recovery */
 
-    /* Clear any outstanding errors that may have been generated */
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+    for (uint32_t retries = 0; retries < COMRESET_RETRIES; retries++)
     {
-      if (!op_write_pmp_reg(port, deviceid, PM_PSCR_SERROR, -1u, error_recovery))
-        return false;
-    }
+      /* Review which have established a PHY link, and try to read the signature.
+       * If the PHY locked, but at an unsupported speed, there will be no response to
+       * the software reset which gets the signature. In that case it's worth
+       * another COMRESET to relock and try the signature again at a different speed. */
+      dprintf("Retry (%d)\n", retries);
+      if (op_rescan_pmp_ports(port, error_recovery))
+        return true;
 
-    /* No command list override needed here, I believe */
-
-    /* Check each PM port's SStatus to see if the link is up */
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      uint32_t sstatus;
-      if (!op_read_pmp_reg(port, deviceid, PM_PSCR_SSTATUS, &sstatus, error_recovery))
-        return false;
-      dprintf("SStatus for PMP %u = %08X\n", deviceid ,sstatus);
-      port->device[deviceid].valid = (sstatus & SSTATUS_DET_MASK) == SSTATUS_DET_DEV;
+      /* Error recovery marks the top level port inactive, force it on again */
+      port->active = true;
     }
-
-    /* For each PM port with a valid link, send a software reset to fetch a
-     * device signature. These have to be done sequentially because the
-     * signature is delivered via a device to host register FIS. */
-    for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
-    {
-      if (port->device[deviceid].valid)
-      {
-        port->device[deviceid].tfd = STATUS_DRDY; /* assumed */
-        if (!software_reset(port, deviceid, error_recovery))
-          return false;
-        dprintf("Signature for PMP %u = %08X\n", deviceid, port->pr->pxsig);
-        port->device[deviceid].sig = (sata_sig_t) port->pr->pxsig;
-      }
-    }
+    return false; /* After COMRESET_RETRIES still not got all signatures */
   }
 
   return true;
@@ -1019,8 +872,7 @@ void op_abort(ahciport_t *restrict port, ahciop_t *restrict op)
     /* In this case, the operation hasn't entered the command list yet, and
      * may not do so for an indeterminate time, so issue the callback routine
      * synchronous to this call rather than from within op_opll(). */
-    if (!op->use_bounce_buffer)
-      for_scatter_list(op, op->total_length, postprocess_direct, NULL);
+    dmaprep_on_abort(op);
     op->e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
     do_op_callback(op);
     op->state = CMD_STATE_RETIRED;
@@ -1053,16 +905,14 @@ void op_abort_all(ahciport_t *port)
   /* All that's left to consider are any op blocks that were never issued */
   if (port->op.state == CMD_STATE_READY)
   {
-    if (!port->op.use_bounce_buffer)
-      for_scatter_list(&port->op, port->op.total_length, postprocess_direct, NULL);
+    dmaprep_on_abort(&port->op);
     port->op.e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
     do_op_callback(&port->op);
     port->op.state = CMD_STATE_RETIRED;
   }
   if (port->error_op.state == CMD_STATE_READY)
   {
-    if (!port->error_op.use_bounce_buffer)
-      for_scatter_list(&port->error_op, port->error_op.total_length, postprocess_direct, NULL);
+    dmaprep_on_abort(&port->error_op);
     port->error_op.e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
     do_op_callback(&port->error_op);
     port->error_op.state = CMD_STATE_RETIRED;
@@ -1137,46 +987,25 @@ _kernel_oserror *op_issue(ataop_block_t *b, bool atapi, bool error_recovery)
   /* Now we have somewhere to build the PRDT, do that first because it can fail */
   op->length_done = 0;
   op->total_length = total_length;
+  scatter_t *scat;
   if (b->r0.bits.scatter)
-    op->list = b->data.scatter;
+    scat = b->data.scatter;
   else
   {
     op->surrogate.address = b->data.block;
     op->surrogate.length = op->total_length;
-    op->list = &op->surrogate;
+    scat = &op->surrogate;
   }
-  op->use_bounce_buffer = false; // until we determine otherwise
 
-  uint32_t prdt_len = 0;
-  if (op->total_length > 0)
+  dmaprep_result_t prep_result = dmaprep_prep(op, b, scat, port);
+  if (prep_result.e != NULL)
   {
-    /* Check to see whether the transfer can be achieved or if it needs to be
-     * truncated. If it can be achieved, determine whether we need to use the
-     * bounce buffer or not. If not using the bounce buffer, mark pages as
-     * temporarily uncacheable and build the PRDT. */
-    preprocess_direct_context_t context = { op->prdt, b, op->list };
-    _kernel_oserror *e = for_scatter_list(op, op->total_length, preprocess_direct, &context);
-
-    /* By now we know for sure whether we're using the bounce buffer or not */
-    if (op->use_bounce_buffer) // implies that the transfer doesn't need truncating
-    {
-      op->prdt[0].dba = port->bounce_buffer_phy;
-      op->prdt[0].dbc = (op->total_length - 1) | AHCI_DBC_I;
-      prdt_len = 1;
-    }
-    else
-    {
-      if (e != NULL)
-      {
-        /* TODO: when op block is allocated from a queue, will need to release the
-         * op block at this point */
-        spinrw_read_unlock(&g_ahci_lock);
-        return e;
-      }
-      context.prdt_entry[-1].dbc |= AHCI_DBC_I;
-      prdt_len = context.prdt_entry - op->prdt;
-    }
+    /* TODO: when op block is allocated from a queue, will need to release the
+     * op block at this point */
+    spinrw_read_unlock(&g_ahci_lock);
+    return prep_result.e;
   }
+  uint32_t prdt_len = prep_result.prdt_len;
 
   op->state = CMD_STATE_READY;
   op->response = b->param.wide_features; // any union member would do

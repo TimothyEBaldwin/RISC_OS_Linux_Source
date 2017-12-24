@@ -1,0 +1,416 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/HWSupport/ATA/SATADriver/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Portions Copyright 2017 Jeffrey Lee
+ * Use is subject to license terms.
+ */
+
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OSMem.h"
+#include "Global/NewErrors.h"
+#include "Interface/ATA.h"
+
+#include "globals.h"
+#include "dmaprep.h"
+#include "message.h"
+#include "SATADriverHdr.h"
+
+typedef struct
+{
+  size_t     length;         /**< Transfer length to use */
+  size_t     offset;         /**< How much of xfer has been consumed (out of length) */
+  scatter_t *scat;           /**< Current scatter list block */
+  size_t     scatter_offset; /**< Offset into current scatter list block */
+}
+scatter_walker_t;
+
+typedef struct
+{
+  ahciop_t         *op;            /**< Op being prepared */
+  int               prdt_index;    /**< Current PRDT index we're writing to, -1 on init */
+  scatter_walker_t  walker;        /**< Current progress through input scatter list */
+  size_t            bounce_offset; /**< Current offset into bounce buffer */
+  paddr_t           bounce_addr;   /**< Current bounce buffer phys address */
+  bool              bouncing;      /**< True if current PRDT entry is in bounce buffer */
+  size_t            out_len;       /**< Output length; for when we need the caller to truncate */
+}
+mem19_ctx_t;
+
+/* Advance to first valid scatter list entry */
+static scatter_t *scatter_init(scatter_t *scat)
+{
+  while (scat->length == 0 && (uintptr_t) scat->address >= SCATTER_THRESHOLD)
+  {
+    scat = (scatter_t *) ((uintptr_t) scat + (uintptr_t) scat->address);
+  }
+  return scat;
+}
+
+/* Return current scatter list chunk */
+static scatter_t scatter_current_chunk(scatter_walker_t *walker)
+{
+  scatter_t res = *walker->scat;
+  size_t remain = walker->length - walker->offset;
+  res.address += walker->scatter_offset;
+  res.length -= walker->scatter_offset;
+  if (res.length > remain)
+  {
+    res.length = remain;
+  }
+  return res;
+}
+
+/* Consume bytes from scatter list */
+static void scatter_consume(scatter_walker_t *walker, size_t bytes)
+{
+  walker->offset += bytes;
+  if (walker->offset == walker->length)
+  {
+    /* Skip scatter list update if we've reached the end */
+    return;
+  }
+  bytes += walker->scatter_offset;
+  scatter_t *scat = walker->scat;
+  while (bytes >= scat->length)
+  {
+    bytes -= scat->length;
+    walker->scat = scatter_init(walker->scat+1);
+  }
+  walker->scatter_offset = bytes;
+}
+
+/* Return details of the next block of memory in the DMA transfer
+ *
+ * In:
+ *  R9 -> scatter walker
+ * Out:
+ *  R0 = log addr
+ *  R1 = length
+ *  R2 = flags
+ */ 
+_kernel_oserror *mem19_in_handler(_kernel_swi_regs *r, void *pw)
+{
+  scatter_walker_t *walker = (scatter_walker_t *) r->r[9];
+  IGNORE(pw);
+
+  /* Work out how much of current chunk we can return */
+  scatter_t chunk = scatter_current_chunk(walker);
+
+  r->r[2] = 0;
+  if (chunk.length == 0)
+  {
+    r->r[1] = 0;
+    return NULL;
+  }
+
+  /* If the start addr or current offset aren't aligned, we need to use a bounce buffer */
+  if ((((uintptr_t) chunk.address) & 1) || (walker->offset & 1))
+  {
+    /* If they're both offset we can get by with only sending one byte via the bounce buffer */
+    if ((((uintptr_t) chunk.address) & 1) && (walker->offset & 1))
+    {
+      chunk.length = 1;
+    }
+    r->r[2] = DMAPrep_UseBounceBuffer;
+  }
+  /* If the end isn't aligned, force last byte via bounce buffer */
+  else if ((((uintptr_t) chunk.address)+chunk.length) & 1)
+  {
+    if (chunk.length == 1)
+    {
+      r->r[2] = DMAPrep_UseBounceBuffer;
+    }
+    else
+    {
+      chunk.length--;
+    }
+  }
+
+  /* Consume bytes */
+  scatter_consume(walker, chunk.length);
+
+  r->r[0] = (int) chunk.address;
+  r->r[1] = chunk.length;
+  return NULL;
+}
+
+/* Receive address translation + bounce buffer usage information for a block
+ * of memory
+ *
+ * In:
+ *  R0 = log addr
+ *  R1 = phys addr
+ *  R2 = length
+ *  R3 = flags
+ *  R9 -> scatter walker
+ */ 
+_kernel_oserror *mem19_out_handler(_kernel_swi_regs *r, void *pw)
+{
+  paddr_t phys = r->r[1];
+  size_t length = r->r[2];
+  bool bounce = r->r[3] & DMAPrep_UseBounceBuffer;
+  mem19_ctx_t *ctx = (mem19_ctx_t *) r->r[9];
+  ahci_prdt_entry_t *prdt = &ctx->op->prdt[ctx->prdt_index];
+  IGNORE(pw);
+
+  /* Claim some space from the bounce buffer if appropriate */
+  if (bounce)
+  {
+    phys = ctx->bounce_addr;
+    ctx->bounce_addr += length;
+    ctx->bounce_offset += length;
+    if (ctx->bounce_offset > BOUNCE_BUFFER_SIZE)
+    {
+      ctx->out_len += length - (ctx->bounce_offset - BOUNCE_BUFFER_SIZE);
+      return MESSAGE_ERRORLOOKUP(true, TooComplex, 0);
+    }
+  }
+
+  while (length > 0)
+  {
+    /* Start a new PRDT entry if: */
+    if ((ctx->prdt_index == -1) /* We don't have any entries yet */
+     || (bounce != ctx->bouncing) /* We're switching from bounce to non-bounce */
+     || (prdt->dbc+1 == AHCI_DBC_MAX) /* Current entry is full */
+     || (!bounce && (prdt->dba + prdt->dbc + 1 != phys))) /* Non-contiguous non-bounce */
+    {
+      if (ctx->prdt_index+1 == AHCI_MAX_PRDT_ENTRIES)
+      {
+        return MESSAGE_ERRORLOOKUP(true, TooComplex, 0);
+      }
+      ctx->prdt_index++;
+      prdt++;
+      prdt->dba = phys;
+      prdt->dbc = (uint32_t) -1;
+      ctx->bouncing = bounce;
+    }
+    /* Don't overflow max size */
+    size_t amt = length;
+    if (amt + prdt->dbc >= AHCI_DBC_MAX)
+    {
+      amt = AHCI_DBC_MAX - (prdt->dbc + 1);
+    }
+    prdt->dbc += amt;
+    length -= amt;
+    phys += amt;
+    ctx->out_len += amt;
+  }
+  return NULL;
+}
+
+dmaprep_result_t dmaprep_prep(ahciop_t *op, ataop_block_t *b, scatter_t *scat, ahciport_t *port)
+{
+  dmaprep_result_t res = {0};
+  if (!op->total_length)
+  {
+    return res;
+  }
+  bool dmawrite = !(b->r0.bits.dir == ATAOp_TransWrite >> ATAOp_TransShift);
+  scat = scatter_init(scat);
+  op->force_bounce = false;
+  op->list = scat;
+  mem19_ctx_t ctx = (mem19_ctx_t) {
+    .op = op,
+    .prdt_index = -1,
+    .bounce_offset = 0,
+    .bounce_addr = port->bounce_buffer_phy,
+  };
+  /* N.B. apparent compiler bug prevents this from being placed directly in the mem19_ctx_t declaration above
+     https://www.riscosopen.org/tracker/tickets/440
+   */
+  ctx.walker = (scatter_walker_t) {
+    .length = op->total_length,
+    .scat = scat,
+  };
+  /* If the first scatter entry is a long unaligned section, reject immediately (minor speed optimisation) */
+  scatter_t first = scatter_current_chunk(&ctx.walker);
+  if ((((uintptr_t) first.address) & 1) && (first.length > BOUNCE_BUFFER_SIZE)) {
+    res.e = MESSAGE_ERRORLOOKUP(true, TooComplex, 0);
+    ctx.out_len = BOUNCE_BUFFER_SIZE;
+  }
+  else 
+  {
+    res.e = _swix(OS_Memory,_INR(0,5),
+      OSMemReason_DMAPrep | (dmawrite ? DMAPrep_Write : 0),
+      g_module_pw,
+      &ctx.walker,
+      mem19_in_veneer,
+      &ctx,
+      mem19_out_veneer);
+  }
+  if (res.e != NULL)
+  {
+    /* If we got an "Address not recognised" error then we're probably being asked to transfer to/from an area which the kernel doesn't consider to be regular RAM, e.g. ROM or an IO region. */
+    if (res.e->errnum == ErrorNumber_BadAddress)
+    {
+      /* Since the bounce buffer has a fixed size, we just need a single PRDT to contain the transfer */
+      if (op->total_length > BOUNCE_BUFFER_SIZE)
+      {
+        res.e = MESSAGE_ERRORLOOKUP(true, TooComplex, 0);
+        ctx.out_len = BOUNCE_BUFFER_SIZE;
+      }
+      else
+      {
+        op->force_bounce = op->use_bounce_buffer = true;
+        op->prdt[0].dba = port->bounce_buffer_phy;
+        op->prdt[0].dbc = (op->total_length - 1) | AHCI_DBC_I;
+        res.e = NULL;
+        res.prdt_len = 1;
+        return res;
+      }
+    }
+    if (res.e->errnum == ErrorNumber_TooComplex)
+    {
+      /* Suggest a transfer length which will work */
+      b->data_len = ctx.out_len;
+    }
+    return res;
+  }
+  op->use_bounce_buffer = (ctx.bounce_offset != 0);
+  op->prdt[ctx.prdt_index].dbc |= AHCI_DBC_I;
+  res.prdt_len = ctx.prdt_index+1;
+  return res;
+}
+
+void dmaprep_on_queue(ahciop_t *op, ahciport_t *port)
+{
+  uint32_t prdt_count = (op->description_info & COMMANDHDR_PRDTL_MASK) >> COMMANDHDR_PRDTL_SHIFT;
+  if (!prdt_count)
+  {
+    return;
+  }
+
+  if (op->use_bounce_buffer && (op->description_info & COMMANDHDR_W) != 0)
+  {
+    /* Populate the bounce buffer with data */
+    scatter_walker_t walker = (scatter_walker_t) {
+      .length = op->total_length,
+      .scat = op->list,
+    };
+    for (uint32_t i = 0; i < prdt_count; i++)
+    {
+      paddr_t phys = (paddr_t) (op->prdt[i].dba);
+      size_t len = (op->prdt[i].dbc & ~AHCI_DBC_I)+1;
+
+      /* Rely on the fact that the bounce buffer is physically contiguous to determine whether a chunk is located in the buffer or not */
+      paddr_t bounce_offset = phys - port->bounce_buffer_phy;
+      if (bounce_offset < BOUNCE_BUFFER_SIZE)
+      {
+        while (len)
+        {
+          scatter_t chunk = scatter_current_chunk(&walker);
+          size_t amt = len;
+          if (amt > chunk.length)
+          {
+            amt = chunk.length;
+          }
+          memcpy(port->bounce_buffer + bounce_offset, chunk.address, amt);
+          len -= amt;
+          bounce_offset += amt;
+          scatter_consume(&walker, amt);
+        }
+      }
+      else
+      {
+        scatter_consume(&walker, len);
+      }
+    }
+  }
+
+  memcpy(&port->command_table->prdt, &op->prdt, sizeof (ahci_prdt_entry_t) * prdt_count);
+}
+
+static void complete_internal(ahciop_t *op, uint8_t *bounce_buffer, paddr_t bounce_buffer_phy)
+{
+  uint32_t prdt_count = (op->description_info & COMMANDHDR_PRDTL_MASK) >> COMMANDHDR_PRDTL_SHIFT;
+  if (!prdt_count)
+  {
+    return;
+  }
+
+  /* Do post-op cache maintenance */
+  scatter_walker_t walker;
+  if (!op->force_bounce)
+  {
+    walker = (scatter_walker_t) {
+      .length = op->length_done + op->total_length,
+      .scat = op->list,
+    };
+    _swix(OS_Memory,_INR(0,3),
+      OSMemReason_DMAPrep | ((op->description_info & COMMANDHDR_W) ? 0 : DMAPrep_Write) | DMAPrep_End,
+      g_module_pw,
+      &walker,
+      mem19_in_veneer);
+  }
+
+  /* Copy any data out of the bounce buffer */
+  if (!bounce_buffer || !op->use_bounce_buffer || (op->description_info & COMMANDHDR_W))
+  {
+    return;
+  }
+
+  walker = (scatter_walker_t) {
+    .length = op->length_done + op->total_length,
+    .scat = op->list,
+  };
+  for (uint32_t i = 0; i < prdt_count; i++)
+  {
+    paddr_t phys = (paddr_t) (op->prdt[i].dba);
+    size_t len = (op->prdt[i].dbc & ~AHCI_DBC_I)+1;
+
+    /* Rely on the fact that the bounce buffer is physically contiguous to determine whether a chunk is located in the buffer or not */
+    paddr_t bounce_offset = phys - bounce_buffer_phy;
+    if (bounce_offset < BOUNCE_BUFFER_SIZE)
+    {
+      while (len)
+      {
+        scatter_t chunk = scatter_current_chunk(&walker);
+        size_t amt = len;
+        if (amt > chunk.length)
+        {
+          amt = chunk.length;
+        }
+        memcpy(chunk.address, bounce_buffer + bounce_offset, amt);
+        len -= amt;
+        bounce_offset += amt;
+        scatter_consume(&walker, amt);
+      }
+    }
+    else
+    {
+      scatter_consume(&walker, len);
+    }
+  }
+}
+
+void dmaprep_on_abort(ahciop_t *op)
+{
+  complete_internal(op, NULL, 0);
+}
+
+void dmaprep_on_complete(ahciop_t *op, ahciport_t *port)
+{
+  complete_internal(op, (uint8_t *) port->bounce_buffer, port->bounce_buffer_phy);
+}

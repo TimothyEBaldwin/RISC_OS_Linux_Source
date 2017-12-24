@@ -57,6 +57,13 @@ TARGET_ROM = rm.${MACHINE}.FPEmulator
 TARGET_RAM = rm.${MACHINE}.FPERAM
 EXPORTS   = ${EXP_HDR}.FPEmulator
 FPEANCHOR ?= Low
+# 32bit-compatible RAM builds store FPEAnchor locally, so that they're compatible with kernels which use high or low zero page workspace. But this means the module must write to its own image to set its workspace pointer.
+# 26bit-only builds can stick with the legacy low FPEAnchor location, avoiding the need for the module to self-modify.
+ifeq (${FPE_APCS},3/26bit)
+FPEANCHOR_RAM ?= Low
+else
+FPEANCHOR_RAM ?= Local
+endif
 
 #
 # Generic rules:
@@ -97,7 +104,7 @@ ${TARGET_ROM}: o.fpe_rom
         ${LD} -rmf -o $@ o.fpe_rom
 
 o.fpe_ram: s.${MACHINE}
-        ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"Local\"" s.${MACHINE} $@
+        ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR_RAM}\"" s.${MACHINE} $@
 
 o.fpe_rom: s.${MACHINE}
         ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR}\"" s.${MACHINE} $@

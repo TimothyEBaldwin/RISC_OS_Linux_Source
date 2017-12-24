@@ -33,7 +33,12 @@
 #include "Global/GraphicsV.h"
 #include "Global/Services.h"
 #include "Global/VduExt.h"
+#include "Global/Variables.h"
+#include "Global/FileTypes.h"
+#include "Global/OsBytes.h"
+#include "Global/CMOS.h"
 #include "Global/ModHand.h"
+#include "Global/VIDCList.h"
 #undef   Module_Title /* CMHG defines this too */
 #include "Interface/HighFSI.h"
 #include "Interface/ScrModes.h"
@@ -45,11 +50,12 @@
 #include "mdfsupport.h"
 #include "edidsupport.h"
 
-/* Switch to define whether EDID is computed, or whether only traditional
- * loadmodefile activity happens. EDID activity enabled by a ReadEDID
- * command, and disabled by a LoadModeFile command.
+/* Switch to define whether live EDID read from the monitor is in use.
+ * If the graphics driver supports it and MonitorType is EDID this
+ * will cause the EDID to be reloaded if the graphics driver changes.
+ * Should an MDF be loaded, this behaviour is cancelled (latching). 
  */
-bool EDIDEnabled;
+static bool using_edid = false;
 
 /* Pointer to (root block of) current monitor definition structure.
  * This becomes valid (non NULL) on successful completion of a
@@ -80,47 +86,70 @@ int old_monitortype = -1; /* -1 means we haven't loaded a file yet */
  * about efficiency; e.g. we could keep the file open and the handle
  * lying around, but there really isn't any point.
  */
-_kernel_oserror *error(int error, const char *arg0, const char *arg1, const char *arg2)
+_kernel_oserror *messages_lookup(char *buffer, size_t space, const char *token,
+                                 const char *arg0, const char *arg1, const char *arg2)
 {
-    /* Where the final returned message is constructed */
-    static _kernel_oserror theerror;
     /* Handle for MessageTrans. */
     int file_data[4];
-    _kernel_swi_regs r;
     _kernel_oserror *res;
-    char token[8];
 
     /* Open the Messages file */
-    r.r[0] = (int)file_data;
-    r.r[1] = (int)Module_MessagesFile;
-    r.r[2] = 0;
-    if ((res = _kernel_swi(MessageTrans_OpenFile, &r, &r)) != NULL)
+    res = _swix(MessageTrans_OpenFile, _INR(0,2),
+                file_data, Module_MessagesFile, 0);
+    if (res != NULL)
     {
         return res;
     }
 
-    sprintf(token, "E%02d", error);
-
-    r.r[0] = (int)file_data;
-    r.r[1] = (int)token;
-    r.r[2] = (int)theerror.errmess;
-    r.r[3] = 252;
-    r.r[4] = (int)arg0;                 /* for %0 */
-    r.r[5] = (int)arg1;                 /* for %1 */
-    r.r[6] = (int)arg2;                 /* for %2 */
-    r.r[7] = 0;                         /* not expecting %3, so don't substitute */
-    res = _kernel_swi(MessageTrans_Lookup, &r, &r);
+    res = _swix(MessageTrans_Lookup, _INR(0,7),
+                file_data, token, buffer, space, arg0, arg1, arg2, NULL);
     /* Always close the messages file, ignoring possible but most unlikely errors */
-    r.r[0] = (int)file_data;
-    (void)_kernel_swi(MessageTrans_CloseFile, &r, &r);
-    /* Check for error from the lookup */
-    if (res)
+    (void)_swix(MessageTrans_CloseFile, _IN(0), file_data);
+    if (res != NULL)
     {
-        return res;                     /* lookup failed */
+        buffer[0] = '?'; buffer[1] = '\0'; /* lookup failed */
+    }
+    return res;
+}
+
+_kernel_oserror *error(int error, const char *arg0, const char *arg1, const char *arg2)
+{
+    /* Where the final returned message is constructed */
+    static _kernel_oserror theerror;
+    _kernel_oserror *res;
+    char token[8];
+
+    sprintf(token, "E%02d", error);
+    res = messages_lookup(theerror.errmess, sizeof(theerror.errmess), token, arg0, arg1, arg2);
+    if (res != NULL)
+    {
+        return res;
     }
     /* Construct the rest of the error block, i.e. the error number */
     theerror.errnum = ERROR_BASE + error;
     return &theerror;
+}
+
+_kernel_oserror *new_monitordescription(MonitorDescriptionRef *description)
+{
+    MonitorDescriptionRef md;
+
+    md = (MonitorDescriptionRef) calloc(1, sizeof(MonitorDescription));
+    if (md == NULL)
+    {
+        return error(ERR_NOSPACE, 0, 0, 0);
+    }
+
+    messages_lookup(md->name, sizeof(md->name), "NoName", NULL, NULL, NULL);
+
+    md->output_format = -1; /* Output format */
+    md->external_clock = -1; /* External clock not present */
+    md->modelist = NULL; /* Empty initially */
+    md->audio_formats = NULL; /* Empty initially */
+
+    *description = md;
+
+    return NULL;
 }
 
 void free_monitordescription(MonitorDescriptionRef description)
@@ -367,8 +396,74 @@ static _kernel_oserror *loadmodefile(const char *file)
           rewind(handle); /* Reset the pointer to the beginning */
           res = loadtextMDF(file, handle);
       }
+      if (res == NULL)
+      {
+          /* Use of an MDF cancels (latching) the automatic EDID side effects */
+          using_edid = false;
+      }
   }
   return res;
+}
+
+static _kernel_oserror *savemodefile(const char *file)
+{
+    char  *fbuf;
+    FILE  *f = NULL;
+    size_t length; 
+    ModeDescriptionRef this;
+
+    if (current_monitor == NULL)
+    {
+        return error(ERR_NOMODEFILE, 0, 0, 0);
+    }
+
+    /* open file for new mode file if required */
+    /* file is a string terminated in 0x0D */
+    length = strcspn(file, "\r");
+    fbuf = malloc(length + 1);
+    if (fbuf)
+    {
+        memcpy(fbuf, file, length);
+        fbuf[length] = '\0';
+        f = fopen(fbuf, "w");
+        free(fbuf);
+    }
+    if (f == NULL)
+    {
+        return _kernel_last_oserror();
+    }
+    fprintf(f, "# Exported from ScrModes " Module_VersionString "\n"
+               "file_format:1\n"
+               "monitor_title:%s\n", current_monitor->name);
+    if (current_monitor->dpms_state!=-1)
+    {
+        fprintf(f, "DPMS_state:%d\n\n", current_monitor->dpms_state);
+    }
+    this = current_monitor->modelist;
+    while (this)
+    {
+        ModeDef *mp = &this->definition.timings;
+        fprintf(f, "# Mode: %d x %d @ %dHz\n", mp->xres, mp->yres, this->frame_hz);
+        fprintf(f, "startmode\n"
+                   " mode_name:%s\n"
+                   " x_res:%d\n"
+                   " y_res:%d\n"
+                   " pixel_rate:%d\n", this->definition.name, mp->xres, mp->yres, mp->pixel_khz);
+        fprintf(f, " h_timings:%d,%d,%d,%d,%d,%d\n", mp->hpar[0], mp->hpar[1], mp->hpar[2],
+                                                     mp->hpar[3], mp->hpar[4], mp->hpar[5]);
+        fprintf(f, " v_timings:%d,%d,%d,%d,%d,%d\n", mp->vpar[0], mp->vpar[1], mp->vpar[2],
+                                                     mp->vpar[3], mp->vpar[4], mp->vpar[5]);
+        fprintf(f, " sync_pol:%d\n", mp->syncpol);
+        if (mp->interlaced == 1)
+        {
+            fprintf(f, " interlaced\n");
+        }
+        fprintf(f,"endmode\n\n");
+        this = this->next;
+    }
+    fclose(f);
+
+    return NULL;
 }
 
 /* List of new PixelFormats available from old GraphicsV_DisplayFeatures */
@@ -390,7 +485,7 @@ static void pixelformat_from_depth(PixelFormatRef pf,int depth)
 }
 
 /* Can this PixelFormat be represented as a pixel depth? (if so, pf->log2bpp is the value) */
-static bool is_old_format(const PixelFormatRef pf)
+bool is_old_format(const PixelFormatRef pf)
 {
     if (pf->log2bpp > 5)
         return false;
@@ -411,7 +506,10 @@ static int current_graphicsv_driver(void)
     return variables[0];
 }
 
-static void build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelFormatRef pf)
+/* Build a VIDC list
+ * Returns the number of control list items
+ */
+static int build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelFormatRef pf)
 {
     int fn;
     int ctrllistpos = 0;
@@ -430,17 +528,17 @@ static void build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelF
     /* Only specify ModeFlags & NColour if necessary? */
     if (!is_old_format(pf))
     {
-        vp->vcparam[ctrllistpos].index = NCOLOUR_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_NColour;
         vp->vcparam[ctrllistpos].value = pf->ncolour;
         ctrllistpos++;
-        vp->vcparam[ctrllistpos].index = MODEFLAGS_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_ModeFlags;
         vp->vcparam[ctrllistpos].value = pf->modeflags;
         ctrllistpos++;
     }
 
     if (current_monitor->dpms_state != -1)
     {
-        vp->vcparam[ctrllistpos].index = DPMS_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_DPMSState;
         vp->vcparam[ctrllistpos].value = current_monitor->dpms_state;
         ctrllistpos++;
     }
@@ -448,58 +546,63 @@ static void build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelF
     if (current_monitor->lcd_support != 0)
     {
         IFDEBUG printf("I'm an LCD panel & I'm going to tell the Kernel!\n");
-        vp->vcparam[ctrllistpos].index = LCDMODE_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_LCDMode;
         vp->vcparam[ctrllistpos].value = LCDMODE_VALUE;
         ctrllistpos++;
         if (current_monitor->lcd_support != 3)
         {
-            vp->vcparam[ctrllistpos].index = LCDDUAL_INDEX;
+            vp->vcparam[ctrllistpos].index = ControlList_LCDDualPanelMode;
             vp->vcparam[ctrllistpos].value = LCDDUAL_VALUE;
             ctrllistpos++;
         }
-        vp->vcparam[ctrllistpos].index = LCDOFF0_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_LCDOffset0;
         vp->vcparam[ctrllistpos].value = LCDOFF0_VALUE;
             ctrllistpos++;
-        vp->vcparam[ctrllistpos].index = LCDOFF1_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_LCDOffset1;
         vp->vcparam[ctrllistpos].value = LCDOFF1_VALUE;
             ctrllistpos++;
-        vp->vcparam[ctrllistpos].index = DACCTRL_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_DACControl;
         vp->vcparam[ctrllistpos].value = DACCTRL_VALUE;
             ctrllistpos++;
     }
 
     if (mp->definition.timings.external_clock != -1)
     {
-        vp->vcparam[ctrllistpos].index = HCLK_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_HClockSelect;
         vp->vcparam[ctrllistpos].value = mp->definition.timings.external_clock;
         ctrllistpos++;
     }
 
     if (mp->definition.timings.interlaced)
     {
-        vp->vcparam[ctrllistpos].index = INTERLACED_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_Interlaced;
         vp->vcparam[ctrllistpos].value = 1;
         ctrllistpos++;
     }
 
     if (current_monitor->output_format != -1)
     {
-        vp->vcparam[ctrllistpos].index = OPFORMAT_INDEX;
+        vp->vcparam[ctrllistpos].index = ControlList_OutputFormat;
         vp->vcparam[ctrllistpos].value = current_monitor->output_format;
         ctrllistpos++;
     }
 
     vp->vcparam[ctrllistpos].index = -1;      /* List terminator */
+
+    return ctrllistpos;
 }
 
 /* Test for whether a given mode definition is usable within the
  * specified data rate and video memory size bounds, at a given pixel
  * depth.  Limitations of the current video controller chip (if known)
  * are also factored in to the test.
+ * If the mode is valid, it optionally copies the VIDC list into the
+ * provided buffer.
  */
 static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
                        uint32_t maxdatarate /* kB/s */,
-                       uint32_t maxdatasize /* bytes */)
+                       uint32_t maxdatasize /* bytes */,
+                       VIDCListRef outlist)
 {
     _kernel_swi_regs r;
     VIDCList         vetlist;
@@ -579,19 +682,105 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
     }
 
     /* Propose the resulting mode to the graphics driver */
-    build_a_vidclist(&vetlist, mp, pf);
+    int ctrllistpos = build_a_vidclist(&vetlist, mp, pf);
     r.r[0] = (int)&vetlist;
-    r.r[1] = NULL;
-    r.r[4] = GraphicsV_VetMode | (driver<<24);
+    r.r[1] = 0; /* Flags */
+    r.r[4] = GraphicsV_VetMode2 | (driver<<24);
     r.r[9] = GraphicsV;
     _kernel_swi(OS_CallAVector, &r, &r);
-    if ((r.r[4] == 0) && (r.r[0] != 0))
+    if ((r.r[4] == 0) && !(r.r[0] & ~7)) /* Call claimed, and no unknown flags returned? */
     {
-        return 0;    /* Had a definitive answer from GraphicsV that it no-likey */
+        if ((r.r[0] & GVVetMode2_ResultMask) == 0)
+        {
+            return 0; /* Had a definitive answer from GraphicsV that it no-likey */
+        }
+        else if (r.r[0] & GVVetMode2_ExtraBytes_Invalid)
+        {
+            /* Check to see if this ExtraBytes value will cause us to exceed
+             * maxdatasize.
+             * (n.b. it's assumed that build_a_vidclist will never set
+             * ExtraBytes itself)
+             */
+            datasize += r.r[2] * my;
+            if (datasize > maxdatasize)
+            {
+                return 0;
+            }
+            /* ExtraBytes value is acceptable, use it */
+            vetlist.vcparam[ctrllistpos].index = ControlList_ExtraBytes;
+            vetlist.vcparam[ctrllistpos].value = r.r[2];
+            ctrllistpos++;
+            vetlist.vcparam[ctrllistpos].index = -1;      /* List terminator */
+        }
+    }
+    else
+    {
+        /* Try the old vet call */
+        r.r[0] = (int)&vetlist;
+        r.r[1] = NULL;
+        r.r[4] = GraphicsV_VetMode | (driver<<24);
+        _kernel_swi(OS_CallAVector, &r, &r);
+        if ((r.r[4] == 0) && (r.r[0] != 0))
+        {
+            return 0; /* Had a definitive answer from GraphicsV that it no-likey */
+        }
     }
 
     /* No obvious conflicts, accept the mode */
+    if (outlist != NULL)
+    {
+        *outlist = vetlist;
+    }
     return 1;
+}
+
+bool find_deepest_by_xyhz(PixelFormatRef fp, ModeDescriptionRef mp)
+{
+    _kernel_swi_regs r;
+    PixelFormatRef   pflist;
+    size_t pflistlen;
+    int    driver, maxlog2bpp = 0;
+    bool   found = false;
+
+    /* See if the driver is helpful in listing the pixel formats */
+    driver = current_graphicsv_driver();
+    r.r[4] = GraphicsV_PixelFormats | (driver<<24);
+    r.r[9] = GraphicsV;
+    _kernel_swi(OS_CallAVector, &r, &r);
+    if (r.r[4] == 0)
+    {
+        pflist = (PixelFormatRef) r.r[0];
+        pflistlen = r.r[1];
+    }
+    else
+    {
+        /* Use the old list */
+        pflist = oldformats;
+        pflistlen = sizeof(oldformats)/sizeof(oldformats[0]);
+    }
+    IFDEBUG printf("Trying %d pixel formats\n", pflistlen);
+
+    /* The format list isn't necessarily sorted by depth, so just try them
+     * all to find the highest log2bpp.
+     */
+    while (pflistlen)
+    {
+        if (mode_valid(mp, pflist, INT32_MAX, INT32_MAX, NULL))
+        {
+            /* That depth is achievable, keep it if bigger */
+            if (pflist->log2bpp > maxlog2bpp)
+            {
+                maxlog2bpp = pflist->log2bpp;
+                IFDEBUG printf("Deeper mode_valid at log2bpp = %d\n", maxlog2bpp);
+                *fp = *pflist;
+                found = true;
+            }
+        }
+        pflist++;
+        pflistlen--;
+    }
+
+    return found;
 }
 
 static ModeDescriptionRef find_by_xy(ModeDescriptionRef mp,
@@ -757,13 +946,11 @@ static void service_modeextension(_kernel_swi_regs *regs)
     {
         /* Test whether this mode can satisfy the requirements */
         if ((sel->framerate == -1 || sel->framerate == mp->frame_hz) &&
-            mode_valid(mp, &pf, dataratelimit, datasizelimit))
+            mode_valid(mp, &pf, dataratelimit, datasizelimit, &thevidclist))
         {
-            build_a_vidclist(&thevidclist, mp, &pf); /* use the local static structure */
-
             /* And claim the service */
             regs->r[1] = 0;                 /* Service_Serviced */
-            regs->r[3] = (int)&thevidclist; /* return pointer to VIDC list to use */
+            regs->r[3] = (int)&thevidclist; /* return pointer to VIDC list to use (mode_valid will have filled this in for us) */
             regs->r[4] = NULL;              /* marks no workspace list(mode selector given) */
             return;
         }
@@ -801,7 +988,6 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
         pflistlen = sizeof(oldformats)/sizeof(oldformats[0]);
     }
 
-
     /* Scan all available modes at all available pixel formats */
     mp = current_monitor->modelist;
     pf = pflist;
@@ -809,7 +995,7 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
 
     for (;;)
     {
-        if (!mode_valid(mp, pf, dataratelimit, datasizelimit))
+        if (!mode_valid(mp, pf, dataratelimit, datasizelimit, NULL))
         {
             /* TMD 03-Nov-93: Fix bug MED-00833
              * Code used to set depth to 5 here, assuming that if the mode
@@ -924,7 +1110,7 @@ static int mode_available(uint32_t xres, uint32_t yres, const PixelFormatRef pf,
     do
     {
         if ((framerate == -1 || framerate == mp->frame_hz) &&
-            mode_valid(mp, pf, INT32_MAX, INT32_MAX))
+            mode_valid(mp, pf, INT32_MAX, INT32_MAX, NULL))
         {
             return 1;
         }
@@ -1035,29 +1221,28 @@ retry_with_4bpp:
 
 static void service_displaychanged(_kernel_swi_regs *regs)
 {
-    _kernel_oserror *res;
     switch (regs->r[0])
     {
         case DisplayChanged_Changing:
             /* The current driver is changing. We must recache any
              * driver-specific things which we store.
              * At the moment all the driver-specific stuff happens during the
-             * enumerate/translate calls, so there's nothing to do.
-             */
-            if (EDIDEnabled)
-            {
-                res = readedid(regs->r[2],NULL);
-            }
-
-            break;
-        case DisplayChanged_Changed:
-            /* Display change is complete
-             * Issue mode file changed service call so that the display manager
-             * is up to date.
-             * (might be possible to skip this if EDID is in use and EDID has
-             * already issued it)
-             */
-            _swix(OS_ServiceCall,_IN(1),Service_ModeFileChanged);
+             * enumerate/translate calls, so just check the monitor's still there.
+             * Note that doing it here means:
+             * a) ScreenModes must precede the driver if you want a mode defined
+             *    during module init AND the MonitorType is EDID. If the MonitorType
+             *    is some other value, including Auto, it doesn't matter
+             *    where ScreenModes is as the Kernel will use a built in numbered mode.
+             * b) Loading ScreenModes off disc won't automatically load the EDID data
+             *    as this service call doesn't happen. Calling readedid() from module
+             *    init isn't possible because the module isn't linked to the service
+             *    call chain, so Display Manager et al can't enumerate the modes
+             *    with OS_ScreenMode 2. This is only a problem for developers, who
+             *    can manually re-read it (standalone builds are only partly supported today).
+            */
+            /* added new reason code of 1 to indicate reset to edid based definitions
+            */
+            readedid(regs->r[2], (regs->r[3]==1) || using_edid);
             break;
     }
 }
@@ -1242,19 +1427,31 @@ find_next_sub_entry:
 /* EXPORTED */
 _kernel_oserror *ScreenModes_initialise(const char *cmd_tail, int podule_base, void *pw)
 {
-    preferred_mode = malloc(sizeof(ModeSelector));
-    if (preferred_mode)
+    char typevar[16];
+    int  config;
+
+    /* Keep a preferred mode with space for 2 extra mode variables */
+    preferred_mode = calloc(1, sizeof(ModeSelector) + (2 * sizeof(ModeParam)));
+
+    /* Define the EDID type name */
+    sprintf(typevar, "File$Type_%03X", FileType_EDID);
+    _swix(OS_SetVarVal, _INR(0,4), typevar, FileType_EDID_Name,
+                                   strlen(FileType_EDID_Name), 0, VarType_String);
+
+    /* Look at the MonitorType to see whether to proactively parse EDID */
+    if (!_swix(OS_Byte, _INR(0,1) | _OUT(2), OsByte_ReadCMOS, VduCMOS, &config))
     {
-        memset(preferred_mode,0,sizeof(ModeSelector));
+        using_edid = ((config & MonitorTypeBits) >> MonitorTypeShift) == MONITOR_EDID;
     }
+
     UNUSED(cmd_tail);
     UNUSED(podule_base);
     UNUSED(pw);
-    EDIDEnabled = 0;          /* not enabled on module boot */
 
     return NULL;
 }
 
+/* EXPORTED */
 _kernel_oserror *ScreenModes_final(int fatal, int podule, void *pw)
 {
     /* Free the space claimed for the current monitor
@@ -1263,6 +1460,7 @@ _kernel_oserror *ScreenModes_final(int fatal, int podule, void *pw)
      */
     (void) restore_monitortype(); /* restore old value */
     release_currentmonitor();
+    release_edidblocks();
     if (preferred_mode)
     {
         free(preferred_mode);
@@ -1321,11 +1519,8 @@ _kernel_oserror *ScreenModes_cmdhandler(const char *arg_string, int argc, int cm
         case CMD_LoadModeFile:
             result = loadmodefile(arg_string);
             break;
-        case CMD_ReadEDID:
-            result = readedid(current_graphicsv_driver(),NULL);
-            break;
-        case CMD_CreateModeFile:
-            result = readedid(current_graphicsv_driver(),arg_string);
+        case CMD_SaveModeFile:
+            result = savemodefile(arg_string);
             break;
         default:
             return NULL;
@@ -1394,6 +1589,11 @@ _kernel_oserror *ScreenModes_swihandler(int swi_no, _kernel_swi_regs *r, void *p
 
         case ScreenModes_EnumerateAudioFormats - ScreenModes_00:
             return swi_enumerateaudioformats(r);
+
+        case ScreenModes_Features - ScreenModes_00:
+            r->r[0] = ScreenModes_Features_EDID; /* These extra features are supported */
+            result = NULL;
+            break;
 
         default:                /* Unknown ScreenModes SWI */
             return error_BAD_SWI;
