@@ -31,4 +31,4 @@ CDEFINES   = -Dkernelheader="\"kernel.h\""
 include CLibrary
 include HostTools
 
-# Dynamic dependencies:
+include Depends
