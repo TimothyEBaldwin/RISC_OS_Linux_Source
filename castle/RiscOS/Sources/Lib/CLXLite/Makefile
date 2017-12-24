@@ -30,4 +30,4 @@ CDEFINES   = -Dkernelheader="\"kernel.h\""
 
 include CLibrary
 
-# Dynamic dependencies:
+include Depends
