@@ -1,0 +1,208 @@
+/*
+ * Copyright (c) 2015, Timothy Baldwin
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ */
+
+#include "header.h"
+#include "swis.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+
+#include "Global/HALEntries.h"
+#include "Global/OSMem.h"
+#include "Global/OSWords.h"
+#include "Global/RISCOS.h"
+
+extern const char fsinfo(void);
+extern const char __module_header(void);
+extern void stdin_handler(void);
+extern char **__HAL_get_env(void);
+
+extern void __PVirt_SetCPSR_c(void);
+extern void __PVirt_GetCPSR(void);
+extern void __PVirt_SetSPSR(void);
+extern void __PVirt_GetSPSR(void);
+extern void __PVirt_GetVCPU(void);
+extern void __PVirt_FindMode(void);
+extern void __PVirt_MOVS_PC_LR(void);
+extern void __PVirt_LoadUsrRegisters(void);
+extern void __PVirt_SWI(void);
+extern void __PVirt_syscall(void);
+extern void __PVirt_FastSWI(void);
+
+static uintptr_t find_routine(uint32_t key) {
+  switch(key) {
+    case 0xe59d0010: // LDR      r0,[sp,#0x10]
+      return (uintptr_t)&__PVirt_SetCPSR_c;
+
+    case 0xe10f0000: // MRS      r0,cpsr
+      return (uintptr_t)&__PVirt_GetCPSR;
+
+    case 0xe16ff001:
+      return (uintptr_t)&__PVirt_SetSPSR;
+
+    case 0xe14f0000: // MRS      r0,spsr
+      return (uintptr_t)&__PVirt_GetSPSR;
+
+    case 1:
+      return (uintptr_t)&__PVirt_GetVCPU;
+
+    case 2:
+      return (uintptr_t)&__PVirt_FindMode;
+
+    case 0xe1b0f00e: // MOVS     pc,lr
+      return (uintptr_t)&__PVirt_MOVS_PC_LR;
+
+    case 3:
+      return (uintptr_t)&__PVirt_LoadUsrRegisters;
+
+    case 0xe59d000c: // LDR      r0,[sp,#0xc]
+      return (uintptr_t)&__PVirt_SWI;
+
+    case 4:
+      return (uintptr_t)&__PVirt_syscall;
+
+    case 0xe1a0f00e: // MOV      pc,lr
+      return (uintptr_t)&__PVirt_FastSWI;
+  }
+  return 0;
+}
+
+static inline void patch_table(uint32_t *a, uint32_t *b) {
+  uint32_t *i = a;
+  while(i < b) {
+    uintptr_t x = find_routine(*i);
+    if (x) {
+      *i++ = 0xE51FF004; // LDR PC, . + 4
+      *i = x;
+    }
+    ++i;
+  }
+  ix_cacheflush(a, i, 0);
+}
+
+
+
+_kernel_oserror *init(const char *cmd_tail, int podule_base, void *pw) {
+
+  // Set system time, looping until time isn't changed whilst setting it.
+  for(uint64_t time, old_time = 0;; old_time = time) {
+    struct ix_timespec t;
+    ix_clock_gettime(ix_CLOCK_REALTIME, &t);
+    time = time_unix2ro(t.tv_sec, t.tv_nsec) << 8 | OWWriteRTC_5ByteInt;
+    if (time == old_time) break;
+    _swi(OS_Word, _INR(0, 1), OsWord_WriteRealTimeClock, &time);
+  };
+
+  // Install interrupt handler for standard input.
+  uintptr_t HAL_IRQClear;
+  HAL_IRQClear = _swi(OS_Hardware, _INR(8, 9) | _RETURN(0), 1, EntryNo_HAL_IRQClear);
+  _swi(OS_ClaimDeviceVector, _INR(0, 2), 0, stdin_handler, HAL_IRQClear);
+  _swi(OS_Hardware, _IN(0) | _INR(8, 9), 0, 0, EntryNo_HAL_IRQEnable);
+
+
+  // Copy Linux environment variables to RISC OS system variables.
+  for(char **i = __HAL_get_env(); *i; ++i) {
+    char *const limit = dirname + sizeof(dirname) - 1;
+    char *s = *i, *d = dirname;
+    if (memcmp(s, "RISC_OS_", 8) == 0) {
+      s += 8;
+      while(*s && *s != '=' && d < limit) {
+        char c = *s++;
+        if (c == '_' || c == '$') c= c ^ ('_' ^ '$');
+        *d++ = c;
+      }
+    } else {
+      *d++ = 'i';
+      *d++ = 'x';
+      *d++ = '$';
+      while(*s && *s != '=' && d < limit) *d++ = *s++;
+    }
+    *d = 0;
+    if (*s == '=') ++s;
+    _swix(OS_SetVarVal, _INR(0, 4), dirname, s, strlen(s), 0, 4);
+  }
+
+  pd1.fd = -1;
+  pd2.fd = -1;
+  pd1.dir_fd = -1;
+  pd2.dir_fd = -1;
+
+  _kernel_oserror *e = 0;
+
+  e = _swix(OS_FSControl, _INR(0, 3), 12, __module_header, (uintptr_t)fsinfo - (uintptr_t)__module_header, pw);
+  return e;
+}
+
+_kernel_oserror *final(int fatal, int podule, void *pw) {
+  (void)pw;
+  _kernel_oserror *e = 0;
+  e = _swix(OS_FSControl, _INR(0, 2), 16, "IXFS");
+  return e;
+}
+
+_kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  switch (swi_no) {
+    case IXSupport_LinuxSyscall - IXSupport_00:
+      __asm {
+        MOV     r0, r->r[0]
+        MOV     r1, r->r[1]
+        MOV     r2, r->r[2]
+        MOV     r3, r->r[3]
+        MOV     r4, r->r[4]
+        MOV     r5, r->r[5]
+        MOV     r6, r->r[6]
+        MOV     r7, r->r[7]
+        BL      __PVirt_syscall, {r0-r7}, {r0}, {}
+        MOV     r->r[0], r0
+      }
+      return 0;
+    case IXSupport_FindRoutine - IXSupport_00:
+      r->r[0] = find_routine(r->r[0]);
+      return 0;
+    case IXSupport_PatchTable - IXSupport_00:
+      patch_table((uint32_t *)r->r[0], (uint32_t *)r->r[1]);
+      return 0;
+  }
+  return error_BAD_SWI;
+}
+
+_kernel_oserror *command_handler(const char *arg_string, int argc, int cmd_no, void *pw) {
+  (void)arg_string;
+  (void)argc;
+  (void)pw;
+  switch(cmd_no) {
+    case CMD_IXFS:
+      return _swix(OS_FSControl, _INR(0, 1), 14, 70);
+    case CMD_IXFSBoot:
+      break;
+  }
+  return 0;
+}
