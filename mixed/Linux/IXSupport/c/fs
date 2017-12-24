@@ -67,6 +67,7 @@ struct ro_attr {
 
 typedef struct handle {
   int fd, dir_fd;
+  char name[1];
 } Handle;
 
 static inline void crash(void) {
@@ -120,7 +121,19 @@ static inline void pd_close(struct path_data *pd) {
   }
 }
 
+static void add_filetype(char *d, const char *s, const struct ro_attr *attr) {
+  while(*s && *s != ',') *d++ = *s++;
+  unsigned filetype = (attr->load >> 8) & 0xFFF;
+  if ((attr->load & 0xFFF00000) == 0xFFF00000 && filetype != 0xFFF) {
+    sprintf(d, ",%03x", filetype);
+  } else {
+    *d = 0;
+  }
+}
+
 static _kernel_oserror *pd_convert_filename(struct path_data *pd, const char *s, int openflags) {
+
+  if (pd->fd >= 0) eprintf("**** path_data leak ****\n");
 
   pd_close(pd);
 
@@ -176,7 +189,7 @@ static _kernel_oserror *pd_convert_filename(struct path_data *pd, const char *s,
         dots = 10;
       }
       *d++ = c;
-      if (d == pd->name + sizeof(pd->name)) goto bad;
+      if (d == pd->name + sizeof(pd->name) - 4) goto bad; // Allow space for filetype
     }
     *d = 0;
     //eprintf("Leaf 2: %s\ndots = %i\n", pd->name, dots);
@@ -261,10 +274,6 @@ bad:
   ix_close(fd);
   eprintf("Bad filename!\n");
   return &bad_path;
-}
-
-static void pd_unname(struct path_data *pd) {
-  sprintf(pd->name, "/proc/self/fd/%i", pd->fd);
 }
 
 static _kernel_oserror *read_dent(void) {
@@ -401,6 +410,9 @@ _kernel_oserror *FSEntry_Func_handler(_kernel_swi_regs *regs, void *pw) {
       attr.load = 0xFFF00000 | (pd1.filetype << 8);
       attr.exec = 0;
       int r = ix_setxattr(pd1.name, "user.RISC_OS.LoadExec", &attr, 8, ix_XATTR_CREATE);
+      if (r == -ix_EOPNOTSUPP) {
+        add_filetype(pd2.name, pd2.name, &attr);
+      }
 
       regs->r[1] = !!ix_rename(pd1.name, pd2.name);
       pd_close(&pd1);
@@ -481,22 +493,30 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
           addr += res;
         }
       }
-      ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0);
+      if (ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0)) {
+        add_filetype(pd2.name, pd1.name, &attr);
+        ix_rename(pd1.name, pd2.name);
+      }
       write_timestamp(fd, 0, &attr);
       regs->r[6] = (unsigned)find_leaf((const char *)regs->r[1]);
       break;
 
-    case 1:
+    case 1: {
       e = pd_convert_filename(&pd1, (const char *)regs->r[1], ix_O_PATH);
       if (e) goto out;
-      pd_unname(&pd1);
+      char name[16];
+      sprintf(name, "/proc/self/fd/%i", pd1.fd);
       attr.load = regs->r[2];
       attr.exec = regs->r[3];
       attr.attributes = regs->r[5];
-      ix_setxattr(pd1.name, "user.RISC_OS.LoadExec", &attr, 12, 0);
-      write_timestamp(ix_AT_FDCWD, pd1.name, &attr);
+      struct ix_stat s;
+      if (ix_setxattr(name, "user.RISC_OS.LoadExec", &attr, 12, 0) && !ix_stat(name, &s) && !(ix_S_IFDIR & s.st_mode)) {
+        add_filetype(pd2.name, pd1.name, &attr);
+        ix_rename(pd1.name, pd2.name);
+      }
+      write_timestamp(ix_AT_FDCWD, name, &attr);
       break;
-
+    }
     case 5:
       e = pd_convert_filename(&pd1, (const char *)regs->r[1], ix_O_PATH);
       if (pd1.fd == -ix_ENOENT) {
@@ -505,7 +525,7 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
         goto out;
       }
       if (e) goto out;
-      pd_unname(&pd1);
+      sprintf(pd1.name, "/proc/self/fd/%i", pd1.fd);
       e = read_meta(&out, pd1.name, pd1.filetype);
       if (e) goto out;
       regs->r[0] = out.type;
@@ -549,7 +569,10 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
           goto out;
         }
       }
-      ix_fsetxattr(pd1.fd, "user.RISC_OS.LoadExec", &attr, 9, 0);
+      if (ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0)) {
+        add_filetype(pd2.name, pd1.name, &attr);
+        ix_rename(pd1.name, pd2.name);
+      }
       write_timestamp(pd1.fd, 0, &attr);
       regs->r[6] = (unsigned)find_leaf((const char *)regs->r[1]);
       break;
@@ -575,7 +598,7 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
       if (e) return e;
       fd = pd1.fd;
 
-      pd_unname(&pd1);
+      sprintf(pd1.name, "/proc/self/fd/%i", pd1.fd);
       e = read_meta(&out, pd1.name, pd1.filetype);
       if (e) goto out;
 
@@ -659,9 +682,10 @@ _kernel_oserror *FSEntry_Open_handler(_kernel_swi_regs *r, void *pw) {
   if ((ix_S_IFDIR & s.st_mode)) info |= 1U<<27;
   // FIXME Test for ttys.
 
-  Handle *handle = malloc(sizeof(Handle)); // FIXME Out of memory error
+  Handle *handle = malloc(sizeof(Handle) + strlen(pd1.name)); // FIXME Out of memory error
   handle->fd = pd1.fd;
   handle->dir_fd = pd1.dir_fd;
+  strcpy(handle->name, pd1.name);
   pd1.fd = -1;
   pd1.dir_fd = -1;
 
@@ -824,7 +848,10 @@ _kernel_oserror *FSEntry_Close_handler(_kernel_swi_regs *r, void *pw) {
     ix_fgetxattr(fd, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
     attr.load = r->r[2];
     attr.exec = r->r[3];
-    ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0);
+    if (ix_fsetxattr(fd, "user.RISC_OS.LoadExec", &attr, 9, 0)) {
+      add_filetype(pd2.name, handle->name, &attr);
+      if (handle->name, pd2.name) ix_rename(handle->name, pd2.name);
+    }
   }
   ix_close(fd);
   if (handle->dir_fd != fd) ix_close(handle->dir_fd);
