@@ -1,3 +1,14 @@
+sdl: mixed/Linux/Support/sdl.cpp mixed/Linux/SocketKVM/h/protocol mixed/Linux/Support/sdlkey.h
+	g++ -Wall -pthread -g -O2 --std=c++11 mixed/Linux/Support/sdl.cpp  `sdl2-config --cflags --libs` -o sdl
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
+
+mixed/Linux/Support/sdlkey.h: mixed/Linux/Support/sdlkey
+	mixed/Linux/Support/sdlkey > $@
+
+mixed/Linux/Support/sdlkey: mixed/Linux/Support/sdlkey.c Export/APCS-32/C/Global/h/Keyboard
+	gcc -std=gnu99 -Wall `sdl2-config --cflags --libs` mixed/Linux/Support/sdlkey.c -o $@
+	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
+
 comma2attr: mixed/Linux/Support/comma2attr.c
 	gcc -std=gnu99 -g `pwd`/mixed/Linux/Support/comma2attr.c -o comma2attr
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e6ffff00000000 $@ || true
