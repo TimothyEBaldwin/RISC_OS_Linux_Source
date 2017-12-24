@@ -45,4 +45,4 @@ scrambler: scrambler.c
         EnsureDepends scramblerDepends
         ${MAKE} -f scrambler/mk THROWBACK=${THROWBACK}
 
-include Depends
+# Dynamic dependencies:

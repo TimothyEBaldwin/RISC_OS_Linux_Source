@@ -91,4 +91,4 @@ ${TARGET}: ${OBJS} ${DIRS}
         ${CHMOD} a+rx $@
 
 #
-include Depends
+# Dynamic dependencies:

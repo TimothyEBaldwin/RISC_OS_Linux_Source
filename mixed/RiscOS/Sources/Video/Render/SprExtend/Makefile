@@ -171,4 +171,4 @@ asmcore.o:
         ${MKDIR} o
         ${CC} ${CFLAGS} $*.c
 
-include Depends
+# Dynamic dependencies:

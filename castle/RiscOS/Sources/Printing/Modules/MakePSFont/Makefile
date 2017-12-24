@@ -31,4 +31,4 @@ ASMHDRS     = MakePSFont
 
 include CModule
 
-include Depends
+# Dynamic dependencies:

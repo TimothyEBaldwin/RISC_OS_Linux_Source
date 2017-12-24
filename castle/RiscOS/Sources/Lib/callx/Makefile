@@ -26,4 +26,4 @@ LIBRARIES  = ${LIBRARYZM} # Only the module version makes sense
 
 include CLibrary
 
-include Depends
+# Dynamic dependencies:

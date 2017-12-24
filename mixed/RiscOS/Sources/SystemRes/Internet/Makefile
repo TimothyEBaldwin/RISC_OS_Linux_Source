@@ -443,4 +443,4 @@ ${SDIR}.utils.utl.X: ${SDIR}.utils.s.X
         @up
         @up
 
-include Depends
+# Dynamic dependencies:

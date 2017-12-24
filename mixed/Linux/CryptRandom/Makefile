@@ -5,4 +5,3 @@ ROM_LIBS = ${PVLibs}
 
 include StdTools
 include AAsmModule
-include Depends

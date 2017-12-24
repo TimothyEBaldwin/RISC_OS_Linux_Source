@@ -32,4 +32,4 @@ HEADER1   = Filter
 include StdTools
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

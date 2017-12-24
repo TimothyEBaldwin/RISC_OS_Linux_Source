@@ -138,4 +138,4 @@ clean:
 	${RM} socklib5
 	${RM} socklib5zm
 
-include Depends
+# Dynamic dependencies:

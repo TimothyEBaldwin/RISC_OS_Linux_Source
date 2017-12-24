@@ -193,4 +193,4 @@ sao.module: h.saheader
 o<Machine>.resfiles: Resources.<Machine>.Tags
 o<Machine>.resfiles: LocalRes:Messages
 
-include Depends
+# Dynamic dependencies:

@@ -142,4 +142,4 @@ ${TOKENSOURCE}: ${HELPSRC} ${TOKENS}
 
 Debugger.s: ${TOKENSOURCE}
 
-include Depends
+# Dynamic dependencies:

@@ -33,4 +33,4 @@ HEADER1    = ScrBlank
 include StdTools
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

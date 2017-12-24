@@ -24,4 +24,4 @@ HDRS      = ModMalloc
 
 include CLibrary
 
-include Depends
+# Dynamic dependencies:

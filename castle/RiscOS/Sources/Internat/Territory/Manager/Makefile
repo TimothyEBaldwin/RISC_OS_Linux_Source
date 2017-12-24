@@ -46,4 +46,4 @@ clean ::
 	${RM} ${SPRITEFILE}
 
 
-include Depends
+# Dynamic dependencies:

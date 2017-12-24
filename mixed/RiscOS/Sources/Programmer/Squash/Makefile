@@ -27,4 +27,4 @@ OBJS        = compress comp_ass cssr debug \
 
 include CModule
 
-include Depends
+# Dynamic dependencies:

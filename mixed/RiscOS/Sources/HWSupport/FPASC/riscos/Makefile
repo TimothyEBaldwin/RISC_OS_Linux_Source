@@ -70,4 +70,4 @@ endif
 
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

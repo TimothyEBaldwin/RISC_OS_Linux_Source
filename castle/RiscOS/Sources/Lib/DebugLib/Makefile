@@ -26,4 +26,4 @@ HDRS      = DebugLib
 
 include CLibrary
 
-include Depends
+# Dynamic dependencies:

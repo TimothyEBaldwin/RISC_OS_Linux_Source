@@ -64,4 +64,4 @@ MkTables.maketables: MkTables.c.maketables
         ${MAKE} -f maketables/mk COMPONENT=maketables THROWBACK=${THROWBACK}
         ${CD} ^
 
-include Depends
+# Dynamic dependencies:

@@ -24,4 +24,4 @@ HDRS      = PDebug
 
 include CLibrary
 
-include Depends
+# Dynamic dependencies:

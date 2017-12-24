@@ -33,4 +33,4 @@ HEADER2   = RS423
 include StdTools
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

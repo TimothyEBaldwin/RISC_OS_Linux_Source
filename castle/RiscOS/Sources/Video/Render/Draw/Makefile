@@ -32,4 +32,4 @@ HEADER1    = Draw
 include StdTools
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

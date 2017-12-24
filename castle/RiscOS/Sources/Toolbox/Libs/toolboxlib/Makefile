@@ -156,4 +156,4 @@ dirs:
 $(TARGET): local_dirs
 	Obey	@.!Mk
 
-include Depends
+# Dynamic dependencies:

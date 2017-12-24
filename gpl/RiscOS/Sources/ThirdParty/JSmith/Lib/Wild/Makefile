@@ -25,4 +25,4 @@ CDEFINES  = -DNDEBUG
 
 include CLibrary
 
-include Depends
+# Dynamic dependencies:

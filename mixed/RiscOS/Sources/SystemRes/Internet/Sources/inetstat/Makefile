@@ -43,4 +43,4 @@ ${TARGET}:	$(OBJS) $(LIBS)
 clean:;		${RM} ${TARGET}
 		IfThere o.* Then ${WIPE} o.* ${WFLAGS}
 	
-include Depends
+# Dynamic dependencies:

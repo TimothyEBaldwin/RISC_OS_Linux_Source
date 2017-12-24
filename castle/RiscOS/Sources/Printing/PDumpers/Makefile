@@ -165,4 +165,4 @@ Sprite:
         ${SUBMAKE} ^.rm.PDumperSP25 INSTDIR=^.rm
         @back
 
-include Depends
+# Dynamic dependencies:

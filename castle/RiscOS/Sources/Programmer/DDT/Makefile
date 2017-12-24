@@ -56,4 +56,4 @@ export: ${EXPORTS}
 ${EXP_HDR}.DDT: hdr.DDT
         ${CP} hdr.DDT $@ ${CPFLAGS}
 
-include Depends
+# Dynamic dependencies:

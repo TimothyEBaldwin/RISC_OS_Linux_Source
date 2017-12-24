@@ -42,5 +42,3 @@ ${DIRS} ::
 
 
 CFLAGS += -Wpn -ITCPIPLibs:
-
-include Depends

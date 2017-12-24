@@ -50,4 +50,4 @@ clean::
         ${RM} hdr.RAMFSErr
         @@echo ${COMPONENT}: cleaned 
 
-include Depends
+# Dynamic dependencies:

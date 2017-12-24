@@ -132,4 +132,4 @@ clean:
 	${RM} unixlibzm
 
 
-include Depends
+# Dynamic dependencies:

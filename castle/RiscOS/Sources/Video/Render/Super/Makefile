@@ -54,4 +54,4 @@ ${ROM_OBJECT} ${SA_OBJECT} ${DBG_OBJECT}: ${MATRIX1} ${MATRIX2}
         ${MAKE} -f matrix/mk COMPONENT=$* THROWBACK=${THROWBACK}
         ${RUN}$* $@
 
-include Depends
+# Dynamic dependencies:

@@ -39,4 +39,4 @@ app:
         ${CP} LocalRes:!Run !SaverAni.!Run ${CPFLAGS}
         ${CP} LocalRes:Templates !SaverAni.Templates ${CPFLAGS}
 
-include Depends
+# Dynamic dependencies:

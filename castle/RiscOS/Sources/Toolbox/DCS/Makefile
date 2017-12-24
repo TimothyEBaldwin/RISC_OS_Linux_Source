@@ -36,4 +36,4 @@ INSTRES_FILES = Res Quit.Messages:^.Quit Quit.Res:^.Quit
 
 include CModule
 
-include Depends
+# Dynamic dependencies:

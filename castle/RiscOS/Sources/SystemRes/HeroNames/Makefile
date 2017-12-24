@@ -42,4 +42,4 @@ install_rom: ${DATA}
         ${CP} ${DATA} ${INSTDIR}.${TARGET} ${CPFLAGS}
         @echo ${COMPONENT}: rom module installed
 
-include Depends
+# Dynamic dependencies:

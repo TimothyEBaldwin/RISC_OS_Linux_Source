@@ -27,4 +27,4 @@ CINCLUDES = -ITCPIPLibs:,C:
 
 include CLibrary
 
-include Depends
+# Dynamic dependencies:

@@ -34,4 +34,4 @@ INSTRES_VERSION = Messages
 include StdTools
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

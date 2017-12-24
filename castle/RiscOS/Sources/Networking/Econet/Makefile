@@ -26,4 +26,4 @@ EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1}
 include StdTools
 include AAsmModule
 
-include Depends
+# Dynamic dependencies:

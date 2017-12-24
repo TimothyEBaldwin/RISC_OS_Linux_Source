@@ -104,4 +104,4 @@ install: export_libs
         ${CP} ${EXPDIR} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
         @${ECHO} ${COMPONENT}: install complete
 
-include Depends
+# Dynamic dependencies:
