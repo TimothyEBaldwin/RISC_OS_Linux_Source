@@ -29,7 +29,7 @@
 #
 
 COMPONENT       = ZeroPain
-OBJS            = cmodule errors config handler_asm handler_c log
+OBJS            = cmodule errors config handler_asm handler_c log log_detailed
 CMHGFILE        = modhead
 HDRS            =
 ROMCDEFINES     = -DROM_MODULE
