@@ -37,6 +37,7 @@ union report {
     ev_keyup     = CONST(2),
     ev_mode_sync = CONST(3),
     ev_resize    = CONST(4),
+    ev_close     = CONST(5),
   } reason;
   struct {
     int32_t reason;
@@ -54,6 +55,7 @@ union command {
     c_set_palette = CONST(1),
     c_pointer     = CONST(2),
     c_suspend     = CONST(3),
+    c_close_ctl   = CONST(4),
   } reason;
   struct {
     int32_t reason;
@@ -73,5 +75,9 @@ union command {
     int32_t reason;
     ule32 delay;
   } suspend;
+  struct close_ctl {
+    int32_t reason;
+    int32_t use_message;
+  } close_ctl;
   uint8_t pad[33 * 8];
 };
