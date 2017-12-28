@@ -67,6 +67,7 @@ const int screen_update = 5554;
 const size_t screen_size = 1024*1024*100;
 int sig_fd, sockets[2];
 bool swapmouse;
+bool use_close_message;
 int log2bpp = 3;
 int height = 480;
 int width = 640;
@@ -287,6 +288,9 @@ int main(int argc, char **argv) {
           cursor = cursor2;
           break;
         }
+        case command::c_close_ctl:
+          use_close_message = c.close_ctl.use_message;
+          break;
       }
     }
 
@@ -309,7 +313,12 @@ int main(int argc, char **argv) {
         }
         break;
       case SDL_QUIT:
-        kill(pid, SIGTERM);
+        if (use_close_message) {
+          r.reason = report::ev_close;
+          write(sockets[0], &r, sizeof(r));
+        } else {
+          kill(pid, SIGTERM);
+        }
         break;
       case SDL_KEYDOWN:
         r.reason = report::ev_keydown;
