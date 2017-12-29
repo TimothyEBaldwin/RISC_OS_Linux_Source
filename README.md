@@ -31,6 +31,7 @@ The following variables are accepted by the Makefile:
 | LINUX_ROM  | Location of Linux RISC OS executable to use for building. |
 | QEMU       | Location of qemu-arm executable. |
 | PHASES     | Space separated list of build phases to run. |
+| SOURCE     | Path to RISC OS source to build, so that one version of the Linux build tools can build another RISC OS version. |
 
 The following targets are provided by the Makefile:
 
