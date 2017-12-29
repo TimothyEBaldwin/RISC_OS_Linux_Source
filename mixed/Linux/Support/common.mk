@@ -29,11 +29,11 @@ update-binary:
 	SOURCE=$$SOURCE
 	BINARY=$$(cd mixed/Linux/Support/bin && git rev-parse HEAD)
 	LINUX='$$(uname -a)'
-	" > mixed/Linux/Support/bin/!Boot/Linux/source
+	" > source
 	#
 	$(MAKE) JOBS=$$(getconf _NPROCESSORS_ONLN)
 	(cd mixed/Linux/Support/bin && git checkout master)
-	cp --reflink=auto --preserve=mode,xattr RISC_OS mixed/Linux/Support/?(sdl.cpp|sdlkey.c|Keyboard.h|protocol.h) mixed/Linux/Support/bin/!Boot/Linux
+	cp -v --reflink=auto --preserve=mode,xattr source RISC_OS mixed/Linux/Support/?(sdl.cpp|sdlkey.c|Keyboard.h|protocol.h) mixed/Linux/Support/bin/!Boot/Linux
 	#
 	cd mixed/Linux/Support/bin
 	git add -u
