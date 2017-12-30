@@ -23,4 +23,4 @@ OBJS      = Args BGet BPut File Find FSControl GBPB logger mymalloc Random BigFi
 
 include CApp
 
-include Depends
+# Dynamic dependencies:

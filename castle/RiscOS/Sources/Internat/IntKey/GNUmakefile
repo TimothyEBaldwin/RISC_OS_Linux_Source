@@ -68,4 +68,4 @@ links:
 	ln -s h/throwback throwback.h
 	ln -s c/throwback throwback.c
 
-include Depends
+# Dynamic dependencies:

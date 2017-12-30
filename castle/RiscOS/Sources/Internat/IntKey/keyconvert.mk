@@ -24,4 +24,4 @@ include StdRules
 include AppLibs
 include CApp
 
-include Depends
+# Dynamic dependencies:

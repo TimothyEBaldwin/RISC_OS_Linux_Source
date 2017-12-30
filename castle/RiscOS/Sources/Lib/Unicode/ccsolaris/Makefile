@@ -92,4 +92,4 @@ links: ; ./mklinks
 	echo made links
 
 # Do not faff with the following comment as Make looks for it explicitly:
-include Depends
+# Dynamic dependencies:

@@ -108,4 +108,4 @@ ${TARGET}: ${OBJS} ${CLIB}
         ${LD} -o $@ -aif ${OBJS} ${CLIB}
 
 
-include Depends
+# Dynamic dependencies:

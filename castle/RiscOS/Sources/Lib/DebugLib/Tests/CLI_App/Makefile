@@ -89,4 +89,4 @@ ${TARGET}: ${OBJS} ${LIBS} ${DIRS}
 ${TARGETMC}: ${OBJSMC} ${LIBSMC} ${DIRS}
 	${LD} ${LDFLAGS} -o $@ ${OBJSMC} ${LIBSMC}
 
-include Depends
+# Dynamic dependencies:

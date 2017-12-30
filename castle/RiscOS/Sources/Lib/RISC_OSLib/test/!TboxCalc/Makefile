@@ -41,4 +41,4 @@ Squeezeflags = -f $@
 @.o.foo:      @.s.foo
            objasm $(asflags) -o @.o.foo @.s.foo           
            
-include Depends
+# Dynamic dependencies:
