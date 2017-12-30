@@ -68,16 +68,4 @@ ${LOADER}: s.Loader
         ${AS} s.Loader $@ ${AFLAGS}
 
 #---------------------------------------------------------------------------
-include Depends
-rm.Loader: Hdr:ListOpts
-rm.Loader: Hdr:Macros
-rm.Loader: Hdr:System
-rm.Loader: Hdr:SWIs
-rm.Loader: Hdr:CPU.Generic26
-rm.Loader: Hdr:IO.GenericIO
-rm.Loader: Hdr:RISCOS
-rm.Loader: Hdr:ModHand
-rm.Loader: Hdr:FSNumbers
-rm.Loader: Hdr:NewErrors
-rm.Loader: Hdr:Podule
-rm.Loader: Version
+# Dynamic dependencies:

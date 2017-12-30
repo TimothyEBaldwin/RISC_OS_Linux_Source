@@ -24,4 +24,4 @@ include HostTools
 include AppLibs
 include CApp
 
-include Depends
+include scramblerDepends
