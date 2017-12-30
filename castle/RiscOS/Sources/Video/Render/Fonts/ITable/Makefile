@@ -27,4 +27,4 @@ include StdTools
 include ModuleLibs
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

@@ -82,4 +82,4 @@ ${EXP_HDR}.HostFS: hdr.HostFS
 ${EXP_HDR}.HostDebug: hdr.HostDebug
         ${CP} hdr.HostDebug $@ ${CPFLAGS}
 
-# Dynamic dependencies:
+include Depends

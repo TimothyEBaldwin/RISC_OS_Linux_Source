@@ -35,4 +35,4 @@ HEADER1     = TaskWindow
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

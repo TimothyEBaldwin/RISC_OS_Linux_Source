@@ -24,4 +24,4 @@ HDRS      = PlainArgv StrTok
 
 include CLibrary
 
-# Dynamic dependencies:
+include Depends

@@ -30,4 +30,4 @@ LIBS          = ${TBOXINTLIB} ${WIMPLIB}
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

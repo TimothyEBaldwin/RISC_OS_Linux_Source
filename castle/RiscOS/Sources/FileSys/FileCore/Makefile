@@ -54,4 +54,4 @@ clean::
 	@IfThere h Then ${ECHO} ${WIPE} h ${WFLAGS}
 	@IfThere h Then ${WIPE} h ${WFLAGS}
 
-# Dynamic dependencies:
+include Depends

@@ -38,4 +38,4 @@ TOKHELPSRC  = ${TOKENSOURCE}
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

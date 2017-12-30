@@ -181,4 +181,4 @@ o.ModuleWrap: s.ModuleWrap
 s.ModuleWrap: ${WRAPPER}
         ${CP} ${WRAPPER} $@ ${CPFLAGS}
 
-# Dynamic dependencies:
+include Depends

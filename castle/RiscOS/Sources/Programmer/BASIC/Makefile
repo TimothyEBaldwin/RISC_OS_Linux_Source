@@ -49,4 +49,4 @@ ifeq ($(COMPONENT),BASICVFP)
 AS            = ObjAsmVFP
 endif
 
-# Dynamic dependencies:
+include Depends
