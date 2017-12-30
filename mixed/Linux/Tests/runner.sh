@@ -36,5 +36,8 @@ RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run --nofork
 }
 
 export -f tests
+
 # cat is needed here as stdout is reopened, which would reset the pointer of regular files.
-unshare -Umrn bash -e -c tests </dev/null 3>/dev/null 2>&1 | cat
+exec  2>&1 > >(cat)
+
+unshare -Umrn bash -e -c tests </dev/null 3>/dev/null
