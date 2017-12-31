@@ -28,7 +28,7 @@
 
 
 COMPONENT    = IXSupport
-OBJS = main fs app_patch
+OBJS = main fs app_patch errors
 RESOURCES   = no
 CUSTOMROM=custom
 CUSTOMEXP=no
@@ -43,6 +43,15 @@ ${DIRS} ::
 	${MKDIR} h
 
 CFLAGS += -Wpn -I<Lib$Dir>.Linux
+
+mkerrors: c.mkerrors
+	%cc -depend !Depend -I<Lib$Dir>.Linux -ITCPIPLibs: -I<Lib$Dir>.Linux -memaccess -L22-S22-L41 c.mkerrors -o mkerrors
+
+s.errors: mkerrors
+	Run mkerrors > s.errors
+
+o.errors: s.errors
+	${AS} ${ASFLAGS} -o $@ s.errors
 
 rom: ${ROM_OBJS_} ${DIRS}
 	@${ECHO} ${COMPONENT}: rom module built
