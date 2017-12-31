@@ -60,7 +60,7 @@ This following items will be download to ~/Downloads if needed:
 
 ## To do List
 
-- [ ] Complete the key map.
+- [x] Complete the key map.
 - [x] Fix the realtime clock.
 - [x] Make data aborts raise errors.
 - [x] Support writing timestamps in IXFS.
@@ -75,8 +75,7 @@ This following items will be download to ~/Downloads if needed:
 - [ ] Fix overwriting of ROM image when rebuilding RISC OS, which will cause a crash if the overwritten ROM image is currently being run.
 - [ ] Provide a means to run Linux programs.
 - [ ] Implement PMP dynamic areas.
-- [ ] Replace the changes that are labeled "Hack" 
-- [ ] Fix the race condition that causes !Edit to crash when loading growing files, it reliably crashes when trying to load it's own WimpSlot.
+- [x] Replace the changes that are labeled "Hack"
 - [x] Replace the branch table at the beginning of the HAL.
 - [ ] Write test cases for VFP errors.
 - [ ] Implement VFPSupport.
