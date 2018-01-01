@@ -33,7 +33,7 @@ OBJS = o.Top o.Main o.PVOps o.Tests
 include Makefiles:StdTools
 include Makefiles:StdRules
 
-CFLAGS = -depend !Depend -c -Wpn -APCS 3/32bit/nofp/noswst -I<Lib$Dir>.Linux -DADDRESS=${ADDRESS} -DHALSIZE=(${HALSize:K=}*1024)
+CFLAGS = -depend !Depend -c -Wpn -APCS 3/32bit/nofp/noswst -DADDRESS=${ADDRESS} -DHALSIZE=(${HALSize:K=}*1024)
 ASFLAGS += -APCS 3/nofp/noswst -pd "ro_size * ${ADDRESS_RW} - ${ADDRESS}"
 
 o._dirs:
