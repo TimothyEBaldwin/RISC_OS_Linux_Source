@@ -45,6 +45,11 @@ export_hdrs: <Lib$Dir>.Linux.h.syscalls
 	${CP} LinuxSyscalls <Export$Dir>.LinuxSyscalls ${CPFLAGS}
 	${CP} h.syscall_defs <Lib$Dir>.Linux.h.syscall_defs ${CPFLAGS}
 	${CP} h.syscall_types <Lib$Dir>.Linux.h.syscall_types ${CPFLAGS}
+	|
+	${MKDIR} <CExport$dir>.ix.h
+	${CP} h.syscalls <CExport$dir>.ix.h.syscalls ${CPFLAGS}
+	${CP} h.syscall_defs <CExport$dir>.ix.h.syscall_defs ${CPFLAGS}
+	${CP} h.syscall_types <CExport$dir>.ix.h.syscall_types ${CPFLAGS}
 	@Echo LinuxSyscalls header export complete
 
 export_libs:
@@ -52,5 +57,3 @@ export_libs:
 
 export_resources:
 	@Echo LinuxSyscalls: no resources
-
-include Depends
