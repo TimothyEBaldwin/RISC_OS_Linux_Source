@@ -27,7 +27,6 @@
 
 COMPONENT = InternetL
 OBJS = main
-ROM_SYMS = ${PVLibs}
 LIBS = TCPIPLibs:o.inetlibzm
 CUSTOMEXP=no
 CUSTOMRES=no
@@ -36,11 +35,12 @@ CMHGDEPENDS = main
 
 include StdTools
 include CModule
+ROM_SYMS += ${PVLIBS}
 
 ${DIRS} ::
 	${MKDIR} h
 
 
-CFLAGS += -Wpn -I<Lib$Dir>.Linux -ITCPIPLibs:
+CFLAGS += -Wpn -ITCPIPLibs:
 
 include Depends
