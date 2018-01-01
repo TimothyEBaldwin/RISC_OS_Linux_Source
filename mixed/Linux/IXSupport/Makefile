@@ -42,10 +42,8 @@ include CModule
 ${DIRS} ::
 	${MKDIR} h
 
-CFLAGS += -Wpn -I<Lib$Dir>.Linux
-
 mkerrors: c.mkerrors
-	%cc -depend !Depend -I<Lib$Dir>.Linux -ITCPIPLibs: -I<Lib$Dir>.Linux -memaccess -L22-S22-L41 c.mkerrors -o mkerrors
+	%cc -depend !Depend -I<Lib$Dir>.Linux -ITCPIPLibs: -memaccess -L22-S22-L41 c.mkerrors -o mkerrors
 
 s.errors: mkerrors
 	Run mkerrors > s.errors
