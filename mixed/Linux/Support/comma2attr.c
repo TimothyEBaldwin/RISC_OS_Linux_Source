@@ -64,7 +64,7 @@ static bool is_suffix(const char *end) {
 
 static void process(int dirfd, char *source) {
   int r;
-  int filetype = -1;
+  unsigned filetype = 0xFFFFFFFF;
 
   struct stat s;
   r = fstatat(dirfd, source, &s, 0);
@@ -96,7 +96,7 @@ static void process(int dirfd, char *source) {
 
   char *end = stpcpy(dest, source);
 
-  struct ro_attr attr;
+  struct ro_attr attr = {};
   int attr_len = getxattr(source, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
   if (attr_len < 0  && errno != ENOATTR) {
     fprintf(stderr, "Unable to read attribute: %s\n", source);
@@ -110,14 +110,17 @@ static void process(int dirfd, char *source) {
     filetype = (attr.load >> 8) & 0xFFF;
   }
 
-  if (suffixed && (filetype == -1 || suffix_priority)) {
+  if (suffixed && (filetype == 0xFFFFFFFF || suffix_priority)) {
       filetype = strtoul(end - 3, 0, 16);
   }
 
   if (strip) {
     if (suffixed) end -= 4;
 
-    if (write_suffix && filetype <= 0xFFF && !((s.st_mode & 0111) && filetype == 0xFE6))
+    if (write_suffix
+        && !S_ISDIR(s.st_mode)
+        && filetype < 0xFFF
+        && !((s.st_mode & 0111) && filetype == 0xFE6))
       end += sprintf(end, ",%03x" , filetype);
 
     *end = 0;
@@ -131,13 +134,16 @@ static void process(int dirfd, char *source) {
     }
   }
 
-  if (filetype >= 0) {
+  if (filetype <= 0xFFF) {
     uint64_t time = ((uint64_t)s.st_mtime + 25567ULL * 24 * 3600) * 100;
     attr.load = 0xFFF00000U | (time >> 32) | (filetype << 8);
     attr.exec = (uint32_t)(time);
-    r = setxattr(source, "user.RISC_OS.LoadExec", &attr, 8, 0);
+
+    if (attr_len < 8) attr_len = 8;
+    r = setxattr(dest, "user.RISC_OS.LoadExec", &attr, attr_len, 0);
+
     if (r && errno != ENODATA) {
-      fprintf(stderr, "Unable to set attribute: %s\n", source);
+      fprintf(stderr, "Unable to set attribute: %s\n", dest);
       return_code |= 8;
       return;
     }
