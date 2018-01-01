@@ -38,6 +38,6 @@ include StdTools
 include CModule
 
 ROM_SYMS += ${PVLIBS}
-CFLAGS += -Wpn -I<Lib$Dir>.Linux -IOSLib:
+CFLAGS += -Wpn -IOSLib:
 
 include Depends
