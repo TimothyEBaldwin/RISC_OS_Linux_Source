@@ -36,17 +36,9 @@ export: export_${PHASE}
 h.syscalls: GenSyscall
 	${PERL} GenSyscall > h.syscalls
 
-<Lib$Dir>.Linux.h.syscalls: h.syscalls
-	${MKDIR} <Lib$Dir>.Linux.h
-	-${DIFF} $@ h.syscalls
-	If "<AMU$ReturnCode>" <> "0" Then ${CP} h.syscalls $@ ${CPFLAGS}
-
-export_hdrs: <Lib$Dir>.Linux.h.syscalls
-	${CP} LinuxSyscalls <Export$Dir>.LinuxSyscalls ${CPFLAGS}
-	${CP} h.syscall_defs <Lib$Dir>.Linux.h.syscall_defs ${CPFLAGS}
-	${CP} h.syscall_types <Lib$Dir>.Linux.h.syscall_types ${CPFLAGS}
-	|
+export_hdrs: h.syscalls
 	${MKDIR} <CExport$dir>.ix.h
+	${CP} LinuxSyscalls <Export$Dir>.LinuxSyscalls ${CPFLAGS}
 	${CP} h.syscalls <CExport$dir>.ix.h.syscalls ${CPFLAGS}
 	${CP} h.syscall_defs <CExport$dir>.ix.h.syscall_defs ${CPFLAGS}
 	${CP} h.syscall_types <CExport$dir>.ix.h.syscall_types ${CPFLAGS}
