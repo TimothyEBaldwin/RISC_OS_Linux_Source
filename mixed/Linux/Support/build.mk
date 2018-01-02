@@ -95,7 +95,7 @@ ${SOURCE}/stamp-prepare: mixed/Linux/Support/build.mk
 	ln -sfn  mixed/RiscOS/Modules
 	ln -sfn castle/RiscOS/Env
 	ln -sfn castle/RiscOS/BuildSys
-	cp -a castle/RiscOS/Export .
+	cp -r --preserve=mode,timestamps castle/RiscOS/Export .
 	mkdir -p Apps
 	(cd Apps && ln -sfn ../*/RiscOS/Apps/\!* .)
 	touch stamp-prepare
