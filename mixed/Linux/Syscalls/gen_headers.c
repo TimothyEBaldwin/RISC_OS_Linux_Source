@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/auxv.h>
@@ -263,6 +264,19 @@ int main(void) {
   DEF(O_RDWR)
   DEF(O_TRUNC)
   DEF(PATH_MAX)
+  DEF(POLLERR)
+  DEF(POLLHUP)
+  DEF(POLLIN)
+  DEF(POLLMSG)
+  DEF(POLLNVAL)
+  DEF(POLLOUT)
+  DEF(POLLPRI)
+  DEF(POLLRDBAND)
+  DEF(POLLRDHUP)
+  DEF(POLLRDNORM)
+  DEF(POLLREMOVE)
+  DEF(POLLWRBAND)
+  DEF(POLLWRNORM)
   DEF(PROT_EXEC)
   DEF(PROT_NONE)
   DEF(PROT_READ)
@@ -341,8 +355,8 @@ int main(void) {
   DEF(TCP_NODELAY)
   DEF(TCSETS)
   DEF(TIMER_ABSTIME)
-  DEF(UTIME_OMIT)
   DEF(UTIME_NOW)
+  DEF(UTIME_OMIT)
   DEF(VMIN)
   DEF(VTIME)
   DEF(WNOHANG)
