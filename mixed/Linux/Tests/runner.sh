@@ -15,8 +15,11 @@ fi
 
 export RISC_OS_Test_Dir='IXFS:$.proc.self.cwd.mixed.Linux.Tests'
 
+# Test ptrace SWI implemnation
+RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' timeout --foreground -sKILL 30 $* --noseccomp --nofork --noaborts
+
+# Various tests that shouldn't cause data aborts
 RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' timeout --foreground -sKILL 30 $* --nofork --noaborts
 
-RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' timeout --foreground -sKILL 30 $* --noseccomp --nofork --noaborts
-
+# Various tests that require data aborts
 RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' timeout --foreground -sKILL 60 $* --nofork 3>/dev/null 2>&1
