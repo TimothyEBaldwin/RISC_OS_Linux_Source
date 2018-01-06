@@ -66,12 +66,7 @@ endif
 
 ifeq (${TARGET}, IOMD32)
 check: rpcemu/rpcemu HardDisc4/stamp
-	echo "Create HostFS:$$.done" > HardDisc4/\!Boot/Choices/Boot/Tasks/ZZZ,feb
-	rm HardDisc4/done* || true
-	timeout --foreground -sKILL 60 rpcemu/rpcemu 7<'${SOURCE}/Images/${TARGET}_rom' 8<HardDisc4 || true
-	sleep 1
-	rm HardDisc4/\!Boot/Choices/Boot/Tasks/ZZZ,feb
-	test -f HardDisc4/done,ffd
+	mixed/Linux/Tests/runner_rpcemu.sh '${SOURCE}/Images/${TARGET}_rom'
 endif
 
 ifeq (${TARGET}, Linux)
