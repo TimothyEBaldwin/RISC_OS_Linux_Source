@@ -116,6 +116,7 @@ struct keys sdl2key[] = {
   {SDL_SCANCODE_PRINTSCREEN,    KeyNo_Print},
   {SDL_SCANCODE_SCROLLLOCK,     KeyNo_ScrollLock},
   {SDL_SCANCODE_PAUSE,          KeyNo_Break},
+  {SDL_SCANCODE_F13,            KeyNo_Break}, // For chromebook
 
   {SDL_SCANCODE_INSERT,         KeyNo_Insert},
   {SDL_SCANCODE_HOME,           KeyNo_Home},
