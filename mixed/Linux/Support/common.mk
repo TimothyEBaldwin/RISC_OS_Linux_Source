@@ -44,6 +44,7 @@ rpcemu/stamp: ${RPCEMU}
 	echo "3f092e6000b5d50984e63768a74cdc9a40284d55c984e26df44c7d5875ced6e9 *${RPCEMU}" | sha256sum -c
 	tar zxf "${RPCEMU}"
 	mv rpcemu-0.8.15 rpcemu
+	(cd rpcemu && patch -p1 < ../mixed/Linux/Support/rpcemu_exit.diff)
 	touch rpcemu/stamp
 
 rpcemu/src/Makefile: rpcemu/stamp
@@ -84,7 +85,11 @@ HardDisc4/stamp: ${HARDDISC4} boot_iomd_rom rpcemu/rpcemu
 	echo '2b5c2eadb4b4d5cff1ae5dfbce1159c15b41720ef89dcf735062d86074f34083 *${HARDDISC4}' | sha256sum -c
 	rm -rf HardDisc4 || true
 	unzip -F '${HARDDISC4}' 'HardDisc4/*'
-	timeout -sKILL 20 rpcemu/rpcemu 7<boot_iomd_rom 8<HardDisc4 || true
+	printf '*Shutdown\nSYS &C0200,,,,,,,,1\n' > 'HardDisc4/!Boot/RO520Hook/Boot/Tasks/off,ffb'
+	printf 'Running Rpcemu...'
+	timeout -sKILL 600 rpcemu/rpcemu 7<boot_iomd_rom 8<HardDisc4
+	printf 'done.\n'
+	rm 'HardDisc4/!Boot/Choices/Boot/Tasks/off,ffb'
 	touch HardDisc4/stamp
 
 boot_iomd_rom: ${IOMD}

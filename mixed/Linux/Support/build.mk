@@ -46,15 +46,11 @@ ifeq (${TARGET}, Linux)
 endif
 	  rm 'Images/${TARGET}_rom'* || true
 	)
-	rm done* || true
 ifeq (${METHOD}, rpcemu)
 	ln -sfn /dev/fd/9 AcornC.C++
 	ln -sfn /dev/fd/8 src
 	echo '*Obey -v mixed.Linux.Support.Build rpcemu HostFS:$$.src HostFS:$$.AcornC/C++ ${TARGET} ${PHASES}' > '!Boot,fea'
-	rpcemu/rpcemu 7<boot_iomd_rom 4<. 8<'${SOURCE}' 9<'${ACORN_CPP}' & \
-	until test -f done,ffd; do sleep 1; done; kill $$!; sleep 1
-	sh done,ffd
-	rm done,ffd
+	rpcemu/rpcemu 7<boot_iomd_rom 4<. 8<'${SOURCE}' 9<'${ACORN_CPP}'
 else
 	RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.4.Build Linux IXFS:$$.dev.fd.8 IXFS:$$.dev.fd.9 ${TARGET} ${PHASES}' ./run ${LINUX_ROM} --nofork 4<mixed/Linux/Support 8<'${SOURCE}' 9<'${ACORN_CPP}' <<END
 	*BASIC
