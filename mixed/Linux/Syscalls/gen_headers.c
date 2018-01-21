@@ -27,6 +27,7 @@
 
 #include <asm/hwcap.h>
 #include <linux/filter.h>
+#include <linux/fs.h>
 #include <linux/memfd.h>
 #include <linux/ptrace.h>
 #include <linux/seccomp.h>
@@ -189,6 +190,7 @@ int main(void) {
   DEF(AT_FDCWD)
   DEF(AT_HWCAP)
   DEF(AT_HWCAP2)
+  DEF(AT_REMOVEDIR)
   DEF(BPF_ABS)
   DEF(BPF_JEQ)
   DEF(BPF_JGE)
@@ -294,6 +296,9 @@ int main(void) {
   DEF(PTRACE_SET_SYSCALL)
   DEF(PTRACE_SYSCALL)
   DEF(PTRACE_TRACEME)
+  DEF(RENAME_NOREPLACE)
+  DEF(RENAME_EXCHANGE)
+  DEF(RENAME_WHITEOUT)
   DEF(SA_NODEFER)
   DEF(SA_ONSTACK)
   DEF(SA_RESTART)
