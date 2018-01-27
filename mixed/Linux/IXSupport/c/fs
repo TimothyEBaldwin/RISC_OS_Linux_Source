@@ -144,10 +144,23 @@ static inline void pd_close(struct path_data *pd) {
   }
 }
 
-static void add_filetype(char *d, const char *s, const struct ro_attr *attr) {
-  while(*s && *s != ',') *d++ = *s++;
-  unsigned filetype = (attr->load >> 8) & 0xFFF;
-  if ((attr->load & 0xFFF00000) == 0xFFF00000 && filetype != 0xFFF) {
+static void add_filetype(char *d, struct path_data *pd, const struct ro_attr *attr, int attr_failed) {
+  int filetype = (attr->load & 0xFFF00000) == 0xFFF00000 ? (attr->load >> 8) & 0xFFF : -1;
+
+  // Don't change name if it has the right type, or if raw mode enabled.
+  if (pd->sf.suffix == 0 || pd->filetype == filetype) {
+    strcpy(d, pd->name);
+    return;
+  }
+
+  // Copy name without any suffix
+  size_t l = strlen(pd->name);
+  if (pd->filetype != -1) l -= 4;
+  memcpy(d, pd->name, l);
+  d += l;
+
+  // Add suffix if required
+  if (filetype != 0xFFF && filetype != 0xFE6 && filetype != -1 && ((attr_failed && pd->sf.suffix > 1) || pd->sf.suffix > 2)) {
     sprintf(d, ",%03x", filetype);
   } else {
     *d = 0;
@@ -272,7 +285,7 @@ static _kernel_oserror *pd_convert_filename(struct path_data *pd, const char *s,
           ++b;
         }
 
-        if (*a == 0 && (*b == 0 || is_suffix(b))) {
+        if (*a == 0 && (*b == 0 || (pd->sf.suffix && is_suffix(b)))) {
           // Match found, so copy it.
           strcpy(leaf, dentry->d_name);
 
@@ -393,19 +406,23 @@ static _kernel_oserror *read_meta(struct ro_dirent *out, int fd, int filetype, i
 
   if (filetype == -1) {
     // If file is executable, default filetype is "UNIX Ex"
-    if (s.st_mode & 0111) filetype = 0xFE6;
+    if (s.st_mode & 0111) filetype = 0xFFFFFFE6;
 
     // If file is not regular, default filetype is "Data"
-    if (!ix_S_ISREG(s.st_mode)) filetype = 0xFFD;
+    if (!ix_S_ISREG(s.st_mode)) filetype = 0xFFFFFFFD;
   }
 
   struct ro_attr attr;
-  attr.load = 0xFFF00000 | (filetype << 8);
-  attr.exec = 0;
   attr.attributes = 3;
-  r = ix_getxattr(name, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
-  if (r < 0 && r != -ix_EACCES && r != -ix_ENOENT && r != -ix_ENODATA && r != -ix_EOPNOTSUPP) {
-    return convert_error(r);
+  if (suffix < 4) {
+    r = ix_getxattr(name, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
+    if (r < 0 && r != -ix_EACCES && r != -ix_ENOENT && r != -ix_ENODATA && r != -ix_EOPNOTSUPP) {
+      return convert_error(r);
+    }
+  }
+  if (r < 8 || filetype != -1) {
+    attr.load = 0xFFF00000 | (filetype << 8);
+    attr.exec = 0;
   }
 
   uint64_t time = time_unix2ro(s.st_mtime, s.st_mtime_nsec);
@@ -449,24 +466,34 @@ _kernel_oserror *FSEntry_Func_handler(_kernel_swi_regs *regs, void *pw) {
       break;
     case fsfunc_Rename: {
       pd1.sf = parse_special_field((const char *)regs->r[6]);
-      e = pd_convert_filename(&pd1, (const char *)regs->r[1], ix_O_PATH);
+      e = pd_convert_filename(&pd1, (const char *)regs->r[1], ix_O_PATH | ix_O_NOFOLLOW);
       if (e) return e;
       pd2.sf = parse_special_field((const char *)regs->r[6]);
-      e = pd_convert_filename(&pd2, (const char *)regs->r[2], ix_O_PATH);
+      e = pd_convert_filename(&pd2, (const char *)regs->r[2], ix_O_PATH | ix_O_NOFOLLOW);
       if (e) {
         pd_close(&pd1);
         return e;
       }
 
       struct ro_attr attr;
-      attr.load = 0xFFF00000 | (pd1.filetype << 8);
-      attr.exec = 0;
-      int r = ix_setxattr(pd1.name, "user.RISC_OS.LoadExec", &attr, 8, ix_XATTR_CREATE);
-      if (r == -ix_EOPNOTSUPP) {
-        add_filetype(pd2.name, pd2.name, &attr);
+      char name[28];
+      sprintf(name, "/proc/self/fd/%i", pd1.fd);
+
+      if (pd1.filetype != -1) {
+        int r = ix_lgetxattr(name, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
+        if (r >= 0 || r == -ix_ENODATA) {
+          if (r < 8) r = 8;
+          attr.load = 0xFFF00000 | (pd1.filetype << 8);
+          attr.exec = 0;
+          r = ix_lsetxattr(name, "user.RISC_OS.LoadExec", &attr, r, 0);
+        }
+        add_filetype(pd2.name, &pd2, &attr, r);
+      } else if (pd1.sf.suffix < 4) {
+        int r = ix_lgetxattr(name, "user.RISC_OS.LoadExec", &attr, sizeof(attr));
+        if (r >= 8) add_filetype(pd2.name, &pd2, &attr, false);
       }
 
-      regs->r[1] = !!ix_rename(pd1.name, pd2.name);
+      regs->r[1] = !!ix_renameat2(ix_AT_FDCWD, pd1.name, ix_AT_FDCWD, pd2.name, ix_RENAME_NOREPLACE);
       pd_close(&pd1);
       pd_close(&pd2);
       break;
@@ -553,6 +580,10 @@ static int write_timestamp(int fd, const char *path, const struct ro_attr *attr)
   return 0;
 }
 
+static int rename_noreplace(const char *oldpath, const char *newpath) {
+  return strcmp(oldpath, newpath) && ix_renameat2(ix_AT_FDCWD, oldpath, ix_AT_FDCWD, newpath, ix_RENAME_NOREPLACE);
+}
+
 _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
   (void)pw;
 
@@ -581,10 +612,8 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
           addr += res;
         }
       }
-      if (ix_fsetxattr(pd1.fd, "user.RISC_OS.LoadExec", &attr, 9, 0)) {
-        add_filetype(pd2.name, pd1.name, &attr);
-        ix_rename(pd1.name, pd2.name);
-      }
+      add_filetype(pd2.name, &pd1, &attr, ix_fsetxattr(pd1.fd, "user.RISC_OS.LoadExec", &attr, 9, 0));
+      rename_noreplace(pd1.name, pd2.name);
       write_timestamp(pd1.fd, 0, &attr);
       regs->r[6] = (unsigned)find_leaf((const char *)regs->r[1]);
       break;
@@ -599,9 +628,10 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
       attr.exec = regs->r[3];
       attr.attributes = regs->r[5];
       struct ix_stat s;
-      if (ix_setxattr(name, "user.RISC_OS.LoadExec", &attr, 12, 0) && !ix_stat(name, &s) && !(ix_S_IFDIR & s.st_mode)) {
-        add_filetype(pd2.name, pd1.name, &attr);
-        ix_rename(pd1.name, pd2.name);
+      int r = ix_setxattr(name, "user.RISC_OS.LoadExec", &attr, 12, 0);
+      if (!ix_stat(name, &s) && !(ix_S_IFDIR & s.st_mode)) {
+        add_filetype(pd2.name, &pd1, &attr, r);
+        rename_noreplace(pd1.name, pd2.name);
       }
       write_timestamp(ix_AT_FDCWD, name, &attr);
       break;
@@ -664,10 +694,8 @@ _kernel_oserror *FSEntry_File_handler(_kernel_swi_regs *regs, void *pw) {
           goto out;
         }
       }
-      if (ix_fsetxattr(pd1.fd, "user.RISC_OS.LoadExec", &attr, 9, 0)) {
-        add_filetype(pd2.name, pd1.name, &attr);
-        ix_rename(pd1.name, pd2.name);
-      }
+      add_filetype(pd2.name, &pd1, &attr, ix_fsetxattr(pd1.fd, "user.RISC_OS.LoadExec", &attr, 9, 0));
+      rename_noreplace(pd1.name, pd2.name);
       write_timestamp(pd1.fd, 0, &attr);
       regs->r[6] = (unsigned)find_leaf((const char *)regs->r[1]);
       break;
