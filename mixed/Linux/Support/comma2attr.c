@@ -59,7 +59,7 @@ static char dest[PATH_MAX];
 static char path[PATH_MAX * 100];
 static int return_code = 0;
 static bool strip = false;
-static bool attribute_priority = true;
+static bool attribute_priority = false;
 static bool write_suffix = false;
 static bool recurse = false;
 static bool write_symlink = false;
