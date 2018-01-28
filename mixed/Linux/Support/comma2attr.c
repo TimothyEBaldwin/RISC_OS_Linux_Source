@@ -49,7 +49,7 @@ struct ro_attr {
 static char dest[PATH_MAX];
 static int return_code = 0;
 static bool strip = false;
-static bool suffix_priority = false;
+static bool attribute_priority = true;
 static bool write_suffix = false;
 static bool recurse = false;
 
@@ -110,8 +110,8 @@ static void process(int dirfd, char *source) {
     filetype = (attr.load >> 8) & 0xFFF;
   }
 
-  if (suffixed && (filetype == 0xFFFFFFFF || suffix_priority)) {
-      filetype = strtoul(end - 3, 0, 16);
+  if (suffixed && (!attribute_priority || filetype == 0xFFFFFFFF)) {
+    filetype = strtoul(end - 3, 0, 16);
   }
 
   if (strip) {
@@ -154,6 +154,7 @@ int main(int argc, char **argv) {
   int opt;
 
   struct option opts[] = {
+    {"attribute-priority", no_argument, NULL, 'a'},
     {"suffix-priority", no_argument, NULL, 'p'},
     {"recurse", no_argument, NULL, 'r'},
     {"write-suffix", no_argument, NULL, 'w'},
@@ -161,10 +162,13 @@ int main(int argc, char **argv) {
     {NULL, 0, NULL, 0}
   };
 
-  while ((opt = getopt_long(argc, argv, "prws", opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "aprws", opts, NULL)) != -1) {
     switch (opt) {
+    case 'a':
+      attribute_priority = true;
+      break;
     case 'p':
-      suffix_priority = true;
+      attribute_priority = false;
       break;
     case 'r':
       recurse = true;
