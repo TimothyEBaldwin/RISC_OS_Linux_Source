@@ -37,29 +37,34 @@ For details of how to setup up a !Boot sequence for your OMAP5 machine, please
 see the 'Putting the HardDisc4 image onto a USB drive' section of this wiki
 page:
 
-  http://www.riscosopen.org/wiki/documentation/pages/Using+the+Cortex-A8+port
+  http://www.riscosopen.org/wiki/documentation/show/Generic%20OMAP%20port%20setup%20information
 
 The 'InstallHD4' script supplied with this archive is intended to be used in
 conjunction with the installation steps given on the above page.
 
 
-An important note about CMOS RAM
-================================
+CMOS RAM
+========
 
 The OMAP port of RISC OS now supports saving configuration settings in a CMOS
 memory chip so that they are kept when the power is turned off. This
 requires a small carrier board to be plugged in, which you can obtain for
-a few pounds from your favourite supplier.
+a few pounds from
 
-If this carrier board is not detected it is possible to have 'read only' 
-settings in one of two ways
+  http://www.riscosopen.org/content/sales/cmos-widgets
+
+or your RISC OS dealer.
+
+If this carrier board is not detected it is possible to seed the CMOS settings
+in one of two ways
 
   * Add a CMOS file to the SD card
     Make any configuration settings changes desired than use the *SaveCMOS
     command to capture them in a file, put this file on the SD card alongside
-    the RISC OS ROM image.
+    the RISC OS ROM image. The SDCMOS module included in the operating system
+    will update this file whenever a configuration change is made.
   * Do nothing
     If the hardware is not present, and you haven't put a CMOS file on the
-    SD card, you'll get the built in defaults.
+    SD card, you'll get the built in defaults every time you turn on.
 
 -- RISC OS Open

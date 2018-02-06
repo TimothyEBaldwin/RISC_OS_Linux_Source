@@ -30,6 +30,18 @@ you install the module before you install this new ROM image, otherwise you may
 have difficulty booting your system.
 
 
+How to install the ROM image
+============================
+
+The easiest way to install the ROM image onto an SD card is to use the
+included !SDCreate application. If you have the RISC OS 5 USB mass storage
+drivers then !SDCreate can write the image straight to an SD card.
+
+Alternatively you can create a disc image file which can then be written to a
+card using any ordinary Windows/Linux/Mac PC. For more information, including
+a description of the SD card structure, see the !SDCreate help file.
+
+
 CMOS RAM
 ========
 
@@ -37,17 +49,17 @@ The Wandboard doesn't include any CMOS memory on the circuit board which
 RISC OS expects to find to hold its essential configuration options needed
 before the main !Boot application is run.
 
-It is possible to seed the CMOS settings in one of two ways
+It is possible to seed the CMOS settings in one of three ways
 
   * Use the RTC and CMOS carrier board
     Computers based on the Wandboard Quad supplied by RComp will have
     this fitted by default.
   * Add a CMOS file to the SD card
-    Make any configuration settings changes desired than use the *SaveCMOS
+    Make any configuration settings changes desired then use the *SaveCMOS
     command to capture them in a file, raw write this file on the SD card 
-    at sector address &20001200. The SDCMOS module included in the 
-    operating system will update this file whenever a configuration change
-    is made.
+    at disc address &20001200 (that is, offset &1200 on drive SDFS::1).
+    The SDCMOS module included in the operating system will update the
+    sector whenever a configuration change is made.
   * Do nothing
     If the hardware is not present, and you haven't put a CMOS file on the
     SD card, you'll get the built in defaults every time you turn on.

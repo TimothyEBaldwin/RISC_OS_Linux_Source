@@ -24,10 +24,7 @@ drivers then !SDCreate can write the image straight to an SD card.
 
 Alternatively you can create a disc image file which can then be written to a
 card using any ordinary Windows/Linux/Mac PC. For more information, including
-a description of the SD card structure, see the !SDCreate help file or the
-RISC OS Open wiki:
-
-  http://www.riscosopen.org/wiki/documentation/pages/Using+the+Cortex-A8+port
+a description of the SD card structure, see the !SDCreate help file.
 
 
 An important note about CMOS RAM
