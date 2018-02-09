@@ -8,7 +8,7 @@ mixed/Linux/Support/sdlkey: mixed/Linux/Support/sdlkey.c Export/APCS-32/C/Global
 	gcc -std=gnu99 -Wall `sdl2-config --cflags --libs` mixed/Linux/Support/sdlkey.c -o $@
 
 comma2attr: mixed/Linux/Support/comma2attr.c
-	gcc -std=gnu99 -g `pwd`/mixed/Linux/Support/comma2attr.c -o comma2attr
+	gcc -std=gnu99 -g mixed/Linux/Support/comma2attr.c -o comma2attr
 
 mixed/Linux/Support/bin/!Boot/Linux/RISC_OS:
 	git submodule init
