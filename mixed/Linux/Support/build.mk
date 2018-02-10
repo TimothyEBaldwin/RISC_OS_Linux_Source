@@ -7,7 +7,6 @@ IOMD=${HOME}/Downloads/IOMD-Soft.5.22.zip
 
 LINUX_ROM=mixed/Linux/Support/bin/!Boot/Linux/RISC_OS
 ACORN_CPP=../DDE/AcornC.C++
-SOURCE=.
 
 #JOBS=$(shell getconf _NPROCESSORS_ONLN)
 export JOBS
@@ -32,13 +31,12 @@ SHELL=/bin/bash
 all: check
 
 ifeq (${METHOD}, rpcemu)
-build: rpcemu/rpcemu boot_iomd_rom ${SOURCE}/stamp-prepare
+build: rpcemu/rpcemu boot_iomd_rom stamp-prepare
 else
-build: run ${LINUX_ROM} ${SOURCE}/stamp-prepare
+build: run ${LINUX_ROM} stamp-prepare
 endif
 	uname -a
 	(
-	  cd '${SOURCE}'
 	  echo Building GIT commit: $$(git rev-parse HEAD)
 ifeq (${TARGET}, Linux)
 	  echo '#define VERSION "GIT commit: '$$(git rev-parse HEAD)'\n"' > mixed/Linux/HAL/h/version1
@@ -48,17 +46,15 @@ endif
 	)
 ifeq (${METHOD}, rpcemu)
 	ln -sfn /dev/fd/9 AcornC.C++
-	ln -sfn /dev/fd/8 src
-	echo '*Obey -v mixed.Linux.Support.Build rpcemu HostFS:$$.src HostFS:$$.AcornC/C++ ${TARGET} ${PHASES}' > '!Boot,fea'
-	rpcemu/rpcemu 7<boot_iomd_rom 4<. 8<'${SOURCE}' 9<'${ACORN_CPP}'
+	echo '*Obey -v mixed.Linux.Support.Build rpcemu HostFS:$$ HostFS:$$.AcornC/C++ ${TARGET} ${PHASES}' > '!Boot,fea'
+	rpcemu/rpcemu 7<boot_iomd_rom 4<. 9<'${ACORN_CPP}'
 else
-	RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.4.Build Linux IXFS:$$.dev.fd.8 IXFS:$$.dev.fd.9 ${TARGET} ${PHASES}' ./run ${LINUX_ROM} --nofork 4<mixed/Linux/Support 8<'${SOURCE}' 9<'${ACORN_CPP}' <<END
+	RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.4.Build Linux IXFS:$$.dev.fd.8 IXFS:$$.dev.fd.9 ${TARGET} ${PHASES}' ./run ${LINUX_ROM} --nofork 4<mixed/Linux/Support 8<. 9<'${ACORN_CPP}' <<END
 	*BASIC
 	VDU 7
 	SYS "IXSupport_LinuxSyscall",20,,,,,,,1
 	END
 endif
-	cd '${SOURCE}'
 	mv 'Images/${TARGET}_rom',??? 'Images/${TARGET}_rom' || true
 	chmod +x 'Images/${TARGET}_rom'
 	ln -f Images/Linux_rom RISC_OS || true
@@ -66,13 +62,12 @@ endif
 
 ifeq (${TARGET}, IOMD32)
 check: rpcemu/rpcemu HardDisc4/stamp
-	mixed/Linux/Tests/runner_rpcemu.sh '${SOURCE}/Images/${TARGET}_rom'
+	mixed/Linux/Tests/runner_rpcemu.sh Images/${TARGET}_rom'
 endif
 
 ifeq (${TARGET}, Linux)
 check: run comma2attr
 	exec 9<.
-	cd '${SOURCE}'
 	mixed/Linux/Tests/runner.sh /dev/fd/9/run ./RISC_OS
 endif
 
@@ -80,8 +75,7 @@ fast: PHASES=install_rom join
 fast: check
 check: build
 
-${SOURCE}/stamp-prepare: mixed/Linux/Support/build.mk
-	cd '${SOURCE}'
+stamp-prepare: mixed/Linux/Support/build.mk
 	ln -sfn  mixed/RiscOS/Library
 	ln -sfn  mixed/RiscOS/Modules
 	ln -sfn castle/RiscOS/Env
