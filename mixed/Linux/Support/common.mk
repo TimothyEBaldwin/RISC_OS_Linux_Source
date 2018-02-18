@@ -71,8 +71,10 @@ qemu/stamp: ${QEMU_SRC}
 	echo "c9d34a79024eae080ce3853aa9afe503824520eefb440190383003081ce7f437 *${QEMU_SRC}" | sha256sum -c
 	tar Jxf "${QEMU_SRC}"
 	mv qemu-2.11.0 qemu
-	(cd qemu && patch -p1 < ../mixed/Linux/Support/qemu_swi.diff)
-	touch qemu/stamp
+	cd qemu
+	patch -p1 < ../../mixed/Linux/Support/qemu_swi.diff
+	patch -p1 < ../../Support/qemu_renameat2.diff
+	touch stamp
 
 qemu/Makefile: qemu/stamp
 	(cd qemu && ./configure --enable-attr --target-list=arm-linux-user --disable-werror)
