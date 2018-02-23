@@ -1,6 +1,7 @@
 #!/bin/bash
 
-timeout --foreground -sKILL 60 rpcemu/rpcemu 7<$1 8<mixed/Linux/Tests
+. Built/rpcemu_sandbox
+timeout --foreground -sKILL 60 $RPCEMU_sandbox --unshare-net --tmpfs /r/hostfs --ro-bind mixed/Linux/Tests /r/hostfs/Tests --dir /r/hostfs/tmp --symlink 'Tests/!Boot,feb' '/r/hostfs/!Boot,feb' /r/rpcemu
 E=$?
-tr -d '\r' < mixed/Linux/Tests/log*
+tr -d '\r' < Support/mnt/dev/fd/8/tmp/log*
 exit $E
