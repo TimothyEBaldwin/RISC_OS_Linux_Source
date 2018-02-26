@@ -52,7 +52,7 @@ SHELL=$(warning Building $@)$(BASH)
 .SILENT:
 
 .DELETE_ON_ERROR:
-.PHONY: all
+.PHONY: all script-all
 
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
 sandbox_misc = $(call robind,/bin /lib /lib32 /libx32 /lib64 /usr/bin /usr/lib /usr/lib32 /usr/libx32 /usr/lib64 /etc/alternatives)
@@ -63,10 +63,10 @@ lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
 
 all: Built/qemu_sandbox sdl Start_RISC_OS.desktop comma2attr
 
-ifeq (,$(findstring q,$(MAKEFLAGS)))
 include Built/qemu_path
-endif
 include $(wildcard Support/build.mk)
+
+script-all: Built/sdl comma2attr Built/qemu_sandbox RISC_OS HardDisc4
 
 RISC_OS:
 
@@ -117,6 +117,7 @@ Built/rpcemu/src/Makefile: Built/rpcemu/stamp
 	  else
 	    ./configure
 	  fi
+	  touch Makefile
 	}
 	export -f configure
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src bash -x -e -c configure
@@ -158,6 +159,7 @@ Built/qemu-arm: Built/qemu_Makefile_stamp
 	test ! -L Built/qemu/arm-linux-user
 	test ! -L Built/qemu/arm-linux-user/qemu-arm
 	ln -f Built/qemu/arm-linux-user/qemu-arm Built/qemu-arm
+	touch Built/qemu-arm
 
 Built/qemu_sandbox: $(QEMU) Built/gen_seccomp Built/qemu_path
 	set -o pipefail
@@ -187,8 +189,7 @@ Built/qemu_path: Built/gen_seccomp
 	  echo QEMU:=Built/qemu-arm > $@
 	fi
 
-
-HardDisc4: | $(HARDDISC4) Built/boot_iomd_rom Built/rpcemu/rpcemu
+HardDisc4: | $(HARDDISC4) Built/boot_iomd_rom Built/rpcemu/rpcemu Built/comma2attr
 	set -o pipefail
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files
@@ -206,6 +207,7 @@ HardDisc4: | $(HARDDISC4) Built/boot_iomd_rom Built/rpcemu/rpcemu
 	printf 'done.\n'
 	rm 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/off,ffb' 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot/Tasks/off,ffb'
 	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir IXFS:$$.HardDisc4\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
+	! Built/comma2attr --recurse HardDisc4_files/HardDisc4
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built
