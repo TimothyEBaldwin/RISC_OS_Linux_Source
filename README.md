@@ -8,7 +8,7 @@ It should run on ARM Linux system natively, or slow on other Linux systems with 
 
 The RISC OS "ROM" Image is a Linux executable.
 
-Unlike virtual machines such as RPCEmu, it provides **no restriction on what RISC OS programs can do to the Linux environment.**
+If you run RISC OS directly then, unlike virtual machines such as RPCEmu, there is **no restriction on what RISC OS programs can do to the Linux environment** beyond that provided by Linux. If you use the provided scripts then RISC OS should be prevented from causing harm.
 
 RISC OS Open Limited’s DDE is required to build RISC OS, this is proprietary software that may be brought from [RISC OS Open Limited](https://www.riscosopen.org/content/sales/dde)
 
@@ -16,15 +16,17 @@ This Linux port of RISC OS can be built in similar fashion to the traditional me
 
 ## Top Level Makefile
 
-It can also be built on Linux (or other Unix) using the Makefile, which runs the majority of the build on RISC OS, by default using an binary of the Linux port that is included with this distribution and RISC OS
-Open Limited’s DDE in ../DDE. This can be brought from [RISC OS Open
-Limited](https://www.riscosopen.org/content/sales/dde)
+It can also be built on Linux using the Makefiles, which runs the majority of the build on RISC OS, by default using an binary of the Linux port that is automatically downloaded from [github](https://github.com/TimothyEBaldwin/RO_Linux) and RISC OS Open Limited’s DDE in ../DDE. Allegro (for RPCEmu), Bash, Bubblewrap, GCC, GNU Make, Libseccomp and SDL 2 are also required by Makefiles and support code. Either Bubblewrap must be setuid root, or unprivileged user namespaces must be enabled.
 
-The following variables are accepted by the Makefile:
+On debian the dependencies are in the packages "bash bubblewrap gcc make liballegro4-dev libc6-dev libseccomp-dev libsdl2-dev".
 
-| Variable | |
-| ---    | ---    |
-| ACORN_CPP | Path to AcornC.C++ diectory of DDE, default is `../DDE/AcornC.C++`
+Additional packages are required for building QEMU.
+
+The following variables are accepted by the Makefiles:
+
+| Variable   | |
+| ---        | ---    |
+| ACORN_CPP  | Path to AcornC.C++ diectory of DDE, default is `../DDE/AcornC.C++`
 | TARGET     | What to build, such as `IOMD32` for a RiscPC/A7000 ROM image. Only `Linux` and `IOMD32` are supported by this source. |
 | METHOD     | How to build, valid values are `rpcemu` and `Linux`. |
 | JOBS       | Number of CPUs to use for building, if 0 or unset build sequentially. |
@@ -32,7 +34,7 @@ The following variables are accepted by the Makefile:
 | QEMU       | Location of qemu-arm executable. |
 | PHASES     | Space separated list of build phases to run. |
 
-The following targets are provided by the Makefile:
+The following targets are provided by the Makefiles:
 
 | Target | Action |
 | ---    | ---    |
@@ -44,7 +46,7 @@ This following items will be download to ~/Downloads if needed:
 * RISC OS 5.22 Disc Archive
 * RISC OS 5.22 IOMD ROM Image
 * RPCEmu 0.8.15
-* QEMU 2.8.0
+* QEMU 2.11.0
 
 ## Linux RISC OS command line options
 
@@ -56,6 +58,27 @@ This following items will be download to ~/Downloads if needed:
 | --noaborts   | Disable aborts - RISC OS will die with SIGSEGV  |
 | --nofork     | Dont't fork - for debugging                     |
 | --noseccomp  | Disable seccomp support                         |
+
+## Linux RISC OS error codes
+
+| Return Code | Error |
+| ---         | ---   |
+|     100     | Reboot requested |
+|     101     | Memory mapping failed, try running "sudo sysctl vm.mmap_min_addr=8192" |
+|     102     | Unrecognised command line option |
+|     103     | Unable to open NVRAM file. |
+|     104     | Permission denied when attempting to open NVRAM file. |
+|     105     | Read only filesystem when attempting to open NVRAM file. |
+|     106     | Unable to read size of NVRAM file. |
+|     107     | Unable to enlarge NVRAM file. |
+|     108     | Failed to reserve address space. |
+|     109     | Unable to fork |
+|     110     | Parent process exited (no message) |
+|     111     | Cloning ptrace thread failed |
+|     112     | Failed to set alternative signal stack. |
+|     113     | SWI intercept failure |
+|     114     | RISC OS kernel returned to HAL |
+
 
 ## To do List
 
@@ -78,3 +101,4 @@ This following items will be download to ~/Downloads if needed:
 - [x] Replace the branch table at the beginning of the HAL.
 - [ ] Write test cases for VFP errors.
 - [ ] Implement VFPSupport.
+- [ ] Possibly add a binary release to the ABRelase phase.
