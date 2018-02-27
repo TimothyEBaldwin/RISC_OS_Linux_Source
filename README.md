@@ -48,6 +48,24 @@ This following items will be download to ~/Downloads if needed:
 * RPCEmu 0.8.15
 * QEMU 2.11.0
 
+## IXFS
+
+### File type handling
+
+Unlike other software IXFS by default stores RISC OS file types in POSIX extended attributes, by default only writing extensions if writing a POSIX extended attribute fails. How IXFS handles file types can be configured using the special field.
+
+| Special Field | Mode Name | Write extension | Read and strip extension | Read extended attribute |
+|     :---:     | ---       | ---             | ---                      | ---                     |
+|       R       | Raw       | Never           | No                       | Yes                     |
+|       P       | Pure      | Remove if wrong | Yes                      | Only if no extension    |
+|               | Normal    | If needed       | Yes                      | Only if no extension    |
+|       W       | Write     | Always          | Yes                      | Only if no extension    |
+|       X       | Exclusive | Always          | Yes                      | Never                   |
+
+### Case sensitivity
+
+As is standard for RISC OS filing systems IXFS is case insensitive by default, if 2 filenames only differ by case it is unpredictable which file is acted upon unless the exact filename is provided to IXFS. Case sensitivity may be enabled by adding "C" to the special field.
+
 ## Linux RISC OS command line options
 
 | Option       | Action                                          |
