@@ -30,6 +30,11 @@ public:
 typedef uint32_t ule32;
 #endif
 
+struct version {
+  int32_t reason;
+  ule32 version;
+} version;
+
 union report {
   enum {
     ev_mouse     = CONST(0),
@@ -38,7 +43,9 @@ union report {
     ev_mode_sync = CONST(3),
     ev_resize    = CONST(4),
     ev_close     = CONST(5),
+    ev_version   = CONST(6),
   } reason;
+  struct version version;
   struct {
     int32_t reason;
     ule32 x, y, buttons;
@@ -56,7 +63,9 @@ union command {
     c_pointer     = CONST(2),
     c_suspend     = CONST(3),
     c_close_ctl   = CONST(4),
+    c_version     = CONST(6),
   } reason;
+  struct version version;
   struct {
     int32_t reason;
     ule32 vidc[16];
