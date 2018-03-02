@@ -153,14 +153,18 @@ struct keys sdl2key[] = {
 int out[SDL_NUM_SCANCODES];
 
 int main() {
-  for(int i = 0; i < sizeof(sdl2key) / sizeof(sdl2key[0]); ++i)
+  int max_keycode = 0;
+
+  for(int i = 0; i < sizeof(sdl2key) / sizeof(sdl2key[0]); ++i) {
     out[sdl2key[i].sdl] = sdl2key[i].ro;
+    if (max_keycode < sdl2key[i].ro) max_keycode = sdl2key[i].ro;
+  }
 
   printf("int sdl2key[%i] = {\n",  SDL_NUM_SCANCODES);
 
   for(int i = 0; i < SDL_NUM_SCANCODES; ++i)
     printf("  %i,\n", out[i]);
 
-  printf("};\n#define KeyNo_Function12 (%i)\n", KeyNo_Function12);
+  printf("};\n#define KeyNo_Function12 (%i)\n#define max_keycode (%i)", KeyNo_Function12, max_keycode);
 
 }

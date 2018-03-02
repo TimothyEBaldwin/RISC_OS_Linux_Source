@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <iostream>
 #include <cstring>
+#include <bitset>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -75,6 +76,7 @@ int screen_fd = -1;
 int no_updates = 0;
 SDL_Window *window;
 SDL_Surface *screen;
+std::bitset<max_keycode + 1> key_state;
 
 inline off_t get_file_size(int fd) {
   struct stat s;
@@ -291,6 +293,21 @@ int main(int argc, char **argv) {
         case command::c_close_ctl:
           use_close_message = c.close_ctl.use_message;
           break;
+        case command::c_version: {
+          for(int i = 0; i != key_state.size(); ++i) {
+            if (key_state[i]) {
+              cerr << i << endl;
+              r.reason = report::ev_keydown;
+              r.key.code = i;
+              write(sockets[0], &r, sizeof(r));
+            }
+          }
+          struct version v;
+          r.reason = report::ev_version;
+          r.version.version = 1;
+          write(sockets[0], &r, sizeof(r));
+          break;
+        }
       }
     }
 
@@ -324,11 +341,13 @@ int main(int argc, char **argv) {
         r.reason = report::ev_keydown;
         r.key.code = sdl2key[e.key.keysym.scancode];
         write(sockets[0], &r, sizeof(r));
+        key_state[r.key.code] = true;
         break;
       case SDL_KEYUP:
         r.reason = report::ev_keyup;
         r.key.code = sdl2key[e.key.keysym.scancode];
         write(sockets[0], &r, sizeof(r));
+        key_state[r.key.code] = false;
         break;
 
       case SDL_MOUSEBUTTONDOWN:
