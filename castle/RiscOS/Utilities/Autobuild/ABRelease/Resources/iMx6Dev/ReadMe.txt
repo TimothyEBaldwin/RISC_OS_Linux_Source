@@ -1,7 +1,7 @@
 RISC OS Open Release Archive
 ============================
 
-This is the OMAP (Beagle Board) development ROM image. It is a bleeding-edge
+This is the iMx6 (Wandboard) development ROM image. It is a bleeding-edge
 build which comes from the latest revisions of all the relevant sources in
 our source code repository and is completely untested.
 
@@ -42,39 +42,24 @@ card using any ordinary Windows/Linux/Mac PC. For more information, including
 a description of the SD card structure, see the !SDCreate help file.
 
 
-The 'InstallHD4' script, and setting up a !Boot sequence
-========================================================
-
-For details of how to setup up a !Boot sequence for your OMAP3 machine, please
-see the 'Putting the HardDisc4 image onto a USB drive' section of this wiki
-page:
-
-  http://www.riscosopen.org/wiki/documentation/show/Generic%20OMAP%20port%20setup%20information
-
-The 'InstallHD4' script supplied with this archive is intended to be used in
-conjunction with the installation steps given on the above page.
-
-
 CMOS RAM
 ========
 
-The OMAP port of RISC OS now supports saving configuration settings in a CMOS
-memory chip so that they are kept when the power is turned off. This
-requires a small carrier board to be plugged in, which you can obtain for
-a few pounds from
+The Wandboard doesn't include any CMOS memory on the circuit board which
+RISC OS expects to find to hold its essential configuration options needed
+before the main !Boot application is run.
 
-  http://www.riscosopen.org/content/sales/cmos-widgets
+It is possible to seed the CMOS settings in one of three ways
 
-or your RISC OS dealer.
-
-If this carrier board is not detected it is possible to seed the CMOS settings
-in one of two ways
-
+  * Use the RTC and CMOS carrier board
+    Computers based on the Wandboard Quad supplied by RComp will have
+    this fitted by default.
   * Add a CMOS file to the SD card
-    Make any configuration settings changes desired than use the *SaveCMOS
-    command to capture them in a file, put this file on the SD card alongside
-    the RISC OS ROM image. The SDCMOS module included in the operating system
-    will update this file whenever a configuration change is made.
+    Make any configuration settings changes desired then use the *SaveCMOS
+    command to capture them in a file, raw write this file on the SD card 
+    at disc address &20001200 (that is, offset &1200 on drive SDFS::1).
+    The SDCMOS module included in the operating system will update the
+    sector whenever a configuration change is made.
   * Do nothing
     If the hardware is not present, and you haven't put a CMOS file on the
     SD card, you'll get the built in defaults every time you turn on.
