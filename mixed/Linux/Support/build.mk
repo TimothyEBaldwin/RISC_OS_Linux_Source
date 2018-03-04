@@ -27,7 +27,7 @@
 #
 
 
-LINUX_ROM=Support/bin/!Boot/Linux/RISC_OS
+LINUX_ROM=Support/bin/RISC_OS
 ACORN_CPP=../DDE/AcornC.C++
 
 TARGET=Linux
@@ -108,7 +108,7 @@ fast: PHASES=install_rom join
 fast: check
 check: build
 
-Support/bin/!Boot/Linux/RISC_OS:
+Support/bin/RISC_OS:
 	git submodule init
 	git submodule update
 
