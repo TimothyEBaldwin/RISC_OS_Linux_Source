@@ -96,6 +96,7 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 |     112     | Failed to set alternative signal stack. |
 |     113     | SWI intercept failure |
 |     114     | RISC OS kernel returned to HAL |
+|     115     | Interrupt test failed |
 
 
 ## To do List
