@@ -62,9 +62,20 @@ COMMONFILES=\
  ${SDIR}.sysctl.SysCtl\
  ${SDIR}.traceroute.TraceRoute
 
-STBFILES=${SDIR}.pong.Pong
+STBFILES=\
+        ${RDIR}.!Boot\
 
-DISCFILES= ${RDIR}.!Boot\
+DBFILES=\
+        ${RDIR}.files.AUNMap\
+        ${RDIR}.files.CertData\
+        ${RDIR}.files.Hosts\
+        ${RDIR}.files.MimeMap\
+        ${RDIR}.files.Networks\
+        ${RDIR}.files.Protocols\
+        ${RDIR}.files.Services\
+
+DISCFILES=\
+        ${RDIR}.!Boot\
         ${LDIR}.!Help\
         ${LDIR}.!Run\
         ${RDIR}.!Sprites\
@@ -76,15 +87,8 @@ DISCFILES= ${RDIR}.!Boot\
         ${SDIR}.md5.MD5\
         ${SDIR}.mrinfo.MRInfo\
         ${SDIR}.mtrace.MTrace\
-        ${SDIR}.pong.Pong\
         ${SDIR}.tftp.Tftp\
         ${SDIR}.utils.utl.RMFind\
-        ${RDIR}.files.AUNMap\
-        ${RDIR}.files.Hosts\
-        ${RDIR}.files.MimeMap\
-        ${RDIR}.files.Networks\
-        ${RDIR}.files.Protocols\
-        ${RDIR}.files.Services\
         ${RDIR}.utils.BootNet\
         ${SDIR}.utils.utl.CheckMem\
         ${SDIR}.newfiler.NewFiler\
@@ -94,6 +98,7 @@ DISCFILES= ${RDIR}.!Boot\
 FILES=\
         ${COMMONFILES} \
         ${DISCFILES} \
+        ${DBFILES} \
         ${STBFILES}
 
 EMERGENCYUTILS = \
@@ -116,7 +121,6 @@ NETUTILS = \
         ${SDIR}.mrinfo.MRInfo        \
         ${SDIR}.mtrace.MTrace        \
         ${SDIR}.ping.Ping            \
-        ${SDIR}.pong.Pong            \
         ${SDIR}.utils.utl.RMFind     \
         ${SDIR}.route.Route          \
         ${SDIR}.showstat.ShowStat    \
@@ -154,20 +158,18 @@ install_common: ${COMMONFILES}
         ${CP} ${SDIR}.sysctl.SysCtl         ${INSTAPP}.bin.SysCtl       ${CPFLAGS}
         ${CP} ${SDIR}.traceroute.TraceRoute ${INSTAPP}.bin.TraceRoute   ${CPFLAGS}
 
-install_STB: ${STBFILES}
-        ${MKDIR} ${INSTAPP}.files
+install_STB: ${STBFILES} ${DBFILES}
         ${AWK} -f awk.Version LocalUserIFRes:!Boot > ${INSTAPP}.!Boot
         SetType ${INSTAPP}.!Boot Obey
         ${CP} LocalUserIFRes:CopyLocal ${INSTAPP}.CopyLocal       ${CPFLAGS}
         ${CP} LocalUserIFRes:RTime     ${INSTAPP}.bin.RTime       ${CPFLAGS}
-        ${CP} ${SDIR}.pong.Pong        ${INSTAPP}.bin.Pong        ${CPFLAGS}
         ${CP} ${RDIR}.files.Hosts      ${INSTAPP}.files.Hosts     ${CPFLAGS}
         ${CP} LocalUserIFRes:MimeMap   ${INSTAPP}.files.MimeMap   ${CPFLAGS}
         ${CP} ${RDIR}.files.Networks   ${INSTAPP}.files.Networks  ${CPFLAGS}
         ${CP} ${RDIR}.files.Protocols  ${INSTAPP}.files.Protocols ${CPFLAGS}
         ${CP} ${RDIR}.files.Services   ${INSTAPP}.files.Services  ${CPFLAGS}
 
-install_: ${DISCFILES} dirs
+install_: ${DISCFILES} ${DBFILES}
         ${AWK} -f awk.Version ${RDIR}.!Boot > ${INSTAPP}.!Boot
         SetType ${INSTAPP}.!Boot Obey
         ${AWK} -f awk.Version ${LDIR}.!Help > ${INSTAPP}.!Help
@@ -192,9 +194,8 @@ install_: ${DISCFILES} dirs
         ${CP} ${SDIR}.md5.MD5               ${INSTAPP}.bin.MD5          ${CPFLAGS}
         ${CP} ${SDIR}.mrinfo.MRInfo         ${INSTAPP}.bin.MRInfo       ${CPFLAGS}
         ${CP} ${SDIR}.mtrace.MTrace         ${INSTAPP}.bin.MTrace       ${CPFLAGS}
-        ${CP} ${SDIR}.pong.Pong             ${INSTAPP}.bin.Pong         ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.RMFind      ${INSTAPP}.bin.RMFind       ${CPFLAGS}
         ${CP} ${SDIR}.tftp.Tftp             ${INSTAPP}.bin.Tftp         ${CPFLAGS}
+        ${CP} ${SDIR}.utils.utl.RMFind      ${INSTAPP}.bin.RMFind       ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.CheckMem    ${INSTAPP}.utils.CheckMem   ${CPFLAGS}
         ${CP} ${SDIR}.newfiler.NewFiler     ${INSTAPP}.utils.NewFiler   ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.ReadCMOSIP  ${INSTAPP}.utils.ReadCMOSIP ${CPFLAGS}
@@ -203,6 +204,7 @@ install_: ${DISCFILES} dirs
 dirs:
         ${MKDIR} ${INSTAPP}
         ${MKDIR} ${INSTAPP}.bin
+        ${MKDIR} ${INSTAPP}.files
 
 clean:
         dir ${SDIR}
@@ -229,7 +231,6 @@ resources-NetUtils: ${NETUTILS}
         ${CP} ${SDIR}.mrinfo.MRInfo         ${RESD}.bin.MRInfo       ${CPFLAGS}
         ${CP} ${SDIR}.mtrace.MTrace         ${RESD}.bin.MTrace       ${CPFLAGS}
         ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
-        ${CP} ${SDIR}.pong.Pong             ${RESD}.bin.Pong         ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.RMFind      ${RESD}.bin.RMFind       ${CPFLAGS}
         ${CP} ${SDIR}.route.Route           ${RESD}.bin.Route        ${CPFLAGS}
         ${CP} ${SDIR}.sysctl.SysCtl         ${RESD}.bin.SysCtl       ${CPFLAGS}
