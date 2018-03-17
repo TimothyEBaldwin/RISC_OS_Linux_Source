@@ -55,8 +55,10 @@ int main(int argc, char **argv) {
   scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
   if (!ctx) error(1, errno, "Unable to create libseccomp context");
 
+#ifdef __aarch64__
   rc = seccomp_arch_add(ctx, SCMP_ARCH_ARM);
   if (rc) error(0, -rc, "Unable to add ARM to libseccomp context");
+#endif
 
   // Don't allow inserting into terminal input buffer
   rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ioctl), 1, SCMP_A1(SCMP_CMP_EQ, TIOCSTI));
