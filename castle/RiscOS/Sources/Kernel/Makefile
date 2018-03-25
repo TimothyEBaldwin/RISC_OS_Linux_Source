@@ -34,8 +34,8 @@ KERNEL_MODULE   = bin${SEP}${COMPONENT}
 ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
+CUSTOMSA        = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
-                  ${EXP_HDR}.EtherDevice \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
@@ -61,8 +61,6 @@ EXPORTS         = ${EXP_HDR}.EnvNumbers \
                   ${C_EXP_HDR}.Variables \
                   ${C_EXP_HDR}.VduExt \
                   ${C_EXP_HDR}.VIDCList
-
-CUSTOMSA=custom
 
 include StdTools
 include AAsmModule
@@ -104,12 +102,6 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
         ${CP} hdr.EnvNumbers $@ ${CPFLAGS}
-
-${EXP_HDR}.SPIDevice: hdr.SPIDevice
-        ${CP} hdr.SPIDevice $@ ${CPFLAGS}
-
-${EXP_HDR}.EtherDevice: hdr.EtherDevice
-        ${CP} hdr.EtherDevice $@ ${CPFLAGS}
 
 ${EXP_HDR}.HALDevice: hdr.HALDevice
         ${CP} hdr.HALDevice $@ ${CPFLAGS}
