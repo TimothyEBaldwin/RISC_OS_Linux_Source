@@ -113,7 +113,6 @@ clean: dirs
 	${XWIPE} ${DEBUGLIBZM} ${WFLAGS}
 	${XWIPE} ${TBOXLIB} ${WFLAGS}
 	${XWIPE} ${TBOXLIBZM} ${WFLAGS}
-	${CP} TboxMake  ${EXPORTS}.TboxMake ${CPFLAGS}
 	@echo ${DEBUGLIB} and ${TBOXLIB}: cleaned
 
 export: export_${PHASE}
@@ -122,7 +121,6 @@ export_hdrs: dirs
 	${CP} objects   ${EXPORTS}.objects   ${CPFLAGS}
 	${CP} h.*       ${EXPORTS}.h.*   ${CPFLAGS}
 	${CP} hdr.*     ${EXP_HDR}.*    ${CPFLAGS}
-	${CP} TboxMake  ${EXPORTS}.TboxMake ${CPFLAGS}
 	${CP} VersionNum ${EXPORTS}.LibVersion ${CPFLAGS}
 	@echo ${DEBUGLIB} and ${TBOXLIB}: export complete (hdrs)
 

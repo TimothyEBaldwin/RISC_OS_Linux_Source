@@ -22,12 +22,11 @@
 # 14-Mar-01  SNB          Recreated.
 #
 
-COMPONENT = Free
-HEADER1   = Free
-ASMCHEADER1 = Free
-RESOURCEEXTRA = resources_templates
-
-EXPORTS = ${C_EXP_HDR}.Free
+COMPONENT     = Free
+HEADER1       = Free
+ASMCHEADER1   = Free
+INSTRES_FILES = Templates
+EXPORTS       = ${C_EXP_HDR}.Free
 
 include StdTools
 include AAsmModule

@@ -22,8 +22,8 @@
 # 20-Dec-2002  KJB         Created.
 #
 
-COMPONENT = NetFiler
-RESOURCEEXTRA = resources_templates
+COMPONENT     = NetFiler
+INSTRES_FILES = Templates
 
 include StdTools
 include AAsmModule

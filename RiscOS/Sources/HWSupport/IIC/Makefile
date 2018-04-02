@@ -24,7 +24,7 @@
 
 COMPONENT     = IIC
 TARGET       ?= ${COMPONENT}
-ROM_SOURCE    = s.IICMod
+ROM_SOURCE    = IICMod.s
 
 HEADER1       = IIC
 

@@ -23,7 +23,7 @@
 #
 
 COMPONENT     = Filer
-RESOURCEEXTRA = resources_templates
+INSTRES_FILES = Templates
 HELPSRC       = s.HelpSrc
 TOKHELPSRC    = ${TOKENSOURCE}
 

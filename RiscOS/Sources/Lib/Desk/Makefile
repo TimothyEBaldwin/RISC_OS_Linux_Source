@@ -99,4 +99,9 @@ ${LIBEXT}.${LIBRARYZM}: !Desk.o.Normalzm
         ${CP} !Desk.o.Normalzm $@ ${CPFLAGS}
         BASIC -quit Patch325 $@
 
+install: export_libs
+        ${MKDIR} ${INSTDIR}
+        ${CP} ${EXPDIR} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
+        @${ECHO} ${COMPONENT}: install complete
+
 # Dynamic dependencies:

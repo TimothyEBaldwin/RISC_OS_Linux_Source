@@ -94,6 +94,7 @@
 #include "LMVars.h"
 #include "Attr.h"   /* For InvalidateDrive */
 #include "Xlate.h"  /* For string functions */
+#include "Auth.h"
 
 /* Definitions ===================================================== */
 
@@ -104,10 +105,11 @@
 
 /* Tuning parameters */
 
-#define FILE_BLOCK_SIZE 1024
-#define RDRAW_BLOCK_SIZE 32768
-#define WRRAW_BLOCK_SIZE 16384
-#define PRN_BLOCK_SIZE  1024
+#define MAX_RX_BLOCK_SIZE (3*1452)  /* Windows clients' default, see [MS-CIFS].pdf note 91 (p709) */
+#define MAX_CORE_TX_BLOCK_SIZE 1024 /* Core dialect doesn't send MaxBufferSize value */
+#define RDRAW_BLOCK_SIZE  32768
+#define WRRAW_BLOCK_SIZE  16384
+#define PRN_BLOCK_SIZE    1024
 
 /* This structure relies on Norcroft C packing the bytes & words
    properly!
@@ -137,12 +139,12 @@ typedef struct
 
 /* Maximum number of word params - 14 is used by Transact */
 #ifdef LONGNAMES
-/* Transact2 (LONGNAMES build only) requires 14 plus setup words
+/* Transact2 (LONGNAMES build only) requires extra setup words.
  * The NT LM 0.12 negprot response requires 17.
  */
 #define MAX_WCT (17+(MAX_SETUPWORDS)+1)
 #else
-#define MAX_WCT 14
+#define MAX_WCT 17
 #endif
 
 /* Max number of significant characters in a shared drive
@@ -281,6 +283,7 @@ struct ActiveServer
   BYTE     *blob;
   char     servname[NAME_LIMIT]; /* upper case */
   char     username[NAME_LIMIT]; /* case preserved */
+  unsigned int maxTxBufferSize; /* maximum SMB message size the server can receive */
 };
 
 typedef struct ActiveServer *hSERVER;
@@ -442,11 +445,11 @@ static BUFCHAIN AddUnicodeStringToChain ( BUFCHAIN pB, char *str )
 
 /* --------------------- */
 
-static BUFCHAIN MkDataString ( BUFCHAIN pB, int type, char *ptr )
+static BUFCHAIN MkDataString ( BUFCHAIN pB, int type, const char *ptr )
 {
   BYTE   hdrblk[4];
 
-  pB = AddChain ( pB, ptr, strlen(ptr)+1 );
+  pB = AddChain ( pB, (void *)ptr, strlen(ptr)+1 );
 
   if ( pB == NULL ) return NULL;
 
@@ -817,7 +820,7 @@ static err_t SMB_WriteRaw ( hSHARE hS, int fid, uint offset,
  * call this function to find out which protocol was accepted.  The
  * offsets within the array of each string are vital to SMB_Negotiate.
  */
-static char *dialects[] = {
+static const char *dialects[] = {
                 "PC NETWORK PROGRAM 1.0",
                 "DOS LM1.2X002",
                 "LM1.2X002",
@@ -827,7 +830,7 @@ static char *dialects[] = {
 #define DIALECT_BASIC 0
 #define DIALECT_LM12X002 1
 #define DIALECT_NT 3
-static char *SMB_Dialect(unsigned int num)
+static const char *SMB_Dialect(unsigned int num)
 {
         if (num <= MAX_DIALECT) return dialects[num];
         return "";
@@ -856,18 +859,6 @@ static err_t SMB_Negotiate( hSHARE hS )
   if ( res != OK )
     return res;
 
-#ifdef DEBUG
-  debug1("Data length on negprot is %d\n", ChainLen(pB));
-  {
-          static char buf[4096];
-          void *ptr = SMB_RxWords;
-          int len = ChainLen(pB);
-          GetData(pB, buf, len);
-          DumpBuffer(buf, len);
-          DumpStruct(ptr, (SMB_RxWords[0] >= DIALECT_NT) ? dvs_NTnegprot : dvs_negprot);
-  }
-#endif
-  FreeChain(pB);
 
   debug1("Negotiated protocol `%s'\n", SMB_Dialect(SMB_RxWords[0]));
   hS->hServer->prot = SMB_RxWords[0];
@@ -875,6 +866,7 @@ static err_t SMB_Negotiate( hSHARE hS )
   {
     if (SMB_RxWords[0] >= DIALECT_NT) {
       /* grr - different response format */
+      hS->hServer->maxTxBufferSize = (SMB_RxWords[3] >> 8) | (SMB_RxWords[4] << 8) | (SMB_RxWords[5] << 24);
       hS->hServer->ProtFlags = PROT_RWMULTI + PROT_SETDATETIME +
          (SMB_RxWords[9] & 0x100 ? PROT_READRAW+PROT_WRITERAW : 0 ) +
          (SMB_RxWords[1] & 1 ? PROT_USERLOGON : 0 ) +
@@ -890,14 +882,17 @@ static err_t SMB_Negotiate( hSHARE hS )
         debug0("No extended security - no GUID in the data block\n");
       }
       hS->hServer->bloblen = SMB_RxWords[16] >> 8;
+      hS->hServer->Sesskey = (SMB_RxWords[7] >> 8) | (SMB_RxWords[8] << 8) | (SMB_RxWords[9] << 24);
     }
     else {
-      hS->hServer->bloblen = SMB_RxWords[11];
+      hS->hServer->maxTxBufferSize = SMB_RxWords[2];
       hS->hServer->ProtFlags = PROT_RWMULTI + PROT_SETDATETIME +
          (SMB_RxWords[1] & 1 ? PROT_USERLOGON : 0 ) +
          (SMB_RxWords[1] & 2 ? PROT_ENCRYPT : 0 ) +
          (SMB_RxWords[5] & 1 ? PROT_READRAW : 0 ) +
          (SMB_RxWords[5] & 2 ? PROT_WRITERAW : 0 );
+      hS->hServer->bloblen = SMB_RxWords[11];
+      hS->hServer->Sesskey = SMB_RxWords[6] | (SMB_RxWords[7] << 16);
     }
     hS->hServer->SMB_flg = SMB_CASELESS;
 #ifdef LONGNAMES
@@ -905,7 +900,6 @@ static err_t SMB_Negotiate( hSHARE hS )
     hS->hServer->SMB_flg2 = SMB_KNOWS_LONG_NAMES; /* | SMB_IS_LONG_NAME;*/
     hS->hServer->t2flags = T2FLAGS_LONGNAMES;
 #endif
-    hS->hServer->Sesskey = SMB_RxWords[6] | (SMB_RxWords[7] << 16);
     if (hS->hServer->bloblen > 0) {
       free(hS->hServer->blob);
       hS->hServer->blob = malloc(hS->hServer->bloblen);
@@ -919,6 +913,7 @@ static err_t SMB_Negotiate( hSHARE hS )
   }
   else
   {
+    hS->hServer->maxTxBufferSize = MAX_CORE_TX_BLOCK_SIZE;
     hS->hServer->ProtFlags = PROT_SETDATETIME;
     hS->hServer->SMB_flg = 0;
 #ifdef LONGNAMES
@@ -926,6 +921,7 @@ static err_t SMB_Negotiate( hSHARE hS )
     hS->hServer->SMB_flg2 = 0;
 #endif
   }
+  FreeChain(pB);
   debug1("%s-level security\n", hS->hServer->ProtFlags & PROT_USERLOGON ? "User" : "Share");
   return OK;
 }
@@ -941,8 +937,8 @@ static err_t SMB_SessSetup ( hSHARE hS, char *userid, char *passwd )
 
   SMB_TxWords[0] = 0x00FF; /* No additional command */
   SMB_TxWords[1] = 0;      /* Offset to next cmd */
-  SMB_TxWords[2] = 4096;   /* Our buffer size */
-  SMB_TxWords[3] = 0;      /* Max pending requests */
+  SMB_TxWords[2] = MAX_RX_BLOCK_SIZE; /* Maximum SMB message size we can receive */
+  SMB_TxWords[3] = 1;      /* Max pending requests */
   SMB_TxWords[4] = 0;      /* First & only VC */
   SMB_TxWords[5] = hS->hServer->Sesskey & 0xFFFF;
   SMB_TxWords[6] = hS->hServer->Sesskey >> 16;
@@ -973,17 +969,49 @@ static err_t SMB_SessSetup ( hSHARE hS, char *userid, char *passwd )
   }
   else {
     /* Server does not support extended security */
-    SMB_TxWords[7] = strlen ( passwd );
-    SMB_TxWords[8] = 0;
-    SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
-    SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
-    pB = AddChain(NULL, "CIFS", sizeof("CIFS"));
-    if (pB) pB = AddChain(pB, "\0RISCOS", sizeof("\0RISCOS"));
-    if (pB) pB = AddChain(pB, userid, strlen(userid) + 1);
-    if (pB) pB = AddChain(pB, passwd, strlen(passwd));
-    if (pB) pB = DumpChain(pB);
-    if (pB == NULL)
-      return EOUTOFMEM;
+    if (hS->hServer->ProtFlags & PROT_ENCRYPT)
+    {
+      unsigned char lmowfv2digest[16];
+      unsigned char challengeResponse[24];
+
+      if (strlen( passwd ) != 0)
+      {
+        Auth_LMOWFv2( (const char *)passwd, strlen( passwd ),
+                      (const char *)userid, strlen( userid ),
+                      (const char *)userid, 0, /* no domain */
+                      lmowfv2digest );
+        Auth_LMv2ChallengeResponse( lmowfv2digest, (void *)hS->hServer->blob, challengeResponse );
+        SMB_TxWords[7] = sizeof(challengeResponse);
+      }
+      else
+      {
+        SMB_TxWords[7] = 0;
+      }
+      SMB_TxWords[8] = 0;
+      SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
+      SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
+      pB = AddChain( NULL, "CIFS", sizeof("CIFS") );
+      if (pB) pB = AddChain( pB, "\0RISCOS", sizeof("\0RISCOS") );
+      if (pB) pB = AddChain( pB, userid, strlen(userid) + 1 );
+      if (pB && (SMB_TxWords[7] != 0)) pB = AddChain( pB, challengeResponse, sizeof(challengeResponse) );
+      if (pB) pB = DumpChain( pB );
+      if (pB == NULL)
+        return EOUTOFMEM;
+    }
+    else
+    {
+      SMB_TxWords[7] = strlen ( passwd );
+      SMB_TxWords[8] = 0;
+      SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
+      SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
+      pB = AddChain( NULL, "CIFS", sizeof("CIFS") );
+      if (pB) pB = AddChain( pB, "\0RISCOS", sizeof("\0RISCOS") );
+      if (pB) pB = AddChain( pB, userid, strlen(userid) + 1 );
+      if (pB) pB = AddChain( pB, passwd, strlen(passwd) );
+      if (pB) pB = DumpChain( pB );
+      if (pB == NULL)
+        return EOUTOFMEM;
+    }
     res = Do_SMB ( hS, SMBsesssetup, 13, pB, NULL );
   }
   if ( res != OK )
@@ -1209,6 +1237,9 @@ static hSERVER AllocServer ( void )
       hS->flags = ALLOCATED;
       hS->hSession = 0;
       hS->blob = 0;
+#ifdef LONGNAMES
+      hS->t2flags = 0;
+#endif
       return hS;
     }
 
@@ -1229,9 +1260,6 @@ static hSHARE AllocShare ( void )
       hS->hServer = NULL;
       hS->Tid=0;
       hS->Datasize=0;
-#ifdef LONGNAMES
-      hS->hServer->t2flags = 0;
-#endif
       return hS;
     }
 
@@ -1591,7 +1619,7 @@ err_t SMB_CreateShare (  int sharetype_in,
     hShare->hServer = hServ;
     hShare->sharetype = sharetype_in;
     strcpy  ( hShare->sharename, uc_sharename );
-    strcpyn_upper ( hShare->password, password_in, NAME_LIMIT );
+    strcpyn ( hShare->password, password_in, NAME_LIMIT );
     Xlt_Jumble(hShare->password);
     done |= ALLOC_SHARE;
   }
@@ -1616,7 +1644,7 @@ err_t SMB_CreateShare (  int sharetype_in,
   {
     /* Set up new server details */
     strcpyn_upper ( hServ->username, username_in, NAME_LIMIT );
-    strcpyn_upper ( hServ->password, password_in, NAME_LIMIT );
+    strncpy ( hServ->password, password_in, NAME_LIMIT );
     Xlt_Jumble(hServ->password);
 
     res = ConnectServer ( hShare );
@@ -2132,6 +2160,7 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
   int n_read = 0;
   int eos;
   int i;
+  DWORD actual_resume_key;
   const int first_flags = ffirst_RETURN_KEYS;
   const int stuck_flags = ffirst_RETURN_KEYS | fnext_CONTINUE;
   const int next_flags  = ffirst_RETURN_KEYS;
@@ -2182,6 +2211,7 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
     con->dir_handle_valid = true;
     con->resume_fake = 0;
     con->resume_key_stuck = false;
+    con->resume_file_name[0] = 0;
     debug1("SMB_ReadDirEntriesX2 -> new dir handle %x\n", con->dir_handle);
   }
   else {
@@ -2191,15 +2221,9 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
     Transact_addword(&con->tp, con->dir_handle);   /* findnext_DirHandle */
     Transact_addword(&con->tp, count);             /* findnext_SearchCount */
     Transact_addword(&con->tp, 1);                 /* Search level  */
-    Transact_addlong(&con->tp, con->resume_key);   /* Resume key from previous */
-    if (con->resume_key_stuck) {
-      Transact_addword(&con->tp, stuck_flags);     /* Set continuation bit as NTFS maintains the position */
-    }
-    else {
-      Transact_addword(&con->tp, next_flags);      /* Jump to place using the resume key */
-      con->resume_key_encountered = true;
-    }
-    Transact_addstring(&con->tp, "");              /* no name needed */
+    Transact_addlong(&con->tp, con->actual_resume_key);   /* Resume key from previous */
+    Transact_addword(&con->tp, next_flags);               /* Jump to place using the resume key */
+    Transact_addstring(&con->tp, con->resume_file_name);
     debug1("SMB_ReadDirEntriesX2 -> continue with key %08x\n", con->resume_key);
     res = SMB_Transact2(hS, &con->tp);
     if (res != OK)
@@ -2235,6 +2259,8 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
       continue;
     }
 
+    actual_resume_key = next_resume_key;
+
     /* Workaround for NTFS always returning zero */
     con->resume_key_stuck = (next_resume_key == 0) ? true : false;
     if (con->resume_key_stuck) next_resume_key = con->resume_fake;
@@ -2243,7 +2269,16 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
     if ( con->resume_key_encountered ) {
       debug1("SMB_ReadDirEntriesX2 -> call back with key %08x\n", next_resume_key);
       res = dirfn(p, 1, &taken, private);
-      if (taken) con->resume_key = next_resume_key;
+
+      if (taken) {
+        con->resume_key = next_resume_key;
+        con->actual_resume_key = actual_resume_key;
+        memcpy(con->resume_file_name, p + 23, length + 1);
+      }
+      else {
+        con->resume_fake--;
+      }
+
       if (res != OK) {
         /* Entry expander must have run out of space! */
         debug0("SMB_ReadDirEntriesX2 -> caller ran out of space (or could be name xlate code)\n");
@@ -2252,6 +2287,8 @@ static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
     }
     else {
       debug2("SMB_ReadDirEntriesX2 -> awaiting key %08x (got %08x)\n", con->resume_key, next_resume_key);
+      con->actual_resume_key = actual_resume_key;
+      memcpy(con->resume_file_name, p + 23, length + 1);
       if ( next_resume_key == con->resume_key )
         con->resume_key_encountered = true;
     }
@@ -2565,7 +2602,7 @@ err_t SMB_Read ( int FH, uint offset, uint len, BYTE *where,
 
   if ( hS->hServer->ProtFlags & PROT_READRAW )
   {
-    while ( len_left > FILE_BLOCK_SIZE )
+    while ( len_left > MAX_RX_BLOCK_SIZE )
     {
       n_read = SMB_ReadRaw ( hS, fid, offset, len_left, where );
       if ( n_read == 0 )  /* Didn't work? Find out why */
@@ -2582,7 +2619,7 @@ err_t SMB_Read ( int FH, uint offset, uint len, BYTE *where,
   while ( len_left > 0 )
   {
     SMB_TxWords[0] = fid;
-    SMB_TxWords[1] = min(len_left,FILE_BLOCK_SIZE);
+    SMB_TxWords[1] = min(len_left, MAX_RX_BLOCK_SIZE);
     SMB_TxWords[2] = offset & 0xFFFF;
     SMB_TxWords[3] = (offset >> 16 );
     SMB_TxWords[4] = (len_left);
@@ -2611,7 +2648,7 @@ err_t SMB_Read ( int FH, uint offset, uint len, BYTE *where,
 
     FreeChain(pB_res);
 
-    if ( n_read < FILE_BLOCK_SIZE )  /* Reached end of file */
+    if ( n_read < MAX_RX_BLOCK_SIZE )  /* Reached end of file */
       break;
   }
 
@@ -2651,7 +2688,7 @@ err_t SMB_Write ( int FH, uint offset, uint len, BYTE *where,
     uint *pOutLen )
 {
   BUFCHAIN pB;
-  uint len_left, n_written;
+  uint len_left, n_written, n_count;
   int  fid;
   hSHARE hS;
 
@@ -2668,9 +2705,9 @@ err_t SMB_Write ( int FH, uint offset, uint len, BYTE *where,
 
   if ( hS->hServer->ProtFlags & PROT_WRITERAW )
   {
-    while ( len_left > FILE_BLOCK_SIZE )
+    while ( len_left >= WRRAW_BLOCK_SIZE )
     {
-      n_written = min(len_left,WRRAW_BLOCK_SIZE);
+      n_written = WRRAW_BLOCK_SIZE;
       res = SMB_WriteRaw ( hS, fid, offset, n_written, where );
       if ( res != OK )
         goto finish;
@@ -2683,14 +2720,14 @@ err_t SMB_Write ( int FH, uint offset, uint len, BYTE *where,
 
   while ( len_left > 0 )
   {
-    n_written = min(len_left,FILE_BLOCK_SIZE);
+    n_count = min(0xFFFF, min(len_left, hS->hServer->maxTxBufferSize));
     SMB_TxWords[0] = fid;
-    SMB_TxWords[1] = n_written;
-    SMB_TxWords[2] = offset & 0xFFFF;
-    SMB_TxWords[3] = (offset >> 16 );
-    SMB_TxWords[4] = (len_left);
+    SMB_TxWords[1] = n_count;
+    SMB_TxWords[2] = (WORD)offset;
+    SMB_TxWords[3] = (WORD)(offset >> 16);
+    SMB_TxWords[4] = min(0xFFFF, len_left); /* Estimate of remainder */
 
-    pB = MkDataBlock ( NULL, DATA_BLOCK, where, n_written, true );
+    pB = MkDataBlock ( NULL, DATA_BLOCK, where, n_count, true );
     if ( pB == NULL )
     {
       res = EOUTOFMEM;
@@ -2706,7 +2743,7 @@ err_t SMB_Write ( int FH, uint offset, uint len, BYTE *where,
     where    += n_written;
     offset   += n_written;
 
-    if ( n_written < FILE_BLOCK_SIZE )  /* End of data */
+    if ( n_written < n_count )  /* Server has insufficient resources */
       break;
   }
 

@@ -14,173 +14,26 @@
 #
 # Makefile for Internet
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name   Description
-# ----       ----   -----------
-# 18-Nov-94  AMcC   Created
-# 05-Jan-95  AMcC   Added resources: rule and paths
-# 21-Feb-95  AMcC   Resources now copied to AUNMsgs
-# 22-Feb-95  AMcC   Added rules to build from sources
-#
 
-#
-# Component specific options:
-#
-COMPONENT  = Internet
-ROM_MODULE = aof.Internet
-TARGET     = rm.Internet
-RDIR       = Resources
-LDIR       = ${RDIR}.${LOCALE}
-RESDIR    = ^.^.AUNMsgs.Resources.${Locale}.Resources.${COMPONENT}
+COMPONENT   = Internet
+VPATH       = ^.build ^.kern ^.net ^.netinet ^.sys ^.riscos ^.lib ^.whoami
+LIBS        = ${ASMUTILS}
+OBJS        = poduleirq kern_subr kern_mib sysctl sys_socket uipc_mbuf kvm unixenv \
+              tick_entry if if_loop if_module radix raw_cb raw_usrreq route rtsock \
+              if_ether igmp in in_cksum ip_mroute in_pcb in_proto in_rmx ip_icmp \
+              ip_input ip_output raw_ip tcp_debug tcp_input tcp_output tcp_subr tcp_timer \
+              tcp_usrreq udp_usrreq globdata mbuf module setsoft socket_swi init swiveneers \
+              domain socket socket1 whoami #svcprint ip_fw tcp_debug
+CINCLUDES   = -ITCPIPLibs:,C:
+HDRS        =
+CFLAGS      = -Wacnp 
+ROMCDEFINES = -DROM
+CMHGFILE    = InetHdr
+CMHGDEPENDS = module socket_swi
+CDEFINES    = -DKERNEL -DINET -DGATEWAY -DCOMPAT_43 -DCOMPAT_OLDSOCK -DDIRECTED_BROADCAST \
+              -DMULTICAST -DDELAY_EVENTS #-DMROUTING -DIPFIREWALL -DIPFIREWALL_VERBOSE \
+              -DFLASHY_SCROLLLOCK -DTCPTDEBUG -DTCPDEBUG -DDIAGNOSTIC -DDEBUG_MTUDISC 
 
-# amu version 5.02 can't cope with @ in VPATH so we have to use ^.build
-#
-VPATH     = ^.build ^.kern ^.net ^.netinet ^.sys ^.riscos ^.lib ^.whoami
+include CModule
 
-#
-# Generic options:
-#
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-MKDIR   = do mkdir -p
-MODSQZ  = modsqz
-RM      = remove
-WIPE    = x wipe
-
-AFLAGS   = -depend !Depend -I<Hdr$Dir>.Global.,<Hdr$Dir>.Interface. -Stamp -quit
-CFLAGS   = -depend !Depend -zps1 -zM -ffa -Wacnp ${INCLUDES} ${DFLAGS} ${OPTS} ${THROWBACK}
-DFLAGS   = -DKERNEL -DINET -DGATEWAY -DCOMPAT_43 -DCOMPAT_OLDSOCK \
- -DDIRECTED_BROADCAST -DMULTICAST -DDELAY_EVENTS #-DMROUTING -DIPFIREWALL \
- -DIPFIREWALL_VERBOSE -DFLASHY_SCROLLLOCK -DTCPTDEBUG -DTCPDEBUG \
- #-DDIAGNOSTIC -DDEBUG_MTUDISC
-INCLUDES = -ITCPIPLibs:,C:
-CPFLAGS  = ~cfr~v
-LDFLAGS  = -linkversion 514
-WFLAGS   = ~c~v
-
-include ModuleLibs
-
-OBJS =\
- InetHdr.o\
- poduleirq.o\
- kern_subr.o\
- kern_mib.o\
- sysctl.o\
- sys_socket.o\
- uipc_mbuf.o\
- kvm.o\
- unixenv.o\
- tick_entry.o\
- if.o\
- if_loop.o\
- if_module.o\
- radix.o\
- raw_cb.o\
- raw_usrreq.o\
- route.o\
- rtsock.o\
- if_ether.o\
- igmp.o\
- in.o\
- in_cksum.o\
- ip_mroute.o\
- in_pcb.o\
- in_proto.o\
- in_rmx.o\
- ip_icmp.o\
- ip_input.o\
- ip_output.o\
- raw_ip.o\
- tcp_debug.o\
- tcp_input.o\
- tcp_output.o\
- tcp_subr.o\
- tcp_timer.o\
- tcp_usrreq.o\
- udp_usrreq.o\
- globdata.o\
- mbuf.o\
- module.o\
- setsoft.o\
- socket_swi.o\
- init.o\
- swiveneers.o\
- domain.o\
- socket.o\
- socket1.o\
- whoami.o
-#svcprint.o
-#ip_fw.o\
-#tcp_debug.o
-
-#
-# Rule patterns
-#
-.c.o:;      ${CC} -c ${CFLAGS} -o $@ $<
-.c.s:;      ${CC} -S ${CFLAGS} $<
-.cmhg.o:;   ${CMHG} -p -o $@ $<
-.s.o:;      ${AS} ${AFLAGS} $< $@
-.cmhg.h:;   ${CMHG} -p -d $@ $<
-
-#
-# Main rules:
-#
-all: ${TARGET}
-        @echo ${COMPONENT}: Module built (Relocatable)
-
-${TARGET}: ${OBJS} ${CLIB}
-        ${LD} ${LDFLAGS} -rmf -o $@ ${OBJS} ${CLIB} ${ASMUTILS} -s Syms
-        ${MODSQZ} $@
-        Access $@ WR/r
-
-rom: ${ROM_MODULE}
-        @echo ${COMPONENT}: Module built (ROM)
-
-install: ${TARGET}
-        ${MKDIR} ${INSTDIR}
-        ${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-        @echo ${COMPONENT}: Module installed (RAM)
-
-install_rom: ${ROM_MODULE}
-        ${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-        @echo ${COMPONENT}: Module installed (ROM)
-
-resources:
-        @echo ${COMPONENT}: Resources in AUNMsgs
-
-clean:
-        ${RM} ${ROM_MODULE}
-        ${RM} ${TARGET}
-        ${RM} Syms
-        ${WIPE} linked.* ${WFLAGS}
-        ${WIPE} map.* ${WFLAGS}
-        ${WIPE} o.* ${WFLAGS}
-        ${RM} h.InetHdr
-        @echo ${COMPONENT}: cleaned
-
-${ROM_MODULE}: ${OBJS} ${ROMCSTUBS}
-        ${LD} ${LDFLAGS} -o $@ -aof ${OBJS} ${ROMCSTUBS} ${ASMUTILS}
-
-o.socket_swi: InetHdr.h
-
-
-# final link for ROM Image (using given base address)
-rom_link: ${ROM_MODULE}
-        ${MKDIR} linked
-        ${MKDIR} map
-        ${LD} -o linked.${COMPONENT} ${LDFLAGS} -rmf -base ${ADDRESS} ${ROM_MODULE} ${ABSSYM} \
-              -map > map.${COMPONENT}
-        ${CP} linked.${COMPONENT} ${LINKDIR}.${COMPONENT} ${CPFLAGS}
-        @echo ${COMPONENT}: rom_link complete
-
-BBETYPE = internet
-bbe-internet: bbe-generic
-        BBE_Export_File ^.VersionNum
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

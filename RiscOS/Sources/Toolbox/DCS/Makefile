@@ -12,48 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for a Toolbox Object module
+# Makefile for Discard/Cancel/Save/Quit module
 #
-# $Id$
-#
-# Component specific options:
-#
-RAMRESOURCES = o.msgs
 
-COMMON_OBJ = o.Modhdr_NoD o.create o.delete o.events o.getstate\
- o.hide o.miscop o.show o.task
+COMPONENT     = DCS
+OBJS          = create delete events getstate\
+                hide main miscop show task
+SA_OBJS       = ${OBJS}
+RESFSDIR      = ${RESDIR}${SEP}DCS
+CMHGFILE      = DCSHdr
+CMHGDEPENDS   = main
+ROMCDEFINES   = -DROM
+CDFLAGS       = -Ddebugging=1
+CMHGDFLAGS    = -Ddebugging=1
+CINCLUDES     = -IC:tboxlibint,tbox:,C:
+HDRS          =
+LIBS          = ${TBOXINTLIB}
+DBG_LIBS      = ${TBOXINTDBGLIB}
+INSTRES_FILES = Res Quit.Messages:^.Quit Quit.Res:^.Quit
 
-ROM_OBJS = o.mainROM ${COMMON_OBJ}
+include CModule
 
-RAM_OBJS = o.main ${RAMRESOURCES} ${COMMON_OBJ}
-
-DBG_OBJS = od.main ${RAMRESOURCES} o.Modhdr od.create od.delete od.events od.getstate\
- od.hide od.miscop od.show od.task
-
-#
-# Get main rules
-#
-include C:tboxlibint.TboxMake
-
-DCSRESDIR = <resource$dir>.Resources2
-
-#
-# Module specific rules:
-#
-resources: LocalRes:DCS.Messages LocalRes:DCS.Res LocalRes:Quit.Messages LocalRes:Quit.Res
-	${MKDIR} ${DCSRESDIR}
-	${CP} Resources.${LOCALE}.*   ${DCSRESDIR}.*  ${CPFLAGS}
-	@echo ${COMPONENT}: resource files copied to Messages module
-
-${RAMRESOURCES}: LocalRes:DCS.Messages LocalRes:DCS.Res LocalRes:Quit.Messages LocalRes:Quit.Res
-	resgen res_files $@ \
-          LocalRes:DCS.Res Resources.DCS.Res \
-          LocalRes:DCS.Messages Resources.DCS.Messages \
-          LocalRes:Quit.Res Resources.Quit.Res \
-          LocalRes:Quit.Messages Resources.Quit.Messages
-
-clean: toolbox-clean
-	@echo ${COMPONENT}: cleaned
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

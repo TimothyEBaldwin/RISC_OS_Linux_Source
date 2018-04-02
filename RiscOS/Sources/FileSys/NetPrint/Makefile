@@ -14,16 +14,9 @@
 #
 # Makefile for NetPrint
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 20-Dec-02  KJB         Created.
-#
 
-COMPONENT = NetPrint
-ROM_SOURCE = NewOS
+COMPONENT  = NetPrint
+ROM_SOURCE = Module.s
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpTexts
 

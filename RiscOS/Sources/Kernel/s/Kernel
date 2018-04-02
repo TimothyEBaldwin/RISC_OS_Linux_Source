@@ -111,6 +111,83 @@ $label  LDR     $reg, =ZeroPage+VduDriverWorkSpace
       ]
         MEND
 
+; *****************************************************
+; ***  Call Get4KPTE/Get64KPTE/Get1MPTE functions,  ***
+; ***  with arbitrary in/out regs                   ***
+; *****************************************************
+        MACRO
+        GetPTE  $out, $size, $addr, $flags
+        Push    "r0-r3,lr"
+      [ $flags <> r1
+        MOV     r1, $flags
+      ]
+      [ $addr <> r0
+        ASSERT  $addr <> r1
+        MOV     r0, $addr
+      ]
+        LDR     r3, =ZeroPage
+        LDR     r2, [r3, #MMU_PPLTrans]
+        LDR     r3, [r3, #MMU_PCBTrans]
+        BL      Get$size.PTE
+      [ :INDEX:$out < 4
+        STR     r0, [sp, #:INDEX:$out * 4]
+      |
+        MOV     $out, r0
+      ]
+        Pull    "r0-r3,lr"
+        MEND
+
+; *******************************************************************
+; ***  Convert RWX flags to OS_Memory 24 flags                    ***
+; ***  N.B. this is using the inverted executability sense (i.e.  ***
+; ***  bit set if executable) - see notes in CheckMemoryAccess    ***
+; *******************************************************************
+        MACRO
+        GenPPLAccess $flags
+        LCLA    access
+access  SETA    0
+      [ ($flags :AND: 1) <> 0
+access  SETA    access :OR: CMA_Partially_UserXN
+      ]
+      [ ($flags :AND: 2) <> 0
+access  SETA    access :OR: CMA_Partially_UserW
+      ]
+      [ ($flags :AND: 4) <> 0
+access  SETA    access :OR: CMA_Partially_UserR
+      ]
+      [ ($flags :AND: 8) <> 0
+access  SETA    access :OR: CMA_Partially_PrivXN
+      ]
+      [ ($flags :AND: 16) <> 0
+access  SETA    access :OR: CMA_Partially_PrivW
+      ]
+      [ ($flags :AND: 32) <> 0
+access  SETA    access :OR: CMA_Partially_PrivR
+      ]
+        DCD     access
+        MEND
+
+; **********************************************************
+; ***  PageTableSync - Sync the CPU after overwriting a  ***
+; ***  faulting page table entry. Corrupts r0, lr.       ***
+; **********************************************************
+        MACRO
+        PageTableSync$cond
+    [ SyncPageTables
+      [ MEMM_Type = "VMSAv6"
+        ; DSB + ISB required to ensure effect of page table write is fully
+        ; visible (after overwriting a faulting entry)
+        myDSB   $cond,r0
+        myISB   $cond,r0,,y
+      |
+        ; For < ARMv6 draining the write buffer should be sufficient
+        ; (write-through or bufferable page tables)
+        LDR$cond r0, =ZeroPage
+        ARMop    DSB_ReadWrite,$cond,,r0 ; N.B. assume that this op won't corrupt NZCV
+      ]
+    ]
+        MEND
+
 ; one that builds a module command table entry:
 ; set Module_BaseAddr to module base before use.
 
@@ -194,8 +271,29 @@ CBack_OldStyle  * 1
 CBack_Postpone  * 2
 CBack_VectorReq * 4
 
-; Set up symbols for the SWIs which aren't really there yet
+; AMBControl definitions - required by GetAppSpaceDANode macro
 
+        GET     s.AMBControl.Options
+        GET     s.AMBControl.Workspace
+
+        MACRO
+        GetAppSpaceDANode $out, $zero
+      [ "$zero" <> ""
+        LDR     $out, [$zero, #AMBControl_ws]
+      |
+        LDR     $out, =ZeroPage+AMBControl_ws
+        LDR     $out, [$out]
+      ]
+        TEQ     $out, #0
+        LDRNE   $out, [$out, #:INDEX:AMBMappedInNode]
+        TEQNE   $out, #0
+        ADDNE   $out, $out, #AMBNode_DANode
+      [ "$zero" <> "" :LAND: "$zero" <> "$out"
+        ADDEQ   $out, $zero, #AppSpaceDANode
+      |
+        LDREQ   $out, =ZeroPage+AppSpaceDANode
+      ]
+        MEND
 
         SUBT    Arthur Code
         OPT     4
@@ -277,7 +375,7 @@ DefaultProcVecs
 DefaultPreVeneers
 UndPreVeneer    *       ZeroPage+ProcVecPreVeneers+(.-DefaultPreVeneers)
         LDR     PC, DefaultPreVeneers-ProcVecPreVeneers+UndHan
-   [ ChocolateAMB
+   [ AMB_LazyMapIn
         DCD     0
    |
 PAbPreVeneer    *       ZeroPage+ProcVecPreVeneers+(.-DefaultPreVeneers)
@@ -625,7 +723,32 @@ VSet_GenerateError ROUT
         LDRB    r11, [r10, #CallBack_Flag]
         B       SWIReturnWithCallBackFlag
 
+; In: r10-r12 stacked
+;     r0 = error pointer
+;     r10 = error number (maybe)
+;     r11 = CallBack_Flag
+;     r12 = SWI number
+;     lr has SPSR for SWI return
 BadErrPtr2
+        TST     r0, #3                  ; Repeat pointer validity check; if this is OK we know we've arrived here because of a bad error number
+        BNE     BadErrPtr
+        ; With RISC OS 3.5+, Wimp_ReportError interprets error numbers with bits
+        ; 24-29 set to 011011 as being a program error
+        EOR     r10, r10, #27 :SHL: 24
+        TST     r10, #&3F000000
+        BEQ     BadErrPtrReturn
+        ; The PRM describes FileCore as returning errors in the form &0001XXYY,
+        ; where XX = filesystem number and YY = error code. However for disc
+        ; errors it breaks this rule and uses error numbers of the form
+        ; &ZZ01XXC7, where ZZ = disc error code and &C7 = "disc error". The
+        ; obvious problem with this is that makes use of the reserved bits in
+        ; the error number, so do an extra check here to detect that format of
+        ; error number and allow it through.
+        BIC     r10, r10, #&FF000000
+        BIC     r10, r10, #&0000FF00
+        EOR     r10, r10, #&00010000
+        TEQ     r10, #&C7
+        BEQ     BadErrPtrReturn
         ; Some types of error lookup code work by passing a bogus error number
         ; into MessageTrans_ErrorLookup and then fixing it up afterwards. To
         ; avoid breaking such code, and to maintain compatibility with
@@ -636,16 +759,16 @@ BadErrPtr2
         ;
         ; [1] - The NVRAM module has a reserved bit set in its error numbers so
         ; that it knows it needs to translate them; after translation the bit is
-        ; cleared. This does assume that the code in PortMan will never see a
+        ; cleared. This does assume that the code in NVRAM will never see a
         ; translated error that has that reserved bit set - so is perhaps not
         ; entirely kosher (although the kernel now requires reserved bits to be
         ; clear too) - but it does avoid a redundant copy of the error token to
         ; the stack.
-        TST     r0, #3                  ; Repeat pointer validity check; if this is OK we know we've arrived here because of a bad error number
-        LDREQ   r10, =XMessageTrans_ErrorLookup
-        TEQEQ   r10, r12
+        LDR     r10, =XMessageTrans_ErrorLookup
+        TEQ     r10, r12
         BEQ     BadErrPtrReturn
 ; In: r10-r12 stacked
+;     r11 = CallBack_Flag
 ;     r12 = SWI number
 ;     lr has SPSR for SWI return
 BadErrPtr ROUT
@@ -1310,6 +1433,7 @@ Issue_Service_SWI ROUT
 ;          32 -> read processor vectors location
 ;          33 -> read cache information
 ;          34 -> read CPU features
+;          35 -> read routine to clear the exclusive monitor lock
 
 PlatFeatSWI ROUT
         Push    lr
@@ -1319,8 +1443,10 @@ PlatFeatSWI ROUT
         BEQ     %FT40
         CMP     r0, #OSPlatformFeatures_ReadCPUFeatures
         BEQ     PlatFeatSWI_ReadCPUFeatures
+        CMP     r0, #OSPlatformFeatures_ReadClearExclusive
+        BEQ     %FT50
         CMP     r0, #OSPlatformFeatures_ReadCodeFeatures
-        BNE     %FT50                   ;No, so send out a service call
+        BNE     %FT75                   ; No, so error
 
         ;Ok, it's the 'code_features' reason code.
       [ ZeroPage <> 0
@@ -1370,20 +1496,24 @@ platfeat_irqinsert
         B       SLVK
 
 50
-  [ {FALSE}
-        Push    "r1-r8"
-        MOV     r1, #Service_UnknownPlatformFeatures
-        Pull    "r2-r9"
-        BL      Issue_Service
-        CMP     r1, #0
-        Push    "r2-r9"
-        Pull    "r1-r8"
-        BNE     %FT75
+        ; Read clear the exclusive routine
+        LDR     r14, =ZeroPage
+        LDR     r14, [r14, #ProcessorFlags]
+        TST     r14, #CPUFlag_LoadStoreEx :OR: CPUFlag_LoadStoreClearExSizes
+        ADRNE   r1, platfeat_clrex      ; Can set the lock, so point R1 to the clear routine
+        MOVEQ   r1, #0
         Pull    lr
-        B       SLVK                    ;Return
-  ]
+        B       SLVK
 
-75      ;Get here if the service call isn't claimed.
+platfeat_clrex
+        ; => SP = a full descending stack
+        ;    LR = return address
+        ; <= all registers preserved, lock cleared
+        Push    "r0, lr"
+        MyCLREX r0, r14
+        Pull    "r0, pc"
+
+75      ; Get here if bad reason
         ADR     R0, ErrorBlock_BadPlatReas
     [ International
         BL      TranslateError

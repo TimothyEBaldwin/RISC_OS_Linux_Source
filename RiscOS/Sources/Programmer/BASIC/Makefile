@@ -22,17 +22,14 @@ RESFSDIR      = ${RESDIR}.BASIC
 
 ifeq ($(VFPASM),TRUE)
 ASFLAGS       = -PD "VFPAssembler SETL {TRUE}"
-RESOURCEEXTRA = ${RESFSDIR}.VFPData
 SA_DEPEND     = VFPData
-
-${RESOURCEEXTRA}: VFPData
-	${MKDIR} ${RESFSDIR}
-	${CP} VFPData $@ ${CPFLAGS}
+INSTRES_FILES = VFPData
+INSTRES_DEPENDS = VFPData
 
 s.VFPData: VFPLib.VFPLib VFPLib.GenData
 	BASIC { < VFPLib.GenData }
 
-VFPData: s.VFPData
+VFPData: s.VFPData hdr.VFPMacros
 	${MKDIR} o
 	${AS} ${ASFLAGS} -PD "BuildingVFPData SETL {TRUE}" -o o.VFPData s.VFPData
 	${LD} -BIN -o $@ o.VFPData
@@ -44,5 +41,9 @@ endif
 
 include StdTools
 include AAsmModule
+
+ifeq ($(COMPONENT),BASICVFP)
+AS            = ObjAsmVFP
+endif
 
 # Dynamic dependencies:

@@ -16,7 +16,7 @@
 #
 
 COMPONENT  = UnicodeLib
-TARGET     = ucode
+TARGET    ?= ucode
 EXPDIR     = ${LIBDIR}${SEP}Unicode
 LIBRARIES  = ${LIBRARY} ${LIBRARYZM} ${LIBRARYD}
 LIBDEPENDS = unictype

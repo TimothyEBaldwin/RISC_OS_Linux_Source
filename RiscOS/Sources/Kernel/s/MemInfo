@@ -67,12 +67,12 @@ MemReturn
         B       AccessPhysAddr                  ; 14
         B       ReleasePhysAddr                 ; 15
         B       MemoryAreaInfo                  ; 16
-        B       %BT20                           ; 17 |
-        B       %BT20                           ; 18 |
-        B       %BT20                           ; 19 |
-        B       %BT20                           ; 20 | Reserved for us
+        B       MemoryAccessPrivileges          ; 17
+        B       FindAccessPrivilege             ; 18
+        B       %BT20                           ; Reason code 19 reserved (for DMAPrep, on SMP branch)
+        B       ChangeCompatibility             ; 20
         B       %BT20                           ; 21 |
-        B       %BT20                           ; 22 |
+        B       %BT20                           ; 22 | Reserved for us
         B       %BT20                           ; 23 |
         B       CheckMemoryAccess               ; 24
                                                 ; 25+ reserved for ROL
@@ -171,7 +171,7 @@ MemoryConvertNoFIQCheck   ROUT
 
         LDMIA   r1!, {r3-r5}            ; Get next three word entry (PN,LA,PA) and move on pointer.
 
-   [ ChocolateAMB
+   [ AMB_LazyMapIn
         BL      handle_AMBHonesty       ; may need to make page honest (as if not lazily mapped)
    ]
 
@@ -254,9 +254,10 @@ MemoryConvertNoFIQCheck   ROUT
         ORR     lr, lr, r5, LSR #10-4
         LDR     r5, [r3, #MMU_PCBTrans]
         ORREQ   lr, lr, #XCB_TU<<4      ; if temp uncache, set TU bit
-        LDRB    lr, [r5, lr, LSR #4]    ; convert to X, C and B bits for this CPU
+        MOV     lr, lr, LSR #3
+        LDRH    lr, [r5, lr]            ; convert to C, B and TEX bits for this CPU
         LDR     r5, [r4]                ; Get L2 entry (safe as we know address is valid).
-        BIC     r5, r5, #(L2_C+L2_B+L2_TEX) :AND: 255 ; Knock out existing attributes (n.b. assumed to not be large page!)
+        BIC     r5, r5, #TempUncache_L2PTMask ; Knock out existing attributes (n.b. assumed to not be large page!)
         ORR     r5, r5, lr              ; Set new attributes
  |
         LDR     r5, [r4]                ; Get L2 entry (safe as we know address is valid).
@@ -292,14 +293,9 @@ MemoryConvertNoFIQCheck   ROUT
         STR     r5, [r4]                ; Write back new L2 entry.
         ASSERT  (L2PT :SHL: 10) = 0     ; Ensure we can convert r4 back to the page log addr
         MOV     r0, r4, LSL #10
-        ARMop   MMU_ChangingUncachedEntry,,,r3   ; Clean TLB
-        MOV     r0, r4, LSL #10
-        MOV     r10, r1
-        ADD     r1, r0, #4096
-        ARMop   Cache_CleanInvalidateRange,,,r3  ; Clean page from cache
+        ARMop   MMU_ChangingEntry,,,r3  ; Clean TLB+cache
         Pull    "r5, lr"                ; Restore OS_Memory flags + IRQ lr
         MSR     CPSR_c, r11             ; Back to original mode + IRQ state
-        MOV     r1, r10
         B       %FT65
 63
         ; Making page cacheable again
@@ -336,7 +332,7 @@ MemoryConvertNoFIQCheck   ROUT
         SETV
         EXIT
 
-   [ ChocolateAMB
+   [ AMB_LazyMapIn
 ;
 ;  entry: r3,r4,r5 = provided PN,LA,PA triple for entry to make honest (at least one given)
 ;         r0 bits flag which of PN,LA,PA are given
@@ -367,7 +363,7 @@ handle_AMBHonesty  ROUT
 90
         Pull    "r0, r3-r5, pc"
 
-   ] ;ChocolateAMB
+   ] ;AMB_LazyMapIn
 
 
 ;----------------------------------------------------------------------------------------
@@ -415,14 +411,19 @@ logical_to_physical
         ADD     r9, r8, r9, LSL #2      ; r9 -> L2PT entry for logical address
         MOV     r5, r9, LSR #12         ; r5 = page offset to L2PT entry for logical address
         LDR     r5, [r8, r5, LSL #2]    ; r5 = L2PT entry for L2PT entry for logical address
-        EOR     r5, r5, #2_10           ; Check for valid page.
-        TST     r5, #3
-        BNE     meminfo_returncs
+      [ MEMM_Type = "ARM600"
+        ASSERT  ((L2_SmallPage :OR: L2_ExtPage) :AND: 2) <> 0
+        ASSERT  (L2_LargePage :AND: 2) = 0
+      |
+        ASSERT  L2_SmallPage = 2
+        ASSERT  L2_XN = 1               ; Because XN is bit 0, bit 1 is the only bit we can check when looking for small pages
+      ]
+        TST     r5, #2                  ; Check for valid (4K) page.
+        BEQ     meminfo_returncs
 
         LDR     r5, [r9]                ; r5 = L2PT entry for logical address
-        EOR     r5, r5, #2_10           ; Check for valid page.
-        TST     r5, #3
-        BNE     meminfo_returncs
+        TST     r5, #2                  ; Check for valid (4K) page.
+        BEQ     meminfo_returncs
 
         LDR     r9, =&FFF               ; Valid so
         BIC     r5, r5, r9              ;   mask off bits 0-11,
@@ -757,13 +758,12 @@ MemoryAmounts   ROUT
         CLRV
         EXIT
 99
-        ADRL    r0, ErrorBlock_BadParameters
-      [ International
-        BL      TranslateError
-      |
+        PullEnv
+        ; Fall through...
+MemoryBadParameters
+        ADRL    r0, ErrorBlock_BadParameters ; n.b. MemReturn handles internationalisation
         SETV
-      ]
-        EXIT
+        MOV     pc, lr
 
 
 ;----------------------------------------------------------------------------------------
@@ -798,10 +798,9 @@ MemoryIOSpace   ROUT
         CallHAL HAL_ControllerAddress
         CMP     r0, #-1
         MOVNE   r1, r0
-        ADREQL  r0, ErrorBlock_BadParameters
-        STREQ   r0, [sp, #0]
-        SETV    EQ
-        EXIT
+        PullEnv
+        MOVNE   pc, lr
+        B       MemoryBadParameters
 
 ;----------------------------------------------------------------------------------------
 ; MemoryFreePoolLock - removed now that free pool is a PMP
@@ -903,15 +902,12 @@ RP_checkotherpagesloop
 
 RP_failed
         MOV     r3,#0
-        ADR     r0,RP_error
+        ADR     r0,ErrorBlock_NoMemChunkAvailable
         SETV
         STR     r0,[sp]
         Pull    "r0-r2,r4-r11,pc"
 
-RP_error
-        DCD     0
-        DCB     "No chunk available (OS_Memory 12)",0
-        ALIGN
+        MakeErrorBlock NoMemChunkAvailable
 
 ;----------------------------------------------------------------------------------------
 ;MapIOpermanent - map IO space (if not already mapped) and return logical address
@@ -933,46 +929,39 @@ RP_error
 ;        - or error if not possible (no room)
 ;
 MapIOpermanent ROUT
-        Push    "r0-r2,r12,lr"
-        MOV     lr, r0
-        LDR     r12, =ZeroPage
-        ASSERT  XCB_NB = 1:SHL:0
-        ASSERT  XCB_NC = 1:SHL:1
-        ASSERT  XCB_P = 1:SHL:2
-        AND     r0, r0, #&1F00
-        MOV     r0, r0, LSR #8
-        LDR     r12, [r12, #MMU_PCBTrans]
-        EOR     r0, r0, #XCB_NB+XCB_NC ; Invert C+B to match XCBTable
-        LDRB    r0, [r12, r0]
-        ; Convert from L2 attributes to L1
-        ASSERT  L1_C = L2_C
-        ASSERT  L1_B = L2_B
-        ASSERT  L2_TEXShift < L1_TEXShift
-        AND     r12, r0, #L2_TEX
-        BIC     r0, r0, #L2_TEX
-        ORR     r0, r0, r12, LSL #L1_TEXShift-L2_TEXShift
-        ; Deal with other flags
-        TST     lr, #1:SHL:16
-        ORRNE   r0, r0, #MapInFlag_DoublyMapped
-        TST     lr, #1:SHL:17
-        ANDNE   lr, lr, #2_1111:SHL:24
-        ADRNEL  r12, PPLTransL1
-        LDRNE   r12, [r12, lr, LSR #22]
-        ORRNE   r0, r0, #MapInFlag_APSpecified
-        ORRNE   r0, r0, r12
-        BL      RISCOS_MapInIO
+        Entry   "r0-r2,r12"
+        ; Convert the input flags to some DA flags
+        TST     r0, #1:SHL:17
+        MOVEQ   r12, #2                 ; Default AP: SVC RW, USR none
+        MOVNE   r12, r0, LSR #24        ; Else use given AP
+        ANDNE   r12, r12, #DynAreaFlags_APBits
+        AND     lr, r0, #&300
+        EOR     lr, lr, #&300
+        ASSERT  DynAreaFlags_NotBufferable = 1:SHL:4
+        ASSERT  DynAreaFlags_NotCacheable = 1:SHL:5
+        ORR     r12, r12, lr, LSR #4
+        AND     lr, r0, #7:SHL:10
+        ASSERT  DynAreaFlags_CPBits = 7:SHL:12
+        ORR     r12, r12, lr, LSL #2
+        ; Calculate the extra flags needed for RISCOS_MapInIO
+        AND     r0, r0, #1:SHL:16
+        ASSERT  MapInFlag_DoublyMapped = 1:SHL:20
+        MOV     r0, r0, LSL #4
+        ; Convert DA flags to page table entry
+        GetPTE  r0, 1M, r0, r12
+ [ MEMM_Type = "VMSAv6"
+        ORR     r0, r0, #L1_XN          ; force non-executable to prevent speculative instruction fetches
+ ]
+        ; Map in the region
+        BL      RISCOS_MapInIO_PTE
         MOV     r3, r0
+        PullEnv
         CMP     r3, #0              ;MOV,CMP rather than MOVS to be sure to clear V
-        Pull    "r0-r2,r12,pc",NE
-        ADR     r0, MIp_error
-        SETV
-        STR     r0, [sp]
-        Pull    "r0-r2,r12,pc"
+        ADREQ   r0, ErrorBlock_NoRoomForIO
+        SETV    EQ
+        MOV     pc, lr
 
-MIp_error
-        DCD     0
-        DCB     "No room for IO space (OS_Memory 13)",0
-        ALIGN
+        MakeErrorBlock NoRoomForIO
 
 ;----------------------------------------------------------------------------------------
 ;AccessPhysAddr - claim temporary access to given physical address (in fact,
@@ -1040,6 +1029,7 @@ ReleasePhysAddr
 ;                               13=Processor vectors
 ;                               14=DebuggerSpace
 ;                               15=Scratch space
+;                               16=Compatibility page
 ;                       16-31   reserved (set to 0)
 ;
 ;       Out:    r1 = base of area
@@ -1075,13 +1065,12 @@ MAI_TableStart
         B       MAI_ProcVecs
         B       MAI_DebuggerSpace
         B       MAI_ScratchSpace
+        B       MAI_CompatibilityPage
 MAI_TableEnd
 
 70
-        ADRL    r0, ErrorBlock_BadParameters
-        SETV
-        STR     r0, [sp, #Proc_RegOffset+0]
-        EXIT
+        PullEnv
+        B       MemoryBadParameters
 
 MAI_CursSysSound
         LDR     r1, =CursorChunkAddress
@@ -1189,6 +1178,269 @@ MAI_ScratchSpace
         MOV     r3, #16*1024
         EXIT
 
+MAI_CompatibilityPage
+      [ CompatibilityPage
+        MOV     r1, #0
+        MOV     r2, #4096
+        LDR     r0, =ZeroPage
+        LDRB    r3, [r0,#CompatibilityPageEnabled]
+        CMP     r3, #0
+        MOVNE   r3, #4096
+      ]
+        EXIT
+
+;----------------------------------------------------------------------------------------
+;
+;        In:    r0 = flags
+;                       bit     meaning
+;                       0-7     17 (reason code)
+;                       8-31    reserved (set to 0)
+;               r1 = AP number to start search from (0 to start enumeration)
+;                    increment by 1 on each call to enumerate all values
+;
+;       Out:    r1 = AP number (-1 if end of list reached)
+;               r2 = Permissions:
+;               bit 0: executable in user mode
+;               bit 1: writable in user mode
+;               bit 2: readable in user mode
+;               bit 3: executable in privileged modes
+;               bit 4: writable in privileged modes
+;               bit 5: readable in privileged modes
+;               bits 6+: reserved
+;
+;       Returns permission information for a given AP / enumerates all AP
+MemoryAccessPrivileges ROUT
+        CMP     r0, #17
+        BNE     MemoryBadParameters
+        Entry   "r3-r4"
+        LDR     r3, =ZeroPage
+        MOV     lr, r1
+        LDR     r3, [r3, #MMU_PPLAccess]
+        ; Currently we don't have any gaps in the table, so we can just index the r1'th element (being careful to not go past the table end)
+10
+        LDR     r4, [r3], #4
+        CMP     r4, #-1
+        BEQ     %FT98
+        SUBS    lr, lr, #1
+        BGE     %BT10
+        BL      PPL_CMA_to_RWX
+        EXIT
+98
+        MOV     r1, #-1
+        MOV     r2, #0
+        EXIT
+
+; In: r4 = CMA-style AP/PPL access flags (from MMU_PPLAccess)
+; Out: r2 = RWX-style AP/PPL access flags (for OS_Memory 17/18)
+PPL_CMA_to_RWX ROUT
+        Entry
+        AND     r2, r4, #CMA_Partially_UserR
+        ASSERT  CMA_Partially_UserR = 1<<4
+        ASSERT  MemPermission_UserR = 1<<2
+        MOV     r2, r2, LSR #4-2
+        AND     lr, r4, #CMA_Partially_UserW
+        ASSERT  CMA_Partially_UserW = 1<<5
+        ASSERT  MemPermission_UserW = 1<<1
+        ORR     r2, r2, lr, LSR #5-1
+        AND     lr, r4, #CMA_Partially_UserXN ; (internally, XN flags are stored inverted)
+        ASSERT  CMA_Partially_UserXN = 1<<14
+        ASSERT  MemPermission_UserX = 1<<0
+        ORR     r2, r2, lr, LSR #14-0
+        AND     lr, r4, #CMA_Partially_PrivR
+        ASSERT  CMA_Partially_PrivR = 1<<6
+        ASSERT  MemPermission_PrivR = 1<<5
+        ORR     r2, r2, lr, LSR #6-5
+        AND     lr, r4, #CMA_Partially_PrivW
+        ASSERT  CMA_Partially_PrivW = 1<<7
+        ASSERT  MemPermission_PrivW = 1<<4
+        ORR     r2, r2, lr, LSR #7-4
+        AND     lr, r4, #CMA_Partially_PrivXN
+        ASSERT  CMA_Partially_PrivXN = 1<<15
+        ASSERT  MemPermission_PrivX = 1<<3
+        ORR     r2, r2, lr, LSR #15-3
+        EXIT
+
+;----------------------------------------------------------------------------------------
+;
+;        In:    r0 = flags
+;                       bit     meaning
+;                       0-7     18 (reason code)
+;                       8-31    reserved (set to 0)
+;               r1 = Permission flag values (as per OS_Memory 17)
+;               r2 = Permission flag mask
+;
+;       Out:    r0 = AP number that gives closest permissions
+;               r2 = Permission flags of that AP (== r1 if exact match)
+;               Error if no suitable AP found
+;
+;       Searches for an AP where ((permissions AND r2) == r1), and which
+;       grants the least extra permissions
+;
+;       Extra permissions are weighted as follows (least acceptable first):
+;       * User write
+;       * User execute
+;       * User read
+;       * Privileged write
+;       * Privileged execute
+;       * Privileged read
+FindAccessPrivilege ROUT
+        CMP     r0, #18 ; No extra flags in r0
+        BICEQS  r0, r1, r2 ; r1 must be a subset of r2
+        BICEQS  r0, r2, #63 ; Only 6 known permission flags
+        BNE     MemoryBadParameters
+        ; n.b. r0 is now 0
+        Entry   "r3-r11"
+        LDR     r3, =ZeroPage
+        MOV     r5, r1
+        LDR     r3, [r3, #MMU_PPLAccess]
+        MOV     r6, r2
+        MOV     r7, #-1 ; Best AP
+        MOV     r8, #0 ; Best flags
+        MOV     r9, #-1 ; Best difference
+        ; Magic constants for weighting the difference
+        LDR     r10, =(1<<1)+(1<<6)+(1<<12)+(1<<18)+(1<<24)+(1<<30)
+        LDR     r11, =(MemPermission_PrivR<<1)+(MemPermission_PrivX<<6)+(MemPermission_PrivW<<12)+(MemPermission_UserR<<18)+(MemPermission_UserX<<24)+(MemPermission_UserW<<30)
+10
+        LDR     r4, [r3], #4
+        CMP     r4, #-1
+        BEQ     %FT50
+        BL      PPL_CMA_to_RWX ; -> r2 = flags
+        ; Check it satisfies the mask
+        AND     lr, r2, r6
+        CMP     lr, r5
+        BNE     %FT40
+        ; Calculate diff
+        BIC     lr, r2, r6
+        MUL     lr, r10, lr ; Replicate the six bits six times
+        AND     lr, r11, lr ; Select just the bits that we care about
+        CMP     lr, r9
+        BEQ     %FT80       ; Exact match found
+        MOVLO   r7, r0      ; Remember new result if better
+        MOVLO   r8, r2
+        MOVLO   r9, lr
+40
+        ADD     r0, r0, #1
+        B       %BT10
+50
+        MOVS    r0, r7
+        BMI     %FT90
+        MOV     r2, r8
+80
+        CLRV
+        EXIT
+
+90
+        MOV     r2, r6 ; Restore original r2
+        ADR     r0, ErrorBlock_AccessPrivilegeNotFound
+        SETV
+        EXIT
+
+        MakeErrorBlock AccessPrivilegeNotFound
+
+
+;----------------------------------------------------------------------------------------
+;
+;       In:     r0 = flags
+;                       bit     meaning
+;                       0-7     20 (reason code)
+;                       8-31    reserved (set to 0)
+;               r1 = 0 to disable compatibility page
+;                    1 to enable compatibility page
+;                    -1 to read state
+;
+;       Out:    r1 = new/current state:
+;                    0 if disabled
+;                    1 if enabled
+;                    -1 if not supported
+;
+;       Controls the page zero compatibility page located at &0
+;
+;       If the compatibility page isn't supported, attempts to enable it will
+;       silently fail, with a result of r1 = -1
+;
+ChangeCompatibility ROUT
+        CMP     r1, #-1
+        CMPNE   r1, #1
+        CMPLS   r0, #255
+        BHI     MemoryBadParameters
+ [ :LNOT: CompatibilityPage
+        MOV     r1, #-1
+        MOV     pc, lr
+ |
+        Entry   "r0-r11", DANode_NodeSize
+        LDR     r12, =ZeroPage
+        LDRB    r0, [r12, #CompatibilityPageEnabled]
+        FRAMSTR r0,,r1 ; return pre-change state in r1 (will be updated later, as necessary)
+        CMP     r1, #-1
+        CMPNE   r0, r1
+        EXIT    EQ
+        ; If we're attempting to enable it, make sure nothing else has mapped itself in to page zero
+        LDR     r8, =L2PT
+        CMP     r1, #0
+        LDRNE   r0, [r8]
+        CMPNE   r0, #0
+        MOVNE   r1, #-1
+        FRAMSTR r1,NE
+        EXIT    NE
+        ; Set up temp DANode on the stack so we can use a Batcall to manage the mapping
+        MOV     r2, sp
+        MOV     r0, #DynAreaFlags_NotCacheable
+        STR     r0, [r2, #DANode_Flags]
+        MOV     r0, #0
+        STR     r0, [r2, #DANode_Base]
+        STR     r0, [r2, #DANode_Handler]
+        CMP     r1, #1
+        STREQ   r0, [r2, #DANode_Size]
+        MOV     r0, #4096
+        STRNE   r0, [r2, #DANode_Size]
+        STR     r0, [r2, #DANode_MaxSize]
+        MOV     r0, #ChangeDyn_Batcall
+        MOV     r1, #4096
+        RSBNE   r1, r1, #0
+        SWI     XOS_ChangeDynamicArea
+        FRAMSTR r0,VS
+        EXIT    VS
+        ; If we just enabled the page, fill it with the special value and then change it to read-only
+        FRAMLDR r1
+        RSBS    r1, r1, #1 ; invert returned state, to be correct for the above action
+        STRB    r1, [r12, #CompatibilityPageEnabled] ; Also update our state flag
+        FRAMSTR r1
+        EXIT    EQ
+        MOV     r0, #0
+        ADR     r1, %FT20
+10
+        CMP     r0, #%FT30-%FT20
+        LDRLO   r2, [r1, r0]
+        STR     r2, [r0], #4
+        CMP     r0, #4096
+        BNE     %BT10
+        LDR     r7, [r12, #MaxCamEntry]
+        MOV     r4, #0
+        BL      logical_to_physical
+        BL      physical_to_ppn
+        ; r9-r11 corrupt, r3 = page number, r5 = phys addr
+        MOV     r0, #OSMemReason_FindAccessPrivilege
+        MOV     r1, #2_100100
+        MOV     r2, #2_100100
+        SWI     XOS_Memory ; Get AP number for read-only access (will make area XN on ARMv6+)
+        ORRVC   r11, r0, #DynAreaFlags_NotCacheable
+        MOVVC   r2, r3
+        MOVVC   r3, #0
+        BLVC    BangCamUpdate
+        EXIT
+
+20
+        ; Pattern to place in compatibility page
+        DCD     &FDFDFDFD ; A few of words of invalid addresses, which should also be invalid instructions on ARMv5 (ARMv6+ will have this page non-executable, ARMv4 and lower can't have high processor vectors)
+        DCD     &FDFDFDFD
+        DCD     &FDFDFDFD
+        DCD     &FDFDFDFD
+        = "!!!!NULL.POINTER.DEREFERENCE!!!!", 0 ; Readable message if interpretered as a string. Also, all words are unaligned pointers.
+        ALIGN
+        DCD     0 ; Fill the rest with zero (typically, most of ZeroPage is zero)
+30
+ ]
+
 ;----------------------------------------------------------------------------------------
 ;
 ;        In:    r0 = flags
@@ -1209,33 +1461,23 @@ MAI_ScratchSpace
 ;               bit 7: partially writable in privileged modes
 ;               bit 8: completely physically mapped (i.e. IO memory)
 ;               bit 9: completely abortable (i.e. custom data abort handler)
-;               bits 10,11: reserved
+;               bit 10: completely non-executable in user mode
+;               bit 11: completely non-executable in privileged modes
 ;               bit 12: partially physically mapped
 ;               bit 13: partially abortable
-;               bits 14+: reserved
+;               bit 14: partially non-executable in user mode
+;               bit 15: partially non-executable in privileged modes
+;               bits 16+: reserved
 ;
 ;       Return various attributes for the given memory region
-CMA_Completely_UserR   * 1<<0
-CMA_Completely_UserW   * 1<<1
-CMA_Completely_PrivR   * 1<<2
-CMA_Completely_PrivW   * 1<<3
-CMA_Partially_UserR    * 1<<4
-CMA_Partially_UserW    * 1<<5
-CMA_Partially_PrivR    * 1<<6
-CMA_Partially_PrivW    * 1<<7
-CMA_Completely_Phys    * 1<<8
-CMA_Completely_Abort   * 1<<9
-CMA_Partially_Phys     * 1<<12
-CMA_Partially_Abort    * 1<<13
+
+; NOTE: To make the flags easier to calculate, this routine calculates executability rather than non-executability. This means that unmapped memory has flags of zero. On exit we invert the sense of the bits in order to get non-executability (so that the public values are backwards-compatible with OS versions that didn't return executability information)
+CMA_Completely_Inverted * CMA_Completely_UserXN + CMA_Completely_PrivXN
 
 CMA_CheckL2PT          * 1<<31 ; Pseudo flag used internally for checking sparse areas
 CMA_DecodeAP           * 1<<30 ; Used with CheckL2PT to indicate AP flags should be decoded from L2PT
 
 ; AP_ equivalents
-CMA_ROM  * CMA_Partially_UserR+CMA_Partially_PrivR
-CMA_Read * CMA_ROM+CMA_Partially_PrivW
-CMA_Full * CMA_Read+CMA_Partially_UserW
-CMA_None * CMA_Partially_PrivR+CMA_Partially_PrivW
 
 CheckMemoryAccess ROUT
         Entry   "r0,r2-r10"
@@ -1264,23 +1506,36 @@ CheckMemoryAccess ROUT
         BHS     %FT10
         ; Check zero page
         ASSERT  ProcVecs = ZeroPage
-      [ ZeroPage = 0
+     [ ZeroPage = 0
         MOV     r3, #0
         MOV     r4, #16*1024
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_ZeroPage
         BL      CMA_AddRange
-      |
+     |
+      [ CompatibilityPage
+        ; Zero page compatibility page
+        LDR     r3, =ZeroPage
+        LDRB    r3, [r3, #CompatibilityPageEnabled]
+        CMP     r3, #0
+        BEQ     %FT05
+        MOV     r3, #0
+        MOV     r4, #4096
+        ; This represents our ideal access flags; it may not correspond to reality
+        LDR     r5, =CMA_Partially_UserR+CMA_Partially_PrivR
+        BL      CMA_AddRange
+05
+      ]
         ; DebuggerSpace
         ASSERT  DebuggerSpace < ScratchSpace
         LDR     r3, =DebuggerSpace
         LDR     r4, =(DebuggerSpace_Size + &FFF) :AND: &FFFFF000
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_DebuggerSpace
         BL      CMA_AddRange
-      ]
+     ]
         ; Scratch space
         LDR     r3, =ScratchSpace
         MOV     r4, #16*1024
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_ScratchSpace
         BL      CMA_AddRange
 10
         ; Application space
@@ -1291,7 +1546,7 @@ CheckMemoryAccess ROUT
         BHS     %FT20
         LDR     r3, [r10, #AMBControl_ws]
         LDR     r3, [r3, #:INDEX:AMBFlags]
-        MOV     r5, #CMA_Full
+        LDR     r5, =CMA_AppSpace
         TST     r3, #AMBFlag_LazyMapIn_disable :OR: AMBFlag_LazyMapIn_suspend
         MOV     r3, #32*1024
         ORREQ   r5, r5, #CMA_Partially_Abort
@@ -1331,13 +1586,9 @@ CheckMemoryAccess ROUT
         CMP     r3, r7
         BHS     %FT30
         ; Decode AP flags
-        ANDS    lr, r6, #3
-        MOVEQ   r5, #CMA_Full
-        TEQ     lr, #1
-        MOVEQ   r5, #CMA_Read
-        CMP     lr, #2
-        MOVEQ   r5, #CMA_None
-        MOVGT   r5, #CMA_ROM
+        LDR     r5, [r10, #MMU_PPLAccess]
+        AND     lr, r6, #DynAreaFlags_APBits
+        LDR     r5, [r5, lr, LSL #2]
         TST     r6, #DynAreaFlags_PMP
         ORRNE   r5, r5, #CMA_DecodeAP
         TSTEQ   r6, #DynAreaFlags_SparseMap
@@ -1363,16 +1614,13 @@ CheckMemoryAccess ROUT
         LDR     r7, =L1PT
         MOVLO   r3, r4 ; Skip all the unallocated regions
 31
-        LDR     r4, [r7, r3, LSR #20-2]
-        AND     r4, r4, #L1_AP
-        ; Decode page AP flags
-        MOV     r5, #CMA_ROM
-        CMP     r4, #AP_None*L1_APMult
-        MOVEQ   r5, #CMA_None
-        CMP     r4, #AP_Read*L1_APMult
-        MOVEQ   r5, #CMA_Read
-        CMP     r4, #AP_Full*L1_APMult
-        MOVEQ   r5, #CMA_Full
+        Push    "r0,r1"
+        LDR     r0, [r7, r3, LSR #20-2]
+        BL      DecodeL1Entry           ; TODO bit wasteful. We only care about access privileges, but this call gives us cache info too.
+        LDR     r5, [r10, #MMU_PPLAccess]
+        AND     lr, r1, #DynAreaFlags_APBits
+        LDR     r5, [r5, lr, LSL #2]
+        Pull    "r0,r1"
         ADD     r4, r3, #1<<20
         ORR     r5, r5, #CMA_Partially_Phys
         BL      CMA_AddRange2
@@ -1383,27 +1631,27 @@ CheckMemoryAccess ROUT
         ; Everything else!
         LDR     r3, =HALWorkspace
         LDR     r4, [r10, #HAL_WsSize]
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_HALWorkspace
         BL      CMA_AddRange
         ASSERT  IRQStackAddress > HALWorkspace
         LDR     r3, =IRQStackAddress
         LDR     r4, =IRQStackSize
-        MOV     r5, #CMA_None
+        LDR     r5, =CMA_IRQStack
         BL      CMA_AddRange
         ASSERT  SVCStackAddress > IRQStackAddress
         LDR     r3, =SVCStackAddress
         LDR     r4, =SVCStackSize
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_SVCStack
         BL      CMA_AddRange
         ASSERT  ABTStackAddress > SVCStackAddress
         LDR     r3, =ABTStackAddress
         LDR     r4, =ABTStackSize
-        MOV     r5, #CMA_None
+        LDR     r5, =CMA_ABTStack
         BL      CMA_AddRange
         ASSERT  UNDStackAddress > ABTStackAddress
         LDR     r3, =UNDStackAddress
         LDR     r4, =UNDStackSize
-        MOV     r5, #CMA_None
+        LDR     r5, =CMA_UNDStack
         BL      CMA_AddRange
         ASSERT  PhysicalAccess > UNDStackAddress
         LDR     r3, =L1PT + (PhysicalAccess:SHR:18)
@@ -1412,7 +1660,12 @@ CheckMemoryAccess ROUT
         BEQ     %FT50
         LDR     r3, =PhysicalAccess
         LDR     r4, =&100000
-        LDR     r5, =CMA_None+CMA_Partially_Phys ; Assume IO memory mapped there
+        ; Assume IO memory mapped there
+      [ MEMM_Type = "VMSAv6"
+        LDR     r5, =CMA_Partially_PrivR+CMA_Partially_PrivW+CMA_Partially_Phys
+      |
+        LDR     r5, =CMA_Partially_PrivR+CMA_Partially_PrivW+CMA_Partially_PrivXN+CMA_Partially_Phys
+      ]
         BL      CMA_AddRange
 50
         ASSERT  DCacheCleanAddress > PhysicalAccess
@@ -1429,13 +1682,14 @@ CheckMemoryAccess ROUT
         BEQ     %FT60
         SUB     r3, r4, #DCacheCleanSize
         MOV     r4, #DCacheCleanSize
-        LDR     r5, =CMA_None+CMA_Partially_Phys ; Mark as IO, it may not be actual memory there
+        ; Mark as IO, it may not be actual memory there
+        LDR     r5, =CMA_DCacheClean+CMA_Partially_Phys
         BL      CMA_AddRange
 60
         ASSERT  KbuffsBaseAddress > DCacheCleanAddress
         LDR     r3, =KbuffsBaseAddress
         LDR     r4, =(KbuffsSize + &FFF) :AND: &FFFFF000
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_Kbuffs
         BL      CMA_AddRange
         ASSERT  HALWorkspaceNCNB > KbuffsBaseAddress
         LDR     r3, [r10, #HAL_Descriptor]
@@ -1444,34 +1698,33 @@ CheckMemoryAccess ROUT
         BEQ     %FT70
         LDR     r3, =HALWorkspaceNCNB
         LDR     r4, =32*1024
-        MOV     r5, #CMA_None
+        LDR     r5, =CMA_HALWorkspaceNCNB
         BL      CMA_AddRange
 70
         ASSERT  L2PT > HALWorkspaceNCNB
         LDR     r3, =L2PT
-        MOV     r5, #CMA_None
         MOV     r4, #4*1024*1024
-        ORR     r5, r5, #CMA_CheckL2PT ; L2PT contains gaps due to logical indexing
+        LDR     r5, =CMA_PageTablesAccess+CMA_CheckL2PT ; L2PT contains gaps due to logical indexing
         BL      CMA_AddRange
         ASSERT  L1PT > L2PT
         LDR     r3, =L1PT
         MOV     r4, #16*1024
-        MOV     r5, #CMA_None
+        LDR     r5, =CMA_PageTablesAccess
         BL      CMA_AddRange
         ASSERT  CursorChunkAddress > L1PT
         LDR     r3, =CursorChunkAddress
         MOV     r4, #32*1024
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_CursorChunk
         BL      CMA_AddRange
         ASSERT  CAM > CursorChunkAddress
         LDR     r3, =CAM
         LDR     r4, [r10, #SoftCamMapSize]
-        MOV     r5, #CMA_None
+        LDR     r5, =CMA_CAM
         BL      CMA_AddRange
         ASSERT  ROM > CAM
         LDR     r3, =ROM
         LDR     r4, =OSROM_ImageSize*1024
-        MOV     r5, #CMA_ROM
+        LDR     r5, =CMA_ROM
         BL      CMA_AddRange
         ; Finally, high processor vectors/relocated zero page
         ASSERT  ProcVecs = ZeroPage
@@ -1479,21 +1732,18 @@ CheckMemoryAccess ROUT
         ASSERT  ZeroPage > ROM
         MOV     r3, r10
         LDR     r4, =16*1024
-        MOV     r5, #CMA_Read
+        LDR     r5, =CMA_ZeroPage
         BL      CMA_AddRange
       ]
 90
         ; If there's anything else, we've wandered off into unallocated memory
         LDR     r3, =&0F0F0F0F
         BIC     r1, r0, r3
-        CLRV
-        EXIT
+        B       CMA_Done
 
 99
         PullEnv
-        ADRL    r0, ErrorBlock_BadParameters
-        SETV
-        MOV     pc, lr
+        B       MemoryBadParameters
 
         ; Add range r3..r4 to attributes in r0
         ; Corrupts r8
@@ -1527,6 +1777,18 @@ CMA_AddRange2 ; r3 = start, r4 = end (excl.)
 10
         ; We've ended inside this range
         MOV     r1, r0
+CMA_Done
+        ; Invert the sense of the executability flags
+        ;               Completely_X Partially_X -> Completely_XN Partially_XN
+        ; Completely X             1           1                0            0
+        ; Partially X              0           1                0            1
+        ; XN                       0           0                1            1
+        ; I.e. swap the positions of the two bits and invert them
+        EOR     r0, r1, r1, LSR #4      ; Completely EOR Partially
+        MVN     r0, r0                  ; Invert as well as swap
+        AND     r0, r0, #CMA_Completely_Inverted ; Only touch these bits
+        EOR     r1, r1, r0              ; Swap + invert Completely flags
+        EOR     r1, r1, r0, LSL #4      ; Swap + invert Partially flags
         CLRV
         EXIT
 
@@ -1572,19 +1834,16 @@ CMA_AddRange2 ; r3 = start, r4 = end (excl.)
         BICCS   r0, r0, r10 ; Not fully mapped, clear completion flags
         BCS     %FT45
         ; Get the L2PT entry and decode the flags
-        LDR     r9, [r8, r4, LSR #10]
-      [ MEMM_Type = "VMSAv6"
-        AND     r9, r9, #L2_AP
-      |
-        AND     r9, r9, #L2X_AP
-      ]
-        MOV     r5, #CMA_ROM
-        CMP     r9, #AP_None*L2X_APMult
-        MOVEQ   r5, #CMA_None
-        CMP     r9, #AP_Read*L2X_APMult
-        MOVEQ   r5, #CMA_Read
-        CMP     r9, #AP_Full*L2X_APMult
-        MOVEQ   r5, #CMA_Full
+        Push    "r0-r2"
+        LDR     r0, [r8, r4, LSR #10]
+        BL      DecodeL2Entry           ; TODO bit wasteful. We only care about access privileges, but this call gives us cache info too. Also, if we know the L2PT backing exists (it should do) we could skip the logical_to_physical call
+        ; r1 = DA flags
+        ; Extract and decode AP
+        LDR     r0, =ZeroPage
+        LDR     r5, [r0, #MMU_PPLAccess]
+        AND     lr, r1, #DynAreaFlags_APBits
+        LDR     r5, [r5, lr, LSL #2]
+        Pull    "r0-r2"
         ORR     r10, r5, r10
         ORR     r0, r0, r5 ; Set new partial flags
         AND     r0, r0, r10, ROR #4 ; Discard completion flags which aren't for this range

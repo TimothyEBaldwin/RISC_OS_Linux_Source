@@ -12,52 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for a Toolbox Object module
+# Makefile for ToolAction module
 #
-# $Id$
-#
-# Component specific options:
-#
-RAMMESSAGES = o.msgs
 
-COMMON_OBJ = o.modhdr o.toolact o.utils
+COMPONENT     = ToolAction
+OBJS          = main toolact utils
+CMHGDEPENDS   = main
+ROMCDEFINES   = -DROM
+CINCLUDES     = -IOS:,C:tboxlibint,tbox:,C:
+CUSTOMEXP     = custom
+ROM_DEPEND    = h.ToolAction 
+SA_DEPEND     = h.ToolAction 
+LIBS          = ${TBOXINTLIB}
 
-ROM_OBJS = o.mainROM ${COMMON_OBJ}
+include CModule
 
-RAM_OBJS = o.main ${RAMMESSAGES} ${COMMON_OBJ}
-
-DBG_OBJS = od.main ${RAMMESSAGES} o.modhdr od.toolact od.utils
-
-CINCLUDES = -IOS:
-RAM_DEPEND = h.ToolAction h.modhdr
-ROM_DEPEND = h.ToolAction h.modhdr
-
-#
-# Get main rules
-#
-include C:tboxlibint.TboxMake
-
-#
-# Module specific rules:
-#
-resources: resources-messages
-	@echo ${COMPONENT}: resource files copied to Messages module
-
-clean: toolbox-clean
+clean::
 	${RM} h.ToolAction
-	${RM} h.modhdr
 	${RM} hdr.ToolAction
-	${RM} o.ToolAction
-	@echo ${COMPONENT}: cleaned
 
 export: h.ToolAction hdr.ToolAction o.ToolAction
-	${MKDIR} <cexport$dir>.h
-	${MKDIR} <cexport$dir>.o
-	${MKDIR} <export$dir>.Interface2
-	${CP} h.ToolAction   <cexport$dir>.h.ToolAction ${CPFLAGS}
-	${CP} o.ToolAction   <cexport$dir>.o.ToolAction ${CPFLAGS}
-	${CP} hdr.ToolAction <export$dir>.ToolAction    ${CPFLAGS}
-	@echo ${COMPONENT}: export complete
+	${MKDIR} ${CEXPDIR}.h
+	${MKDIR} ${CEXPDIR}.o
+	${MKDIR} ${EXPDIR}.Interface2
+	${CP} h.ToolAction   ${CEXPDIR}.h.ToolAction ${CPFLAGS}
+	${CP} o.ToolAction   ${CEXPDIR}.o.ToolAction ${CPFLAGS}
+	${CP} hdr.ToolAction ${EXPDIR}.Interface2.ToolAction ${CPFLAGS}
+	@echo ${COMPONENT}: header export complete
 
 h.ToolAction: Documents.def.ToolAction
 	${DEFMOD} -h > h.ToolAction < Documents.def.ToolAction
@@ -66,10 +47,10 @@ hdr.ToolAction: Documents.def.ToolAction
 	${DEFMOD} -hdr > hdr.ToolAction < Documents.def.ToolAction
 
 o.ToolAction: Documents.def.ToolAction
+	${MKDIR} o
 	${DEFMOD} -l -o DefMod < Documents.def.ToolAction
 	${AR} -c -o o.ToolAction -via viafile
 	${RM} viafile
-	${WIPE} Defmod ${WFLAGS}
+	${XWIPE} Defmod ${WFLAGS}
 
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

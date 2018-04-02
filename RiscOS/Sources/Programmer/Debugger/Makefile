@@ -31,7 +31,7 @@ HELPSRC       = HelpSrc
 TOKENSOURCE   = TokHelpSrc
 TOKHELPSRC    = ${TOKENSOURCE}
 ASMHDRS       = Debugger
-OBJS          = Debugger util dis2_vfp support
+OBJS          = Debugger util dis2_vfp support exc
 HDRS          =
 CMHGFILE      =
 
@@ -81,16 +81,19 @@ ACTIONS_ARM = actions/common \
               actions/ARMv7 \
               actions/ARMv7_ASIMD \
               actions/ARMv7_VFP \
+              actions/ARMv8_AArch32 \
+              actions/ARMv8FP_AArch32 \
               actions/FPA \
               actions/XScale_DSP
 
 ACTIONS_VFP = actions/common \
               actions/ARMv7_ASIMD \
-              actions/ARMv7_VFP
+              actions/ARMv7_VFP \
+              actions/ARMv8FP_AArch32
 
 ENCODINGS = Build:decgen.encodings.ARMv7 \
-            Build:decgen.encodings.ARMv7_ASIMD \
-            Build:decgen.encodings.ARMv7_VFP \
+            Build:decgen.encodings.ARMv8FP_AArch32 \
+            Build:decgen.encodings.ARMv8_AArch32 \
             Build:decgen.encodings.FPA \
             Build:decgen.encodings.XScale_DSP
 
@@ -116,9 +119,15 @@ dis2_vfp.o: dis2_vfp.c
 dis2_vfp.oz: dis2_vfp.c
 	${CC} ${CFLAGS} ${C_MODULE} -o $@ dis2_vfp.c
 
+excdump.h: hdr.ExcDump
+	${HDR2H} hdr.ExcDump $@
+
+exc.c: excdump.h
+
 clean::
 	${RM} c.dis2_vfp
 	${RM} c.dis2_arm
+	${RM} h.excdump
 	${RM} ${TOKENSOURCE}
 
 # Stuff from AAsmModule that's missing from CModule

@@ -27,7 +27,6 @@ COMPONENT = BootNet
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpTexts
 ROM_SOURCE = Module.s
-RESOURCES  = No
 
 include StdTools
 include AAsmModule

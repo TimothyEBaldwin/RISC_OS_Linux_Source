@@ -22,18 +22,12 @@
 # 09-Mar-01  SNB          Recreated
 #
 
-COMPONENT = Portable
-HEADER1   = Portable
-ROM_SOURCE = GetAll.s
-RESOURCEEXTRA = resources_lcd
+COMPONENT     = Portable
+HEADER1       = Portable
+ROM_SOURCE    = GetAll.s
+INSTRES_FILES = LCD SelectLCD
 
 include StdTools
 include AAsmModule
-
-resources_lcd:
-	${MKDIR} ${RESFSDIR}
-	${CP} LocalRes:LCD       ${RESFSDIR}.LCD       ${CPFLAGS}
-	${CP} LocalRes:SelectLCD ${RESFSDIR}.SelectLCD ${CPFLAGS}
-	@echo ${COMPONENT}: extra resource files copied to Messages module
 
 # Dynamic dependencies:

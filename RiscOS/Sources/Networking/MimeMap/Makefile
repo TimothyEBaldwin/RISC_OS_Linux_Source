@@ -35,6 +35,10 @@ HDRS         =
 CMHGAUTOHDR  = ${TARGET}
 ASMHDRS      = ${TARGET}
 ASMCHDRS     = ${TARGET}
+ROMCDEFINES  = -DROM
+ifeq ("${CMDHELP}","None")
+CMHGDEFINES += -DNO_INTERNATIONAL_HELP
+endif
 
 include CModule
 

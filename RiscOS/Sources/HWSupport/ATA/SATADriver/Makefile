@@ -16,6 +16,18 @@ ROMCDEFINES = -DROM_MODULE
 #CFLAGS     += -DDEBUG_ENABLED -DDEBUGLIB -DDEBUGLIB_NOBRACKETS
 #LIBS       += ${DEBUGLIBS} ${NET5LIBS}
 
+# Decide whether to use OS_Memory 0 or OS_Memory 19 for DMA prep
+OSMEM19 ?= FALSE
+
+ifeq ($(OSMEM19),TRUE)
+CFLAGS += -DOSMEM19
+CMHGFLAGS += -DOSMEM19
+OBJS += osmem19
+CMHGDEPENDS += osmem19
+else
+OBJS += osmem0
+endif
+
 include CModule
 
 expasmc.AHCIDevice: hdr.AHCIDevice h.AHCIDevice

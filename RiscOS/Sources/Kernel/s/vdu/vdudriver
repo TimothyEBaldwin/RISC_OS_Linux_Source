@@ -149,7 +149,7 @@ VduInit ROUT
 
 
         LDROSB  R0, LastBREAK           ; is it a hard reset ?
-        TEQ     R0, #0
+        TEQ     R0, #SoftReset
         BEQ     %FT10                   ; [no, don't reset font]
 
 
@@ -225,14 +225,16 @@ VduInit ROUT
         STR     r3, [WsPtr, #SecPalAddr]
 
 ; initialise blank palette to all solid black
+; zero-init the other palettes too, to make sure log & phys palettes are
+; consistent
 
         MOV     r3, #0
-        MOV     r4, #PalEntries
+        LDR     r4, =PalEntries*5
 04      STR     r3, [r2], #4
         SUBS    r4, r4, #1
         BNE     %BT04
 
-        ADD     r2, r2, #Pal_RTable-(Pal_Blank+4*PalEntries) ; r2 -> rgb tables
+        ASSERT  Pal_RTable = Pal_Blank + PalEntries*5*4
 
 ; initialise red, green and blue transfer function tables to 1-1 mapping
 
@@ -333,13 +335,15 @@ InitialiseMode ROUT
 
         MOV     r0, #ScreenModeReason_SelectMode
         SWI     XOS_ScreenMode
-        EXIT    VC
+        BVC     %FT40
 
         MOV     r0, #114                ; failed, so get rid of any shadow
         MOV     r1, #1
         SWI     XOS_Byte
         SWI     XOS_WriteI+22
         SWIVC   XOS_WriteI+0            ; and if we can't get mode 0, we're really fooked!!!
+40
+        BLVC    UpdateAllPalette        ; make sure GV driver is aware of the pointer colours (this will also redundantly set the main palette + border colour, but re-using this routine as-is avoids duplicating a bunch of code)
         EXIT
 
 ;
@@ -584,6 +588,7 @@ CursorNbitTab
         &       Cursor8bit-CursorNbitTab
         &       Cursor16bit-CursorNbitTab
         &       Cursor32bit-CursorNbitTab
+        &       Cursor64bit-CursorNbitTab
 
 ; table of susbstitute mode numbers to cater for hardware that might
 ; not support all of 1,2,4,8 bpp (bits per pixel) modes
@@ -608,6 +613,7 @@ ModePromoTable
       DCB    2,    2     ;  5
       DCB    1,   13     ;  6
     [ TTX256
+      ; This case should be irrelevant (ModePromoTable no longer used for mode 7), but keep it in sync with vdumodes just in case
       DCB    8,  &FF     ;  7
     |
       DCB    4,   13     ;  7
@@ -690,6 +696,24 @@ VduBadExit                              ; jumped to if an error in VDU code
         Pull    PC
 
 ModeChangeSub ROUT
+        ; Wrap the bulk of ModeChangeSub in some code that will free any new
+        ; TTX workspace pointer if the mode change fails (or the pointer isn't
+        ; claimed for any other reason)
+        Entry
+        MOV     r0, #0
+        STR     r0, [WsPtr, #TTXNewWorkspace]
+        BL      %FT01
+        LDR     r2, [WsPtr, #TTXNewWorkspace]
+        TEQ     r2, #0
+        EXIT    EQ
+        MRS     r3, CPSR
+        MOV     r4, r0
+        BL      FreeSysHeapNode
+        MSR     CPSR_c, r3
+        MOV     r0, r4
+        EXIT
+
+01
         Push    lr
 
         ;If its a common mode number (0..49) consider a possible mode number
@@ -703,6 +727,9 @@ ModeChangeSub ROUT
         AND     r1, r2, #&7F
         CMP     r1, #NumModes                ; mode number
         BHS     mchsub_3
+        ; For mode 7 we have some logic in FindOKMode to deal with looking for a replacement, prefer that over this logic
+        CMP     r1, #7
+        BEQ     mchsub_3
         Push    "r0-r4"
         LDR     r4, [WsPtr, #CurrentGraphicsVDriver]
         MOV     r4, r4, LSL #24
@@ -762,6 +789,13 @@ mchsub_3
         MOV     R11, R10
         BL      PushModeInfo
         BVS     %FT07                   ; [probably duff mode selector]
+
+        ; Allocate new teletext workspace if required
+        LDR     R0, [R13, #wkModeFlags]
+        TST     R0, #ModeFlag_Teletext
+        MOVNE   R0, R13
+        BLNE    TeletextAlloc
+        BVS     %FT07
 
         LDR     R11, [R13, #wkScreenSize] ; get screen size for this mode
         LDR     R9, [WsPtr, #TotalScreenSize] ; maximum allowed amount
@@ -937,6 +971,11 @@ mchsub_3
         STR     R3, [R4], #4
         SUBS    R2, R2, #4              ; loop until all done
         BNE     %BT15
+
+; initialise any values which SwitchOutput refers to
+
+        LDR     R4, [R13, #wkLineLength]
+        STR     R4, [WsPtr, #DisplayLineLength]
 
 ; now set up other mode variables by calling SwitchOutput
 
@@ -1160,7 +1199,7 @@ IssueModeService Entry "r2,r3"
 ;       onto stack, having generated it by possibly issuing service
 ;
 ; in:   R10 = mode to try for
-;       R11 = mode to use if service not claimed
+;       R11 = mode to use if service not claimed (and R10 is mode number)
 ;       R10 and R11 should have bit 7 CLEAR (if mode numbers)
 ;
 ; out:  If r10 is an invalid mode selector or invalid new format sprite word then
@@ -1283,17 +1322,36 @@ PushModeInfoCommonNoService
         CMP     r14, #-1
         BEQ     %FT58                   ; didn't find the interlaced entry - not interlaced
 
+        TEQ     r14, #ControlList_ExtraBytes
+        BNE     %FT571
+        LDR     r14, [r10, #-4]
+        ; Adjust LineLength, ScreenSize by ExtraBytes
+        LDR     r2, [r9, #wkModeFlags]
+        TST     r2, #ModeFlag_Teletext
+        LDR     r2, [r9, #wkLineLength]
+        ADD     r2, r2, r14
+        STR     r2, [r9, #wkLineLength]
+        LDR     r2, [r9, #wkYWindLimit]
+        MLA     r2, r14, r2, r14        ; (yWindLimit+1) * ExtraBytes
+        LDR     r14, [r9, #wkScreenSize]
+        ADD     r14, r14, r2
+        ADDNE   r14, r14, r2            ; teletext ScreenSize is actually enough for two screens
+        STR     r14, [r9, #wkScreenSize]
+        B       %BT57
+
+571
         TEQ     r14, #ControlList_Interlaced
         BNE     %BT57                   ; check the next one then
 
         LDR     r14, [r10, #-4]         ; read value
         TEQ     r14, #0
-        BEQ     %FT58                   ; if zero, not interlaced
+        BEQ     %BT57                   ; if zero, not interlaced
 
 ; it's interlaced
         LDR     r14, [r9, #wkModeFlags]
         ORR     r14, r14, #ModeFlag_InterlacedMode
         STR     r14, [r9, #wkModeFlags]
+        B       %BT57                   ; process remaining control list items
 58
         Push    "r0-r2"
         LDR     r0, [WsPtr, #GraphicsVFeatures]
@@ -1440,6 +1498,64 @@ GenerateModeSelectorVars Entry "r0,r1,r3-r8,r10-r12"
         ADD     r4, r2, #ModeSelector_ModeVars  ; now do pairs of mode variables
         BL      ProcessModeVarPairs
 
+        ; Fixup teletext modes
+        LDR     r0, [r9, #wkModeFlags]
+        TST     r0, #ModeFlag_Teletext
+        BEQ     %FT09
+        ; Force the mode flags to be correct for our implementation
+      [ HiResTTX
+        ORR     r0, r0, #ModeFlag_NonGraphic+ModeFlag_GapMode+ModeFlag_DoubleVertical
+      |
+        BIC     r0, r0, #ModeFlag_DoubleVertical
+        ORR     r0, r0, #ModeFlag_NonGraphic+ModeFlag_GapMode
+      ]
+        STR     r0, [r9, #wkModeFlags]
+        ; Ensure colour depth is acceptable
+        LDR     r0, [r9, #wkNColour]
+        CMP     r0, #15
+      [ HiResTTX
+        ADRLOL  r0, ErrorBlock_BadPixelDepth
+        BLO     %FT90
+        CMP     r0, #63
+        ADREQL  r0, ErrorBlock_BadPixelDepth
+        BEQ     %FT90
+      |
+        ADRNEL  r0, ErrorBlock_BadPixelDepth
+        BNE     %FT90
+      ]
+        ; Fixup PalIndex
+        CMP     r0, #255
+        MOVLS   r0, #4
+        STRLS   r0, [r9, #wkPalIndex]
+        ; Massage ScreenSize, needs to be large enough for two screen banks
+        LDR     r0, [r9, #wkScreenSize]
+        MOV     r0, r0, LSL #1
+        STR     r0, [r9, #wkScreenSize]
+        ; Clamp ScrRCol, ScrBRow
+        LDR     r0, [r9, #wkScrRCol]
+        CMP     r0, #254 ; TTXDoubleCounts is a byte array
+        MOVHI   r0, #254
+        LDR     r7, [r2, #ModeSelector_XRes]
+        MOV     lr, #1
+      [ HiResTTX
+        RSB     r7, lr, r7, LSR #4
+      |
+        RSB     r7, lr, r7, LSR #3
+      ]
+        CMP     r0, r7
+        MOVHI   r0, r7
+        STR     r0, [r9, #wkScrRCol]
+        LDR     r0, [r9, #wkScrBRow]
+      [ HiResTTX
+        DivRem  r7, r5, #20, lr, norem
+      |
+        DivRem  r7, r5, #10, lr, norem
+      ]
+        CMP     r0, r7
+        SUBHS   r0, r7, #1
+        STR     r0, [r9, #wkScrBRow]
+
+09
         CLRV
         EXIT
 

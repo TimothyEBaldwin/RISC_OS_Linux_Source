@@ -14,20 +14,9 @@
 #
 # Makefile for NetFS
 #
-# ************************************
-# ***     C h a n g e   L i s t    ***
-# ************************************
-# Date         Name        Description
-# ----         ----        -----------
-# 20-Dec-2002  KJB         Created.
-#
 
-# AMcC {28-Apr-94}: Source should be set to CurrentOS - it's set to NewOS
-# for comparison with RISC OS 3.50 only.
-#
-
-COMPONENT = NetFS
-ROM_SOURCE = CurrentOS
+COMPONENT  = NetFS
+ROM_SOURCE = Module.s
 TOKHELPSRC = ${TOKENSOURCE}
 HELPSRC    = HelpTexts
 

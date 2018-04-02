@@ -12,37 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for a Toolbox Object module
+# Makefile for FileInfo module
 #
-# $Id$
-#
-# Component specific options:
-#
-RAMBOTH = o.msgs
 
-COMMON_OBJ = o.Modhdr_NoD o.auxiliary o.create o.delete o.events o.getstate\
- o.hide o.miscop o.show o.task
+COMPONENT     = FileInfo
+OBJS          = auxiliary create delete events getstate\
+                hide main miscop show task
+CMHGDEPENDS   = main
+ROMCDEFINES   = -DROM
+CDFLAGS       = -Ddebugging=1
+CMHGDFLAGS    = -Ddebugging=1
+CINCLUDES     = -IC:tboxlibint,tbox:,C:
+HDRS          =
+LIBS          = ${TBOXINTLIB}
+DBG_LIBS      = ${TBOXINTDBGLIB}
+INSTRES_FILES = Res
 
-ROM_OBJS = o.mainROM ${COMMON_OBJ}
+include CModule
 
-RAM_OBJS = o.main ${RAMBOTH} ${COMMON_OBJ}
-
-DBG_OBJS = od.main ${RAMBOTH} o.Modhdr od.auxiliary od.create od.delete od.events od.getstate\
- od.hide od.miscop od.show od.task
-
-#
-# Get main rules
-#
-include C:tboxlibint.TboxMake
-
-#
-# Module specific rules:
-#
-resources: resources-both
-	@echo ${COMPONENT}: resource files copied to Messages module
-
-clean: toolbox-clean
-	@echo ${COMPONENT}: cleaned
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

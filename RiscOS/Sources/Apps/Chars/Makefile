@@ -14,17 +14,7 @@
 #
 # Makefile for Chars
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name   Description
-# ----       ----   -----------
-# 05-Nov-94  AMcC   Updated for Black build
-#
 
-#
-# Program specific options:
-#
 COMPONENT  = Chars
 APP        = !${COMPONENT}
 ROM_MODULE = rm.${COMPONENT}
@@ -43,7 +33,7 @@ FILES =\
  ${LDIR}.!Help \
  ${RDIR}.!Run \
  ${RDIR}.!RunImage \
- ${LDIR}.Messages \
+ ${RDIR}.GenMessage \
  ${LDIR}.Templates 
 
 # Resources to be included in the ROM module (not in Messages module}
@@ -64,7 +54,7 @@ install: ${FILES}
 	${CP} ${LDIR}.!Help      ${INSTDIR}.${APP}.!Help     ${CPFLAGS}
 	${CP} ${RDIR}.!Run       ${INSTDIR}.${APP}.!Run      ${CPFLAGS}
 	${CP} ${RDIR}.!RunImage  ${INSTDIR}.${APP}.!RunImage ${CPFLAGS}
-	${CP} ${LDIR}.Messages   ${INSTDIR}.${APP}.Messages  ${CPFLAGS}
+	${CP} ${RDIR}.GenMessage ${INSTDIR}.${APP}.Messages  ${CPFLAGS}
 	${CP} ${LDIR}.Templates  ${INSTDIR}.${APP}.Templates ${CPFLAGS}
 	${CHMOD} -R 555 ${INSTDIR}.${APP}.*
 	@${ECHO} ${COMPONENT}: Application installed (Disc)
@@ -73,19 +63,20 @@ install_rom: ${ROM_MODULE}
 	${CP} ${ROM_MODULE} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: Module installed (ROM)
 
-resources: ${LDIR}.!RunLink
+resources: ${LDIR}.!RunLink ${RDIR}.GenMessage
 	${MKDIR} ${RESAPP}
 	${MKDIR} ${RESDIR}
 	${CP} ${LDIR}.!Help      ${RESAPP}.!Help     ${CPFLAGS}
 	${CP} ${RDIR}.ROM.!Run   ${RESAPP}.!Run      ${CPFLAGS}
 	${CP} ${LDIR}.!RunLink   ${RESDIR}.!RunLink  ${CPFLAGS}
-	${CP} ${LDIR}.Messages   ${RESDIR}.Messages  ${CPFLAGS}
+	${CP} ${RDIR}.GenMessage ${RESDIR}.Messages  ${CPFLAGS}
 	${CP} ${LDIR}.Templates  ${RESDIR}.Templates ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: resource files copied to Messages module
 
 clean:
 	${RM} ${ROM_MODULE}
 	${RM} ${RDIR}.!RunImage
+	${RM} ${RDIR}.GenMessage
 	${RM} ${LDIR}.!RunLink
 	${XWIPE} crunched.* ${WFLAGS}
 	@${ECHO} ${COMPONENT}: cleaned
@@ -98,18 +89,16 @@ ${ROM_MODULE}: VersionNum ${RESFILES}
 	${GETVERSION} Chars$BuildV Chars$FullV Chars$Date
 	${DO} ${MODGEN} -date "<Chars$Date>" ${ROM_MODULE} !Chars !Chars <Chars$BuildV> Resources.!RunImage Resources.Chars.!RunImage
 
+${RDIR}.GenMessage: ${LDIR}.Messages
+	${INSERTVERSION} ${LDIR}.Messages > ${RDIR}.GenMessage
+
 ${RDIR}.!RunImage: crunched.!RunImage
 	${SQUISH} ${SQUISHFLAGS} -from crunched.!RunImage -to $@
 
 crunched.!RunImage: bas.!RunImage
-	${RUN}crunch.!RunImage; BASIC
+	${RUN}BasCrunch -1 bas.!RunImage $@
 
 ${LDIR}.!RunLink: bas.!RunLink
 	${SQUISH} ${SQUISHFLAGS} -from bas.!RunLink -to $@
 
-BBETYPE = chars
-bbe-chars: bbe-generic
-	BBE_Export_Dir Resources
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

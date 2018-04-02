@@ -16,10 +16,11 @@
 #
 
 COMPONENT     = ScrModes
-OBJS          = ScrModes
+OBJS          = ScrModes tables mdfsupport edidsupport
 CMHGFILE      = ScrModesv
 HDRS          =
 ASMHDRS       = ScrModes
+ASMCHDRS      = ScrModes
 CDFLAGS       = -DDODEBUG=1
 CMHGDEPENDS   = ScrModes
 RESFSDIR      = ${RESDIR}.ScreenMode

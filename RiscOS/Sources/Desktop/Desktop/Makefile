@@ -15,30 +15,23 @@
 # Makefile for Desktop
 #
 
-COMPONENT     = Desktop
-RESOURCEEXTRA = resources_banner resources_templates
-
-#
-# Resource specials
-# In ROM
-#   This component has messages, a template, and squashed sprites
-#   which are copied in the 'resources' phase
-# In RAM
-#   The 'install' rule produces a RAM loading standalone module
-# On disc
-#   If the target is the ThemeDefs application, the 'install' rule is
-#   overridden to just install the various banner themes
-#
-resources_banner: LocalRes:<UserIF>.Sprites
-	${SQUASH} LocalRes:<UserIF>.Sprites ${RESFSDIR}.Sprites
+COMPONENT       = Desktop
+INSTRES_FILES   = Sprites Templates
+INSTRES_DEPENDS = compress
 
 ifeq (${TARGET},ThemeDefs)
-CUSTOMSA = custom
+CUSTOMSA        = custom
 install: 
 	${MKDIR} ${INSTDIR}.${USERIF}
 	${CP} LocalRes:${USERIF}.Sprites ${INSTDIR}.${USERIF}.Banner ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: disc theme resources installed
 endif
+
+compress:
+	${SQUASH} LocalRes:${USERIF}.Sprites Sprites
+
+clean::
+	${RM} Sprites
 
 include StdTools
 include AAsmModule

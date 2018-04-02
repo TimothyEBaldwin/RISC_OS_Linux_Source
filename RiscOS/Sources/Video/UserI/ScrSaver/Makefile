@@ -20,14 +20,10 @@ OBJS        = module
 CINCLUDES   = -IC:
 CMHGFILE    = header
 CMHGDEPENDS = module
-RES_OBJ     =
-CUSTOMEXP   = custom
-CUSTOMRES   = custom
+HDRS        =
+CUSTOMRES   = no
 
 include CModule
-
-resources:
-	@${ECHO} ${COMPONENT}: no resources
 
 clean::
 	${XWIPE} !SaverAni ${WFLAGS}

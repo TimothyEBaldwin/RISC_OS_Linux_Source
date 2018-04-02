@@ -18,7 +18,7 @@
 COMPONENT    = DOSFS
 OBJS         = DOSFS DOSFSctl DOSclusters DOSdirs DOSnaming Helpers MsgTrans \
                OpsArgs OpsFind OpsFunc OpsFile OpsGetPut \
-               Statics TIMEconv StaticDefs
+               Statics TIMEconv StaticDefs Accessors
 ROM_OBJS     = ${OBJS} init
 ROMCDEFINES  = -DROM
 RES_AREA     = dosfs_msgarea
@@ -32,8 +32,7 @@ LIBS         = ${ASMUTILS}
 include CModule
 
 DBG_LIBS    += ${NET5LIBS}
-ASFLAGS     += -pd "PCMCIATRUE SETL {${PCMCIA}}"
-CFLAGS      += -DPCMCIA${PCMCIA}
+CFLAGS      += -DNONFLOPPIES
 CDFLAGS     += -DDEBUGLIB
 
 # Dynamic dependencies:
