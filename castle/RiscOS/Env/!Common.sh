@@ -4,7 +4,6 @@
 
 [ "$MACHINE" != "" ] || { echo "No build selected - Run an Env file"; exit 1; }
 
-export BUILDDIR=`pwd`
 export TOOLSDIR=$BUILDDIR/Library
 
 export ROOL_BIN=/opt/rool/bin
@@ -18,14 +17,14 @@ export MAKEFILEDIR=$BUILDDIR/BuildSys/GNUmakefiles
 #export SRCDIR=$BUILDDIR/Sources
 export INSTALLDIR=$BUILDDIR/Install
 
-if [ "$APCS" == "APCS-R" ]; then
+if [ "$APCS" = "APCS-R" ]; then
 	TOOLOPTIONS="-26bit"
 	ASASM_TOOLOPTIONS="-apcs26 -apcsfpv2"
 	CMUNGE_TOOLOPTIONS="-26bit -apcs 3/26bit/fpe2"
 	GCC_TOOLOPTIONS="-mapcs-26 -march=armv2 -mfpu=fpe2"
 	NCC_TOOLOPTIONS="-APCS 3/26bit/fpe2"
 	OBJASM_TOOLOPTIONS="-APCS 3/26bit"
-elif [ "$APCS" == "APCS-32" ]; then
+elif [ "$APCS" = "APCS-32" ]; then
 	TOOLOPTIONS="-32bit"
 	ASASM_TOOLOPTIONS="-apcs32 -apcsfpv3"
 	CMUNGE_TOOLOPTIONS="-32bit -apcs 3/32bit/fpe3"
@@ -93,3 +92,48 @@ export LIBDIR=$APCSEXPORTDIR/Lib
 
 # This enables you to simply type "make all" from the command line
 alias make="make -I$MAKEFILEDIR --no-print-directory"
+
+# This is similar, but infers COMPONENT, TARGET and INSTDIR from the ModuleDB
+# if possible. Where a source directory occurs multiple times within the
+# ModuleDB, make is invoked once for each possible COMPONENT, unless a single
+# COMPONENT is specified in the environment. Settings of TARGET and INSTDIR
+# from the environment also override those from the ModuleDB. You can also
+# use the -C switch to avoid having to cd to a component first, just like
+# with make. Any additional arguments (make targets etc) are passed to make.
+mk ()
+{(
+    COMPONENTDIR=`pwd`
+    if [ "$1" = "-C" ]; then
+        COMPONENTDIR="$(cd $2 && pwd)"
+        shift
+        shift
+    fi
+    RELPATH=`echo ${COMPONENTDIR#*$BUILDDIR/} | tr / .`
+    MYTMP=$(mktemp)
+    
+    if [ -n "$COMPONENT" ]; then
+        grep "^$COMPONENT " $BUILDDIR/BuildSys/ModuleDB > $MYTMP
+    else
+        grep "$RELPATH" $BUILDDIR/BuildSys/ModuleDB | grep -v "$RELPATH\." > $MYTMP
+    fi
+    
+    if [ $? -ne 0 ]; then
+        # Component not found in ModuleDB - can't infer anything
+        make -C $COMPONENTDIR $@
+    else
+        while read -r DB_COMPONENT _ _ DB_INSTDIR DB_TARGET; do
+            ARGS=""
+            if [ -z "$COMPONENT" ]; then
+                ARGS="$ARGS COMPONENT=$DB_COMPONENT"
+            fi
+            if [ -z "$TARGET" ]; then
+                ARGS="$ARGS TARGET=$DB_TARGET"
+            fi
+            if [ -z "$INSTDIR" ]; then
+                ARGS="$ARGS INSTDIR=$INSTALLDIR/$DB_INSTDIR"
+            fi
+            make -C $COMPONENTDIR $ARGS $@
+        done < $MYTMP
+    fi
+    rm $MYTMP
+)}
