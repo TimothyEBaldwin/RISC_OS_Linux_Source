@@ -5,21 +5,36 @@ This build of RISC OS makes use of "zero page relocation", a change to the
 standard memory map which moves the processor vectors and the kernel's "zero
 page" workspace away from address zero and up to the high end of the memory
 map. This greatly increases the system's resilience to a common type of
-software bug known as a "null pointer dereference". However, there is a catch:
-because the OS has always had memory mapped to address zero, large amounts of
-RISC OS software contains cases of "harmless" null pointer dereferences where
-the code reads from page zero and then does something insignificant with the
-result (usually ignoring it completely). With the new memory map, these
-programs will most likely cease to operate, exiting with a data abort as soon
-as they try to access page zero.
+software bug known as a "null pointer dereference", this comes in two forms:
 
-Since relocating zero page is very beneficial to the stability and security of
-the OS, the goal is to have the feature enabled for all future stable releases,
-starting with RISC OS 5.24. But due to the large amount of buggy software out
-there we can't simply turn it on and be done with it - we need to have a
-transition period in which developers can fix their code without worrying about
-the fact their compilers, text editors, etc. are buggy too. We also need a way
-for regular users to get involved with the testing process.
+a) Reading
+   Buggy software makes a "harmless" null pointer dereferences where
+   the code reads from page zero and then does something insignificant with 
+   the result (usually ignoring it completely), or proceeds to use the value
+   read and subsequently crashes.
+b) Writing
+   Buggy software corrupts either the operating system workspace or overwrites
+   the processor vectors, most likely this results in crashing the computer
+   or similar knock on effects.
+
+Starting with RISC OS 5.24 the default state is running with the processor
+vectors and kernel's workspace moved away from "zero page. But due to the 
+large amount of buggy software out there as a temporary measure there is still
+a page of RAM left mapped in at the old address. The access attributes are
+set such that:
+
+a) Reading
+   Is permitted in all processor modes (no change).
+b) Writing
+   Is forbidden in all processor modes (previously it was forbidden in user
+   mode, but privileged modes could write).
+
+This is designed to ensure the class of bugs with the most dangerous side
+effect are always faulted. The other class of bug, reading, is still a problem
+because the data your application is using is undefined.
+
+In order to allow you to check your applications for bugs and report them to
+the author so they can be fixed, a means of logging them is needed.
 
 This is where ZeroPain comes in. ZeroPain traps most attempts to read page zero
 and emulates the operation, providing a safe level of compatibility with the
@@ -44,16 +59,9 @@ file 'ZeroPain' in the root of your boot drive. However if desired you can
 specify a different location for the file by editing the file !Boot.Choices.
 Boot.PreDesk.!!ZeroPain.!Run.
 
-Note that there is no need to uninstall ZeroPain before running a ROM which
-does not use zero page relocation. The module will refuse to start on such a
-machine, and the provided loader in the skeleton !Boot will swallow the error
-so that it does not affect the startup of your machine.
-
-Also note that the module contains a built-in kill switch - it will refuse to
-run on RISC OS 5.24 or later. The module is intended to be a temporary aid to
-be used while we transition the OS to having zero page relocation enabled by
-default - it is not intended to be a long-term compatibility solution for
-running old or unmaintained software.
+The module is intended to be a temporary aid to be used until the dummy 
+compatibility page of RAM at address zero is removed - it is not intended to 
+be a long-term compatibility solution for running old or unmaintained software.
 
 
 Use
@@ -68,7 +76,10 @@ message to Reporter's log.
 Remember to review the contents of the log file at regular intervals, to see if
 there are any issues which haven't already been reported to the relevant
 application developer. The information below can help you to try and work out
-which application caused a particular access.
+which application caused a particular access. Any defective applications should
+be reported to the author and added to the list of known problems
+
+  https://www.riscosopen.org/wiki/documentation/show/Reporting%20zero%20page%20protection%20errors
 
 ZeroPain will pause logging once the log file exceeds 1MB in size. Deleting the
 log will allow it to resume.
