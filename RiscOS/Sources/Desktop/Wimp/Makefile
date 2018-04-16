@@ -63,7 +63,6 @@ endif
 include StdTools
 include AAsmModule
 
-ifeq (objs,$(notdir ${CURDIR}))
 resources: resources-wimp-${CMDHELP}
 	@echo ${COMPONENT}: resource files copied
 
@@ -82,7 +81,6 @@ resources-wimp-None: resources-wimp_common
 
 resources-wimp-: resources-wimp_common
 	@IfThere LocalRes:CmdHelp Then ${CAT} LocalRes:CmdHelp { >> ${RESFSDIR}.Messages }
-endif
 
 BBETYPE = wimp
 bbe-wimp: bbe-generic-resources-get-alias
