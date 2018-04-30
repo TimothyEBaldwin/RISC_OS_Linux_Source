@@ -93,7 +93,7 @@ Built/comma2attr: Support/comma2attr.c $(lib_depends) | Built
 	gcc -std=gnu99 -Wall -g Support/comma2attr.c -o Built/comma2attr
 
 Built/gen_seccomp: Support/gen_seccomp.c $(lib_depends) | Built
-	gcc -std=c99 -Wall -Os -lseccomp Support/gen_seccomp.c -o Built/gen_seccomp
+	gcc -std=c99 -Wall -Os Support/gen_seccomp.c -o Built/gen_seccomp -lseccomp
 
 Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
 	rm -rf Built/rpcemu*
