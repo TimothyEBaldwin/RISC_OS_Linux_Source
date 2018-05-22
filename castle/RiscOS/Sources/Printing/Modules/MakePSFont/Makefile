@@ -20,7 +20,7 @@
 
 COMPONENT   = MakePSFont
 CINCLUDES   = -IC:,C:AsmUtils
-OBJS        = convert float init module provide registry swicall use
+OBJS        = convert float init module provide registry use
 CMHGFILE    = mheader
 CMHGDEPENDS = module
 LIBS        = ${ASMUTILS}
