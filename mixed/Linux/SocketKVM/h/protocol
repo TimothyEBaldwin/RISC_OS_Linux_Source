@@ -64,6 +64,8 @@ union command {
     c_suspend     = CONST(3),
     c_close_ctl   = CONST(4),
     c_version     = CONST(6),
+    c_activescreen = CONST(7),
+    c_startscreen = CONST(8),
   } reason;
   struct version version;
   struct {
@@ -88,5 +90,13 @@ union command {
     int32_t reason;
     int32_t use_message;
   } close_ctl;
+  struct activescreen {
+    int32_t reason;
+    ule32 address;
+  } activescreen;
+  struct startscreen {
+    int32_t reason;
+    ule32 address;
+  } startscreen;
   uint8_t pad[33 * 8];
 };
