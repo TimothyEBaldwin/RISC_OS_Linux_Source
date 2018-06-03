@@ -76,6 +76,9 @@ Built:
 sdl: Built/sdl
 	ln -sf Built/sdl sdl
 
+opengl: Built/opengl
+	ln -sf Built/opengl opengl
+
 comma2attr: Built/comma2attr
 	ln -sf Built/comma2attr comma2attr
 
@@ -84,6 +87,9 @@ Start_RISC_OS.desktop:
 
 Built/sdl: Support/sdl.cpp Built/sdlkey.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol)
 	g++ --std=c++11 -Wall -pthread -g -O2 -IBuilt Support/sdl.cpp  `sdl2-config --cflags --libs` -o Built/sdl
+
+Built/opengl: mixed/Linux/Support/opengl.cpp
+	g++ -pthread -g -O2 --std=c++11 Support/opengl.cpp -lGL -lGLU -lglut -o Built/opengl
 
 Built/sdlkey.h: Support/sdlkey.c $(lib_depends) Support/Keyboard.h | Built
 	gcc -std=gnu99 -Wall -IBuilt `sdl2-config --cflags --libs` Support/sdlkey.c -o Built/sdlkey
