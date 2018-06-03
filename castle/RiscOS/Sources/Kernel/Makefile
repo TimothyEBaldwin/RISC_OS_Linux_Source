@@ -34,10 +34,9 @@ KERNEL_MODULE   = bin${SEP}${COMPONENT}
 ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}" -APCS 3/32bit/nofp/noswst
 CFLAGS          = -Wpn -APCS 3/32bit/nofp/noswst -IC:
 CUSTOMROM       = custom
-CUSTOMSA        = custom
 CUSTOMEXP       = custom
+CUSTOMSA        = custom
 EXPORTS         = ${EXP_HDR}.EnvNumbers \
-                  ${EXP_HDR}.EtherDevice \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
@@ -121,12 +120,6 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
         ${CP} hdr.EnvNumbers $@ ${CPFLAGS}
-
-${EXP_HDR}.SPIDevice: hdr.SPIDevice
-        ${CP} hdr.SPIDevice $@ ${CPFLAGS}
-
-${EXP_HDR}.EtherDevice: hdr.EtherDevice
-        ${CP} hdr.EtherDevice $@ ${CPFLAGS}
 
 ${EXP_HDR}.HALDevice: hdr.HALDevice
         ${CP} hdr.HALDevice $@ ${CPFLAGS}

@@ -30,33 +30,16 @@
 #                     in a 32-mode with interrupts enabled, you can change
 #                     the APCS to 32bit for a more efficient emulator
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
+COMPONENT ?= FPEmulator
+SA_MODULE  = FPERAM${SUFFIX_MODULE}
+ROM_LIBS   = ${PVLIBS}
+ifeq (,${MAKE_VERSION})
+ROM_SOURCE = s.${MACHINE}
+else
+ROM_SOURCE = ${MACHINE}.s
+endif
+HEADER1    = FPEmulator
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AS      = ObjAsm
-CP      = Copy
-LD      = Link
-RM      = Remove
-WIPE    = -Wipe
-CCFLAGS = -c -depend !Depend -IC:
-ASFLAGS = -depend !Depend
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
-ADDRESS ?= 0
-
-#
-# Program specific options:
-#
-COMPONENT = FPEmulator
-TARGET_ROM = rm.${MACHINE}.FPEmulator
-TARGET_RAM = rm.${MACHINE}.FPERAM
-EXPORTS   = ${EXP_HDR}.FPEmulator
 FPEANCHOR ?= Low
 # 32bit-compatible RAM builds store FPEAnchor locally, so that they're compatible with kernels which use high or low zero page workspace. But this means the module must write to its own image to set its workspace pointer.
 # 26bit-only builds can stick with the legacy low FPEAnchor location, avoiding the need for the module to self-modify.
@@ -66,75 +49,38 @@ else
 FPEANCHOR_RAM ?= Local
 endif
 
-#
-# Generic rules:
-#
-
-ifeq (${DELAY_LINK},YES)
-rom${CUSTOMROM}: o.fpe_rom
-        @echo ${COMPONENT}: rom module built (link delayed)
+ifeq (,$(filter ${MAKECMDGOALS},rom install_rom))
+ASFLAGS += -PD "FPEAnchorType SETS \"${FPEANCHOR_RAM}\""
 else
-rom${CUSTOMROM}: ${TARGET_ROM}
-        @echo ${COMPONENT}: rom module built
+ASFLAGS += -PD "FPEAnchorType SETS \"${FPEANCHOR}\""
+endif
+ASFLAGS += -APCS ${FPE_APCS}
+
+ifeq (,${MAKE_VERSION})
+ASFLAGS += -PD "CoreDir SETS \"^.coresrc.s.\"" -PD "VeneerDir SETS \"^.vensrc.riscos.\"" -PD "FileExt SETS \"\""   -I^
+else
+ASFLAGS += -PD "CoreDir SETS \"coresrc/\""     -PD "VeneerDir SETS \"vensrc/riscos/\""   -PD "FileExt SETS \".s\""
+# The layout of source files in this component is rather non-standard!
+
+SYMLINK_DEPEND = symlink_extra
+symlink_extra:
+	$(foreach linksource,$(wildcard ../coresrc/s/*), \
+		$(shell \
+			leaf=`basename ${linksource}`; \
+			[ -d ${linksource} ] || [ -L objs/coresrc/$$leaf.s ] || mkdir -p objs/coresrc; \
+			[ -d ${linksource} ] || [ -L objs/coresrc/$$leaf.s ] || ln -s ../../${linksource} objs/coresrc/$$leaf.s; \
+		) \
+	)
+	$(foreach linksource,$(wildcard ../vensrc/riscos/*), \
+		$(shell \
+			leaf=`basename ${linksource}`; \
+			[ -d ${linksource} ] || [ -L objs/vensrc/riscos/$$leaf.s ] || mkdir -p objs/vensrc/riscos; \
+			[ -d ${linksource} ] || [ -L objs/vensrc/riscos/$$leaf.s ] || ln -s ../../../${linksource} objs/vensrc/riscos/$$leaf.s; \
+		) \
+	)
+	@[ -L objs/VersionASM ] || ln -s ../../VersionASM objs/VersionASM
 endif
 
-export: ${EXPORTS}
-        @echo ${COMPONENT}: export complete
-
-install: ${TARGET_RAM}
-        ${MKDIR} ${INSTDIR}
-        ${CP} ${TARGET_RAM} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-        @echo ${COMPONENT}: ram module installed
-
-rom_link: install_rom
-
-install_rom: ${TARGET_ROM}
-        ${CP} ${TARGET_ROM} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-        @echo ${COMPONENT}: rom module installed
-
-clean:
-        ${RM} ${TARGET_ROM}
-        ${RM} ${TARGET_RAM}
-        ${WIPE} o.* ${WFLAGS}
-        @echo ${COMPONENT}: cleaned
-
-resources:
-        ${MKDIR} ${RESDIR}.${COMPONENT}
-	TokenCheck LocalRes:Messages
-        ${CP} LocalRes:Messages  ${RESDIR}.${COMPONENT}.Messages  ${CPFLAGS}
-        @echo ${COMPONENT}: resource files copied
-
-${TARGET_RAM}: o.fpe_ram
-        ${MKDIR} rm.${MACHINE}
-        ${LD} -rmf -o $@ o.fpe_ram
-
-include $(wildcard OLD_ADDRESS)
-
-ifneq (${ADDRESS},${OLD_ADDRESS})
-FORCEROMLINK = FORCE
-endif
-
-FORCE: ; ${NOP}
-
-${TARGET_ROM}: o.fpe_rom ${FORCEROMLINK} ${PVLIBS}
-        ${MKDIR} rm.${MACHINE}
-        Remove $@
-        Echo OLD_ADDRESS=${ADDRESS} { > OLD_ADDRESS }
-        ${LD} -Base ${ADDRESS} -rmf -o $@ o.fpe_rom ${PVLIBS}
-
-o.fpe_ram: s.${MACHINE}
-	${MKDIR} o
-        ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR_RAM}\"" s.${MACHINE} $@
-
-o.fpe_rom: s.${MACHINE}
-	${MKDIR} o
-        ${AS} -I Hdr:t.^ ${ASFLAGS} -APCS ${FPE_APCS} -PD "FPEAnchorType SETS \"${FPEANCHOR}\"" s.${MACHINE} $@
-
-${EXP_HDR}.FPEmulator: hdr.FPEmulator
-        ${CP} hdr.FPEmulator $@ ${CPFLAGS}
-
-BBETYPE = fpasc
-bbe-fpasc: bbe-generic
-        BBE_Export_File ^.VersionNum
+include AAsmModule
 
 include Depends

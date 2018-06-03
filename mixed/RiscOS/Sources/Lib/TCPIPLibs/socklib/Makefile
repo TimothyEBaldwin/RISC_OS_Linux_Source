@@ -33,7 +33,7 @@ ASFLAGS=	-depend !Depend ${THROWBACK}
 ASFLAGSZM=	-depend !Depend ${THROWBACK} -predefine "module SETL {TRUE}"
 
 OFILES4=	accept.o bind.o connect.o copyerror.o getpeernam.o \
-		getsocknam.o getsockopt.o getstabsiz.o listen.o makecall.o \
+		getsocknam.o getsockopt.o getstabsiz.o listen.o \
 		recv.o recvfrom.o recvmsg.o select.o send.o sendmsg.o \
 		sendto.o setsockopt.o shutdown.o sockclose.o socket.o \
 		socketstat.o sockioctl.o sockread.o sockreadv.o sockwrite.o \
@@ -42,7 +42,7 @@ OFILES4=	accept.o bind.o connect.o copyerror.o getpeernam.o \
 		sockver.o _inet_err.o
 
 ZFILES4=	z.accept z.bind z.connect z.copyerror z.getpeernam \
-		z.getsocknam z.getsockopt z.getstabsiz z.listen z.makecall \
+		z.getsocknam z.getsockopt z.getstabsiz z.listen \
 		z.recv z.recvfrom z.recvmsg z.select z.send z.sendmsg \
 		z.sendto z.setsockopt z.shutdown z.sockclose z.socket \
 		z.socketstat z.sockioctl z.sockread z.sockreadv z.sockwrite \
@@ -51,7 +51,7 @@ ZFILES4=	z.accept z.bind z.connect z.copyerror z.getpeernam \
 		z.sockver z._inet_err
 
 OFILES5=	accept5.o bind.o connect.o copyerror.o getpeerna5.o \
-		getsockna5.o getsockopt.o getstabsiz.o listen.o makecall.o \
+		getsockna5.o getsockopt.o getstabsiz.o listen.o \
 		recv5.o recvfrom5.o recvmsg5.o select.o send5.o sendmsg5.o \
 		sendto.o setsockopt.o shutdown.o sockclose.o socket.o \
 		socketstat.o sockioctl.o sockread.o sockreadv.o sockwrite.o \
@@ -60,7 +60,7 @@ OFILES5=	accept5.o bind.o connect.o copyerror.o getpeerna5.o \
 		orecvfrom.o kvm_nlist.o sockver.o _inet_err.o
 
 ZFILES5=	z.accept5 z.bind z.connect z.copyerror z.getpeerna5 \
-		z.getsockna5 z.getsockopt z.getstabsiz z.listen z.makecall \
+		z.getsockna5 z.getsockopt z.getstabsiz z.listen \
 		z.recv5 z.recvfrom5 z.recvmsg5 z.select z.send5 z.sendmsg5 \
 		z.sendto z.setsockopt z.shutdown z.sockclose z.socket \
 		z.socketstat z.sockioctl z.sockread z.sockreadv z.sockwrite \
