@@ -79,15 +79,7 @@ int no_updates = 0;
 
 void setupTexture();
 volatile int draw_pixels=1;
-unsigned int *screen[NUM_SCREENS];
-
-typedef struct {
-  unsigned int *location;
-  unsigned int bpp;
-  unsigned int w,h;
-} curr_screen_t;
-
-curr_screen_t current_screen;
+void *current_pixels;
 
 
 static unsigned short keycode[256];
@@ -169,11 +161,9 @@ int display_width=SCREEN_WIDTH,display_height=SCREEN_HEIGHT;
 static volatile int buttons=0;
 bool shiftkey=false;
 
-void OnMouseClick(int button, int state, int x, int y)
+void OnMouseClick(int button, int state, int, int)
 {
-  report r;
-   x=x*current_screen.w/display_width;
-   y=current_screen.h-y*current_screen.h/display_height;
+   report r;
    buttons=button;
      
    switch (state) {
@@ -192,12 +182,9 @@ void OnMouseClick(int button, int state, int x, int y)
 
 void My_mouse_routine(int x, int y){
   report r;
-  x=x*current_screen.w/display_width;
-  y=current_screen.h-y*current_screen.h/display_height;
-
   r.reason = report::ev_mouse;
-  r.mouse.x = x;
-  r.mouse.y = y;
+  r.mouse.x = x * width / display_width;
+  r.mouse.y = height - y * height / display_height;
   r.mouse.buttons = buttons;
   write(sockets[0], &r, sizeof(r));
 
@@ -297,7 +284,7 @@ void myspecialdown(int key, int x, int y)
 void setupTexture()
 {
     // Create a texture 
-    glTexImage2D(GL_TEXTURE_2D, 0, 3, SCREEN_WIDTH, SCREEN_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, (GLvoid*)current_screen.location);
+    glTexImage2D(GL_TEXTURE_2D, 0, 3, SCREEN_WIDTH, SCREEN_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, current_pixels);
  
     // Set up the texture
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -321,26 +308,26 @@ void updateTexture()
     glMatrixMode(GL_MODELVIEW);
     glViewport(0, 0, display_width, display_height);
     // Update Texture
-    switch(current_screen.bpp) {
-      case 1:
+    switch(log2bpp) {
+      case 3:
         
-        glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, current_screen.w, current_screen.h, GL_RGB,  GL_UNSIGNED_BYTE_3_3_2, (GLvoid*)current_screen.location);
+        glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, width, height, GL_RGB,  GL_UNSIGNED_BYTE_3_3_2, current_pixels);
         break;
-      case 2:
-        glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, current_screen.w, current_screen.h, GL_RGBA,  GL_UNSIGNED_SHORT_1_5_5_5_REV, (GLvoid*)current_screen.location);
+      case 4:
+        glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, current_pixels);
         break;
       default:
-        glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, current_screen.w, current_screen.h, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV, (GLvoid*)current_screen.location);
+        glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, width, height, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV, current_pixels);
         break;
     }
  
 
     glBegin( GL_QUADS );
     
-        glTexCoord2d(0.0, 0.0);                                                                glVertex2d(0.0, 0.0);
-        glTexCoord2d(1.0*current_screen.w/SCREEN_WIDTH, 0.0);                                  glVertex2d(display_width, 0.0);
-        glTexCoord2d(1.0*current_screen.w/SCREEN_WIDTH, 1.0*current_screen.h/SCREEN_HEIGHT);   glVertex2d(display_width, display_height);
-        glTexCoord2d(0.0, 1.0*current_screen.h/SCREEN_HEIGHT);                                 glVertex2d(0.0, display_height);
+        glTexCoord2d(0.0, 0.0);                                           glVertex2d(0.0, 0.0);
+        glTexCoord2d(1.0*width/SCREEN_WIDTH, 0.0);                        glVertex2d(display_width, 0.0);
+        glTexCoord2d(1.0*width/SCREEN_WIDTH, 1.0*height/SCREEN_HEIGHT);   glVertex2d(display_width, display_height);
+        glTexCoord2d(0.0, 1.0*height/SCREEN_HEIGHT);                      glVertex2d(0.0, display_height);
 
     glEnd();
 }
@@ -377,7 +364,7 @@ int init_my_GL(int argc, char **argv)
     glutInit(&argc, argv);          
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
  
-    glutInitWindowSize(current_screen.w, current_screen.w);
+    glutInitWindowSize(width, height);
     glutInitWindowPosition(320, 320);
     glutCreateWindow("RISC OS 5");
  
@@ -454,32 +441,20 @@ void interact_rule()
           height = c.mode.vidc[11];
           width = c.mode.vidc[5];
           log2bpp = c.mode.vidc[1];
-          screennumber = 0;
           cerr << "Set mode " << log2bpp << ' ' << height << ' ' << width << endl;
 
           switch (log2bpp) {
             case 3:
               display_size = width*height;
-              for (numscr=0;numscr<NUM_SCREENS;numscr++) 
-                screen[numscr] = (unsigned int*) (pixels + numscr*display_size);
-              current_screen.bpp=1;
               break;
             case 4:
               display_size = width*height*2;
-              for (numscr=0;numscr<NUM_SCREENS;numscr++)
-                screen[numscr] = (unsigned int*) (pixels + numscr*display_size);
-              current_screen.bpp=2;
               break;
             case 5:
               display_size = width*height*4;
-              for (numscr=0;numscr<NUM_SCREENS;numscr++)
-                screen[numscr] = (unsigned int*) (pixels + numscr*display_size);
-              current_screen.bpp=4;
               break;
           }
-          current_screen.location = (unsigned int*)pixels;
-          current_screen.w = width;
-          current_screen.h = height;
+          current_pixels = pixels;
           if (width==SCREEN_WIDTH && height == SCREEN_HEIGHT)
             glutFullScreen();
           else
@@ -490,18 +465,9 @@ void interact_rule()
           write(sockets[0], &r.reason, sizeof(r.reason));
           break;
         case command::c_activescreen:
-          // swap buffer, the buffer number we compute from the offset.
-          if ( 3 > ( c.activescreen.address/display_size )) {
-            screennumber = c.activescreen.address/display_size;
-            current_screen.location = screen[screennumber];
-          }
-          break;
-        case command::c_startscreen:
-          // swap buffer, the buffer number we compute from the offset. 
-          if ( 3 > ( c.startscreen.address/display_size )) {
-            screennumber = c.startscreen.address/display_size;
-            // screen swap later..
-            
+          // swap buffer, ensure no unauthorised memory access.
+          if (c.activescreen.address + display_size <= screen_size) {
+            current_pixels = pixels + static_cast<uint32_t>(c.activescreen.address);
           }
           break;
         case command::c_suspend:
@@ -619,10 +585,7 @@ int main(int argc, char **argv) {
   int cursor_active_y = 0;
 
   pixels = mmap(0, screen_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  current_screen.location = (unsigned int *)pixels;
-  current_screen.bpp=4;
-  current_screen.w=1024;
-  current_screen.h=600;
+  current_pixels = pixels;
   init_keyboard();
   init_my_GL(argc,argv);
 
