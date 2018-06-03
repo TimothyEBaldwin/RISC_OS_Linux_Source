@@ -57,10 +57,10 @@ endif
 	  cd /build
 	  ! rm 'Images/$(TARGET)_rom'*
 	  mkdir -p Apps
-	  ln -sf /src/*/RiscOS/Apps/\!* Apps
-	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
 	  cp -ru --preserve=mode,timestamps /src/castle/RiscOS/Export .
 	  ! cp -Hrsn /src/{bsd,castle,cddl,gpl,mixed} . 2>/dev/null
+	  ln -sf /src/*/RiscOS/Apps/\!* Apps
+	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
 ifeq ($(TARGET), Linux)
 	  echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
 	  cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
