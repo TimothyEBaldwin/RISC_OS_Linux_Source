@@ -497,6 +497,7 @@ clean_all:
         ${RM} s.abssym
         ${RM} s.c_abssym
         ${RM} s.a_abssym
+        ${RM} rom_link_Entries
         ${XWIPE} lib.* ${WFLAGS}
         @echo ${COMPONENT}: cleaned
 
@@ -556,7 +557,7 @@ aof.CLib: ${CLIB_ROM_OBJS}
 # Final link for the ROM Image {using given base address}
 #
 
-include $(wildcard OLD_ADDRESS-${TARGET})
+include $(wildcard linked.${TARGET}_address)
 
 ifneq (${ADDRESS},${OLD_ADDRESS})
 FORCEROMLINK = FORCE
@@ -583,7 +584,7 @@ linked.RISC_OSLib: ${ROM_OBJS} rom_link_Entries rlib.s.rl_entries ${PVLIBS} ${FO
               -symbols syms.${TARGET} \
               -bin -base ${ADDRESS} \
               -map > map.${TARGET}
-        Echo OLD_ADDRESS=${ADDRESS} { > OLD_ADDRESS-${TARGET} }
+        Echo OLD_ADDRESS=${ADDRESS} { > linked.RISC_OSLib_address }
 
 linked.CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS} ${FORCEROMLINK}
         ${RM} $@
@@ -596,7 +597,7 @@ linked.CLib: ${CLIB_ROM_OBJS} rom_link_Entries ${PVLIBS} ${FORCEROMLINK}
               -symbols syms.${TARGET} \
               -bin -base ${ADDRESS} \
               -map > map.${TARGET}
-        Echo OLD_ADDRESS=${ADDRESS} { > OLD_ADDRESS-${TARGET} }
+        Echo OLD_ADDRESS=${ADDRESS} { > linked.CLib_address }
 
 rom_link: linked.${TARGET}
         ${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
