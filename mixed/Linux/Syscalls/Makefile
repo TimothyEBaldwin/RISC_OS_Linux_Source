@@ -49,3 +49,6 @@ export_libs:
 
 export_resources:
 	@Echo LinuxSyscalls: no resources
+
+clean:
+        ${RM} h.syscalls
