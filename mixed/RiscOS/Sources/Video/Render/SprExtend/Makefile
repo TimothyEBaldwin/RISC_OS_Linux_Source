@@ -102,6 +102,7 @@ export: hdr.SprExtend
         @${ECHO} ${COMPONENT}: export complete
 
 clean:
+        ${RM} utilDepends
         ${RM} ${ROM_TARGET}
         ${RM} ${RAM_TARGET}
         ${RM} ${GENPALETTE}

@@ -110,6 +110,7 @@ clean:
 	${WIPE} @.sources.ActionButt.o.* ${WFLAGS}
 	$(RM) $(TARGET)
 	$(RM) AutoGenMF
+	$(RM) AutoGenDepends
 	@echo $(COMPONENT): cleaned
 
 local_dirs:

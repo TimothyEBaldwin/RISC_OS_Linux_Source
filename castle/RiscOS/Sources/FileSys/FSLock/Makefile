@@ -39,6 +39,7 @@ install_rom: rom_common
 clean::
         ${XWIPE} od ${WFLAGS}
         ${RM} scrambler
+        ${RM} scramblerDepends
 
 scrambler: scrambler.c
         EnsureDepends scramblerDepends

@@ -45,6 +45,7 @@ clean::
         ${XWIPE} Palettes.* ${WFLAGS}
         ${XWIPE} MkTables.o.* ${WFLAGS}
         ${RM} MkTables.maketables
+        ${RM} MkTables.Depends
 
 #
 # Static dependencies:

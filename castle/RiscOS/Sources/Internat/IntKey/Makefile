@@ -66,6 +66,7 @@ clean::
         ${WIPE} s ${WFLAGS}
         ${RM} keygen
         ${RM} keyconvert
+        ${RM} keygenDepends
         @echo ${COMPONENT}: cleaned
 
 keygen: keygen.c throwback.c unicdata.c
