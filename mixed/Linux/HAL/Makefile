@@ -70,4 +70,11 @@ h.version:
 
 o.Main: h.version
 
+clean::
+	${XWIPE} o ${WFLAGS}
+	${RM} h.version
+	${RM} HAL_Linux
+	${RM} HAL_Linux/rw
+	${RM} HAL_Linux_sym
+
 include Depends
