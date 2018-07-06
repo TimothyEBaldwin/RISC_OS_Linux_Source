@@ -31,3 +31,5 @@ rom_link-ShareFS:
 	link -o linked.${TARGET} -rmf -base ${ADDRESS} aof.${TARGET} RISCOSLIB:o.c_abssym
 	@${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
 
+clean::
+	${RM} linked.ShareFS
