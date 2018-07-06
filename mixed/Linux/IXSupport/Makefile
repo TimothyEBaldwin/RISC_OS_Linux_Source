@@ -58,6 +58,9 @@ rom_link: ${ROM_OBJS_} ${ROM_LIBS} ${ROMCSTUBS} ${FORCEROMLINK} ${DIRS} ${ROM_DE
 	${AS} ${ASFLAGS} -pd "base * ${ADDRESS}" -o o.stubs s.stubs
 	${LD} ${LDFLAGS} ${LDLINKFLAGS} -o ${LINKDIR}.${TARGET} -rmf -base ${ADDRESS} ${ROM_OBJS_} o.stubs <Lib$Dir>.Linux.o.HALSyms ${ROM_LIBS} ${ROMCSTUBS} ${ABSSYM} -Symbols ${LINKDIR}.${TARGET}_sym
 
+clean::
+	${RM} s.errors
+	${RM} mkerrors
 
 
 include Depends
