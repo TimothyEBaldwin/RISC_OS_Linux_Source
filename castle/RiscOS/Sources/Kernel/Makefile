@@ -219,5 +219,6 @@ Global.h.VIDCList: hdr.VIDCList
 clean::
         ${XWIPE} Global ${WFLAGS}
         ${XWIPE} bin    ${WFLAGS}
+        ${RM} h.kernel
 
 include Depends
