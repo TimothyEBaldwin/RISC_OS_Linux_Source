@@ -35,3 +35,5 @@ rom_link-Resolver:
 	link -o linked.${TARGET} -rmf -base ${ADDRESS} aof.${TARGET} RISC_OSLib:o.c_abssym
 	@${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
 
+clean::
+	${RM} linked.Resolver
