@@ -1,0 +1,267 @@
+SMP IRQ handling
+================
+
+What this document covers
+-------------------------
+
+This document specifies a new revision of the HAL interrupt API which allows the HAL/OS to implement useful multi-core IRQ handling on typical multi-core systems such as the above.
+
+The new specification is backwards-compatible with the current specification, so multi-core device drivers running on older, single-core OS versions should function correctly. However old single-core drivers running on a multi-core OS may require updates to ensure correct behaviour.
+
+
+Typical multi-core IRQ hardware
+-------------------------------
+
+Consider the following example of a typical multi-core IRQ setup:
+
+                        +---------------+
+ +--------+     +--+  /-| Private timer |
+ |        |     |#0|-/  +---------------+
+ |        | IRQ |#1|-------\
+ | Core 0 |-----|#2|------\ \+--------+
+ |        |     |#3|-----\ \/         |-------< peripheral 1
+ |        |     |#4|----\ \/          |
+ +--------+     +--+     \/           |-------< peripheral 2
+                         + IRQ router |
+ +--------+     +--+     /\           |-------< peripheral 3
+ |        |     |#0|-\  / /\          |
+ |        | IRQ |#1|--{- / /\         |-------< peripheral 4
+ | Core 1 |-----|#2|--{-- / /+--------+
+ |        |     |#3|--{--- /
+ |        |     |#4|--{----
+ +--------+     +--+  | +---------------+
+                      \-| Private timer |
+                        +---------------+
+
+* Core 0 has a private timer IRQ, and four periperhal IRQs (#1-#4, corresponding to peripherals 1-4)
+* Core 1 has the same setup, but IRQ#0 corresponds to a different private timer device
+* An interrupt router is present which controls which core(s) receive each of the four peripheral interrupts.
+  * On some systems, the interrupt router will allow multiple cores to receive the same interrupt (N-N in ARM GIC terminology). A software or hardware interlock will be used to ensure only one CPU services each interrupt at a time.
+  * On other systems, the interrupt router will only allow each peripheral interrupt to be routed to a single core at a time.
+  * For simplicity we'll only consider the case where the routing can be controlled on a per-interrupt basis; if routing can only be performed on groups of interrupts then we assume the HAL will use a fixed mapping scheme and not allow the routing to be modified at runtime.
+* It's not shown on the diagram, but typically some of the interrupt controller registers will be banked, with each CPU seeing its own view of the register.
+  * For example, with the ARM GIC, private interrupts such as the private timer IRQ can only have their enable/disable state modified by the core that owns the interrupt
+
+
+Overview of the revised API
+---------------------------
+
+The new specification aims to produce a system where device drivers shouldn't need to know or care what core their interrupt handlers are running on. Ideally, the OS should be able to route interrupts to cores as it pleases, in order to balance the overall IRQ latency of the system.
+
+To support this, the following is necessary:
+
+* The HAL will ensure that IRQ device numbers (as used by the HAL IRQ/FIQ APIs) are assigned to interrupts such that each unique source device/peripheral is assigned a unique device number.
+  * For example, the above example would require six device numbers: Two for the two private timers and four for the four peripherals.
+  * This may require the HAL to internally remap device numbers to/from hardware IRQ numbers
+
+* A new HAL entry point, HAL_IRQProperties, will be introduced to allow the HAL to describe the properties of a given device number
+  * e.g. which core(s) it can be routed to
+
+* Two new HAL entry points, HAL_IRQSetCores and HAL_IRQGetCores, will be introduced to allow the IRQ routing to be modified
+  * Currently there are no new calls defined to allow the routing of FIQs, however these can easily be added at a later date if required
+
+* In general, operations which mask/unmask interrupts (HAL_IRQEnable / HAL_IRQDisable & the FIQ equivalents) are expected to operate correctly no matter what core they are called from.
+  * However, to simplify HAL implementation, the HAL is not required to support the use of those calls for interrupts where the state is only accessible from the owning core (such as the private timer interrupts). Usually this restriction only applies to kernel-level interrupts like timers and doorbells, so the restriction is not expected to impact general device drivers.
+  * If this becomes a problem in the future, it's expected that the HAL or kernel could be extended to use a message passing system to allow the state of private interrupts to be transparently controlled by other cores.
+
+
+The dangers of HAL_IRQEnable / HAL_IRQDisable
+---------------------------------------------
+
+HAL_IRQEnable/HAL_IRQDisable do not perform reference counting, which makes them dangerous to use in threaded or multi-core environments. To ensure the calls are used in a safe manner, drivers must obey the following rules:
+
+* After calling OS_ClaimDeviceVector, a driver must call HAL_IRQEnable to enable receipt of the interrupt (ideally the kernel would do this automatically, but to ensure drivers are compatible with prior releases of RISC OS 5 there is little to be gained by having the kernel do this)
+* If the IRQ line is shared, the driver must make no other calls to HAL_IRQEnable / HAL_IRQDisable (otherwise there is the danger that it could conflict with calls made by other drivers)
+  * This means that nested interrupts (as described below) must be handled by masking the interrupts in the peripheral. If the peripheral does not have a dedicated interrupt mask register then nested interrupts must not be used.
+* For non-shared IRQ lines, the driver is free to call HAL_IRQEnable / HAL_IRQDisable at its leisure. However it must be aware of the dangers of this (e.g. a foreground thread may conflict with the IRQ handler if they are on different cores)
+* The kernel will only call HAL_IRQDisable for unhandled interrupts, so there should be no danger of it conflicting with usage by device drivers
+  * There is the danger of a race condition with OS_ClaimDeviceVector which could result in an interrupt being erroneously disabled by the kernel. To avoid this the kernel must treat OS_ClaimDeviceVector as a barrier operation, which ensures there is no running interrupt handler for the device (including the unhandled interrupt handler) while the handler list is being updated.
+
+HAL_FIQEnable/HAL_FIQDisable are also dangerous in threaded or multi-core environments, however since RISC OS only allows one driver to claim the FIQ vector at a time, the driver which owns the FIQ vector should not have to worry about any calls from other drivers which cause problems.
+
+
+IRQ handling state machine
+--------------------------
+
+At the HAL layer, IRQ handling is expected to match the behaviour described by the following state machine. Each CPU core is expected to implement its own instance of the state machine.
+
+      Start       (1): An unmasked IRQ is received by the interrupt controller, 
+        |              and it has decided to route it to the current CPU. The   
+        V              CPU's IRQ line will be asserted and at some point the CPU
+     /------\          will start executing the IRQ vector.                     
+ /-->| idle |<-\                                                                
+ |   \------/  |  (2): The CPU calls HAL_IRQSource to determine the source of   
+ |      |      |       the pending interrupt. While in the 'active' state:      
+ |(4)   | (1)  |        * The state of the CPU's IRQ line is indeterminate      
+ |      V      |        * The result of further calls to HAL_IRQSource is       
+ | /---------\ |          unpredictable                                         
+ | | pending | |                                                                
+ | \---------/ |  (3): The CPU calls HAL_IRQClear OR HAL_IRQDisable, specifying 
+ |   |  |      |       the device number that was returned by HAL_IRQSource.    
+ \---/  | (2)  |        * After the call, the CPU's IRQ line will be de-asserted
+        V      |          and the interrupt controller will resume looking for  
+   /--------\  |          new interrupts                                        
+   | active |  |        * Calling HAL_IRQClear for a different device number to 
+   \--------/  |          that returned by HAL_IRQSource is unpredictable       
+        | (3)  |        * Calling HAL_IRQDisable for a different device number  
+        \------/          will not cause a state transition                     
+                                                                                
+                  (4): The CPU calls HAL_IRQSource, and -1 is returned,         
+                       indicating a spurious IRQ.                               
+                        * No further action by the CPU is necessary, the IRQ    
+                          line will be de-asserted and the interrupt controller 
+                          will resume looking for new interrupts.               
+
+  State    Allowed operations
+  -----    ------------------
+
+  idle     All, except HAL_IRQSource and HAL_IRQClear.
+
+  pending  All, except HAL_IRQClear. HAL_IRQSource will either trigger
+           transition (2) or (4), depending on the return value.
+
+  active   All, except HAL_IRQSource. HAL_IRQClear is only valid if it
+           specifies the device number that was returned by HAL_IRQSource, in
+           which case transition (3) will be triggered. (3) will also be
+           triggered if HAL_IRQDisable is called with the device number that was
+           returned by HAL_IRQSource. Note that in all cases, (3) will only be
+           triggered if it is the core that received the interrupt that makes
+           the call.
+
+This state machine is identical to that used by the single-core IRQ handling. However it is only now that it has been formally specified.
+
+
+Nested interrupts
+-----------------
+
+Most modern interrupt controllers have builtin support for handling of nested interrupts, typically using a prioritisation-based scheme. The HAL/OS currently has no way of taking advantage of this functionality, and this document does not aim to tackle that.
+
+Therefore, nested interrupts are expected to be handled using the following scheme:
+
+ 1. The kernel calls HAL_IRQSource to determine the interrupt source, and then calls the appropriate IRQ handler
+ 2. The interrupt handler silences the interrupt, either by using HAL_IRQDisable (non-shared IRQ line) or by masking the interrupt in the peripheral and calling HAL_IRQClear (shared IRQ line). This will also allow the IRQ controller to start generating new IRQ requests to the processor.
+ 3. The interrupt handler clears the PSR.I bit to allow the CPU to handle any incoming IRQs.
+ 4. At end of execution, the interrupt handler sets PSR.I (to prevent any stack overflows if the disabled device is already interrupting again), and reverses the action that was performed in step 2 (i.e. call HAL_IRQEnable, or un-mask the interrupts in the peripheral)
+ 5. The interrupt handler returns to the kernel
+
+Again, this is the scheme that is currently used for single-core IRQ handling, and provides (unprioritised) nested IRQ support for any type of interrupt controller.
+
+
+API details
+-----------
+
+Note that all calls which accept a device number expect the number to be in the range [0, HAL_IRQMax). E.g. the 'shared' flag which some APIs place in bit 31 must be clear.
+
+
+#107: int HAL_IRQMax(void)
+
+  Returns the highest (+1) interrupt device number in the system. In addition to the uniqueness constraint described in the overview above, the HAL should also aim to keep the HAL_IRQMax number as low as reasonably possible, so that the OS can use a simple lookup table to map device numbers to handlers.
+
+
+#1: int HAL_IRQEnable(int device)
+#6: int HAL_FIQEnable(int device)
+
+  Unmasks the specified interrupt source within the interrupt controller.
+
+  Returns non-zero if the interrupt was previously enabled (for IRQ/FIQ as appropriate), zero if it was previously disabled.
+
+  Behaviour is unpredictable if a private interrupt is specified, but the calling core does not own the interrupt.
+
+
+#2: int HAL_IRQDisable(int device)
+#7: int HAL_FIQDisable(int device)
+
+  Masks the specified interrupt source within the interrupt controller, so that it will no longer trigger IRQ/FIQ generation.
+
+  Returns non-zero if the interrupt was previously enabled (for IRQ/FIQ as appropriate), zero if it was previously disabled.
+
+  Behaviour is unpredictable if a private interrupt is specified, but the calling core does not own the interrupt.
+
+  If the interrupt is currently firing (i.e. HAL_IRQSource has returned with that number) then this call will also act as a call to HAL_IRQClear / HAL_FIQClear.
+
+
+#4: int HAL_IRQSource(void)
+#10: int HAL_FIQSource(void)
+
+  The kernel must call this on entry to the IRQ/FIQ vector in order to determine the source of the current interrupt.
+
+  The return value will be a IRQ/FIQ device number, or -1 if the interrupt was spurious.
+
+  If a valid IRQ/FIQ device number is returned, it's expected that the OS will handle the interrupt; calling HAL_IRQSource and then doing nothing with the result is forbidden (e.g. if you had a routine which polls interrupt state with IRQs disabled).
+
+
+#3: void HAL_IRQClear(int device)
+#9: void HAL_FIQClear(int device)
+
+  This should be called at the end of each interrupt handler, to signal to the interrupt controller that the given IRQ/FIQ interrupt has been dealt with.
+
+  Generally when the HAL receives this call it will signal to the interrupt controller that the interrupt has been dealt with, e.g. by writing to the EOIR register in a GIC. Failing to mark in interrupt as complete may mean the interrupt gets (spuriously) triggered again, or it may prevent lower priority interrupts from being received.
+
+  For HAL timer IRQs and VSync IRQs (when using the HAL video API) the HAL may also use this to update the IRQ state within the timer or video controller. Implementing this behaviour within a new HAL is discouraged (use HAL_TimerIRQClear and GraphicsV video devices)
+
+  For spurious interrupts, no call to HAL_IRQClear/HAL_FIQClear should be made.
+
+  For SMP, these calls are only expected to work correctly if the call is being made on the core on which the interrupt was received.
+
+
+#5: int HAL_IRQStatus(int device)
+#11: int HAL_FIQStatus(int device)
+
+  Returns non-zero if the indicated device is currently requesting an interrupt, ignoring its current enable/disable state.
+
+
+#8: void HAL_FIQDisableAll(void)
+
+  Disable all FIQ sources for the current core.
+
+
+#53: __value_in_regs struct { int irq, fiq; } HAL_IRQProperties(int device)
+
+  Returns information about the behaviour of the given interrupt in SMP systems.
+
+  The low 16 bits of irq and fiq are bit masks, indicating which core(s) the interrupt can be routed to (and whether it can be routed as an IRQ or an FIQ).
+
+  The high 16 bits of irq and fiq provide additional information:
+
+  Bit 31: =1 if the interrupt can be assigned to multiple cores at once
+          =0 if it can only be assigned to (a maximum of) one core at a time
+
+  Bit 30: =1 if HAL_IRQEnable/HAL_IRQDisable (or FIQ equivalent) will only operate correctly if they are called from a core which the interrupt is currently routed to
+          =0 if HAL_IRQEnable/HAL_IRQDisable (or FIQ equivalent) will work from any core, and will affect all cores to which the interrupt is routed (i.e. there is a global enable flag for each interrupt)
+
+  Bits 29-16: Reserved
+
+
+#54: int HAL_IRQSetCores(int device, int mask)
+
+  Set the IRQ routing for the given interrupt; bit N of mask should be set if the interrupt is to be routed to core N.
+
+  Returns the new mask, which may be different to what was requested.
+
+  Currently there is no equivalent call allocated for FIQ routing (it's expected FIQs will have fixed routing)
+
+  To avoid race conditions with active interrupt handlers, this call is for kernel use only. Other components which need to manually manage IRQ routing must do so via the SWI interface (TBD)
+
+
+#55: int HAL_IRQGetCores(int device)
+
+  Returns the current IRQ routing for the given device
+
+  Currently there is no equivalent call allocated for FIQ routing (it's expected FIQs will have fixed routing)
+
+
+Kernel changes
+--------------
+
+To ensure safe operation of multi-core IRQs, the kernel will require at least the following changes:
+
+* A barrier placing in OS_ClaimDeviceVector, as described above
+* A barrier placing in OS_ReleaseDeviceVector, to ensure the handler being removed has finished executing by the time the SWI returns
+
+
+General advice
+--------------
+
+Traditionally device drivers have just disabled interrupts as a means of making sure their interrupt handler isn't running (e.g. in order to perform an atomic update of some state). In a multi-core environment this will not work; a spinlock must be used instead. This may also require your interrupt handler to be capable of dealing with spurious interrupts from its device - e.g. if the foreground masks an interrupt within the peripheral at the same time as that interrupt fires, the IRQ handler (looking at the new state) may not be able to recognise the source of the interrupt within the device.
+
+

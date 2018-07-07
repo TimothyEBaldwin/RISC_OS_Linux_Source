@@ -32,7 +32,8 @@ ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 CUSTOMSA        = custom
-EXPORTS         = ${EXP_HDR}.EnvNumbers \
+EXPORTS         = ${EXP_HDR}.DBellDevice \
+                  ${EXP_HDR}.EnvNumbers \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
@@ -99,6 +100,9 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
 	${CP} hdr.EnvNumbers $@ ${CPFLAGS}
+
+${EXP_HDR}.DBellDevice: hdr.DBellDevice
+	${CP} hdr.DBellDevice $@ ${CPFLAGS}
 
 ${EXP_HDR}.HALDevice: hdr.HALDevice
 	${CP} hdr.HALDevice $@ ${CPFLAGS}
