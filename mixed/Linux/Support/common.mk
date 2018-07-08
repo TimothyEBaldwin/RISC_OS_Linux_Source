@@ -186,6 +186,7 @@ endif
 
 Built/qemu_path: Built/gen_seccomp
 	set -o pipefail
+	$(sandbox_base) $(sandbox_misc) true
 	export RISC_OS_Alias_IXFSBoot='BASIC -quit IXFS:$.Finish'
 	if $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS; then
 	  echo QEMU:=/usr/bin/env > $@
