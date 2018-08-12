@@ -27,6 +27,9 @@
  *
  */
 
+#define max_keycode (105)
+#include "frontend_common.h"
+
 #include <GL/glut.h>
 #include <GL/freeglut.h>
 #include <unistd.h>
@@ -36,16 +39,6 @@
 #include <iostream>
 #include <cstring>
 
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/socket.h>
-#include <sys/mman.h>
-#include <sys/prctl.h>
-#include <sys/signal.h>
-#include <sys/signalfd.h>
-#include <sys/stat.h>
 #include <sys/uio.h>
 #include <poll.h>
 
@@ -56,21 +49,15 @@ using std::endl;
 
 #define NUM_SCREENS 3 
 
-#include "protocol.h"
-#include "Keyboard.h"
 #include <chrono>
 
 
 const int refresh_period = 20;
 const int mode_change = 5555;
 const int screen_update = 5554;
-const size_t screen_size = 1024*1024*32;
-int sig_fd, sockets[2];
-bool swapmouse;
 int log2bpp = 3;
 int height = 480;
 int width = 640;
-int screen_fd = -1;
 int no_updates = 0;
 
 // Display size
@@ -170,12 +157,12 @@ void OnMouseClick(int button, int state, int, int)
      case GLUT_DOWN:
         r.reason = report::ev_keydown;
         r.key.code = 0x70 + button;
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         break;
       case GLUT_UP:
         r.reason = report::ev_keyup;
         r.key.code = 0x70 + button;
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         break;
      }
 }
@@ -186,7 +173,7 @@ void My_mouse_routine(int x, int y){
   r.mouse.x = x * width / display_width;
   r.mouse.y = height - y * height / display_height;
   r.mouse.buttons = buttons;
-  write(sockets[0], &r, sizeof(r));
+  send_report(r);
 
 }
 
@@ -207,7 +194,7 @@ void myupfunc(unsigned char key, int x, int y){
     report r;
     r.reason = report::ev_keyup;
     r.key.code = keycode[key];
-    write(sockets[0], &r, sizeof(r));    
+    send_report(r);
 
 }
 void mydownfunc(unsigned char key, int x, int y){
@@ -216,7 +203,7 @@ void mydownfunc(unsigned char key, int x, int y){
     r.reason = report::ev_keydown;
     r.reason = report::ev_keydown;
     r.key.code = keycode[key];
-    write(sockets[0], &r, sizeof(r));
+    send_report(r);
     if (keycode[key]==0)
       cerr << "Key pressed:" << (unsigned int) key << "\n";
 }
@@ -263,7 +250,7 @@ void myspecialup(int key, int x, int y)
   r.reason = report::ev_keyup;
   r.key.code = special_to_code(key);
   if (r.key.code!=0)
-    write(sockets[0], &r, sizeof(r));
+    send_report(r);
   else
     cerr << " KEYup " << key <<"\n";
 
@@ -275,7 +262,7 @@ void myspecialdown(int key, int x, int y)
   r.reason = report::ev_keydown;
   r.key.code = special_to_code(key);
   if (r.key.code!=0)
-    write(sockets[0], &r, sizeof(r));
+    send_report(r);
   else
     cerr << " KEYdown " << key <<"\n";
 }
@@ -385,56 +372,22 @@ int init_my_GL(int argc, char **argv)
     return 0;
 }
 
-inline off_t get_file_size(int fd) {
-  struct stat s;
-  s.st_size = 0;
-  fstat(fd, &s);
-  return s.st_size;
-}
-
-void *pixels;
 auto start = std::chrono::steady_clock::now();
 void interact_rule()
 {
   
     report r;
 
-    /*{
-      struct signalfd_siginfo s;
-      while(read(sig_fd, &s, sizeof(s)) > 0);
-
-      int status;
-      if (waitpid(pid, &status, WNOHANG) == pid) return WEXITSTATUS(status);
-    }*/
+    exit_poll();
 
 
       command c;
       int numscr;
-      char buf[CMSG_SPACE(sizeof(int)) * 2];
 
-      struct iovec iov = {
-        .iov_base = &c,
-        .iov_len = sizeof(c),
-      };
-
-      struct msghdr msg = {
-        msg.msg_control = buf,
-        msg.msg_controllen = sizeof(buf),
-        msg.msg_iov = &iov,
-        msg.msg_iovlen = 1,
-      };
-
-      int s = recvmsg(sockets[0], &msg, MSG_DONTWAIT);
+      int s = read_msg(c);
 
       if (s >= 4) {
 
-      for (struct cmsghdr *i = CMSG_FIRSTHDR(&msg); i != NULL; i = CMSG_NXTHDR(&msg, i)) {
-        if (i->cmsg_level == SOL_SOCKET && i->cmsg_type == SCM_RIGHTS) {
-          close(screen_fd);
-          screen_fd = *(int *)CMSG_DATA(i);
-          mmap(pixels, screen_size, PROT_READ, MAP_FIXED | MAP_SHARED, screen_fd, 0);
-        }
-      }
 
       switch (c.reason) {
         case command::c_mode_change:
@@ -552,39 +505,11 @@ int main(int argc, char **argv) {
   }
 
   
-  {
-    sigset_t sigset;
-    sigemptyset(&sigset);
-    sigaddset(&sigset, SIGCHLD);
-    sigprocmask(SIG_BLOCK, &sigset, nullptr);
-    sig_fd = signalfd(-1, &sigset, SFD_CLOEXEC | SFD_NONBLOCK);
-  }
-
-  socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
-
-  pid_t self = getpid();
-  pid_t pid = fork();
-  if (!pid) {
-    prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
-    int socket = fcntl(sockets[1], F_DUPFD, 31); // 31 for compatibilty with early RISC OS
-    char s[40];
-    std::cerr << "STARTING RISCOS\n";
-    sprintf(s, "RISC_OS_SocketKVM_Socket=%i", socket);
-    putenv(s);
-
-    sigset_t sigset;
-    sigemptyset(&sigset);
-    sigprocmask(SIG_SETMASK, &sigset, nullptr);
-
-    if (getppid() == self) execvp(argv[optind], argv + optind);
-    _exit(1);
-  }
-  close(sockets[1]);
+  run_RISC_OS(argv + optind);
 
   int cursor_active_x = 0;
   int cursor_active_y = 0;
 
-  pixels = mmap(0, screen_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   current_pixels = pixels;
   init_keyboard();
   init_my_GL(argc,argv);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Timothy Baldwin
+ * Copyright (c) 2016-2018, Timothy Baldwin
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -31,59 +31,31 @@
 #include <SDL_video.h>
 #include <SDL_surface.h>
 
-#include <thread>
-#include <array>
-#include <algorithm>
-#include <iostream>
-#include <cstring>
-#include <bitset>
-
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/socket.h>
-#include <sys/mman.h>
-#include <sys/prctl.h>
-#include <sys/signal.h>
-#include <sys/signalfd.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#include <poll.h>
+#include "sdlkey.h"
+#include "frontend_common.h"
 
 #include <getopt.h>
+#include <poll.h>
+
+#include <cstring>
+#include <iostream>
+#include <thread>
 
 using std::cerr;
 using std::endl;
-
-
-#include "protocol.h"
-#include "sdlkey.h"
 
 namespace {
 
 const int refresh_period = 50;
 const int mode_change = 5555;
 const int screen_update = 5554;
-const size_t screen_size = 1024*1024*100;
-int sig_fd, sockets[2];
-bool swapmouse;
 bool use_close_message;
 int log2bpp = 3;
 int height = 480;
 int width = 640;
-int screen_fd = -1;
 int no_updates = 0;
 SDL_Window *window;
 SDL_Surface *screen;
-std::bitset<max_keycode + 1> key_state;
-
-inline off_t get_file_size(int fd) {
-  struct stat s;
-  s.st_size = 0;
-  fstat(fd, &s);
-  return s.st_size;
-}
 
 void update_screen() {
   if (no_updates <= 0 && get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
@@ -137,33 +109,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  {
-    sigset_t sigset;
-    sigemptyset(&sigset);
-    sigaddset(&sigset, SIGCHLD);
-    sigprocmask(SIG_BLOCK, &sigset, nullptr);
-    sig_fd = signalfd(-1, &sigset, SFD_CLOEXEC | SFD_NONBLOCK);
-  }
-
-  socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
-
-  pid_t self = getpid();
-  pid_t pid = fork();
-  if (!pid) {
-    prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
-    int socket = fcntl(sockets[1], F_DUPFD, 31); // 31 for compatibilty with early RISC OS
-    char s[40];
-    sprintf(s, "RISC_OS_SocketKVM_Socket=%i", socket);
-    putenv(s);
-
-    sigset_t sigset;
-    sigemptyset(&sigset);
-    sigprocmask(SIG_SETMASK, &sigset, nullptr);
-
-    if (getppid() == self) execvp(argv[optind], argv + optind);
-    _exit(1);
-  }
-  close(sockets[1]);
+  run_RISC_OS(argv + optind);
 
   SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
   SDL_Init(SDL_INIT_VIDEO);
@@ -176,7 +122,6 @@ int main(int argc, char **argv) {
   cursor_surface->format->palette->colors[0].a = 0;
   SDL_Cursor* cursor = nullptr;
 
-  void *pixels = mmap(0, screen_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
   SDL_Palette *palette = SDL_AllocPalette(256);
 
@@ -187,42 +132,14 @@ int main(int argc, char **argv) {
   while(true) {
     report r;
 
-    {
-      struct signalfd_siginfo s;
-      while(read(sig_fd, &s, sizeof(s)) > 0);
-
-      int status;
-      if (waitpid(pid, &status, WNOHANG) == pid) return WEXITSTATUS(status);
-    }
-
+    exit_poll();
 
     while (true) {
       command c;
 
-      char buf[CMSG_SPACE(sizeof(int)) * 2];
 
-      struct iovec iov = {
-        .iov_base = &c,
-        .iov_len = sizeof(c),
-      };
-
-      struct msghdr msg = {
-        msg.msg_control = buf,
-        msg.msg_controllen = sizeof(buf),
-        msg.msg_iov = &iov,
-        msg.msg_iovlen = 1,
-      };
-
-      int s = recvmsg(sockets[0], &msg, MSG_DONTWAIT);
+      int s = read_msg(c);
       if (s < 4) break;
-
-      for (struct cmsghdr *i = CMSG_FIRSTHDR(&msg); i != NULL; i = CMSG_NXTHDR(&msg, i)) {
-        if (i->cmsg_level == SOL_SOCKET && i->cmsg_type == SCM_RIGHTS) {
-          close(screen_fd);
-          screen_fd = *(int *)CMSG_DATA(i);
-          mmap(pixels, screen_size, PROT_READ, MAP_FIXED | MAP_SHARED, screen_fd, 0);
-        }
-      }
 
       switch (c.reason) {
         case command::c_mode_change:
@@ -299,13 +216,13 @@ int main(int argc, char **argv) {
               cerr << i << endl;
               r.reason = report::ev_keydown;
               r.key.code = i;
-              write(sockets[0], &r, sizeof(r));
+              send_report(r);
             }
           }
           struct version v;
           r.reason = report::ev_version;
           r.version.version = 1;
-          write(sockets[0], &r, sizeof(r));
+          send_report(r);
           break;
         }
       }
@@ -325,14 +242,14 @@ int main(int argc, char **argv) {
           r.reason = report::ev_resize;
           r.mouse.x = e.window.data1;
           r.mouse.y = e.window.data2;
-          write(sockets[0], &r, sizeof(r));
+          send_report(r);
           if (no_updates < 200) no_updates = 200;
         }
         break;
       case SDL_QUIT:
         if (use_close_message) {
           r.reason = report::ev_close;
-          write(sockets[0], &r, sizeof(r));
+          send_report(r);
         } else {
           kill(pid, SIGTERM);
         }
@@ -340,13 +257,13 @@ int main(int argc, char **argv) {
       case SDL_KEYDOWN:
         r.reason = report::ev_keydown;
         r.key.code = sdl2key[e.key.keysym.scancode];
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         key_state[r.key.code] = true;
         break;
       case SDL_KEYUP:
         r.reason = report::ev_keyup;
         r.key.code = sdl2key[e.key.keysym.scancode];
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         key_state[r.key.code] = false;
         break;
 
@@ -354,13 +271,13 @@ int main(int argc, char **argv) {
         r.reason = report::ev_keydown;
         r.key.code = 0x70 + e.button.button - 1;
         if (swapmouse && r.key.code != 0x70) r.key.code = r.key.code ^ 3;
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         break;
       case SDL_MOUSEBUTTONUP:
         r.reason = report::ev_keyup;
         r.key.code = 0x70 + e.button.button - 1;
         if (swapmouse && r.key.code != 0x70) r.key.code = r.key.code ^ 3;
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         break;
       case SDL_MOUSEMOTION:
         buttons = static_cast<uint32_t>(e.motion.state);
@@ -368,7 +285,7 @@ int main(int argc, char **argv) {
         r.mouse.x = static_cast<uint32_t>(e.motion.x);
         r.mouse.y = height - static_cast<uint32_t>(e.motion.y);
         r.mouse.buttons = buttons;
-        write(sockets[0], &r, sizeof(r));
+        send_report(r);
         //std::cerr << "Motion " << r.x << ' ' << r.y << ' ' << r.buttons << std::endl;
         break;
     }

@@ -60,6 +60,7 @@ sandbox_build = $(call robind,/bin /lib /lib32 /libx32 /lib64 /usr /etc/alternat
 sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp
 ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind '$(1)' /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib(|32|x32|64)(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
+frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol) $(lib_depends)
 
 all: Built/qemu_sandbox sdl Start_RISC_OS.desktop comma2attr
 
@@ -90,10 +91,10 @@ comma2attr: Built/comma2attr
 Start_RISC_OS.desktop:
 	ln -s Support/Start_RISC_OS.desktop
 
-Built/sdl: Support/sdl.cpp Built/sdlkey.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol)
+Built/sdl: Support/sdl.cpp Built/sdlkey.h $(frontend_depends)
 	g++ --std=c++11 -Wall -pthread -g -O2 -IBuilt Support/sdl.cpp  `sdl2-config --cflags --libs` -o Built/sdl
 
-Built/opengl: mixed/Linux/Support/opengl.cpp
+Built/opengl: Support/opengl.cpp $(frontend_depends)
 	g++ -pthread -g -O2 --std=c++11 Support/opengl.cpp -lGL -lGLU -lglut -o Built/opengl
 
 Built/sdlkey.h: Support/sdlkey.c $(lib_depends) Support/Keyboard.h | Built

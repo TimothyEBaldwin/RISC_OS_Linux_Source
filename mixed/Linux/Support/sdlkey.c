@@ -165,6 +165,5 @@ int main() {
   for(int i = 0; i < SDL_NUM_SCANCODES; ++i)
     printf("  %i,\n", out[i]);
 
-  printf("};\n#define KeyNo_Function12 (%i)\n#define max_keycode (%i)", KeyNo_Function12, max_keycode);
-
+  printf("};\n#define max_keycode (%i)\n", max_keycode);
 }
