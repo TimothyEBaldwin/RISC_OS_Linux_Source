@@ -155,14 +155,10 @@ void OnMouseClick(int button, int state, int, int)
      
    switch (state) {
      case GLUT_DOWN:
-        r.reason = report::ev_keydown;
-        r.key.code = 0x70 + button;
-        send_report(r);
+        report_key(KeyNo_LeftMouse + button, true);
         break;
       case GLUT_UP:
-        r.reason = report::ev_keyup;
-        r.key.code = 0x70 + button;
-        send_report(r);
+        report_key(KeyNo_LeftMouse + button, false);
         break;
      }
 }
@@ -191,19 +187,11 @@ void mouseWheel(int button, int dir, int x, int y)
 }
 
 void myupfunc(unsigned char key, int x, int y){
-    report r;
-    r.reason = report::ev_keyup;
-    r.key.code = keycode[key];
-    send_report(r);
-
+    report_key(keycode[key], false);
 }
-void mydownfunc(unsigned char key, int x, int y){
-    report r;
 
-    r.reason = report::ev_keydown;
-    r.reason = report::ev_keydown;
-    r.key.code = keycode[key];
-    send_report(r);
+void mydownfunc(unsigned char key, int x, int y){
+    report_key(keycode[key], true);
     if (keycode[key]==0)
       cerr << "Key pressed:" << (unsigned int) key << "\n";
 }
@@ -246,23 +234,18 @@ unsigned short special_to_code(int key) {
 
 void myspecialup(int key, int x, int y)
 {
-  report r;
-  r.reason = report::ev_keyup;
-  r.key.code = special_to_code(key);
-  if (r.key.code!=0)
-    send_report(r);
+  int k = special_to_code(key);
+  if (k != 0)
+    report_key(k, false);
   else
     cerr << " KEYup " << key <<"\n";
 
 }
 void myspecialdown(int key, int x, int y)
 {
-  report r;
-
-  r.reason = report::ev_keydown;
-  r.key.code = special_to_code(key);
-  if (r.key.code!=0)
-    send_report(r);
+  int k = special_to_code(key);
+  if (k != 0)
+    report_key(k, true);
   else
     cerr << " KEYdown " << key <<"\n";
 }

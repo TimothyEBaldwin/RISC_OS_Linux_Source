@@ -211,15 +211,9 @@ int main(int argc, char **argv) {
           use_close_message = c.close_ctl.use_message;
           break;
         case command::c_version: {
-          for(int i = 0; i != key_state.size(); ++i) {
-            if (key_state[i]) {
-              cerr << i << endl;
-              r.reason = report::ev_keydown;
-              r.key.code = i;
-              send_report(r);
-            }
-          }
+          resend_keys();
           struct version v;
+          report r;
           r.reason = report::ev_version;
           r.version.version = 1;
           send_report(r);
@@ -239,6 +233,7 @@ int main(int argc, char **argv) {
         break;
       case SDL_WINDOWEVENT:
         if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
+          report r;
           r.reason = report::ev_resize;
           r.mouse.x = e.window.data1;
           r.mouse.y = e.window.data2;
@@ -248,6 +243,7 @@ int main(int argc, char **argv) {
         break;
       case SDL_QUIT:
         if (use_close_message) {
+          report r;
           r.reason = report::ev_close;
           send_report(r);
         } else {
@@ -255,29 +251,17 @@ int main(int argc, char **argv) {
         }
         break;
       case SDL_KEYDOWN:
-        r.reason = report::ev_keydown;
-        r.key.code = sdl2key[e.key.keysym.scancode];
-        send_report(r);
-        key_state[r.key.code] = true;
+        report_key(sdl2key[e.key.keysym.scancode], true);
         break;
       case SDL_KEYUP:
-        r.reason = report::ev_keyup;
-        r.key.code = sdl2key[e.key.keysym.scancode];
-        send_report(r);
-        key_state[r.key.code] = false;
+        report_key(sdl2key[e.key.keysym.scancode], false);
         break;
 
       case SDL_MOUSEBUTTONDOWN:
-        r.reason = report::ev_keydown;
-        r.key.code = 0x70 + e.button.button - 1;
-        if (swapmouse && r.key.code != 0x70) r.key.code = r.key.code ^ 3;
-        send_report(r);
+        report_key(KeyNo_LeftMouse + e.button.button - 1, true);
         break;
       case SDL_MOUSEBUTTONUP:
-        r.reason = report::ev_keyup;
-        r.key.code = 0x70 + e.button.button - 1;
-        if (swapmouse && r.key.code != 0x70) r.key.code = r.key.code ^ 3;
-        send_report(r);
+        report_key(KeyNo_LeftMouse + e.button.button - 1, false);
         break;
       case SDL_MOUSEMOTION:
         buttons = static_cast<uint32_t>(e.motion.state);

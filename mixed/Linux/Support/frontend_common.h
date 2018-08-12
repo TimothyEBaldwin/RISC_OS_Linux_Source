@@ -129,3 +129,27 @@ int read_msg(command &c) {
 void send_report(const report &r) {
   write(sockets[0], &r, sizeof(r));
 }
+
+void report_key(int keycode, bool down) {
+
+  if (swapmouse && (keycode == KeyNo_CentreMouse || keycode == KeyNo_RightMouse)) {
+    keycode ^= KeyNo_CentreMouse ^ KeyNo_RightMouse;
+  }
+
+  report r;
+  r.reason = down ? report::ev_keydown : report::ev_keyup;
+  r.key.code = keycode;
+  key_state[keycode] = down;
+  send_report(r);
+}
+
+void resend_keys() {
+  report r;
+  for(int i = 0; i != key_state.size(); ++i) {
+    if (key_state[i]) {
+      r.reason = report::ev_keydown;
+      r.key.code = i;
+      send_report(r);
+    }
+  }
+}
