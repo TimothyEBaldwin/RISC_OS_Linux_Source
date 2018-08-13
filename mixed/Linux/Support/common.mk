@@ -213,7 +213,7 @@ HardDisc4: | $(HARDDISC4) Built/comma2attr
 	  rm HardDisc4.zip
 	  chmod -R u+rw .
 	  cp -a --reflink=auto 'HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4/!Boot/Choices/Boot'
-	  printf 'X AddTinyDir IXFS:$$\nX AddTinyDir IXFS:$$.HardDisc4\n' > 'HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
+	  printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
 	  ! ./comma2attr --recurse --strip .
 	  rm ./comma2attr
 	}
