@@ -196,25 +196,24 @@ Built/qemu_path: Built/gen_seccomp $(LINUX_ROM)
 	  echo QEMU:=Built/qemu-arm > $@
 	fi
 
-HardDisc4: | $(HARDDISC4) Built/boot_iomd_rom Built/rpcemu/rpcemu Built/comma2attr
+HardDisc4: | $(HARDDISC4) Built/comma2attr
 	set -o pipefail
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files
+	ln Built/comma2attr HardDisc4_files/comma2attr
 	cp --reflink=auto '$(HARDDISC4)' HardDisc4_files/HardDisc4.zip
 	unpack() {
 	  echo 'b2229fbf5f08026d99e2fd552431187d868b3276816b1429709d0594b4a400bc *HardDisc4.zip' | sha256sum -c
 	  unzip -F HardDisc4.zip
 	  rm HardDisc4.zip
-	  printf '*Shutdown\nSYS &C0200,,,,,,,,1\n' > 'HardDisc4/!Boot/RO520Hook/Boot/Tasks/off,ffb'
+	  chmod -R u+rw .
+	  cp -a --reflink=auto 'HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4/!Boot/Choices/Boot'
+	  printf 'X AddTinyDir IXFS:$$\nX AddTinyDir IXFS:$$.HardDisc4\n' > 'HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
+	  ! ./comma2attr --recurse --strip .
+	  rm ./comma2attr
 	}
 	export -f unpack
 	$(sandbox_base) $(sandbox_misc) --bind HardDisc4_files /hd4 --chdir /hd4 bash -x -e -c unpack
-	printf 'Running Rpcemu...'
-	timeout -sKILL 60 $(BWRAP) --unshare-pid --unshare-net --ro-bind /tmp/.X11-unix /tmp/.X11-unix --proc /proc $(sandbox_misc) --ro-bind Built/rpcemu /r --ro-bind Built/boot_iomd_rom /r/roms/ROM --bind HardDisc4_files/HardDisc4 /r/hostfs --dev-bind /dev/null /r/hd4.hdf /r/rpcemu
-	printf 'done.\n'
-	rm 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/off,ffb' 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot/Tasks/off,ffb'
-	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir IXFS:$$.HardDisc4\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
-	! Built/comma2attr --recurse HardDisc4_files/HardDisc4
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built
