@@ -46,7 +46,6 @@
 #include "version.h"
 
 static bool qemu_hack;
-struct ix_termios oldTioIn, oldTioOut, newTioIn, newTioOut;
 
 static struct {
   ix_timer_t id;
@@ -553,9 +552,9 @@ static void hal_run(unsigned startFlags);
 static const char help_text[] ="Command line options:\n"
 "  --help         Display this message\n"
 "  --nvram FILE   Filename for nvram\n"
-"  --notimers     Disable HAL timers\n"
+"  --isreboot     Indicate hard reset to RISC OS (not power on)\n"
 "  --noaborts     Disable aborts - RISC OS will die with SIGSEGV\n"
-"  --nofork       Dont't fork - for debuging\n"
+"  --notimers     Disable HAL timers\n"
 "  --noseccomp    Disable seccomp support\n";
 
 static char **environ;
@@ -566,25 +565,6 @@ static int sig_fd;
 unsigned __HAL_hwcap;
 unsigned __HAL_hwcap2;
 char **__HAL_get_env(void) { return environ; }
-
-static int do_fork(unsigned startFlags) {
-  int ppid = ix_getpid();
-  int pid = ix_fork();
-  if (pid < 0) {
-    ix_MESSAGE(2, "Unable to fork\n");
-    ix_exit(109);
-  } else if (pid == 0) {
-    ix_prctl(ix_PR_SET_PDEATHSIG, ix_SIGTERM, 0, 0, 0);
-    ix_sigsetmask(0ULL);
-    ix_close(sig_fd);
-
-    // Check if parent just died.
-    if (ix_getppid() != ppid) ix_exit(110);
-
-    hal_run(startFlags); // Doesn't return
-  }
-  return pid;
-}
 
 int main(int argc, char **argv) {
   environ = argv + argc + 1;
@@ -608,7 +588,7 @@ int main(int argc, char **argv) {
     auxv += 2;
   }
 
-  bool nofork = false;
+  unsigned startFlags = OSStartFlag_FastBoot | OSStartFlag_POR | OSStartFlag_NoCMOSReset | OSStartFlag_RAMCleared;
 
   for(int i = 1; i != argc; ++i) {
     if (!strcmp(argv[i], "--help")) {
@@ -653,12 +633,14 @@ int main(int argc, char **argv) {
 
       nvram_fd = fd;
 
+    } else if (!strcmp(argv[i], "--isreboot")) {
+      startFlags &= ~OSStartFlag_POR;
     } else if (!strcmp(argv[i], "--noaborts")) {
       no_aborts = true;
     } else if (!strcmp(argv[i], "--notimers")) {
       notimers = true;
     } else if (!strcmp(argv[i], "--nofork")) {
-      nofork = true;
+      // Ignore for compatibility
     } else if (!strcmp(argv[i], "--noseccomp")) {
       use_seccomp = false;
     } else {
@@ -677,10 +659,8 @@ int main(int argc, char **argv) {
     ix_exit(108);
   }
 
-  // Check if stdout is a terminal.
-  bool isterm = !ix_ioctl(1, ix_TCGETS, &oldTioIn);
-
   // Get terminal status, if successful reopen terminal for input.
+  struct ix_termios oldTioIn;
   if (!ix_ioctl(0, ix_TCGETS, &oldTioIn)) {
     int fd = ix_open("/proc/self/fd/0", ix_O_RDONLY, 0);
     if (fd > 0) {
@@ -689,78 +669,8 @@ int main(int argc, char **argv) {
     }
   }
 
-
-  if (nofork) hal_run(OSStartFlag_FastBoot | OSStartFlag_POR | OSStartFlag_NoCMOSReset | OSStartFlag_RAMCleared); // Doesn't return
-
-  uint64_t mask = 0;
-  mask |= 1ULL << (ix_SIGTERM - 1);
-  mask |= 1ULL << (ix_SIGINT  - 1);
-  mask |= 1ULL << (ix_SIGHUP  - 1);
-  mask |= 1ULL << (ix_SIGTSTP - 1);
-  mask |= 1ULL << (ix_SIGTTIN - 1);
-  mask |= 1ULL << (ix_SIGTTOU - 1);
-  mask |= 1ULL << (ix_SIGCHLD - 1);
-  ix_sigsetmask(mask);
-  sig_fd = ix_signalfd(-1, &mask, 8);
-
-
-  // Disable terminal echo.
-  newTioIn = oldTioIn;
-  newTioIn.c_iflag &= ~ix_IGNCR & ~ix_INLCR;
-  newTioIn.c_cc[ix_VMIN] = 1;
-  newTioIn.c_cc[ix_VTIME] = 0;
-  newTioIn.c_lflag &= ~ix_ICANON & ~ix_ECHO;
-  ix_ioctl(0, ix_TCSETS, &newTioIn);
-
-  int pid = do_fork(OSStartFlag_FastBoot | OSStartFlag_POR | OSStartFlag_NoCMOSReset | OSStartFlag_RAMCleared);
-
-  while (true) {
-    volatile struct ix_signalfd_siginfo s;
-    s.ssi_signo = 0;
-    ix_read(sig_fd, (void *)&s, sizeof(s));
-    switch(s.ssi_signo) {
-      case ix_SIGTERM:
-      case ix_SIGINT:
-      case ix_SIGHUP:
-        ix_kill(pid, s.ssi_signo);
-        break;
-      case ix_SIGTSTP:
-      case ix_SIGTTIN:
-      case ix_SIGTTOU:
-        ix_ioctl(0, ix_TCSETS, &oldTioIn);
-        ix_kill(ix_getpid(), ix_SIGSTOP);
-        ix_ioctl(0, ix_TCSETS, &newTioIn);
-        break;
-      case ix_SIGCHLD:
-        while(true) {
-          int status;
-          ix_pid_t p = ix_waitpid(pid, &status, ix_WNOHANG);
-          if (p <= 0) break;
-
-          // Write a new line to keep output tidy.
-          if (isterm) ix_MESSAGE(1, "\n");
-
-          if (status == (100 << 8)) {
-            pid = do_fork(OSStartFlag_FastBoot | OSStartFlag_NoCMOSReset | OSStartFlag_RAMCleared);
-          } else {
-
-            // Restore terminal status
-            ix_ioctl(0, ix_TCSETS, &oldTioIn);
-
-            if (status & 0x7F) {
-              ix_sigsetmask(0);
-              //ix_raise(status & 0x7F);
-            }
-            return status >> 8;
-          }
-        }
-        break;
-    }
-  }
-}
-
-
-static inline void init_swi(void) {
+  // Set TLS pointer to vcpu struct.
+  ix_set_tls(&init_vcpu);
 
   // For SECCOMP2
   if (ix_prctl(ix_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
@@ -797,11 +707,9 @@ static inline void init_swi(void) {
 
   if (use_seccomp && ix_prctl(ix_PR_SET_SECCOMP, ix_SECCOMP_MODE_FILTER, (unsigned)&fprog, 0, 0) == 0) {
     ix_MESSAGE(2, "Seccomp-bpf filter installed.\n");
-    return;
-  }
 
   // If seccomp fails try ptrace.
-  if (ix_ptrace(ix_PTRACE_CONT, ix_gettid(), 0, 0) != -ix_ENOSYS) {
+  } else if (ix_ptrace(ix_PTRACE_CONT, ix_gettid(), 0, 0) != -ix_ENOSYS) {
     ix_MESSAGE(2, "Seccomp-bpf not available so using ptrace - This is slow.\n");
     int ppid = ix_getpid();
     if (start_ptrace()) {
@@ -816,27 +724,19 @@ static inline void init_swi(void) {
     // This is the child, start tracing.
     ix_ptrace(ix_PTRACE_TRACEME, 0, 0, 0);
     ix_raise(ix_SIGTRAP);
-    return;
-  }
 
   // If seccomp and ptrace fail try QEMU.
-  ix_MESSAGE(2, "Seccomp-bpf and ptrace not available so trying QEMU SWI hack.\n");
-  __asm {
+  } else {
+    ix_MESSAGE(2, "Seccomp-bpf and ptrace not available so trying QEMU SWI hack.\n");
+    __asm {
       MOV     r0, &__HAL_LinuxSyscall
       ADD     r1, r0, #4
       MOV     r2, #0
       MOV     r7, #__NR_getpid  // Fall though if treated as Linux syscall.
       SWI     0xC0001, {r0, r1, r2, r7}, {}, {r0, r7, psr}
+    }
+    qemu_hack = true;
   }
-  qemu_hack = true;
-}
-
-static void hal_run(unsigned startFlags) {
-
-  // Set TLS pointer to vcpu struct.
-  ix_set_tls(&init_vcpu);
-
-  init_swi();
 
   // Set alternative stack for signal handlers,
   // RISC OS stack may not exist or be usable.

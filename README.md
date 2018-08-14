@@ -72,10 +72,10 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 | ---          | ---                                             |
 | --help       | Display help message                            |
 | --nvram FILE | Filename for nvram                              |
-| --notimers   | Disable HAL timers                              |
 | --noaborts   | Disable aborts - RISC OS will die with SIGSEGV  |
-| --nofork     | Dont't fork - for debugging                     |
+| --isreboot   | Indicate hard reset to RISC OS (not power on)   |
 | --noseccomp  | Disable seccomp support                         |
+| --notimers   | Disable HAL timers                              |
 
 ## Linux RISC OS error codes
 
