@@ -72,7 +72,7 @@ endif
 
 include $(wildcard Support/build.mk)
 
-script-all: Built/sdl comma2attr Built/qemu_sandbox RISC_OS HardDisc4
+script-all: Built/sdl comma2attr Built/qemu_sandbox RISC_OS HardDisc4 Built/wrapper
 
 RISC_OS:
 
@@ -103,6 +103,9 @@ Built/sdlkey.h: Support/sdlkey.c $(lib_depends) Support/Keyboard.h | Built
 
 Built/comma2attr: Support/comma2attr.c $(lib_depends) | Built
 	gcc -std=gnu99 -Wall -g Support/comma2attr.c -o Built/comma2attr
+
+Built/wrapper: Support/wrapper.c $(lib_depends) | Built
+	gcc -std=gnu99 -Wall -Os Support/wrapper.c -o Built/wrapper
 
 Built/gen_seccomp: Support/gen_seccomp.c $(lib_depends) | Built
 	gcc -std=c99 -Wall -Os Support/gen_seccomp.c -o Built/gen_seccomp -lseccomp
