@@ -184,7 +184,7 @@ endif
 	fi
 	echo \'
 
-Built/qemu_path: Built/gen_seccomp
+Built/qemu_path: Built/gen_seccomp $(LINUX_ROM)
 	set -o pipefail
 	$(sandbox_base) $(sandbox_misc) true
 	export RISC_OS_Alias_IXFSBoot='BASIC -quit IXFS:$.Finish'
