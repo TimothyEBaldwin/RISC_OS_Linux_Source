@@ -129,7 +129,7 @@ endif
 	(cd Support/bin && git fetch --force https://github.com/TimothyEBaldwin/RO_Linux.git master:master && git checkout master)
 	rm -rf Support/bin/Support 'Support/bin/!Boot'
 	mkdir -p Support/bin/Support
-	cp -v --reflink=auto --preserve=mode,xattr Support/{Keyboard.h,*.c,*.cpp,*.diff,Start_RISC_OS.desktop,Finish,common.mk,download.sh,rpcemu.cfg,run_RISC_OS} Support/bin/Support/
+	cp -v --reflink=auto --preserve=mode,xattr Support/!(protocol.h|bin|build.mk|Build,feb|BufferWriteC) Support/bin/Support/
 	cp -v --reflink=auto --preserve=mode,xattr mixed/Linux/SocketKVM/h/protocol Support/bin/Support/protocol.h
 	cp -v --reflink=auto --preserve=mode,xattr RISC_OS Support/bin/RISC_OS
 	ln -sf 'Support/Start_RISC_OS.desktop' 'Support/bin/Start_RISC_OS.desktop'
