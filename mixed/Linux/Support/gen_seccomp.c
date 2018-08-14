@@ -89,5 +89,5 @@ int main(int argc, char **argv) {
   rc = seccomp_export_bpf(ctx, STDOUT_FILENO);
   if (rc) error(1, -rc, "Unable to load seccomp rules");
 
-  return 1;
+  return 0;
 }
