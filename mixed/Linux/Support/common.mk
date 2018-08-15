@@ -63,7 +63,12 @@ lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
 
 all: Built/qemu_sandbox sdl Start_RISC_OS.desktop comma2attr
 
+ifeq ($(INSECURE), YES)
+QEMU:=/usr/bin/env
+else
 include Built/qemu_path
+endif
+
 include $(wildcard Support/build.mk)
 
 script-all: Built/sdl comma2attr Built/qemu_sandbox RISC_OS HardDisc4
@@ -167,7 +172,7 @@ Built/qemu-arm: Built/qemu_Makefile_stamp
 	ln -f Built/qemu/arm-linux-user/qemu-arm Built/qemu-arm
 	touch Built/qemu-arm
 
-Built/qemu_sandbox: $(QEMU) Built/gen_seccomp Built/qemu_path
+Built/qemu_sandbox: $(QEMU) Built/gen_seccomp
 	set -o pipefail
 	exec > Built/qemu_sandbox
 ifeq ($(QEMU),/usr/bin/env)
@@ -212,8 +217,12 @@ HardDisc4: | $(HARDDISC4) Built/comma2attr
 	  ! ./comma2attr --recurse --strip .
 	  rm ./comma2attr
 	}
+ifeq ($(INSECURE), YES)
+	( cd HardDisc4_files && unpack )
+else
 	export -f unpack
 	$(sandbox_base) $(sandbox_misc) --bind HardDisc4_files /hd4 --chdir /hd4 bash -x -e -c unpack
+endif
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built

@@ -36,9 +36,17 @@ PHASES=export_hdrs export_libs resources rom install_rom join
 
 .PHONY: update-binary build check fast
 
+all: build
+ifeq ($(INSECURE), YES)
+src = /dev/fd/15
+build = /dev/fd/16
+else
+src = /src
+build = /build
 all: check
+endif
 
-RISC_OS: $(if $(wildcard RISC_OS),,check)
+RISC_OS: $(if $(wildcard RISC_OS),,all)
 
 build_binds = $(foreach dir,bsd castle cddl gpl mixed,--ro-bind $(dir) /src/$(dir)) --bind build /build --ro-bind '${ACORN_CPP}' /AcornC.C++
 
@@ -54,20 +62,25 @@ endif
 	#
 	mkdir -p build
 	setup_build() {
-	  cd /build
+	  cd $(build)
 	  ! rm 'Images/$(TARGET)_rom'*
 	  mkdir -p Apps
-	  cp -ru --preserve=mode,timestamps /src/castle/RiscOS/Export .
-	  ! cp -Hrsn /src/{bsd,castle,cddl,gpl,mixed} . 2>/dev/null
-	  ln -sf /src/*/RiscOS/Apps/\!* Apps
+	  cp -ru --preserve=mode,timestamps $(src)/castle/RiscOS/Export .
+	  ! cp -Hrsn $(src)/{bsd,castle,cddl,gpl,mixed} . 2>/dev/null
+	  ln -sf $(src)/*/RiscOS/Apps/\!* Apps
 	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
 ifeq ($(TARGET), Linux)
 	  echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
 	  cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
 endif
 	}
+ifeq ($(INSECURE), YES)
+	exec 15<. 16<build
+	( setup_build )
+else
 	export -f setup_build
 	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null bash -x -e -c setup_build
+endif
 	#
 ifeq ($(METHOD), rpcemu)
 	echo '*Obey -v HostFS:$$.build.mixed.Linux.Support.Build rpcemu HostFS:$$.build HostFS:$$.AcornC/C++ $(TARGET) $(PHASES)' | \
@@ -76,7 +89,11 @@ ifeq ($(METHOD), rpcemu)
 	--symlink /build /r/hostfs/build --symlink /AcornC.C++ /r/hostfs/AcornC.C++ --file 0 '/r/hostfs/!Boot,fea' /r/rpcemu
 else
 	. Built/qemu_sandbox
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.src.mixed.Linux.Support.Build Linux IXFS:$$.build IXFS:$$.AcornC/C++ $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '${LINUX_ROM}' /RISC_OS $$QEMU_sandbox $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+ifeq ($(INSECURE), YES)
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.15.mixed.Linux.Support.Build Linux IXFS:$$.dev.fd.16 IXFS:$$.dev.fd.8 $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  8<'${ACORN_CPP}' <<END 2>&1 | cat
+else
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.src.mixed.Linux.Support.Build Linux IXFS:$$.build IXFS:$$.AcornC/C++ $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS $$QEMU_sandbox $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+endif
 	*BASIC
 	VDU 7
 	SYS "IXSupport_LinuxSyscall",20,,,,,,,1
