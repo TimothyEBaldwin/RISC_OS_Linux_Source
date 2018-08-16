@@ -119,14 +119,23 @@ ifndef FAST
 	git clean -fxd
 	git reset --hard
 endif
-	(cd mixed/Linux/Support/bin && git reset --hard && git clean -fxd && git checkout master~0)
+	(
+	  cd mixed/Linux/Support/bin
+	  git reset --hard
+	  git clean -fxd
+	  git checkout master~0
+	)
 	git submodule update
 	SOURCE=$$(git rev-parse HEAD)
 	#
 ifndef FAST
 	$(MAKE) JOBS=$(JOBS) METHOD=$(METHOD)
 endif
-	(cd Support/bin && git fetch --force https://github.com/TimothyEBaldwin/RO_Linux.git master:master && git checkout master)
+	(
+	  cd Support/bin
+	  git fetch --force https://github.com/TimothyEBaldwin/RO_Linux.git master:master
+	  git checkout master
+	)
 	rm -rf Support/bin/Support 'Support/bin/!Boot'
 	mkdir -p Support/bin/Support
 	cp -v --reflink=auto --preserve=mode,xattr Support/!(protocol.h|bin|build.mk|Build,feb|BufferWriteC) Support/bin/Support/
@@ -143,9 +152,9 @@ endif
 	" > Support/bin/Support/source
 	#
 	(
-	cd Support/bin
-	git add -A
-	git commit -m "Rebuilt binary from $$SOURCE"
+	  cd Support/bin
+	  git add -A
+	  git commit -m "Rebuilt binary from $$SOURCE"
 	)
 	git add -u
 	git commit -m "Rebuilt bootstrap binary"
