@@ -37,18 +37,13 @@ PHASES=export_hdrs export_libs resources rom install_rom join
 .PHONY: update-binary build check fast
 
 all: build
-ifeq ($(INSECURE), YES)
-src = /dev/fd/15
-build = /dev/fd/16
-else
-src = /src
-build = /build
+ifneq ($(INSECURE), YES)
 all: check
 endif
 
 RISC_OS: $(if $(wildcard RISC_OS),,all)
 
-build_binds = $(foreach dir,bsd castle cddl gpl mixed,--ro-bind $(dir) /src/$(dir)) --bind build /build --ro-bind '${ACORN_CPP}' /AcornC.C++
+build_binds = $(foreach dir,bsd castle cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build /dev/fd/5/Build --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
 ifeq ($(METHOD), rpcemu)
 build: Built/rpcemu/rpcemu Built/boot_iomd_rom
@@ -63,53 +58,83 @@ endif
 	export COMMIT="$$(git rev-parse HEAD)"
 	echo Building GIT commit: $$COMMIT
 	#
-	mkdir -p build
+	ln -sfn . lock_source_1510718522
+	mkdir -p Build
 	setup_build() {
-	  cd $(build)
+	  #
+	  # Find directories and files
+	  shopt -s globstar
+	  shopt -s extglob
+	  dirs=({bsd,castle,cddl,gpl,mixed}/**/)
+	  files=({bsd,castle,cddl,gpl,mixed}/**)
+	  #
+	  cd Build
+	  #
+	  # Remove old output
 	  ! rm 'Images/$(TARGET)_rom'*
-	  mkdir -p Apps
-	  cp -ru --preserve=mode,timestamps $(src)/castle/RiscOS/Export .
-	  ! cp -Hrsn $(src)/{bsd,castle,cddl,gpl,mixed} . 2>/dev/null
-	  ln -sf $(src)/*/RiscOS/Apps/\!* Apps
-	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
+	  #
+	  # Create needed directories
+	  mkdir -p Apps "$${dirs[@]}"
+	  #
+	  # Create relative symbolic links
+	  # Fast perl, fallback to slow shell
+	  perl -e '
+	    foreach $$f (@ARGV) {
+	      $$t = $$f;
+	      $$t =~ s:[^/]+:..:g;
+	      symlink "$$t/lock_source_1510718522/$$f", $$f;
+	    }
+	  ' "$${files[@]}" || {
+	    for i in "$${files[@]}"; do
+	      test -f "../$$i" -a ! -L "$$i" && ln -sf "$${i//+([^\/])/..}/lock_source_1510718522/$$i" "$$i"
+	      echo -n .
+	    done
+	  echo
+	  }
+	  #
 ifeq ($(TARGET), Linux)
+	  # Create version header
 	  echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
 	  cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
 endif
+	  cp -ru --preserve=mode,timestamps ../castle/RiscOS/Export .
+	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
+	  cd Apps
+	  ln -sf ../*/RiscOS/Apps/\!* .
 	}
 ifeq ($(INSECURE), YES)
-	exec 15<. 16<build
 	( setup_build )
 else
 	export -f setup_build
-	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null bash -x -e -c setup_build
+	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null --chdir /dev/fd/5 bash -e -c setup_build
 endif
 	#
 ifeq ($(METHOD), rpcemu)
-	echo '*Obey -v HostFS:$$.build.mixed.Linux.Support.Build rpcemu HostFS:$$.build HostFS:$$.AcornC/C++ $(TARGET) $(PHASES)' | \
+	echo '*Set IXFS$$Path HostFS:
+	*Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build rpcemu $(TARGET) $(PHASES)' | \
 	$(BWRAP) --unshare-pid --unshare-net --ro-bind /tmp/.X11-unix /tmp/.X11-unix --proc /proc $(sandbox_misc) \
 	--ro-bind Built/rpcemu /r --ro-bind Built/boot_iomd_rom /r/roms/ROM --tmpfs /r/hostfs --dev-bind /dev/null /r/hd4.hdf $(build_binds) \
-	--symlink /build /r/hostfs/build --symlink /AcornC.C++ /r/hostfs/AcornC.C++ --file 0 '/r/hostfs/!Boot,fea' /r/rpcemu
+	--symlink /dev/fd /r/hostfs/dev/fd --file 0 '/r/hostfs/!Boot,fea' /r/rpcemu
 else
+  ifeq ($(INSECURE), YES)
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
+  else
 	. Built/qemu_sandbox
-ifeq ($(INSECURE), YES)
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.15.mixed.Linux.Support.Build Linux IXFS:$$.dev.fd.16 IXFS:$$.dev.fd.8 $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  8<'${ACORN_CPP}' <<END 2>&1 | cat
-else
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.src.mixed.Linux.Support.Build Linux IXFS:$$.build IXFS:$$.AcornC/C++ $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS $$QEMU_sandbox $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
-endif
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS $$QEMU_sandbox $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+  endif
 	*BASIC
 	VDU 7
 	SYS "IXSupport_LinuxSyscall",20,,,,,,,1
 	END
 endif
-	find build/Images -type l -delete
-	! mv 'build/Images/$(TARGET)_rom',??? 'build/Images/$(TARGET)_rom'
-	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'build/Images/$(TARGET)_rom'
+	find Build/Images -type l -delete
+	! mv 'Build/Images/$(TARGET)_rom',??? 'Build/Images/$(TARGET)_rom'
+	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build/Images/$(TARGET)_rom'
 	true
 ifeq ($(TARGET), Linux)
-	chmod +x 'build/Images/$(TARGET)_rom'
-	ln -f build/Images/Linux_rom build/Images/Linux_rom_keep
-	mv build/Images/Linux_rom_keep RISC_OS
+	chmod +x 'Build/Images/$(TARGET)_rom'
+	ln -f Build/Images/Linux_rom Build/Images/Linux_rom_keep
+	mv Build/Images/Linux_rom_keep RISC_OS
 endif
 
 ifeq ($(TARGET), IOMD32)

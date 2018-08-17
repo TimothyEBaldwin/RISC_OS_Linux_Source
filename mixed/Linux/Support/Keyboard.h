@@ -16,8 +16,8 @@
  * online at www.castle-technology.co.uk/riscosbaselicence.htm
  */
 /* Created by Hdr2H.  Do not edit.*/
-#ifndef IXFS___BUILD_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
-#define IXFS___BUILD_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
+#ifndef IXFS___DEV_FD_5_BUILD_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
+#define IXFS___DEV_FD_5_BUILD_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
 
 #pragma force_top_level
 #pragma include_only_once
