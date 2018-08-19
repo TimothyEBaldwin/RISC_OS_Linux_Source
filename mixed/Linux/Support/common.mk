@@ -55,10 +55,10 @@ SHELL=$(warning Building $@)$(BASH)
 .PHONY: all script-all
 
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
-sandbox_misc = $(call robind,/bin /lib /lib32 /libx32 /lib64 /usr/bin /usr/lib /usr/lib32 /usr/libx32 /usr/lib64 /etc/alternatives)
-sandbox_build = $(call robind,/bin /lib /lib32 /libx32 /lib64 /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
+sandbox_misc = $(call robind,/bin /lib*  /usr/bin /usr/lib* /etc/alternatives)
+sandbox_build = $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
 sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
-ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind '$(1)' /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib(|32|x32|64)(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
+ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind '$(1)' /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
 frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol) $(lib_depends)
 
