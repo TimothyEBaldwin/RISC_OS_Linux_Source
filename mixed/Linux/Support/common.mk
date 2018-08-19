@@ -62,17 +62,19 @@ ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind '$(1)' /exe ldd /
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
 frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol) $(lib_depends)
 
-all: Built/qemu_sandbox sdl Start_RISC_OS.desktop comma2attr
+all: sdl Start_RISC_OS.desktop comma2attr
 
 ifeq ($(INSECURE), YES)
 QEMU:=/usr/bin/env
 else
 include Built/qemu_path
+all: Built/qemu_sandbox
+script-all: Built/qemu_sandbox
 endif
 
 include $(wildcard Support/build.mk)
 
-script-all: Built/sdl comma2attr Built/qemu_sandbox RISC_OS HardDisc4 Built/wrapper
+script-all: Built/sdl comma2attr RISC_OS HardDisc4 Built/wrapper
 
 RISC_OS:
 

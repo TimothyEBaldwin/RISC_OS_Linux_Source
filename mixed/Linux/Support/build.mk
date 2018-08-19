@@ -53,7 +53,10 @@ build_binds = $(foreach dir,bsd castle cddl gpl mixed,--ro-bind $(dir) /src/$(di
 ifeq ($(METHOD), rpcemu)
 build: Built/rpcemu/rpcemu Built/boot_iomd_rom
 else
-build: Built/qemu_sandbox ${LINUX_ROM}
+  ifneq ($(INSECURE), YES)
+build: Built/qemu_sandbox
+  endif
+build: ${LINUX_ROM}
 endif
 	set -o pipefail
 	uname -a
