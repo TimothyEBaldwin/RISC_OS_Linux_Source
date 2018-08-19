@@ -98,7 +98,7 @@ Built/opengl: Support/opengl.cpp $(frontend_depends)
 	g++ -pthread -g -O2 --std=c++11 Support/opengl.cpp -lGL -lGLU -lglut -o Built/opengl
 
 Built/sdlkey.h: Support/sdlkey.c $(lib_depends) Support/Keyboard.h | Built
-	gcc -std=gnu99 -Wall -IBuilt `sdl2-config --cflags --libs` Support/sdlkey.c -o Built/sdlkey
+	gcc -std=gnu99 -Wall -IBuilt Support/sdlkey.c `sdl2-config --cflags --libs` -o Built/sdlkey
 	Built/sdlkey > $@
 
 Built/comma2attr: Support/comma2attr.c $(lib_depends) | Built
