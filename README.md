@@ -18,7 +18,7 @@ This Linux port of RISC OS can be built in similar fashion to the traditional me
 
 It can also be built on Linux using the Makefiles, which runs the majority of the build on RISC OS, by default using an binary of the Linux port that is automatically downloaded from [github](https://github.com/TimothyEBaldwin/RO_Linux) and RISC OS Open Limited’s DDE in ../DDE. Allegro (for RPCEmu), Bash, Bubblewrap, GCC, GNU Make, Libseccomp and SDL 2 are also required by Makefiles and support code. Either Bubblewrap must be setuid root, or unprivileged user namespaces must be enabled.
 
-On debian the dependencies are in the packages "bash bubblewrap gcc make liballegro4-dev libc6-dev libseccomp-dev libsdl2-dev".
+On Debian and Ubuntu the dependencies are in the packages "bash bubblewrap gcc make liballegro4-dev libattr1-dev libc6-dev libpixman-1-dev libseccomp-dev libsdl2-dev unzip".
 
 Additional packages are required for building QEMU.
 
