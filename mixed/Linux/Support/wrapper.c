@@ -108,6 +108,29 @@ int main(int argc, char **argv) {
     int s = read(sockets[0], socket_args, sizeof(socket_args));
     if (s == 0) break;
 
+    s = -1;
+    if (socket_args[0] == AF_INET) {
+      s = socket(socket_args[0], socket_args[1], socket_args[2]);
+    }
+
+    union {
+      char buf[CMSG_SPACE(sizeof(int))];
+      struct cmsghdr align;
+    } u;
+
+    struct msghdr msg = {
+      .msg_control = u.buf,
+      .msg_controllen = sizeof(u.buf)
+    };
+    struct cmsghdr *cmsg;
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &s, sizeof(s));
+
+    sendmsg(sockets[0], &msg, 0);
+    close(s);
   }
 
   // Write a new line to keep output tidy.
