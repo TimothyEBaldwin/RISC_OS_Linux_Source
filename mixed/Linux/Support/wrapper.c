@@ -87,6 +87,10 @@ int main(int argc, char **argv) {
     return 109;
   }
   if (!pid) {
+    // Don't Ignore fatal signals
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+
     prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
     int socket = fcntl(sockets[1], F_DUPFD, 32);
     char s[48];
