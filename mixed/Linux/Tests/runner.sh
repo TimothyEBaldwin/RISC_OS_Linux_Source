@@ -16,7 +16,7 @@ tests() {
 run() {
   timeout --foreground -sKILL 60 \
   ${BWRAP:=bwrap} --unshare-all --share-net --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp -p) \
-  --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests $QEMU_sandbox $QEMU \
+  --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests "${QEMU_sandbox[@]}" $QEMU \
   /RISC_OS "$@"
 }
 

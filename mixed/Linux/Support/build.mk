@@ -120,7 +120,7 @@ else
 	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
   else
 	. Built/qemu_sandbox
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS $$QEMU_sandbox $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${QEMU_sandbox[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
   endif
 	*BASIC
 	VDU 7
