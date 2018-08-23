@@ -42,13 +42,17 @@ int main(int argc, char **argv) {
   int opt, rc;
   bool allow_unix_socket = false;
   bool allow_symlinks = false;
+  bool allow_ptrace = false;
 
-  while ((opt = getopt(argc, argv, "+us")) != -1) switch (opt) {
+  while ((opt = getopt(argc, argv, "+usp")) != -1) switch (opt) {
     case 'u':
       allow_unix_socket = true;
       break;
     case 's':
       allow_symlinks = true;
+      break;
+    case 'p':
+      allow_ptrace = true;
       break;
   }
 
@@ -74,6 +78,11 @@ int main(int argc, char **argv) {
 
   if (!allow_unix_socket) {
     rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1, SCMP_A0(SCMP_CMP_EQ, AF_UNIX));
+    if (rc) error(1, -rc, "Unable to create UNIX socket rule");
+  }
+
+  if (!allow_ptrace) {
+    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ptrace), 0);
     if (rc) error(1, -rc, "Unable to create UNIX socket rule");
   }
 
