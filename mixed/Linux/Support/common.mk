@@ -194,6 +194,9 @@ endif
 	if $(BWRAP) --die-with-parent --dev-bind / / true; then
 	  echo -n '--die-with-parent '
 	fi
+	if $(BWRAP) --unshare-all --as-pid-1 --dev-bind / / true; then
+	  echo -n '--as-pid-1 '
+	fi
 	echo \)
 
 Built/qemu_path: Built/gen_seccomp $(LINUX_ROM)
