@@ -144,9 +144,7 @@ endif
 
 ifeq ($(TARGET), Linux)
 check: Built/qemu_sandbox
-	if unshare -Umrnpfi true; then
-	  mixed/Linux/Tests/runner.sh ./RISC_OS
-	fi
+	mixed/Linux/Tests/runner.sh ./RISC_OS
 endif
 
 fast: PHASES=install_rom join
@@ -159,7 +157,6 @@ Support/bin/RISC_OS:
 
 update-binary:
 	+shopt -s extglob
-	unshare -Umrnpfi true
 ifndef FAST
 	git clean -fxd
 	git reset --hard
