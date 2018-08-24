@@ -12,13 +12,15 @@ If you run RISC OS directly then, unlike virtual machines such as RPCEmu, there 
 
 RISC OS Open Limited’s DDE is required to build RISC OS, this is proprietary software that may be brought from [RISC OS Open Limited](https://www.riscosopen.org/content/sales/dde)
 
+## Compiling on RISC OS
+
 This Linux port of RISC OS can be built in similar fashion to the traditional method as documented on the RISC OS website, it is not necessary to run InstallTools as the relevant files will be accessed from the DDE without copying. However this will not build the SDL front-end which connects RISC OS to the Linux graphics system, without it RISC OS is limited to a text only interface.
 
-## Top Level Makefile
+## Compiling on Linux
 
-It can also be built on Linux using the Makefiles, which runs the majority of the build on RISC OS, by default using an binary of the Linux port that is automatically downloaded from [github](https://github.com/TimothyEBaldwin/RO_Linux) and RISC OS Open Limited’s DDE in ../DDE. Allegro (for RPCEmu), Bash, Bubblewrap, GCC, GNU Make, Libseccomp and SDL 2 are also required by Makefiles and support code. Either Bubblewrap must be setuid root, or unprivileged user namespaces must be enabled.
+It can also be built on Linux using the Makefiles, which runs the majority of the build on RISC OS, by default using a binary of the Linux port that is automatically downloaded from [github](https://github.com/TimothyEBaldwin/RO_Linux) and RISC OS Open Limited’s DDE in ../DDE. Allegro (for RPCEmu), Bash, Bubblewrap, GCC, GNU Make, Libattr, Libseccomp and SDL 2 are also required by Makefiles and support code. Either Bubblewrap must be setuid root, or unprivileged user namespaces must be enabled, or insecure mode enabled.
 
-On Debian and Ubuntu the dependencies are in the packages "bash bubblewrap gcc make liballegro4-dev libattr1-dev libc6-dev libpixman-1-dev libseccomp-dev libsdl2-dev unzip".
+On Debian and Ubuntu the dependencies are in the packages "bash bubblewrap gcc g++ make liballegro4-dev libattr1-dev libc6-dev libpixman-1-dev libseccomp-dev libsdl2-dev unzip", .
 
 Additional packages are required for building QEMU.
 
@@ -33,6 +35,7 @@ The following variables are accepted by the Makefiles:
 | LINUX_ROM  | Location of Linux RISC OS executable to use for building. |
 | QEMU       | Location of qemu-arm executable. |
 | PHASES     | Space separated list of build phases to run. |
+| INSECURE   | Set to YES to enable insecure mode. |
 
 The following targets are provided by the Makefiles:
 
@@ -46,7 +49,7 @@ This following items will be download to ~/Downloads if needed:
 * RISC OS 5.22 Disc Archive
 * RISC OS 5.22 IOMD ROM Image
 * RPCEmu 0.8.15
-* QEMU 2.11.0
+* QEMU 3.0.0
 
 ## IXFS
 
@@ -71,9 +74,9 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 | Option       | Action                                          |
 | ---          | ---                                             |
 | --help       | Display help message                            |
+| --isreboot   | Indicate hard reset to RISC OS (not power on)   |
 | --nvram FILE | Filename for nvram                              |
 | --noaborts   | Disable aborts - RISC OS will die with SIGSEGV  |
-| --isreboot   | Indicate hard reset to RISC OS (not power on)   |
 | --noseccomp  | Disable seccomp support                         |
 | --notimers   | Disable HAL timers                              |
 
