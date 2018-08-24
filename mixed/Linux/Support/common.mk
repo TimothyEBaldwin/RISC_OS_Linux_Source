@@ -191,12 +191,11 @@ else
 	$(call ldd2sandbox,$(QEMU))
 	echo -n '--ro-bind $(QEMU) /qemu-arm '
 endif
-	if $(BWRAP) --die-with-parent --dev-bind / / true; then
-	  echo -n '--die-with-parent '
-	fi
-	if $(BWRAP) --unshare-all --as-pid-1 --dev-bind / / true; then
-	  echo -n '--as-pid-1 '
-	fi
+	for i in --die-with-parent --as-pid-1 "--cap-drop ALL"; do
+	  if $(BWRAP) --unshare-all $$i --dev-bind / / true; then
+	    echo -n "$$i "
+	  fi
+	done
 	echo \)
 
 Built/qemu_path: Built/gen_seccomp $(LINUX_ROM)
