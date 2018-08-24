@@ -41,6 +41,7 @@ QEMU1:=$(call pathsearch,qemu-arm)
 BASH:=$(call pathsearch,bash)
 BWRAP:=$(call pathsearch,bwrap)
 export BWRAP
+export QEMU1
 
 SHELL=$(BASH)
 JOBS:=$(shell getconf _NPROCESSORS_ONLN)
@@ -54,14 +55,6 @@ SHELL=$(warning Building $@)$(BASH)
 .DELETE_ON_ERROR:
 .PHONY: all script-all
 
-robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
-sandbox_misc = $(call robind,/bin /lib*  /usr/bin /usr/lib* /etc/alternatives)
-sandbox_build = $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
-sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
-ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind '$(1)' /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
-lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
-frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol) $(lib_depends)
-
 all: sdl Start_RISC_OS.desktop comma2attr
 
 ifeq ($(INSECURE), YES)
@@ -71,6 +64,14 @@ include Built/qemu_path
 all: Built/qemu_sandbox
 script-all: Built/qemu_sandbox
 endif
+
+robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
+sandbox_misc := $(sandbox_root) $(call robind,/usr/bin /usr/lib* /etc/alternatives)
+sandbox_build := $(sandbox_root) $(call robind,/usr /etc/alternatives) --dev /dev --tmpfs /usr/local
+sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
+ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
+lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
+frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol) $(lib_depends)
 
 include $(wildcard Support/build.mk)
 
@@ -198,17 +199,26 @@ endif
 	done
 	echo \)
 
-Built/qemu_path: Built/gen_seccomp $(LINUX_ROM)
+Built/qemu_path: Built/gen_seccomp $(LINUX_ROM) /bin
 	set -o pipefail
-	$(sandbox_base) $(sandbox_misc) true
+	$(BWRAP) --ro-bind / /  true
+	#
+	for i in /bin /sbin /lib*; do
+	  if [[ -L $$i ]]; then
+	    sandbox_root+=(--symlink "$$(readlink "$$i")" "$$i")
+	  else
+	    sandbox_root+=(--ro-bind "$$i" "$$i")
+	  fi
+	done
+	#
 	export RISC_OS_Alias_IXFSBoot='BASIC -quit IXFS:$.Finish'
 	if $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS; then
-	  echo QEMU:=/usr/bin/env > $@
-	elif $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS $$($(call ldd2sandbox,$(QEMU1))) --ro-bind '$(QEMU1)' /qemu-arm /qemu-arm /RISC_OS; then
-	  echo QEMU:='$(QEMU1)' > $@
-	else
-	  echo QEMU:=Built/qemu-arm > $@
+	  QEMU1=/usr/bin/env
+	elif ! $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS $$($(call ldd2sandbox,"$$QEMU1")) --ro-bind "$$QEMU1" /qemu-arm /qemu-arm /RISC_OS; then
+	  QEMU1=Built/qemu-arm
 	fi
+	echo "sandbox_root:=$${sandbox_root[@]@Q}
+	QEMU:=$$QEMU1" > $@
 
 HardDisc4: | $(HARDDISC4) Built/comma2attr
 	set -o pipefail
