@@ -182,7 +182,7 @@ endif
 	mkdir -p Support/bin/Support
 	cp -v --reflink=auto --preserve=mode,xattr Support/!(protocol.h|bin|build.mk|Build,feb|BufferWriteC) Support/bin/Support/
 	cp -v --reflink=auto --preserve=mode,xattr mixed/Linux/SocketKVM/h/protocol Support/bin/Support/protocol.h
-	cp -v --reflink=auto --preserve=mode,xattr RISC_OS Support/bin/RISC_OS
+	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Support/bin/
 	ln -sf 'Support/Start_RISC_OS.desktop' 'Support/bin/Start_RISC_OS.desktop'
 	#
 	echo "# Source and build GIT commits
