@@ -145,8 +145,8 @@ ifeq ($(TARGET), Linux)
 endif
 
 ifeq ($(TARGET), IOMD32)
-check: Built/rpcemu/rpcemu Built/rpcemu_sandbox
-	mixed/Linux/Tests/runner_rpcemu.sh Images/$(TARGET)_rom'
+check: Built/rpcemu/rpcemu
+	mixed/Linux/Tests/runner_rpcemu.sh 'Build/Images/$(TARGET)_rom'
 endif
 
 ifeq ($(TARGET), Linux)
