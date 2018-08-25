@@ -16,19 +16,6 @@
 # online at www.castle-technology.co.uk/riscosbaselicence.htm
 # 
 # Makefile for Floating Point Accelerator Support Code (FPASC)
-#
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name     Description
-# ----       ----     -----------
-# 25-May-94  AMcC     Created.
-# 17-Aug-94  AMcC     Removed Specific machine names.
-#                     If building for old series machines, comment out A600
-#                     target and uncomment ARM2/3 target.
-# 28-Jan-97  KJB      If building for a kernel that is capable of operating
-#                     in a 32-mode with interrupts enabled, you can change
-#                     the APCS to 32bit for a more efficient emulator
 
 COMPONENT ?= FPEmulator
 SA_MODULE  = FPERAM${SUFFIX_MODULE}
