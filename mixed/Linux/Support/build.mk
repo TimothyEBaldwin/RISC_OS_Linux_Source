@@ -191,6 +191,7 @@ endif
 	cp -v --reflink=auto --preserve=mode,xattr mixed/Linux/SocketKVM/h/protocol Support/bin/Support/protocol.h
 	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Support/bin/
 	ln -sf 'Support/Start_RISC_OS.desktop' 'Support/bin/Start_RISC_OS.desktop'
+	ln -sf 'Support/run_RISC_OS' 'Support/bin/run_RISC_OS'
 	#
 	echo "# Source and build GIT commits
 	SOURCE=$$SOURCE
