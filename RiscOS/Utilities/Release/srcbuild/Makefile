@@ -30,6 +30,7 @@ COMPONENT ?= srcbuild
 OBJS      = srcbuild riscos build parse
 LIBS      = ${CLXLIB}
 
+include HostTools
 include CApp
 
 # Dynamic dependencies:

@@ -26,5 +26,6 @@ OBJS       = bytesex dir elf err filestamp hash host         maxalloc pathmacro 
 CDEFINES   = -Dkernelheader="\"kernel.h\""
 
 include CLibrary
+include HostTools
 
 # Dynamic dependencies:
