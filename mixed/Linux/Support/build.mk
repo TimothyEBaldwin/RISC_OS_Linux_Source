@@ -110,11 +110,18 @@ else
 endif
 	#
 ifeq ($(METHOD), rpcemu)
-	echo '*Set IXFS$$Path HostFS:
-	*Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build rpcemu $(TARGET) $(PHASES)' | \
-	$(BWRAP) --unshare-pid --unshare-net --ro-bind /tmp/.X11-unix /tmp/.X11-unix --proc /proc $(sandbox_misc) \
-	--ro-bind Built/rpcemu /r --ro-bind Built/boot_iomd_rom /r/roms/ROM --tmpfs /r/hostfs --dev-bind /dev/null /r/hd4.hdf $(build_binds) \
-	--symlink /dev/fd /r/hostfs/dev/fd --file 0 '/r/hostfs/!Boot,fea' /r/rpcemu
+	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build rpcemu $(TARGET) $(PHASES)' | \
+	$(BWRAP) --unshare-pid --unshare-net $(sandbox_misc) \
+	--ro-bind /tmp/.X11-unix /tmp/.X11-unix \
+	--proc /proc \
+	--ro-bind Built/rpcemu /r \
+	--tmpfs /r/hostfs \
+	--dev-bind /dev/null /r/hd4.hdf \
+	--ro-bind Built/boot_iomd_rom /r/roms/ROM \
+	$(build_binds) \
+	--symlink /dev/fd /r/hostfs/dev/fd \
+	--file 0 '/r/hostfs/!Boot,fea' \
+	/r/rpcemu
 else
   ifeq ($(INSECURE), YES)
 	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
