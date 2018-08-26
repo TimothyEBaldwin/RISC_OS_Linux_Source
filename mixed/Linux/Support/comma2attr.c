@@ -35,8 +35,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #include <attr/xattr.h>
+#include <attr/attributes.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
