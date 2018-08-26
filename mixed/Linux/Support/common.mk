@@ -75,7 +75,7 @@ frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protoco
 
 include $(wildcard Support/build.mk)
 
-script-all: Built/sdl comma2attr RISC_OS HardDisc4 Built/wrapper
+script-all: Built/sdl RISC_OS HardDisc4 Built/wrapper
 
 RISC_OS:
 
@@ -220,27 +220,33 @@ Built/qemu_path: Built/gen_seccomp $(LINUX_ROM) /bin
 	echo "sandbox_root:=$${sandbox_root[@]@Q}
 	QEMU:=$$QEMU1" > $@
 
-HardDisc4: | $(HARDDISC4) Built/comma2attr
+HardDisc4: | $(HARDDISC4)
 	set -o pipefail
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files
-	ln Built/comma2attr HardDisc4_files/comma2attr
 	cp --reflink=auto '$(HARDDISC4)' HardDisc4_files/HardDisc4.zip
 	unpack() {
 	  echo 'b2229fbf5f08026d99e2fd552431187d868b3276816b1429709d0594b4a400bc *HardDisc4.zip' | sha256sum -c
-	  unzip -F HardDisc4.zip
+	  unzip HardDisc4.zip
 	  rm HardDisc4.zip
 	  chmod -R u+rw .
+	  mv 'HardDisc4/!Boot/!Run' 'HardDisc4/!Boot/!Run_real,feb'
+	  {
+	    echo 'Dir <Obey$$Dir>.^'
+	    cat ../Support/hd4_types
+	    echo -n '
+	      Remove <Obey$$Dir>.!Run
+	      Rename <Obey$$Dir>.!Run_real <Obey$$Dir>.!Run
+	      /<Obey$$Dir>'
+	  } >> 'HardDisc4/!Boot/!Run,feb'
 	  cp -a --reflink=auto 'HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4/!Boot/Choices/Boot'
 	  printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
-	  ! ./comma2attr --recurse --strip .
-	  rm ./comma2attr
 	}
 ifeq ($(INSECURE), YES)
 	( cd HardDisc4_files && unpack )
 else
 	export -f unpack
-	$(sandbox_base) $(sandbox_misc) --bind HardDisc4_files /hd4 --chdir /hd4 bash -x -e -c unpack
+	$(sandbox_base) $(sandbox_misc) --ro-bind Support /Support --bind HardDisc4_files /hd4 --chdir /hd4 bash -x -e -c unpack
 endif
 	mv HardDisc4_files/HardDisc4 .
 
