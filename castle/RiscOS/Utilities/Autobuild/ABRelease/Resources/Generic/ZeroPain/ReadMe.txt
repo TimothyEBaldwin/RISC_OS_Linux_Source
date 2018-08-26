@@ -18,7 +18,7 @@ b) Writing
    or similar knock on effects.
 
 Starting with RISC OS 5.24 the default state is running with the processor
-vectors and kernel's workspace moved away from "zero page. But due to the 
+vectors and kernel's workspace moved away from zero page. But due to the 
 large amount of buggy software out there as a temporary measure there is still
 a page of RAM left mapped in at the old address. The access attributes are
 set such that:

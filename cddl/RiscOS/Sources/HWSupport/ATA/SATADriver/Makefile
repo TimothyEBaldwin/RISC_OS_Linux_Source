@@ -17,7 +17,7 @@ ROMCDEFINES = -DROM_MODULE
 #LIBS       += ${DEBUGLIBS} ${NET5LIBS}
 
 # Decide whether to use OS_Memory 0 or OS_Memory 19 for DMA prep
-OSMEM19 ?= FALSE
+OSMEM19 ?= TRUE
 
 ifeq ($(OSMEM19),TRUE)
 CFLAGS += -DOSMEM19

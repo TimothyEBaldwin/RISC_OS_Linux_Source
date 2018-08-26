@@ -36,7 +36,8 @@ CFLAGS          = -Wpn -APCS 3/32bit/nofp/noswst -IC:
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 CUSTOMSA        = custom
-EXPORTS         = ${EXP_HDR}.EnvNumbers \
+EXPORTS         = ${EXP_HDR}.DBellDevice \
+                  ${EXP_HDR}.EnvNumbers \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
                   ${EXP_HDR}.ModHand \
@@ -120,6 +121,9 @@ export: ${EXPORTS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
         ${CP} hdr.EnvNumbers $@ ${CPFLAGS}
+
+${EXP_HDR}.DBellDevice: hdr.DBellDevice
+        ${CP} hdr.DBellDevice $@ ${CPFLAGS}
 
 ${EXP_HDR}.HALDevice: hdr.HALDevice
         ${CP} hdr.HALDevice $@ ${CPFLAGS}
