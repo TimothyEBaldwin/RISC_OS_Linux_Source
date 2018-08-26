@@ -43,21 +43,28 @@
 
 struct termios oldTioIn, newTioIn;
 
-static void stop_handler(int signal) {
+static void stop_handler(int s) {
   tcsetattr(0, TCSANOW, &oldTioIn);
   raise(SIGSTOP);
   tcsetattr(0, TCSANOW, &newTioIn);
 }
 
+static void fatal_handler(int s) {
+  tcsetattr(0, TCSANOW, &oldTioIn);
+  signal(s, SIG_DFL);
+  raise(signal);
+}
+
 int main(int argc, char **argv) {
 
-
-  // Ignore fatal signals
-  signal(SIGINT, SIG_IGN);
-  signal(SIGTERM, SIG_IGN);
+  // Die if parent dies
+  prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
 
   // Get terminal status, if successful reopen terminal for input.
   if (!tcgetattr(0, &oldTioIn)) {
+
+    // Standard input is a terminal, ro reopen it avoid
+    // other programs having to cope with non-blocking etc.
     int fd = open("/proc/self/fd/0", O_RDONLY);
     if (fd > 0) {
       dup2(fd, 0);
@@ -70,12 +77,17 @@ int main(int argc, char **argv) {
     newTioIn.c_cc[VMIN] = 1;
     newTioIn.c_cc[VTIME] = 0;
     newTioIn.c_lflag &= ~ICANON & ~ECHO;
+
+    // Install cleanup signal handlers
     signal(SIGTSTP, &stop_handler);
     signal(SIGTTIN, &stop_handler);
     signal(SIGTTOU, &stop_handler);
+    signal(SIGINT,  &fatal_handler);
+    signal(SIGHUP,  &fatal_handler);
+    signal(SIGTERM, &fatal_handler);
 
+    // Set new termnal state
     tcsetattr(0, TCSANOW, &newTioIn);
-
   }
 
   int sockets[2];
@@ -84,13 +96,10 @@ int main(int argc, char **argv) {
   pid_t self = getpid();
   pid_t pid = fork();
   if (pid < 0) {
+    tcsetattr(0, TCSANOW, &oldTioIn);
     return 109;
   }
   if (!pid) {
-    // Don't Ignore fatal signals
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
-
     prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
     int socket = fcntl(sockets[1], F_DUPFD, 32);
     char s[48];
