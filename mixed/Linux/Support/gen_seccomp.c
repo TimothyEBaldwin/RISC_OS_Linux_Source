@@ -37,6 +37,15 @@
 
 #include <seccomp.h>
 
+static scmp_filter_ctx ctx;
+
+static void ban(int syscall, const char* message) {
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(syscall), 0);
+  if (rc) error(1, -rc, message);
+}
+
+#define BAN(s) ban(SCMP_SYS(s), "Unable to create " #s " rule")
+
 int main(int argc, char **argv) {
 
   int opt, rc;
@@ -56,7 +65,7 @@ int main(int argc, char **argv) {
       break;
   }
 
-  scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
+  ctx = seccomp_init(SCMP_ACT_ALLOW);
   if (!ctx) error(1, errno, "Unable to create libseccomp context");
 
 #ifdef __aarch64__
@@ -69,11 +78,8 @@ int main(int argc, char **argv) {
   if (rc) error(1, -rc, "Unable to create rule to block inserting into terminal input buffer");
 
   if (!allow_symlinks) {
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(symlink), 0);
-    if (rc) error(1, -rc, "Unable to create symlink rule");
-
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(symlinkat), 0);
-    if (rc) error(1, -rc, "Unable to create symlinkat rule");
+    BAN(symlink);
+    BAN(symlinkat);
   }
 
   if (!allow_unix_socket) {
@@ -82,18 +88,12 @@ int main(int argc, char **argv) {
   }
 
   if (!allow_ptrace) {
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ptrace), 0);
-    if (rc) error(1, -rc, "Unable to create UNIX socket rule");
+    BAN(ptrace);
   }
 
-  rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(keyctl), 0);
-  if (rc) error(1, -rc, "Unable to create keyctl rule");
-
-  rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(request_key), 0);
-  if (rc) error(1, -rc, "Unable to create request_key rule");
-
-  rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(add_key), 0);
-  if (rc) error(1, -rc, "Unable to create add_key rule");
+  BAN(keyctl);
+  BAN(request_key);
+  BAN(add_key);
 
   rc = seccomp_export_bpf(ctx, STDOUT_FILENO);
   if (rc) error(1, -rc, "Unable to load seccomp rules");
