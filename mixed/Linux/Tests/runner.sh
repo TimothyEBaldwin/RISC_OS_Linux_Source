@@ -17,18 +17,20 @@ exec </dev/null 3>/dev/null 2>&1 > >(cat)
 
 run() {
   timeout --foreground -sKILL 60 \
-  ${BWRAP:=bwrap} --unshare-all --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp -p) \
+  ${BWRAP:=bwrap} --unshare-all --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp $1) \
   --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests "${QEMU_sandbox[@]}" $QEMU \
-  /RISC_OS "$@"
+  /RISC_OS "${@:2}"
 }
 
 set -x
 
-# Test ptrace SWI implemnation
-RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run --noseccomp --nofork --noaborts
+if [[ $QEMU -eq "" ]]; then
+  # Test ptrace SWI implemnation
+  RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run -p --noaborts
+fi
 
 # Various tests that shouldn't cause data aborts
-RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run --nofork --noaborts
+RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run '' --noaborts
 
 # Various tests that require data aborts
-RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run --nofork
+RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run ''

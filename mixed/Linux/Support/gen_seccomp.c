@@ -32,6 +32,7 @@
 #include <error.h>
 #include <stdbool.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -89,6 +90,10 @@ int main(int argc, char **argv) {
 
   if (!allow_ptrace) {
     BAN(ptrace);
+  } else {
+    BAN(seccomp);
+    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(prctl), 1, SCMP_A0(SCMP_CMP_EQ, PR_SET_SECCOMP));
+    if (rc) error(1, -rc, "Unable to prctl(PR_SET_SECCOMP...) rule");
   }
 
   BAN(keyctl);
