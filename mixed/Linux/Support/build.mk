@@ -100,7 +100,7 @@ endif
 	  cp -ru --preserve=mode,timestamps ../castle/RiscOS/Export .
 	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
 	  cd Apps
-	  ln -sf ../*/RiscOS/Apps/\!* .
+	  ln -sf ../../lock_source_1510718522/Build/*/RiscOS/Apps/\!* .
 	}
 ifeq ($(INSECURE), YES)
 	( setup_build )
