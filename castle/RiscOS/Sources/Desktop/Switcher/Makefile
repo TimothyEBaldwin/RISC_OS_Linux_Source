@@ -36,12 +36,12 @@ include StdTools
 include AAsmModule
 
 resources-special:
-        ${MKDIR} ${RESFSDIR}
-        Set SwitcherRes$Path LocalUserIFRes:,LocalRes:
-        ${CP} SwitcherRes:Messages  ${RESFSDIR}.Messages ${CPFLAGS}
-        ${CP} SwitcherRes:Templates ${RESFSDIR}.Templates ${CPFLAGS}
-        Unset SwitcherRes$Path
-        @echo ${COMPONENT}: resource files copied
+	${MKDIR} ${RESFSDIR}
+	Set SwitcherRes$Path LocalUserIFRes:,LocalRes:
+	${CP} SwitcherRes:Messages  ${RESFSDIR}.Messages ${CPFLAGS}
+	${CP} SwitcherRes:Templates ${RESFSDIR}.Templates ${CPFLAGS}
+	Unset SwitcherRes$Path
+	@echo ${COMPONENT}: resource files copied
 
 
 include Depends

@@ -40,10 +40,10 @@ include AAsmModule
 ${SA_OBJECT} ${DBG_OBJECT} ${ROM_OBJECT}: ${SPRITEFILE}
 
 ${SPRITEFILE}: SystemDisc
-        ${SQUASH} SystemDisc $@
+	${SQUASH} SystemDisc $@
 
 clean ::
-        ${RM} ${SPRITEFILE}
+	${RM} ${SPRITEFILE}
 
 
 include Depends
