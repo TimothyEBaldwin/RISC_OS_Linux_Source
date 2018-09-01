@@ -1,0 +1,230 @@
+/*
+ * Copyright (c) 2018, RISC OS Open Ltd
+ * Copyright (c) 1995, 1996, 1997, 1998, and 1999 WIDE Project.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <string.h>
+#include <stdlib.h>
+#include "Global/NewErrors.h"
+#include "sys/types.h"
+#include "sys/param.h"
+#include "sys/socket.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+#include "netdb.h"
+#include "socklib.h"
+#include "swis.h"
+
+/*
+ * DNS module SWIs
+ */
+#define DNS_GetHostByName 0x46000
+#define DNS_GetHost       0x46001 /* According to ANT Resolver */
+#define DNS_GetHostByAddr 0x46001 /* According to InetDB and ResolverZM */
+
+static struct hostent *hostentdup(struct hostent *hp, int *err)
+{
+	struct hostent *nhp;
+	char *cp, **pp;
+	size_t size, addrsize;
+	size_t nalias = 0, naddr = 0;
+	int al_off;
+	int i;
+
+	if (hp == NULL)
+		return hp;
+
+	/* count size to be allocated */
+	size = sizeof(struct hostent);
+	if (hp->h_name != NULL)
+		size += strlen(hp->h_name) + 1;
+	if ((pp = hp->h_aliases) != NULL) {
+		for (i = 0; *pp != NULL; i++, pp++) {
+			if (**pp != '\0') {
+				size += strlen(*pp) + 1;
+				nalias++;
+			}
+		}
+	}
+	/* adjust alignment */
+	size = ALIGN(size);
+	al_off = size;
+	size += sizeof(char *) * (nalias + 1);
+	addrsize = ALIGN(hp->h_length);
+	if ((pp = hp->h_addr_list) != NULL) {
+		while (*pp++ != NULL)
+			naddr++;
+	}
+	size += addrsize * naddr;
+	size += sizeof(char *) * (naddr + 1);
+
+	/* copy */
+	if ((nhp = (struct hostent *)malloc(size)) == NULL) {
+		*err = TRY_AGAIN;
+		return NULL;
+	}
+	cp = (char *)&nhp[1];
+	if (hp->h_name != NULL) {
+		nhp->h_name = cp;
+		strcpy(cp, hp->h_name);
+		cp += strlen(cp) + 1;
+	} else
+		nhp->h_name = NULL;
+	nhp->h_aliases = (char **)((char *)nhp + al_off);
+	if ((pp = hp->h_aliases) != NULL) {
+		for (i = 0; *pp != NULL; pp++) {
+			if (**pp != '\0') {
+				nhp->h_aliases[i++] = cp;
+				strcpy(cp, *pp);
+				cp += strlen(cp) + 1;
+			}
+		}
+	}
+	nhp->h_aliases[nalias] = NULL;
+	cp = (char *)&nhp->h_aliases[nalias + 1];
+	nhp->h_addrtype = hp->h_addrtype;
+	nhp->h_length = hp->h_length;
+	nhp->h_addr_list = (char **)cp;
+	if ((pp = hp->h_addr_list) != NULL) {
+		cp = (char *)&nhp->h_addr_list[naddr + 1];
+		for (i = 0; *pp != NULL; pp++) {
+			nhp->h_addr_list[i++] = cp;
+			memcpy(cp, *pp, hp->h_length);
+			cp += addrsize;
+		}
+	}
+	nhp->h_addr_list[naddr] = NULL;
+	return nhp;
+}
+
+struct hostent *getipnodebyname(const char *name, int af, int flags, int *err)
+{
+	struct in_addr numeric;
+	struct hostent *hp;
+	_kernel_oserror *e;
+
+	if (af != AF_INET) {
+		*err = NO_RECOVERY;
+		return NULL;
+	}
+	if (flags & AI_ADDRCONFIG) {
+		/* Flags AI_V4MAPPED_CFG
+		 *       AI_V4MAPPED
+		 *       AI_ALL
+		 * ignored since AF_INET6 rejected above.
+		 */
+		int s = socket(af, SOCK_DGRAM, 0);
+		if (s < 0) {
+			*err = NO_RECOVERY;
+			return NULL;
+		}
+		socketclose(s);
+	}
+	if (inet_aton(name, &numeric)) {
+		struct hostent hres;
+		char *addr_list[2];
+
+		/* Numeric address converted OK */
+		hres.h_name = (char *)name;
+		hres.h_aliases = NULL;
+		hres.h_addr_list = addr_list;
+		hres.h_addrtype = af;
+		hres.h_length = sizeof(struct in_addr);
+		addr_list[0] = (char *)&numeric;
+		addr_list[1] = NULL;
+
+		*err = NETDB_SUCCESS;
+		return hostentdup(&hres, err);
+	}
+
+	/* Try a name lookup */
+	e = _swix(DNS_GetHostByName, _INR(0,1)|_OUT(1), 0, name, &hp);
+	if ((e == NULL) && (hp != NULL))
+		goto copy;
+	if ((e != NULL) && (e->errnum != ErrorNumber_NoSuchSWI)) {
+		/* Resolution error */
+		*err = TRY_AGAIN;
+		return NULL;
+	}
+
+	/* Try the hosts database (strictly, not reentrant) */
+	sethostent(0);
+	while (hp = gethostent()) {
+		char **aliases;
+
+		if (strcmp(hp->h_name, name) == 0)
+			goto found;
+		for (aliases = hp->h_aliases;
+		     aliases != NULL && *aliases != NULL;
+		     aliases++) {
+			if (strcmp(*aliases, name) == 0)
+				goto found;
+		}
+	}
+found:
+	endhostent();
+	if (hp == NULL) {
+		/* No matches */
+		*err = HOST_NOT_FOUND;
+		return NULL;
+	}
+copy:
+	/* Take a copy of potentially static records */
+	*err = NETDB_SUCCESS;
+	return hostentdup(hp, err);
+}
+
+struct hostent *getipnodebyaddr(const void *src, size_t srclen, int af, int *err)
+{
+	if (af != AF_INET) {
+		*err = NO_RECOVERY;
+		return NULL;
+	}
+
+	if (srclen == sizeof(struct in_addr)) {
+		struct in_addr numeric;
+		char conv[INET_ADDRSTRLEN];
+
+		/* Convert the src into a dotted string and pass on */
+		memcpy(&numeric, src, sizeof(struct in_addr));
+		if (numeric.s_addr == INADDR_ANY) {
+			*err = NO_RECOVERY;
+			return NULL;
+		}
+		inet_ntop(af, src, conv, sizeof(conv));
+
+		return getipnodebyname(conv, af, AI_DEFAULT, err);
+	}
+
+	*err = NO_RECOVERY;
+	return NULL;
+}
+
+void freehostent(struct hostent *ptr)
+{
+	/* hostentdup() rolled everything into a single malloc() */
+	free(ptr);
+}

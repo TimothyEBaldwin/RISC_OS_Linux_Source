@@ -1,0 +1,810 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:    filters.c
+ * Purpose: handling Wimp filters installed by Object Modules in the Toolbox
+ * Author:  Ian Johnson
+ * History: 13-Sep-93: IDJ:   created
+ *          26-Jul-94: IDJ: don't corrupt parent/ancestor when object not found on which
+ *                          event happened (eg ObjectDeleted).
+ *          26-Jul-94: IDJ: added concept of "eaten" event which should not be delivered
+ *                          back to client (to help Wimp_ProcessKey stuff)
+ *          08-Aug-94: IDJ: only do a Wimp_AddMessages, when a filter gets registered on
+ *                          behalf of a task which was either interested in no messages
+ *                          or a specific list of messages (ie don;t do it for a task
+ *                          which was interested in ALL messages!)
+ *          15-Aug-94: IDJ: raise tbox error on error return from prefilter call
+ *          AFTER PRODUCT RELEASE
+ *           7-Feb-95: IDJ: AQU-00793 - never claim nulls, cos it breaks wimp_starttask
+ *                          (see comment in postfilter)
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "twimp.h"
+#include "messages.h"
+#include "objects/toolbox.h"
+#include "objects/window.h"
+
+#include "globals.h"
+
+
+#include "task.h"
+#include "object.h"
+#include "event.h"
+
+#include "filters.h"
+
+/* used to raise errors to the client, during event handling */
+static ToolboxErrorEvent error_event = {{sizeof(ToolboxErrorEvent),0,Toolbox_Error}};
+
+/*
+ * Hanging on each task descriptor there is a list of postfilters to call and
+ * a list of prefilters.  When a Wimp event occurs the postfilters are called
+ * only if there is an object module which has expressed interest in an event
+ * of this type on an object whose class is the same as the object for which
+ * the event has occurred.  Prefilters are all called, when SWI Wimp_Poll
+ * is called by the client.
+ *
+ */
+
+
+extern void filters_remove_list (void)
+{
+    filters_PreFilter  *pre  = task->prefilter_list;
+    filters_PostFilter *post = task->postfilter_list;
+
+    while (pre != NULL)
+    {
+        filters_PreFilter *next = pre->next;
+
+        mem_free ((void *)pre, "removing list of prefilters");
+
+        pre = next;
+    }
+    task->prefilter_list = NULL;
+
+    while (post != NULL)
+    {
+        filters_PostFilter *next = post->next;
+
+        mem_free ((void *)post, "removing list of postfilters");
+
+        post = next;
+    }
+    task->postfilter_list = NULL;
+}
+
+
+/*********************************** object module SWIs ********************************/
+
+extern _kernel_oserror *filters_register_postfilter (_kernel_swi_regs *r)
+{
+
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *                 bit 0 set means no longer interested in being called
+     *                       by post-filter.
+     *         R1  =  SWI number to be called by filter
+     *                (0 => no longer interested in being called by filter
+     *                 for these events, messages or Toolbox Events).
+     *         R2  =  one-word value to be passed to the postfilter SWI in
+     *                R2
+     *         R3  =  filter type
+     *                   1 => Wimp Events
+     *                   2 => Wimp Messages
+     *                   3 => Toolbox Events
+     *         R4  =  -> list of pairs of Object Class identifier and either
+     *                   Wimp event codes, Wimp message numbers, or Toolbox
+     *                   Event codes depending on the value of R3.
+     *
+     *    Exit:
+     *         R1-R9 preserved
+     *
+     */
+
+    _kernel_oserror          *e           = NULL;
+    filters_PostFilter       *f, *prev_f;
+    int                       swi_to_call = r->r[1];
+    void                     *R2          = (void *)r->r[2];
+    int                       type        = r->r[3];
+    EventInterest            *i           = (EventInterest*)r->r[4];
+
+    /*
+     * If appropriate bit set in R0, then remove the filter from the list
+     * to be called, else add a new filter if not already there.
+     * Do this for each entry in the list pointed at by R4 (terminated by
+     * a -1 word.
+     *
+     */
+
+    /*
+     * NOTE:******* expressing an interest in a wimp message will cause all such
+     * messages to be delivered from now on!
+     */
+
+    DEBUG debug_output ("postfilters", "T:Registering postfilter - SWI %x, pw %p, type %d\n", r->r[1], (void *)r->r[2], r->r[3]);
+
+    while (i->code != -1)
+    {
+        int         code  = i->code;
+        ObjectClass class_id = i->class_id;
+
+
+        f = task->postfilter_list;
+
+        /*
+         * search for this entry in the list of postfilters
+         *
+         */
+
+        prev_f = f;
+        while (f != NULL)
+        {
+            if (f->type == type &&
+                f->code == code &&
+                f->swi_to_call == swi_to_call &&
+                f->R2 == R2 &&
+                f->class_id == class_id)
+                break;
+            prev_f = f;
+            f = f->next;
+        }
+
+        if (r->r[0] & Toolbox_RegisterPostFilter_Remove)
+        {
+            /*
+             * if found remove it
+             */
+
+            if (f != NULL)
+            {
+                DEBUG debug_output ("postfilters", "T:Removing postfilter %d %x %x \n", f->type, f->code, f->class_id);
+
+                if (f == task->postfilter_list)      /* remove at head of list */
+                    task->postfilter_list = f->next;
+                else
+                    prev_f->next = f->next;
+
+                mem_free ((void *)f, "freeing postfilter");
+            }
+        }
+        else
+        {
+            /*
+             * if not already there, add a new entry
+             */
+
+            filters_PostFilter *new_elem;
+
+            if (f == NULL)
+            {
+                DEBUG debug_output ("postfilters", "T:Adding new postfilter\n");
+
+                /*
+                 * if interested in a Wimp message, then add to Wimp list for this task
+                 * NOTE: we only add to wimp mesages if task is not already interested
+                 * in all wimp messages!
+                 */
+
+                if (type == Toolbox_RegisterPostFilter_WimpMessage &&
+                   (task->wimp_msg_list == NULL ||
+                   (task->wimp_msg_list != NULL && task->wimp_msg_list[0] != 0)
+                   ))
+                {
+                    _kernel_swi_regs regs;
+                    _kernel_oserror *e;
+                    int list[2];
+
+                    list[0] = code;
+                    list[1] = 0;
+
+                    regs.r[0] = (int)list;
+
+                    DEBUG debug_output ("Wimp_AddMessages", "T:Adding message %x\n", code);
+
+                    if ((e = _kernel_swi (Wimp_AddMessages, &regs, &regs)) != NULL)
+                        return e;
+                }
+
+                if ((new_elem = mem_allocate (sizeof(filters_PostFilter), "postfilter")) == NULL)
+                    return make_error (Toolbox_NoMem, 0);
+
+                new_elem->next = task->postfilter_list;
+                task->postfilter_list = new_elem;
+
+                new_elem->type        = type;
+                new_elem->code        = code;
+                new_elem->swi_to_call = swi_to_call;
+                new_elem->R2          = R2;
+                new_elem->class_id    = class_id;
+            }
+        }
+
+        i++;   /* move on to next event of interest */
+    }
+
+    DEBUG debug_output ("postfilters", "T:PostFilter registered OK\n");
+
+    return e;
+}
+
+
+static filters_PreFilter *filters__find_prefilter (int swi_to_call, void *R2)
+{
+    filters_PreFilter *f = task->prefilter_list;
+
+    while (f != NULL)
+    {
+        if (f->swi_to_call == swi_to_call && f->R2 == R2)
+            break;
+        f = f->next;
+    }
+
+    return f;
+}
+
+static void filters__remove_prefilter (filters_PreFilter *f)
+{
+    if (f == task->prefilter_list)
+        task->prefilter_list = f->next;
+    else
+        f->prev->next = f->next;
+
+    if (f->next != NULL)
+        f->next->prev = f->prev;
+}
+
+static _kernel_oserror *filters__add_prefilter (int swi_to_call, void *R2)
+{
+    filters_PreFilter *f;
+
+    DEBUG debug_output ("prefilters", "allocating memory for prefilter\n");
+
+    if ((f = (filters_PreFilter *)mem_allocate (sizeof(filters_PreFilter), "prefilter")) == NULL)
+        return make_error (Toolbox_NoMem, 0);
+
+    DEBUG mem_chk(task->prefilter_list, CHECK_HEAP);
+
+    f->next        = task->prefilter_list;
+    f->prev        = NULL;
+    f->swi_to_call = swi_to_call;
+    f->R2          = R2;
+    if (task->prefilter_list != NULL)
+        (task->prefilter_list)->prev = f;
+    task->prefilter_list = f;
+
+    DEBUG debug_output ("prefilters", "added prefilter\n");
+
+    return NULL;
+}
+
+extern _kernel_oserror *filters_register_prefilter (_kernel_swi_regs *r)
+{
+
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *                 bit 0 set means no longer interested in being called
+     *                       by pre-filter.
+     *         R1  =  SWI number to be called by filter
+     *         R2  =  one-word value to be passed to the SWI (in R2)
+     *
+     *   Exit:
+     *         R1-R9 preserved
+     *
+     */
+
+    /*
+     * If adding a prefilter, look to see if it's there already, if not add it
+     * If removing a prefilter, just remove it
+     */
+
+    filters_PreFilter  *f;
+    _kernel_oserror    *e;
+
+    DEBUG debug_output ("prefilters", "registering prefilter\n");
+
+    /* see if the prefilter is already there */
+    if ((f = filters__find_prefilter (r->r[1], (void *)r->r[2])) != NULL)
+    {
+        if (r->r[0] & Toolbox_RegisterPreFilter_Remove)
+        {
+            filters__remove_prefilter (f);
+            mem_free(f, "Freeing prefilter memory");
+        }
+        return NULL;   /* do nothing */
+    }
+
+    /*
+     * trying to remove a prefilter which is not there!
+     */
+
+    if (f == NULL && r->r[0] & Toolbox_RegisterPreFilter_Remove)
+    {
+        return make_error (Toolbox_NoSuchPreFilter, 0);
+    }
+
+    DEBUG debug_output ("prefilters", "adding prefilter\n");
+
+    /* add prefilter */
+    if ((e = filters__add_prefilter (r->r[1], (void *)r->r[2])) != NULL)
+        return e;
+
+    return NULL;
+}
+
+
+
+/********************************************* the Toolbox's own filters *******************************/
+
+extern int filters_prefilter (int mask, void *block, TaskDescriptor *this_task);
+extern int filters_prefilter (int mask, void *block, TaskDescriptor *this_task)
+{
+
+    /*
+     * This function gets called as a Wimp pre-filter for the current task.
+     * It is passed the current task's descriptor as a sanity check
+     * (it should have the same value as the global "task", which gets set
+     * in the post-filter).  It just zips down the list of pre-filters for
+     * this task calling them.
+     * Mask is the R0 value passed to Wimp_Poll
+     * Block is the R1 value passed to Wimp_Poll
+     *
+     * Note the original mask is always passed to the object modules.
+     */
+
+    filters_PreFilter *f        = task->prefilter_list;
+    int                new_mask = mask;
+
+    IGNORE (this_task);
+
+    /*
+     * note the mask used by the client.  This will be used in the postfilter
+     * to decide whether to pass an event back to the client (it may have occurred
+     * because we enabled an event for toolbox purposes)
+     */
+
+    task->mask = mask;
+
+    DEBUG debug_output ("mask", "T:Original poll mask %x\n", mask);
+
+    /*
+     * call all registered prefilters in turn, passing them their R2
+     */
+
+    while (f != NULL)
+    {
+        _kernel_swi_regs regs;
+        _kernel_oserror *e;
+
+        DEBUG debug_output ("prefilters", "T:Calling prefilter 0x%x (%x)\n", f->swi_to_call, (int)f->R2);
+
+        regs.r[0] = mask;
+        regs.r[1] = (int)block;
+        regs.r[2] = (int)f->R2;
+        e = _kernel_swi (f->swi_to_call, &regs, &regs);
+
+        if (e)
+        {
+            error_event.errnum = e->errnum;
+            strncpy (error_event.errmess, e->errmess, 208);  /*yuk*/
+
+            regs.r[0] = 0;
+            regs.r[1] = 0;
+            regs.r[2] = -1;
+            regs.r[3] = (int)&error_event;
+            event_raise_toolbox_event(&regs);
+        }
+
+        /*
+         * mask may have been modified by the SWI, so we make it the current
+         * mask.
+         */
+
+        new_mask &= regs.r[0];
+
+        f = f->next;
+    }
+
+
+    DEBUG debug_output ("mask", "T:Poll mask after calling prefilters %x\n", new_mask);
+
+    /*
+     * here we indicate that a potentially "non-Toolbox" task will be swapped in
+     */
+
+    task = NULL;
+
+
+    /*
+     * NOTE: we are ALWAYS interested in Wimp messages!
+     */
+
+    new_mask &= ~(wimp_EMSEND | wimp_EMSEND_WANT_ACK);
+
+
+    /*
+     * we return the new mask, which is then passed to Wimp_Poll
+     */
+
+    DEBUG debug_output ("mask", "T:Poll mask %x\n", new_mask);
+
+    return new_mask;
+}
+
+
+extern int filters_postfilter (int event_code, wimp_PollBlock *p, TaskDescriptor *this_task);
+extern int filters_postfilter (int event_code, wimp_PollBlock *p, TaskDescriptor *this_task)
+{
+
+    /*
+     * This function gets called as a Wimp post-filter for the current task.
+     * It does a "task swap", by setting the global variable "task" to be
+     * the value given by "this_task", which is the task descriptor passed to
+     * Wimp_RegisterPostFilter in R2 (and thus returned in R12) to our veneer.
+     * We go down the list of postfilters seeing if they are interested.  An
+     * interested filter will return a non-zero R0, in which case we stop, and
+     * traverse the list again (until no-one claims interest).
+     * If the event is one which the application did not really expect, we pass
+     * back -1 in R0 (return value from function) to indicate to the Wimp that
+     * the event should not be delivered.
+     */
+
+    filters_PostFilter *f;
+    int                 type;
+    int                 code;
+    IDBlock            *id_block;
+    _kernel_swi_regs    regs;
+    ObjectClass         class_id;
+    BOOL                done;
+    BOOL                event_was_eaten = FALSE;
+
+    /*
+     * Do a "task swap"
+     */
+
+    task      = this_task;
+    id_block  = task->id_block;
+
+    DEBUG mem_chk(id_block, CHECK_NONZERO);
+
+    /*
+     * zero the id block before filters are called
+     */
+
+    id_block->self_id            = (ObjectID)0;
+    id_block->self_component     = (ComponentID)-1;
+    id_block->parent_id          = (ObjectID)0;
+    id_block->parent_component   = (ComponentID)-1;
+    id_block->ancestor_id        = (ObjectID)0;
+    id_block->ancestor_component = (ComponentID)-1;
+
+
+    DEBUG { if (event_code != 0) debug_output ("events", "T:Event code %d\n", event_code); }
+    DEBUG { if (event_code == wimp_ESEND) debug_output ("events", "T:Message action == %x\n", p->msg.hdr.action); }
+
+    /*
+     * if it's a Toolbox event sent as a message, we need to turn it into a
+     * Toolbox event
+     */
+
+    if (event_code ==  wimp_ESEND && p->msg.hdr.action == wimp_MTOOLBOX_EVENT)
+    {
+        _kernel_swi_regs regs;
+
+        event_code = wimp_ETOOLBOX_EVENT;
+
+        DEBUG mem_chk(p, CHECK_NONZERO);
+        DEBUG debug_output ("events", "T:Filling in event block @%x\n", p);
+
+        /*
+         * set up the "id" block for this toolbox event
+         */
+
+        id_block->self_id             = p->msg.data.toolbox_event_msg.self;
+        id_block->self_component      = p->msg.data.toolbox_event_msg.component;
+
+        DEBUG debug_output ("events", "T:TBox event for (self 0x%x , component 0x%x)\n",
+                                       id_block->self_id, id_block->self_component);
+
+        if (id_block->self_id != (ObjectID)0)
+        {
+            _kernel_oserror *e;
+
+            regs.r[0] = 0;
+            regs.r[1] = (int)id_block->self_id;
+            if ((e = object_get_parent (&regs)) == NULL)
+            {
+                id_block->parent_id = (ObjectID)regs.r[0];
+                id_block->parent_component = (ComponentID)regs.r[1];
+            }
+
+            regs.r[0] = 0;
+            regs.r[1] = (int)id_block->self_id;
+            if ((e = object_get_ancestor (&regs)) == NULL)
+            {
+                id_block->ancestor_id = (ObjectID)regs.r[0];
+                id_block->ancestor_component = (ComponentID)regs.r[1];
+            }
+        }
+
+        /*
+         * fill in the unique toolbox event number (taken from wimp msg number)
+         */
+
+        p->msg.data.toolbox_event_msg.event.hdr.reference_number = p->msg.hdr.my_ref;
+
+
+        /*
+         * Toolbox event details are held in Wimp message data block.  Need to copy
+         * "up" into the expected Toolbox event block
+         */
+
+        memmove (&p->toolbox_event, &p->msg.data.toolbox_event_msg.event,
+                 p->msg.data.toolbox_event_msg.event.hdr.size);
+
+        DEBUG debug_output ("events", "T:Event is (ref 0x%x code 0x%x)\n",p->toolbox_event.hdr.reference_number,
+                                                                        p->toolbox_event.hdr.event_code);
+    }
+
+    /*
+     * determine type of event to search for in list of interested parties
+     */
+
+    if (event_code == wimp_ESEND || event_code == wimp_ESEND_WANT_ACK)
+    {
+        type = Toolbox_RegisterPostFilter_WimpMessage;
+        code = p->msg.hdr.action;
+        /* Addition for Toolbox 1.42 to try and solve the event ordering problems */
+        if (code == wimp_MMENU_WARNING) {
+		if (p->msg.hdr.your_ref == 0) {
+		        /* Call Window SWI and ack message */
+		        DEBUG debug_output("events", "T:Sending PreSubMenuShow\n");
+		        _swix(Window_PreSubMenuShow, _IN(0), 0);
+		        p->msg.hdr.your_ref = p->msg.hdr.my_ref;
+		        if (!_swix(Wimp_SendMessage, _INR(0,2), 17, p, task->info.wimp_handle)) {
+		                /* Intercept this event */
+			        return -1;
+		        }
+		        DEBUG debug_output("events", "T:Sending PreSubMenuShow FAILED\n");
+		}
+        }
+    }
+    else if (event_code == wimp_ETOOLBOX_EVENT)
+    {
+        type = Toolbox_RegisterPostFilter_ToolboxEvent;
+        code = p->toolbox_event.hdr.event_code;
+    }
+    else
+    {
+        type = Toolbox_RegisterPostFilter_WimpEvent;
+        code = event_code;
+    }
+
+
+    /*
+     * Go down list of postfilters, calling interested parties.  If the called
+     * SWI returns non-zero R0, then it has "claimed" the event, and we go back
+     * to the head of the list and pass the event through again (since the SWI
+     * has changed the self_id field in the id block.
+     */
+
+    done = FALSE;
+    while (!done)
+    {
+        int event_was_claimed = FALSE;
+        IDBlock old_block = *id_block;
+
+        f = task->postfilter_list;
+
+        if (id_block->self_id == NULL)
+        {
+            /* special case - event destined for underlying Wimp object */
+            class_id = Toolbox_RegisterPostFilter_WimpObject;
+        }
+        else
+        {
+            regs.r[0] = 0;
+            regs.r[1] = (int)id_block->self_id;
+            object_get_class (&regs);
+            class_id  = (ObjectClass)regs.r[0];
+        }
+
+        DEBUG debug_output ("events", "T:Searching for %d %x %x\n", type, code, (int)class_id);
+
+        while (f != NULL)
+        {
+            DEBUG debug_output ("elist", "T:Looking at type %d code 0x%x class 0x%x\n", f->type, f->code, f->class_id);
+
+            if (f->type == type && f->code == code && (f->class_id == class_id || f->class_id == Toolbox_RegisterPostFilter_AnyClass))
+            {
+                _kernel_oserror *e;
+
+                DEBUG debug_output ("events", "T:Calling SWI 0x%x (code 0x%x, @%p, R2 %p)\n", f->swi_to_call, event_code, (void *)p, f->R2);
+
+                regs.r[0] = event_code;
+                regs.r[1] = (int)p;
+                regs.r[2] = (int)f->R2;
+                regs.r[3] = (int)id_block;
+                e = _kernel_swi (f->swi_to_call, &regs, &regs);
+
+		DEBUG {if (f->swi_to_call == 0x82881) debug_output ("events", "T:SWI exited OK\n");}
+
+                DEBUG {if (e) debug_output ("events", "T:error raised %s\n", e->errmess);}
+
+                /*
+                 * If the Object Module SWI returned an error, the best we can do is to
+                 * raise it as a Toolbox_Error event, for an unspecified object/component
+                 * pair.
+                 */
+
+                if (e)
+                {
+                    error_event.errnum = e->errnum;
+                    strncpy (error_event.errmess, e->errmess, 208);  /*yuk*/
+
+                    regs.r[0] = 0;
+                    regs.r[1] = 0;
+                    regs.r[2] = -1;
+                    regs.r[3] = (int)&error_event;
+                    event_raise_toolbox_event(&regs);
+                }
+
+                /*
+                 * if SWI returns non-zero R0, then it has claimed the event
+                 * NOTE: we do an extra sanity check on whether the id_block
+                 * has really changed before saying that the event was claimed
+                 */
+
+
+                /*
+                 * note: if object module returns -1, then don't pass event back to
+                 * client app.
+                 */
+
+                if (regs.r[0] == -1)
+                    event_was_eaten = TRUE;
+
+                if (regs.r[0] != 0 && memcmp(&old_block, id_block, sizeof(IDBlock)) && e==NULL)
+                {
+                    DEBUG debug_output ("claim", "T:Event claimed (%x) old ((%x %x),(%x %x),(%x %x)) new ((%x %x),(%x %x),(%x %x))\n",
+                                        regs.r[0],
+                                        (int)old_block.ancestor_id,
+                                        (int)old_block.ancestor_component,
+                                        (int)old_block.parent_id,
+                                        (int)old_block.parent_component,
+                                        (int)old_block.self_id,
+                                        (int)old_block.self_component,
+                                        (int)id_block->ancestor_id,
+                                        (int)id_block->ancestor_component,
+                                        (int)id_block->parent_id,
+                                        (int)id_block->parent_component,
+                                        (int)id_block->self_id,
+                                        (int)id_block->self_component);
+
+                    if (event_was_claimed == TRUE)
+                    {
+                        /* raise an error here */
+                    }
+                    else
+                        event_was_claimed = TRUE;
+                }
+            }
+
+            f = f->next;
+        }
+
+        done = (f == NULL && event_was_claimed == FALSE);
+    }
+
+    /*
+     * check if the event was expected by the client.
+     * If so, set up parent and ancestor values appropriately
+     * IDJ:7-Feb-95: ohh dear! When the client calls wimp_starttask
+     *               the postfilter gets entered with a faked null
+     *               event.  We can't claim the event, or next time
+     *               round its poll loop the wimp will have a rubbish
+     *               value for R1 (poll block).  So we NEVER claim
+     *               null events!
+     */
+
+    if ((((type == Toolbox_RegisterPostFilter_WimpEvent && !(task->mask & (1<<code)))
+         || (type == Toolbox_RegisterPostFilter_WimpMessage && task_expected_wimp_message (code))
+         || (type == Toolbox_RegisterPostFilter_ToolboxEvent && task_expected_toolbox_event (code)))
+         && !event_was_eaten)
+       || code == 0)
+    {
+        if (id_block->self_id != (ObjectID)0)
+        {
+            _kernel_oserror *e;
+
+            regs.r[0] = 0;
+            regs.r[1] = (int)id_block->self_id;
+            if ((e = object_get_parent (&regs)) == NULL)
+            {
+                id_block->parent_id = (ObjectID)regs.r[0];
+                id_block->parent_component = (ComponentID)regs.r[1];
+            }
+
+            regs.r[0] = 0;
+            regs.r[1] = (int)id_block->self_id;
+            if ((e = object_get_ancestor (&regs)) == NULL)
+            {
+                id_block->ancestor_id = (ObjectID)regs.r[0];
+                id_block->ancestor_component = (ComponentID)regs.r[1];
+            }
+            id_block->ancestor_id = (ObjectID)regs.r[0];
+            id_block->ancestor_component = (ComponentID)regs.r[1];
+        }
+    }
+    else
+    {
+        /*
+         * event was not expected by client (probably an event enabled by the Toolbox)
+         * so we return -1 from the filter to stop the wimp delivering it to the client
+         */
+
+        filters_PreFilter *f        = task->prefilter_list;
+
+        DEBUG debug_output ("events", "T:Unexpected event (%x)\n", code);
+
+        event_code = -1;
+
+        /*
+         * call prefilters if swallowing event, cos app will not poll the wimp again!!!
+         */
+
+        while (f != NULL)
+        {
+            _kernel_swi_regs regs;
+            _kernel_oserror *e;
+
+            DEBUG debug_output ("prefilters", "T:Calling prefilter 0x%x (%x)\n", f->swi_to_call, (int)f->R2);
+
+            regs.r[0] = task->mask;
+            regs.r[1] = (int)p;
+            regs.r[2] = (int)f->R2;
+            e = _kernel_swi (f->swi_to_call, &regs, &regs);
+
+            if (e)
+            {
+                error_event.errnum = e->errnum;
+                strncpy (error_event.errmess, e->errmess, 208);  /*yuk*/
+
+                regs.r[0] = 0;
+                regs.r[1] = 0;
+                regs.r[2] = -1;
+                regs.r[3] = (int)&error_event;
+                event_raise_toolbox_event(&regs);
+            }
+
+            f = f->next;
+        }
+    }
+
+    DEBUG debug_output ("events", "T:leaving postfilter\n");
+
+    return event_code;
+}

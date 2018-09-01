@@ -1,0 +1,197 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/HWSupport/ATA/SATADriver/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Use is subject to license terms.
+ */
+
+/** \file swi.c
+ * Implementation of SWIs.
+ */
+
+#include <stddef.h>
+#include "swis.h"
+
+#include "Global/NewErrors.h"
+#include "Interface/ATA.h"
+
+#include "globals.h"
+#include "message.h"
+#include "register.h"
+#include "swi.h"
+#include "util.h"
+
+_kernel_oserror *swi_initialise_reset(uint32_t cpid)
+{
+  ahciport_t *port;
+  _kernel_oserror *e = util_find_port(cpid, true, &port);
+  if (e != NULL)
+    return e;
+
+  /* Lock all the devices on this port to ensure atomicity of commands during reset. */
+  for (uint32_t deviceid = 0; deviceid < 16; deviceid++)
+  {
+    swi_control_lock(cpid, deviceid);
+    port->device[deviceid].busy = MUTEX_LOCKED; /* port count may be increasing (notably first time through) so ensure they're locked even if currently invalid */
+  }
+
+  port->active = op_rescan_port(port, false);
+
+  /* Unlock all the valid devices on this port. */
+  for (uint32_t deviceid = 0; deviceid < 16; deviceid++)
+  {
+    if (port->device[deviceid].valid)
+      swi_control_unlock(cpid, deviceid);
+  }
+
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_control_try_lock(uint32_t cpid, uint32_t deviceid)
+{
+  ahciport_t *port;
+  satadevice_t *device;
+  _kernel_oserror *e = util_find_port_and_device(cpid, deviceid, &port, &device);
+  if (e != NULL)
+    return e;
+
+  if (!mutex_try_lock(&device->busy))
+  {
+    spinrw_read_unlock(&g_ahci_lock);
+    return MESSAGE_ERRORLOOKUP(true, ATA_DeviceInUse, 0);
+  }
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_control_lock(uint32_t cpid, uint32_t deviceid)
+{
+  ahciport_t *port;
+  satadevice_t *device;
+  _kernel_oserror *e = util_find_port_and_device(cpid, deviceid, &port, &device);
+  if (e != NULL)
+    return e;
+
+  mutex_lock(&device->busy);
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_control_sleep_lock(uint32_t cpid, uint32_t deviceid)
+{
+  ahciport_t *port;
+  satadevice_t *device;
+  _kernel_oserror *e = util_find_port_and_device(cpid, deviceid, &port, &device);
+  if (e != NULL)
+    return e;
+
+  mutex_sleep_lock(&device->busy);
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_control_unlock(uint32_t cpid, uint32_t deviceid)
+{
+  ahciport_t *port;
+  satadevice_t *device;
+  _kernel_oserror *e = util_find_port_and_device(cpid, deviceid, &port, &device);
+  if (e != NULL)
+    return e;
+
+  mutex_unlock(&device->busy);
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_control_abort_all(uint32_t cpid)
+{
+  ahciport_t *port;
+  _kernel_oserror *e = util_find_port(cpid, false, &port);
+  if (e != NULL)
+    return e;
+
+  op_abort_all(port);
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_control_abort_op(uint32_t cpid, ahciop_t *op)
+{
+  ahciport_t *port;
+  _kernel_oserror *e = util_find_port(cpid, false, &port);
+  if (e != NULL)
+    return e;
+
+  op_abort(port, op);
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_enumerate_drives(uint32_t *restrict index, uint32_t *restrict r2)
+{
+  spinrw_read_lock(&g_ahci_lock);
+  /* TODO: handle controller bits */
+  uint32_t cpid = (*index & ATAEnumerate_CPIDMask) >> ATAEnumerate_CPIDShift;
+  uint32_t deviceid = (*index & ATAEnumerate_DeviceIDMask) >> ATAEnumerate_DeviceIDShift;
+  while (cpid < 32)
+  {
+    ahciport_t *port = &g_ahci.port[cpid];
+    if (!port->active)
+      ++cpid;
+    else
+    {
+      if (!port->device[deviceid].valid ||
+          (port->device[deviceid].sig != SATA_SIG_ATA &&
+           port->device[deviceid].sig != SATA_SIG_ATAPI))
+      {
+        if (++deviceid == 16)
+        {
+          deviceid = 0;
+          ++cpid;
+        }
+      }
+      else
+      {
+        *r2 = (deviceid << ATAEnumerate_DeviceIDShift) |
+              (cpid << ATAEnumerate_CPIDShift) |
+              ((port->device[deviceid].sig == SATA_SIG_ATAPI) * ATAEnumerate_PacketDevice);
+        *index = (++deviceid << ATAEnumerate_DeviceIDShift) + (cpid << ATAEnumerate_CPIDShift);
+        spinrw_read_unlock(&g_ahci_lock);
+        return NULL;
+      }
+    }
+  }
+  /* Run out of drives */
+  *index = 0;
+  spinrw_read_unlock(&g_ahci_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_op(ataop_block_t *b)
+{
+  return op_issue(b, false, false);
+}
+
+_kernel_oserror *swi_packetop(atapacketop_block_t *b)
+{
+  return op_issue((ataop_block_t *) b, true, false);
+}

@@ -1,0 +1,513 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Title: c.txtundo
+ * Purpose: Undo facilities for text objects
+ * Author: W. Stoye
+ * Status: system-independent
+ * History:
+ *   13-Oct-87: started
+ *   02-Mar-88: WRS: implicit txtundo_init on any change to txt object.
+ *   08-Mar-88: WRS: txtundo_commit added.
+ *   14-Mar-88: WRS: undoing of selection added.
+ */
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include "flex.h"
+#include "trace.h"
+#include "txt.h"
+#include "EditIntern/txtundo.h"
+#include "EditIntern/txt1.h"
+#include "txtscrap.h"
+#include "werr.h"
+
+typedef struct txtundo__state {
+  char *buf;
+  int size;
+  int head;       /* in [0..size-1] */
+  int tail;       /* in [0..size-1], head==tail ? empty. */
+  int ptr;        /* current pointer for undo/redo */
+  BOOL withinundo;
+  BOOL suspended;
+} txtundo__state;
+/*
+  head==tail -> empty
+  head -> first free for insertion
+  tail -> last interesting byte
+  ptr -> last thing ungot, so Undo starts with DEC(ptr)
+*/
+
+#define INITIAL_BUF_SIZE 20
+
+/* -------- Debugging info -------- */
+
+/* Can be omitted on "production" versions of things. */
+#if TRACE
+
+void txtundo__safewrch(char c)
+{
+  if (c == '*') tracef0(" *");
+  else if (c >= 32 && c < 127) tracef1(":%c", c);
+  else tracef1("%.2x", c);
+}
+
+void txtundo__tab(int by)
+{
+  int i;
+  for (i=1; i<=by; i++) tracef0(" ");
+}
+
+void txtundo_pr(txtundo u)
+{
+  int i;
+  tracef("Undo buffer:\n");
+  if (u->size > 300)
+    tracef(">>>>size=%i head=%i tail=%i ptr=%i\n",
+      u->size, u->head, u->tail, u->ptr);
+  else {
+    /* zap the gap chars to make things clearer */
+    if (u->tail > u->head) {
+      for (i=u->head; i<=u->tail-1; i++) u->buf[i] = '*';
+    } else if (u->tail <= u->head) {
+      for (i=u->head; i<=u->size-1; i++) u->buf[i] = '*';
+      for (i=0; i<u->tail; i++) u->buf[i] = '*';
+    };
+    tracef("   [");
+    for (i=0; i<u->size; i++) txtundo__safewrch(u->buf[i]);
+    tracef("]\n");
+    txtundo__tab(2*u->head); tracef("head^^ (%i)\n", u->head);
+    txtundo__tab(2*u->tail); tracef("tail^^ (%i)\n", u->tail);
+    txtundo__tab(2*u->ptr); tracef(" ptr^^ (%i)\n", u->ptr);
+  };
+}
+#endif
+/* -------- Creation, Deletion -------- */
+
+txtundo txtundo_new(void)
+{
+  txtundo u;
+  u = malloc(sizeof(txtundo__state));
+  if (u == 0) return 0;
+  if (flex_alloc((void**) &(u->buf), INITIAL_BUF_SIZE) == 0) {
+    free(u);
+    return 0;
+  };
+  u->head = 0;
+  u->tail = 0;
+  u->size = INITIAL_BUF_SIZE;
+  u->ptr = 0;
+  u->withinundo = FALSE;
+  u->suspended = FALSE;
+  return u;
+}
+
+void txtundo_dispose(txtundo u)
+{
+  flex_free((flex_ptr) &u->buf);
+  free(u);
+}
+
+void txtundo_setbufsize(txt t, int nbytes)
+{
+  txtundo u = t->undostate;
+  int by;
+  if (nbytes <= u->size) {
+    by = 0;
+  } else {
+    by = nbytes - u->size;
+  };
+  if (flex_midextend((void**) &(u->buf), u->head, by)) {
+    if (u->tail >= u->head) {u->tail += by;};
+    if (u->ptr >= u->head) {u->ptr += by;};
+    u->head += by;
+    u->size += by;
+  } else {
+    /* he can't have the store, but it doesn't matter. */
+    tracef0("Undo setbufsize didn't work.\n");
+  };
+}
+
+void txtundo_purge_undo(txt t)
+{
+  /* very easy, just empty the buffer. */
+  txtundo u = t->undostate;
+  u->head = 0;
+  u->tail = 0;
+  u->ptr = 0; /* 20-Dec-88 WRS: otherwise, a following ReDo will get confused... */
+}
+
+BOOL txtundo_suspend_undo(txt t, BOOL newstate)
+{
+  BOOL oldstate;
+  oldstate = t->undostate->suspended;
+  t->undostate->suspended = newstate;
+  return oldstate;
+}
+
+/* -------- Put operations. -------- */
+
+void txtundo_putcode(txtundo u, char code)
+{
+  if (u->suspended) return;
+  u->buf[u->head++] = code;
+  if (u->head == u->size) u->head = 0;
+  if (u->head == u->tail) {
+    u->tail++;
+    if (u->tail == u->size) u->tail = 0;
+  };
+  if (! u->withinundo) {
+    /* If this update is generated outside an undo context then
+    cancel any current chain of undos. */
+    u->ptr = u->head;
+  };
+}
+
+static int min(int a, int b) {return a < b ? a : b;}
+
+void txtundo_putbytes(txtundo u, char* bytes, int n)
+{
+  int blocksize;
+  if (u->suspended) return;
+  if (n >= u->size) {
+    /* We'll never be able to undo this, so forget it. */
+    tracef1("Undo %i chars impossible, clearing.\n", n);
+    u->head = 0;
+    u->tail = 0;
+  } else {
+    while (1) {
+      if (n == 0) break;
+      blocksize = min(n, u->size - u->head);
+      tracef1("Undo putbytes %i.\n", blocksize);
+      (void) memcpy(/*to*/ &u->buf[u->head], /*from*/ bytes, blocksize);
+      n -= blocksize;
+      bytes += blocksize;
+      if (u->tail >= u->head && u->tail <= u->head + blocksize) {
+        u->tail = u->head + blocksize + 1;
+        if (u->tail == u->size) u->tail = 0;
+        if (u->tail == u->size + 1) u->tail = 1;
+      };
+      u->head += blocksize;
+      if (u->head == u->size) {
+        u->head = 0;
+        if (u->tail == 0) u->tail = 1;
+      };
+    };
+  };
+}
+
+void txtundo_putnumber(txtundo u, int n)
+{
+/* Chars will be picked up LS byte first, each byte contributing 7 bits, with
+all but the last one having top bit set. */
+  if (u->suspended) return;
+  tracef1("undo putnumber %i.\n", n);
+  txtundo_putcode(u, n % 128);
+  while (1) {
+    n = n / 128;
+    if (n == 0) break;
+    txtundo_putcode(u, 128 + n % 128);
+  };
+}
+
+static char txtundo__charbefore(txtundo u, int p)
+{
+  if (p == 0) {
+    return u->buf[u->size - 1];
+  } else {
+    return u->buf[p-1];
+  };
+}
+
+void txtundo_separate_major_edits(txt t)
+{
+  txtundo u = t->undostate;
+  if (u->suspended) return;
+  if (u->head != u->tail && txtundo__charbefore(u, u->head) == 's') {
+    /* already separated */
+    tracef0("undo sepmajoredits, already separated.\n");
+  } else {
+    tracef0("undo sepmajoredits.\n");
+    txtundo_putcode(u, 's');
+  };
+}
+
+/* -------- Extract operations. -------- */
+
+static int txtundo__count_ptr_to_tail(txtundo u)
+/* e.g. bytes still extractable.
+   Extraction happens below the poitner, e.g. starts at head.
+   ptr==tail->nothing left.
+*/
+{
+  if (u->ptr >= u->tail) {
+    return u->ptr - u->tail;
+  } else {
+    return u->ptr + (u->size - u->tail);
+  };
+}
+
+static int txtundo__count_ptr_to_head(txtundo u)
+/* How much could be inserted with ptr remaining valid? Add 1 to this
+because the buffer always clears one char ahead. */
+{
+  if (u->head < u->ptr) {
+    return u->ptr - u->head;
+  } else {
+    return u->ptr + (u->size - u->head);
+  };
+}
+
+static int txtundo__extractch(txtundo u, char *c /*out*/)
+{
+  if (u->ptr == u->tail) return 0;
+  if (u->ptr == 0) u->ptr = u->size;
+  *c = u->buf[--u->ptr];
+  tracef2("Undo extract char %i from %i.\n", *c, u->ptr);
+  return 1;
+}
+
+static int txtundo__extractnum(txtundo u, int *c /*out*/)
+{
+  char ch;
+  *c = 0;
+  while (1) {
+    if (txtundo__extractch(u, &ch)) {
+      if (ch < 128) {
+        *c = *c * 128 + ch;
+        return 1;
+      } else {
+        *c = *c * 128 + ch - 128;
+      };
+    } else {
+      return 0;
+    };
+  };
+}
+
+static void txtundo__extractchars(txtundo u, int n, txt t)
+/* There definitely are enough. Insert them into the Text. */
+{
+  int blocksize;
+  int saven = n;
+  int savehead = u->head;
+
+  tracef1("Undo extractchars n=%i.\n", n);
+  if (n == 0 || u->ptr == u->tail) return;
+  while (n > 0) {
+    if (u->ptr == 0) u->ptr = u->size;
+    blocksize = u->ptr;
+    if (u->tail < u->ptr) blocksize = u->ptr - u->tail;
+    if (blocksize > n) blocksize = n;
+    u->ptr -= blocksize;
+    n -= blocksize;
+    tracef2("undo reinserts %i chars from %i.\n",
+      blocksize, u->ptr);
+    txt_replacechars(t, 0, &(u->buf[u->ptr]), blocksize);
+      /* This will recursively call back and adjust u-> */
+    u->head = savehead;
+  };
+  txtundo_putnumber(u, saven);
+  txtundo_putcode(u, 'd');
+}
+/* The savehead/saven business is in case we go round twice, to prevent this
+one simple edit from becoming two and so gently swallowing more of the
+undeletion buffer. the head=savehead is in the loop to prevent event to two
+delete operations from piling up. */
+
+/* -------- Undo operations. -------- */
+
+void txtundo_init(txt t)
+{
+  txtundo u = t->undostate;
+  u->ptr = u->head;
+}
+
+void txtundo_commit(txt t)
+{
+  txtundo u = t->undostate;
+  u->head = u->ptr;
+}
+
+txtundo_result txtundo_undo(txt t)
+{
+  txtundo u = t->undostate;
+  char code;
+  int n;
+  int saveptr = u->ptr;
+  txtundo_result result;
+
+  if (txtundo__extractch(u, &code) == 0) return txtundo_RANOUT;
+  u->withinundo = TRUE;
+  switch (code) {
+  case 's':
+    result = txtundo_MAJOR;
+    break;
+  case 't':
+    result = txtundo_MINOR;
+    if (txtscrap_selectowner() != NULL) {
+      extern void txtedit_swapcase(txt); /* Not in public headers */
+      txtedit_swapcase(t);
+    }
+    break;
+  case 'm':
+    if (txtundo__extractnum(u, &n) && txtundo__count_ptr_to_head(u) >= 5) {
+      txt_setdot(t, n);
+      result = txtundo_MINOR;
+    } else {
+      u->ptr = saveptr;
+      result = txtundo_RANOUT;
+    };
+    break;
+  case 'd':
+    if (txtundo__extractnum(u, &n) && txtundo__count_ptr_to_head(u) >= 5+n) {
+      txt_delete(t, n);
+      result = txtundo_MINOR;
+    } else {
+      u->ptr = saveptr;
+      result = txtundo_RANOUT;
+    };
+    break;
+  case 'i':
+    if (txtundo__extractnum(u, &n)
+      && txtundo__count_ptr_to_tail(u) >= n
+      && txtundo__count_ptr_to_head(u) >= 5+2*n)
+      /* e.g. can extract them, and insertion will still be reversable. */
+    {
+      txtundo__extractchars(u, n, t);
+      result = txtundo_MINOR;
+    } else {
+      u->ptr = saveptr;
+      result = txtundo_RANOUT;
+    };
+    break;
+  case 'l':
+    { int n1;
+      if (txtundo__extractnum(u, &n) && txtundo__extractnum(u, &n1)) {
+        txtscrap_setselect(t, n, n1);
+        result = txtundo_MINOR;
+      } else {
+        u->ptr = saveptr;
+        result = txtundo_RANOUT;
+      };
+    };
+    break;
+  default:
+    tracef1("Undo found a %i char.\n", code);
+    u->ptr = saveptr;
+    result = txtundo_RANOUT;
+    break;
+  };
+  u->withinundo = FALSE;
+  return result;
+}
+
+/* -------- Redo operations. -------- */
+
+static int txtundo__skipop(txtundo u, int p)
+/* Skip past a complete recorded operation. */
+{
+  int saveptr;
+  char code;
+  int result;
+  int n;
+
+  saveptr = u->ptr;
+  u->ptr = p;
+  if (txtundo__extractch(u, &code) == 0) {
+    tracef0("Undo bug 1.\n");
+  };
+  switch (code) {
+  case 's':
+  case 't':
+    break;
+  case 'd':
+    if (txtundo__extractnum(u, &n) == 0) tracef0("Undo bug 2.\n");
+    break;
+  case 'm':
+    if (txtundo__extractnum(u, &n) == 0) tracef0("Undo bug 3.\n");
+    break;
+  case 'i':
+    if (txtundo__extractnum(u, &n) == 0) tracef0("Undo bug 4.\n");
+    if (u->ptr < n) {
+      u->ptr = u->size + u->ptr - n;
+    } else {
+      u->ptr -= n;
+    };
+    break;
+  case 'l':
+    if (txtundo__extractnum(u, &n) == 0) tracef0("undo bug 5.\n");
+    if (txtundo__extractnum(u, &n) == 0) tracef0("undo bug 6.\n");
+    break;
+  default:
+    tracef0("Undo bug 5.\n");
+  }
+  result = u->ptr;
+  u->ptr = saveptr;
+  return result;
+}
+
+static int txtundo__skip_to_previous(txtundo u, int p, int *onebeforethat /*out*/)
+{
+  int p1;
+  int p2;
+  p1 = u->head;
+  p2 = u->head;
+  *onebeforethat = u->head;
+  while (p1 != p) {
+    *onebeforethat = p2;
+    p2 = p1;
+    p1 = txtundo__skipop(u, p1);
+  }
+  return p2;
+}
+
+txtundo_result txtundo_redo(txt t)
+{
+  txtundo u = t->undostate;
+  int prev;
+  int onebeforethat;
+  txtundo_result res;
+
+  if (u->ptr == u->head) return txtundo_RANOUT;
+  u->withinundo = TRUE;
+  u->ptr = txtundo__skip_to_previous(u, u->ptr, &onebeforethat);
+  tracef2("Redo prev=%i before that=%i.\n", u->ptr, onebeforethat);
+  prev = u->ptr;
+  if (txtundo__charbefore(u, u->ptr) == 's') {
+    /* undo a separator: no problem, done. */
+  } else {
+    u->ptr = u->head;
+    res = txtundo_undo(t);
+    u->head = u->ptr;
+    u->ptr = prev;
+  };
+  if (onebeforethat == u->head) {
+    res = txtundo_RANOUT;
+  } else if (txtundo__charbefore(u, onebeforethat) == 's') {
+    res = txtundo_MAJOR;
+  } else {
+    res = txtundo_MINOR;
+  };
+  u->withinundo = FALSE;
+  return res;
+}
+
+/* end */

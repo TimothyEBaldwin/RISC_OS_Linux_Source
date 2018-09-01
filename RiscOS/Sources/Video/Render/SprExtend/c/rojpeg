@@ -1,0 +1,969 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* rojpeg.c - JPEG for use within RISC OS */
+
+#include <stdlib.h>
+#include <stdint.h>
+#include "swis.h"
+#include "Global/VduExt.h"
+#include "Interface/HighFSI.h"
+#include "commondefs.h"
+#include "rojpeg.h"
+
+/**************************************************************************
+*                                                                         *
+*    JPEG utility functions.                                              *
+*                                                                         *
+**************************************************************************/
+
+static int palette_is_grey(int *palette, int entries); /* In c.PutScaled */
+
+static void check_jpeg_workspace(asm_workspace *wp, int jpeg_ws_size)
+/* Check (and adjust) the workspace needed */
+{
+  j_decompress_ptr cinfo = wp->jpeg_info_ptr;
+
+  if (!cinfo)
+  {
+    dprintf(("", "Requesting %x bytes of workspace\n", jpeg_ws_size));
+    cinfo = area_resize(AREA_WKSP0, NULL, jpeg_ws_size);
+    assert(cinfo != NULL, ERROR_NO_MEMORY);
+    wp->jpeg_info_ptr = cinfo;                   
+    cinfo->error_code = -1;                      /* mark the workspace entirely uninitialised */
+    cinfo->workspace_size = jpeg_ws_size;        /* at least that big, malloc might have rounded up */
+  }
+  else
+  {
+    if (jpeg_ws_size)                            /* need more */
+    {
+      void *area;
+
+      dprintf(("", "Requesting %x extra bytes of workspace\n", jpeg_ws_size));
+      jpeg_ws_size = jpeg_ws_size + cinfo->workspace_size;
+      area = area_resize(AREA_WKSP0, &cinfo->workspace_size, jpeg_ws_size);
+      assert(area != NULL, ERROR_NO_MEMORY);
+      cinfo->error_code = -1;                    /* mark the workspace entirely uninitialised */
+    }
+  }
+}
+
+static int jpeg_decompressor_opts(j_decompress_ptr cinfo, asm_workspace *wp)
+/* Deduce the decompressor options */
+{
+  int opt = 0;
+  
+  /* JPEG decompression options */
+  if ((wp->save_xadd - wp->save_xdiv) * 6 <= wp->save_xdiv &&
+      (wp->save_yadd - wp->save_ydiv) * 6 <= wp->save_ydiv)
+    opt |= jopt_DC_ONLY; /* postage stamp - go faster, do only DC values of JPEG tiles */
+
+  /* Starting assumption that the blitter wants 32bpp &BGR */
+  cinfo->pixelformat = PixelFormat_32bpp;
+
+  /* If colour mapping is in use, only produce ordinary 32bpp output. TODO - Improve on
+   * this, e.g. could call colour mapping before error diffusion.
+   */
+  if (wp->TTRType != TTRType_ColourMap)
+  {
+    if ((wp->BPP < 4))
+    {
+      opt |= jopt_GREY; /* greyscale if 4bpp or less */
+      if ((wp->save_PdriverIntercept & 2) == 0) /* printing is not on */
+      {
+        wp->ColourTTR = 0; /* don't use trans table for 4bpp or less, results are naff */
+        wp->TTRType = TTRType_None;
+      }
+    }
+
+    if ((wp->BPP <=8) && (wp->dither_truecolour & 2))
+    {
+      opt |= jopt_DIFFUSE;
+      wp->ColourTTR = 0;
+      wp->TTRType = TTRType_None;
+    }
+
+    if (wp->BPP == 8)
+    {
+      int temp, size;
+  
+      _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) | _OUT(3),
+                                     -1, -1, 0, 256*4, 0, &size); /* save palette into newtranstable area */
+      dprintf(("", "need %x bytes for palette\n", size));
+      _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4),
+                                     -1, -1, wp->newtranstable, size, 0); /* save palette into newtranstable area */
+      temp = palette_is_grey(wp->newtranstable, size / sizeof(int));
+      if (temp) opt |= jopt_GREY;
+      if (temp == 2)
+      {
+        opt |= jopt_OUTBPP_8GREY;
+        opt &= ~jopt_DIFFUSE;
+      }
+    }
+
+    if ((wp->save_PdriverIntercept & 2) == 0 && (wp->dither_truecolour & 1)) /* printing is not on, dither is on */
+    {
+      int  size;
+  
+      if ((wp->dither_truecolour & 2) && wp->BPP < 16) /* error diffused dither, and paletted mode */
+      {
+#ifdef DEBUG
+        int loop;
+#endif
+        dprintf(("", "trying new shiny 8BPP plotting technique\n"));
+        _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4) | _OUT(3),
+                                       -1, -1, 0, 256*4, 0, &size); /* save palette into newtranstable area */
+        dprintf(("", "need %x bytes for palette\n", size));
+        _swix(ColourTrans_ReadPalette, _IN(0) | _IN(1) | _IN(2) | _IN(3) | _IN(4),
+                                       -1, -1, &(wp->newtranstable[0]), size, 0); /* save palette into newtranstable area */
+        dprintf(("", "created palette at %x\n", &(wp->newtranstable[0])));
+#ifdef DEBUG
+        dprintf(("", "Read palette, palette entries are:-\n"));
+        for(loop = 0;loop<size/4;loop++)
+          dprintf(("", "Entry %d = %x\n", loop, wp->newtranstable[loop]));
+#endif
+        if (wp->BPP == 4)
+        {
+          if (palette_is_grey(wp->newtranstable, size / sizeof(int))) opt |= jopt_GREY; /* prefer grey please */
+        }
+        else if (wp->BPP == 8)
+        {
+          int temp;
+  
+          temp = palette_is_grey(wp->newtranstable, size / sizeof(int));
+          if (temp) opt |= jopt_GREY; /* prefer grey please */
+          if (temp == 2)
+          {
+            opt |= jopt_OUTBPP_8GREY; /* grey palette, demand output grey */
+            opt &= ~jopt_DIFFUSE; /* don't dither grey */
+          }
+        }
+      }
+  
+      if ((wp->BPP == 4) && !(wp->dither_truecolour & 2)) /* 4bpp, no error diffusion, prefer grey please */
+        opt |= jopt_GREY; 
+  
+      if (wp->BPP == 8)
+      {
+        if ((wp->dither_truecolour & 2) && !(opt & jopt_OUTBPP_8GREY))
+        {
+          opt |= jopt_OUTBPP_8DITHER;                  /* full error diffusion */
+          cinfo->error_code = -1;                      /* mark the workspace entirely uninitialised */
+        }
+        else
+        {
+          int modeflags;
+  
+          _swix(OS_ReadModeVariable, _INR(0,1) | _OUT(2), -1, VduExt_ModeFlags, &modeflags);
+          if ((modeflags & ModeFlag_FullPalette) == 0)
+            opt |= jopt_OUTBPP_8YUV; /* diffusion from YUV data to 64 entry VIDC1 palette direct */
+        }
+      }
+      else if (wp->BPP == 16)
+      {
+        opt |= jopt_OUTBPP_16; /* request 16bpp with ordered dither */
+      }
+
+    }
+
+    /* Pick a specific pixel format for the merged upsampler/colour converter */
+    if (opt & (jopt_OUTBPP_16 | jopt_OUTBPP_8YUV | jopt_OUTBPP_8GREY))
+    {
+      cinfo->pixelformat = (int)compute_pixelformat(wp->ncolour, wp->modeflags, wp->Log2bpp);
+    }
+  }
+
+#ifdef DEBUG
+  dprintf(("", "After set up, options are:\n"));
+  if (opt & jopt_GREY) dprintf(("", "   jopt_GREY\n"));
+  if (opt & jopt_DC_ONLY) dprintf(("", "   jopt_DC_ONLY\n"));
+  if (opt & jopt_INTERP_X) dprintf(("", "   jopt_INTERP_X\n"));
+  if (opt & jopt_OUTBPP_8DITHER) dprintf(("", "   jopt_OUTBPP_8DITHER\n"));
+  if (opt & jopt_OUTBPP_16) dprintf(("", "   jopt_OUTBPP_16\n"));
+  if (opt & jopt_OUTBPP_8YUV) dprintf(("", "   jopt_OUTBPP_8YUV\n"));
+  if (opt & jopt_DIFFUSE) dprintf(("", "   jopt_DIFFUSE\n"));
+  if (opt & jopt_OUTBPP_8GREY) dprintf(("", "   jopt_OUTBPP_8GREY\n"));
+#endif
+
+  return opt;
+}
+
+/**************************************************************************
+*                                                                         *
+*    JPEG entry points.                                                   *
+*                                                                         *
+**************************************************************************/
+
+typedef enum {			/* JPEG marker codes */
+  M_SOF0  = 0xc0,		/* baseline */         
+  M_SOF1  = 0xc1,		/* extended sequential, Huffman */
+  M_SOF2  = 0xc2,		/* progressive, Huffman */
+  M_SOF3  = 0xc3,		/* lossless, Huffman */
+                 		                                             
+  M_SOF5  = 0xc5,		/* differential sequential, Huffman */
+  M_SOF6  = 0xc6,		/* differential progressive, Huffman */
+  M_SOF7  = 0xc7,		/* differential lossless, Huffman */         
+
+  M_JPG   = 0xc8,
+  M_SOF9  = 0xc9,		/* extended sequential, arithmetic */
+  M_SOF10 = 0xca,		/* progressive, arithmetic */                
+  M_SOF11 = 0xcb,		/* lossless, arithmetic */                                                        
+                 
+  M_SOF13 = 0xcd,		/* differential sequential, arithmetic */
+  M_SOF14 = 0xce,		/* differential progressive, arithmetic */   
+  M_SOF15 = 0xcf,		/* differential lossless, arithmetic */    
+                                                                           
+  M_DHT   = 0xc4,
+  
+  M_DAC   = 0xcc,
+  
+  M_RST0  = 0xd0,
+  M_RST1  = 0xd1,
+  M_RST2  = 0xd2,
+  M_RST3  = 0xd3,
+  M_RST4  = 0xd4,
+  M_RST5  = 0xd5,
+  M_RST6  = 0xd6,
+  M_RST7  = 0xd7,
+  
+  M_SOI   = 0xd8,
+  M_EOI   = 0xd9,
+  M_SOS   = 0xda,
+  M_DQT   = 0xdb,
+  M_DNL   = 0xdc,
+  M_DRI   = 0xdd,
+  M_DHP   = 0xde,
+  M_EXP   = 0xdf,
+  
+  M_APP0  = 0xe0,
+  M_APP1  = 0xe1,
+  M_APP2  = 0xe2,
+  M_APP3  = 0xe3,
+  M_APP4  = 0xe4,
+  M_APP5  = 0xe5,
+  M_APP6  = 0xe6,
+  M_APP7  = 0xe7,
+  M_APP8  = 0xe8,
+  M_APP9  = 0xe9,
+  M_APP10 = 0xea,
+  M_APP11 = 0xeb,
+  M_APP12 = 0xec,
+  M_APP13 = 0xed,
+  M_APP14 = 0xee,
+  M_APP15 = 0xef,
+  
+  M_JPG0  = 0xf0,
+  M_JPG13 = 0xfd,
+  M_COM   = 0xfe,
+  
+  M_TEM   = 0x01,
+  
+  M_ERROR = 0x100
+} JPEG_MARKER;
+
+#define BADSAMPFACTOR(f) ((f > MAX_SAMP_FACTOR) || (f & (f-1)) || !f ) \
+                       /* Out of range          OR Not a power of 2 */
+#define BADCOMPCOUNT(c) ((c != 1) && (c != 3) && (c != 4)) \
+                       /* Grey        RGB/YUV     CMYK/CYYK */
+#define BADDCTSIZE(d) ((d != DCTSIZE) && (d != 1)) \
+                     /* Baseline          Lossless */
+#define BADFILE(reason) {dprintf(("", "bad file %d", reason)); \
+                         cinfo->error_code = reason; \
+                         return reason;}
+#define BADFILE1(reason,arg) {dprintf(("", "bad file %d %d", reason, arg)); \
+                              cinfo->error_code = reason; \
+                              cinfo->error_argument = arg; \
+                              return reason;}
+
+/*!
+ * \param   cinfo Compression state structure
+ * \param   buffer The image to consider, word aligned
+ * \param   buffer_size Bytes there are in the image buffer
+ * \param   xmin Left clipping boundary
+ * \param   xmax Right clipping boundary
+ * \param   width Overall JPEG width in pixels
+ * \param   height Overall JPEG height in pixels
+ * \param   options Plotting options found with jpeg_decompressor_opts() earlier
+ * \details Initial setup stage prior to rending an image.
+ * \return  Error code, or 0 for none.
+ */
+int jpeg_scan_file(j_decompress_ptr cinfo, const JOCTET *buffer, size_t buffer_size,
+                          int xmin, int xmax, int width, int height, int options)
+{
+  int i;
+  int vsamp, hsamp, mcu_height, mcu_width;
+  size_t huff_pointers_size;
+
+  dprintf(("", "jpeg_scan_file cinfo=0x%x buffer=0x%x buffer_size=%i xmin=%i xmax=%i width=%i height=%i\n",
+          (int)cinfo, (int)buffer, buffer_size, xmin, xmax, width, height));
+  dprintf(("", "options=%i workspace_size %x\n", options, cinfo->workspace_size));
+
+  if (xmin < 0) xmin = 0; /* xmax will be clipped to image_width, when we know it. */
+  if (options & (jopt_OUTBPP_8DITHER | jopt_OUTBPP_8YUV))
+  {
+    xmin -= 16; /* cos errors can diffuse forwards a little - clipped to 0 later */
+    if (xmin < 0) xmin = 0;
+    xmin &= ~15; /* round down to multiple of 16 - needed by dithering */
+    xmax += 16; /* cos errors can diffuse backwards a little - clipped to image width later */
+  }
+
+  /* Look to see if this is precisely the same JPEG file as last time */
+  if (  cinfo->error_code == 0                                             /* check for very first time, or for error last time */
+     && cinfo->jpeg_user_buffer == buffer                                  /* check for image in same place */
+     && cinfo->jpeg_user_buffer_size == buffer_size                        /* check length unchanged */
+     && (width == -1 || cinfo->image_width == width)                       /* width OK */
+     && (height == -1 || cinfo->image_height == height)                    /* height OK */
+     && cinfo->check1 == ((int*)buffer)[buffer_size/(2*4)]                 /* Random checks on data - the /4 gets us down to char offsets */
+     && cinfo->check2 == ((int*)buffer)[buffer_size/4 - buffer_size/(4*4)] /* we check a word half-way through, and two later on */
+     && cinfo->check3 == ((int*)buffer)[buffer_size/4 - buffer_size/(8*4)] /* any change will perturb the whole file - we trust! */
+     && cinfo->orgoptions == options
+     )
+  {
+    dprintf(("", "This looks like the same JPEG file as last time.\n"));
+    if (xmax > cinfo->image_width) xmax = cinfo->image_width;
+    if (xmin < cinfo->xmin || xmax > cinfo->xmax) cinfo->current_huff_pointer = -1; /* no band sufficiently loaded */
+    cinfo->xmin = xmin; /* might need more, or less, than last time */
+    cinfo->xmax = xmax;
+
+    dprintf(("", "Exit jpeg_scan_file OK\n"));
+    return 0;
+  }
+
+  /* Step 1: allocate and initialize JPEG decompression object */
+
+  /* Errors are handled inline with the various macros in jerror.h, so there
+   * is no call to jpeg_std_error() since nothing uses the function pointers
+   * in cinfo->err.
+   */
+
+  /* If called for the first time, initialise the table32k pointer. */
+  if (cinfo->error_code < 0) cinfo->table32k = NULL;
+
+  /* Now we can initialize the JPEG decompression object. */
+  jpeg_create_decompress(cinfo);
+
+  /* Remember key facts about this JPEG, to hope for repeated calls */
+  cinfo->check1 = ((int*)buffer)[buffer_size/(2*4)];
+  cinfo->check2 = ((int*)buffer)[buffer_size/4 - buffer_size/(4*4)];
+  cinfo->check3 = ((int*)buffer)[buffer_size/4 - buffer_size/(8*4)];
+  cinfo->jpeg_user_buffer = buffer;
+  cinfo->jpeg_user_buffer_size = buffer_size;
+
+  /* Step 2: specify data source (from memory) */
+
+  jpeg_mem_src(cinfo, (unsigned char *)buffer, (unsigned long)buffer_size);
+  
+  /* Step 3: read file parameters with jpeg_read_header() */
+
+  (void) jpeg_read_header(cinfo, TRUE);
+  /* We can ignore the return value from jpeg_read_header since
+   * the whole image is in memory so suspension is never needed.
+   */
+
+#if defined(D_ARITH_CODING_SUPPORTED) || defined(D_PROGRESSIVE_SUPPORTED)
+  /* Step 3a: transcode progressive and arithmetic into baseline */
+  if (cinfo->progressive_mode || cinfo->arith_code)
+  {
+    jpegtrans_make_baseline(cinfo, &buffer, &buffer_size);
+  }
+#endif  
+  cinfo->jpeg_buffer = buffer;
+  cinfo->jpeg_buffer_size = buffer_size;
+
+  /* Step 4: set parameters for decompression */
+
+  cinfo->dct_method = JDCT_IFAST; /* The only method compiled in */
+  cinfo->do_fancy_upsampling = FALSE; /* So merged upsampling happens */
+  cinfo->orgoptions = cinfo->options = options; /* Contains colour conversion options */
+  cinfo->out_color_space = JCS_RGB; /* Process everything as though RGB */
+
+  /* Step 5: Start decompressor */
+
+  (void) jpeg_start_decompress(cinfo);
+  /* We can ignore the return value since
+   * the whole image is in memory so suspension is never needed.
+   */
+
+  /* Adjust clipping box & opts now dimensions are known */ 
+  if (xmax > cinfo->image_width) xmax = cinfo->image_width;
+  if (xmin > xmax) xmin = xmax; /* guard against silly input */
+  cinfo->xmin = xmin;
+  cinfo->xmax = xmax;
+
+  vsamp = cinfo->max_v_samp_factor;
+  hsamp = cinfo->max_h_samp_factor;
+  mcu_height = cinfo->block_size * vsamp; /* Scan lines */
+  mcu_width = cinfo->block_size * hsamp; /* Pixels */
+  dprintf(("", "MCUs are %dx%d pixels\n", mcu_width, mcu_height));
+
+  /* Check various limitations of our code */
+  if (BADCOMPCOUNT(cinfo->num_components)) BADFILE(JERR_COMPONENT_COUNT);
+  if (cinfo->data_precision != BITS_IN_JSAMPLE) BADFILE1(JERR_BAD_PRECISION, cinfo->data_precision);
+  if (BADSAMPFACTOR(hsamp) || BADSAMPFACTOR(vsamp)) BADFILE1(JERR_BAD_SAMPLING, (hsamp << 8) | vsamp);
+  if (cinfo->image_width != width && width != -1) BADFILE1(JERR_IMAGE_TOO_BIG, cinfo->image_width);
+  if (cinfo->image_height != height && height != -1) BADFILE1(JERR_IMAGE_TOO_BIG, cinfo->image_height);
+  if (BADDCTSIZE(cinfo->block_size)) BADFILE1(JERR_BAD_DCTSIZE, cinfo->block_size);
+
+  /* Allocate the array of pointers into the entropy stream */
+  i = (cinfo->block_size != DCTSIZE) ? 0 : 3;
+  cinfo->l2_mcu_width  = i +
+                         ((hsamp == 4) ? hsamp - 2 : hsamp - 1); /* log2 of MCU width 1/2/4 -> 0/1/2 */
+  cinfo->l2_mcu_height = i +
+                         ((vsamp == 4) ? vsamp - 2 : vsamp - 1); /* log2 of MCU height 1/2/4 -> 0/1/2 */
+  huff_pointers_size = sizeof(huff_pointer) * ((cinfo->image_height + mcu_height - 1) / mcu_height); /* Bytes */
+  cinfo->huff_pointers = cinfo->mem->alloc_large((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                                 huff_pointers_size);
+  cinfo->current_huff_pointer = -1; /* Nothing currently loaded. */
+
+  /* Allocate the band buffer for output pixels */
+  cinfo->band_buffer_size = cinfo->image_width *
+                            sizeof(int) * /* 32bpp output max */
+                            MAX(2, mcu_height); /* At least 2 lines for the diffuse routine */  
+  cinfo->band_buffer = cinfo->mem->alloc_sarray((j_common_ptr)cinfo, JPOOL_IMAGE,
+                                                cinfo->image_width * sizeof(int), MAX(2, mcu_height));
+
+  dprintf(("", "Band buffer at %x, Huff pointers at %x\n", cinfo->band_buffer[0], cinfo->huff_pointers));
+
+  /* Step 5a: Decompress all the MCU rows, recording an array of pointers into
+   * the entropy stream to allow random access during rendering.
+   */
+  if (1)
+  {
+    size_t huff_pointer_index = 0;
+    JCOEF dc[D_MAX_BLOCKS_IN_MCU];
+    JBLOCKROW dummy[D_MAX_BLOCKS_IN_MCU];
+    int mcus_wide, mcus_tall, mcus_per_imcu;
+    int Se = cinfo->lim_Se;
+  
+    /* The static state for each MCU only includes the DC value, not AC, so speed
+     * up this pass by forcing the entropy decoder to only do DC decompression.
+     * An extra start pass with a DC limit recomputes the coefficient limits.
+     */
+    cinfo->lim_Se = 0;
+    cinfo->entropy->start_pass(cinfo);
+    cinfo->lim_Se = Se;
+    
+    /* Since only the DC components are needed, fake up some JBLOCKs with only
+     * one coefficient's worth of storage on the stack. 
+     */
+    for (i = 0; i < D_MAX_BLOCKS_IN_MCU; i++)
+    {
+      dummy[i] = (JBLOCK *)&dc[i];
+    }
+  
+    /* Generally each MCU comprises an hsamp * vsamp block, but if there's
+     * only one component (ie. monochrome) each MCU is DCTSIZE2 so loop
+     * an equivalent number of rows to make it look like the colour case.
+     */
+    mcus_per_imcu = cinfo->MCUs_per_row;
+    if (cinfo->num_components == 1) mcus_per_imcu = mcus_per_imcu * vsamp;
+
+    mcus_tall = 0;
+    while (mcus_tall < cinfo->image_height)
+    {
+      /* Save the state at start of this band. This loop is broadly
+       * based on decompress_onepass() minus the IDCT bit we don't need.
+       */
+      huff_pointer_save(cinfo, &cinfo->huff_pointers[huff_pointer_index]);
+      huff_pointer_index++;
+
+      for (mcus_wide = mcus_per_imcu; mcus_wide > 0; mcus_wide--)
+      {
+        cinfo->entropy->decode_mcu(cinfo, dummy);
+      }
+      mcus_tall += mcu_height;
+    }
+  
+    if (!(options & jopt_DC_ONLY))
+    {
+      /* Do another start pass for all frequencies, so the coefficient limits
+       * are their correct values. Leave as is for a postage stamp DC only decode.
+       */
+      cinfo->entropy->start_pass(cinfo);
+      dprintf(("", "Restored entropy limits %d\n", cinfo->lim_Se));
+    }
+  }
+
+  if (!cinfo->master->using_merged_upsample)
+  {
+    /* The discrete upsampler + colour converter only ever outputs 32bpp */
+    options &= ~(jopt_OUTBPP_16 | jopt_OUTBPP_8YUV | jopt_OUTBPP_8GREY);
+  }
+
+  if (options & jopt_INTERP_X) /* interpolation requested */
+  {
+    int size_per_line = cinfo->band_buffer_size / mcu_width;
+
+    if (cinfo->image_width * 2 <= size_per_line)
+      cinfo->error_argument |= jopt_INTERP_X; /* signal that we'll do it */
+    else
+      options &= ~jopt_INTERP_X; /* not enough space - remember that we won't do it */
+  }
+  if (options & jopt_OUTBPP_8DITHER) cinfo->error_argument |= jopt_OUTBPP_8DITHER;
+  if (options & jopt_OUTBPP_16) cinfo->error_argument |= jopt_OUTBPP_16;
+  if (options & jopt_OUTBPP_8YUV) cinfo->error_argument |= jopt_OUTBPP_8YUV;
+  if (options & jopt_OUTBPP_8GREY) cinfo->error_argument |= jopt_OUTBPP_8GREY;
+  cinfo->options = options; /* post discovery options we're not prepared to do */
+
+#ifdef DEBUG
+  dprintf(("", "cinfo->error_argument = %d\n", cinfo->error_argument));
+  dprintf(("", "After scan file, options are:\n"));
+  if (options & jopt_GREY) dprintf(("", "  jopt_GREY\n"));
+  if (options & jopt_DC_ONLY) dprintf(("", "  jopt_DC_ONLY\n"));
+  if (options & jopt_INTERP_X) dprintf(("", "  jopt_INTERP_X\n"));
+  if (options & jopt_OUTBPP_8DITHER) dprintf(("", "  jopt_OUTBPP_8DITHER\n"));
+  if (options & jopt_OUTBPP_16) dprintf(("", "  jopt_OUTBPP_16\n"));
+  if (options & jopt_OUTBPP_8YUV) dprintf(("", "  jopt_OUTBPP_8YUV\n"));
+  if (options & jopt_DIFFUSE) dprintf(("", "  jopt_DIFFUSE\n"));
+  if (options & jopt_OUTBPP_8GREY) dprintf(("", "  jopt_OUTBPP_8GREY\n"));
+#endif
+
+  dprintf(("", "Exit jpeg_scan_file (%d)\n", cinfo->error_code));
+
+  return cinfo->error_code;
+}
+
+/*!
+ * \param   cinfo Compression state structure
+ * \param   ycoord Bottom up scan line number
+ * \param   palette_data Pointer to palette
+ * \details This gets called for every line of a rendered image. Most of the time it
+ *          is fast, every MCU height it must do some de-JPEGing of some more data.
+ * \return  Pointer to the line of pixels produced.
+ */
+int *jpeg_find_line(j_decompress_ptr cinfo, int ycoord, const int *palette_data)
+{
+  size_t huff_pointer_index;
+  int    l2_band_height, l2_block_size;
+
+  dprintf(("", "jpeg_find_line, palette data at %x\n", palette_data));
+  
+  l2_block_size = (cinfo->block_size != DCTSIZE) ? 0 : 3;
+  l2_band_height = cinfo->l2_mcu_height;
+  ycoord = cinfo->image_height - ycoord - 1; /* switch to top down row numbering */
+
+  assert(cinfo->band_buffer != NULL, ERROR_FATAL);
+  assert(ycoord >= 0, ERROR_FATAL);
+  assert(ycoord < cinfo->image_height, ERROR_FATAL);
+  assert(MAX_SAMP_FACTOR == 4, ERROR_FATAL);
+
+  huff_pointer_index = ycoord >> l2_band_height;
+  if (huff_pointer_index != cinfo->current_huff_pointer) /* Fetch a line */
+  {
+    int rows_wanted;
+    JSAMPARRAY band_buffer = cinfo->band_buffer;
+    JDIMENSION row_ctr;
+
+    cinfo->current_huff_pointer = -1; /* In case of error exit - set correctly at end */
+
+    /* De-JPEG one MCU's worth into the band buffer. Restore entropy state
+     * at the start of the required band, then proceed to buffered case.
+     */
+    huff_pointer_restore(cinfo, &cinfo->huff_pointers[huff_pointer_index]);
+
+    /* Various bits of the library count the number of lines emitted so
+     * far and stop working once the end of image is reached. Since we want
+     * to randomly access the image, reset all the accumulators to zero.
+     * As this is guaranteed to be an MCU boundary, seeding the accumulators
+     * to zero is sufficient, and avoids having to calculate them properly.
+     */
+    cinfo->output_scanline = 0;
+    cinfo->input_iMCU_row = 0;
+    cinfo->output_iMCU_row = 0;
+    cinfo->global_state = DSTATE_SCANNING;
+
+    /* A couple of processing steps also hold private state. These are normally
+     * cleared in prepare_for_output_pass() when processing a full image, so
+     * do the equivalent startup calls now. Can skip the idct/coef/post
+     * ones since they do nothing useful state-wise.
+     */
+    cinfo->upsample->start_pass(cinfo);
+    cinfo->main->start_pass(cinfo, JBUF_PASS_THRU);
+
+    /* Step 6: while (scan lines remain to be read) */
+    /*           jpeg_read_scanlines(...); */
+
+    rows_wanted = 1 << l2_band_height;
+    while (rows_wanted)
+    {
+      /* This is jpeg_read_scanlines() minus the front end checks */
+      row_ctr = 0;
+      cinfo->main->process_data(cinfo, band_buffer, &row_ctr, cinfo->block_size);
+      rows_wanted -= row_ctr;
+      band_buffer += row_ctr;
+    }
+
+    if (cinfo->options & jopt_DIFFUSE)
+    {
+      int rows_fetched = 1 << l2_band_height;
+      int linelen, xmin;
+
+      /* The error diffusion cannot handle a very thin strip at the right, eg one pixel wide. So the last
+       * unit of diffusion may be up to 31 pixels. However, the units of diffusion until then must
+       * be unaffected by exactly what xmin/xmax are, or we will get minor pixel variation depending
+       * on the clipping. xmin is already a multiple of 16.
+       */
+      linelen = cinfo->xmax - cinfo->xmin;
+      linelen = (linelen + 15) & ~15; /* round up to a multiple of 16 */
+      if (linelen > cinfo->image_width - cinfo->xmin) linelen = cinfo->image_width - cinfo->xmin;
+      xmin = cinfo->xmin;
+
+      if (!cinfo->table32k_unavailable)
+      {
+        /* Try to get the 16bpp->8bpp lookup table from ColourTrans. If we
+         * fail then never try again, probably running on old OS/ColourTrans where it
+         * isn't available.
+         */
+        cinfo->table32k = asm_get_table32k(palette_data);
+        if (cinfo->table32k == 0) cinfo->table32k_unavailable = TRUE;
+        dprintf(("", "Fetched 32k lookup table, at 0x%x\n", (int) cinfo->table32k));
+      }
+
+      /* Dither in lengths of 16, to allow xmin to be non-zero. xmin is a multiple of 16 */
+      if (cinfo->options & jopt_OUTBPP_8DITHER)
+      {
+        while (linelen > 0)
+        {
+          int blockwidth = linelen >= 32 ? 16 : linelen; /* avoid having very narrow blocks at r hand edge. */
+
+          dprintf(("", "calling diffuse to 8bpp code. palette = %x\n", palette_data));
+          asm_diffuse_to_8bpp(cinfo->band_buffer, blockwidth, cinfo->band_buffer, cinfo->table32k, rows_fetched, xmin, palette_data);
+          linelen -= blockwidth;
+          xmin    += blockwidth;
+          dprintf(("", "done diffusion blockwidth = &%x linelen = &%x\n", blockwidth, linelen));
+        }
+      }
+      else
+      {
+        while (linelen > 0)
+        {
+          int blockwidth = linelen >= 32 ? 16 : linelen; /* avoid having very narrow blocks at r hand edge. */
+
+          dprintf(("", "calling diffuse to palette entries code. palette = %x\n", palette_data));
+          asm_diffuse_to_24bpp(cinfo->band_buffer, blockwidth, cinfo->band_buffer, cinfo->table32k, rows_fetched, xmin, palette_data);
+          linelen -= blockwidth;
+          xmin += blockwidth;
+          dprintf(("", "done diffusion blockwidth = &%x linelen = &%x\n", blockwidth, linelen));
+        }
+      }
+    }
+
+    cinfo->current_huff_pointer = huff_pointer_index; /* line completed correctly - remember for next time */
+  }
+
+  if (cinfo->options & jopt_DC_ONLY)
+  {
+    /* Rather than copy the data 8 times, the DC content is spaced out by just 1 line
+     * and the address frigged here to point to line 0 (MCU height 8), 0 or 1 (MCU
+     * height 16), 0 to 3 (MCU height 32).
+     */
+    return (int *)cinfo->band_buffer[(ycoord & ((1 << l2_band_height) - 1)) >> l2_block_size];
+  }
+  else
+  {
+    /* Non DC case, choose from 8 or 16 or 32 rows of pixels */
+    return (int *)cinfo->band_buffer[(ycoord & ((1 << l2_band_height) - 1))];
+  }
+}
+
+/*!
+ * \param   jdata The image to consider (b0 of ws_size clear) or filename (b0 of ws_size set)
+ * \param   image Structure to fill with image dimension and information
+ * \param   ws_size Filled in with workspace size needed
+ * \details Find basic dimensions of a JPEG file. Not done via main scanning code so
+ *          that you can decide these things before you allocate the band buffer etc.
+ * \return  Returns one of a) is a JPEG, can be rendered by me
+ *                         b) looks like a JPEG, but can't be rendered by me
+ *                         c) is not a valid JPEG
+ *          or an OS error if a SWI fails during the decision making.
+ */
+_kernel_oserror *jpeg_find_image_dims(const char *jdata, image_dims_info *image, int *ws_size)
+{
+  int       iwidth, iheight, itype = 0;
+  int       max_vsamp, max_hsamp, mcu_width, mcu_height;
+  int       comps, new_size = 0;
+  BOOL      hadapp0 = FALSE, hadsof = FALSE;
+  size_t    i, markerlen, advance;
+  _kernel_oserror *e;
+  BOOL      load_file;
+  char      buffer[1024];
+  uintptr_t dataend;
+  int       file_handle, xdens, ydens, ipixel_density;
+
+  dprintf(("", "Find image dims called.\n"));
+
+  /* Bit 0 clear means it's all in memory, else load from file */
+  load_file = (((unsigned)ws_size & 3) == 1);
+  if (load_file) 
+  {
+    dprintf(("", "We think it's a filename '%s'\n", jdata));
+    e = _swix(OS_Find, _INR(0,1) | _OUT(0),
+              OSFind_OpenIn | open_nopath | open_nodir | open_mustopen, jdata,
+              &file_handle);
+    if (e != NULL) /* failed to open the file */
+    {
+      dprintf(("", "Failed to open '%s', '%s'\n", jdata, e->errmess));
+      return e;
+    }
+    jdata = buffer;
+    dprintf(("", "Going to scan top of handle %d into buffer = %p\n", file_handle, buffer));
+    e = _swix(OS_GBPB, _INR(0,3) | _OUT(2),
+              OSGBPB_ReadFromPTR, file_handle, jdata, sizeof(buffer),
+              &dataend);
+    if (e != NULL) goto finish;
+    dprintf(("", "Got jdata = %x, data_end = %x\n", jdata, dataend));
+  }
+  dprintf(("", "jdata = %x\n", jdata));
+
+  /* Just check there's a SOI tag, the other decoding software can look
+   * at the M_APPn tags. Thus we let through JFIF and EXIF at this stage
+   * See JFIF 1.02 spec
+   *     EXIF 2.00 spec
+   * This is equivalent to IJG's first_marker().
+   */
+  if ((jdata[0] != 0xFF) || (jdata[1] != M_SOI))
+  {
+    dprintf(("", "Even a cursory look shows it ain't a jpeg\n"));
+    e = jfid_NOT_JPEG;
+    goto finish;
+  }
+  advance = 2; /* skip over 0xFF, M_SOI */
+
+  /* We need the image width and height in order to construct the
+   * sprite header. Walk into the JPEG file until we find the SOF marker.
+   * This is equivalent to IJG's next_marker().
+   */
+  while (!hadsof)
+  {
+    jdata += advance;
+#define M_READAHEAD_MAX 20 /* Longest read within marker of interest. M_SOF wins the prize. */
+    if (load_file && (((uintptr_t)jdata + M_READAHEAD_MAX) > dataend))
+    {
+      size_t offset = (uintptr_t)jdata - dataend;
+      size_t current;
+
+      /* Next tag isn't in the buffer so jump forward and load more
+       * such that the new tag is at the start of the RAM, thus there's no
+       * danger of reading off the end of the buffer.
+       */
+      dprintf(("", "Loading another chunk. jdata = %x, offset = %x\n", jdata, offset));
+      e = _swix(OS_Args, _INR(0,1) | _OUT(2), OSArgs_ReadPTR, file_handle, &current);
+      if (e != NULL) goto finish;
+
+      jdata = buffer;
+      e = _swix(OS_GBPB, _INR(0,4) | _OUT(2),
+                OSGBPB_ReadFromGiven, file_handle, jdata, sizeof(buffer), current + offset,
+                &dataend);
+      if (e != NULL) goto finish;
+      
+      if ((uintptr_t)jdata == dataend)
+      {
+        e = jfid_NOT_JPEG;
+        goto finish; /* nothing was transferred, must be EOF of a malformed JPEG */
+      }
+    }
+    if (jdata[0] == 0xFF)
+    {
+      advance = 1; 
+      continue; /* the while() */
+    }
+
+    markerlen = (jdata[1] << 8) | jdata[2]; /* big endian, 65533 max */
+    switch (jdata[0])
+    {
+      case 0: /* stuffing */
+        advance = 1;
+        continue;
+
+      case M_SOS:
+      case M_EOI: /* no SOF found before start of scan or end of image */
+        e = jfid_NOT_JPEG;
+        goto finish;
+
+#ifndef D_PROGRESSIVE_SUPPORTED
+      case M_SOF2:
+#endif
+#ifndef D_ARITH_CODING_SUPPORTED
+      case M_SOF9:
+#endif
+#if !defined(D_ARITH_CODING_SUPPORTED) || !defined(D_PROGRESSIVE_SUPPORTED)
+      case M_SOF10:
+#endif
+      case M_SOF3:  case M_SOF5:  case M_SOF6:  case M_SOF7:
+      case M_SOF11: case M_SOF13: case M_SOF14: case M_SOF15:
+        e = jfid_CANT_RENDER;
+        goto finish;
+
+#ifdef D_PROGRESSIVE_SUPPORTED
+      case M_SOF2:
+#endif
+#ifdef D_ARITH_CODING_SUPPORTED
+      case M_SOF9:
+#endif      
+#if defined(D_ARITH_CODING_SUPPORTED) && defined(D_PROGRESSIVE_SUPPORTED)
+      case M_SOF10:
+#endif
+      case M_SOF0:
+      case M_SOF1:
+        if ((markerlen < 8) ||
+            (markerlen < (8 + (jdata[8] * 3))))
+        {
+          e = jfid_NOT_JPEG;
+          goto finish;
+        }
+        hadsof = TRUE;
+        comps = jdata[8]; /* 1 for monochrome, 3 for YUV or RGB, 4 for CMYK or YCCK */
+        iheight = (jdata[4] << 8) + jdata[5];
+        iwidth = (jdata[6] << 8) + jdata[7];
+        itype |= comps;
+        itype |= ((jdata[0] & 0xF) << 8); /* mix in the 4 bit SOF type */
+        max_vsamp = max_hsamp = 1;
+        for (i = 0; i < comps; i++)
+        {
+          unsigned char c = jdata[10 + (i * 3)];
+
+          max_vsamp = MAX(max_vsamp, c & 0xF);
+          max_hsamp = MAX(max_hsamp, c >> 4);
+        }
+        if (BADCOMPCOUNT(comps) || /* same checks as jpeg_scan_file() */
+            (jdata[3] != BITS_IN_JSAMPLE) ||
+            BADSAMPFACTOR(max_vsamp) || BADSAMPFACTOR(max_hsamp))
+        {
+          e = jfid_CANT_RENDER;
+          goto finish;
+        }
+        break;
+
+      case M_APP0: /* the JFIF app segment */
+        if ((markerlen < 16) ||
+            (jdata[3] != 'J' || jdata[4] != 'F' || jdata[5] != 'I' || jdata[6] != 'F'))
+        {
+          break; /* probably a 'JFXX' marker then, ignore */
+        }
+        if (jdata[8] != 1) /* need major version 1 */
+        {
+          e = jfid_CANT_RENDER;
+          goto finish;
+        }
+        hadapp0 = TRUE;
+        dprintf(("", "pixel density type %x\n", jdata[10]));
+        dprintf(("", "  jdata[11-14], %02x%02x %02x%02x\n", jdata[11], jdata[12], jdata[13], jdata[14]));
+        switch (jdata[10])
+        {
+          case 0: /* ratio (no units) */
+            xdens = STANDARDDPI;
+            ydens = (jdata[11] << 8) + jdata[12];
+            if (ydens == 0) ydens = 1; /* take into account the case where the scale may be 0:0, pah! */
+            ydens = ((jdata[13] << 8) + jdata[14]) / ydens;
+            if (ydens == 0)
+              ydens = STANDARDDPI;
+            else
+              ydens *=STANDARDDPI;
+            ipixel_density = (xdens << 16) | ydens;
+            itype |= 0x80;    /* set bit in type word to indicate density is only a ratio */
+            break;
+     
+          case 1: /* dp-inch */
+            ipixel_density = (jdata[11] << 24) + (jdata[12] << 16) + (jdata[13] << 8) + jdata[14];
+            break;
+     
+          case 2: /* dp-cm */
+            xdens = ((int)((jdata[11] << 8) + jdata[12])*CMTOINCH_NUM)/CMTOINCH_DEN;
+            ydens = ((int)((jdata[13] << 8) + jdata[14])*CMTOINCH_NUM)/CMTOINCH_DEN;
+            ipixel_density = (xdens << 16) | ydens;
+            break;
+     
+          default:
+            e = jfid_CANT_RENDER;
+            goto finish;
+        }
+        break;
+
+      case M_TEM: /* no parameters with these markers */
+      case M_RST0: case M_RST1: case M_RST2: case M_RST3:
+      case M_RST4: case M_RST5: case M_RST6: case M_RST7:
+        markerlen = 0; 
+        /* Fall through.. */
+      default:
+        dprintf(("", "skip tag = %x\n", jdata[0]));
+        break;
+    }
+    advance = markerlen + 2; /* skip over variable length marker */
+  }
+
+  if (!hadapp0)
+  {
+    dprintf(("", "no APP0 tag, assuming a 1:1 xdpi to ydpi ratio\n"));
+    itype |= 0x80;    /* set bit in type word to indicate density is only a ratio */
+    ipixel_density = (STANDARDDPI << 16) | STANDARDDPI;
+  }
+  dprintf(("", "pixel density is %d\n", ipixel_density));
+
+  /* Work out the required workspace to handle this specimen */
+  mcu_height = max_vsamp * DCTSIZE;
+  mcu_width = max_hsamp * DCTSIZE;
+  new_size = sizeof(struct jpeg_decompress_struct) /* Compression state structure */ +
+             (24 * 1024) /* From libjpeg.txt */ +
+             sizeof(huff_pointer) * ((iheight + (mcu_height - 1)) / mcu_height) /* Entropy pointers */ +
+             MAX(2, mcu_height) * (iwidth + (mcu_width - 1)) * sizeof(int) /* Band buffer */;
+  new_size = (new_size + 3) & ~3;
+
+  if (image != NULL)
+  {
+    image->height = iheight;
+    image->width = iwidth;
+    image->type = itype;
+    image->density = ipixel_density;
+  }
+
+  if ((unsigned)ws_size > 3)
+  {
+    j_decompress_ptr  cinfo;
+    int               page_size;
+
+    ws_size = (int *)((unsigned)ws_size & ~3);
+    cinfo = (j_decompress_ptr)*ws_size;
+
+    /* If cinfo is not NULL then it points to the current decompress_info_struct which
+     * contains info about the current memory allocation
+     */
+    if (cinfo == NULL)
+    {
+      new_size = new_size + (10*1024); /* first jpeg => alloc size we need plus safety margin */
+    }
+    else
+    {
+      if (cinfo->workspace_size >= new_size)
+      {
+        new_size = 0; /* we already have enough memory */
+      }
+      else
+      {
+        new_size -= cinfo->workspace_size; /* size that will be added for this jpeg */
+      }
+    }
+    _swix(OS_ReadMemMapInfo, _OUT(0), &page_size);
+    new_size = (new_size + (page_size - 1)) & ~(page_size - 1);
+    *ws_size = new_size;
+    dprintf(("", "We need another %x bytes\n", new_size));
+  }
+  e = jfid_OK; /* checks out OK */
+
+finish:
+  if (load_file)
+  {
+    _swix(OS_Find, _INR(0,1), OSFind_Close, file_handle);
+  }
+  return e;
+}

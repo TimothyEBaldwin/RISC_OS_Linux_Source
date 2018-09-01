@@ -1,0 +1,212 @@
+/*
+ * Copyright (c) 2015, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/NewErrors.h"
+#include "Global/OSRSI6.h"
+#include "Global/OSMem.h"
+#include "Global/ModHand.h"
+#include "Global/Services.h"
+
+#include "config.h"
+#include "errors.h"
+#include "handler.h"
+#include "log.h"
+
+void *private_word;
+
+#ifdef DEBUG
+extern void (*dadwritec)(void);
+#endif
+
+static bool restore_compat_page = false;
+
+static void disable_compatibility(void)
+{
+	int state;
+	_kernel_oserror *e = _swix(OS_Memory,_INR(0,1)|_OUT(1),OSMemReason_Compatibility,-1,&state);
+	if (!e && (state == 1))
+	{
+		restore_compat_page = !_swix(OS_Memory,_INR(0,1),OSMemReason_Compatibility,0);
+	}
+}
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) podule_base;
+
+	_kernel_oserror *e = NULL;
+
+	private_word = pw;
+
+#ifdef DEBUG
+	if (_swix(0x531c0,_OUT(0),&dadwritec))
+		dadwritec = NULL;
+#endif
+
+	/* Check if zero page relocation is in effect
+	   There's no SWI for this, so check if anything is mapped in at page 0
+	*/
+	int flags;
+	e = _swix(OS_Memory,_INR(0,2)|_OUT(1),OSMemReason_CheckMemoryAccess,0,0x4000,&flags);
+	if (e)
+	{
+		/* Old kernel without OS_Memory 24 support? */
+		return error_get(E_Unsupported);
+	}
+	if (flags & 1)
+	{
+		/* Zero page is fully readable in user mode. We aren't needed. */
+		return error_get(E_NotRequired);
+	}
+
+#ifndef ROM_MODULE /* Inclusion in ROM implies that we do want the code active */
+	/* Only support up to the next stable OS release (5.24)
+	*/
+	int osver;
+	e = _swix(OS_Module,_INR(0,2)|_OUT(6),ModHandReason_EnumerateROM_ModulesWithInfo,0,-1,&osver);
+	if (e || (osver >= 0x52600))
+	{
+		return error_get(E_Unsupported);
+	}
+#endif
+
+	/* Get the locations of the zero page areas we emulate */
+	int vals[RSI6Count+1];
+	vals[DomainId] = OSRSI6_DomainId;
+	vals[MetroGnome] = OSRSI6_MetroGnome;
+	vals[VecPtrTab] = OSRSI6_VecPtrTab;
+	vals[RSI6Count] = -1;
+	e = _swix(OS_ReadSysInfo,_INR(0,2),6,vals,rsi6vals);
+	if (e)
+	{
+		goto err0;
+	}
+
+	/* Read our config file */
+	e = config_read(cmd_tail);
+	if (e)
+	{
+		goto err0;
+	}
+
+#ifndef ROM_MODULE /* Log path will be initialised later */
+	/* Do we have a log path? */
+	if (!log_file[0])
+	{
+		e = error_get(E_NoLog);
+		goto err1;
+	}
+#endif
+
+	/* Install CallEvery */
+	e = _swix(OS_CallEvery,_INR(0,2),100,log_flush_entry,pw);
+	if (e)
+	{
+		goto err1;
+	}
+
+	/* Install abort handler */
+	e = handler_install(handler_do);
+	if (e)
+	{
+		goto err2;
+	}
+
+	/* Make sure the Debugger module is at least collecting exception dumps via SeriousErrorV */
+	const char *val = getenv("Debugger$DumpOptions");
+	if (!val || !val[0])
+	{
+		_kernel_setenv("Debugger$DumpOptions","-none");
+	}
+
+	/* For us to be fully effective, we must disable the compatibility page, if present */
+	disable_compatibility();
+
+	return NULL;
+
+err2:
+	_swix(OS_RemoveTickerEvent,_INR(0,1),log_flush_entry,pw);
+err1:
+	config_free();
+err0:
+
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) podule;
+	(void) fatal;
+
+	/* Restore compatibility page before removing handler, just in case something is regularly reading page zero */
+	if (restore_compat_page)
+	{
+		_swix(OS_Memory,_INR(0,1),OSMemReason_Compatibility,1);
+	}
+
+	_kernel_oserror* e = handler_remove();
+	if (e)
+	{
+		/* Can't die! */
+		return e;
+	}
+
+	_swix(OS_RemoveTickerEvent,_INR(0,1),log_flush_entry,pw);
+	_swix(OS_RemoveCallBack,_INR(0,1),log_callback_entry,pw);
+
+	/* Write any pending items */
+	log_flush();
+
+	config_free();
+
+	return NULL;
+}
+
+void module_services(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	switch (service_number)
+	{
+	case Service_NewApplication:
+		log_new_application();
+		break;
+	case Service_PostInit:
+		/* The kernel enables the compatibility page just before Service_PostInit
+		   Make sure it stays disabled */
+		disable_compatibility();
+		break;
+	}
+}

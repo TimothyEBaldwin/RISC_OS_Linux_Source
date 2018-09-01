@@ -1,0 +1,171 @@
+/* Copyright 1999 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ *  IPVars (ipvars.c)
+ *
+ * Copyright (C) Pace Micro Technology plc. 1999
+ *
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <ctype.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/ioctl.h"
+#include "sys/filio.h"
+#include "sys/sockio.h"
+#include "net/if.h"
+#include "protocols/dhcp.h"
+#include "sys/dcistructs.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+#include "net/if_dl.h"
+#include "net/if_arp.h"
+#include "net/if_types.h"
+#include "sys/errno.h"
+
+#include "socklib.h"
+
+/* This is the socket handle which we can use for all our activities, including
+ * sending ioctls to the Internet module.
+ */
+static int s;
+
+
+/* Creates a new datagram socket and binds it to the DHCP client port so that it
+ * receives copies of any incoming datagrams on any interface.  This allows it
+ * to bypass the Internet module.
+ */
+static void sockets_init(void)
+{
+        s = socket(PF_INET, SOCK_DGRAM, 0);
+        if (s == -1) {
+                fprintf(stderr, "socket() failed -> errno %d (%s)\n", errno, _inet_err());
+                exit(EXIT_FAILURE);
+        }
+}
+
+static void sockets_discard(void)
+{
+        if (s != -1) {
+                (void) socketclose(s);
+                s = -1;
+        }
+}
+
+static void process_hw_interface(const char *ifname, const char *result)
+{
+        if (result) {
+                char sysvar[sizeof("Inet$") + sizeof("$MAC") + IFNAMSIZ];
+                if (!isdigit(*result)) {
+                        result = strchr(result, ':');
+                        if (result) ++result;
+                }
+                if (result) {
+                        sprintf(sysvar, "Inet$%s$MAC", ifname);
+                        _kernel_setenv(sysvar, result);
+                }
+        }
+}
+
+static void process_interface(const char *ifname, struct in_addr addr)
+{
+        struct ifreq ifr;
+        char sysvar[sizeof("Inet$") + sizeof("$Broadcast") + IFNAMSIZ];
+        char ipaddr[32];
+        const char *result;
+        struct in_addr mask, ip;
+
+        strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+        if (ioctl(s, SIOCGIFNETMASK, &ifr) < 0) {
+                fprintf(stderr, "ioctl() failed -> errno %d (%s)\n", errno, _inet_err());
+                exit(EXIT_FAILURE);
+        }
+
+        memcpy(&mask, &((struct sockaddr_in *) &ifr.ifr_addr)->sin_addr, sizeof(mask));
+
+        sprintf(sysvar, "Inet$%s$Addr", ifname);
+        ip = addr;
+        result = inet_ntop(AF_INET, &ip, ipaddr, sizeof(ipaddr));
+        if (result) _kernel_setenv(sysvar, result);
+        sprintf(sysvar, "Inet$%s$Mask", ifname);
+        ip = mask;
+        result = inet_ntop(AF_INET, &ip, ipaddr, sizeof(ipaddr));
+        if (result) _kernel_setenv(sysvar, result);
+        sprintf(sysvar, "Inet$%s$Network", ifname);
+        ip.s_addr = addr.s_addr & mask.s_addr;
+        result = inet_ntop(AF_INET, &ip, ipaddr, sizeof(ipaddr));
+        if (result) _kernel_setenv(sysvar, result);
+        sprintf(sysvar, "Inet$%s$Host", ifname);
+        ip.s_addr = addr.s_addr & ~mask.s_addr;
+        result = inet_ntop(AF_INET, &ip, ipaddr, sizeof(ipaddr));
+        if (result) _kernel_setenv(sysvar, result);
+        sprintf(sysvar, "Inet$%s$Broadcast", ifname);
+        ip.s_addr = (addr.s_addr & mask.s_addr) | ~mask.s_addr;
+        result = inet_ntop(AF_INET, &ip, ipaddr, sizeof(ipaddr));
+        if (result) _kernel_setenv(sysvar, result);
+}
+
+static void sockets_list_interfaces(void)
+{
+        struct ifconf ifc;
+        struct ifreq *ifr, *end;
+        static const size_t bufsize = 1500;
+
+        ifc.ifc_len = bufsize;
+        ifc.ifc_buf = malloc(ifc.ifc_len);
+        if (ifc.ifc_buf == NULL) {
+                return;
+        }
+
+        if (socketioctl(s, SIOCGIFCONF, &ifc) == 0) {
+                ifr = ifc.ifc_req;
+                end = (struct ifreq *) (ifc.ifc_buf + ifc.ifc_len);
+                while (ifr < end) {
+                        if (ifr->ifr_addr.sa_family == AF_INET) {
+                                struct sockaddr_in *sin;
+                                sin = (struct sockaddr_in *) &ifr->ifr_addr;
+                                process_interface(ifr->ifr_name, sin->sin_addr);
+                        }
+                        else if (ifr->ifr_addr.sa_family == AF_LINK) {
+                                struct sockaddr_dl *dl;
+                                dl = (struct sockaddr_dl *) &ifr->ifr_addr;
+                                process_hw_interface(ifr->ifr_name, link_ntoa(dl));
+                        }
+                        if (ifr->ifr_addr.sa_len) {
+                                /* Dodgy hack for dual Internet 4/Internet 5 compat */
+                                ifr = (struct ifreq *) ((caddr_t) ifr +
+                                        ifr->ifr_addr.sa_len - sizeof(struct sockaddr));
+                        }
+                        ++ifr;
+                }
+        }
+
+        free(ifc.ifc_buf);
+}
+
+int main(void)
+{
+        sockets_init();
+        atexit(sockets_discard);
+        sockets_list_interfaces();
+
+        return 0;
+}

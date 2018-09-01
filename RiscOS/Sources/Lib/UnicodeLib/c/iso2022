@@ -1,0 +1,1042 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* > iso2022.c */
+
+/**************************************************************************/
+/*                                                                        */
+/* Copyright [1997-2000] Pace Micro Technology PLC.  All rights reserved. */
+/*                                                                        */
+/* The copyright in this material is owned by Pace Micro Technology PLC   */
+/* ("Pace").  This material is regarded as a highly confidential trade    */
+/* secret of Pace.  It may not be reproduced, used, sold or in any        */
+/* other way exploited or transferred to any third party without the      */
+/* prior written permission of Pace.                                      */
+/**************************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "charsets.h"
+#include "encpriv.h"
+#include "iso2022.h"
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+#define MAX_TABLES	10
+
+typedef struct ISO2022_Set ISO2022_Set;
+typedef struct ISO2022_EncoderSet ISO2022_EncoderSet;
+typedef struct ISO2022_Encoding ISO2022_Encoding;
+
+struct ISO2022_EncoderSet
+{
+    encoding_table table;
+
+    const unsigned char *esc_seq;
+    int esc_seq_len;
+};
+
+struct ISO2022_Encoding
+{
+    EncodingPriv e;
+    ISO2022_Set *Set[4+2];
+
+    ISO2022_Set *CL, *GL, *CR, *GR;
+    unsigned char CL_s, GL_s, CR_s, GR_s;
+
+    unsigned char ssarea;
+
+    unsigned char sync[2];
+
+    unsigned char tempset;
+    ISO2022_Set *oldset;
+
+    /* Whether escape sequences are disabled
+     *
+     * Value: Meaning:
+     *   0    All escape sequences enabled
+     *   1    Only SS2/3 escape sequences enabled
+     *   2    All escape sequences disabled
+     */
+    unsigned char esc_disabled;
+
+    /* Whether C1 control characters are permitted
+     *
+     * Value: Meaning:
+     *   0    No C1 control characters permitted
+     *   1    Only 0x8E/0x8F permitted
+     *   2    All C1 control characters permitted
+     */
+    unsigned char c1_permitted;
+
+    /* Pending escape commands */
+    unsigned char esc_pending;
+    unsigned char esc_multi;
+    unsigned char esc_inter1;
+    unsigned char esc_inter2;
+    unsigned char esc_inter3;
+    unsigned char esc_revision;
+
+    /* encoding tables - 10 pointers should do for now */
+    ISO2022_EncoderSet table[MAX_TABLES];
+    int current[4];
+    unsigned char first;
+    unsigned char oneoffdesignator;
+};
+
+#define iso2022_ws_size (sizeof(ISO2022_Encoding) - sizeof(EncodingPriv))
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+struct ISO2022_Set
+{
+    UCS4 (*next_code)(struct ISO2022_Set *s, int c, int invoker, unsigned char *sync);
+};
+
+#define G0 0
+#define G1 1
+#define G2 2
+#define G3 3
+#define C0 4
+#define C1 5
+
+#define G94_ISO646_IRV 0x42
+#define C0_ISO646 0x40
+#define C1_ISO6429 0x43
+
+#define _GL 0
+#define _GR 1
+#define _CL 2
+#define _CR 3
+
+#define SS2 0x8E
+#define SS3 0x8F
+
+typedef struct simple_set
+{
+    ISO2022_Set s;
+    encoding_table table;
+} simple_set;
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+/* static UCS2 *table94[0x3F], *table96[0x3F], *table128[0x3F], *table94x94[0x3F]; */
+/* static UCS2 *tableC0[0x3F], *tableC1[0x3F]; */
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static UCS4 iso2022_esc_cont(ISO2022_Encoding *i, unsigned char c);
+static void iso2022_esc(ISO2022_Encoding *i);
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static UCS4 simple_double_next_code_94(ISO2022_Set *s, int c, int invoker, unsigned char *sync)
+{
+    simple_set *ss = (simple_set *) s;
+
+    if (c == 0x00 || c == 0x5F)
+    {
+        *sync = 0;
+        return invoker == _GL ? c + 0x20 : 0xFFFD;
+    }
+
+    if (!*sync)
+    {
+        *sync = c;
+        return NULL_UCS4;
+    }
+    else
+    {
+        UCS4 u = encoding_table_ptr(ss->table)[94*(*sync-1) + c-1];
+        *sync = 0;
+        return u;
+    }
+}
+
+static UCS4 null_double_next_code(ISO2022_Set *s, int c, int invoker, unsigned char *sync)
+{
+    return 0xFFFD;
+
+    NOT_USED(s);
+    NOT_USED(c);
+    NOT_USED(invoker);
+    NOT_USED(sync);
+}
+
+static UCS4 simple_next_code_94(ISO2022_Set *s, int c, int invoker, unsigned char *sync)
+{
+    if (c > 0 && c < 0x5F)
+        return encoding_table_ptr(((simple_set *)s)->table)[c-1]; /* -1 for 94 byte tables */
+
+    if (invoker != _GL)
+        return 0xFFFD;
+
+    return c == 0 ? 0x20 : 0x7F;
+
+    NOT_USED(sync);
+}
+
+static UCS4 simple_next_code_96(ISO2022_Set *s, int c, int invoker, unsigned char *sync)
+{
+    return encoding_table_ptr(((simple_set *)s)->table)[c];
+
+    NOT_USED(invoker);
+    NOT_USED(sync);
+}
+
+static UCS4 null_next_code_94(ISO2022_Set *s, int c, int invoker, unsigned char *sync)
+{
+    if (invoker == _GL)
+    {
+        if (c == 0) return 0x20;
+        if (c == 0x5F) return 0x7F;
+    }
+
+    return 0xFFFD;
+
+    NOT_USED(s);
+    NOT_USED(sync);
+}
+
+static UCS4 null_next_code_96(ISO2022_Set *s, int c, int invoker, unsigned char *sync)
+{
+    return 0xFFFD;
+
+    NOT_USED(s);
+    NOT_USED(c);
+    NOT_USED(invoker);
+    NOT_USED(sync);
+}
+
+static void iso2022_ls(ISO2022_Encoding *i, int n)
+{
+    i->GL = i->Set[n];
+    i->GL_s = n;
+}
+
+static void iso2022_lsr(ISO2022_Encoding *i, int n)
+{
+    i->GR = i->Set[n];
+    i->GR_s = n;
+}
+
+static void iso2022_ss(ISO2022_Encoding *i, int n)
+{
+    if (i->ssarea)
+    {
+        i->tempset = 2;
+        i->oldset = i->GR;
+        i->GR = i->Set[n];
+    }
+    else
+    {
+        i->tempset = 1;
+        i->oldset = i->GL;
+        i->GL = i->Set[n];
+    }
+}
+
+encoding_table iso2022_find_table(int type, int id)
+{
+    const char *dir;
+    char fname[256];
+
+    /* 07/14 is the empty set (section 14.1) */
+    if (id == 0x7E)
+        return NULL;
+
+    switch (type)
+    {
+        case 32:
+/*           table = tableC0 + id - 0x40; */
+          dir = "C0";
+          break;
+        case 32+1:
+/*           table = tableC1 + id - 0x40; */
+          dir = "C1";
+          break;
+        case 94:
+/*           table = table94 + id - 0x40; */
+          dir = "G94";
+          break;
+        case 96:
+/*           table = table96 + id - 0x40; */
+          dir = "G96";
+          break;
+        case 94*94:
+/*           table = table94x94 + id - 0x40; */
+          dir = "G94x94";
+          break;
+        default:
+          return NULL;
+    }
+
+    sprintf(fname, "ISO2022" DIR_SEP "%s" DIR_SEP "%02X" DIR_WILD, dir, id);
+    return encoding_load_map_file(fname);
+}
+
+static void set_free(ISO2022_Set *Set)
+{
+    simple_set *set = (simple_set *)Set;
+    if (set)
+    {
+	encoding_discard_map_file(set->table);
+	encoding__free(set);
+    }
+}
+
+static int iso2022_select_set(ISO2022_Encoding *i, int setno, int type, int id)
+{
+    encoding_table t;
+    ISO2022_Set *set;
+
+    UNIDBG(("iso2022_select_set: enc %p setno %d type %d\n", i, setno, type));
+
+    /* This can return NULL if the table is not present in which case
+       we fall back on default mapping functions below */
+    t = iso2022_find_table(type, id);
+
+    set = encoding__alloc(sizeof(simple_set));
+    if (!set) return 0;
+    memset(set, 0, sizeof(simple_set));
+
+    if (type == 94*94)
+    {
+        if (t)
+            set->next_code = simple_double_next_code_94;
+        else
+            set->next_code = null_double_next_code;
+    }
+    else if (type == 94)
+    {
+        if (t)
+            set->next_code = simple_next_code_94;
+        else
+            set->next_code = null_next_code_94;
+    }
+    else
+    {
+        if (t)
+            set->next_code = simple_next_code_96;
+        else
+            set->next_code = null_next_code_96;
+    }
+
+    ((simple_set *)set)->table = t;
+
+    UNIDBG(("iso2022_select_set: free %p new %p tempset %d oldset %p\n", i->Set[setno], set, i->tempset, i->oldset));
+
+    set_free(i->Set[setno]);
+    i->Set[setno] = set;
+
+    if (i->CL_s == setno) i->CL = i->Set[setno];
+    if (i->GL_s == setno) i->GL = i->Set[setno];
+    if (i->CR_s == setno) i->CR = i->Set[setno];
+    if (i->GR_s == setno) i->GR = i->Set[setno];
+
+    return t != NULL;
+}
+
+/* Free the tables that have been saved away to search when re
+encoding. */
+
+static void iso2022_free_write_tables(ISO2022_Encoding *i)
+{
+    int tab;
+    for (tab = 0; tab < MAX_TABLES; tab++)
+    {
+	encoding_table *pt = &i->table[tab].table;
+	if ( *pt )
+	{
+	    encoding_discard_map_file( *pt );
+	    *pt = NULL;
+	}
+    }
+}
+
+static void iso2022_delete(EncodingPriv *e)
+{
+    ISO2022_Encoding *i = (ISO2022_Encoding *) e;
+    set_free(i->Set[G0]);
+    set_free(i->Set[G1]);
+    set_free(i->Set[G2]);
+    set_free(i->Set[G3]);
+    set_free(i->Set[C0]);
+    set_free(i->Set[C1]);
+
+    iso2022_free_write_tables(i);
+}
+
+static int iso2022_reset(Encoding *e, int for_encoding)
+{
+    ISO2022_Encoding *i = (ISO2022_Encoding *) e;
+
+/*  memset(i->Set, 0, sizeof i->Set); */
+
+    i->CL_s = C0;
+    i->GL_s = G0;
+    i->CR_s = C1;
+    i->GR_s = G1;
+
+    i->c1_permitted = 2;
+    i->esc_disabled = 0;
+    i->esc_pending = i->esc_revision = 0;
+    i->tempset = 0;
+    i->oldset = NULL;
+    i->ssarea = 0;
+    i->first = 1;
+    i->sync[_GL] = i->sync[_GR] = 0;
+
+    iso2022_select_set(i, G0, 94, G94_ISO646_IRV);
+    iso2022_select_set(i, G1, 96, 0x7E);
+    iso2022_select_set(i, G2, 96, 0x7E);
+    iso2022_select_set(i, G3, 96, 0x7E);
+    iso2022_select_set(i, C0, 32, C0_ISO646);
+    iso2022_select_set(i, C1, 32+1, C1_ISO6429);
+
+    /* ISO8859 and EUC variants of ISO2022 require preloading with
+       escape sequences to get the appropriate tables */
+    if (e->list_entry->preload)
+    {
+        char euc = 0;
+	unsigned int n = strlen(e->list_entry->preload);
+	if (n != e->read(e, NULL, (unsigned char *)e->list_entry->preload, n, NULL))
+	    return 0;
+
+        if (e->list_entry->identifier == csEUCPkdFmtJapanese ||
+                /* e->list_entry->identifier == csKSC56011987 || */
+                e->list_entry->identifier == csEUCKR ||
+                e->list_entry->identifier == csGB2312)
+        {
+            euc = 1;
+        }
+
+        /* If we've preloaded and we're not handling an EUC variant
+         * then we need to disable further escape sequences otherwise
+         * stray control sequences (eg 8E, 8F) will try and switch tables.
+         *
+         * If we're handling an EUC variant which has loaded tables into
+         * G2 and G3, then SS2/SS3 are permitted. */
+        if (euc && ((simple_set *)i->Set[G2])->table &&
+                ((simple_set *)i->Set[G3])->table)
+        {
+            i->esc_disabled = 1;
+            i->c1_permitted = 1;
+        }
+        else
+        {
+            i->esc_disabled = 2;
+            if (euc)
+                i->c1_permitted = 0;
+        }
+    }
+
+    if (for_encoding != encoding_READ)
+    {
+	const unsigned char *s = (const unsigned char *)e->list_entry->encoder_data;
+	if (s)
+	{
+	    int tab = 0;
+	    const unsigned char *last_s = NULL;
+
+	    /* free up the old ones before allocating new ones */
+	    iso2022_free_write_tables(i);
+
+	    /* process the table specifying string, they will all place into G1 */
+	    while (tab < MAX_TABLES)
+	    {
+		unsigned char c = *s;
+
+		if (c == 0 || c == 0x1B)
+		{
+		    if (last_s)
+		    {
+			simple_set *ss = (simple_set *)i->Set[G1];
+
+			i->table[tab].table = ss->table;	/* copy over table ptr */
+			ss->table = NULL;			/* null entry so it doesn't get discarded */
+
+			i->table[tab].esc_seq = last_s;
+			i->table[tab].esc_seq_len = s - last_s;
+
+			UNIDBG(("iso2022_reset: loaded write table %d table %p esc_seq_len %d\n", tab,
+			        i->table[tab].table, i->table[tab].esc_seq_len));
+
+			tab++;
+		    }
+
+		    last_s = s;
+		}
+
+		if (c == 0)
+		    break;
+		else if (c == 0x1B)
+		    iso2022_esc(i);
+		else
+		{
+		    /* Jiggery pokery - run all through G1 just for this scan */
+		    iso2022_esc_cont(i,(unsigned char )(c >= 0x28 && c <= 0x2F ?
+                                                        (c&~3)+1 : c));
+
+		    /* Aaargh! Above won't work for crummy 1B 24 42 Japanese broken sequences */
+		    if (c == 0x24 && s[1] >= 0x40) iso2022_esc_cont(i, 0x29);
+		}
+
+		s++;
+	    }
+
+	    set_free(i->Set[G1]);
+
+	    i->Set[G1] = 0;
+    	    /*
+    	     * Special - this may need improving. If only two tables (ASCII variant + 1 other)
+             * we assume that only one designator sequence is required, at the top of the
+             * output. This handles ISO-2022-KR. Although that doesn't actually require
+             * it at the top, it requires it at the start of a line; at the top is the
+             * easiest way to do that.
+             */
+    	    i->oneoffdesignator = tab <= 2;
+	}
+
+	i->current[G0] = 0;	/* assume the first table is set initially */
+    }
+
+    return 1;
+}
+
+#if 0
+/* Not used at the moment */
+static void iso2022_disable_escapes(EncodingPriv *i)
+{
+    ((ISO2022_Encoding *)i)->esc_disabled = 1;
+}
+#endif
+
+static void iso2022_esc(ISO2022_Encoding *i)
+{
+    i->esc_pending = 1;
+    i->esc_multi = 0;
+    i->esc_inter1 = 0;
+    i->esc_inter2 = 0;
+    i->esc_inter3 = 0;
+}
+
+static UCS4 iso2022_esc_cont(ISO2022_Encoding *i, unsigned char c)
+{
+    if (c >= 0x7F || c < 0x20)
+    {
+        /* Illegal. Yuck */
+        i->esc_pending = 0;
+        return 0xFFFD;
+    }
+
+    if (c >= 0x20 && c <= 0x2F)
+    {
+        /* A continuation byte */
+        switch (c)
+        {
+            case 0x24:
+              if (!i->esc_inter1)
+              {
+                  i->esc_multi = 0x24;
+                  break;
+              }
+              /* else fall through */
+            default:
+              if (!i->esc_inter1)
+                 i->esc_inter1 = c;
+              else if (!i->esc_inter2)
+                 i->esc_inter2 = c;
+              break;
+        }
+        return NULL_UCS4;
+    }
+
+    /* The final byte (yippee) */
+    i->esc_pending = 0;
+
+    /* Special: ESC $ <c> == ESC $ ( <c> */
+    if (i->esc_multi && !i->esc_inter1)
+        i->esc_inter1 = 0x28;
+
+    if (!i->esc_multi && !i->esc_inter1)
+    {
+        /* A single character escape sequence */
+        if (c >= 0x40 && c <= 0x5F)
+            return i->Set[C1]->next_code(i->Set[C1], c - 0x40, _GL, NULL);
+        else if (c == 0x6E)
+            iso2022_ls(i, G2);
+        else if (c == 0x6F)
+            iso2022_ls(i, G3);
+        else if (c == 0x7E)
+            iso2022_lsr(i, G1);
+        else if (c == 0x7D)
+            iso2022_lsr(i, G2);
+        else if (c == 0x7C)
+            iso2022_lsr(i, G3);
+
+        return NULL_UCS4;
+    }
+
+    switch (i->esc_inter1)
+    {
+        case 0x20:
+          switch (c)
+          {
+            case 0x5C:
+              i->ssarea = 1;
+              break;
+          }
+          break;
+        case 0x21: iso2022_select_set(i, C0, 32, c); break;
+        case 0x22: iso2022_select_set(i, C1, 32+1, c); break;
+        case 0x25: /* Non-ISO2022 set */ break;
+        case 0x26: i->esc_revision = c; break;
+        case 0x28: iso2022_select_set(i, G0, i->esc_multi ? 94*94 : 94, c); break;
+        case 0x29: iso2022_select_set(i, G1, i->esc_multi ? 94*94 : 94, c); break;
+        case 0x2A: iso2022_select_set(i, G2, i->esc_multi ? 94*94 : 94, c); break;
+        case 0x2B: iso2022_select_set(i, G3, i->esc_multi ? 94*94 : 94, c); break;
+        case 0x2D: iso2022_select_set(i, G1, i->esc_multi ? 96*96 : 96, c); break;
+        case 0x2E: iso2022_select_set(i, G2, i->esc_multi ? 96*96 : 96, c); break;
+        case 0x2F: iso2022_select_set(i, G3, i->esc_multi ? 96*96 : 96, c); break;
+    }
+
+    return NULL_UCS4;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static unsigned int iso2022_read(EncodingPriv *e,
+			  encoding_read_callback_fn ucs_out,
+                          const unsigned char *s,
+                          unsigned int n,
+                          void *handle)
+{
+    ISO2022_Encoding *i = (ISO2022_Encoding *) e;
+    unsigned int count;
+
+    for (count = n; count; count--)
+    {
+        unsigned char c = *s++;
+        UCS4 u;
+
+	UNIDBG(("iso2022: %02x\n", c));
+
+	/* check for illegal single shifts */
+	if ((i->tempset == 1 && (c < 0x20 || c > 0x7F)) ||
+	    (i->tempset == 2 && (c < 0xA0)))
+	{
+	    u = 0xFFFD;
+	}
+        /* or illegal continuation bytes */
+        else if ((i->sync[_GL] && (c < 0x20 || c > 0x7F)) ||
+                 (i->sync[_GR] && (c < 0xA0)))
+        {
+            u = 0xFFFD;
+        }
+	else if (i->esc_pending)
+	{
+            u = iso2022_esc_cont(i, c);
+	}
+        else if (c < 0x20)
+        {
+            i->sync[_GL] = i->sync[_GR] = 0;
+            u = i->CL->next_code(i->CL, c       , _CL, NULL);
+        }
+        else if (c < 0x80)
+        {
+            i->sync[_GR] = 0;
+            u = i->GL->next_code(i->GL, c - 0x20, _GL, i->sync + _GL);
+        }
+        else if (c < 0xA0)
+        {
+            i->sync[_GL] = i->sync[_GR] = 0;
+            if (i->c1_permitted == 2 ||
+                    (i->c1_permitted == 1 && (c == 0x8E || c == 0x8F)))
+            {
+                u = i->CR->next_code(i->CR, c - 0x80, _CR, NULL);
+            }
+            else
+            {
+                u = 0xFFFD;
+            }
+        }
+        else
+        {
+            i->sync[_GL] = 0;
+	    u = i->GR->next_code(i->GR, c - 0xA0, _GR, i->sync + _GR);
+        }
+
+        switch (u)
+        {
+            case 0x1B: if (!i->esc_disabled) { iso2022_esc(i); continue; }
+                       break;
+            case 0x0F: if (!i->esc_disabled) { iso2022_ls(i, G0); continue; }
+                       break;
+            case 0x0E: if (!i->esc_disabled) { iso2022_ls(i, G1); continue; }
+                       break;
+            case 0x8E: if (i->esc_disabled < 2) { iso2022_ss(i, G2); continue; }
+                       break;
+            case 0x8F: if (i->esc_disabled < 2) { iso2022_ss(i, G3); continue; }
+                       break;
+        }
+
+        if (u != NULL_UCS4)
+        {
+            if (i->tempset)
+            {
+                if (i->tempset == 1)
+                    i->GL = i->oldset;
+                else
+                    i->GR = i->oldset;
+                i->tempset = 0;
+            }
+
+            if (u == NULL_UCS2)
+                u = 0xFFFD;
+
+            if (ucs_out)
+                if (ucs_out(handle, u))
+                {
+                    /* Character has been used, so ensure it's counted */
+                    count--;
+                    break;
+                }
+        }
+    }
+
+    return n - count;
+}
+
+static int iso2022_read_in_multibyte_sequence(EncodingPriv *e)
+{
+    ISO2022_Encoding *i = (ISO2022_Encoding *) e;
+
+    return i->sync[_GL] != 0 || i->sync[_GR] != 0 || i->esc_pending != 0;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static int write_index(int index, unsigned char *out, int table_size, int sevenbit)
+{
+    int base = sevenbit ? 0x20 : 0xA0;
+    switch (table_size)
+    {
+    case 32:
+    case 32+1:
+	*out++ = index;
+	return 1;
+
+    case 94:
+	*out++ = base + 1 + index;
+	return 1;
+
+    case 96:
+	*out++ = base + index;
+	return 1;
+
+    case 94*94:
+    {
+	int c1 = index / 94;
+	int c2 = index % 94;
+
+	out[0] = base + 1 + c1;
+	out[1] = base + 1 + c2;
+
+	return 2;
+    }
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static int iso2022_scan_tables(ISO2022_Encoding *enc, UCS4 u, int *index, int *table_no, int *size)
+{
+    int i, tab;
+    for (tab = 0; tab < MAX_TABLES; tab++)
+    {
+	encoding_table table = enc->table[tab].table;
+
+	if (table && (i = encoding_lookup_in_table(u, table)) != -1)
+	{
+	    *index = i;
+	    *table_no = tab;
+	    *size = encoding_n_table_entries(table);
+	    return 1;
+	}
+    }
+
+    return 0;
+}
+
+/* 7bit scheme. Two or more character sets are set up and SO,SI,SS2,SS3 are used
+ * to switch between them.
+ */
+
+static int iso2022_write_shifts(EncodingPriv *e, UCS4 u, unsigned char **ps, int *bufsize)
+{
+    ISO2022_Encoding *enc = (ISO2022_Encoding *)e;
+    int index, tab, n_entries;
+    unsigned char buf[16];		/* assume that 16 characters will be enough space */
+    int out = 0;
+    int GL_s = enc->GL_s;
+    int current[4];
+
+    memcpy(current, enc->current, sizeof current);
+
+    if (enc->first && enc->oneoffdesignator && u != NULL_UCS4)
+    {
+        memcpy(buf + out, enc->table[1].esc_seq, enc->table[1].esc_seq_len);
+        out += enc->table[1].esc_seq_len;
+        current[G1] = 1;
+    }
+
+    /* control chars */
+    if (u < 0x0021 || u == NULL_UCS4)
+    {
+        if (GL_s != G0)
+	{
+	    buf[out++] = 0x0F;
+	    GL_s = G0;
+	}
+
+	if (current[G0] != 0)
+	{
+            memcpy(buf + out, enc->table[0].esc_seq, enc->table[0].esc_seq_len);
+            out += enc->table[0].esc_seq_len;
+            current[G0] = 0;
+        }
+
+	if (!enc->oneoffdesignator && (u == NULL_UCS4 || u == 0x0D || u == 0x0A))
+	{
+  	    /* Forget all our other designators */
+	    current[G1] = current[G2] = current[G3] = 0;
+	}
+
+	if (u != NULL_UCS4)
+	    buf[out++] = u;
+    }
+
+    /* main chars */
+
+    else if ((index = encoding_lookup_in_table(u, enc->table[current[GL_s]].table)) != -1)
+    {
+        out += write_index(index, buf + out, encoding_n_table_entries(enc->table[current[GL_s]].table), 1);
+    }
+
+    else if (iso2022_scan_tables(enc, u, &index, &tab, &n_entries))
+    {
+ 	 UNIDBG(("iso2022_write_escapes: u %04x index %d table %d n_entries %d\n",
+ 	         u, index, tab, n_entries));
+	if (enc->current[GL_s] != tab)
+	{
+	    ISO2022_EncoderSet *eset = &enc->table[tab];
+	    int setno;
+
+	    UNIDBG(("iso2022_write_escapes: switch set\n"));
+
+	    /* Which Gn set does this table belong in? */
+	    if (eset->esc_seq[1] >= 0x28 && eset->esc_seq[1] <= 0x2F)
+	        setno = (eset->esc_seq[1] & 3) + G0;
+	    else if (eset->esc_seq[2] >= 0x28 && eset->esc_seq[2] <= 0x2F)
+	        setno = (eset->esc_seq[2] & 3) + G0;
+	    else /* Yuck - one of the broken ISO-2022-JP specifiers */
+	        setno = 0;
+
+	    if (current[setno] != tab)
+	    {
+	        memcpy(buf + out, eset->esc_seq, eset->esc_seq_len);
+	        out += eset->esc_seq_len;
+	        current[setno] = tab;
+	    }
+
+	    if (GL_s != setno)
+	    {
+                switch (setno)
+                {
+                    case G0: buf[out++] = 0x0F; GL_s = G0; break;
+                    case G1: buf[out++] = 0x0E; GL_s = G1; break;
+                    case G2: buf[out++] = 0x1B; buf[out++] = 0x4E; break;
+                    case G3: buf[out++] = 0x1B; buf[out++] = 0x4F; break;
+                }
+            }
+	}
+
+	out += write_index(index, buf + out, n_entries, 1);
+    }
+
+    else if (e->for_encoding == encoding_WRITE_STRICT)
+	return -1;
+
+    /* special chars */
+    else /* if (u == 0xFFFD) */	/* bad character */
+    {
+        if (GL_s != G0)
+	{
+	    buf[out++] = 0x0F;
+	    GL_s = G0;
+	}
+
+	buf[out++] = '?';
+    }
+
+    /* check space */
+    if ((*bufsize -= out) < 0 || !ps)
+	return 0;
+
+    enc->first = 0;
+    enc->GL_s = GL_s;
+    memcpy(enc->current, current, sizeof current);
+
+    /* copy out and update ptr */
+    memcpy(*ps, buf, out);
+    (*ps) += out;
+
+    return 1;
+}
+
+
+EncodingPriv enc_iso2022 =
+{
+    iso2022_read,
+    iso2022_read_in_multibyte_sequence,
+    iso2022_reset,
+    sizeof (ISO2022_Encoding) - sizeof(EncodingPriv),
+    iso2022_delete,
+    0,
+    iso2022_write_shifts,
+    0,
+    0,
+    0
+};
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+static int iso2022_scan_sets(ISO2022_Encoding *enc, UCS4 u, int *index, int *table_no, int *size)
+{
+    int i, set;
+    for (set = 0; set < 4; set++)
+    {
+	simple_set *setptr = (simple_set *) enc->Set[set];
+
+        /* UNIDBG(("scan_table: set %d table %p\n", set, setptr->table)); */
+
+        if (setptr->table == NULL) continue;
+
+	if ((i = encoding_lookup_in_table(u, setptr->table)) != -1)
+	{
+	    *index = i;
+	    *table_no = set;
+	    *size = encoding_n_table_entries(setptr->table);
+	    return 1;
+	}
+    }
+
+    return 0;
+}
+
+/* EUC:    sets 0 and 1 are fixed, SS2,SS3 used to select sets 2 and 3
+ * 8859-X: sets 0 and 1 are fixed, sets 2 and 3 aren't used.
+ */
+
+static int iso2022_write_euc(EncodingPriv *e, UCS4 u, unsigned char **euc, int *bufsize)
+{
+    ISO2022_Encoding *enc = (ISO2022_Encoding *)e;
+    unsigned char buf[4];
+
+    int index, set, n_entries;
+    int out = 0;
+
+    if (u == NULL_UCS4)
+	return 0;
+
+retry:
+
+    /* control chars */
+    if (u < 0x0021 || u == 0x007F)
+        buf[out++] = u;
+    else if ((enc->c1_permitted == 2 && 0x0080 <= u && u <= 0x009F))
+        buf[out++] = u;
+
+    /* main chars */
+    else if (iso2022_scan_sets(enc, u, &index, &set, &n_entries))
+    {
+        UNIDBG(("iso2022_write_euc: u %04x index %d set %d size %d\n",
+                u, index, set, n_entries));
+	switch (set)
+	{
+	case G0:
+	    buf[out++] = index + 0x21;
+	    break;
+
+	case G1:
+	    out += write_index(index, buf+out, n_entries, 0);
+	    break;
+
+	case G2:
+	    buf[out++] = SS2;
+	    out += write_index(index, buf+out, n_entries, 0);
+	    break;
+
+	case G3:
+	    buf[out++] = SS3;
+	    out += write_index(index, buf+out, n_entries, 0);
+	    break;
+	}
+    }
+
+    else if (e->for_encoding == encoding_WRITE_STRICT)
+	return -1;
+
+    else if (u == 0x0110) /* D-stroke - try Eth */
+    {
+        u = 0x00D0;
+        goto retry;
+    }
+
+    /* special chars */
+    else /* if (u == 0xFFFD) */	/* bad character */
+	buf[out++] = '?';
+
+    /* check space */
+    if ((*bufsize -= out) < 0 || !euc)
+	return 0;
+
+    /* copy out and update ptr */
+    memcpy(*euc, buf, out);
+    (*euc) += out;
+
+    return 1;
+}
+
+EncodingPriv enc_iso2022_euc =
+{
+    iso2022_read,
+    iso2022_read_in_multibyte_sequence,
+    iso2022_reset,
+    sizeof (ISO2022_Encoding) - sizeof(EncodingPriv),
+    iso2022_delete,
+    0,
+    iso2022_write_euc,
+    0,
+    0,
+    0
+};
+
+/* ---------------------------------------------------------------------------------------------------- */
+
+/* eof iso2022.c */

@@ -1,0 +1,660 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdbool.h>
+#include <ctype.h>
+
+#include "Global/Services.h"
+#include "swis.h"
+
+#define BUFSZ 512
+
+char path[ BUFSZ ];
+char buffer[ BUFSZ ];
+
+typedef unsigned int word;
+
+typedef struct
+{
+        word next;
+        word loadaddr;
+        word execaddr;
+        word length;
+        word access;
+} resfile;
+
+typedef struct
+{
+        word loadaddr;
+        word execaddr;
+        word length;
+        word attr;
+        word type;
+        char name[1];
+} object;
+
+#define filetype( object )      (((object)->loadaddr>>8)&0xFFF)
+
+
+/* Define some things needed to store exactly which territories we are storing. */
+#define ENV_LOCALE_LIST "LocaleList"  /* name of env var holding the comma-seperated list of lcoales */
+#define MAX_TERRITORIES 10            /* 10 is a value defined in the spec. */
+char* supported_territories[MAX_TERRITORIES] = NULL; /* An array in which territories defined in the Env file can be stored. */
+unsigned int num_of_territories = 0;                 /* The number of territories defined. */
+
+/* Now something to store the territories we are saving */
+char* terrritory_directories[MAX_TERRITORIES] = NULL; /* Stores the directory names */
+unsigned int territory_numbers[MAX_TERRITORIES][MAX_TERRITORIES]; /*  Store the numeric representaion of each territory. Array is terminated by -1. */
+unsigned int num_of_territory_dirs = 0;                 /* The number of territory directories scanned. */
+
+
+/* Forward prototypes */
+bool parse_territories(char* territory_line);
+bool find_resource_directories(const char* const root_path);
+bool convert_dir_to_numeric_form(const char* const dir_name);
+int return_country_number(const char* const country);
+
+
+/*****************************************************************************
+* cstrcmp
+*
+* This routine compares two string caselessly.
+*
+* Assumptions
+*  State any assumptions and side effects (eg. globals changed)
+*
+* Inputs
+*  a:            The first string to be compared.
+*  b:            The second string to be compared.
+*
+* Outputs
+*  None.
+*
+* Returns
+*  0 if both strings are NULL, or both strings are (ignoring case) identical.
+*  -1 if one (but not both) of the strings are NULL.
+*  Any other value if the strings are different.
+*****************************************************************************/
+
+int cstrcmp(const char *a, const char *b)
+{
+  int d;
+
+  if (a == NULL && b == NULL)
+    return (0);
+
+  if (a == NULL || b == NULL)
+    return (-1);
+
+  while (*a || *b) {
+    d = tolower(*(a++)) - tolower(*(b++));
+    if (d)
+      return (d);
+  }
+  return (0);
+}
+
+
+
+void error( const char *str, ... )
+{
+        va_list argp;
+
+        sprintf( buffer, "ERROR: %s\n", str );
+
+        va_start( argp, str );
+        vprintf( buffer, argp );
+        va_end( argp );
+
+        exit(EXIT_FAILURE);
+}
+
+
+/*
+ * malloc an area for a string and copy the string in
+ */
+char *strdup(const char *str)
+{
+  char *newstr = malloc(str == NULL ? 1 : (strlen(str) + 1));
+
+  if (newstr != NULL) {
+    if (str == NULL)
+      *newstr = 0;
+    else
+      strcpy(newstr, str);
+  }
+  return (newstr);
+}
+
+
+
+
+/*
+ * read an environment variable in to a malloced string
+ */
+char *read_env(char *variable)
+{
+  char *var = NULL;
+  char *cp = NULL;
+
+  if ((var = getenv(variable)) != NULL)
+    cp = strdup(var);
+
+  return (cp);
+}
+
+
+
+int
+gettype( char *obj )
+{
+        int type;
+
+        _swi( OS_File, _IN(0)|_IN(1)|_OUT(0), 17, obj, &type );
+
+        return type;
+}
+
+void
+clear( word *buf, int nwords )
+{
+        while ( nwords-- ) *(buf++)=0;
+}
+
+void
+appendfile( object *op, char *path, char *respath, FILE *fp )
+{
+        int filelen = (op->length+3)&~3;                /* Aligned file length. */
+        int pathlen = 0;
+        int totallen;
+        char *fbuf, *resp, *resendp = NULL;
+
+        /* ResourceFS directories can contain more than 77 directory entries but ADFS
+         * directories can't. To get round this any directory starting with "Resources"
+         * (eg. Resources1, Resources2 etc.) will be reduced to "Resources" in the pathname
+         * inside ResourceFS.
+         */
+        if ( (resp = strstr(respath, "Resources")) != NULL )
+        {
+                if ( (resendp = strchr(resp, '.')) != NULL )
+                {
+                        /* Adjustment for pathlen as Resources* will have * stripped out. */
+                        pathlen = 9-(resendp-resp);
+                }
+                else
+                {
+                        resp = NULL;
+                }
+        }
+        pathlen = (pathlen+strlen(respath)+4)&~3;       /* Aligned ResourceFS file name length. */
+
+        totallen = sizeof(resfile)+pathlen+sizeof(int)+filelen;
+
+        fbuf = (char *)malloc( totallen );
+
+        if ( fbuf != NULL )
+        {
+                FILE *rp = fopen( path, "rb" );
+                if ( rp != NULL )
+                {
+                        resfile *rf = (resfile *)fbuf;
+                        char *path = fbuf+sizeof(resfile);
+
+                        /* Clear fbuf. */
+                        clear( (word *)fbuf, totallen>>2 );
+
+                        /* Set up resource file header. */
+                        rf->next = totallen;
+                        rf->loadaddr = op->loadaddr;
+                        rf->execaddr = op->execaddr;
+                        rf->length = op->length;
+                        rf->access = 3;
+
+                        /* Copy ResourceFS file name. */
+                        if ( resp != NULL )
+                        {
+                                /* Work out length of respath up to and including "Resources". */
+                                int sublen = resp-respath+9;
+                                strncpy( path, respath, sublen );
+
+                                /* Strip out chars trailing after "Resources" up to next directory separator. */
+                                strcpy( path+sublen, resendp );
+                        }
+                        else
+                        {
+                                strcpy( path, respath );
+                        }
+
+                        /* Store file length + 4 */
+                        *(int *)(path+pathlen) = op->length+4;
+
+                        /* Load resource file. */
+                        if ( fread( fbuf+totallen-filelen, sizeof(char), op->length, rp ) != op->length )
+                                error( "Error reading '%s'", path );
+
+                        fclose( rp );
+
+                        if ( fwrite( fbuf, sizeof(char), totallen, fp ) != totallen )
+                                error( "Error writing to output file", NULL );
+                }
+                else
+                {
+                        error( "Can't open '%s' for read", path );
+                }
+                free( fbuf );
+        }
+        else
+        {
+                error( "Not enough memory to append '%s'", path );
+        }
+}
+
+void
+appendleaf( char *path, char *leaf )
+{
+        strcat( path, "." );
+        strcat( path, leaf );
+}
+
+void
+stripleaf( char *path )
+{
+        char *sep = strrchr( path, '.' );
+
+        if ( sep != 0 ) *sep = '\0';
+}
+
+void
+descend( char *path, char *respath, FILE *fp )
+{
+        char *buf = malloc( BUFSZ );
+        int offset = 0;
+
+//  printf("descend(): path=%s, respath=%s\n", path, respath);
+
+        if ( buf != NULL )
+        {
+                do
+                {
+                        object *op = (object *)buf;
+                        int nread;
+
+                        _swi( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+                                10, path, buf, 80, offset, BUFSZ, 0, &nread, &offset );
+
+                        while ( nread > 0 )
+                        {
+                                appendleaf( path, op->name );
+                                switch ( op->type )
+                                {
+                                        case 2:
+                                                descend( path, respath, fp );
+                                                break;
+
+                                        default:
+                                                appendfile( op, path, respath, fp );
+                                                break;
+                                }
+                                stripleaf( path );
+                                op = (object *)(((int)(op->name)+strlen(op->name)+4)&~3);
+                                nread -= 1;
+                        }
+                } while ( offset != -1 );
+
+                free( buf );
+        }
+        else
+        {
+                error( "Not enough memory to descend '%s'", path );
+        }
+}
+
+
+
+/* This routine parses any territory line passed in and strips out all the
+territories into an array.
+   If the line is invalid, it retunrs false, otherwise it returns true. A
+line is considered invalid if it is empty or contains whitespace.
+ */
+
+bool parse_territories(char* territory_line)
+{
+  char *territory = NULL;
+
+  printf("Parsing territory line %s\n", territory_line);
+
+  if (strlen(territory_line) < 1)
+  {
+    /* Line must contain something */
+    return (false);
+  }
+
+  territory = strtok(territory_line, ",");
+  while (territory)
+  {
+    printf ("territory is %s\n", territory);
+    supported_territories[num_of_territories++] = strdup(territory);
+    territory = strtok (NULL, ",");
+  }
+
+  printf ("%d territories detected in the territories list.\n", num_of_territories);
+
+  return (true);
+}
+
+
+
+
+/* Write a number in word form toa file pointer. */
+int
+fwriteword( int n, FILE *fp )
+{
+        return fwrite( &n, sizeof n, 1, fp );
+}
+
+
+
+/* Under the new scheme, we wish to store each of the territory directories
+    in the structure in the following way.
+   Note that one resource block can be used by more than one country, eg.
+    the USA and UK may share resource blocks as they may well be indentical.
+
+      |-----------|
+      |     1     | Header. One word per territory held in the following block. Each number
+      |     4     |  is the corresponding country code for the territory, with 0 being the common block.
+      |    -1     | The list is terminated with a -1.
+      |-----------|
+      | Resources |  The resources block for this country.
+      |           |
+      |           |
+      |-----------|
+      |     0     |  End of this resourcefs chain.
+      |-----------|
+      |     0     |  Another country (this one is the common one)
+      |    -1     |
+      |-----------|
+      | Resources |  Another resources block
+      |           |
+      |           |
+      |-----------|
+      |     0     |  End of this resourcefs chain.
+      |-----------|
+      |    -1     |  Block terminator.
+      |-----------|
+
+     Hence we introduce a wrapper around the original code, calling it once
+for each different territory block that we wish to add. Simple, eh?
+*/
+
+int main( int argc, char *argv[] )
+{
+  unsigned int loop;
+  FILE *fp = NULL;
+  char path2[BUFSZ];
+
+  if ( argc != 3 )
+  {
+    error( "Syntax: scanres <directory> <file>", NULL );
+  }
+
+  printf("Scanning from directory %s\n", argv[1]);
+
+  /* Canonicalise directory path. */
+  _swi( OS_FSControl, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5),
+         37, argv[1], path, 0, 0, BUFSZ );
+
+  /* Read all the directory names.
+     If a directory is numeric, ten it contans 1 or more territories (eg. 0001 would have both Common (00) and UK (01) resource blocks
+     If it is a string, then it is a country name. Pass it in to Territory_NumberToName to get te numeric value. If it does not exist, throw an error.
+  */
+  find_resource_directories(path);
+
+  /* Canonicalise output file path. */
+  _swi( OS_FSControl, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5),
+      37, argv[2], buffer, 0, 0, BUFSZ );
+
+  /* Open the output file for writing the resource blocks to. */
+  if ((fp=fopen( buffer, "wb" )) == 0)
+  {
+    error("Could not open %s for writing\n", buffer);
+  }
+
+  /* Parse through all the directories that have been stored, writing the
+      relevant data to the block before appending the data. */
+  for (loop=0; loop < num_of_territory_dirs; loop++)
+  {
+    unsigned int index = 0;
+    printf("Directory %d is %s (territory numbers: ", loop, terrritory_directories[loop]);
+    /* Write the list of territories this block is suitable for:
+    * zero means any; list terminated by -1.
+    */
+    do
+    {
+      printf("%d ", territory_numbers[loop][index]);
+      fwriteword(territory_numbers[loop][index++], fp);
+    }
+    while (territory_numbers[loop][index]!=-1);
+    fwriteword(-1, fp); /* Terminate the header territory list. */
+    printf(")\n");
+
+    strcpy(path2, path);
+    appendleaf(path2, terrritory_directories[loop]);
+    printf ("Appending data for territory resource dir %s\n", path2);
+
+    if ( gettype(path2) == 2 ) /* It must obviously be a directory */
+    {
+      descend( path2, path2+strlen(path2)+1, fp );
+
+      /* Add on a zero-word to mark end of ResourceFS chain */
+      fwriteword( 0, fp );
+    }
+    else
+    {
+      error( "'%s' is not a directory", path );
+    }
+  }
+
+  /* And a -1 to mark end of block sequence */
+  fwriteword( -1, fp );
+
+  /* Close the output file. */
+  fclose( fp );
+
+  /* Tidy up the memory allocation */
+  for (loop=0; loop < num_of_territory_dirs; loop++)
+  {
+    if (terrritory_directories[loop])
+    {
+      free (terrritory_directories[loop]);
+      terrritory_directories[loop] = NULL;
+    }
+  }
+
+}
+
+
+
+
+
+/*
+  This routine scans through root_path and places all directories held within
+it into the territory_directories array. It then parses through the directory
+entries and converts the entries into numeric form.
+  It returns false if no valid resource directories were located in root_path.
+*/
+
+bool find_resource_directories(const char* const root_path)
+{
+  /* Recurse from path. */
+  char *buf = malloc( BUFSZ );
+  int offset = 0;
+
+  if ( buf != NULL )
+  {
+    do
+    {
+      object *op = (object *)buf;
+      int nread;
+
+      _swi( OS_GBPB, _IN(0)|_IN(1)|_IN(2)|_IN(3)|_IN(4)|_IN(5)|_IN(6)|_OUT(3)|_OUT(4),
+              10, path, buf, 80, offset, BUFSZ, 0, &nread, &offset );
+
+      while ( nread > 0 )
+      {
+        appendleaf( path, op->name );
+        switch ( op->type )
+        {
+           case 2:
+             printf("Directory is %s\n", path);
+             convert_dir_to_numeric_form(op->name);
+             break;
+        }
+        stripleaf( path );
+        op = (object *)(((int)(op->name)+strlen(op->name)+4)&~3);
+        nread -= 1;
+      }
+    } while ( offset != -1 );
+
+    free( buf );
+  }
+  else
+  {
+    error( "Not enough memory to descend '%s'", path );
+  }
+
+  return (true);
+}
+
+
+
+/* Convert the directory name passed in to a numeric form.
+   If the directory name is in numeric form, then it converts every two
+digits into a unique territory number (eg. 0105 represents territories 1 and
+5). Textual names (eg. UK or France) get sent to Service_International to be
+converted to a numeric representation.
+   The name 'Common' is a special case; if this is seen, then it is given the
+territory number of 0 as expected within the specification.
+   If there is an error, return false.
+*/
+bool convert_dir_to_numeric_form(const char* const dir_name)
+{
+  unsigned int loop=0;
+  bool is_numeric = true;
+  bool success = true;
+
+  /* Firstly, is this a numeric filename? */
+  for (loop=0; loop<strlen(dir_name); loop++)
+  {
+    if (!isdigit(dir_name[loop])) /* It is not a numeric digit */
+    {
+      is_numeric = false;
+    }
+  }
+
+  if (is_numeric) /* Split this into a series of two-digit country codes. */
+  {
+    char tempstr[10];
+    unsigned int length = strlen(dir_name);
+    unsigned int index = 0;
+    unsigned int count = 0;
+    do
+    {
+      tempstr[0] = dir_name[index++];
+      tempstr[1] = dir_name[index++];
+      tempstr[2] = '\0';
+      printf ("Index = %d  number=%d\n", index, atoi(tempstr));
+      territory_numbers[num_of_territory_dirs][count++] = atoi(tempstr);
+    }
+    while (index < length); /* Until we reach the end of the string. */
+    territory_numbers[num_of_territory_dirs][count++] = -1; /* Terminate the list. */
+  }
+  else /* Is a named country. Convert to a territory number. */
+  {
+    unsigned int territory_number;
+    if (cstrcmp(dir_name, "Common") == 0) /* It is the common dir */
+    {
+      territory_number = 0; /* Country code representing the Common dir */
+    }
+    else
+    {
+      if ((territory_number = return_country_number(dir_name)) == -1)
+      {
+        /* Unrecognised country name */
+        success = false;
+      }
+    }
+    printf("Country code for %s is %d\n", dir_name, territory_number);
+    territory_numbers[num_of_territory_dirs][0] = territory_number;
+    territory_numbers[num_of_territory_dirs][1] = -1; /* Terminate the list. */
+  }
+
+  terrritory_directories[num_of_territory_dirs] = strdup(dir_name);
+  /* Move onto the next part of the territory list. */
+  num_of_territory_dirs++;
+
+  return (success);
+}
+
+
+
+
+
+/*****************************************************************************
+* return_country_number
+*
+* This routine returns the country code number of a passed in country.
+*
+* Assumptions
+*  That the version of the International module has knowledge about the
+*   country that is being requested.
+*
+* Inputs
+*  country     : A string containing the name of the territory to be
+*                 converted.
+*
+* Outputs
+*  None
+*
+* Returns
+*  This routine returns the numeric form of the territory name passed in, or
+*   -1 if it is not a valid country. Note that build machines that wish
+*   to use utilities that inclue this routine should ensure that they have
+*   the latest version of the International module so that they can ensure
+*   they are aware of all the latest Name->number mappings.
+*
+*****************************************************************************/
+int return_country_number(const char* const country)
+{
+  _kernel_swi_regs reg;
+  int return_value = 0;
+
+  reg.r[1] = Service_International;
+  reg.r[2] = 0;              /* sub-reason code 0 */
+  reg.r[3] = (int)country;   /* The country we require (NULL terminated) */
+  reg.r[4] = 0;
+  _kernel_swi(OS_ServiceCall, &reg, &reg);
+
+  if (reg.r[1] != 0)
+    return_value = -1; /* Unrecognised country */
+  else
+    return_value = reg.r[4];
+
+  return (return_value);
+}
+
+

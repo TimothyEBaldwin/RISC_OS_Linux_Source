@@ -1,0 +1,486 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; Acorn Programming Language Support
+;
+; AUTHORS: L.Smith, J. Sutton
+;          Cherry Hinton x5272
+;
+; DATE:    Last edit 16-Mar-90 (ECN)
+;
+; VERSION: 0.07
+;
+; DESCRIPTION: Overlay Manager
+;
+; CHANGES: 28-Feb-90  LDS
+;          Fixed a bug in check_for_invalidated_returns whereby a return
+;          handler was allocated on return rather than just on call.
+;
+;          16-Mar-90 ECN
+;          Use OS_GetEnv to read the overlay directory instead of Obey$Dir
+;          which doesn't work if the image is not executed from an obey file.
+;
+;          Tidied up the behaviour of "Disk not present errors". The previous
+;          version just splatted a message all over the desktop. The new
+;          version only prompt for disk insertion if executing outside the
+;          desktop (inside the desktop the wimp will prompt the user).
+;
+;          Tidied up the generation of errors and exit from application.
+;          Previously either gave a trap or stiffed the machine.
+;
+; ENTRIES:
+
+   GBLL    ModeMayBeNonUser
+ModeMayBeNonUser SETL {FALSE}
+
+   GET     s.h_Brazil
+   GET     Hdr:Wimp
+
+   EXPORT  |Image$$overlay_init|
+   EXPORT  |Image$$load_seg|
+
+; pointers to start and end of workspace area supplied by the linker
+   IMPORT  |Overlay$$Data$$Base|
+   IMPORT  |Overlay$$Data$$Limit|
+   IMPORT  exit, WEAK
+
+Error_Internal    * &800EFD
+Error_OutOfMemory * &800EFE
+Error_LoadSegment * &800EFF
+
+R0   RN   0
+R1   RN   1
+R2   RN   2
+R3   RN   3
+R4   RN   4
+R5   RN   5
+R6   RN   6
+R7   RN   7
+R8   RN   8
+R9   RN   9
+SL   RN   10  ; new procedure call standard
+FP   RN   11
+IP   RN   12
+SP   RN   13
+;SL   RN   13
+;FP   RN   10
+;IP   RN   11
+;SP   RN   12
+LR   RN   14
+PC   RN   15
+
+ZeroInitCodeOffset * 52
+
+PSRmask * &FC000003 ; mask for PSR in PC
+TopBit  * &80000000 ; for setting error code top bit
+
+; Why does the linker need to generate this zero init area, why can't the
+; Overlay Manager define it itself??? ECN.
+;
+; Layout of workspace allocated by the linker pointed to by Overlay$$Data
+; This area is automatically zero-initialised AFTER overlay_init is called
+; offsets are prefixed with Work_
+              ^  0
+Work_HStack   #  4   ; top of stack of allocated handlers
+Work_HFree    #  4   ; head of free-list
+Work_RSave    #  9*4  ; for R0-R8
+Work_LRSave   #  4     ; saved LR
+Work_PCSave   #  4     ; saved PC
+Work_ReturnHandlersArea * @  ; rest of this memory is treated as heap space for the return handlers
+Work_MinSize  * @ + 32 * RHandl_Size
+
+; Return handler. 1 is allocated per inter-segment procedure call
+; allocated and free lists of handlers are pointed to from HStack and HFree
+; offsets are prefixed with RHandl_
+                ^  0
+RHandl_Branch   #  4   ; BL load_seg_and_ret
+RHandl_RealLR   #  4   ; space for the real return address
+RHandl_Segment  #  4   ; -> PCIT section of segment to load
+RHandl_Link     #  4   ; -> next in stack order
+RHandl_Size     *  @
+; set up by check_for_invalidated_returns.
+
+; PCITSection. 1 per segment stored in root segment, allocated by linker
+; offsets are prefixed with PCITSect_
+                 ^  0
+PCITSect_Vecsize #  4  ; .-4-EntryV          ; size of entry vector
+PCITSect_Base    #  4          ; used by load_segment; not initialised
+PCITSect_Limit   #  4          ; used by load_segment; not initialised
+PCITSect_Name    #  11 ;  <11 bytes> ; 10-char segment name + NUL in 11 bytes
+PCITSect_Flags   #  1  ; ...and a flag byte
+PCITSect_ClashSz #  4  ;  PCITEnd-.-4         ; size of table following
+PCITSect_Clashes #  4  ; >table of pointers to clashing segments
+
+; Stack structure  (all offsets are negative)
+; defined in procedure call standard
+; offsets are prefixed with Stack_
+                   ^  0
+Stack_SaveMask     # -4
+Stack_LRReturn     # -4
+Stack_SPReturn     # -4
+Stack_FPReturn     # -4
+
+; the code and private workspace area
+  AREA     OverLayMgrArea, PIC, CODE
+
+; Private workspace that will not be zero-initialised AFTER overlay_init
+; offsets are prefixed with PWork_
+               ^  0
+PWork_PathName #  256 ; program directory name string for finding overlay files in
+                      ; name of overlay file is appended here
+; PWork_NameLen  #  2   ; length of Obey$Dir directory pathname
+; PWork_InitDone #  2   ; bit 0 set to 1 when return handlers are initialised on 1st call to load_seg
+          ; this cannot be done in overlay_init because the workspace supplied at link time
+          ; is zero-initialised AFTER overlay_init is called
+; the actual (private) work area:
+PrivateWorkSpace %  @
+      ALIGN
+
+STRLR   STR     LR, [PC, #-8]  ; a word that is to be matched in PCITs
+
+; Store 2 words which are the addresses of the start and end of the workspace
+WorkSpace     DCD |Overlay$$Data$$Base|
+WorkSpaceEnd  DCD |Overlay$$Data$$Limit|
+
+|Image$$overlay_init| ROUT
+; initialise overlay manager. Entered immediately before the program is started
+        LDR     IP, WorkSpace
+        ADD     IP, IP, #Work_RSave
+        STMIA   IP, {R0-R8,LR}
+
+; 1. Check workspace is big enough for me. Only check if debugging
+;        LDR    R1, WorkSpace
+;        LDR    R2, WorkSpaceEnd
+;        SUB    R2, R2, R1     ; check there is enough memory
+;        CMP    R2, #Work_MinSize
+;        ADRLT  R0, NoMem
+;        SWILT  OS_GenerateError
+
+        SWI     OS_GetEnv
+        ADR     R1, PrivateWorkSpace
+        MOV     R2, #&20000000 ; Stop at first space
+        ADD     R2, R2, #255
+        SWI     OS_GSTrans
+strip_tail
+        SUBS    R2, R2, #1
+        BCC     strip_tail1
+        LDRB    R0, [R1, R2]
+        CMP     R0, #'.'
+        CMPNE   R0, #':'
+        BNE     strip_tail
+strip_tail1
+        ADD     R2, R2, #1
+        MOVS    R0, #0                                  ; set Z (for TEQ PC,PC below)
+        STRB    R0, [R1, R2]
+
+        TEQ     PC, PC
+        ADDEQ   PC, LR, #ZeroInitCodeOffset             ; 32-bit version
+        ADDNES  PC, LR, #ZeroInitCodeOffset             ; 26-bit version
+
+;NoMem   DCD TopBit:OR:Error_OutOfMemory
+;        = "Overlay$$Data area too small", 0
+
+        ALIGN
+InitDoneFlag DCD    0
+
+; entry point
+|Image$$load_seg|  ROUT
+; called when segment has been called but is not loaded
+; presume ip is corruptible by this
+        LDR     IP, WorkSpace
+        ADD     IP, IP, #Work_RSave
+        STMIA   IP, {R0-R8}         ; save working registers
+; (save in my workspace because stack is untouchable during procedure call)
+        ADR     R0, PrivateWorkSpace
+        LDRB    R1, InitDoneFlag
+        CMP     R1, #0
+        BNE     InitDone
+
+;Initialise Return Handlers on first call to this routine
+        MOV     R1, #1
+        STRB    R1, InitDoneFlag    ; set InitDone flag
+        LDR     R0, WorkSpace
+; R0 points to workspace
+; corrupts R0-R3,LR
+; create and initialise return handler linked list
+        MOV    R2, #0
+        STR    R2, [R0, #Work_HStack]  ; initialise start of handler list with NULL
+        ADD    R1, R0, #Work_ReturnHandlersArea ; Start of heap space
+        STR    R1, [R0, #Work_HFree]   ; Start of list of free handlers point to heap space
+        LDR    R0, WorkSpaceEnd        ; for test in loop to make sure..
+        SUBS   R0, R0, #RHandl_Size    ;    ..I dont overrun in init
+01      ADD    R3, R1, #RHandl_Size    ; next handler
+; set up link to point to next handler (in fact consecutive locations)
+        STR    R3, [R1, #RHandl_Link]
+        MOV    R1, R3                  ; next handler
+        CMP    R1, R0                  ; test for end of workspace
+        BLT    %BT01
+        SUB    R1, R1, #RHandl_Size ; previous handler
+        STR    R2, [R1, #RHandl_Link]  ; NULL-terminate list
+
+InitDone
+        LDR     R3, WorkSpace
+  [ {CONFIG}=26
+        BIC     R8, LR, #PSRmask    ; Clear psr
+  |
+        MOV     R4, #0
+        MRS     R4, CPSR
+        TST     R4, #2_11100
+        MOVNE   R8, LR
+        BICEQ   R8, LR, #PSRmask    ; Clear psr
+  ]
+        LDR     R0, [R8, #-8]       ; saved R14... (is end of PCIT)
+        STR     R0, [R3, #Work_LRSave]   ; ...save it here ready for retry
+        LDR     R0, STRLR           ; look for this...
+        SUB     R1, R8, #8          ; ... starting at last overwrite
+01      LDR     R2, [R1, #-4]!
+        CMP     R2, R0              ; must stop on guard word...
+        BNE     %B01
+        ADD     R1, R1, #4          ; gone one too far...
+ [ {CONFIG}=26
+        AND     R0, LR, #PSRmask    ; psr at point of call...
+        ORR     R1, R1, R0          ; combine with address branched via
+ |
+        TST     R4, #2_11100
+        ANDEQ   R0, LR, #PSRmask    ; psr at point of call...
+        ORREQ   R1, R1, R0          ; combine with address branched via
+ ]
+        STR     R1, [R3, #Work_PCSave]   ; where to resume at
+
+load_segment
+; IP -> the register save area; R8 -> the PCIT section of the segment to load.
+; First re-initialise the PCIT section (if any) which clashes with this one...
+        ADD     R1, R8, #PCITSect_Clashes
+        LDR     R0, [R8, #PCITSect_ClashSz]
+01      SUBS    R0, R0, #4
+        BLT     Done_Reinit         ; nothing left to do
+        LDR     R7, [R1], #4        ; a clashing segment...
+        LDRB    R2, [R7, #PCITSect_Flags]    ; its flags (0 if unloaded)
+        CMPS    R2, #0              ; is it loaded?
+        BEQ     %B01                ; no, so look again
+; clashing segment is loaded (clearly, there can only be 1 such segment)
+; mark it as unloaded and reinitialise its PCIT
+; R7 -> PCITSection of clashing loaded segment
+        MOV     R0, #0
+        STRB    R0, [R7, #PCITSect_Flags]  ; mark as unloaded
+        LDR     R0, [R7, #PCITSect_Vecsize]
+        SUB     R1, R7, #4          ; end of vector
+        LDR     R2, STRLR           ; init value to store in the vector...
+02      STR     R2, [R1, #-4]!      ;>
+        SUBS    R0, R0, #4          ;> loop to initialise the PCIT segment
+        BGT     %B02                ;>
+; Now we check the chain of call frames on the stack for return addresses
+; which have been invalidated by loading this segment and install handlers
+; for each invalidated return.
+; Note: R8 identifies the segment being loaded; R7 the segment being unloaded.
+        BL      check_for_invalidated_returns
+Done_Reinit
+; All segment clashes have now been dealt with, as have the re-setting
+; of the segment-loaded flags and the intercepting of invalidated returns.
+; So, now load the required segment.
+
+Retry
+        MOV     R0, #12
+        ADD     R1, R8, #PCITSect_Name
+        LDR     R2, [R8, #PCITSect_Base]
+        MOV     R3, #0
+        ADR     R4, PrivateWorkSpace
+        SWI     XOS_File
+        BVS     overlay_load_error  ; R1 points to name failed to load
+        STRB    R0, [R8, #PCITSect_Flags]  ; R0 == 1
+        LDR     R2, [R8, #PCITSect_Base] ; true load address of file (OS_File returns datestamp here)
+        ADD     R0, R2, R4          ; start + length = end of file
+; The segment's entry vector is at the end of the segment...
+; ...copy it to the PCIT section identified by R8.
+        LDR     R1, [R8, #PCITSect_Vecsize]
+        SUB     R3, R8, #8          ; end of entry vector...
+        MOV     R4, #0              ; for data initialisation
+01      LDR     R2, [R0, #-4]!      ;>loop to copy
+        STR     R4, [R0]            ; (zero-init possible data section)
+        STR     R2, [R3], #-4       ;>the segment's PCIT
+        SUBS    R1, R1, #4          ;>section into the
+        BGT     %B01                ;>global PCIT
+ [ StrongARM
+   ;there may have been some poking about with code, for invalidated returns, so synchronise
+   MOV  r0,#0
+   SWI  XOS_SynchroniseCodeAreas
+ ]
+; Finally, continue, unabashed...
+ [ {CONFIG}=26
+        LDMIA   IP, {R0-R8, LR, PC}^
+ |
+      [ {FALSE} ; this instruction is now deprecated
+        LDMIA   IP, {R0-R8, LR, PC}
+      |
+        LDMIA   IP, {R0-R8, LR}
+        LDR     PC, [IP, #10*4]
+      ]
+ ]
+
+in_desktop
+        MOV     R0, #0
+        SWI     XWimp_ReadSysInfo   ; See if we are in desktop
+        MOVVS   R0, #0              ; No wimp!, must be Arthur
+        CMPS    R0, #0              ; No. of wimp tasks
+        MOV     PC, LR              ; 0 => Arthur
+
+overlay_load_error ROUT
+        BL      in_desktop
+        BNE     LoadErrorExit1
+        ADR     R0, LoadPrompt
+        SWI     XOS_Write0
+        SWI     XOS_Confirm
+        BVS     LoadErrorExit   ; error in SWI Confirm
+        BCS     LoadErrorExit   ; escape pressed
+        BNE     LoadErrorExit
+        SWI     XOS_NewLine
+        B       Retry
+LoadErrorExit
+        SWI     XOS_NewLine
+LoadErrorExit1
+        ADR     R0, LoadErrorEnd
+        MOV     R1, #0
+        STRB    R1, [R0]
+        ADR     R0, LoadError
+errorexit
+        MOV     R1, R0
+        BL      in_desktop
+        MOV     R0, R1
+        BEQ     text_error
+        MOV     R1, #1              ; OK box - No frills
+        ADR     R2, MgrName
+        SWI     XWimp_ReportError
+        B       exit_prog
+text_error
+        ADR     R0, MgrName
+        SWI     XOS_Write0
+        SWI     XOS_WriteS
+        DCB     ": ", 0
+        ALIGN
+        ADD     R0, R1, #4
+        SWI     XOS_Write0
+        SWI     XOS_NewLine
+exit_prog
+        LDR     R0, exitad          ; Check to see if C library is present
+        CMP     R0, #0
+        BEQ     exit_prog1          ; No, safe to exit via OS_Exit
+        MOV     R0, #1
+        BL      exit
+exit_prog1
+        LDR     R1, abex
+        MOV     R2, #1
+        SWI     OS_Exit              ; DIE!!!
+
+abex    DCD     &58454241
+exitad  DCD     exit
+
+        ALIGN
+LoadError    DCD TopBit:OR:Error_LoadSegment
+LoadPrompt = "Can't load overlay segment"
+LoadErrorEnd DCB '.'
+           = " Retry? (y/n)", 0
+MgrName    = "Overlay Manager", 0
+
+        ALIGN
+load_seg_and_ret
+; presume ip is corruptible by this
+        LDR     IP, WorkSpace
+        ADD     IP, IP, #Work_RSave
+        STMIA   IP, {R0-R8}          ; save working registers
+; (save in my workspace because stack is untouchable during procedure call)
+        LDR     R3, WorkSpace
+; lr points to the return handler
+        BIC     R8, LR, #PSRmask     ; Clear psr
+ ; load return handler fields RealLR, Segment, Link
+        LDMIA   R8, {R0, R1, R2}
+        SUB     R8, R8, #4    ; point to true start of return handler before BL
+        STR     R0, [R3, #Work_LRSave]
+        STR     R0, [R3, #Work_PCSave]
+; Now unchain the handler and return it to the free pool
+; HStack points to this handler
+        LDR     R0, [R3, #Work_HStack]
+        CMPS    R0, R8
+        ADRNE   R0, HandlersScrewed
+        BNE     errorexit
+        STR     R2, [R3, #Work_HStack]  ; new top of handler stack
+        LDR     R2, [R3, #Work_HFree]
+        STR     R2, [R8, #RHandl_Link]  ; Link -> old HFree
+        STR     R8, [R3, #Work_HFree]   ; new free list
+        MOV     R8, R1                  ; segment to load
+        B       load_segment
+
+check_for_invalidated_returns
+; Note: R8 identifies the segment being loaded; R7 the segment being unloaded.
+; Note: check for returns invalidated by a call NOT for returns invalidated by
+;       a return! In the 2nd case, the saved LR and saved PC are identical.
+        LDR     R5, WorkSpace
+        ADD     R6, R5, #Work_LRSave   ; 1st location to check
+        LDMIA   R6, {R0, R1}           ; saved LR & PC
+        CMPS    R0, R1
+        MOVEQS  PC, LR                 ; identical => returning...
+        MOV     R0, FP                 ; temporary FP...
+01      LDR     R1, [R6]               ; the saved return address...
+        BIC     R1, R1, #PSRmask       ; ...with status bits masked off
+        LDR     R2, [R5, #Work_HStack] ; top of handler stack
+        CMPS    R1, R2                 ; found the most recent handler, so
+        MOVEQS  PC, LR                 ; abort the search
+        LDR     R2, [R7, #PCITSect_Base]
+        CMPS    R1, R2                 ; see if >= base...
+        BLT     %F02
+        LDR     R2, [R7, #PCITSect_Limit]
+        CMPS    R1, R2                 ; ...and < limit ?
+        BLT     FoundClash
+02      CMPS    R0, #0                 ; bottom of stack?
+        MOVEQS  PC, LR                 ; yes => return
+        ADD     R6, R0, #Stack_LRReturn
+        LDR     R0, [R0, #Stack_FPReturn]      ; previous FP
+        B       %B01
+FoundClash
+        LDR     R0, [R5, #Work_HFree]  ; head of chain of free handlers
+        CMPS    R0, #0
+        ADREQ   R0, NoHandlers
+        BEQ     errorexit
+; Transfer the next free handler to head of the handler stack.
+        LDR     R1, [R0, #RHandl_Link] ; next free handler
+        STR     R1, [R5, #Work_HFree]
+        LDR     R1, [R5, #Work_HStack] ; the active handler stack
+        STR     R1, [R0, #RHandl_Link]
+        STR     R0, [R5, #Work_HStack] ; now with the latest handler linked in
+; Initialise the handler with a BL load_seg_and_ret, RealLR and Segment.
+        ADR     R1, load_seg_and_ret
+        SUB     R1, R1, R0             ; byte offset for BL in handler
+        SUB     R1, R1, #8             ; correct for PC off by 8
+        MOV     R1, R1, ASR #2         ; word offset
+        BIC     R1, R1, #&FF000000
+        ORR     R1, R1, #&EB000000     ; code for BL
+        STR     R1, [R0, #RHandl_Branch]
+
+        LDR     R1, [R6]               ; LRReturn on stack
+        STR     R1, [R0, #RHandl_RealLR]   ; RealLR
+        STR     R0, [R6]               ; patch stack to return to handler
+
+        STR     R7, [R0, #RHandl_Segment]  ; segment to re-load on return
+        Return  "", LinkNotStacked
+
+HandlersScrewed
+        DCD     TopBit:OR:Error_Internal
+        =       "Internal error", 0
+        ALIGN
+
+NoHandlers
+        DCD     TopBit:OR:Error_OutOfMemory
+        =       "Out of return handlers", 0
+        ALIGN
+
+   END

@@ -1,0 +1,944 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* > c.ScanSpr3
+ */
+
+#include "includes.h"
+#include "CurveFit.h"
+#include <setjmp.h>
+#include <signal.h>
+#include <float.h>
+
+
+typedef struct ctrlstr {
+  pointstr p1, p2;
+} ctrlstr;
+
+typedef struct pathstr {
+  struct pathstr * link;
+  int x,y;
+  int E;                /* minimum total error from here to start */
+  int e;                /* actual error - if 0, this is a line */
+  struct pathstr *K;    /* point to connect to in order to do this */
+  double curveE;
+  struct pathstr *curveK;
+  ctrlstr ctrl;
+  pointstr tangent;
+} pathstr;
+
+typedef struct rowstr {
+  struct rowstr * next;
+  struct pathstr * path;
+} rowstr;
+
+
+typedef enum
+{
+  DRAW_TERM = 0,          /* end of path */
+  DRAW_MOVE = 2,          /* moveto x,y */
+  DRAW_CLOS = 5,          /* closepath */
+  DRAW_CURV = 6,          /* curveto x1,y1, x2,y2, x3,y3 */
+  DRAW_LINE = 8           /* lineto x,y */
+} drawelement;
+
+
+#define Draw_ProcessPath     0x40700
+#define Draw_ProcessPathFP   0x40701
+#define Draw_Fill            0x40702
+#define Draw_FillFP          0x40703
+#define Draw_Stroke          0x40704
+#define Draw_StrokeFP        0x40705
+#define Draw_StrokePath      0x40706
+#define Draw_StrokePathFP    0x40707
+#define Draw_FlattenPath     0x40708
+#define Draw_FlattenPathFP   0x40709
+#define Draw_TransformPath   0x4070A
+#define Draw_TransformPathFP 0x4070B
+
+
+os_error *averagelines(rowstr *result);
+os_error *nocurvefit(rowstr *result);
+os_error *exportpath(char *filename, rowstr *result, int width, int height, int xmagnify, int ymagnify);
+os_error *buildpath(rowstr *resultrow, int *outbuff);
+os_error *drawstroke(int *buffer);
+os_error *scansprite(sprite_area *area, sprite_id *spr, rowstr **resultp);
+pathstr *nextpt(rowstr **rowp1, rowstr **rowp2, int *flag);
+os_error *connect(pathstr *p1, pathstr *p2, int y, rowstr **result);
+pathstr *newpoint(int x, int y, pathstr *link);
+rowstr *newrow(pathstr *p, rowstr *link);
+void * myalloc(int size);
+void err_abort(os_error *e);
+os_error *fitlines(rowstr **resultp);
+os_error *localfit(pathstr *p1, pathstr *p2, pathstr *p3);
+double fitcurve(pathstr *p1, pathstr *p2);
+os_error *drawcurve(pathstr *p);
+int leastsquared(pathstr *p1, pathstr *p2);
+pathstr *backlink(pathstr *p);
+pathstr *backKlink(pathstr *p);
+
+
+#define err_return(x) { register os_error *e = x; if (e) return(e); }
+
+#define BUFFSIZE 0x30000
+
+#define log2px 1
+#define log2py 2
+#define XMAG 4
+#define YMAG 4
+
+
+int main(int argc, char **argv)
+{
+  int *outbuff;
+  rowstr *result;
+  int xmag, ymag;
+
+  __heap_checking_on_all_deallocates(1);
+  __heap_checking_on_all_allocates(1);
+
+  if (argc < 2) {
+    fprintf(stderr, "Syntax: *CurveFit <Sprite file> <output directory> [<xmag> [<ymag>]]\n");
+    exit(1);
+  } else {
+    static sprite_area initspr = { 0, 0, 16, 16 };
+    sprite_area *sparea;
+    sprite_id sprid;
+    FILE *infile;
+    int i;
+
+    xmag = ymag = 1;
+    if (argc >= 4) {
+      if (sscanf(argv[3], "%d", &xmag) != 1) { printf("Bad number\n"); exit(1); }
+      ymag = xmag;
+      if (argc >= 5) {
+        if (sscanf(argv[4], "%d", &ymag) != 1) { printf("Bad number\n"); exit(1); }
+      }
+    }
+
+    printf("xmag=%d, ymag=%d\n",xmag,ymag);
+
+    if ((infile = fopen(argv[1], "r")) == NULL) {
+      printf("Couldn't open input file '%s'\n", argv[1]);
+      exit(1);
+    }
+    fseek(infile, 0, SEEK_END);
+    initspr.size = (int)ftell(infile)+4;
+    fclose(infile);
+
+    sparea = myalloc(initspr.size);
+    *sparea = initspr;
+    err_abort(sprite_area_load(sparea, argv[1]));
+
+    sprid.tag = sprite_id_addr;
+    sprid.s.addr = (sprite_ptr) (((char *)sparea)+sparea->sproff);
+
+    outbuff = myalloc(BUFFSIZE);
+
+    for (i=1; i<=sparea->number; i++) {
+      char outfilename[256];
+      char *charstr = ((sprite_header *)sprid.s.addr)->name;
+      int charno;
+
+      sscanf(charstr, "char%d", &charno);
+      sprintf(outfilename, "cdir %s.chunk%d", argv[2], charno >> 5);
+      err_abort(os_cli(outfilename));
+
+      sprintf(outfilename, "%s.chunk%d.%s", argv[2], charno >> 5, charstr);
+      if ((infile=fopen(outfilename,"r")) != NULL) {
+        fclose(infile);
+      } else {
+        outbuff[0] = 0;
+        outbuff[1] = BUFFSIZE-8;
+
+        err_abort(scansprite(sparea, &sprid, &result));
+#if 0
+        /* err_abort(averagelines(result)); */
+        bbc_vdu(12);
+        bbc_gcol(0,7);
+        err_abort(buildpath(result, outbuff));
+        printf("drawstroke ...");
+        err_abort(drawstroke(outbuff));
+        printf(" done.\n");
+
+        err_abort(fitlines(&result));
+#else
+        err_abort(nocurvefit(result));     /* just use the initial lines created */
+#endif
+        if (argc >= 3) {
+          sprite_info sprinfo;
+
+          err_abort(sprite_readsize(sparea, &sprid, &sprinfo));
+          err_abort(exportpath(outfilename,
+                               result,
+                               sprinfo.width << (8+log2px),
+                               sprinfo.height << (8+log2py),
+                               xmag, ymag
+                              )
+                   );
+        }
+
+        while(result) {
+          register rowstr *row = result;
+          register pathstr *path = result->path;
+          register pathstr *ptr = path;
+          do {
+            register pathstr *ptr2 = ptr;
+            ptr = ptr->link;
+            free(ptr2);
+          } while (ptr != path);
+          result = result->next;
+          free(row);
+        }
+      } /* if */
+      sprid.s.addr = (sprite_ptr) (((char *) sprid.s.addr) + ((sprite_header *)sprid.s.addr)->next);
+    } /* for */
+  } /* if */
+
+  return(0);
+}
+
+
+os_error *averagelines(rowstr *result)
+{
+  while (result) {
+    pathstr *startpoint = result->path;
+    pathstr *p1;
+    int x0 = startpoint->x;
+    int y0 = startpoint->y;
+
+    for (p1 = startpoint; p1->link != startpoint; p1 = p1->link) {
+      p1->x += p1->link->x;
+      p1->y += p1->link->y;
+    }
+    p1->x += x0;
+    p1->y += y0;
+
+    result = result->next;
+  }
+  return(NULL);
+}
+
+
+os_error *nocurvefit(rowstr *result)
+{
+  while (result) {
+    pathstr *startpoint = result->path;
+    pathstr *p0,*p1;
+    int going;
+
+    for (p0=startpoint, going=0; !going || p0 != startpoint; p0=p0->link, going=1) {
+      p0->e = 0;
+      p0->K = p0->curveK = p0->link;
+    }
+
+    for (p0=startpoint, p1=p0->link, going=1; going; p1=p1->link) {
+      if ((p0->x==p1->x && p1->x == p1->link->x) || (p0->y==p1->y && p1->y == p1->link->y)) {
+        p0->K = p0->curveK = p1->link;
+      } else {
+        p0 = p1;
+      }
+      if (p1==startpoint) break;
+    }
+
+    result = result->next;
+  }
+  return(NULL);
+}
+
+
+os_error *exportpath(char *filename, rowstr *result, int width, int height, int xmagnify, int ymagnify)
+{
+  int outbuff[BUFFSIZE];
+  int *ptr = outbuff;
+  int *sizep, *bbox1, *bbox2;
+
+  *ptr++ = *((int *)"Draw");
+  *ptr++ = 201;
+  *ptr++ = 0;
+  strcpy((char *)ptr,"CurveFit    "); ptr += 3;
+  bbox1 = ptr; ptr += 4;          /* fill bbox in later */
+  *ptr++ = 2;                     /* path object */
+  sizep = ptr++;                  /* fill size in later */
+  bbox2 = ptr; ptr += 4;          /* fill bbox in later */
+  *ptr++ = 0;                     /* fill with black */
+  *ptr++ = -1;                    /* do not stroke */
+  *ptr++ = 0;                     /* line width (n/a) */
+  *ptr++ = 1<<6;                  /* even-odd fill */
+
+  while (result) {
+    pathstr *startpoint = result->path;
+    pathstr *endpoint = startpoint;
+
+    *ptr++ = DRAW_MOVE;
+    *ptr++ = (endpoint->x << (8+log2px)) * xmagnify;
+    *ptr++ = (endpoint->y << (8+log2py)) * ymagnify;
+    do {
+      if (endpoint->curveK == endpoint->K && endpoint->e == 0) {
+        *ptr++ = DRAW_LINE;
+      } else {
+        *ptr++ = DRAW_CURV;
+        *ptr++ = (endpoint->ctrl.p1.x << log2px) * xmagnify / XMAG;
+        *ptr++ = (endpoint->ctrl.p1.y << log2py) * ymagnify / YMAG;
+        *ptr++ = (endpoint->ctrl.p2.x << log2px) * xmagnify / XMAG;
+        *ptr++ = (endpoint->ctrl.p2.y << log2py) * ymagnify / YMAG;
+      }
+      endpoint = endpoint->curveK;
+      *ptr++ = (endpoint->x << (8+log2px)) * xmagnify;
+      *ptr++ = (endpoint->y << (8+log2py)) * ymagnify;
+    } while (endpoint != startpoint);
+    *ptr++ = DRAW_CLOS;
+
+    result = result->next;
+  }
+  *ptr++ = DRAW_TERM;
+
+  bbox1[0] = bbox2[0] = 0;
+  bbox1[1] = bbox2[1] = 0;
+  bbox1[2] = bbox2[2] = width * xmagnify;
+  bbox1[3] = bbox2[3] = height * ymagnify;
+
+  *sizep = (ptr-sizep+1) * sizeof(int);
+  { os_filestr f;
+    f.action = 10;                 /* save file, stamped */
+    f.name = filename;
+    f.loadaddr = 0xAFF;            /* DrawFile */
+    f.execaddr = 0;
+    f.start = (int)outbuff;
+    f.end = (int)ptr;
+    err_return(os_file(&f));
+  }
+  return(NULL);
+}
+
+
+void err_abort(os_error *e)
+{
+  if (e) {
+    printf("Error &%x: %s\n",e->errnum,e->errmess);
+    exit(1);
+  }
+}
+
+
+os_error *drawstroke(int *buffer)
+{
+  os_regset r;
+  int matrix[6];
+
+  matrix[0] = XMAG << 16;
+  matrix[1] = 0;
+  matrix[2] = 0;
+  matrix[3] = YMAG << 16;
+  matrix[4] = 128 << log2px;
+  matrix[5] = 128 << log2py;
+
+  r.r[0] = (int) buffer;
+  r.r[1] = 0x18;               /* 0x18  = fill boundary */
+  r.r[2] = (int) &matrix;
+  r.r[3] = 0;                  /* 0 ==> default flatness */
+  r.r[4] = 0;                  /* 0 ==> 1 pixel thick */
+  r.r[5] = 0;                  /* no special line joins */
+  r.r[6] = 0;                  /* not dotted */
+
+  return(os_swix(Draw_Stroke,&r));
+}
+
+
+os_error * scansprite(sprite_area *area, sprite_id *spr, rowstr **resultp)
+{
+  rowstr *lastrow, *thisrow, *lastptr, *thisptr, *resultrow = NULL;
+  pathstr *point1, *point2;
+  int row, col, flag;
+  sprite_info sprinfo;
+
+  printf("Scanning sprite ...\n");
+
+  sprite_readsize(area, spr, &sprinfo);
+
+  lastrow = NULL;
+  for (row=0; row <= sprinfo.height; row++) {
+    thisrow = NULL;
+    if (row != sprinfo.height) {
+      sprite_colour lastcolour, colour;
+      lastcolour.colour = 0;
+      for (col=sprinfo.width-1; col >= -1; col--) {
+        if (col < 0) colour.colour = 0;
+        else sprite_readpixel(area,spr,col,row,&colour);
+        if (colour.colour != lastcolour.colour) {
+          thisrow = newrow(newpoint(col+1,row+1,NULL),thisrow);
+          lastcolour.colour = colour.colour;
+        }
+      }
+    }
+    thisptr = thisrow;
+    lastptr = lastrow;
+    flag = 1;                      /* treat upper line first */
+    while (thisptr || lastptr) {
+      point1 = nextpt(&thisptr,&lastptr,&flag);
+      point2 = nextpt(&thisptr,&lastptr,&flag);
+      connect(point1,point2,row,&resultrow);
+    }
+    while (lastrow) {
+      lastptr = lastrow->next;
+      free(lastrow);
+      lastrow = lastptr;
+    }
+    lastrow = thisrow;
+  }
+
+  *resultp = resultrow;
+  return(NULL);
+}
+
+
+os_error *buildpath(rowstr *resultrow, int *outbuff)
+{
+  int size = outbuff[1];
+  os_error *err = NULL;
+
+  printf("Converting to path ...\n");
+
+  while (resultrow) {
+    int type = DRAW_MOVE;
+    pathstr *p = resultrow->path, *initp;
+
+    initp = p;
+    while (p) {
+      if (size >= 20) {
+        *outbuff++ = type;
+        *outbuff++ = p->x << 8;
+        *outbuff++ = p->y << 8;
+        size -= 12;
+      } else {
+        if (err==NULL) {
+          static os_error er = { 1, "Buffer overflow" };
+          err = &er;
+          printf("Buffer overflow\n");
+        }
+      }
+      p = p->link;
+      if (p == initp) break;
+      type = DRAW_LINE;
+    }
+    if (err == NULL) { *outbuff++ = DRAW_CLOS; size -= 4; }
+    resultrow = resultrow->next;
+  }
+  outbuff[0] = DRAW_TERM;
+  outbuff[1] = size;
+
+  printf("Done.\n");
+
+  return(err);
+}
+
+
+pathstr *nextpt(rowstr **rowp1, rowstr **rowp2, int *flag)
+{
+  register rowstr *row1 = *rowp1;
+  register rowstr *row2 = *rowp2;
+
+  if (row1 == NULL) {
+    *rowp2 = row2->next; return(row2->path);
+  } else if (row2 == NULL) {
+    *flag = -*flag;
+    *rowp1 = row1->next; return(row1->path);
+  } else if ((row1->path->x<<1) <= (row2->path->x<<1)+*flag) {
+    *flag = -*flag;
+    *rowp1 = row1->next; return(row1->path);
+  } else {
+    *rowp2 = row2->next; return(row2->path);
+  }
+}
+
+
+os_error * connect(pathstr *p1, pathstr *p2, int y, rowstr **result)
+{
+  register int x1 = p1->x;
+  register int x2 = p2->x;
+  register int x;
+  register pathstr *link, *link2;
+
+  if (p2->link == NULL) { register pathstr *p=p1; p1=p2; p2=p; }  /* swap */
+
+  if (p2->link == NULL) {
+    link = p2->link = newpoint(p2->x,y,NULL);
+  } else link = p2;
+
+  if (p1->x <= p2->x) {
+    for(x=x2-1;x>x1;x--) link = newpoint(x,y,link);
+  } else {
+    for(x=x1+1;x<x2;x++) link = newpoint(x,y,link);
+  }
+
+  if (p1->link == NULL) {
+    if (link->x != p1->x) link = newpoint(p1->x,y,link);
+    p1->link = link;                    /* single path continues */
+  } else {                              /* path completion */
+    p2 = p1;                   /* remember the start of the chain */
+    /* printf("Reversing chain:"); */   /* ends up circular */
+    while (p1) { /* printf(" %p",p1); */
+      link2 = p1->link; p1->link = link; link = p1; p1 = link2; }
+    /* printf("\n"); */
+    link = p2;
+    while (link) {
+      link = link->link;
+      if (link == p2) {
+        /* printf("Result "); */
+        *result = newrow(p2, *result);
+        break;
+      }
+    }
+  }
+  return(NULL);
+}
+
+
+rowstr *newrow(pathstr *p, rowstr *link)
+{
+  register rowstr *blk = myalloc(sizeof(rowstr));
+
+  blk->next = link;
+  blk->path = p;
+
+  /* printf("Row str at %p/%p -> path str at %p\n",blk,link,p); */
+
+  return(blk);
+}
+
+
+pathstr *newpoint(int x, int y, pathstr *link)
+{
+  register pathstr *blk = myalloc(sizeof(pathstr));
+
+  blk->x = x;
+  blk->y = y;
+  blk->link = link;
+
+  /* printf("Path str at %p/%p (%d,%d)\n",blk,link,x,y); */
+
+  return(blk);
+}
+
+
+void * myalloc(int size)
+{
+  register void * ptr = malloc(size);
+  if (ptr==NULL) { printf("Not enough memory"); exit(1); }
+  return(ptr);
+}
+
+
+#define CONSTANT (1<<8)
+#define THRESHOLD (1<<14)
+#define SQTHRESHOLD 128
+
+#define curve_CONSTANT (900.0*900.0)
+#define line_CONSTANT (500.0*500.0)
+#define join_CONSTANT (700.0*700.0)
+#define curve_THRESHOLD (1000.0*1000.0 + curve_CONSTANT)
+
+os_error *fitlines(rowstr **resultp)
+{
+  rowstr *result = *resultp;
+
+  while (result) {
+    pathstr *startpoint = result->path;
+    pathstr *endpoint = backlink(startpoint);
+    pathstr *cutoff, *pt;
+    int npoints = 1;
+
+    for (pt = startpoint; pt != endpoint; pt = pt->link) npoints++;
+
+    if (npoints <= 16) {
+      printf("Path with %d elements ignored\n", npoints);
+      pt = startpoint;
+      do {
+        pathstr *pt2 = pt->link;
+        free(pt);
+        pt = pt2;
+      } while (pt != startpoint);
+      *resultp = result->next;      /* delete this path altogether! */
+      free(result);
+      result = *resultp;
+    } else {
+      startpoint->E = 0;
+      endpoint->E = CONSTANT;
+      endpoint->K = startpoint;
+
+      cutoff = startpoint->link;
+      do {
+        register pathstr *p = endpoint->link;
+        register int minE = endpoint->E + CONSTANT;
+        register int mine = 0;
+        register pathstr *minK = endpoint;
+        endpoint = backlink(endpoint);
+        for (; p != cutoff; p = p->link) {
+          register int e = leastsquared(endpoint,p);
+          register int E = e + CONSTANT + p->E;
+          if (e > THRESHOLD) { cutoff = p; break; }
+          if (E < minE) { minE = E; minK = p; mine = e; }
+        }
+        endpoint->E = minE;
+        endpoint->e = mine;       /* if 0, this is an exact fit */
+        endpoint->K = minK;
+  /*
+        bbc_gcol(3,11);
+        bbc_move(endpoint->x * XMAG, endpoint->y * YMAG);
+        bbc_draw(minK->x * XMAG, minK->y * YMAG);
+        bbc_get();
+        bbc_move(endpoint->x * XMAG, endpoint->y * YMAG);
+        bbc_draw(minK->x * XMAG, minK->y * YMAG);
+  */
+      } while (endpoint != startpoint);
+
+      /* display straight lines with potential knot positions */
+
+      do {
+        register pathstr *p = endpoint->K;
+        bbc_gcol(0,11);
+        bbc_move(endpoint->x * XMAG, endpoint->y * YMAG);
+        bbc_draw(p->x * XMAG, p->y * YMAG);
+        bbc_gcol(0,10);
+        bbc_rectanglefill(p->x*XMAG-4,p->y*YMAG-4,8,8);
+        endpoint = p;
+      } while (endpoint != startpoint);
+
+      /* consider pairs of lines, finding tangents if angle < 135 degrees */
+
+      do {
+        pathstr *p1 = endpoint->K;
+        pathstr *p2 = p1->K;
+        int x0 = p1->x << log2px;
+        int y0 = p1->y << log2py;
+        int dx0 = (endpoint->x << log2px) - x0;
+        int dy0 = (endpoint->y << log2py) - y0;
+        int dx1 = (p2->x << log2px) - x0;
+        int dy1 = (p2->y << log2py) - y0;
+        int d = dx0*dx1 + dy0*dy1;
+        int d0 = dx0*dx0+dy0*dy0;
+        int d1 = dx1*dx1+dy1*dy1;
+
+        p1->tangent.x =
+        p1->tangent.y = UNKNOWN;
+
+        if (d < 0) {
+          while (d0 > (1<<14)) { d0 >>= 2; d >>= 1; }
+          while (d1 > (1<<14)) { d1 >>= 2; d >>= 1; }
+          while (d > (1<<14)) { d >>= 1; d0 >>= 1; d1 >>= 1; }
+          if (((d*d)<<1) > d0*d1) {
+            /* fit a bezier curve to the two lines, then get tangent */
+            err_return(localfit(endpoint,p1,p2));
+          }
+        }
+        endpoint = p1;
+      } while (endpoint != startpoint);
+
+      /* fit curves using knot positions / tangents */
+
+      startpoint->curveE = 0.0;         /* this one is required! */
+      endpoint = backKlink(startpoint);
+      endpoint->curveE = fitcurve(endpoint,startpoint);
+      endpoint->curveK = startpoint;
+
+      cutoff = startpoint->K;
+      do {
+        pathstr *p = endpoint->K;
+        double minE;
+        pathstr *minK = endpoint;
+        ctrlstr minctrl;
+
+        endpoint = backKlink(endpoint);
+        minE = minK->curveE + fitcurve(endpoint,minK);
+        minctrl = endpoint->ctrl;
+
+        for (; p != cutoff; p = p->K) {
+          double e = fitcurve(endpoint,p);
+          double E = e + p->curveE;
+          if (e > curve_THRESHOLD) { cutoff = p; break; }
+          if (E < minE) { minE = E; minK = p; minctrl = endpoint->ctrl; }
+        }
+        endpoint->curveE = minE;
+        endpoint->curveK = minK;
+        endpoint->ctrl = minctrl;   /* invalid if straight line used */
+  /*
+        bbc_gcol(3,8);
+        drawcurve(endpoint);
+        bbc_get();
+        drawcurve(endpoint);
+  */
+      } while (endpoint != startpoint);
+
+      /* display bezier curves with actual knot positions */
+
+      do {
+        register pathstr *p = endpoint->curveK;
+        bbc_gcol(0,15);
+        drawcurve(endpoint);
+        bbc_gcol(0,15);
+        bbc_rectanglefill(p->x*XMAG-8,p->y*YMAG-8,16,16);
+        endpoint = p;
+      } while (endpoint != startpoint);
+
+      resultp = &result->next;
+      result = *resultp;
+    } /* if */
+  } /* while */
+  return(NULL);
+}
+
+
+/* fit bezier curve from p1 to p3, noting the tangent at p2 */
+
+os_error *localfit(pathstr *p1, pathstr *p2, pathstr *p3)
+{
+  pointstr data[MAXPOINTS];
+  double ti[MAXPOINTS];
+  pathstr *p;
+  bezierstr result;
+  int n = 0, midindex = -1;
+
+  for (p=p1; p!=p3->link; p=p->link) {
+    if (n >= MAXPOINTS-1) returnerr("Too many points");
+#if 0
+    if (n >= MAXPOINTS-1) {
+      if (midindex == -1) {
+        while (p != p2) { n++; p=p->link; }
+        midindex = n;
+      }
+      if (midindex > n * 3/4) {                      /* rearrange if midindex is close to one end */
+        int skippoints = midindex-n/2;
+        p=p1; for (n=0; n<skippoints; n++) p=p->link;
+        midindex = -1;
+        n = 0;
+        for (; p!=p3->link; p=p->link) {
+          if (n >= MAXPOINTS-1) break;       /* give up at this point */
+          if (p==p2) midindex = n;
+          data[n].x = (p->x << 8) * XMAG;
+          data[n++].y = (p->y << 8) * YMAG;
+        }
+      }
+      break;
+    }
+#endif
+    if (p==p2) midindex = n;
+    data[n].x = (p->x << 8) * XMAG;
+    data[n++].y = (p->y << 8) * YMAG;
+  }
+  if (midindex == -1) returnerr("Points counted incorrectly");
+
+  result.p0 = data[0];
+  result.p1.x = UNKNOWN;
+  result.p2.x = UNKNOWN;
+  result.p3 = data[n-1];
+
+  err_return(curvefit(&result, data, ti, n));
+  err_return(plot_bezier(&result));
+
+  /* Given x0,y0,x1,y1,x2,y2,x3,y3, calculate the coefficients:
+   *     cx0 = x0
+   *     cx1 = 3*(x1-x0)
+   *     cx2 = 3*(x2-x1)-cx1
+   *     cx3 = x3-cx2-cx1-x0
+   * Then:
+   *     dx/dt = 3*cx3*t2 + 2*cx2*t + cx1
+   *     dy/dt = 3*cy3*t2 + 2*cy2*t + cy1
+   */
+  {
+    int cx1 = 3*(result.p1.x-result.p0.x);
+    int cx2 = 3*(result.p2.x-result.p1.x) - cx1;
+    int cx3 = result.p3.x-cx2-cx1-result.p0.x;
+    int cy1 = 3*(result.p1.y-result.p0.y);
+    int cy2 = 3*(result.p2.y-result.p1.y) - cy1;
+    int cy3 = result.p3.y-cy2-cy1-result.p0.y;
+    double t = ti[midindex];
+    double t2 = t * t;
+    double dx = 3*cx3*t2 + 2*cx2*t + cx1;
+    double dy = 3*cy3*t2 + 2*cy2*t + cy1;
+    double d = sqrt(dx*dx+dy*dy);
+
+    p2->tangent.x = (int) ((32 * dx) / d);
+    p2->tangent.y = (int) ((32 * dy) / d);
+  }
+
+  { int dx = p2->tangent.x;
+    int dy = p2->tangent.y;
+    int x = p2->x * XMAG;
+    int y = p2->y * YMAG;
+
+    bbc_gcol(3,14);
+    bbc_move(x-dy,y+dx);
+    bbc_draw(x+dy,y-dx);
+  }
+
+  p2->tangent.x += (p2->x << 8) * XMAG;
+  p2->tangent.y += (p2->y << 8) * YMAG;
+
+  return(NULL);
+}
+
+
+/* fit bezier curve from p1 to p2, with appropriate constraints */
+
+typedef void SignalHandler(int);
+static SignalHandler *oldhandler;
+
+static jmp_buf arithabort;
+
+static void handler(int sig)
+{
+  if (sig != SIGFPE) fprintf(stderr, "Unexpected signal !!!\n");
+  else fprintf(stderr, "Arithmetic exception - trapped\n");
+  longjmp(arithabort,1);
+}
+
+double fitcurve(pathstr *p1, pathstr *p2)
+{
+  pointstr data[MAXPOINTS];
+  double ti[MAXPOINTS];
+  pathstr *p;
+  bezierstr result;
+  int n = 0;
+  double error = curve_CONSTANT;
+
+  oldhandler = signal(SIGFPE, &handler);
+
+  if (setjmp(arithabort)) {
+    signal(SIGFPE, oldhandler);
+    return(DBL_MAX / 100);
+  }
+
+  if (p1->K == p2 && p1->e == 0) {
+    signal(SIGFPE, oldhandler);
+    return(line_CONSTANT);
+  }
+
+  for (p=p1->K;p!=p2;p=p->K)
+    if (p->tangent.x == UNKNOWN) error += join_CONSTANT;
+
+  if (error >= curve_THRESHOLD) {
+    signal(SIGFPE, oldhandler);
+    return(error);
+  }
+
+  for (p=p1; p!=p2->link; p=p->link) {
+    if (n >= MAXPOINTS) {
+      signal(SIGFPE, oldhandler);
+      return(curve_THRESHOLD);
+    }
+    data[n].x = (p->x << 8) * XMAG;
+    data[n++].y = (p->y << 8) * YMAG;
+  }
+
+  result.p0 = data[0];
+  result.p1 = p1->tangent;
+  result.p2 = p2->tangent;
+  result.p3 = data[n-1];
+
+  err_abort(curvefit(&result, data, ti, n));
+
+  p1->ctrl.p1 = result.p1;      /* associate both with first point */
+  p1->ctrl.p2 = result.p2;
+
+  if (p1->K == p2) error += curve_CONSTANT;   /* discourage */
+
+  bbc_tab(0,0);
+  printf("Error = %d ^ 2 + %dm = %dm : th = %dm         \n",
+         (int) (sqrt(result.error)),
+         (int) (error/1000000),
+         (int) ((result.error + error)/1000000),
+         (int) (curve_THRESHOLD/1000000));
+/*  bbc_get(); */
+  plot_bezier(&result);
+
+  signal(SIGFPE, oldhandler);
+  return(result.error + error);
+}
+
+
+os_error *drawcurve(pathstr *p)
+{
+  int buffer[11];
+  os_regset r;
+
+  if (p->curveK == p->K && p->e == 0) {
+    bbc_move(p->x*XMAG, p->y*YMAG);
+    bbc_draw(p->K->x*XMAG, p->K->y*YMAG);
+    return(NULL);
+  }
+
+  buffer[0] = DRAW_MOVE;
+  buffer[1] = (p->x << 8) * XMAG;
+  buffer[2] = (p->y << 8) * YMAG;
+  buffer[3] = DRAW_CURV;
+  buffer[4] = p->ctrl.p1.x;
+  buffer[5] = p->ctrl.p1.y;
+  buffer[6] = p->ctrl.p2.x;
+  buffer[7] = p->ctrl.p2.y;
+  buffer[8] = (p->curveK->x << 8) * XMAG;
+  buffer[9] = (p->curveK->y << 8) * YMAG;
+  buffer[10] = DRAW_TERM;
+
+  r.r[0] = (int) buffer;
+  r.r[1] = 0x18;               /* 0x18  = fill boundary only */
+  r.r[2] = 0;                  /* no matrix */
+  r.r[3] = 0;                  /* 0 ==> default flatness */
+  r.r[4] = 0;                  /* 0 ==> 1 pixel thick */
+  r.r[5] = 0;                  /* no special line joins */
+  r.r[6] = 0;                  /* not dotted */
+  return(os_swix(Draw_Stroke,&r));
+}
+
+
+int leastsquared(pathstr *p1, pathstr *p2)
+{
+  int x0 = p1->x;
+  int y0 = p1->y;
+  int dx = p2->x - x0;
+  int dy = p2->y - y0;
+  register int sum = 0;
+  register pathstr *p;
+
+  if (dx || dy) {
+    for (p=p1->link; p!=p2; p=p->link) {
+      register int xx = (p->x-x0)*dy - (p->y-y0)*dx;
+      if (xx > SQTHRESHOLD) { sum = THRESHOLD; break; }
+      sum += xx*xx;
+      if (sum >= THRESHOLD) break;
+    }
+    if (sum < THRESHOLD) sum = (sum << 8)/(dx*dx+dy*dy);
+  } else sum = THRESHOLD;
+
+  return(sum);
+}
+
+
+pathstr *backlink(pathstr *p)
+{
+  pathstr *p2 = p;
+  pathstr *p3 = p->link;
+
+  while (p3 != p) { p2 = p3; p3 = p3->link; }
+  return(p2);
+}
+
+
+pathstr *backKlink(pathstr *p)
+{
+  pathstr *p2 = p;
+  pathstr *p3 = p->K;
+
+  while (p3 != p) { p2 = p3; p3 = p3->K; }
+  return(p2);
+}

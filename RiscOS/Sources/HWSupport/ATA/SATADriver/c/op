@@ -1,0 +1,1149 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/HWSupport/ATA/SATADriver/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Portions Copyright 2017 Jeffrey Lee
+ * Use is subject to license terms.
+ */
+
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include "swis.h"
+
+#include "Global/NewErrors.h"
+#include "Interface/ATA.h"
+#include "SyncLib/synclib.h"
+
+#include "coroutine.h"
+#include "globals.h"
+#include "message.h"
+#include "op.h"
+#include "register.h"
+#include "swi.h"
+#include "util.h"
+#include "dmaprep.h"
+
+/* Timeouts are in cs */
+#define PORT_IDLE_TIMEOUT      (50)  // AHCI spec 10.1.2 advocates half-second wait for PxCMD.CR to clear after deasserting PxCMD.ST
+#define COMRESET_ASSERT_TIME   (5)   // AHCI spec only advocates 1 millisecond, though
+#define COMRESET_RECOVERY_TIME (50)
+#define PM_PSCR_TIMEOUT        (50)
+#define DEVICE_CONTROL_OP_TIMEOUT    (50)
+#define SOFTWARE_RESET_ASSERT_TIME   (1) /* really only needs 5us */
+#define SOFTWARE_RESET_RECOVERY_TIME (50)
+
+/* Some controllers need to retry COMRESET if we get device detected but link not established */
+#define COMRESET_RETRIES (10)
+
+#define FATAL_ERRORS (IRQ_HBF | IRQ_HBD | IRQ_IF | IRQ_TFE)
+#define FATAL_INTERFACE_ERRORS (SERROR_DIAG_T | SERROR_DIAG_S | SERROR_DIAG_H | SERROR_DIAG_C | SERROR_DIAG_D | SERROR_DIAG_B | SERROR_DIAG_I | SERROR_DIAG_N | SERROR_ERR_E | SERROR_ERR_P | SERROR_ERR_C | SERROR_ERR_T)
+
+static void do_op_callback(ahciop_t *op)
+{
+  if (op->callback != NULL)
+  {
+    /* Time for some inline assembler magic :) */
+    __asm {
+      MOV r0, op->e
+      MOV r4, op->total_length
+      MOV r5, op->callback_r5
+      MOV r12, op->callback_r12
+      MSR CPSR_f, op->e == NULL ? 0 : 1<<28
+      BLX op->callback, {r0,r4,r5,r12,pc}
+    }
+  }
+}
+
+static uint32_t identify_running_command(ahciport_t *port)
+{
+  /* Read PxCI and PxCMD.CCS repeatedly if necessary until we're confident that
+   * the current command slot didn't progress between reads */
+  uint32_t ccs, prev_ci, ci = port->pr->pxci;
+  do
+  {
+    prev_ci = ci;
+    ccs = (port->pr->pxcmd & PXCMD_CCS_MASK) >> PXCMD_CCS_SHIFT;
+    ci = port->pr->pxci;
+  }
+  while (ci != prev_ci);
+
+  /* The caller is expected to test the return value against commands_issued
+   * to distinguish between CCS pointing at the running command and the port
+   * being idle, in which case it points at the last slot which was running.
+   * This requires that we state-transition any completed operations (so we
+   * require that state_lock is held on entry to this function). */
+  uint32_t completed_commands = port->commands_issued &~ ci;
+  port->commands_issued &= ~completed_commands;
+  port->commands_completed |= completed_commands;
+  if (completed_commands != 0)
+  {
+    /* Ensure relative ordering of reading which commands have completed
+     * with respect to reading byte counts from the command list or (in the
+     * case of read operations) reading data from the data buffer */
+    barrier();
+
+    while (completed_commands != 0)
+    {
+      uint32_t completed_command = completed_commands &~ (completed_commands - 1);
+      uint32_t index;
+      __asm {
+        CLZ index, completed_command
+      }
+      index = 31 - index;
+      port->op_for_command[index]->state = CMD_STATE_COMPLETED;
+      port->op_for_command[index]->length_done = port->op_for_command[index]->total_length;
+      port->op_for_command[index]->total_length = 0;
+      completed_commands &= ~completed_command;
+    }
+  }
+
+  return ccs;
+}
+
+static void halt_command_list(ahciport_t *port, uint32_t ccs)
+{
+  port->pr->pxcmd &= ~PXCMD_ST;
+
+  uint32_t ready_commands = port->commands_issued &~ (1u << ccs);
+  port->commands_issued = 0;
+  while (ready_commands != 0)
+  {
+    uint32_t ready_command = ready_commands &~ (ready_commands - 1);
+    uint32_t index;
+    __asm {
+      CLZ index, ready_command
+    }
+    index = 31 - index;
+    port->op_for_command[index]->state = CMD_STATE_READY;
+    port->op_for_command[index]->slot = -1u;
+    ready_commands &= ~ready_command;
+  }
+
+  uint32_t retired_commands = port->commands_pending_abort;
+  port->commands_pending_abort = 0;
+  while (retired_commands != 0)
+  {
+    uint32_t retired_command = retired_commands &~ (retired_commands - 1);
+    uint32_t index;
+    __asm {
+      CLZ index, retired_command
+    }
+    index = 31 - index;
+    ahciop_t *op = port->op_for_command[index];
+    dmaprep_on_abort(op);
+    op->e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
+    do_op_callback(op);
+    op->slot = -1u;
+    op->state = CMD_STATE_RETIRED;
+    retired_commands &= ~retired_command;
+  }
+
+  int32_t now;
+  _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  port->op_for_command[ccs]->timeout = now + PORT_IDLE_TIMEOUT + 1;
+  port->wait_for_halt = true;
+}
+
+static void clean_up_completed_op(void *context, uint32_t index)
+{
+  ahciport_t *port = context;
+  ahciop_t *op = port->op_for_command[index];
+  uint8_t *p = op->response;
+  /* Cache the task file status register after each command completion,
+   * separately for each device. TODO: This doesn't really scale to having
+   * multiple commands queued simultaneously, because by the time we get round
+   * to reading this after a successful op, the hardware may have commenced a
+   * second (or worse) and already received a FIS for that. */
+  uint32_t deviceid = op->cfis.c_i_pmp & FIS_RHD_PMP;
+  port->device[deviceid].tfd = port->pr->pxtfd;
+  /* Actually, we have a potential problem here if more than one command has
+   * completed, because the device-to-host register FIS for the first command
+   * will have been overwritten in the received FIS structure and we'll end up
+   * copying garbage into the caller's parameter block as a result. However, the
+   * parameter block on exit is probably ignored except in error cases, so let's
+   * not worry about this too much. */
+  register_fis_t rfis = (*port->received_fis)[0].rfis; /* copy into cached RAM */
+  if (op->op_type == OP_DEVICE_CONTROL)
+  {
+    *p++ = rfis.control;
+  }
+  else if (op->op_type != OP_ATAPI)
+  {
+    *p++ = rfis.features7_0_error;
+    if (op->op_type >= OP_WIDE_FEATURES)
+      *p++ = rfis.features15_8;
+    *p++ = rfis.count7_0;
+    if (op->op_type >= OP_48BIT_LBA)
+      *p++ = rfis.count15_8;
+    *p++ = rfis.lba7_0;
+    *p++ = rfis.lba15_8;
+    *p++ = rfis.lba23_16;
+    if (op->op_type >= OP_48BIT_LBA)
+    {
+      *p++ = rfis.lba31_24;
+      *p++ = rfis.lba39_32;
+      *p++ = rfis.lba47_40;
+    }
+    *p++ = rfis.device;
+    *p++ = rfis.command_status;
+  }
+  dmaprep_on_complete(op, port);
+}
+
+static void clean_up_and_callback_completed_op(void *context, uint32_t index)
+{
+  ahciport_t *port = context;
+  ahciop_t *op = port->op_for_command[index];
+  clean_up_completed_op(context, index);
+  do_op_callback(op);
+}
+
+static void retire_op(void *context, uint32_t index)
+{
+  ahciport_t *port = context;
+  port->op_for_command[index]->state = CMD_STATE_RETIRED;
+  port->op_for_command[index]->slot = -1u;
+}
+
+static void for_bits_in(uint32_t word, void (*callback)(void *, uint32_t), void *context)
+{
+  uint32_t bit;
+  while (word != 0)
+  {
+    bit = word &~ (word - 1);
+    word &= ~bit;
+    __asm {
+      CLZ bit, bit
+    }
+    callback(context, 31 - bit);
+  }
+}
+
+static void recovery_coroutine(void *context)
+{
+  ahciport_t *port = context;
+  /* Remember some register values - they'll be lost by the time we've finished
+   * recovery, but we'll need them to decide which RISC OS error to generate */
+  uint32_t is = port->pr->pxis & FATAL_ERRORS;
+  uint32_t serror = port->pr->pxserr & FATAL_INTERFACE_ERRORS;
+  uint32_t tfd = port->pr->pxtfd;
+  uint32_t failed = port->commands_aborted | port->commands_errored;
+  __asm { CLZ failed, failed }
+  failed = 31 - failed;
+  ahciop_t *op = port->op_for_command[failed];
+
+  /* Acknowledge the errors */
+  port->pr->pxis = FATAL_ERRORS;
+  port->pr->pxserr = -1u;
+
+  clean_up_completed_op(port, failed);
+
+  /* If the device never returned shadow registers indicating that it had
+   * returned to an idle state, we need to send it a COMRESET. We don't know if
+   * the port multiplier (if applicable) or the device was at fault, so we need
+   * to reset both; however once a port multiplier is reset, all of its device
+   * ports are disabled so we actually end up needing a complete reinitialise
+   * of the port multiplier and all its attached devices. Fortunately, because
+   * we're in error recovery state, there's no need to lock all the devices to
+   * ensure nobody else gets in between commands issued as part of the scan
+   * process, because we still need to do error recovery for background
+   * operations and any attempt to lock devices from the background could lead
+   * to deadlock. */
+  if ((tfd & (STATUS_BSY | STATUS_DRQ | STATUS_ERR)) != STATUS_ERR)
+    port->active = op_rescan_port(port, true);
+  else
+    port->pr->pxcmd |= PXCMD_ST;
+
+  /* Work out the appropriate RISC OS error. This is done as late as possible
+   * to avoid lifetime issues with MessageTrans error buffers. */
+  if (is & IRQ_HBF)
+    op->e = MESSAGE_ERRORLOOKUP(true, ATA_HostAbort, 0);
+  else if (is & IRQ_HBD)
+    op->e = MESSAGE_ERRORLOOKUP(true, ATA_HostData, 0);
+  else if (is & IRQ_IF)
+  {
+    /* Pick the lowest set bit from SError (from which we have already removed
+     * bits that don't appear to be error states) */
+    serror = serror &~ (serror - 1);
+    uint32_t number;
+    __asm { CLZ number, serror }
+    number = ErrorNumber_ATA_InterfaceBase + 31 - number;
+    char name[4];
+    sprintf(name, "E%2X", number & 0xFF);
+    op->e = message_error_lookup(true, number, name);
+  }
+  else if (is & IRQ_TFE)
+  {
+    /* Indicates that STATUS_ERR was set in received FIS.
+     * Decode this as per old ADFS, including checking some bits in status
+     * register with higher priority. */
+    if (tfd & STATUS_BSY)
+      op->e = MESSAGE_ERRORLOOKUP(true, ATA_Busy, 0);
+    else if ((op->op_type != OP_ATAPI && (tfd & STATUS_DF) != 0) ||
+             (op->op_type == OP_ATAPI && ((STATUS_DF | STATUS_ERR) &~ tfd) == 0))
+      op->e = MESSAGE_ERRORLOOKUP(true, ATA_WFT, 0);
+    else if (tfd & STATUS_ERR)
+    {
+      uint32_t error = tfd >> PXTFD_ERR_SHIFT;
+      if (op->atapi_errors)
+      {
+        if ((error & (ERROR_SENSE_MASK | ERROR_EOM | ERROR_ILU)) != 0)
+          op->e = MESSAGE_ERRORLOOKUP(true, ATA_Packet, 0);
+        else if ((error & ERROR_ABRT) != 0)
+          op->e = MESSAGE_ERRORLOOKUP(true, ATA_ABRT, 0);
+        else
+          op->e = MESSAGE_ERRORLOOKUP(true, ATA_Unknown, 0);
+      }
+      else
+      {
+        error &= (ERROR_ICRC | ERROR_UNC | ERROR_IDNF | ERROR_ABRT | ERROR_ILRER | ERROR_CCTO);
+        uint32_t number;
+        __asm { CLZ number, error }
+        number = ErrorNumber_ATA_TaskFileBase + 31 - number;
+        char name[4];
+        sprintf(name, "E%2X", number & 0xFF);
+        op->e = message_error_lookup(true, number, name);
+      }
+    }
+  }
+  else
+    op->e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
+
+  do_op_callback(op);
+
+  spin_lock(&port->state_lock);
+  port->commands_aborted = 0;
+  port->commands_errored = 0;
+  op->slot = -1u;
+  op->state = CMD_STATE_RETIRED;
+  spin_unlock(&port->state_lock);
+
+  /* Finished */
+  port->error_recovery = false;
+  coroutine_wait(&port->recovery_coroutine); // doesn't return
+}
+
+static void op_poll(ahciport_t *port)
+{
+  /* Serialise entry to function */
+  if (!mutex_try_lock(&port->doing_poll))
+    return;
+
+  ahciop_t *op;
+  int32_t now;
+  _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+
+  /* Note that at this point, we don't know (or care) whether the AHCI is
+   * working on a normal command or an error-recovery one */
+
+  spin_lock(&port->state_lock);
+
+  /* Read error status before reading which commands (if any) have completed.
+   * This is because the error recovery process nukes the PxCI register so if
+   * one command completed OK then another errors between the two reads, we
+   * could lose track of the fact that the earlier one succeeded. Once a fatal
+   * error happens, by contrast, no more commands are processed, so if we just
+   * miss reading the error status in time then at worst we have to wait until
+   * this routine is called again on the next timer tick to act upon it. */
+  uint32_t is = port->pr->pxis;
+
+  uint32_t ccs = identify_running_command(port);
+  if (is & FATAL_ERRORS)
+  {
+    port->commands_issued &= ~1u << ccs;
+    port->commands_errored = 1u << ccs;
+    port->op_for_command[ccs]->state = CMD_STATE_ERRORED;
+    if (port->op_for_command[ccs]->total_length != 0)
+    {
+      port->op_for_command[ccs]->length_done = (*port->command_list)[ccs].prdbc;
+      port->op_for_command[ccs]->total_length -= port->op_for_command[ccs]->length_done;
+    }
+    halt_command_list(port, ccs);
+  }
+
+  /* Release the lock since some of the following could be quite time-consuming */
+  spin_unlock(&port->state_lock);
+
+  /* Some operations may have been identified as completed. If these exist in
+   * addition to an aborted/errored operation, they will have completed first
+   * so process them first. */
+  for_bits_in(port->commands_completed, clean_up_and_callback_completed_op, port);
+
+  /* Retire completed ops */
+  spin_lock(&port->state_lock);
+  for_bits_in(port->commands_completed, retire_op, port);
+  port->commands_completed = 0;
+  spin_unlock(&port->state_lock);
+
+  uint32_t pxcmd = port->pr->pxcmd;
+  if (port->wait_for_halt)
+  {
+    /* Only one bit will be set between commands_aborted and commands_errored */
+    uint32_t failed = port->commands_aborted | port->commands_errored;
+    __asm { CLZ failed, failed }
+    failed = 31 - failed;
+    if ((pxcmd & PXCMD_CR) != 0 /* Hardware not halted yet? */ &&
+        now - port->op_for_command[failed]->timeout < 0)
+      goto exit; /* give it a while longer */
+    /* We now consider the command list reset to be complete. If the operation
+     * that caused the reset was a normal one, initialise the error recovery
+     * process. If the operation was itself part of error recovery, don't -
+     * that way lies infinite recursion. Instead, just acknowledge the errors
+     * and clean up after the operation (chances are that high-level software
+     * will retry the original operation so we'll get a few more goes at
+     * reseting things). */
+    port->wait_for_halt = false;
+    if (port->error_recovery)
+    {
+      port->pr->pxis = FATAL_ERRORS;
+      port->pr->pxserr = -1u;
+      clean_up_and_callback_completed_op(port, 0); /* error ops always get slot 0 */
+      port->pr->pxcmd |= PXCMD_ST;
+    }
+    else
+    {
+      coroutine_reset(&port->recovery_coroutine, recovery_coroutine, port);
+      port->error_recovery = true;
+    }
+  }
+
+  /* Step through the error recovery coroutine if necessary. This may issue
+   * error recovery commands, or drop out of error recovery mode, or neither */
+  if (port->error_recovery)
+    coroutine_resume(&port->recovery_coroutine);
+
+  /* See if there is a command ready to be issued (or more than one once we get
+   * queues implemented). Where we get it from depends upon whether we're in
+   * error recovery mode or not. */
+  op = port->error_recovery ? &port->error_op : &port->op;
+  if (op->state == CMD_STATE_READY)
+  {
+    uint32_t slot = 0; // TODO: select one empty slot out of the many
+    port->op_for_command[slot] = op;
+
+    op->e = NULL;
+
+    if ((op->description_info & COMMANDHDR_R) == 0)
+    {
+      uint32_t deviceid = op->cfis.c_i_pmp & FIS_RHD_PMP;
+      uint32_t tfd = port->device[deviceid].tfd;
+      if ((tfd & STATUS_BSY) != 0)
+      {
+        /* Maintain atomicity of state changes */
+        spin_lock(&port->state_lock);
+        if (op->state == CMD_STATE_READY)
+        {
+          dmaprep_on_abort(op);
+          op->e = MESSAGE_ERRORLOOKUP(true, ATA_CmdBusy, 0);
+          do_op_callback(op);
+          op->state = CMD_STATE_RETIRED;
+        }
+        spin_unlock(&port->state_lock);
+        goto exit; // TODO: examine the next queued op block instead
+      }
+      else if (!op->nodrdy && (tfd & STATUS_DRDY) == 0)
+      {
+        /* Maintain atomicity of state changes */
+        spin_lock(&port->state_lock);
+        if (op->state == CMD_STATE_READY)
+        {
+          dmaprep_on_abort(op);
+          op->e = MESSAGE_ERRORLOOKUP(true, ATA_CmdNotRdy, 0);
+          do_op_callback(op);
+          op->state = CMD_STATE_RETIRED;
+        }
+        spin_unlock(&port->state_lock);
+        goto exit; // TODO: examine the next queued op block instead
+      }
+    }
+
+    dmaprep_on_queue(op, port);
+
+    (*port->command_list)[slot].description_info = op->description_info;
+    (*port->command_list)[slot].prdbc = 0; // starts at 0, incremented by controller until it reaches op->total_length
+    (*port->command_list)[slot].ctba = port->command_table_phy;
+    memcpy(&port->command_table->cfis, &op->cfis, sizeof op->cfis);
+    if (op->op_type == OP_ATAPI)
+      memcpy(&port->command_table->acmd, &op->acmd, sizeof op->acmd);
+
+    spin_lock(&port->state_lock);
+    if (op->state == CMD_STATE_READY)
+    {
+      /* Ensure all pending buffered writes to the command list and
+       * (in the case of write operations) the data buffer have completed
+       * before we issue the command */
+      barrier();
+
+      op->state = CMD_STATE_ISSUED;
+      op->slot = slot;
+      port->commands_issued |= 1u<<slot;
+      port->pr->pxci = 1u<<slot;
+      spin_unlock(&port->state_lock);
+    }
+    else
+    {
+      spin_unlock(&port->state_lock);
+      goto exit; // TODO: examine the next queued op block instead
+    }
+  }
+
+exit:
+  /* End serialisation */
+  mutex_unlock(&port->doing_poll);
+}
+
+static void poll(ahciport_t *port, bool error_recovery)
+{
+  if (error_recovery)
+    coroutine_wait(&port->recovery_coroutine);
+  else
+    op_poll(port);
+}
+
+static bool internal_op_issue(ataop_block_t *restrict b, uint32_t timeout, ahciport_t *restrict port, bool error_recovery)
+{
+  volatile size_t fg_not_transferred;
+  extern void fgopcb(void);
+  volatile uintptr_t op_status = -1; /* -1 while op running, thereafter 0 or error pointer */
+  b->r0.bits.bg = true, // OK because we do our own polling
+  b->r5.callback_r5 = (void *) &fg_not_transferred;
+  b->callback = fgopcb;
+  b->callback_r12 = (void *) &op_status;
+  _kernel_oserror *e = op_issue(b, false, error_recovery);
+  if (e != NULL)
+    return false;
+  int32_t now, end;
+  _swix(OS_ReadMonotonicTime, _OUT(0), &end);
+  end += timeout + 1;
+  while (op_status == -1)
+  {
+    _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+    if (now - end >= 0)
+    {
+      swi_control_abort_op(port->cpid, b->r1.op_handle);
+      do
+      {
+        poll(port, error_recovery);
+      } while (op_status == -1);
+      return false;
+    }
+    poll(port, error_recovery);
+  }
+  if (op_status != 0)
+    return false;
+  return true;
+}
+
+static bool pmp_read_write_reg(ahciport_t *restrict port, ataop_param_wide_features_t *restrict param, bool error_recovery)
+{
+  ataop_block_t b = {
+      .r0.bits.nodrdy = true,
+      .r0.bits.deviceid = PM_CONTROL_PORT,
+      .r0.bits.cpid = port->cpid,
+      .r0.bits.dir = ATAOp_TransNone >> ATAOp_TransShift,
+      .r0.bits.bg = true, // OK because we do our own polling
+      .r1.param_len = 12,
+      .param.wide_features = param,
+  };
+  return internal_op_issue(&b, PM_PSCR_TIMEOUT, port, error_recovery);
+}
+
+bool op_read_pmp_reg(ahciport_t *restrict port, uint32_t pmp, pm_scr_t pm_scr, uint32_t *restrict value, bool error_recovery)
+{
+  ataop_param_wide_features_t param = {
+    .command = PMCOMMAND_READ_PORT_MULTIPLIER,
+    .device = pmp,
+    .features0 = pm_scr & 0xFF,
+    .features1 = pm_scr >> 8
+  };
+  bool ok = pmp_read_write_reg(port, &param, error_recovery);
+  if (!ok)
+    return false;
+  *value = (param.sector_count0 << 0) | (param.lba0 << 8) | (param.lba1 << 16) | (param.lba2 << 24);
+  return true;
+}
+
+bool op_write_pmp_reg(ahciport_t *port, uint32_t pmp, pm_scr_t pm_scr, uint32_t value, bool error_recovery)
+{
+  ataop_param_wide_features_t param = {
+    .command = PMCOMMAND_WRITE_PORT_MULTIPLIER,
+    .device = pmp,
+    .sector_count0 = value >> 0,
+    .lba0 = value >> 8,
+    .lba1 = value >> 16,
+    .lba2 = value >> 24,
+    .features0 = pm_scr & 0xFF,
+    .features1 = pm_scr >> 8
+  };
+  return pmp_read_write_reg(port, &param, error_recovery);
+}
+
+static bool op_modify_pmp_reg(ahciport_t *port, uint32_t pmp, pm_scr_t pm_scr, uint32_t and, uint32_t xor, bool error_recovery)
+{
+  uint32_t value;
+  if (and != 0 && !op_read_pmp_reg(port, pmp, pm_scr, &value, error_recovery))
+    return false;
+  value &= and;
+  value ^= xor;
+  if (!op_write_pmp_reg(port, pmp, pm_scr, value, error_recovery))
+    return false;
+  return true;
+}
+
+static void delay(uint32_t howlong, ahciport_t *port, bool error_recovery)
+{
+  int32_t now, timeout;
+  _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  timeout = now + howlong + 1;
+  do
+  {
+    poll(port, error_recovery);
+    _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  }
+  while (timeout - now >= 0);
+}
+
+static bool write_control_register(ahciport_t *port, uint32_t deviceid, uint8_t value, bool error_recovery)
+{
+  ataop_param_device_control_t params = value;
+  ataop_block_t b = {
+      .r0.bits.nodrdy = true,
+      .r0.bits.deviceid = deviceid,
+      .r0.bits.cpid = port->cpid,
+      .r0.bits.dir = ATAOp_TransNone >> ATAOp_TransShift,
+      .r1.param_len = 1,
+      .param.device_control = &params,
+  };
+  return internal_op_issue(&b, DEVICE_CONTROL_OP_TIMEOUT, port, error_recovery);
+}
+
+static bool software_reset(ahciport_t *port, uint32_t deviceid, bool error_recovery)
+{
+  if (!write_control_register(port, deviceid, CONTROL_SRST, error_recovery) != NULL)
+    return false;
+  delay(SOFTWARE_RESET_ASSERT_TIME, port, error_recovery);
+
+  /* To minimise the time spent waiting for reset to complete, zero out a
+   * byte in the received FIS buffer so that we can detect when the signature
+   * has been returned. Yes, I know - but the received FIS interrupt isn't
+   * generated and given that neighbouring devices will often have the same
+   * signature, there's no other easy way to detect this. */
+  volatile uint8_t *p = &(*port->received_fis)[0].rfis.count7_0;
+  *p = 0;
+
+  if (!write_control_register(port, deviceid, 0, error_recovery) != NULL)
+    return false;
+
+  int32_t now, timeout;
+  _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  timeout = now + SOFTWARE_RESET_RECOVERY_TIME + 1;
+  do
+  {
+    poll(port, error_recovery);
+    if (*p != 0)
+      break;
+    _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  }
+  while (timeout - now >= 0);
+
+  return true;
+}
+
+static bool op_rescan_pmp_ports(ahciport_t *port, bool error_recovery)
+{
+  /* Do a COMRESET on all PM ports in parallel to save time */
+#define SCONTROL_CLEAR_BITS (SCONTROL_DET_MASK | SCONTROL_IPM_NO_PARTIAL | SCONTROL_IPM_NO_SLUMBER | SCONTROL_IPM_NO_DEVSLEEP | SCONTROL_PMP_MASK)
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
+        ~SCONTROL_CLEAR_BITS, SCONTROL_DET_COMRESET, error_recovery))
+      return false;
+  }
+  delay(COMRESET_ASSERT_TIME, port, error_recovery);
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_modify_pmp_reg(port, deviceid, PM_PSCR_SCONTROL,
+        ~SCONTROL_CLEAR_BITS, SCONTROL_DET_NOOP, error_recovery))
+      return false;
+  }
+  delay(COMRESET_RECOVERY_TIME, port, error_recovery);
+
+  /* Clear any outstanding errors that may have been generated */
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (!op_write_pmp_reg(port, deviceid, PM_PSCR_SERROR, -1u, error_recovery))
+      return false;
+  }
+
+  /* No command list override needed here, I believe */
+
+  /* Check each PM port's SStatus to see if the link is up */
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    uint32_t sstatus;
+    if (!op_read_pmp_reg(port, deviceid, PM_PSCR_SSTATUS, &sstatus, error_recovery))
+      return false;
+    dprintf("SStatus for PMP %u = %08X\n", deviceid ,sstatus);
+    port->device[deviceid].valid = (sstatus & SSTATUS_DET_MASK) == SSTATUS_DET_DEV;
+  }
+
+  /* For each PM port with a valid link, send a software reset to fetch a
+   * device signature. These have to be done sequentially because the
+   * signature is delivered via a device to host register FIS. */
+  bool result = true;
+  for (uint32_t deviceid = 0; deviceid < port->pmp_ports; deviceid++)
+  {
+    if (port->device[deviceid].valid)
+    {
+      port->device[deviceid].tfd = STATUS_DRDY; /* assumed */
+      if (!software_reset(port, deviceid, error_recovery))
+      {
+        dprintf("Signature for PMP %u not returned\n", deviceid);
+        port->device[deviceid].sig = (sata_sig_t) 0;
+        result = false;
+
+        /* For errors during error recovery, give up */
+        if (error_recovery)
+          break;
+      }
+      else
+      {
+        dprintf("Signature for PMP %u = %08X\n", deviceid, port->pr->pxsig);
+        port->device[deviceid].sig = (sata_sig_t) port->pr->pxsig;
+      }
+    }
+  }
+
+  return result; /* When true all ports with link up gave signatures */
+}
+
+bool op_rescan_port(ahciport_t *port, bool error_recovery)
+{
+  /* Must stop command list processing to issue top-level COMRESET */
+  port->pr->pxcmd &= ~PXCMD_ST; /* Also clears pxci register */
+  /* Wait for DMA engine to halt */
+  do; while (port->pr->pxcmd & PXCMD_CR);
+  /* Enable FIS reception to get the COMINIT reply */
+  port->pr->pxcmd |= PXCMD_FRE;
+
+  for (uint32_t retries = 0; retries < COMRESET_RETRIES; retries++)
+  {
+    /* Send COMRESET to top-level port */
+    uint32_t scontrol = port->pr->pxsctl &~ (SCONTROL_DET_MASK | SCONTROL_IPM_NO_PARTIAL | SCONTROL_IPM_NO_SLUMBER | SCONTROL_IPM_NO_DEVSLEEP);
+    port->pr->pxsctl = scontrol | SCONTROL_DET_COMRESET;
+    delay(COMRESET_ASSERT_TIME, port, error_recovery);
+    port->pr->pxsctl = scontrol | SCONTROL_DET_NOOP;
+    delay(COMRESET_RECOVERY_TIME, port, error_recovery);
+
+    if ((port->pr->pxssts & SSTATUS_DET_MASK) != SSTATUS_DET_DEV_NE)
+      break;
+  }
+
+  /* Clear any outstanding errors that may have been generated */
+  port->pr->pxserr = -1u;
+
+  /* Check top-level SStatus to see if the link is up */
+  if ((port->pr->pxssts & SSTATUS_DET_MASK) != SSTATUS_DET_DEV)
+    return false;
+  port->active = true;
+  port->device[PM_CONTROL_PORT].valid = true; /* for now - needed so we can try issuing commands to it */
+
+  /* Now do a software reset to force a signature update.
+   * According to AHCI spec section 9.2, we first need to issue a
+   * command list override to reliably enumerate port multipliers. */
+  if (port->support_clo)
+  {
+    /* Command list processing is already disabled following the COMRESET above */
+    port->pr->pxcmd |= PXCMD_CLO;
+    /* Wait for CLO to complete */
+    do; while (port->pr->pxcmd & PXCMD_CLO);
+  }
+  /* Re-enable command list processing */
+  port->pr->pxcmd |= PXCMD_FRE | PXCMD_ST;
+
+  /* Send a software reset to port 15. This will send us the signature of the
+   * port multiplier if there is one, else the signature of the single device */
+  if (!software_reset(port, PM_CONTROL_PORT, error_recovery))
+    return false;
+
+  if (port->pr->pxsig != SATA_SIG_PM)
+  {
+    port->pmp_ports = 1;
+    port->device[0].sig = (sata_sig_t) port->pr->pxsig;
+    port->device[0].valid = true;
+    port->device[0].tfd = STATUS_DRDY; /* assumed */
+    for (uint32_t deviceid = 1; deviceid <= PM_CONTROL_PORT; deviceid++)
+      port->device[deviceid].valid = false;
+  }
+  else
+  {
+    port->device[PM_CONTROL_PORT].sig = SATA_SIG_PM;
+    if (!op_read_pmp_reg(port, PM_CONTROL_PORT, PM_GSCR_PORT_INFORMATION, &port->pmp_ports, error_recovery))
+      return false;
+    port->pmp_ports &= 0xF;
+    dprintf("%u ports\n", port->pmp_ports);
+    for (uint32_t deviceid = port->pmp_ports; deviceid < PM_CONTROL_PORT; deviceid++)
+      port->device[deviceid].valid = false;
+
+    if (error_recovery)
+      return op_rescan_pmp_ports(port, error_recovery); /* No retries during error recovery */
+
+    for (uint32_t retries = 0; retries < COMRESET_RETRIES; retries++)
+    {
+      /* Review which have established a PHY link, and try to read the signature.
+       * If the PHY locked, but at an unsupported speed, there will be no response to
+       * the software reset which gets the signature. In that case it's worth
+       * another COMRESET to relock and try the signature again at a different speed. */
+      dprintf("Retry (%d)\n", retries);
+      if (op_rescan_pmp_ports(port, error_recovery))
+        return true;
+
+      /* Error recovery marks the top level port inactive, force it on again */
+      port->active = true;
+    }
+    return false; /* After COMRESET_RETRIES still not got all signatures */
+  }
+
+  return true;
+}
+
+void op_abort(ahciport_t *restrict port, ahciop_t *restrict op)
+{
+  spin_lock(&port->state_lock);
+  if (op->slot != -1)
+  {
+    /* Operation has already been added to the command list.
+     * If it's already aborted, errored or completed OK, take no action,
+     * as it will be cleared up when we next enter op_poll().
+     * If it's issued but not yet started (not the current command slot)
+     * then we can't take any action yet without affecting the other
+     * slots in the command list, so mark it as abort-pending.
+     * If it is the current command slot, we can stop the command list,
+     * though this will also cancel any other listed operations,
+     * so we need to either rewind their state so that they will be
+     * added to the list again when it is reenabled, or (if they were
+     * abort-pending) issue their callback routine. We have to wait
+     * until op_poll() to do the callback routine if we're aborting
+     * the current command slot, because we need to be able to issue
+     * cleanup commands.
+     */
+    uint32_t ccs = identify_running_command(port);
+    if (op->state == CMD_STATE_ISSUED)
+    {
+      if (ccs != op->slot)
+      {
+        port->commands_issued &= ~(1u << op->slot);
+        port->commands_pending_abort |= 1u << op->slot;
+        op->state = CMD_STATE_ABORT_PENDING;
+      }
+      else
+      {
+        halt_command_list(port, ccs);
+        port->commands_issued &= ~(1u << op->slot);
+        port->commands_aborted = (1u << op->slot);
+        op->state = CMD_STATE_ABORTED;
+        if (op->total_length != 0)
+        {
+          op->length_done = (*port->command_list)[ccs].prdbc;
+          op->total_length -= op->length_done;
+        }
+      }
+    }
+  }
+  else if (op->state == CMD_STATE_READY)
+  {
+    /* In this case, the operation hasn't entered the command list yet, and
+     * may not do so for an indeterminate time, so issue the callback routine
+     * synchronous to this call rather than from within op_opll(). */
+    dmaprep_on_abort(op);
+    op->e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
+    do_op_callback(op);
+    op->state = CMD_STATE_RETIRED;
+  }
+  spin_unlock(&port->state_lock);
+}
+
+void op_abort_all(ahciport_t *port)
+{
+  spin_lock(&port->state_lock);
+
+  /* This is similar to the op_abort() case except that issued-but-unstarted
+   * operations can be retired immediately. This is achieved by moving them to
+   * abort-pending state. */
+  uint32_t ccs = identify_running_command(port);
+  if (port->commands_issued != 0)
+  {
+    port->op_for_command[ccs]->state = CMD_STATE_ABORTED;
+    if (port->op_for_command[ccs]->total_length != 0)
+    {
+      port->op_for_command[ccs]->length_done = (*port->command_list)[ccs].prdbc;
+      port->op_for_command[ccs]->total_length -= port->op_for_command[ccs]->length_done;
+    }
+    port->commands_aborted = 1u << ccs;
+    port->commands_pending_abort |= port->commands_issued &~ (1u << ccs);
+    port->commands_issued = 0;
+    halt_command_list(port, ccs);
+  }
+
+  /* All that's left to consider are any op blocks that were never issued */
+  if (port->op.state == CMD_STATE_READY)
+  {
+    dmaprep_on_abort(&port->op);
+    port->op.e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
+    do_op_callback(&port->op);
+    port->op.state = CMD_STATE_RETIRED;
+  }
+  if (port->error_op.state == CMD_STATE_READY)
+  {
+    dmaprep_on_abort(&port->error_op);
+    port->error_op.e = MESSAGE_ERRORLOOKUP(true, ATA_Abort, 0);
+    do_op_callback(&port->error_op);
+    port->error_op.state = CMD_STATE_RETIRED;
+  }
+
+  spin_unlock(&port->state_lock);
+}
+
+_kernel_oserror *op_issue(ataop_block_t *b, bool atapi, bool error_recovery)
+{
+  int32_t now, timeout;
+  ahciport_t *port;
+  satadevice_t *device;
+
+  /* Set timeout time */
+  if (!b->r0.bits.bg)
+  {
+    _swix(OS_ReadMonotonicTime, _OUT(0), &timeout);
+    if (b->r5.timeout == 0)
+      timeout += 0x7fffffff; /* 248 days, near enough infinite */
+    else
+      timeout += b->r5.timeout + 1; /* add 1 to compensate for first tick being < 1cs */
+  }
+
+  /* Find port pointer */
+  _kernel_oserror *e = util_find_port_and_device(b->r0.bits.cpid, b->r0.bits.deviceid, &port, &device);
+  if (e != NULL)
+    return e;
+
+  /* First check anything that can raise an error before we even grab an op block */
+//  if (b->r0.bits.bg) // background transfers not yet implemented
+//  {
+//    spinrw_read_unlock(&g_ahci_lock);
+//    return MESSAGE_ERRORLOOKUP(false, ATA_BadParms, 0);
+//  }
+  if ((atapi && ((atapacketop_block_t *)b)->r1.control_len != 12 && ((atapacketop_block_t *)b)->r1.control_len != 16) ||
+      (!atapi && b->r1.param_len != 1 && b->r1.param_len != 7 && b->r1.param_len != 11 && b->r1.param_len != 12))
+  {
+    spinrw_read_unlock(&g_ahci_lock);
+    return MESSAGE_ERRORLOOKUP(false, ATA_BadParms, 0);
+  }
+//  if ((e = validate_address_range(b->param, b->r1.param_len)) != NULL)
+//  {
+//    spinrw_read_unlock(&g_ahci_lock);
+//    return e;
+//  }
+  size_t total_length = b->data_len;
+  if (b->r0.bits.dir == ATAOp_TransNone >> ATAOp_TransShift)
+    total_length = 0; // old ADFS says R4 unused in this case, so its value may be nonsense
+  if (total_length & 3)
+  {
+    spinrw_read_unlock(&g_ahci_lock);
+    return MESSAGE_ERRORLOOKUP(false, ATA_BadParms, 0);
+  }
+
+  /* Since we're only supporting foreground transfers, we only have one op block
+   * so that's the one we use. Once background transfers are added, we'd want to
+   * grab a free one from the queue. Back in SDIODriver we held a spinlock while
+   * doing all this, but doing a load of page table lookups with IRQs off sounds
+   * like a bad idea, so we'd probably need to have an intermediate state for an
+   * op block to say it's been allocated but is still under construction and so
+   * not suitable for the interrupt handler to start using yet. In the meantime,
+   * without background transfers, don't bother locking it at all. */
+
+  /* As a special exception, we need one extra op block so we can do error
+   * discrimination and recovery for devices behind a port multiplier before we
+   * doing the callback for the original erroring operation. Error probing isn't
+   * something that we can parallelise (it involves doing a COMRESET on the
+   * port) so we won't ever need an array of these. */
+  ahciop_t *op = error_recovery ? &port->error_op : &port->op;
+
+  /* Now we have somewhere to build the PRDT, do that first because it can fail */
+  op->length_done = 0;
+  op->total_length = total_length;
+  scatter_t *scat;
+  if (b->r0.bits.scatter)
+    scat = b->data.scatter;
+  else
+  {
+    op->surrogate.address = b->data.block;
+    op->surrogate.length = op->total_length;
+    scat = &op->surrogate;
+  }
+
+  dmaprep_result_t prep_result = dmaprep_prep(op, b, scat, port);
+  if (prep_result.e != NULL)
+  {
+    /* TODO: when op block is allocated from a queue, will need to release the
+     * op block at this point */
+    spinrw_read_unlock(&g_ahci_lock);
+    return prep_result.e;
+  }
+  uint32_t prdt_len = prep_result.prdt_len;
+
+  op->state = CMD_STATE_READY;
+  op->response = b->param.wide_features; // any union member would do
+
+  volatile uintptr_t op_status = -1;
+  volatile size_t    fg_not_transferred;
+  if (b->r0.bits.bg)
+  {
+    op->callback = b->callback;
+    op->callback_r5 = b->r5.callback_r5;
+    op->callback_r12 = b->callback_r12;
+  }
+  else
+  {
+    extern void fgopcb(void);
+    op->callback = fgopcb;
+    op->callback_r5 = (void *) &fg_not_transferred;
+    op->callback_r12 = (void *) &op_status;
+  }
+
+  memset(&op->cfis, 0, sizeof op->cfis);
+  memset(&op->acmd, 0, sizeof op->acmd);
+
+  if (atapi)
+  {
+    atapacketop_block_t *b2 = (atapacketop_block_t *) b;
+    op->nodrdy = true; /* ATAPI devices never assert DRDY it seems */
+    op->op_type = OP_ATAPI;
+    op->atapi_errors = true;
+    op->cfis.fis_type = FISTYPE_RHD;
+    op->cfis.c_i_pmp = FIS_RHD_C | b2->r0.bits.deviceid;
+    op->cfis.command_status = ATACOMMAND_PACKET;
+    op->cfis.features7_0_error = b2->r0.bits.dma * (FEATURES_PACKET_DMA +
+        b2->r0.bits.dmadir * !(op->description_info & COMMANDHDR_W) * FEATURES_PACKET_DMADIR);
+    op->cfis.lba15_8 = PACKET_COMMAND_BYTE_COUNT & 0xFF;
+    op->cfis.lba23_16 = PACKET_COMMAND_BYTE_COUNT >> 8;
+    op->cfis.device = DEVICE_MAGIC;
+    /* There doesn't appear to be any way to signal to an
+     * ATAPI device whether it's getting 12 or 16 bytes... */
+    memcpy(op->acmd, b2->control, b2->r1.control_len);
+  }
+  else
+  {
+    op->nodrdy = b->r0.bits.nodrdy;
+    uint8_t *p = (uint8_t *) b->param.wide_features; // any union member would do
+    op->cfis.fis_type = FISTYPE_RHD;
+    if (b->r1.param_len == 1)
+    {
+      op->op_type = OP_DEVICE_CONTROL;
+      op->cfis.c_i_pmp = b->r0.bits.deviceid; // C bit clear in this one case
+      op->cfis.control = *p++;
+    }
+    else
+    {
+      op->op_type = OP_WIDE_FEATURES;
+      op->cfis.c_i_pmp = FIS_RHD_C | b->r0.bits.deviceid;
+      op->cfis.features7_0_error = *p++;
+      if (b->r1.param_len >= 12)
+        op->cfis.features15_8 = *p++;
+      else
+        op->op_type = OP_48BIT_LBA;
+      op->cfis.count7_0 = *p++;
+      if (b->r1.param_len >= 11)
+        op->cfis.count15_8 = *p++;
+      else
+        op->op_type = OP_28BIT_LBA;
+      op->cfis.lba7_0 = *p++;
+      op->cfis.lba15_8 = *p++;
+      op->cfis.lba23_16 = *p++;
+      if (b->r1.param_len >= 11)
+      {
+        op->cfis.lba31_24 = *p++;
+        op->cfis.lba39_32 = *p++;
+        op->cfis.lba47_40 = *p++;
+      }
+      op->cfis.device = *p++;
+      op->cfis.command_status = *p++;
+    }
+    op->atapi_errors = op->cfis.command_status == ATACOMMAND_RESET_DEVICE;
+  }
+  op->description_info =
+      (prdt_len << COMMANDHDR_PRDTL_SHIFT) |
+      (b->r0.bits.deviceid << COMMANDHDR_PMP_SHIFT) |
+      ((op->op_type == OP_DEVICE_CONTROL && (*b->param.device_control & 4) != 0) * (COMMANDHDR_C | COMMANDHDR_R)) |
+      ((op->op_type == OP_ATAPI || prdt_len > 0) * COMMANDHDR_P) |
+      ((b->r0.bits.dir == ATAOp_TransWrite >> ATAOp_TransShift) * COMMANDHDR_W) |
+      ((op->op_type == OP_ATAPI) * COMMANDHDR_A) |
+      ((sizeof (register_fis_t) / 4) << COMMANDHDR_CFL_SHIFT);
+
+  /* Now either exit (for background ops) or block (for foreground ops) */
+  if (b->r0.bits.bg)
+  {
+    b->r0.word = 0;
+    b->r1.op_handle = op;
+    spinrw_read_unlock(&g_ahci_lock);
+    return NULL;
+  }
+  else
+  {
+    while (op_status == -1)
+    {
+      bool timed_out = false;
+      bool escape = false;
+      _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+      timed_out = now - timeout >= 0;
+      if (!b->r0.bits.no_escape)
+      {
+        uint32_t flags;
+        _swix(OS_ReadEscapeState, _OUT(_FLAGS), &flags);
+        if (flags & _C)
+        {
+          escape = true;
+          _swix(OS_Byte, _IN(0), 124); /* clear escape condition */
+        }
+      }
+      if (timed_out || escape)
+      {
+        swi_control_abort_op(b->r0.bits.cpid, op);
+        do
+        {
+          op_poll(port);
+        } while (op_status == -1);
+        b->r0.word = 0;
+        b->data_len = fg_not_transferred;
+        spinrw_read_unlock(&g_ahci_lock);
+        if (escape)
+          return MESSAGE_ERRORLOOKUP(false, Escape, 0);
+        else
+          return MESSAGE_ERRORLOOKUP(true, ATA_OpTO, 0);
+      }
+
+      op_poll(port);
+    }
+    b->r0.word = 0;
+    b->data_len = fg_not_transferred;
+    spinrw_read_unlock(&g_ahci_lock);
+    return (_kernel_oserror *) op_status;
+  }
+}

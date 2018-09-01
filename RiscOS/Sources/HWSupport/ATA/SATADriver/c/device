@@ -1,0 +1,212 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/HWSupport/ATA/SATADriver/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Use is subject to license terms.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include "swis.h"
+
+#include "Global/HALEntries.h"
+#include "Interface/ATA.h"
+#include "Interface/AHCIDevice.h"
+#include "SyncLib/synclib.h"
+
+#include "device.h"
+#include "register.h"
+#include "swi.h"
+#include "SATADriverHdr.h"
+#include "trampoline.h"
+
+void device_added(ahcidevice_t *dev)
+{
+  /* Ignore device if it's not a recognised major version number */
+  if ((dev->dev.version & 0xFFFF0000) != HALDeviceAHCI_MajorVersion_SATADriver)
+    return;
+
+  /* We initialise the controller struct in place, so gain a write lock before
+   * we start */
+  spinrw_write_lock(&g_ahci_lock);
+  if (g_ahci.valid)
+  {
+    /* Only support one controller at the moment */
+    spinrw_write_unlock(&g_ahci_lock);
+    return;
+  }
+
+  memset(&g_ahci, 0, sizeof g_ahci);
+
+  g_ahci.trampoline = malloc(trampoline_length);
+  if (g_ahci.trampoline == NULL)
+  {
+    spinrw_write_unlock(&g_ahci_lock);
+    return;
+  }
+  memcpy(g_ahci.trampoline, dev->dev.devicenumber & (1u<<31) ? trampoline_vectored : trampoline_unshared, trampoline_length);
+  g_ahci.trampoline[trampoline_offset_pointer] = (uint32_t) &g_ahci;
+  g_ahci.trampoline[trampoline_offset_privateword] = (uint32_t) g_module_pw;
+  g_ahci.trampoline[trampoline_offset_cmhgveneer] = (uint32_t) module_irq_veneer;
+  _swix(OS_SynchroniseCodeAreas, _INR(0,2), 1, g_ahci.trampoline, (uint32_t)g_ahci.trampoline + trampoline_length - 1);
+
+  g_ahci.dev = dev;
+  hba_regset_t *hba = dev->dev.address;
+
+  /* Initialise the controller hardware */
+  if (dev->dev.Activate(&dev->dev) == false)
+  {
+    /* Controller initialisation failed */
+    free(g_ahci.trampoline);
+    spinrw_write_unlock(&g_ahci_lock);
+    return;
+  }
+  /* Reset the controller */
+  hba->ghc |= GHC_HR;
+  do; while (hba->ghc & GHC_HR);
+
+  /* Initialise port data structures */
+  _kernel_oserror *e = NULL;
+  for (uint32_t porti = 0; e == NULL && porti < 32; porti++)
+  {
+    if (hba->pi & (1u<<porti))
+    {
+      ahciport_t *port = &g_ahci.port[porti];
+      port->valid = true;
+      port->support_clo = hba->cap & CAP_SCLO;
+      port->pr = &hba->port[porti];
+      port->doing_poll = MUTEX_UNLOCKED;
+      port->state_lock = (spinlock_t) SPIN_INITIALISER;
+      ((_kernel_stack_chunk *)port->recovery_coroutine.stack)->sc_mark = 0xF60690FF;
+      ((_kernel_stack_chunk *)port->recovery_coroutine.stack)->sc_size = sizeof port->recovery_coroutine.stack;
+      memcpy((uint8_t *) port->recovery_coroutine.stack + sizeof (_kernel_stack_chunk), _kernel_current_stack_chunk() + 1, 28);
+
+      /* Allocate locked-down RAM pages for communication with the AHCI. */
+      {
+        e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUTR(0,1),
+                  MAX_COMMAND_SLOTS * sizeof (ahci_command_hdr_t), AHCI_COMMAND_HDR_ALIGN, 0,
+                  &port->command_list, &port->command_list_phy);
+      }
+      if (!e)
+      {
+        e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUTR(0,1),
+                  sizeof (ahci_command_table_t) + AHCI_MAX_PRDT_ENTRIES * sizeof (ahci_prdt_entry_t), AHCI_COMMAND_TABLE_ALIGN, 0,
+                  &port->command_table, &port->command_table_phy);
+      }
+      if (!e)
+      {
+        e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUTR(0,1),
+                  BOUNCE_BUFFER_SIZE, BOUNCE_BUFFER_SIZE, 0,
+                  &port->bounce_buffer, &port->bounce_buffer_phy);
+      }
+      if (!e)
+      {
+        e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUTR(0,1),
+                  MAX_RECEIVED_FIS_SLOTS * sizeof (ahci_received_fis_t), AHCI_RECEIVED_FIS_ALIGN, 0,
+                  &port->received_fis, &port->received_fis_phy);
+      }
+      if (!e)
+      {
+        for (uint32_t deviceid = 0; deviceid < 16; deviceid++)
+        {
+          port->device[deviceid].busy = MUTEX_UNLOCKED;
+        }
+
+        port->pr->pxclb = port->command_list_phy;
+        port->pr->pxfb = port->received_fis_phy;
+        port->pr->pxcmd |= PXCMD_POD | PXCMD_SUD;
+      }
+    }
+  }
+  if (e != NULL)
+  {
+    for (uint32_t porti = 0; porti < 32; porti++)
+    {
+      if (hba->pi & (1u<<porti))
+      {
+        ahciport_t *port = &g_ahci.port[porti];
+        _swix(PCI_RAMFree, _IN(0), port->command_list);
+        _swix(PCI_RAMFree, _IN(0), port->command_table);
+        _swix(PCI_RAMFree, _IN(0), port->bounce_buffer);
+        _swix(PCI_RAMFree, _IN(0), port->received_fis);
+      }
+    }
+    free(g_ahci.trampoline);
+    spinrw_write_unlock(&g_ahci_lock);
+    return;
+  }
+
+  /* Install interrupt handler for this controller - needed before we can issue commands */
+  _swix(OS_ClaimDeviceVector, _INR(0,2), dev->dev.devicenumber, g_ahci.trampoline, dev);
+  /* Enable the interrupt in the interrupt controller */
+  _swix(OS_Hardware, _IN(0)|_INR(8,9), dev->dev.devicenumber, 0, EntryNo_HAL_IRQEnable);
+
+  g_ahci.valid = true;
+  spinrw_write_unlock(&g_ahci_lock);
+
+  /* Now reset and probe each port */
+  for (uint32_t porti = 0; porti < 32; porti++)
+  {
+    ahciport_t *port = &g_ahci.port[porti];
+    if (port->valid)
+      swi_initialise_reset(porti << ATAReset_CPIDShift);
+  }
+}
+
+void device_removed(ahcidevice_t *dev)
+{
+  spinrw_write_lock(&g_ahci_lock);
+
+  /* Mask interrupts in the AHCI controller */
+  for (uint32_t porti = 0; porti < 32; porti++)
+  {
+    ahciport_t *port = &g_ahci.port[porti];
+    if (port->valid)
+    {
+      port->pr->pxie = 0;
+    }
+  }
+
+  /* Leave the interrupt enabled in the interrupt controller as per standard RISC OS practice */
+
+  /* Deregister interrupt handler */
+  _swix(OS_ReleaseDeviceVector, _INR(0,2), dev->dev.devicenumber, g_ahci.trampoline, dev);
+
+  /* Tell the HAL device to do its own cleanup */
+  dev->dev.Deactivate(&dev->dev);
+
+  /* Release memory */
+  for (uint32_t porti = 0; porti < 32; porti++)
+  {
+    ahciport_t *port = &g_ahci.port[porti];
+    if (port->valid)
+    {
+      _swix(PCI_RAMFree, _IN(0), port->command_list);
+      _swix(PCI_RAMFree, _IN(0), port->command_table);
+      _swix(PCI_RAMFree, _IN(0), port->bounce_buffer);
+      _swix(PCI_RAMFree, _IN(0), port->received_fis);
+    }
+  }
+  free(g_ahci.trampoline);
+
+  g_ahci.valid = false;
+  spinrw_write_unlock(&g_ahci_lock);
+}

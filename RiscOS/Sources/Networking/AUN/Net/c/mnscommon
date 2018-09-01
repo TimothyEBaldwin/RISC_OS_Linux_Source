@@ -1,0 +1,722 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* mnscommon.c
+ *
+ * Author: Keith Ruttle (Acorn)
+ *
+ * Description
+ * ===========
+ * Code previously common to mns.c and mnsi.c
+ *
+ * Environment
+ * ===========
+ * Acorn RISC OS 3.11 or later.
+ *
+ * Compiler
+ * ========
+ * Acorn Archimedes C release 5.06 or later.
+ *
+ * Change record
+ * =============
+ *
+ * JPD  Jem Davies (Cambridge Systems Design)
+ *
+ *
+ * 14-Mar-95  13:20  JPD  Version 1.00
+ * Created file.
+ *
+ * 22-Mar-95  17:10  JPD  Version 1.01
+ * Moved mns_sc_handler() here. Changed it to ignore point-to-point drivers.
+ * Moved reset_is_soft() here. Changed mns_sc_handler() to set callback on
+ * receipt of service calls to call check_present() and then reinitialise
+ * appropriately.
+ *
+ * 04-Oct-95  09:49  JPD  Version 1.02
+ * Include <string.h>: should not change code!
+ *
+ * 10-Oct-95  15:34  JPD  Version 1.03
+ * Moved machine_type here from mns.c/mnsi.c. Added debug.
+ *
+ *
+ **End of change record*
+ */
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/Services.h"
+#include "Global/OsBytes.h"
+#include "Global/RISCOS.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/ioctl.h"
+#include "netinet/in.h"
+#include "sys/dcistructs.h"
+
+#include "netasm.h"
+#include "module.h"
+#include "debug.h"
+#include "mns.h"
+#include "mnscommon.h"
+#include "text.h"
+#include "configure.h"
+#include "swicode.h"
+
+#include "socklib.h"
+
+/******************************************************************************/
+
+void *module_wsp;
+int restarting;
+
+/* whether reinitialising on a callback due to a service call */
+static int reinit_on_callback;
+static int do_netmapchanged_on_callback;
+
+/* MessageTrans file descriptors */
+int msg_fd_mns[4];
+
+struct s_ebuf ebuf;
+
+char textbuf[64];
+
+unsigned char machine_type = MACHINE_TYPE_ARC;
+
+/* whether necessary modules (DCI driver and Internet) are present and OK */
+int modules_present;
+
+/******************************************************************************/
+
+void mns_ping(int argc, char **argv)
+{
+/*
+ * *NetProbe code: similar function to *Ping, actually does a machine-type peek
+ *
+ * Parameters:
+ *    argc : }
+ *    argv : } command line parms
+ *
+ * Returns:
+ *    None
+ */
+
+   _kernel_swi_regs r;
+   int station, net;
+   char b[6];             /* <<< why not 4 bytes? */
+
+   UNUSED(argc);
+
+   memset(b, 0, 6);
+   r.r[1] = (int)argv[0];
+
+   if (!ReadStationNumber(&r)) /* if sensible address on command line */
+   {
+      station = r.r[2];
+      net     = r.r[3] == -1 ? 0 : r.r[3]; /* use 0 if no net number */
+      r.r[0]  = 8;   /* MachinePeek */
+      r.r[1]  = 0;
+      r.r[2]  = station;
+      r.r[3]  = net;
+      r.r[4]  = (int)b;
+      r.r[5]  = sizeof(b);
+      r.r[6]  = 2;
+      r.r[7]  = 100;
+      printf("%s\n", (DoImmediate(&r) == 0 && r.r[0] == Status_Transmitted) ?
+                       mns_str(Str_TxOk) : mns_str(Str_NotAcc));
+      return;
+   }
+   printf("%s\n", mns_str(Str_GtwSta));    /* else print "Bad station number" */
+
+   return;
+
+} /* mns_ping() */
+
+/******************************************************************************/
+
+void notify_users(void)
+{
+/*
+ * Issue Service call ReAllocatePorts so that users of "Econet" will know
+ * that "Econet" has effectively been reinitialised.
+ *
+ * Parameters:
+ *    None
+ *
+ * Returns:
+ *    None
+ */
+
+   _kernel_swi_regs r;
+
+   DEBUGP1("#Issuing Service_ReAllocatePorts\n\r");
+
+   r.r[1] = Service_ReAllocatePorts;
+   (void) _kernel_swi(OS_ServiceCall, &r, &r);
+
+   return;
+
+} /* notify_users() */
+
+/******************************************************************************/
+
+int do_getsock(int port, int inputsocket, int direct)
+{
+/*
+ * Open socket for use by Net module
+ *
+ * Parameters:
+ *    port        : port number on which to open socket
+ *    inputsocket : !0 => socket is for input
+ *    direct      : !0 => get Internet module to call us directly on Rx by
+ *                  issuing the EconetRxDirect SWI to us rather than by
+ *                  generating an Internet event
+ *
+ * Returns:
+ *    the socket number opened, or -1 if error
+ */
+
+   struct sockaddr_in addr;
+   int sock, arg, on = 1;
+
+   if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+   {
+      DEBUGP1("#do_getsock() socket failed\n\r");
+      return -1;
+   }
+
+   arg = direct ? Econet_InetRxDirect : 1;
+
+  /* Set non-blocking I/O. Either receive asynchronous notification or get
+   * called directly by Internet module via Econet_RxDirect SWI.
+   */
+   if (socketioctl(sock, FIONBIO, (char *)&on) < 0 ||
+       socketioctl(sock, direct ? FIORXDIR : FIOASYNC, (char *)&arg) < 0)
+   {
+      DEBUGP1("#do_getsock() socketioctl failed\n\r");
+      socketclose(sock);
+      return -1;
+   }
+
+   /* Permit sending of broadcast messages */
+   if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char *)&on, sizeof(on)) < 0)
+   {
+      DEBUGP1("#do_getsock() setsockopt failed\n\r");
+      socketclose(sock);
+      return -1;
+   }
+
+   if (inputsocket)
+   {
+      addr.sin_family      = AF_INET;
+      addr.sin_len         = sizeof addr;
+      addr.sin_addr.s_addr = htonl(INADDR_ANY);
+      addr.sin_port        = htons((u_short)port);
+      if (bind(sock, (struct sockaddr *)&addr, sizeof (addr)) < 0)
+      {
+         DEBUGP1("#do_getsock() bind failed\n\r");
+         socketclose(sock);
+         return -1;
+      }
+   }
+
+   return sock;
+
+} /* do_getsock() */
+
+/******************************************************************************/
+
+_kernel_oserror *mns_cli_handler(char *arg_string, int arg_count,
+                                                           int cmd_no, void *pw)
+{
+/* cmhg module *-command handler
+ *
+ * Parameters:
+ *    arg_string : string of arguments
+ *    arg_count  : number of arguments
+ *    cmd_no     : offset into list of commands
+ *    pw         : "R12" value
+ *
+ * Returns:
+ *    None
+ */
+
+   struct client *callp;
+   int margc;
+   char *margv[10];
+   char *cp;
+   char **argp = margv;
+
+   UNUSED(pw);
+
+   margc = 0;
+   cp = arg_string;
+   while (*cp && arg_count-- > 0)
+   {
+      while (isspace(*cp))
+         cp++;
+      if (*cp == '\0')
+         break;
+      *argp++ = cp;
+      margc++;
+      while (*cp != '\0' && !isspace(*cp))
+         cp++;
+      if (*cp == '\0')
+         break;
+      *cp++ = '\0';
+   }
+
+   *argp++ = 0;
+   callp = &mns_cli_call[cmd_no];
+   (*(callp->cli_call))(margc, margv);
+
+   return NULL;
+
+} /* mns_cli_handler() */
+
+/******************************************************************************/
+
+void mns_sc_handler(int sn, _kernel_swi_regs *r)
+{
+/*
+ * cmhg module service call handler
+ *
+ * Parameters:
+ *    sn : service call number
+ *    r  : pointer to registers block
+ *
+ * Returns:
+ *    None
+ */
+
+   DEBUGP2("#Service_handler: &%X\n\r", r->r[1]);
+
+   switch (sn)
+   {
+      case Service_DCIDriverStatus:
+         DEBUGP2("#Service_DCIDriverStatus: %d\n\r", r->r[2]);
+         /* If point-to-point driver, then ignore totally */
+         if (ignore_driver((struct dib *)r->r[0], r->r[3]))
+         {
+            DEBUGP1("#sc_handler() ignoring driver\n\r");
+            return;
+         }
+        /* Whether it is our driver or not, whether starting or stopping,
+         * set a flag to check on a callback whether there are suitable
+         * modules present, and if so, to reinitialise and connect to them,
+         * or else to reinitialise unconnected.
+         */
+         reinit_on_callback = 1;
+         setcallback();
+         break;
+
+
+     case Service_DCIProtocolStatus:
+         DEBUGP2("#Service_DCIProtocolStatus: %d\n\r", r->r[2]);
+         /* If it's not the Internet module, do nothing */
+         if (strcmp((char *)r->r[4], INTERNET_MODULE_NAME) != 0)
+            return;
+
+        /* It is the Internet module. If starting, reinitialise if device
+         * driver present as well
+         */
+         if (r->r[2] == 0)
+         {
+            reinit_on_callback = 1;
+            setcallback();
+            return;
+         }
+         else
+         {
+            if (r->r[2] == 1)
+            {
+               /* Internet is dying, so go dormant */
+               modules_present = 0;
+               (void) do_mns_init(0);
+               return;
+            }
+         }
+         break;
+
+
+      case Service_Reset:
+         /* Post-reset: if a soft reset, reinitialise, else do nothing */
+         DEBUGP1("#Service_reset\n\r");
+         if (!reset_is_soft())
+            return;
+         DEBUGP1("#Service_reset, was a soft reset, reinitialising\n\r");
+         (void) do_mns_init(0);
+         break;
+
+
+      case Service_EconetDying:
+         /* The real Econet module is dying, reinitialise */
+         econet_not_present = 1;
+         connected_econet = -1;
+         reinit_on_callback = 1;
+         setcallback();
+         break;
+
+#ifndef ROM
+      case Service_ResourceFSStarting:
+         /* Reregister the messages */
+         (*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+         break;
+#endif
+    }
+
+   return;
+
+} /* mns_sc_handler() */
+
+/******************************************************************************/
+
+_kernel_oserror *mns_error(int error)
+{
+   _kernel_swi_regs r;
+   _kernel_oserror *e;
+
+   if (!error)
+      return NULL;
+
+   ebuf.e_nbr = error_blocks[error].err_nbr;
+   strcpy(ebuf.e_string, error_blocks[error].err_token);
+
+   /* prevent unwanted parameter substitution */
+   memset ((char *)&r, 0, sizeof(r));
+
+   r.r[0] = (int)&ebuf;
+   r.r[1] = (int)msg_fd_mns;
+   e = _kernel_swi(MessageTrans_ErrorLookup, &r, &r);
+
+   return (e ? e : (_kernel_oserror *)&ebuf);
+
+} /* mns_error() */
+
+/******************************************************************************/
+
+_kernel_oserror *mns_error_parm(int error, void *parmp)
+{
+   _kernel_swi_regs r;
+   _kernel_oserror *e;
+
+   if (!error)
+      return NULL;
+
+   ebuf.e_nbr = error_blocks[error].err_nbr;
+   strcpy(ebuf.e_string, error_blocks[error].err_token);
+   memset ((char *)&r, 0, sizeof(r));
+   r.r[0] = (int)&ebuf;
+   r.r[1] = (int)msg_fd_mns;
+   r.r[2] = (int)textbuf;
+   r.r[3] = sizeof(textbuf);
+   r.r[4] = (int)parmp;     /* parameter to substitute for %0 */
+   e = _kernel_swi(MessageTrans_ErrorLookup, &r, &r);
+
+   return (e ? e : (_kernel_oserror *)&ebuf);
+
+} /* mns_error_parm() */
+
+/******************************************************************************/
+
+char *mns_str(int strnbr)
+{
+   _kernel_swi_regs r;
+   _kernel_oserror *e;
+
+   /* prevent unwanted parameter substitution */
+   memset((char *)&r, 0, sizeof(r));
+
+   *textbuf = '\0';
+   r.r[0] = (int)msg_fd_mns;
+   r.r[1] = (int)message_strs[strnbr];
+   r.r[2] = (int)textbuf;
+   r.r[3] = sizeof(textbuf);
+   e = _kernel_swi(MessageTrans_Lookup, &r, &r);
+
+   return (e ? (char *)message_strs[strnbr] : textbuf);
+
+} /* mns_str() */
+
+/******************************************************************************/
+
+void generate_event(int rx, int handle, int status, int port)
+{
+   _kernel_swi_regs r;
+
+   r.r[0] = rx ? Event_Econet_Rx : Event_Econet_Tx;
+   r.r[1] = handle;
+   r.r[2] = status;
+   r.r[3] = port;
+   (void) _kernel_swi(OS_GenerateEvent, &r, &r);
+
+   return;
+
+} /* generate_event() */
+
+/******************************************************************************/
+
+static volatile int callbackflag = 0;
+
+/******************************************************************************/
+
+void setcallback(void)
+{
+   int oldstate = ensure_irqs_off();
+
+   DEBUGP1("#setcallback()\n\r");
+   if (callbackflag == 0)
+   {
+      callbackflag = 1;
+
+      if (addcallback(callb_entry) != 0)
+         callbackflag = 0;
+   }
+
+   restore_irqs(oldstate);
+
+} /* setcallback() */
+
+/******************************************************************************/
+
+void removecallback(void)
+{
+/* Remove any added transient callback
+ *
+ * Parameters:
+ *    None
+ *
+ * Returns:
+ *    None
+ */
+
+   _kernel_swi_regs regs;
+
+   int oldstate = ensure_irqs_off();
+
+   DEBUGP1("#removecallback()\n\r");
+
+   if (callbackflag != 0)
+   {
+      callbackflag = 0;
+
+      regs.r[0] = (int) callb_entry;
+      regs.r[1] = (int) module_wsp;
+
+      /* Ignore any error. This will only work on RISC OS 3 or later */
+      _kernel_swi(OS_RemoveCallBack, &regs, &regs);
+   }
+
+   restore_irqs(oldstate);
+
+} /* removecallback() */
+
+/******************************************************************************/
+
+void generate_event_on_callback(struct txcb *tx)
+{
+   tx->tx_callb = 1;
+   setcallback();
+}
+
+/******************************************************************************/
+
+void retransmit_on_callback(struct txcb *tx)
+{
+   tx->tx_callb = 2;
+   setcallback();
+}
+
+/******************************************************************************/
+
+void netmapchanged_on_callback(void)
+{
+   do_netmapchanged_on_callback = 1;
+   setcallback();
+}
+
+/******************************************************************************/
+
+int addcallback(void (*func)(void))
+{
+   _kernel_swi_regs r;
+
+   r.r[0] = (int)func;
+   r.r[1] = (int)module_wsp;
+
+   return (_kernel_swi(OS_AddCallBack, &r, &r) != NULL) ? -1 : 0;
+
+} /* callback() */
+
+/******************************************************************************/
+
+int callb_handler(const _kernel_swi_regs *rr)
+{
+/*
+ * Transient Callback handler
+ *
+ * Parameters:
+ *    rr : pointer to regs structure
+ *
+ * Returns:
+ *    Non-0 to indicate call "not processed"
+ */
+
+   struct txcb *tx;
+   int cval = 0; /* keep compiler quiet */
+   int oldstate = ensure_irqs_off();
+
+   UNUSED(rr);
+
+   xDEBUGP3("#-- A: %08X, %08X\n\r",
+                      *(unsigned int *)0x01c00000, *(unsigned int *)0x01c00004);
+
+   if (callbackflag == 0)
+   {
+      restore_irqs(oldstate);
+      return 1;
+   }
+
+   callbackflag = 0;
+   restore_irqs(oldstate);
+
+   if (restarting)
+   {
+      restarting = 0;
+      notify_users();
+   }
+
+   if (reinit_on_callback)
+   {
+      DEBUGP1("#callb_handler() reinit on callback set\n\r");
+      reinit_on_callback = 0;
+
+      if (modules_present = check_present(), modules_present)
+      {
+         free_sockets();
+         (void) do_mns_init(1);
+         notify_users();
+      }
+      else
+         (void) do_mns_init(0);
+   }
+
+   if (do_netmapchanged_on_callback)
+   {
+       do_netmapchanged_on_callback = 0;
+       _swix(OS_ServiceCall, _INR(0,1), InternetStatus_NetMapChanged,
+                                        Service_InternetStatus);
+   }
+
+   for (;;)
+   {
+      oldstate = ensure_irqs_off();
+      for (tx = mns.mns_txlist; tx; tx = tx->tx_next)
+      {
+         if ((cval = tx->tx_callb) != 0)
+         {
+            tx->tx_callb = 0;
+            break;
+         }
+      }
+      restore_irqs(oldstate);
+
+      if (tx == (struct txcb *)0)
+         break;
+
+      switch (cval)
+      {
+         case 1:
+            if (tx->tx_status != Status_Free)
+               generate_event(0, tx->tx_handle, tx->tx_status, tx->tx_port);
+            break;
+
+         case 2:
+            retry_tx(tx);
+            break;
+
+         default:
+            break;
+      }
+   }
+
+   return 1;
+
+} /* callb_handler() */
+
+/******************************************************************************/
+
+_kernel_oserror *calleverytick(void (*fun)(void))
+{
+/*
+ * Install a function on Ticker vector
+ *
+ * Parameters:
+ *    fun : pointer to the function to be installed
+ *
+ * Returns:
+ *     0 : => success
+ *    !0 : => error (pointer to standard RISC OS error block)
+ */
+
+   _kernel_swi_regs r;
+
+   r.r[0] = TickerV;
+   r.r[1] = (int)fun;
+   r.r[2] = (int)module_wsp;
+   return _kernel_swi(OS_Claim, &r, &r);
+
+} /* calleverytick() */
+
+/******************************************************************************/
+
+void removetickerevent(void (*fun)(void))
+{
+/*
+ * Remove a previously installed ticker handler
+ *
+ * Parameters:
+ *    fun : pointer to ticker handler previously installed
+ *
+ * Returns:
+ *    None
+ */
+
+   _kernel_swi_regs r;
+
+   r.r[0] = TickerV;
+   r.r[1] = (int)fun;
+   r.r[2] = (int)module_wsp;
+   (void)_kernel_swi(OS_Release, &r, &r);
+
+} /* removetickerevent() */
+
+/******************************************************************************/
+
+int reset_is_soft(void)
+{
+   _kernel_swi_regs r;
+
+   r.r[0] = OsByte_RW_LastResetType;
+   r.r[1] = 0;
+   r.r[2] = 255;
+   return ((_kernel_swi(OS_Byte, &r, &r) != 0 || r.r[1] == 0) ? 1 : 0);
+}
+
+/******************************************************************************/
+
+/* EOF mnscommon.c */

@@ -1,0 +1,1026 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* armsys.c:  Copyright (C) Codemist Ltd., 1988       */
+/* Copyright (C) Acorn Computers Ltd., 1988           */
+/* Very ARM (and Brazil & Arthur) specific routines.  */
+
+/* version 11 */
+
+#define __system_io 1                           /* to get at flag bits */
+#define _LARGEFILE64_SOURCE /* define 64-bit file pointer stuff in stdio.h */
+
+#include "VersionNum"
+
+#include "hostsys.h"                            /* things like _initio() */
+#include "territory.h"
+#include "kernel.h"
+#include "swis.h"
+#include <stdio.h>                              /* for EOF               */
+#include <stdlib.h>                             /* for exit()            */
+#include <ctype.h>                              /* isprint(), isspace()  */
+#include <string.h>                             /* for strlen()          */
+#include <time.h>                               /* for clock             */
+#include <errno.h>
+#include <stdbool.h>
+
+/* IMPORTS */
+extern int main(int argc, char **argv);         /* the point of it all   */
+extern FILEHANDLE __dup(int new, int old);
+extern void _ctype_init(void);
+extern int _fprintf_lf(FILE *fp, const char *fmt, ...);
+extern int _sprintf(char *buff, const char *fmt, ...);
+extern int _sprintf_lf(char *buff, const char *fmt, ...);
+extern _kernel_oserror *_kernel_peek_last_oserror(void);
+
+/* HIDDEN EXPORTS */
+void _main(char *s, int (*main)(int, char **));
+void _backtrace(int why, int *address, _kernel_unwindblock *uwb);
+const char *_clib_version(void);
+int _sys_msg_1(const char *s, const char *but);
+int _desktop_task(void);
+
+#define str(x)  #x
+#define xstr(x) str(x)
+const char *_clib_version(void)
+{
+    return LIB_SHARED "C Library vsn " xstr(Module_Version) "/"
+    #ifdef __APCS_32
+           "32"
+    #else
+           "R"
+    #endif
+           " [" __DATE__ "]\n";
+}
+#undef str
+#undef xstr
+
+static int unused[15];
+
+/* timing things... */
+
+/* struct bbctime objects are used to hold bbc/brazil 5-byte timer value -
+   conventionally centi-seconds since 1-Jan-1900.
+*/
+
+struct bbctime {unsigned int l,h;};
+
+static clock_t _time0;
+
+static clock_t _clock(void)
+{   struct bbctime bt;
+    _kernel_osword(1, (int *)&bt);
+    return bt.l;
+}
+
+static void _clock_init(void)   /* private - for initialisation */
+{   _time0 = _clock();
+}
+
+static void _clock_ignore(clock_t t)
+/* ignores ticks from t to now - used to remove terminal input waits */
+{   _time0 += (_clock() - _time0) - t;
+}
+
+/* Exported... */
+
+clock_t clock(void)
+{   return _clock() - _time0;     /* clock runs even if date not set */
+}
+
+time_t time(time_t *timer)
+{
+    /* ISO9899 7.23.1 (1) defines either 'calendar time' or 'local time'           */
+    /* Local time is further defined as incorporating timezone and daylight saving */
+    /* information, therefore calendar time is implicitly taken to mean UTC.       */
+    /* ISO9899 7.23.2.4 (3) this function determines the calendar time.            */
+    /* This implementation uses seconds since the UNIX epoch 01-Jan-1970.          */
+    time_t result;
+    struct bbctime bt, w, w2;
+
+    bt.l = 3;                       /* 'request time' arg */
+    _kernel_osword(14, (int *)&bt); /* read time as UTC 5 byte integer  */
+
+    /* to two 3-byte things - for divide */
+    w.h = ((bt.h & 255) << 8) | (bt.l >> 24);
+    w.l = bt.l & 0xffffff;
+    /* turn csecs to secs */
+    w2.h = w.h / 100;
+    w2.l = ((w.h % 100 << 24) | w.l) / 100;
+    /* back to 8 byte binary */
+    bt.h = w2.h >> 8;
+    bt.l = (w2.h << 24) | w2.l;
+    /* normalise to Jan70 instead of Jan00... */
+#define secs0070 (((unsigned)86400)*(365*70+17))  /* less than 2^32 */
+    if (bt.l < secs0070) bt.h--;
+    bt.l -= secs0070;
+    /* if high word is non-zero then date is unset/out of unix range... */
+    result = bt.h ? -1 : bt.l;
+
+    if (timer) *timer = result;
+    return result;
+}
+
+/* system dependent I/O routines ... */
+
+/* Riscos has a second distinguished FILEHANDLE value, to indicate that  */
+/* a file is a keyboard and/or vdu, which can't be read or written using */
+/* Riscos file operations (or at any rate, couldn't when the library was */
+/* originally implemented).                                              */
+#define TTYHANDLE 0
+
+#define istty(fh) ((fh) == TTYHANDLE)
+
+/*
+ * We're a desktop task if we're in user mode, TaskWindow_TaskInfo 0 returns 0 (or an error),
+ * and Wimp_ReadSysInfo 3 says we're in the desktop, and Wimp_ReadSysInfo 5 gives us a
+ * task handle.
+ */
+int _desktop_task(void)
+{
+    _kernel_swi_regs r;
+    if (_kernel_processor_mode() & 0xF) return 0;
+    r.r[0] = 0;
+    if (_kernel_swi(TaskWindow_TaskInfo, &r, &r) || r.r[0])
+        return 0;
+    r.r[0] = 3;
+    _kernel_swi(Wimp_ReadSysInfo, &r, &r);
+    if (r.r[0] == 0) return 0;
+    r.r[0] = 5;
+    _kernel_swi(Wimp_ReadSysInfo, &r, &r);
+    return r.r[0];
+}
+
+static int _desktop_report(const char *s, const char *but)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror err, *e;
+    char *p, *end;
+    int flags, h = _desktop_task();
+    if (h == 0) return 0;
+
+    flags = 0x102; /* New error, cancel button */
+
+    if ((e = _kernel_last_oserror()) != NULL && s == e->errmess)
+    {
+        flags |= 2 << 9;
+        err = *e;
+    }
+    else
+    {
+        while (*s == ' ')
+            s++;
+
+        if (s[0] == '*') /* If leading '*'s then make it a serious one */
+        {
+            while (*s == '*' || *s == ' ') /* Strip off the '*'s */
+                s++;
+            flags |= 3 << 9;
+            err.errnum = 0x1B << 24;
+        }
+        else
+        {
+            flags |= 2 << 9;
+            err.errnum = 0;
+        }
+
+        for (p = err.errmess, end = err.errmess + sizeof err.errmess - 1; p < end && *s >= ' '; )
+            *p++ = *s++;
+
+        *p = '\0';
+        err.errmess[0] = toupper(err.errmess[0]);
+    }
+    r.r[0] = h;
+    if (_kernel_swi(TaskManager_TaskNameFromHandle, &r, &r) == 0)
+        r.r[2] = r.r[0];
+    else
+        r.r[2] = 0;
+    r.r[0] = (int) &err;
+    r.r[1] = flags;
+    r.r[3] = 0;
+    r.r[4] = 1;
+    r.r[5] = (int) but;
+    if (_kernel_swi(Wimp_ReportError, &r, &r) == 0)
+        return r.r[1];
+    else
+        return 0;
+}
+
+bool _sys__assert(const char *s, const char *expr, const char *func, const char *file, int line)
+{
+    char buffer[252];
+    int len, funclen, exprlen, filelen;
+
+    if (!istty(stderr->__file)) return false;
+
+    if (!_desktop_task()) return false;
+
+    if (strlen(s) > 200) return false; /* Be safe */
+
+    len = func ? _sprintf(buffer, s, "", "", "", line)
+               : _sprintf(buffer, s, "", "", line);
+    funclen = func ? strlen(func) : 0;
+    exprlen = strlen(expr);
+    filelen = strlen(file);
+    if (len + funclen + exprlen + filelen < 251)
+    {
+        func ? _sprintf(buffer, s, expr, func, file, line)
+             : _sprintf(buffer, s, expr, file, line);
+    }
+    else
+    {
+        char expr2[200];
+        char func2[50];
+        char file2[100];
+
+        #define min(a,b) a<b?a:b
+        exprlen = min(exprlen, 199);
+        funclen = min(funclen, 49);
+        filelen = min(filelen, 99);
+        filelen = min(filelen, 251-len-funclen-exprlen);
+        if (filelen < 0) filelen = 0;
+        funclen = min(funclen, 251-len-exprlen-filelen);
+        if (funclen < 0) funclen = 0;
+        exprlen = min(exprlen, 251-len-funclen-filelen);
+        memcpy(expr2, expr, exprlen);
+        memcpy(func2, func, funclen);
+        memcpy(file2, file, filelen);
+        expr2[exprlen]='\0';
+        func2[funclen]='\0';
+        file2[filelen]='\0';
+        func ? _sprintf(buffer, s, expr2, func2, file2, line)
+             : _sprintf(buffer, s, expr2, file2, line);
+    }
+    return _desktop_report(buffer, NULL);
+}
+
+static int _error_recursion;
+int _sys_msg_1(const char *s, const char *but)
+{
+    if (istty(stderr->__file))
+    {
+        int r = _desktop_report(s, but);
+        if (r) return r;
+    }
+
+    /* write out s carefully for intimate system use.                      */
+    if ((stderr->__flag & _IOWRITE) && !_error_recursion)
+    {
+        _error_recursion = 1;
+        fputc('\n', stderr);
+        while (*s >= ' ')
+            fputc(*s++, stderr);
+        fputc('\n', stderr);
+        _error_recursion = 0;
+    }
+    else
+    {   _ttywrite((unsigned char *)"\n", 1, 0);
+        _ttywrite((unsigned char *)s, strlen(s), 0);
+        _ttywrite((unsigned char *)"\n", 1, 0);
+    }
+
+    return 0;
+}
+
+void _sys_msg(const char *s)
+{
+    _sys_msg_1(s, NULL);
+}
+
+#define LF '\n'
+#define CR '\r'
+
+static int isttyname(const char *s)
+{   if (s[0] == ':' && (s[1]|0x20) == 't' && (s[2]|0x20) == 't' && s[3] == 0)
+        return 1;   /* string specification (:tt) of terminal stream */
+    return 0;
+}
+
+FILEHANDLE _sys_open(const char *filename, int openmode)
+{ /* nasty magic number interface for openmode */
+  static const int modtab[6] = { /* r = */ 0x04c, /* r+ = */ 0x0cc,
+                                 /* w = */ 0x4cc, /* w+ = */ 0x4cc,
+                                 /* a = */ 0x3cc, /* a+ = */ 0x3cc };
+  if (isttyname(filename)) return TTYHANDLE;
+  else {
+    char *name = (char *)filename;                 /*  yuk yuk yuk yuk yuk  */
+    FILEHANDLE fh;
+    int size = 16 * 1024;                    /* first try for created files */
+    int osmode = modtab[(openmode >> 1) & 7];    /* forget the 'b'inary bit */
+    _kernel_osfile_block fb;
+
+    /* maybe stamp file with current datestamp */
+    if ((openmode & OPEN_T) ||                /* update timestamp requested */
+        (openmode & OPEN_W) ||
+        (openmode & ~OPEN_B) == OPEN_A)           /* or mode = w, w+, or a */
+    {   if (_kernel_osfile(9, name, &fb) == _kernel_ERROR)
+        {   if (_kernel_peek_last_oserror()->errnum == 0x108c9)
+            {   errno = -1;
+                return NONHANDLE;                       /* (Protected disc) */
+            }
+        }
+    }
+retry_open:
+    fh = _kernel_osfind(osmode & 0xff, name);
+    if (osmode <= 0x0cc) {                                       /* r or r+ */
+      if (fh == _kernel_ERROR) errno = -1;
+      return (fh <= 0) ? NONHANDLE :                           /* not found */
+                         fh;
+    } else if (fh > 0) {
+      if ((osmode == 0x4cc) || (size == 0))
+          if (_kernel_osargs(3, fh, 0) == _kernel_ERROR) {
+              _kernel_osfind(0, (char *)fh);
+              errno = -1;
+              return NONHANDLE;
+          }
+      return fh;
+    } else if (fh <= 0) {
+        /* _kernel_osfile(11) creates an empty file of size 'size', of type */
+        /* given by fb.load, stamped with the current date & time           */
+      fb.load = (openmode & 1) ? 0xffd : 0xfff;              /* data : text */
+      fb.start = 0;
+      for (; ; size >>= 1) {
+        if (size < 512) { errno = -1; return NONHANDLE; }
+        fb.end = size;
+        if (_kernel_osfile(11, name, &fb) > 0) break;
+      }
+      size = 0;
+      goto retry_open;
+    }
+    if (fh == _kernel_ERROR) errno = -1;
+    return NONHANDLE;
+  }
+}
+
+int _sys_istty(FILE *stream)
+{
+    return istty(stream->__file);
+}
+
+int _sys_seek(FILEHANDLE fh, off64_t pos)
+{
+    if istty(fh) return 0;
+#if 1
+    /* Can't use _kernel_osargs, even for 32-bit file pointers, because it can't handle files of size 4G-2 .*/
+    /* Use _kernel_swi instead so that _kernel_last_oserror is set up on failure like it always was. */
+    _kernel_swi_regs r;
+    r.r[0] = 1;
+    r.r[1] = fh;
+    r.r[2] = (unsigned int) pos;
+    if (_kernel_swi(OS_Args, &r, &r) != NULL)
+    {
+        errno = -1;
+        return _kernel_ERROR;
+    }
+    return 0;
+#else
+    {   int rc = _kernel_osargs(1, fh, (int)pos);
+        if (rc == _kernel_ERROR) errno = -1;
+        return rc;
+    }
+#endif
+}
+
+off64_t _sys_flen(FILEHANDLE fh)
+{
+    if istty(fh) return 0;
+#if 1
+    /* Can't use _kernel_osargs, even for 32-bit file pointers, because it can't handle files of size 4G-2 .*/
+    /* Use _kernel_swi instead so that _kernel_last_oserror is set up on failure like it always was. */
+    _kernel_swi_regs r;
+    r.r[0] = 2;
+    r.r[1] = fh;
+    if (_kernel_swi(OS_Args, &r, &r) != NULL)
+    {
+        errno = -1;
+        return _kernel_ERROR;
+    }
+    return (unsigned int) r.r[2];
+#else
+    int rc = _kernel_osargs(2, fh, 0);
+    if (rc == _kernel_ERROR) errno = -1;
+    return rc;
+#endif
+}
+
+int _sys_write(FILEHANDLE fh, const unsigned char *buf, unsigned len, int mode)
+{   if (istty(fh))
+        return _ttywrite(buf, len, mode);
+    else {
+        _kernel_osgbpb_block b;
+        b.dataptr = (void *)buf;
+        b.nbytes = (int)len;
+        if (_kernel_osgbpb(2, fh, &b) == _kernel_ERROR) {
+            errno = -1;
+            return _kernel_ERROR;
+        } else
+            return b.nbytes;
+    }
+}
+
+int _sys_read(FILEHANDLE fh, unsigned char *buf, unsigned len, int mode)
+{
+    if (istty(fh))
+        return _ttyread(buf, (int)len, mode);
+    else {
+        _kernel_osgbpb_block b;
+        b.dataptr = (void *)buf;
+        b.nbytes = (int)len;
+        if (_kernel_osgbpb(4, fh, &b) == _kernel_ERROR) {
+            errno = -1;
+            return _kernel_ERROR;
+        } else
+            return b.nbytes;
+    }
+}
+
+int _sys_ensure(FILEHANDLE fh)
+{
+    if (istty(fh)) return 0;
+    {   int rc = _kernel_osargs(0xFF, fh, 0);
+        if (rc == _kernel_ERROR) errno = -1;
+        return rc;
+    }
+}
+
+int _sys_close(FILEHANDLE fh)
+{   if (istty(fh)) return 0;
+    {   int rc = _kernel_osfind(0, (char *)fh);
+        if (rc == _kernel_ERROR) errno = -1;
+        return rc;
+    }
+}
+
+int _ttywrite(const unsigned char *buf, unsigned int len, int flag)
+/* behaves like Kgbpb, but outputs to console.                              */
+/* if 'flag' has _IOBIN set then LF's ('\n's) do not have CR suffixed.      */
+{   while (len-- > 0)
+    {   int ch = *buf++;
+        if (!(flag & _IOBIN)) {
+          if (ch == '\n') {
+            if (_kernel_oswrch(LF) < 0) return -1;
+            ch = CR;
+          } else if (ch < 32 && ch != 0x07 && ch != 0x08 && !isspace(ch)) {
+            if (_kernel_oswrch('|') < 0) return -1;
+            ch = (ch & 31) | 64;
+          }
+        }
+        if (_kernel_oswrch(ch) < 0) return -1;
+    }
+    return 0;    /* number of chars unwritten */
+}
+
+int _ttyread(unsigned char *buff, int size, int flag)
+{
+/* behaviour similar to Kgbpb but reads from keyboard, performing local  */
+/* edits as necessary.  Control chars echo as ^<upper case>.             */
+/* AM: ignore clock ticks while waiting for keyboard                     */
+/* If _IOBIN is set return 1st char read with no echo.
+ * If _IONBF is set return 1st char read with echo.
+ * Else read till CR LF ^D or EOF and return line.  Refuse echo if buffer full.
+ */
+    int count=0;
+    time_t t = clock();
+    do
+    {   int ch;
+        do {
+            ch = _kernel_osrdch();
+        } while (ch == -27) /* ESCAPE */;
+        if (flag & _IOBIN && ch != EOF && ch != _kernel_ERROR)
+            buff[count++] = ch;             /* binary - no echo */
+        else switch (ch)
+        {
+case _kernel_ERROR:
+case EOF:                                   /* see _osrdch for EOF */
+case 0x04:  _clock_ignore(t);               /* ^D */
+            return(0x80000000+size-count);
+case '\n':                                  /* treat CR as LF */
+case '\r':  if(count>=size) continue;
+            _kernel_oswrch('\r'); _kernel_oswrch(LF);
+            buff[count++] = '\n';
+            _clock_ignore(t);
+            return(size-count);
+case 0x08:                                  /* BS     */
+case 0x7f:  if(count!=0)                    /* rubout */
+            {   _kernel_oswrch(0x7f);
+                if (buff[--count] < ' ') _kernel_oswrch(0x7f);
+            }
+            break;
+case 0x15:  while(count>0)                  /* ctrl-U kills line */
+            {   _kernel_oswrch(0x7f);
+                if (buff[--count] < ' ') _kernel_oswrch(0x7f);
+            }
+            break;
+default:    if(count>=size) continue;
+            if (ch < ' ' && ch != 0x07)
+               _kernel_oswrch('|'), _kernel_oswrch(ch | '@');
+            else
+               _kernel_oswrch(ch);
+            buff[count++] = ch;
+            break;
+        }
+    } while (!(flag & _IOBIN+_IONBF));
+    _clock_ignore(t);
+    return(size-count);
+}
+
+int remove(const char *pathname)
+{
+    _kernel_osfile_block fb;
+    if (_kernel_osfile(6, pathname, &fb) <= 0) return 1;
+    return 0;
+}
+
+int rename(const char *old, const char *new)
+{
+    _kernel_swi_regs r;
+    r.r[0] = 25;
+    r.r[1] = (int) old;
+    r.r[2] = (int) new;
+    if (_kernel_swi(OS_FSControl, &r, &r)) return 1;
+    return 0;
+}
+
+void _sys_tmpnam_(char *name, int sig)
+{
+    if (_kernel_getenv("wimp$scrapdir", name, L_tmpnam-10) != NULL)
+      strcpy(name, "$.tmp");
+    name += strlen(name);
+    sprintf(name, ".x%.8x", sig);
+}
+
+static char *_getenv_value;
+static size_t _getenv_size;
+
+char *getenv(const char *name)
+{
+    _kernel_swi_regs r, rout;
+    _kernel_oserror *e;
+
+    /* Allocate a buffer of 256 bytes if we don't already have one */
+    if (_getenv_value == NULL)
+    {
+      _getenv_size=256;
+      if ( (_getenv_value = _kernel_RMAalloc(_getenv_size)) == NULL)
+      {
+         _getenv_size = 0;
+         return NULL;      /* Could not allocate buffer */
+      }
+    }
+
+    /* Whilst we keep getting buffer overflow errors, try to extend the buffer
+     * a bit and try again.  Note that you CANNOT rely on OS_ReadVarVal returning
+     * (NOT length) in R2 since this doesn't work for number or macro variables.
+     * It doesn't work.
+     */
+
+    r.r[0] = (int) name;
+    r.r[3] = 0;
+    r.r[4] = 3;
+    do {
+      /* Try to read into the current buffer */
+      r.r[1] = (int) _getenv_value;
+      r.r[2] = _getenv_size - 1;   /* Leave one byte in buffer for terminating null to be added later */
+      if ((e = _kernel_swi(OS_ReadVarVal, &r, &rout)) != NULL)
+      {
+          /* What was the error? */
+          if (e->errnum != 0x1E4)
+              return NULL;   /* It wasn't buffer overflow, so return NULL */
+
+          /* Buffer overflow occurred, so try to reallocate the buffer */
+          _kernel_RMAfree(_getenv_value);
+          _getenv_value = _kernel_RMAalloc(_getenv_size += 256);
+          if (_getenv_value == NULL) {
+              _getenv_size = 0;
+              return NULL;
+          }
+      }
+    } while (e);
+
+    /* Terminate the value */
+    _getenv_value[rout.r[2]] = '\0';
+
+    return _getenv_value;
+}
+
+void _terminate_getenv(void)
+{
+    if (_getenv_value)
+        _kernel_RMAfree(_getenv_value);
+
+    _getenv_value = NULL;
+}
+
+#ifdef DDE
+#define DDEUtils_SetCLSize 0x42581
+#define DDEUtils_SetCL     0x42582
+#define DDEUtils_FlushCL   0x4258B
+
+static int _cli_limit;
+#endif
+int system(const char *string)
+{
+#define CALL  0
+#define CHAIN 1
+    int rc;
+#ifdef DDE
+    int type;
+    char *cmd_string, *cmd;
+    char *s, *t;
+    _kernel_swi_regs r;
+#endif
+    int procmode = _kernel_processor_mode() & 0xF; /* Privileged mode iff procmode != 0 */
+    if (string==NULL) return (procmode == 0);
+    if (procmode != 0) return -2;
+#ifdef DDE
+    type = CALL;
+#endif
+    if ((string[0] | 0x20)=='c') {
+      char c = string[1] | 0x20;
+      if (c=='a') {
+        if ((string[2] | 0x20)=='l' && (string[3] | 0x20)=='l' &&
+            string[4]==':') string = string+5;
+      } else if (c=='h') {
+        if ((string[2] | 0x20)=='a' && (string[3] | 0x20)=='i' &&
+            (string[4] | 0x20)=='n' && string[5]==':') {
+          string = string+6;
+#ifdef DDE
+          type = CHAIN;
+#else
+          _lib_shutdown();
+          _kernel_system(string, CHAIN);
+          /* which never returns */
+#endif
+        }
+      }
+    }
+#ifdef DDE
+    cmd_string = NULL;
+    if (strlen(string) >= _cli_limit) {
+        s = (char *)string;
+        while (*s == ' ') s++;
+        cmd = s;
+        while (*s > ' ') s++;
+        while (*s == ' ') s++;
+        r.r[0] = strlen(s) + 1;
+        if (!_kernel_swi(DDEUtils_SetCLSize, &r, &r)) {
+            r.r[0] = (int)s;
+            if (!_kernel_swi(DDEUtils_SetCL, &r, &r)) {
+                cmd_string = malloc(s - cmd + 1);
+                if (cmd_string) {
+                    s = cmd;
+                    t = cmd_string;
+                    while (*s > ' ') *t++ = *s++;
+                    *t++ = 0;
+                    string = cmd_string;
+                }
+            }
+        }
+    } else {
+        _kernel_swi(DDEUtils_FlushCL, &r, &r);
+    }
+    if (type == CHAIN)
+        _lib_shutdown();
+    rc = _kernel_system(string, type);
+    if (cmd_string != NULL)
+        free(cmd_string);
+#else
+    rc = _kernel_system(string, CALL);
+#endif
+    if (rc != 0) return rc;
+    else
+    { char *env;
+      env = getenv("Sys$ReturnCode");
+      if (env == NULL) return 0;
+      else return (atoi(env));
+    }
+    /* -2 Kernel Fail, 0 = OK. Any other = result code from subprogram exit */
+#undef CALL
+#undef CHAIN
+}
+
+char *decimal_point = ".";
+
+void _armsys_lib_init(void)
+{   char *stdinfile  = TTYFILENAME,
+         *stdoutfile = TTYFILENAME,
+         *stderrfile = TTYFILENAME;
+    (void) unused;
+    _getenv_value = NULL;
+    _error_recursion = 0;
+#ifdef DDE
+    if ((_kernel_osbyte(129, 0, 255) & 0xFF) >= 0xA8)
+        _cli_limit = 1024; /* Ursula long command lines */
+    else
+        _cli_limit = 256;  /* Pre Ursula shorter ones */
+#endif
+    _ctype_init();          /* C locale */
+    _exit_init();           /* must happen before exit() can be called   */
+    _signal_init();         /* had better be done pretty early           */
+    _clock_init();          /* set Cpu time zero point                   */
+    _init_alloc();          /* as had the allocator                      */
+/* SIGINT events are not safe until about now.                           */
+    _raise_stacked_interrupts();       /* enable SIGINT                  */
+    if (!_kernel_client_is_module())
+        _initio(stdinfile, stdoutfile, stderrfile);
+}
+
+void _main(char *s, int (*main)(int, char **))
+#define LINE_SIZE 256
+#define BAD_REDIRECTION {goto bad_redirection;}
+#define NO_REDIRECTION goto no_redirection
+{   char ch;
+    static char **argv;
+    static char *args;
+    int curarg = 0, in_quotes = 0, was_quoted = 0;
+    int after_file_name = 0, redirection = 0;
+    int argc = 1, i = 0;
+    int pre_digit = 0, dup_arg_1 = 0;
+    char mode[2];
+
+    while (s[i] != 0)
+    {  while (isspace(s[i])) i++;
+       while ((!isspace(s[i])) && s[i] != 0) i++;
+       argc++;
+    }
+    argv = _sys_alloc(argc*sizeof(char *));
+    args = _sys_alloc(++i);
+    _init_user_alloc();
+
+    i = 0; argc = 0;
+    do
+    {   ch = *s++;
+        if (!in_quotes)
+        {   if (ch == '"')
+            {   was_quoted = in_quotes = 1;
+                ch = *s++;
+            }
+            else if ((i == curarg) && (!after_file_name))
+            {   char *next = s - 1;
+                pre_digit = -1; dup_arg_1 = -1;
+                mode[0] = 0; mode[1] = 0;
+                if (*next >= '0' && *next <= '9') pre_digit = *next++ - '0';
+                if ((*next == '>') || (*next == '<'))
+                {   if (*next == '>') /* stdout or stderr */
+                    {   mode[0] = 'w';
+                        if (pre_digit == 0 || pre_digit > 2) BAD_REDIRECTION
+                        else if (*++next == '>') { mode[0] = 'a'; next++; }
+                    } else
+                    {   char *p;
+                        next++;
+                        for (p = next; (*p != 0) && (*p != ' '); p++)
+                            if (*p == '>') NO_REDIRECTION;
+                        if (pre_digit > 0) BAD_REDIRECTION
+                        mode[0] = 'r';
+                    }
+                    if (*next == '&')
+                    {   if (pre_digit != -1) /* was a preceeding digit */
+                        {   if ((pre_digit > 0) &&
+                                ((*++next >= '0') && (*next <= '2')) &&
+                                (*next++ == (pre_digit % 2 + 1) + '0'))
+                            {   /* 2>&1 or 1>&2 */
+                                mode[0] = 0; /* no fopen required */
+                                dup_arg_1 = pre_digit;
+                            } else BAD_REDIRECTION
+                        } else /* no preceeding digit */
+                        {   next++;
+                            dup_arg_1 = 2;
+                            pre_digit = (mode[0] != 'r'); /* default = 0 or 1 */                        }
+                    }
+                    else if (pre_digit == -1)
+                        pre_digit = (mode[0] != 'r'); /* default = 0 or 1 */
+
+                    if (mode[0] != 0)
+                    {   after_file_name = 1;
+                        while (isspace(*next)) next++;
+                        if (*next == '"') { in_quotes = 1; next++; }
+                    }
+                    else if ((*next != 0) && (!isspace(*next)))
+                        BAD_REDIRECTION
+                    redirection = 1;
+                    s = next; ch = *s++;
+                }
+            }
+        }
+        if (in_quotes)
+        {   if ((ch == '\\') && ((*s == '"') || (*s == '\\')))
+                ch = *s++;
+            else
+                while (ch == '"') {in_quotes = !in_quotes;  ch = *s++;}
+        }
+
+no_redirection:
+        if (ch != 0 && (in_quotes || !isspace(ch)))
+        {   args[i++] = ch;
+            continue;
+        }
+        /* Assert: ((ch == 0) || (isspace(ch) && !in_quotes)) */
+        /* ------- possible end of arg ---------------------- */
+        if (i != curarg || was_quoted || (redirection && !after_file_name))
+        {   /* end of arg */
+            args[i++] = 0;
+            if (redirection)
+            {   if (after_file_name &&
+                       freopen(&args[curarg], mode, &__iob[pre_digit]) == 0) {
+                    _fprintf_lf(stderr,
+                       _kernel_getmessage("can't open '%s' for I/O redirection", "C19"),
+                       &args[curarg]);
+                    fputc('\n', stderr);
+                    exit(EXIT_FAILURE);
+                }
+                if ((dup_arg_1 > -1) &&
+                    (__dup(dup_arg_1, dup_arg_1 % 2 + 1) != TTYHANDLE))
+                {   /* data to go to file */
+                    FILE *s_new = &__iob[dup_arg_1];
+                    FILE *s_old = &__iob[dup_arg_1 % 2 + 1];
+                    setvbuf(s_new, _sys_alloc(LINE_SIZE), _IOLBF, LINE_SIZE);
+                    s_new->__flag |= _IOSBF;
+                    setvbuf(s_old, _sys_alloc(LINE_SIZE), _IOLBF, LINE_SIZE);
+                    s_old->__flag |= _IOSBF;
+                }
+                redirection = 0; after_file_name = 0; i = curarg;
+            }
+            else
+            {   argv[argc++] = &args[curarg];
+                curarg = i;
+            }
+        }
+        if (ch != 0) { in_quotes = was_quoted = 0; }
+    }
+    while (ch != 0);
+
+    if (in_quotes) {
+        _fprintf_lf(stderr, _kernel_getmessage("missing double quotes", "C20"));
+        fputc('\n', stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Clear any callback postponement flag in the kernel - otherwise programs which execute no SWIs may be completely uninterruptible */
+    _swix(OS_IntOn,0);
+
+    argv[argc] = 0;      /* for ANSI spec */
+    exit(/* hmm, relies on lots of things, but fast! */
+         (argc > 0 && (*(int *)argv[0] & ~0x20202020) == *(int *)"RUN") ?
+              _call_client_2(main, argc-1, argv+1) :
+              _call_client_2(main, argc, argv));
+
+bad_redirection:
+    _fprintf_lf(stderr,
+                _kernel_getmessage("unsupported or illegal I/O redirection '%s'", "C21"),
+                --s);
+    fputc('\n', stderr);
+    exit(EXIT_FAILURE);
+#undef NO_REDIRECTION
+#undef LINE_SIZE
+#undef BAD_REDIRECTION
+}
+
+static void p_in(unsigned int pc)
+{
+    _fprintf_lf(stderr, _kernel_getmessage("%x in ", "C22"), pc);
+}
+
+#define ERROR_ILLEGALREAD 0x80800ea0
+#define ERROR_ILLEGALWRITE 0x80800ea1
+
+void _backtrace(int why, int *address, _kernel_unwindblock *uwb)
+{   /* all the messages in the following should go to stderr             */
+    const unsigned int psr_mask = (_kernel_processor_mode() & 0x1C) != 0 ? 0 : 0xFC000003;
+    FILE *err = stderr;
+    char *lang = _kernel_language(uwb->pc);
+    unsigned cl_base, cl_limit;
+    _kernel_swi_regs r;
+
+    r.r[0] = 18;
+    r.r[1] = (int)"SharedCLibrary";
+    cl_base = 0;
+    cl_limit = 0;
+    if (!_kernel_swi(OS_Module, &r, &r)) {
+        cl_base = r.r[3];
+        cl_limit = cl_base + *((int *)(cl_base - 4));
+    }
+    if (why==ERROR_ILLEGALREAD || why == ERROR_ILLEGALWRITE) {
+        _fprintf_lf(err, _kernel_getmessage("(address %p)", "C23"), address);
+        fputc('\n', err);
+    } else {
+        fputc('\n', err);
+        _fprintf_lf(err, _kernel_getmessage("Postmortem requested", "C24"));
+    }
+    fputc('\n', err);
+
+/* Now unwind the stack. I keep track of sp here (as well as fp), but for */
+/* the moment I make no use of it.                                       */
+    while (uwb->fp!=0)
+    {   int *z, i, nargs, *argp;
+        char *name = 0;
+        int *fp = (int *) uwb->fp;
+        _kernel_swi_regs r;
+        if (lang && (lang[0]=='C') && (lang[1]==0)) {
+            z = (int *)(fp[0] &~ psr_mask);
+/* Check that when I save pc in a STM instruction it could save PC+8 or  */
+/* PC+12 beyond the instruction.                                         */
+            r.r[0] = 0;
+            if (!_kernel_swi(OS_PlatformFeatures, &r, &r) && (r.r[0] & 8))
+                z -= 2;
+            else
+                z -= 3;
+/* If the word before the STM is itself STM sp!, {a1-a4} that shows      */
+/* where I should find args, and suggests that there are >= 5.           */
+/* (this needs to work whether sp is r12 or r13)                         */
+            argp = fp+1;
+            if ((*(z-1) & ~0x00010000) ==0xe92c000f) {
+                nargs = 5;
+            } else {
+                int mask = *z & 0xffff;
+/* Otherwise args were stored as part of the main STM. Find out where &  */
+/* how many.                                                             */
+                nargs = 0;
+                while (mask != 0)
+                {   argp--;
+                    if (mask & 0xf) ++nargs;
+                    mask ^= mask & (-mask);
+                }
+            }
+/* Print args from the highest one downwards, in hex and decimal         */
+            argp += nargs;
+            while (nargs!=0) {
+                int v = *(--argp);
+                int carry;
+
+                _fprintf_lf(err,
+                            _kernel_getmessage("  Arg%d: %#.8x %d", "C25"),
+                            nargs--, v, v);
+/* Indirect through addresses that might be legal...                     */
+                if (v && !(v & 3)) {
+                    r.r[0] = (int)v;
+                    r.r[1] = (int)v + 4 * 4 - 1;
+                    if (!_kernel_swi_c(OS_ValidateAddress, &r, &r, &carry)) {
+                        if (!carry) {
+                            unsigned *vp = (unsigned *)v;
+
+                            fprintf(err, " -> [%#.8x %#.8x %#.8x %#.8x]",
+                                    vp[0], vp[1], vp[2], vp[3]);
+                        }
+                    }
+                }
+                fputc('\n', err);
+            }
+/* I search up to 10 words before the STM looking for the marker that    */
+/* shows me where the function name is.                                  */
+            for (i=0; i<10; i++)
+            {   int w = *--z;
+                if ((w & 0xffff0000) == 0xff000000)
+                {   name = (char *)z - (w & 0xffff);
+                    break;
+                }
+            }
+            p_in(uwb->pc & ~psr_mask);
+            if (name == 0)
+            {   if ((unsigned)z >= cl_base && (unsigned)z < cl_limit)
+                    _fprintf_lf(err, _kernel_getmessage("shared library function", "C26"));
+                else
+                    _fprintf_lf(err, _kernel_getmessage("anonymous function", "C27"));
+            }
+            else
+                _fprintf_lf(err, _kernel_getmessage("function %s", "C28"), name);
+        } else {
+            p_in(uwb->pc & ~psr_mask);
+            if (lang==NULL) {
+                _fprintf_lf(err, _kernel_getmessage("unknown procedure", "C29"));
+            } else {
+                char *procname = _kernel_procname(uwb->pc);
+                if (procname!=NULL) {
+                    _fprintf_lf(err,
+                                _kernel_getmessage("%s procedure %s", "C30"),
+                                lang, procname);
+                } else {
+                    _fprintf_lf(err,
+                                _kernel_getmessage("anonymous %s procedure", "C31"),
+                                lang);
+                }
+            }
+        }
+        fputc('\n', err);
+        if (_kernel_unwind(uwb, &lang) < 0) {
+            fputc('\n', err);
+            _fprintf_lf(err, _kernel_getmessage("stack overwritten", "C32"));
+            fputc('\n', err);
+            break;
+        }
+    }
+    exit(EXIT_FAILURE);
+}
+
+/* end of armsys.c */
