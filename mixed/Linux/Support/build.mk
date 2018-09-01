@@ -165,7 +165,7 @@ Support/bin/RISC_OS:
 update-binary:
 	+shopt -s extglob
 ifndef FAST
-	git clean -fxd
+	! git clean -fxd
 	git reset --hard
 endif
 	(
