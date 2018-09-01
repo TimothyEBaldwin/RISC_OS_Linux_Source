@@ -1,0 +1,676 @@
+12345678901234567890123456789012345678901234567890123456789012345678901234567890
+
+mjs   12 Jan 2001   Early Draft
+mjs   14 Feb 2001   XScale survey revised, ARMop reentrancy defined
+
+
+RISC OS Kernel ARM core support
+===============================
+
+This document is concerned with the design of open ended support for
+multiple ARM cores within the RISC OS kernel, as part of the work loosely
+termed hardware abstraction. Note that the ARM core support is part of the
+OS kernel, and so is not part of the hardware abstraction layer (HAL)
+itself.
+
+Background
+----------
+
+ARM core support (including caches and MMU) has historically been coded in a
+tailored way for one or two specific variants. Since version 3.7 this has
+meant just two variants; ARM 6/7 and StrongARM SA110. A more generic
+approach is required for the next generation. This aims both to support
+several cores in a more structured way, and to cover minor variants (eg.
+cache size) with the same support code. The natural approach is to set up
+run-time vectors to a set of ARM support routines.
+
+Note that it is currently assumed that the ARM MMU architecture will not
+change radically in future ARM cores. Hence, the kernel memory management
+algorithms remain largely unchanged. This is believed to be a reasonable
+assumption, since the last major memory management change was with Risc PC
+and ARM 610 (when the on-chip MMU was introduced).
+
+Note that all ARM support code must be 32-bit clean, as part of the 32-bit
+clean kernel.
+
+Survey of ARM core requirements
+-------------------------------
+
+At present, five broad ARM core types can be considered to be of interest;
+ARM7 (and ARM6), ARM9, ARM10, StrongARM (SA1) and  XScale. These divide
+primarily in terms of cache types, and cache and TLB maintenance
+requirements. They also span a range of defined ARM architecture variants,
+which introduced variants for system operations (primarily coprocessor 15
+instructions).
+
+The current ARM architecture is version 5. This (and version 4) has some
+open ended definitions to allow code to determine cache size and types from
+CP15 registers. Hence, the design of the support code can hope to be at
+least tolerant of near future variations that are introduced.
+
+ARM7
+----
+
+ARM7 cores may be architecture 3 or 4. They differ in required coprocessor
+15 operations for the same cache and TLB control. ARM6 cores are much the
+same as architecture 3 ARM7. The general character of all these cores is of
+unified write-through caches that can only be invalidated on a global basis.
+The TLBs are also unified, and can be invalidated per entry or globally.
+
+ARM9
+----
+
+ARM9 cores are architecture 4. We ignore ARM9 variants without an MMU. The
+kernel can read cache size and features. The ARM 920 or 922 have harvard
+caches, with writeback and writethrough capable data caches (on a page or
+section granularity). Data and instruction caches can be invalidated by
+individual lines or globally. The data cache can be cleaned by virtual
+address or cache segment/index, allowing for efficient cache maintenance.
+Data and instruction TLBs can be invalidated by entry or globally.
+
+ARM10
+-----
+
+ARM 10 is architecture 5. Few details available at present. Likely to be
+similar to ARM9 in terms of cache features and available operations. 
+
+StrongARM
+---------
+
+StrongARM is architecture 4. StrongARMs have harvard caches, the data cache
+being writeback only (no writethrough option). The data cache can only be
+globally cleaned in an indirect manner, by reading from otherwise unused
+address space. This is inefficient because it requires external (to the
+core) reads on the bus. In particular, the minimum cost of a clean, for a
+nearly clean cache, is high. The data cache supports clean and invalidate by
+individual virtual lines, so this is reasonably efficient for small ranges
+of address. The data TLB can be invalidated by entry or globally.
+
+The instruction cache can only be invalidated globally. This is inefficient
+for cases such as IMBs over a small range (dynamic code). The instruction
+TLB can only be invalidated globally.
+
+Some StrongARM variants have a mini data cache. This is selected over the
+main cache on a section or page by using the cachable/bufferable bits set to
+C=1,B=0 in the MMU (this is not standard ARM architecture). The mini data
+cache is writeback and must be cleaned in the same manner as the main data
+cache.
+
+XScale
+------
+
+XScale is architecture 5. It implements harvard caches, the data cache being
+writeback or writethrough (on a page or section granularity). Data and
+instruction caches can be invalidated by individual lines or globally. The
+data cache can be fully cleaned by allocating lines from otherwise unused
+address space. Unlike StrongARM, no external reads are needed for the clean
+operation, so that cache maintenance is efficient.
+
+XScale has a mini data cache. This is only available by using extension bits
+in the MMU. This extension is not documented in the current manual for
+architecture 5, but will presumably be properly recognised by ARM. It should
+be a reasonably straightforward extension for RISC OS. The mini data cache
+can only be cleaned by inefficient indirect reads as on StrongARM.
+
+For XScale, the whole mini data cache can be configured as writethrough. The
+most likely use for RISC OS is to map screen memory as mini cacheable, so
+writethrough caching will be selected to prevent problems with delayed
+screen update (and hence intricate screen/cache management code as in Ursula
+for StrongARM). With writethrough configured, most operations can ignore the
+mini cache, because invalidation by virtual address will invalidate mini or
+main cache entries as appropriate. 
+
+Unfortunately, for global cache invalidatation, things are very awkward.
+RISC OS cannot use the global cache invalidate operation (which globally
+invalidates both data caches), unless it is very careful to 100% clean the
+main cache with all interrupts (IRQs and FIQs) disabled. This is to avoid
+fatal loss of uncleaned lines from the writeback main cache. Disabling
+interrupts for the duration of a main cache clean is an unacceptable
+latency. Therefore, reluctantly, RISC OS must do the equivalent of cleaning
+the mini cache (slow physical reads) in order to globally invalidate it as a
+side effect.
+
+The instruction and data TLBs can each be invalidated by entry or globally.
+
+
+Kernel ARM operations
+---------------------
+
+This section lists the definitions and API of the set of ARM operations
+(ARMops) required by the kernel for each major ARM type that is to be
+supported. Some operations may be very simple on some ARMs. Others may need
+support from the kernel environment - for example, readable parameters that
+have been determined at boot, or address space available for cache clean
+operations.
+
+The general rules for register usage and preservation in calling these
+ARMops iare:
+
+  - any parameters are passed in r0,r1 etc. as required
+  - r0 may be used as a scratch register
+  - the routines see a valid stack via sp, at least 16 words are available
+  - lr is the return link as required
+  - on exit, all registers except r0 and lr must be preserved
+
+Note that where register values are given as logical addresses, these are
+RISC OS logical addresses. The equivalent ARM terminology is virtual address
+(VA), or modified virtual address (MVA) for architectures with the fast
+context switch extension.
+
+Note also that where cache invalidation is required, it is implicit that any
+associated operations for a particular ARM should be performed also. The
+most obvious example is for an ARM with branch prediction, where it may be
+necessary to invalidate a branch cache anywhere where instruction cache
+invalidation is to be performed.
+
+Any operation that is a null operation on the given ARM should be
+implemented as a single return instruction:
+
+  MOV pc, lr
+
+
+ARMop reentrancy
+----------------
+
+In general, the operations will be called from SVC mode with interrupts
+enabled. However, some use of some operations from interrupt mode is
+expected. Notably, it is desirable for the IMB operations to be
+available from interrupt mode. Therefore, it is intended that all
+implementations of all ARMops be reentrant. Most will be so with no
+difficulty. For ARMs with writeback data caches, the cleaning algorithm
+may have to be constructed carefully to handle reentrancy (and to avoid
+turning off interrupts for the duration of a clean).
+
+
+Cache ARMops
+------------
+
+-- Cache_CleanInvalidateAll
+
+The cache or caches are to be globally invalidated, with cleaning of any
+writeback data being properly performed. 
+
+   entry: -
+   exit:  -
+
+Note that any write buffer draining should also be performed by this
+operation, so that memory is fully updated with respect to any writeaback
+data.
+
+The OS only expects the invalidation to be with respect to instructions/data
+that are not involved in any currently active interrupts. In other words, it
+is expected and desirable that interrupts remain enabled during any extended
+clean operation, in order to avoid impact on interrupt latency.
+
+-- Cache_CleanInvalidateRange
+
+The cache or caches are to be invalidated for (at least) the given range, with
+cleaning of any writeback data being properly performed. 
+
+   entry: r0 = logical address of start of range
+          r1 = logical address of end of range (exclusive)
+          Note that r0 and r1 are aligned on cache line boundaries
+   exit:  -
+
+Note that any write buffer draining should also be performed by this
+operation, so that memory is fully updated with respect to any writeaback
+data.
+
+The OS only expects the invalidation to be with respect to instructions/data
+that are not involved in any currently active interrupts. In other words, it
+is expected and desirable that interrupts remain enabled during any extended
+clean operation, in order to avoid impact on interrupt latency.
+
+-- Cache_CleanAll
+
+The unified cache or data cache are to be globally cleaned (any writeback data
+updated to memory). Invalidation is not required.
+
+   entry: -
+   exit:  -
+
+Note that any write buffer draining should also be performed by this
+operation, so that memory is fully updated with respect to any writeaback
+data.
+
+The OS only expects the cleaning to be with respect to data that are not
+involved in any currently active interrupts. In other words, it is expected
+and desirable that interrupts remain enabled during any extended clean
+operation, in order to avoid impact on interrupt latency.
+
+-- Cache_CleanRange
+
+The cache or caches are to be cleaned for (at least) the given range.
+Invalidation is not required.
+
+   entry: r0 = logical address of start of range
+          r1 = logical address of end of range (exclusive)
+          Note that r0 and r1 are aligned on cache line boundaries
+   exit:  -
+
+Note that any write buffer draining should also be performed by this
+operation, so that memory is fully updated with respect to any writeaback
+data.
+
+The OS only expects the invalidation to be with respect to instructions/data
+that are not involved in any currently active interrupts. In other words, it
+is expected and desirable that interrupts remain enabled during any extended
+clean operation, in order to avoid impact on interrupt latency.
+
+-- Cache_InvalidateAll
+
+The cache or caches are to be globally invalidated. Cleaning of any writeback
+data is not to be performed.
+
+   entry: -
+   exit:  -
+
+This call is only required for special restart use, since it implies that
+any writeback data are either irrelevant or not valid. It should be a very
+simple operation on all ARMs.
+
+-- Cache_InvalidateRange
+
+The cache or caches are to be invalidated for the given range. Cleaning of any
+writeback data is not to be performed.
+
+   entry: r0 = logical address of start of range
+          r1 = logical address of end of range (exclusive)
+          Note that r0 and r1 are aligned on cache line boundaries
+   exit:  -
+
+This call is intended for use in situations where another bus master (e.g. DMA)
+has written to an area of cacheable memory, and stale data is to be cleared
+from the ARM's cache so that software can see the new values.
+
+It is important that only the indicated region is invalidated - neighbouring
+cache lines may contain valid data that has not yet been written back. Because
+software should not have been writing to the DMA buffer while the DMA was in
+progress, it is permissible for this operation to both clean and invalidate.
+E.g. if a write-back cache is in use, it would be incorrect to promote a large
+invalidate to a global invalidate, and so an implementation could instead
+perform a global clean+invalidate.
+
+The OS only expects the invalidation to be with respect to instructions/data
+that are not involved in any currently active interrupts. In other words, it
+is expected and desirable that interrupts remain enabled during any extended
+clean operation, in order to avoid impact on interrupt latency.
+
+-- Cache_RangeThreshold
+
+Return a threshold value for an address range, above which it is advisable
+to globally clean and/or invalidate caches, for performance reasons. For a
+range less than or equal to the threshold, a ranged cache operation is
+recommended.
+
+   entry: -
+   exit:  r0 = threshold value (bytes)
+
+This call returns a value that the kernel may use to select between strategies
+in some cache operations. This threshold may also be of use to some of the
+ARM operations themselves (although they should typically be able to read
+the parameter more directly).
+
+The exact value is unlikely to be critical, but a sensible value may depend
+on both the ARM and external factors such as memory bus speed.
+
+-- Cache_Examine
+
+Return information about a given cache level
+
+   entry: r1 = cache level (0-based)
+   exit:  r0 = Flags
+               bits 0-2: cache type:
+                  000 -> none
+                  001 -> instruction
+                  010 -> data
+                  011 -> split
+                  100 -> unified
+                  1xx -> reserved
+               Other bits: reserved
+          r1 = D line length
+          r2 = D size
+          r3 = I line length
+          r4 = I size
+          r0-r4 = zero if cache level not present
+
+For unified caches, r1-r2 will match r3-r4. This call mainly exists for the
+benefit of OS_PlatformFeatures 33.
+
+-- ICache_InvalidateAll
+
+The instruction cache is to be globally invalidated.
+
+   entry: -
+   exit:  -
+
+This operation should only act on instruction caches - not data or unified
+caches. If only data or unified caches are present then the operation can be
+implemented as a NOP.
+
+-- ICache_InvalidateRange
+
+The instruction cache is to be invalidated for the given range.
+
+   entry: r0 = logical address of start of range
+          r1 = logical address of end of range (exclusive)
+          Note that r0 and r1 are aligned on cache line boundaries
+   exit:  -
+
+This operation should only act on instruction caches - not data or unified
+caches. If only data or unified caches are present then the operation can be
+implemented as a NOP.
+
+
+Memory barrier ARMops
+=====================
+
+-- DSB_ReadWrite (previously, WriteBuffer_Drain)
+
+This call is roughly equivalent to the ARMv7 "DSB SY" instruction:
+
+ * Writebuffers are drained
+ * Full read/write barrier - no data load/store will cross the instruction
+ * Instructions following the barrier will only begin execution once the
+   barrier is passed - but any prefetched instructions are not flushed
+
+   entry: -
+   exit:  -
+
+
+-- DSB_Write
+
+This call is roughly equivalent to the ARMv7 "DSB ST" instruction:
+
+ * Writebuffers are drained
+ * Write barrier - reads may cross the instruction
+ * Instructions following the barrier will only begin execution once the
+   barrier is passed - but any prefetched instructions are not flushed
+
+   entry: -
+   exit:  -
+
+
+-- DSB_Read
+
+There is no direct equivalent to this in ARMv7 (barriers are either W or RW).
+However it's useful to define a read barrier, as (e.g.) on Cortex-A9 a RW
+barrier would require draining the write buffer of the external PL310 cache,
+while a R barrier can simply be an ordinary DSB instruction.
+
+ * Read barrier - writes may cross the instruction
+ * Instructions following the barrier will only begin execution once the
+   barrier is passed - but any prefetched instructions are not flushed
+
+   entry: -
+   exit:  -
+
+
+-- DMB_ReadWrite
+
+This call is roughly equivalent to the ARMv7 "DMB SY" instruction:
+
+ * Ensures in-order operation of data load/store instructions
+ * Does not stall instruction execution
+ * Does not guarantee that any preceeding memory operations complete in a
+   timely manner (or at all)
+
+   entry: -
+   exit:  -
+
+Although this call doesn't guarantee that any memory operation completes, it's
+usually all that's required when interacting with hardware devices which use
+memory-mapped IO. E.g. fill a buffer with data, issue a DMB, then write to a
+hardware register to start some external DMA. The writes to the buffer will
+have been guaranteed to complete by the time the write to the hardware register
+completes.
+
+
+-- DMB_Write
+
+This call is roughly equivalent to the ARMv7 "DMB ST" instruction:
+
+ * Ensures in-order operation of data store instructions
+ * Does not stall instruction execution
+ * Does not guarantee that any preceeding memory operations complete in a
+   timely manner (or at all)
+
+   entry: -
+   exit:  -
+
+Although this call doesn't guarantee that any memory operation completes, it's
+usually all that's required when interacting with hardware devices which use
+memory-mapped IO. E.g. fill a buffer with data, issue a DMB, then write to a
+hardware register to start some external DMA. The writes to the buffer will
+have been guaranteed to complete by the time the write to the hardware register
+completes.
+
+
+-- DMB_Read
+
+There is no direct equivalent to this in ARMv7 (barriers are either W or RW).
+However it's useful to define a read barrier, as (e.g.) on Cortex-A9 a RW
+barrier would require draining the write buffer of the external PL310 cache,
+while a R barrier can simply be an ordinary DMB instruction.
+
+ * Ensures in-order operation of data load instructions
+ * Does not stall instruction execution
+ * Does not guarantee that any preceeding memory operations complete in a
+   timely manner (or at all)
+
+   entry: -
+   exit:  -
+
+Although this call doesn't guarantee that any memory operation completes, it's
+usually all that's required when interacting with hardware devices which use
+memory-mapped IO. E.g. after reading a hardware register to detect that a DMA
+write to RAM has completed, issue a read barrier to ensure that any reads from
+the data buffer see the final data.
+
+
+TLB ARMops
+----------
+
+-- TLB_InvalidateAll
+
+The TLB or TLBs are to be globally invalidated.
+
+   entry: -
+   exit:  -
+
+
+-- TLB_InvalidateEntry
+
+The TLB or TLBs are to be invalidated for the entry at the given logical
+address.
+
+   entry: r0 = logical address of entry to invalidate (page aligned)
+   exit:  -
+
+The address will always be page aligned (4k).
+
+
+IMB ARMops
+----------
+
+-- IMB_Full
+
+A global instruction memory barrier (IMB) is to be performed.
+
+   entry: -
+   exit:  -
+
+An IMB is an operation that should be performed after new instructions have
+been stored and before they are executed. It guarantees correct operation
+for code modification (eg. something as simple as loading code to be
+executed).
+
+On some ARMs, this operation may be null. On ARMs with harvard architecture
+this typically consists of:
+
+  1) clean data cache
+  2) drain write buffer
+  3) invalidate instruction cache
+
+There may be other considerations such as invalidating branch prediction
+caches.
+
+
+-- IMB_Range
+
+An instruction memory barrier (IMB) is to be performed over a logical
+address range.
+
+   entry: r0 = logical address of start of range
+          r1 = logical address of end of range (exclusive)
+          Note that r0 and r1 are aligned on cache line boundaries
+   exit: -
+
+An IMB is an operation that should be performed after new instructions have
+been stored and before they are executed. It guarantees correct operation
+for code modification (eg. something as simple as loading code to be
+executed).
+
+On some ARMs, this operation may be null. On ARMs with harvard architecture
+this typically consists of:
+
+  1) clean data cache over the range
+  2) drain write buffer
+  3) invalidate instruction cache over the range
+
+There may be other considerations such as invalidating branch prediction
+caches.
+
+Note that the range may be very large. The implementation of this call is
+typically expected to use a threshold (related to Cache_RangeThreshold) to
+decide when to perform IMB_Full instead, being faster for large ranges.
+
+
+-- IMB_List
+
+A variant of IMB_Range that accepts a list of address ranges.
+
+   entry: r0 = pointer to word-aligned list of (start, end) address pairs
+          r1 = pointer to end of list (past last valid entry)
+          r2 = total amount of memory to be synchronised
+
+If you have several areas to synchronise then using this call may result in
+significant performance gains, both from reducing the function call overhead
+and from optimisations in the algorithm itself (e.g. only flushing instruction
+cache once for StrongARM).
+
+As with IMB_Range, start & end addresses are inclusive-exclusive and must be
+cache line aligned. The list must contain at least one entry, and must not
+contain zero-length entries.
+
+
+MMU mapping ARMops
+------------------
+
+-- MMU_Changing
+
+The global MMU mapping has just changed.
+
+   entry: -
+   exit:  -
+
+The operation must typically perform the following:
+
+  1) globally invalidate TLB or TLBs
+  2) globally clean and invalidate all caches
+  3) drain write buffer
+
+Note that it should not be necessary to disable IRQs. The OS ensures that
+remappings do not affect currently active interrupts.
+
+This operation should typically be used when a large number of cacheable pages
+have had their attributes changed in a way which will affect cache behaviour.
+
+-- MMU_ChangingEntry
+
+The MMU mapping has just changed for a single page entry (4k).
+
+   entry: r0 = logical address of entry (page aligned)
+   exit:  -
+
+The operation must typically perform the following:
+
+  1) invalidate TLB or TLBs for the entry
+  2) clean and invalidate all caches over the 4k range of the page
+  3) drain write buffer
+
+Note that it should not be necessary to disable IRQs. The OS ensures that
+remappings do not affect currently active interrupts.
+
+This operation should typically be used when a cacheable page has had its
+attributes changed in a way which will affect cache behaviour.
+
+-- MMU_ChangingUncached
+
+The MMU mapping has just changed in a way that globally affects uncacheable
+space.
+
+   entry: -
+   exit:  -
+
+The operation must typically globally invalidate the TLB or TLBs. The OS
+guarantees that cacheable space is not affected, so cache operations are not
+required. However, there may still be considerations such as fill buffers
+that operate in uncacheable space on some ARMs.
+
+-- MMU_ChangingUncachedEntry
+
+The MMU mapping has just changed for a single uncacheable page entry (4k).
+
+   entry: r0 = logical address of entry (page aligned)
+   exit:  -
+
+The operation must typically invalidate the TLB or TLBs for the entry. The
+OS guarantees that cacheable space is not affected, so cache operations are
+not required. However, there may still be considerations such as fill
+buffers that operate in uncacheable space on some ARMs.
+
+
+-- MMU_ChangingEntries
+
+The MMU mapping has just changed for a contiguous range of page entries
+(multiple of 4k).
+
+   entry: r0 = logical address of first page entry (page aligned)
+          r1 = number of page entries ( >= 1)
+   exit:  -
+
+The operation must typically perform the following:
+
+  1) invalidate TLB or TLBs over the range of the entries
+  2) clean and invalidate all caches over the range of the pages
+  3) drain write buffer
+
+Note that it should not be necessary to disable IRQs. The OS ensures that
+remappings do not affect currently active interrupts.
+
+Note that the number of entries may be large. The operation is typically
+expected to use a reasonable threshold, above which it performs a global
+operation instead for speed reasons.
+
+This operation should typically be used when cacheable pages have had their
+attributes changed in a way which will affect cache behaviour.
+
+-- MMU_ChangingUncachedEntries
+
+The MMU mapping has just changed for a contiguous range of uncacheable page
+entries (multiple of 4k).
+
+   entry: r0 = logical address of first page entry (page aligned)
+          r1 = number of page entries ( >= 1)
+   exit:  -
+
+The operation must typically invalidate the TLB or TLBs over the range of
+the entries. The OS guarantees that cacheable space is not affected, so
+cache operations are not required. However, there may still be
+considerations such as fill buffers that operate in uncacheable space on
+some ARMs.
+
+Note that the number of entries may be large. The operation is typically
+expected to use a reasonable threshold, above which it performs a global
+operation instead for speed reasons.

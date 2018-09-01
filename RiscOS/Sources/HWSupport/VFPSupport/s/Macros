@@ -1,0 +1,89 @@
+; 
+; Copyright (c) 2010, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+
+; Macros to make up for the fact that objasm doesn't support the required instructions yet
+
+; Instruction Synchronisation Barrier - required on ARMv6+ to ensure the effects of the following are visible to following instructions:
+; * Completed cache, TLB & branch predictor maintenance operations
+; * CP14/CP15 writes
+; This version will only work on ARMv6+!
+        MACRO
+        myISB $cond,$temp
+       [ NoARMv7
+        ; ARMv6 support required, use legacy MCR op
+        MOV$cond $temp,#0
+        MCR$cond p15,0,$temp,c7,c5,4
+       |
+        ; ARMv7+, use ISB instruction (saves on temp register, but instruction is unconditional)
+        ; Shouldn't hurt too much if we just ignore the condition code
+        DCI &F57FF06F ; ISB SY
+       ]
+        MEND
+
+; VMRS
+        MACRO
+        myVMRS $cond,$reg,$fpreg
+      [ "$fpreg" = "FPSID"
+        MRC$cond p10,7,$reg,c0,c0,0
+      ELIF "$fpreg" = "FPSCR"
+        MRC$cond p10,7,$reg,c1,c0,0
+      ELIF "$fpreg" = "MVFR2"
+        MRC$cond p10,7,$reg,c5,c0,0
+      ELIF "$fpreg" = "MVFR1"
+        MRC$cond p10,7,$reg,c6,c0,0
+      ELIF "$fpreg" = "MVFR0"
+        MRC$cond p10,7,$reg,c7,c0,0
+      ELIF "$fpreg" = "FPEXC"
+        MRC$cond p10,7,$reg,c8,c0,0
+      ELIF "$fpreg" = "FPINST"
+        MRC$cond p10,7,$reg,c9,c0,0
+      |
+        ASSERT "$fpreg" = "FPINST2"
+        MRC$cond p10,7,$reg,c10,c0,0
+      ]
+        MEND
+
+; VMSR
+        MACRO
+        myVMSR $cond,$fpreg,$reg
+      [ "$fpreg" = "FPSID"
+        MCR$cond p10,7,$reg,c0,c0,0
+      ELIF "$fpreg" = "FPSCR"
+        MCR$cond p10,7,$reg,c1,c0,0
+      ELIF "$fpreg" = "FPEXC"
+        MCR$cond p10,7,$reg,c8,c0,0
+      ELIF "$fpreg" = "FPINST"
+        MCR$cond p10,7,$reg,c9,c0,0
+      |
+        ASSERT "$fpreg" = "FPINST2"
+        MCR$cond p10,7,$reg,c10,c0,0
+      ]
+        MEND
+
+
+        END

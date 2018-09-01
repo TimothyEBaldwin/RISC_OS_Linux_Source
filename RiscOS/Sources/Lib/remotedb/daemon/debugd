@@ -1,0 +1,293 @@
+#!/usr/local/bin/perl
+$banner='# Debug daemon 0.02';
+# Internals:
+#  $conns[$n] - hash for connection
+#    fh		File handle ref
+#    peer	Hash ref of other end, or undef for internal
+#    inbuf	Input buffer
+#    outbuf	Output buffer
+#    modname    Name of module if is debug end
+#    defspec    Default module name, IP address
+
+$usage="Usage: $0 [-r] [-d] [-p] [port [address]]\n";
+
+$timeout= undef;
+$rfdmask='';
+$wfdmask='';
+ 
+while($ARGV[0]=~/^-/) {
+  my $arg=shift;
+  if($arg eq '--') {
+    last;
+  } elsif($arg eq '-r') {
+    $cr=1;
+  } elsif($arg eq '-d') {
+    $debug={fh => \*STDERR};
+    @conns[0]=$debug;
+    vec($rfdmask,fileno($debug->{fh}),1)=1;
+  } elsif($arg eq '-p') {
+    $pipe = 1;
+  } else {
+    die$usage;
+  };
+};
+
+use Socket;
+use Fcntl;
+$|=1;
+ 
+$sockaddr = 'S n a4 x8';
+ 
+if($#ARGV==-1 && ($peer=getpeername(STDIN))) { # Check if we're on a socket
+  open(SM,"<& STDIN")||failed("dup(STDIN)");
+  setsockopt(SM,SOL_SOCKET,SO_REUSEADDR,1)||failed("setsockopt");
+  doaccept();
+} else {
+  $standalone=1;
+  $port= shift || 1447;
+  $inetaddr= shift || '0.0.0.0';
+  @ARGV && die "usage: debugd [port [address]]";
+
+  ($name, $aliases, $proto) = getprotobyname('tcp');
+  ($name, $aliases, $port) = getservbyname($port, 'tcp')
+      unless $port =~ /^\d+$/;
+  $this = pack($sockaddr, &AF_INET, $port, pack("C4",split(/\./,$inetaddr)));
+  socket(SM, &PF_INET, &SOCK_STREAM, $proto) || die "socket: $!";
+  setsockopt(SM,SOL_SOCKET,SO_REUSEADDR,1)||failed("setsockopt");
+  bind(SM, $this) || die("bind: $!");
+  listen(SM, 5) || die("listen: $!");
+};
+vec($rfdmask,fileno(SM),1)=1;
+
+doprint($debug,"[Debug Daemon started $port]\n");
+
+for (;;) {
+  $nfound=select($rfsd=$rfdmask,$wfds=$wfdmask,$efds='',undef);
+#  print "select returned $nfound\n" if($debug);
+  if($nfound==-1) {
+    failed("select");
+    next;
+  };
+  if(vec($rfsd,fileno(SM),1)) {
+    doaccept();
+  };
+  for($x=0;$x<=$#conns;$x++) {
+    my($hash)=$conns[$x];
+#    print "Conn $x, fileno ",fileno($hash->{fh}),"\n" if($debug);
+    if(vec($rfsd,fileno($hash->{fh}),1)) {
+      doprint($debug,"Read on conn $x\n");
+      $nfound--;
+      $res=sysread($hash->{fh},$buf,1024);
+      if(!$res) {
+	if(!defined($res)) {
+	  doprint($hash->{peer},"# Error from read: $!\n");
+	  doprint($debug,"# Error from read: $!\n");
+	};
+	disconnect($x);
+      } else {
+	$hash->{inbuf}.=$buf;
+	while($hash->{inbuf}=~s/^(.*)\n//) {
+	  my $line=$1;
+	  $line=~s/\r$//;
+#	  doprint($hash,":ack\n") if($hash->{version} >= 0.04);
+          if ($pipe) {
+            print "$x $line\n";
+          }
+	  doprint($debug,"Got line '$line', version $hash->{version}\n");
+	  if($line=~/^([^:].*)$/||$line=~/^:(:.*)$/) {
+	    $line=$1;
+	    if(defined($hash->{peer})) {
+	      doprint($hash->{peer},"$line\n");
+	    } elsif(!defined($hash->{modname})) {
+	      if($line=~
+		 /^(\w+):\W+(\(\d+\)\W+)?open version\W+(\d+\.\d+)$/i) {
+		$hash->{version}=$3;
+		doprint($debug,"Open from module $1, version $3\n");
+		my $name=ipname(getpeername($hash->{fh})).":".$1;
+		$hash->{modname}=$name;
+		for($x=0;$x<=$#conns;$x++) {
+		  my $phash=$conns[$x];
+		  if((!defined($phash->{peer}) || !defined($hash->{peer})) &&
+		     $name eq $phash->{defname}) {
+		    $hash->{peer}=$phash;
+		  };
+		};
+		if($hash->{peer}) {
+		  if($hash->{peer}{peer}) {
+		    doprint($hash->{peer}{peer},"# Connection stolen\n");
+		    undef $hash->{peer}{peer}{peer};
+		  };
+		  $hash->{peer}{peer}=$hash;
+		  doprint($hash->{peer},"# Connection from $name\n");
+		};
+	      } elsif($line=~/^\d+$/) {
+		my $other=$hash->{others}[$line];
+		if(defined($other)) {
+		  my $x;
+		  $hash->{defname}=$other;
+		  for($x=0;$x<=$#conns;$x++) {
+		    my $phash=$conns[$x];
+		    if(!defined($phash->{peer})
+		       && $other eq $phash->{modname}) {
+		      $hash->{peer}=$phash;
+		      $phash->{peer}=$hash;
+		      last;
+		    };
+		  };
+		  if(!defined($hash->{peer})) {
+		    doprint($hash,"# Connection gone away\n");
+		  };
+		} else {
+		  doprint($hash,"# Number too large\n");
+		};
+	      } else {
+		doprint($hash,"# Bad connect line\n");
+	      };
+	    };
+	  } elsif($line=~/^:default\s+(.*)$/) {
+	    $hash->{defname}=$1;
+	  } elsif($line=~/^:debug$/i) {
+	    $debug=$hash;
+	  } elsif($line=~/^:info$/i) {
+	    my $c;
+	    doprint($hash,"# Current connection: $x\n");
+	    for($c=0;$c<=$#conns;$c++) {
+	      my $chash=$conns[$c],$key;
+	      doprint($hash,"#\n# Connection $c: $chash\n");
+	      foreach $key (keys %$chash) {
+		doprint($hash,"#   $key -> $chash->{$key}\n")
+		    if($key ne 'outbuf');
+		if($key eq 'others') {
+		  my $n;
+		  for($n=0;$n<=$#{$chash->{others}};$n++) {
+		    doprint($hash,"#     $n. $chash->{others}[$n]\n");
+		  };
+		} elsif($key eq 'outbuf' || $key eq 'inbuf') {
+		  doprint($hash,"#   $key length ".length($chash->{$key}).
+			  "\n");
+		};
+	      };
+	    };
+	    doprint($hash,"#\n# Ready.\n");
+	  } elsif($line=~/^:list$/i) {
+	    dolist($hash);
+	  } elsif($line=~/^:quit$/i) {
+	    if(defined($hash->{peer})) {
+	      doprint($hash->{peer},"# quit\n");
+	    };
+	    disconnect($x);
+	  } elsif($line=~/^:status$i/) {
+	    if(defined($hash->{peer})) {
+	      doprint($hash,"# Connected");
+	      if(defined($hash->{peer}{modname})) {
+		doprint($hash," to module ".$hash->{peer}{modname}."\n");
+	      } else {
+		doprint($hash," to unknown\n");
+	      };
+	    };
+	    if(defined($hash->{defname})) {
+	      doprint($hash,"# default module: '".$hash->{defname}."'\n");
+	    };
+	    doprint($hash,"# Ready.\n");
+	  } else {
+	    $line=~/^:([^ \t]*)/;
+	    doprint($hash,"# Bad command: $1\n");
+	  };
+	};
+      };
+    };
+    if(vec($wfds,fileno($hash->{fh}),1)) {
+#      print "Write on conn $x\n" if($debug);
+      $res=syswrite($hash->{fh},$hash->{outbuf},length($hash->{outbuf}));
+      if(!$res) {
+	if(!defined($res)) {
+	  doprint($hash->{peer},"# Error from write: $!\n");
+	};
+	disconnect($x);
+      } else {
+	substr($hash->{outbuf},0,$res)='';
+	vec($wfdmask,fileno($hash->{fh}),1)=length($hash->{outbuf})?1:0;
+      };
+    };
+  };
+}
+
+sub ipname {
+  my (@sa) = unpack($sockaddr,$_[0]);
+  scalar(gethostbyaddr($sa[2],$sa[0]));
+}
+
+sub dolist {
+  my ($hash)=$_[0];
+  my $x,$others=[];
+  for($x=0;$x<=$#conns;$x++) {
+    my $chash=$conns[$x];
+    my $name=$chash->{modname};
+    if(defined($name)&&!defined($chash->{peer})) {
+      push@$others,$name;
+      doprint($hash,"#   $#{$others}: $name\n");
+    };
+  };
+  doprint($hash,"# Ready.\n");
+  $hash->{others}=$others;
+}
+
+my $id=0;
+sub doaccept {
+  my $sock=\*{S.$id++};
+  my $hashref,$x;
+  accept($sock,SM)||failed("accept");
+  fcntl($sock,F_SETFL,O_NONBLOCK)||warn("$0: fcntl(F_SETFL): $!\n");
+  $hashref={fh => $sock};
+  push@conns,$hashref;
+  doprint($debug,"Connect from ".ipname(getpeername($sock))."\n") if($debug);
+  vec($rfdmask,fileno($sock),1)=1;
+  doprint($hashref,"$banner\n");
+  dolist($hashref);
+}
+
+sub failed {
+  die"$0: $_[0] failed: $!\n";
+}
+
+sub disconnect {
+  my ($hash)=$conns[$_[0]];
+  if(defined($hash->{peer})) {
+    unless(defined($hash->{peer}{modname})) {
+      doprint($hash->{peer},"# Connection closed\n");
+    };
+    delete $hash->{peer}{peer};
+  };
+  doprint($debug,"Disconnecting session $_[0], $#conns left\n");
+  shutdown($hash->{fh},2)||doprint($debug,"shutdown: $!\n");
+  vec($rfdmask,fileno($hash->{fh}),1)=0;
+  vec($wfdmask,fileno($hash->{fh}),1)=0;
+  close($hash->{fh});
+  undef($hash->{fh});
+  undef $debug if($debug eq $hash);
+  if($_[0]==$#conns) {
+    pop@conns;
+  } else {
+    $conns[$_[0]]=pop@conns;
+  };
+  if($#conns==-1 && !$standalone) {
+    exit 0;
+  };
+}
+
+sub doprint {
+  my ($hash,$str)=@_;
+  if(defined($hash)) {
+#  print "Writing string $str\n" if($debug);
+    if(defined($cr)) {
+      $str =~ s/\n/\r\n/g;
+    };
+    $hash->{outbuf}.=$str;
+    vec($wfdmask,fileno($hash->{fh}),1)=1;
+  };
+}
+
+# Local Variables:
+# mode: perl
+# perl-indent-level: 2
+# End:

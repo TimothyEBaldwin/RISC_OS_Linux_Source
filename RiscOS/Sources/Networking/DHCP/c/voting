@@ -1,0 +1,213 @@
+/* Copyright 1999 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ *  DHCP (voting.c)
+ *
+ * Copyright (C) Element 14 Ltd. 1999
+ *
+ */
+#include <stdio.h>
+#include <string.h>
+#include <limits.h>
+#include <stdbool.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "net/if.h"
+#include "protocols/dhcp.h"
+#include "sys/dcistructs.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+
+#include "dhcpintern.h"
+#include "interfaces.h"
+#include "packets.h"
+#include "voting.h"
+
+static bool dhcp_vote_is_null_ip(struct in_addr ia)
+{
+        return ia.s_addr == INADDR_ANY;
+}
+
+void dhcp_add_to_blacklist(dhcp_interface *di, struct in_addr ia)
+{
+        size_t i;
+
+	trace(("Adding server %s to the blacklist\n", inet_ntoa(ia)));
+
+        for (i = 0; i < blacklist_MAX; ++i) {
+                struct in_addr *iap = &di->blacklist.server[i];
+                if (memcmp(iap, &ia, sizeof(*iap)) == 0) {
+                        /* Already in blacklist */
+                        return;
+                }
+                else if (dhcp_vote_is_null_ip(*iap)) {
+                        /* Found a hole in the blacklist */
+                        *iap = ia;
+                        return;
+                }
+        }
+
+	/* Expire oldest entry, and add new entry at the end */
+        (void) memmove(&di->blacklist.server[0], &di->blacklist.server[1],
+        	sizeof(di->blacklist.server[0]) * (blacklist_MAX - 1));
+        di->blacklist.server[blacklist_MAX - 1] = ia;
+}
+
+void dhcp_empty_blacklist(dhcp_interface *di)
+{
+        trace(("Emptying blacklist\n"));
+        (void) memset(&di->blacklist, 0, sizeof(di->blacklist));
+}
+
+static bool dhcp_vote_server_in_blacklist(dhcp_interface *di, const DHCP *offer)
+{
+        size_t i;
+        struct in_addr si;
+
+	if (!dhcp_find_server_identifier(offer, &si)) {
+	        return true;
+        }
+
+        for (i=0; i < blacklist_MAX; ++i) {
+                if (si.s_addr == di->blacklist.server[i].s_addr) {
+                        return true;
+                }
+        }
+        return false;
+}
+
+void dhcp_vote_notify_offer_accepted(dhcp_interface *di)
+{
+        /* If we have been forced to accept an offer from somebody in the
+         * blacklist, then all of the available servers must presumably
+         * also be in the blacklist, so we clear it out and try to work
+         * out the friendly server list again
+         */
+        if (dhcp_vote_server_in_blacklist(di, &di->offer)) {
+                dhcp_empty_blacklist(di);
+        }
+}
+
+/* Compare the two DHCPOFFER messages and decide whether the new one is "better"
+ * than the currently preferred offer or not.
+ */
+
+int dhcp_vote(dhcp_interface *di, const DHCP *offer)
+{
+        dhcp_time new_expiry, current_expiry;
+       	bool current_in_blacklist, new_in_blacklist;
+	bool current_has_vendor_options, new_has_vendor_options;
+	bool current_is_bootp, new_is_bootp;
+	int current_priority, new_priority;
+
+        if (di->offer.op != BOOTREPLY) {
+                /* We haven't had any other offers yet - remember this one */
+                return vote_PREFER;
+        }
+
+	/* Prefer non-blacklisted servers */
+	current_in_blacklist = dhcp_vote_server_in_blacklist(di, &di->offer);
+	new_in_blacklist = dhcp_vote_server_in_blacklist(di, offer);
+
+	if (current_in_blacklist == false && new_in_blacklist == true) {
+	        trace(("Rejecting blacklisted server\n"));
+	        return vote_REJECT;
+	}
+
+	if (current_in_blacklist == true && new_in_blacklist == false) {
+	        trace(("Preferring non-blacklisted server\n"));
+	        return vote_PREFER;
+	}
+
+	/* Prefer according to server priority option (draft-ietf-dhc-sso-01.txt) */
+	dhcp_find_server_priority(&di->offer, &current_priority);
+	dhcp_find_server_priority(offer, &new_priority);
+	if (new_priority > current_priority) {
+		trace(("Preferring server with higher priority\n"));
+		return vote_PREFER;
+	}
+	else if (new_priority < current_priority) {
+		trace(("Rejecting server with lower priority\n"));
+		return vote_REJECT;
+	}
+
+	/* Prefer our current IP address */
+	if (!dhcp_vote_is_null_ip(di->preferred_ip)) {
+	        if (offer->yiaddr == di->preferred_ip.s_addr && di->offer.yiaddr != di->preferred_ip.s_addr) {
+	                /* This is the one we wanted - prefer it */
+	                return vote_PREFER;
+	        }
+	        if (offer->yiaddr != di->preferred_ip.s_addr && di->offer.yiaddr == di->preferred_ip.s_addr) {
+	                /* This isn't the one we wanted and we have a preferred one - reject it */
+	                return vote_REJECT;
+	        }
+	}
+
+	/* Prefer DHCP over BOOTP */
+	current_is_bootp = !dhcp_find_option(&di->offer, OPTION_DHCPMESSAGETYPE);
+	new_is_bootp = !dhcp_find_option(offer, OPTION_DHCPMESSAGETYPE);
+
+	if (current_is_bootp == false && new_is_bootp == true) {
+		trace(("Rejecting BOOTP server\n"));
+		return vote_REJECT;
+	}
+
+	if (current_is_bootp == true && new_is_bootp == false) {
+		trace(("Preferring DHCP server\n"));
+		return vote_PREFER;
+	}
+
+
+	/* Prefer a server providing vendor-specific options */
+	current_has_vendor_options = !!dhcp_find_option(&di->offer, OPTION_VENDORSPECIFIC);
+	new_has_vendor_options = !!dhcp_find_option(offer, OPTION_VENDORSPECIFIC);
+
+	if (current_has_vendor_options == false && new_has_vendor_options == true) {
+		trace(("Preferring server providing vendor-specific options\n"));
+		return vote_PREFER;
+	}
+
+	if (current_has_vendor_options == true && new_has_vendor_options == false) {
+		trace(("Rejecting server not providing vendor-specific options\n"));
+		return vote_REJECT;
+	}
+
+
+	/* Prefer a longer lease (DHCP only) */
+
+	if (!new_is_bootp) {  /* Old must also be DHCP or we would have already preferred this one */
+
+		if (dhcp_find_lease_expiry(offer, &new_expiry, OPTION_IPADDRLEASETIME) == NULL) {
+		        /* new message didn't have an expiry date suggestion! */
+		        return vote_REJECT;
+		}
+
+		if (dhcp_find_lease_expiry(&di->offer, &current_expiry, OPTION_IPADDRLEASETIME) == NULL) {
+		        /* Current reply didn't have an expiry suggestion! */
+			return vote_PREFER;
+		}
+
+ 		if (new_expiry > current_expiry) {
+	    		/* This was a longer lease offer - prefer it */
+	        	return vote_PREFER;
+		}
+	}
+
+	/* Prefer the server who responded first */
+	return vote_REJECT;
+}

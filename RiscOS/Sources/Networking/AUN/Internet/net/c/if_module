@@ -1,0 +1,799 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ *
+ * support external device driver module.
+ *
+ */
+#include "kernel.h"
+#include "swis.h"
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/malloc.h>
+#include <sys/mbuf.h>
+#include <sys/protosw.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/errno.h>
+#include <sys/syslog.h>
+
+#ifndef __riscos
+#include <machine/cpu.h>
+#endif
+
+#include <net/if.h>
+#include <net/netisr.h>
+#include <net/route.h>
+#include <net/if_llc.h>
+#include <net/if_dl.h>
+#include <net/if_types.h>
+
+#ifdef INET
+#include <netinet/in.h>
+#include <netinet/in_systm.h>
+#include <netinet/in_var.h>
+#endif
+#include <netinet/if_ether.h>
+
+#ifdef NS
+#include <netns/ns.h>
+#include <netns/ns_if.h>
+#endif
+
+#ifdef ISO
+#include <netiso/argo_debug.h>
+#include <netiso/iso.h>
+#include <netiso/iso_var.h>
+#include <netiso/iso_snpac.h>
+#endif
+
+#ifdef LLC
+#include <netccitt/dll.h>
+#include <netccitt/llc_var.h>
+#endif
+
+#if defined(LLC) && defined(CCITT)
+extern struct ifqueue pkintrq;
+#endif
+
+#include <sys/dcistructs.h>
+#include "module.h"
+#include "svcdebug.h"
+#include "debug.h"
+
+u_char	etherbroadcastaddr[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+#define senderr(e) { error = (e); goto bad;}
+
+static int if_module_addmulti(struct ifreq *ifr, struct ifnet *ifp);
+static int if_module_delmulti(struct ifreq *ifr, struct ifnet *ifp);
+
+/**********************************************************************/
+
+int
+if_module_output(ifp, m0, dst, rt0)
+    register struct ifnet *ifp;
+    struct mbuf *m0;
+    struct sockaddr *dst;
+    struct rtentry *rt0;
+{
+	int swinum = ifp->if_swibase + DCI4Transmit;
+	_kernel_oserror *e;
+	int type, off;
+	u_char edst[6];
+	struct mbuf *m = m0;
+	register struct rtentry *rt;
+	struct mbuf *mcopy = (struct mbuf *)0;
+	register struct ether_header *eh;
+	int error = 0;
+	struct arpcom *ac = (struct arpcom *)ifp;
+#ifdef FLASHY_SCROLLLOCK
+	static struct timeval lastflash;
+	struct timeval flashdiff;
+#endif
+
+#ifdef DEBUG
+	    if( DODEBUG((1 << 16)) )
+	    {
+		int i = 0;
+		struct mbuf *m1;
+
+                Printf("if_module_output(ifp=%x,m0=%x,dst=%x,rt0=%x) dst->sa_family=%d, len=%d\n", ifp, m0, dst, rt0, dst->sa_family, m->m_pkthdr.len);
+		Printf("\021\003if_module_output Packet Dump:\n");
+
+		for( m1 = m0; m1; m1 = m1->m_next )
+		{
+		    int j;
+		    u_char *cptr = mtod(m1, u_char *);
+
+		    for( j = 0; j < m1->m_len; ++j )
+		    {
+			Printf("%02x", *cptr++);
+
+			if( !(++i % 32) )
+			    Printf("\n");
+			else if( !(i % 4) )
+			    Printf("  ");
+		    }
+		}
+
+		if( (i % 32) )
+		    Printf("\021\007\n");
+	    Printf("\021\07\n");
+	    }
+#endif
+	/*
+	 * check that driver is still present.  this is quite probably
+	 * paranoia, as there should be no way to get to this routine
+	 * if the driver module has been killed, but it is better to
+	 * be safe than sorry
+	 */
+	if (ifp->if_flags & IFF_NODRIVER)
+		senderr(ENXIO);
+
+	if ((ifp->if_flags & (IFF_UP|IFF_RUNNING)) != (IFF_UP|IFF_RUNNING))
+		senderr(ENETDOWN);
+
+	ifp->if_lastchange = time;
+	if (rt = rt0) {
+		if ((rt->rt_flags & RTF_UP) == 0) {
+			if (rt0 = rt = rtalloc1(dst, 1, 0UL))
+				rt->rt_refcnt--;
+			else
+				senderr(EHOSTUNREACH);
+		}
+		if (rt->rt_flags & RTF_GATEWAY) {
+			if (rt->rt_gwroute == 0)
+				goto lookup;
+			if (((rt = rt->rt_gwroute)->rt_flags & RTF_UP) == 0) {
+				rtfree(rt); rt = rt0;
+			lookup: rt->rt_gwroute = rtalloc1(rt->rt_gateway, 1,
+							  0UL);
+				if ((rt = rt->rt_gwroute) == 0)
+					senderr(EHOSTUNREACH);
+			}
+		}
+		if (rt->rt_flags & RTF_REJECT)
+			if (rt->rt_rmx.rmx_expire == 0 ||
+			    time.tv_sec < rt->rt_rmx.rmx_expire)
+				senderr(rt == rt0 ? EHOSTDOWN : EHOSTUNREACH);
+	}
+
+	switch (dst->sa_family) {
+
+#ifdef INET
+	case AF_INET:
+		if (!arpresolve(ac, rt, m, dst, edst, rt0)) {
+#ifdef DEBUG
+	    		if( DODEBUG(DBGOUTPUT) )
+				Printf("imo: waiting for ARP resolution\n");
+#endif
+			return (0);	/* if not yet resolved */
+	        }
+		/* If broadcasting on a simplex interface, loopback a copy */
+		/* Note - can't be a list - won't fragment broadcasts */
+		if ((m->m_flags & M_BCAST) && (ifp->if_flags & IFF_SIMPLEX))
+			mcopy = m_copy(m, 0, (int)M_COPYALL);
+		off = m->m_pkthdr.len - m->m_len;
+		type = ETHERTYPE_IP;
+		break;
+
+/*	if( usetrailers && off > 0 && (off & 0x1ff) == 0 &&
+	   m->m_off >= MINOFF(m) + 2 * sizeof(u_short) )
+	{
+	    type = ETHERTYPE_TRAIL + (off >> 9);
+	    m->m_off -= 2 * sizeof(u_short);
+	    m->m_len += 2 * sizeof(u_short);
+	    *mtod(m, u_short *) = htons((u_short)ETHERTYPE_IP);
+	    *(mtod(m, u_short *) + 1) = htons((u_short)m->m_len);
+	    goto gottrailertype;
+	}
+
+	type = ETHERTYPE_IP;
+	off = 0;
+	destp = edst;
+	goto gottype;*/
+#endif
+#ifdef NS
+	case AF_NS:
+		type = ETHERTYPE_NS;
+ 		bcopy((caddr_t)&(((struct sockaddr_ns *)dst)->sns_addr.x_host),
+		    (caddr_t)edst, sizeof (edst));
+		if (!bcmp((caddr_t)edst, (caddr_t)&ns_thishost, sizeof(edst)))
+			return (looutput(ifp, m, dst, rt));
+		/* If broadcasting on a simplex interface, loopback a copy */
+		if ((m->m_flags & M_BCAST) && (ifp->if_flags & IFF_SIMPLEX))
+			mcopy = m_copy(m, 0, (int)M_COPYALL);
+		break;
+#endif
+#ifdef	ISO
+	case AF_ISO: {
+		int	snpalen;
+		struct	llc *l;
+		register struct sockaddr_dl *sdl;
+
+		if (rt && (sdl = (struct sockaddr_dl *)rt->rt_gateway) &&
+		    sdl->sdl_family == AF_LINK && sdl->sdl_alen > 0) {
+			bcopy(LLADDR(sdl), (caddr_t)edst, sizeof(edst));
+		} else if (error =
+			    iso_snparesolve(ifp, (struct sockaddr_iso *)dst,
+					    (char *)edst, &snpalen))
+			goto bad; /* Not Resolved */
+		/* If broadcasting on a simplex interface, loopback a copy */
+		if (*edst & 1)
+			m->m_flags |= (M_BCAST|M_MCAST);
+		if ((m->m_flags & M_BCAST) && (ifp->if_flags & IFF_SIMPLEX) &&
+		    (mcopy = m_copy(m, 0, (int)M_COPYALL))) {
+#error This won't work on RISC OS - sizeof (*eh) is 16
+			M_PREPEND(mcopy, sizeof (*eh), M_DONTWAIT);
+			if (mcopy) {
+				eh = mtod(mcopy, struct ether_header *);
+				bcopy((caddr_t)edst,
+				      (caddr_t)eh->ether_dhost, sizeof (edst));
+				bcopy((caddr_t)ac->ac_enaddr,
+				      (caddr_t)eh->ether_shost, sizeof (edst));
+			}
+		}
+		M_PREPEND(m, 3, M_DONTWAIT);
+		if (m == NULL)
+			return (0);
+		type = m->m_pkthdr.len;
+		l = mtod(m, struct llc *);
+		l->llc_dsap = l->llc_ssap = LLC_ISO_LSAP;
+		l->llc_control = LLC_UI;
+		len += 3;
+		IFDEBUG(D_ETHER)
+			int i;
+			printf("unoutput: sending pkt to: ");
+			for (i=0; i<6; i++)
+				printf("%x ", edst[i] & 0xff);
+			printf("\n");
+		ENDDEBUG
+		} break;
+#endif /* ISO */
+#ifdef	LLC
+/*	case AF_NSAP: */
+	case AF_CCITT: {
+		register struct sockaddr_dl *sdl =
+			(struct sockaddr_dl *) rt -> rt_gateway;
+
+		if (sdl && sdl->sdl_family == AF_LINK
+		    && sdl->sdl_alen > 0) {
+			bcopy(LLADDR(sdl), (char *)edst,
+				sizeof(edst));
+		} else goto bad; /* Not a link interface ? Funny ... */
+		if ((ifp->if_flags & IFF_SIMPLEX) && (*edst & 1) &&
+		    (mcopy = m_copy(m, 0, (int)M_COPYALL))) {
+#error This won't work on RISC OS - sizeof (*eh) is 16
+			M_PREPEND(mcopy, sizeof (*eh), M_DONTWAIT);
+			if (mcopy) {
+				eh = mtod(mcopy, struct ether_header *);
+				bcopy((caddr_t)edst,
+				      (caddr_t)eh->ether_dhost, sizeof (edst));
+				bcopy((caddr_t)ac->ac_enaddr,
+				      (caddr_t)eh->ether_shost, sizeof (edst));
+			}
+		}
+		type = m->m_pkthdr.len;
+#ifdef LLC_DEBUG
+		{
+			int i;
+			register struct llc *l = mtod(m, struct llc *);
+
+			printf("ether_output: sending LLC2 pkt to: ");
+			for (i=0; i<6; i++)
+				printf("%x ", edst[i] & 0xff);
+			printf(" len 0x%x dsap 0x%x ssap 0x%x control 0x%x\n",
+			       type & 0xff, l->llc_dsap & 0xff, l->llc_ssap &0xff,
+			       l->llc_control & 0xff);
+
+		}
+#endif /* LLC_DEBUG */
+		} break;
+#endif /* LLC */
+
+	case AF_UNSPEC:
+#if 0 /* This code invokes undefined behaviour - dst->sa_data is not aligned */
+		eh = (struct ether_header *)dst->sa_data;
+		(void)memcpy(edst, eh->ether_dhost, sizeof (edst));
+		type = eh->ether_type;
+#else
+                (void)memcpy(edst, dst->sa_data, ETHER_ADDR_LEN);
+                type = *(u_short *)(dst->sa_data+2*ETHER_ADDR_LEN);
+#endif
+		break;
+
+	default:
+#ifdef DEBUG
+		Printf("%s%d: can't handle af%d\n", ifp->if_name, ifp->if_unit,
+			dst->sa_family);
+#endif
+		senderr(EAFNOSUPPORT);
+	}
+
+
+	if (mcopy) {
+#ifdef DEBUG
+                Printf("Copying via loopback: mcopy=%x\n", mcopy);
+#endif
+		(void) looutput(ifp, mcopy, dst, rt);
+	}
+
+#ifdef NotYet
+  gottrailertype:
+    /*
+     * Packet to be sent as trailer: move first packet
+     * (control information) to end of chain.
+     */
+    while (m->m_next)
+	m = m->m_next;
+
+    m->m_next = m0;
+    m = m0->m_next;
+    m0->m_next = 0;
+    m0 = m;
+
+  gottype:
+#endif
+#ifdef DEBUG
+    if( DODEBUG(DBGOUTPUT) )
+    {
+	switch( type )
+	{
+	  case ETHERTYPE_IP:
+	    Printf("imo: IP output to %s on i/f %s%d\n",
+		   ether_sprintf(edst), ifp->if_name, ifp->if_unit);
+	    break;
+
+	  default:
+	    Printf("imo: %x output to %s on i/f %s%d\n",
+		   type, ether_sprintf(edst), ifp->if_name, ifp->if_unit);
+	    break;
+	}
+    }
+#endif
+
+    {
+        struct mbuf *m1;
+
+        for (m1=m; m1; m1=m1->m_nextpkt) {
+            /* TRACE */
+            #ifdef DEBUG
+            if (DODEBUG(DBGOUTPUT))
+            {
+        	struct mbuf *m2;
+
+        	Printf("\021\003TXF (type %x): ", type);
+        	for( m2 = m1; m2; m2 = m2->m_next )
+        	    Printf("%x(%d, %d)-->", m2, m2->m_type, m2->m_len);
+        	Printf("(NULL)\021\007\n");
+            }
+            #endif
+            ifp->if_opackets++;
+            ifp->if_obytes+=m1->m_pkthdr.len;
+            if (m1->m_flags & (M_BCAST|M_MCAST))
+                ifp->if_omcasts++;
+        }
+    }
+
+#ifdef FLASHY_SCROLLLOCK
+    flashdiff = ifp->if_lastchange;
+    timevalsub(&flashdiff, &lastflash);
+    if (flashdiff.tv_sec != 0)
+        flashdiff.tv_usec = 1024*1024;
+
+    if (flashdiff.tv_usec > 49152) /* If last flashed > ~1/20 second ago */
+    {
+        lastflash = ifp->if_lastchange;
+    	_swix(OS_Byte, _INR(0,2), 202, 2, 255);  /* Toggle scrolllock state */
+    	_swix(OS_Byte, _IN(0),    118);          /* Reflect status in LEDs  */
+    	_swix(OS_Byte, _INR(0,2), 202, 2, 255);  /* Toggle scrolllock state */
+    }
+#endif
+
+    /*
+     * set parameters for Transmit - use default MAC address,
+     * and the driver assumes ownership of the data
+     *
+     * XXX
+     *
+     * the only possible error the driver can return is
+     * lack of output buffers, return an appropriate error
+     */
+    #if 1
+    if( (e = _swix(swinum, _INR(0,4), TX_OWNSOURCE | TX_DRIVERSDATA,
+                                      ifp->if_unit, type, m, edst)) != NULL ) {
+	error = ENOBUFS;
+	ifp->if_oerrors++;
+    }
+    #else
+    {
+        struct mbuf *aaa, *next = m;
+        while (next)
+        {
+            aaa = next->m_list;
+            m_freem(next);
+            next = aaa;
+        }
+
+        error = ENOBUFS;
+        ifp->if_oerrors++;
+    }
+    #endif
+
+#ifdef FLASHY_SCROLLLOCK
+    if (flashdiff.tv_usec > 49152)
+    	_swix(OS_Byte, _IN(0), 118); /* Reflect status in LEDs */
+#endif
+
+#ifdef DEBUG
+    if (DODEBUG(DBGOUTPUT))
+        Printf("imo: done output, error=%d\n", error);
+#endif
+    return(error);
+
+bad:
+    /*
+     * under DCI 4, m0 may be the head of a list of mbuf
+     * chains, make sure each chain is correctly freed.
+     */
+    while (m0)
+    {
+	m = m0;
+	m0 = m0->m_list;
+
+	m_freem(m);
+    }
+
+    return (error);
+}
+
+/**********************************************************************/
+
+int if_module_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e = NULL;
+    struct ifaddr *ifa = (struct ifaddr *)data;
+    struct ifreq *ifr = (struct ifreq *)data;
+    int error = 0;
+    int s = splimp();
+
+    r.r[0] = ifp->if_unit;
+
+    switch (cmd)
+    {
+      case SIOCSIFADDR:
+#ifdef DEBUG
+        if (DODEBUG(DBGOUTPUT))
+            Printf("if_module_ioctl(SIOCSIFADDR)\n");
+#endif
+	/*
+	 * as well as setting the interface address, this
+	 * call should also start the interface running
+	 * if necessary.  we do not directly tell the driver
+	 * to start running, but do this indirectly by
+	 * claiming the required frame types.
+	 */
+	if( (ifp->if_flags & (IFF_UP | IFF_RUNNING)) !=
+	   (IFF_UP | IFF_RUNNING) )
+	{
+	    if( (e = claim_frames(ifp, 1)) == NULL )
+		ifp->if_flags |= (IFF_UP | IFF_RUNNING);
+	}
+
+        arp_ifinit((struct arpcom *)ifp, ifa);
+
+	break;
+
+#ifdef MULTICAST
+      case SIOCADDMULTI:
+	error = if_module_addmulti(ifr, ifp);
+	break;
+      case SIOCDELMULTI:
+	error = if_module_delmulti(ifr, ifp);
+	break;
+#endif
+
+	case SIOCSIFFLAGS:
+	/*
+	 * flags have already been set by higher levels,
+	 * see whether interface is now supposed to be
+	 * up or down
+	 */
+	if( (ifp->if_flags & IFF_UP) && !(ifp->if_flags & IFF_RUNNING) )
+	{
+	    /*
+	     * try and bring the interface up
+	     */
+	    if( (e = claim_frames(ifp, 1)) != NULL )
+		/*
+		 * we failed
+		 */
+		ifp->if_flags &= ~(IFF_UP | IFF_RUNNING);
+	    else
+		ifp->if_flags |= IFF_RUNNING;
+	}
+	else if( !(ifp->if_flags & IFF_UP) && (ifp->if_flags & IFF_RUNNING) )
+	{
+	    /*
+	     * take the interface down
+	     */
+	    e = claim_frames(ifp, 0);
+	    ifp->if_flags &= ~(IFF_RUNNING);
+	}
+
+	break;
+
+	case SIOCSIFMTU:
+		e = _swix(ifp->if_swibase + DCI4SetNetworkMTU, _INR(0,2),
+                          0, ifp->if_unit, ifr->ifr_metric);
+                if (e == NULL)
+			ifp->if_mtu=ifr->ifr_metric;
+		break;
+
+      default:
+	break;
+    }
+
+    splx(s);
+
+    if (error)
+        return (error);
+
+    /*
+     * 950227 KWelton
+     *
+     * as an earlier comment suggested, we really
+     * should return an error here.
+     */
+    if( e )
+    {
+	errtunnel = *e;
+	return(ETUNNEL);
+    }
+    else
+    {
+	errtunnel.errnum = 0;
+	errtunnel.errmess[0] = '\0';
+	return(0);
+    }
+}
+
+/**********************************************************************/
+
+/*
+ * if_module_null - do nothing, and return no error
+ * (equivalent to nulldev() in BSD Unix).
+ */
+int if_module_null(struct ifnet *ifp, u_long cmd, caddr_t data)
+{
+    return(0);
+}
+
+/**********************************************************************/
+
+/*
+ * if_module_none - do nothing, and return ENXIO
+ * (equivalent to nodev() in BSD Unix).
+ */
+int if_module_none(struct ifnet *ifp, struct mbuf *m0, struct sockaddr *dst, struct rtentry *rt)
+{
+    struct mbuf *m;
+
+    /*
+     * under DCI 4, m0 may be the head of a list of mbuf
+     * chains, make sure each chain is correctly freed.
+     */
+    while (m0)
+    {
+        m = m0;
+        m0 = m0->m_list;
+
+        m_freem(m);
+    }
+
+    return(ENXIO);
+}
+
+/**********************************************************************/
+
+
+/*
+ * Convert Ethernet address to printable (loggable) representation.
+ */
+static char digits[] = "0123456789abcdef";
+char *
+ether_sprintf(ap)
+	register const u_char *ap;
+{
+	register int i;
+	static char etherbuf[18];
+	register char *cp = etherbuf;
+
+	for (i = 0; i < 6; i++) {
+		*cp++ = digits[*ap >> 4];
+		*cp++ = digits[*ap++ & 0xf];
+		*cp++ = ':';
+	}
+	*--cp = 0;
+	return (etherbuf);
+}
+
+#define ifp_to_dib(ifp) ((struct dib *)(ifp->if_dib))
+
+#ifdef MULTICAST
+static int if_module_addmulti(struct ifreq *ifr, struct ifnet *ifp)
+{
+    u_long addr;
+    struct if_multi *ifm;
+    struct sockaddr_in *sin;
+
+    if (ifr->ifr_addr.sa_family != AF_INET)
+        return EAFNOSUPPORT;
+
+    sin = (struct sockaddr_in *)&ifr->ifr_addr;
+    addr = sin->sin_addr.s_addr;
+
+    if (!IN_MULTICAST(ntohl(addr)) && addr != INADDR_ANY)
+        return EINVAL;
+
+    for (ifm = ifp->if_multiaddrs; ifm; ifm = ifm->ifm_next)
+    {
+        /* We know all addrs in the list are AF_INET */
+        if (((struct sockaddr_in *)&ifm->ifm_addr)->sin_addr.s_addr == addr)
+        {
+            ++ifm->ifm_refcount;
+            return 0;
+        }
+    }
+
+    /* New address - allocate it and link it in */
+    ifm = (struct if_multi *) malloc(sizeof(*ifm), M_IFMADDR, M_NOWAIT);
+    if (ifm == NULL)
+        return ENOBUFS;
+
+    ifm->ifm_next = ifp->if_multiaddrs;
+    ifm->ifm_refcount = 1;
+    ifm->ifm_addr = ifr->ifr_addr;
+    ifp->if_multiaddrs = ifm;
+
+    /* Need to do all the above to maintain the list even if we don't have a
+     * DCI driver that can do anything with it, because the darned fool user
+     * may later load a newer version of that driver with filtering!
+     * So we only check at this point...
+     */
+
+    if (ifp_to_dib(ifp)->dib_inquire & INQ_FILTERMCAST)
+    {
+        _kernel_oserror *e;
+        int flags = MULTICAST_ADDR_REQ;
+        u_int typenlevel = ETHERTYPE_IP;
+        u_char hwaddr[6];
+
+        if (addr == INADDR_ANY)
+            flags |= MULTICAST_ALL_ADDR;
+        else
+            ETHER_MAP_IP_MULTICAST(&sin->sin_addr, hwaddr);
+
+        SET_FRAMELEVEL(typenlevel, FRMLVL_E2SPECIFIC);
+        e = dci4_mc_request(ifp_to_dib(ifp), flags, typenlevel, hwaddr, &sin->sin_addr);
+        if (e)
+        {
+            errtunnel = *e;
+            return ETUNNEL;
+        }
+    }
+
+    return 0;
+}
+
+static int if_module_delmulti(struct ifreq *ifr, struct ifnet *ifp)
+{
+    u_long addr;
+    struct if_multi *ifm, **p;
+    struct sockaddr_in *sin;
+
+    if (ifr->ifr_addr.sa_family != AF_INET)
+        return EAFNOSUPPORT;
+
+    sin = (struct sockaddr_in *)&ifr->ifr_addr;
+    addr = sin->sin_addr.s_addr;
+
+    for (ifm = ifp->if_multiaddrs; ifm; ifm = ifm->ifm_next)
+    {
+        /* We know all addrs in the list are AF_INET */
+        if (((struct sockaddr_in *)&ifm->ifm_addr)->sin_addr.s_addr == addr)
+           break;
+    }
+
+    if (ifm == NULL)
+        return ENXIO;
+
+    if (--ifm->ifm_refcount != 0)
+        return 0; /* Still some claims to this record */
+
+    /* Unlink this record */
+    for (p = &ifp->if_multiaddrs; *p != ifm; p = &(*p)->ifm_next)
+        continue;
+
+    *p = (*p)->ifm_next;
+    free(ifm, M_IFMADDR);
+
+    if (ifp_to_dib(ifp)->dib_inquire & INQ_FILTERMCAST)
+    {
+        _kernel_oserror *e;
+        int flags = MULTICAST_ADDR_REL;
+        u_int typenlevel = ETHERTYPE_IP;
+        u_char hwaddr[6];
+
+        if (addr == INADDR_ANY)
+            flags |= MULTICAST_ALL_ADDR;
+        else
+            ETHER_MAP_IP_MULTICAST(&sin->sin_addr, hwaddr);
+
+        SET_FRAMELEVEL(typenlevel, FRMLVL_E2SPECIFIC);
+        e = dci4_mc_request(ifp_to_dib(ifp), flags, typenlevel, hwaddr, &sin->sin_addr);
+        if (!e && addr == INADDR_ANY)
+        {
+            /* We've just released our "all addresses" claim. DCI requires us to reclaim
+             * all our individual claims.
+             */
+             e = if_module_reclaimmulti(ifp);
+        }
+
+        if (e)
+        {
+            errtunnel = *e;
+            return ETUNNEL;
+        }
+    }
+
+    return 0;
+}
+
+_kernel_oserror *if_module_reclaimmulti(struct ifnet *ifp)
+{
+    _kernel_oserror *e;
+    struct sockaddr_in *sin;
+    u_long addr;
+    struct if_multi *ifm;
+    u_char hwaddr[6];
+    u_int typenlevel = ETHERTYPE_IP;
+
+    SET_FRAMELEVEL(typenlevel, FRMLVL_E2SPECIFIC);
+
+    for (ifm = ifp->if_multiaddrs; ifm; ifm = ifm->ifm_next)
+    {
+        int flags = MULTICAST_ADDR_REQ;
+
+        /* Again, we know all addresses are AF_INET */
+        sin = (struct sockaddr_in *)&ifm->ifm_addr;
+        addr = sin->sin_addr.s_addr;
+
+        if (addr == INADDR_ANY)
+            flags |= MULTICAST_ALL_ADDR;
+        else
+            ETHER_MAP_IP_MULTICAST(&sin->sin_addr, hwaddr);
+
+        e = dci4_mc_request(ifp_to_dib(ifp), flags, typenlevel, hwaddr, &sin->sin_addr);
+        if (e) return e;
+    }
+
+    return NULL;
+}
+#endif

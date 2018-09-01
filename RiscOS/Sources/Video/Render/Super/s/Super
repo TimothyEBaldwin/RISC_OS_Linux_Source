@@ -1,0 +1,656 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > Sources.Super
+;
+; Purpose: Super-sample 1-bpp images to 4-bpp, reducing by 4x4
+; Author:  Neil Raine
+;
+; CHANGE LIST:
+;
+; 12-Aug-88     0.02    File created (version 1 was the slow version)
+;  5-May-89     0.03    SWI chunk changed to use &40D80..&40DBF
+;  9-May-89             Help string changed to correspond to module name
+;  9-May-89     0.04    Unbodge SWI table so Super_Sample90 can be used
+; 22-Aug-89             Put in Roger's speedups
+; 24-Aug-89     0.05    Read the version number and date from 'VersionS'
+; 15-Sep-89     0.06    Use threshold to remove very light pixels
+; 12-Dec-91     0.07    Now looks up error messages using MessageTrans
+; 08-Feb-93     0.08    Use Hdr: to get headers.
+;
+;----------------------------------------------------------------------------
+;
+; Algorithm:
+;
+; Each point in the output sprite is produced by taking the weighted average
+; of the pixels in a 7x7 grid centred on the point:
+;
+;     1  2  3  4  3  2  1
+;     2  4  6  8  6  4  2             The sample grids are spaced exactly
+;     3  6  9 12  9  6  3             4 input pixels apart (ie. they overlap
+;     4  8 12 16 12  8  4             by 3 pixels on each side).
+;     3  6  9 12  9  6  3
+;     2  4  6  8  6  4  2             f(x,y) = (4-|x|) * (4-|y|)
+;     1  2  3  4  3  2  1
+;
+; Since all the input pixels are 0 or 1, we find that each row of input pixels
+; forms a 7-bit binary number, which can be used as the index into a lookup
+; table giving the right answer!
+;
+; The possible totals range from 0 to 256, so we add a rounding up value and
+; divide by 16 to obtain a value suitable for a 4-bpp sprite (ensuring that
+; 16 is rounded down to 15).
+;
+;-----------------------------------------------------------------------------
+
+
+        AREA    |SuperSample$$Code|, CODE, READONLY, PIC
+
+Module_BaseAddr
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:NDRDebug
+        GET     Hdr:MsgTrans
+
+	GET	VersionASM
+
+        GBLL    debug
+        GBLL    hostvdu
+
+debug   SETL    {FALSE}
+hostvdu SETL    {TRUE}
+
+MySWIBase * SuperSamplerSWI_Base
+
+        ASSERT  (.=Module_BaseAddr)
+        DCD     0            ; Start
+        DCD     0            ; Init
+        DCD     0            ; Die
+        DCD     0            ; Service
+        DCD     Title        - Module_BaseAddr
+        DCD     Helpstr      - Module_BaseAddr
+        DCD     0            ; Helptable
+        DCD     MySWIBase
+        DCD     MySWIDecode  - Module_BaseAddr
+        DCD     MySWINames   - Module_BaseAddr
+        DCD     0
+    [ :LNOT: No32bitCode
+        DCD     0
+        DCD     MyFlags      - Module_BaseAddr
+    ]
+
+Title   =       "SuperSample",0
+Helpstr =       "SuperSample",9,"$Module_HelpVersion", 0
+        ALIGN
+
+    [ :LNOT: No32bitCode
+MyFlags DCD     ModuleFlag_32bit
+    ]
+
+;;----------------------------------------------------------------------------
+;; SWI decoding
+;;----------------------------------------------------------------------------
+
+MySWIDecode
+        CLRPSR  I_bit+F_bit,R0          ; re-enable interrupts!!!
+        LDR     R12,[R12]               ; R12 --> workspace
+        CMP     R11,#maxSWI
+        ASSERT  (MySWITable-. = 8)      ; table must follow
+        ADDCC   PC,PC,R11,LSL #2
+        B       swierror
+
+MySWITable
+        B       SuperSample90           ; 1 x 1 aspect ratio
+        B       SuperSample45           ; 1 x 2 aspect ratio
+
+maxSWI  *       (.-MySWITable):SHR:2
+
+MySWINames
+        DCB     "Super",0             ; prefix
+        DCB     "Sample90",0
+        DCB     "Sample45",0
+        DCB     0
+        ALIGN
+
+swierror
+        ADR     R0,ErrorBlock_NoSuchSWI
+        ADR     R1,Title
+        B       LookupError
+
+        MakeInternatErrorBlock  NoSuchSWI,,BadSWI
+
+;
+; Entry:  R1 --> input (1-bpp) array
+;         R2 = line spacing    - bit 31 of last word of each row unused
+;         R3 = number of rows  - must be 4n+3 for some n>0
+;         R4 --> output (4-bpp) array (will be n rows deep)
+; Exit:   R0 corrupted, all other regs preserved
+; Errors: "Bad super-sample sprite size"
+;
+; If the input sprite is 4n+3 pixels wide and high, then we don't need to
+; do any special messing-about at the edges (start at 3,3 and step by 4,4)
+;
+
+inptr    RN     R1      ; Fmask
+linegap  RN     R2      ; shift
+rowcount RN     R3      ; hex7F
+outptr   RN     R4      ; lookup - outptr not used in main loop
+
+total   RN      R0
+Fmask   RN      R1      ; inptr
+shift   RN      R2      ; linegap
+hex7F   RN      R3      ; rowcount
+lookup  RN      R4      ; outptr
+outword RN      R5
+inword1 RN      R6
+inword2 RN      R7
+inword3 RN      R8
+inword4 RN      R9
+inword5 RN      R10
+inword6 RN      R11
+inword7 RN      R12
+
+roundup   *     14              ; same as Roger's stuff
+
+        MakeInternatErrorBlock BadParameters,,BadParm
+
+; In    R1 = inptr
+;       R2 = linegap
+;       R3 = rowcount
+;       R4 = outptr
+
+SuperSample90 ROUT
+
+        AND     R0,rowcount,#&80000003
+        TEQ     R0,#3
+        TSTEQ   linegap,#&80000003
+        ADRNE   R0,ErrorBlock_BadParameters
+        MOVNE   R1,#0
+        BNE     LookupError
+
+        Push    "R1-R11,LR"
+;
+        SUBS    rowcount,rowcount,#3
+        Pull    "R1-R11,PC",EQ                  ; treat as null if < 7 rows
+
+                ^       0
+sp_inptr        #       4
+sp_linegap      #       4
+sp_outptr       #       4
+sp_colcount     #       4
+sp_rowcount     #       4
+sp_localsize    #       0
+
+
+        Debug   ,"SuperSample90: R1,R2,R3,R4 =",R1,R2,R3,R4
+
+        ASSERT  linegap < rowcount
+        ASSERT  inptr < linegap
+        ASSERT  linegap < outptr
+
+        Push    "linegap,rowcount"              ; column,row counters
+        Push    "inptr,linegap,outptr"
+
+        ADR     lookup,LookupTable              ; 1 2 3 4 3 2 1
+        MOV     hex7F,#&7F
+01
+        Debug   ,"New row: inptr,linegap =",inptr,linegap
+
+        LDR     inword1,[inptr],linegap
+        LDR     inword2,[inptr],linegap
+        LDR     inword3,[inptr],linegap
+        LDR     inword4,[inptr],linegap
+        LDR     inword5,[inptr],linegap
+        LDR     inword6,[inptr],linegap
+        LDR     inword7,[inptr],linegap
+02
+        MOV     outword,#&08000000              ; stop with 1 pixel to go
+        MOV     shift,#0                        ; loop is performed 7 times
+        MOV     Fmask,#&F0000000
+;
+; first 7 pixels are done in a loop, using all 14 available registers!
+; could be expanded out to get another register
+;
+03
+        ANDS    total,hex7F,inword1,LSR shift
+        LDRNEB  total,[lookup,total]            ; x 1
+
+        ANDS    r14,hex7F,inword2,LSR shift
+        LDRNEB  r14,[lookup,R14]
+        ADD     total,total,R14,LSL #1          ; x 2
+
+        ANDS    r14,hex7F,inword3,LSR shift
+        LDRNEB  r14,[lookup,R14]
+        ADD     total,total,R14,LSL #1
+        ADD     total,total,R14                 ; x 3
+
+        ANDS    r14,hex7F,inword4,LSR shift
+        LDRNEB  r14,[lookup,R14]
+        ADD     total,total,R14,LSL #2          ; x 4
+
+        ANDS    r14,hex7F,inword5,LSR shift
+        LDRNEB  r14,[lookup,R14]
+        ADD     total,total,R14,LSL #1
+        ADD     total,total,R14                 ; x 3
+
+        ANDS    r14,hex7F,inword6,LSR shift
+        LDRNEB  r14,[lookup,R14]
+        ADD     total,total,R14,LSL #1          ; x 2
+
+        ANDS    r14,hex7F,inword7,LSR shift
+        LDRNEB  r14,[lookup,R14]
+        ADD     total,total,R14                 ; x 1
+
+        ADD     total,total,#roundup            ; round to nearest colour
+        ANDS    total,Fmask,total,LSL #24
+        MOVCS   total,#&F0000000                ; watch out for overflow!
+      [ Module_Version >= 6
+        CMP     total,#&10000000                ; remove very light pixels
+        MOVLS   total,#&00000000                ; due to overwriting problems
+      ]
+        ORRS    outword,total,outword,LSR #4
+        ADDCC   shift,shift,#4
+        BCC     %BT03                           ; stop when only 3 bits left
+;
+; for the last pixel, we must collect the bottom 3 bits of the next word
+; read in inword1..7 while we're at it!
+;
+        ASSERT  sp_inptr = 0
+        ASSERT  sp_linegap = 4
+
+        LDMIA   sp,{inptr,linegap}
+
+        LDR     R14,[sp,#sp_colcount]           ; column counter
+        SUBS    R14,R14,#4
+        BEQ     %FT04                           ; don't do last pixel of a row
+        STR     R14,[sp,#sp_colcount]
+
+        MOV     R14,inword1,LSR #3              ; 4 bits (25..28) are used
+        LDR     inword1,[inptr,#4]!
+        STR     inptr,[sp,#sp_inptr]            ; update for next time
+
+        ORR     R14,R14,inword1,LSL #29         ; stuff in the top 3 bits
+        LDRB    total,[lookup,R14,LSR #25]      ; x 1
+
+        MOV     R14,inword2,LSR #3
+        LDR     inword2,[inptr,linegap]!
+        ORR     R14,R14,inword2,LSL #29
+        LDRB    R14,[lookup,R14,LSR #25]
+        ADD     total,total,R14,LSL #1          ; x 2
+
+        MOV     R14,inword3,LSR #3
+        LDR     inword3,[inptr,linegap]!
+        ORR     R14,R14,inword3,LSL #29
+        LDRB    R14,[lookup,R14,LSR #25]
+        ADD     total,total,R14,LSL #1
+        ADD     total,total,R14                 ; x 3
+
+        MOV     R14,inword4,LSR #3
+        LDR     inword4,[inptr,linegap]!
+        ORR     R14,R14,inword4,LSL #29
+        LDRB    R14,[lookup,R14,LSR #25]
+        ADD     total,total,R14,LSL #2          ; x 4
+
+        MOV     R14,inword5,LSR #3
+        LDR     inword5,[inptr,linegap]!
+        ORR     R14,R14,inword5,LSL #29
+        LDRB    R14,[lookup,R14,LSR #25]
+        ADD     total,total,R14,LSL #1
+        ADD     total,total,R14                 ; x 3
+
+        MOV     R14,inword6,LSR #3
+        LDR     inword6,[inptr,linegap]!
+        ORR     R14,R14,inword6,LSL #29
+        LDRB    R14,[lookup,R14,LSR #25]
+        ADD     total,total,R14,LSL #1          ; x 2
+
+        MOV     R14,inword7,LSR #3
+        LDR     inword7,[inptr,linegap]         ; don't bother with writeback
+        ORR     R14,R14,inword7,LSL #29
+        LDRB    R14,[lookup,R14,LSR #25]
+        ADD     total,total,R14                 ; x 1
+
+        ADD     total,total,#roundup            ; round to nearest colour
+        MOVS    total,total,LSL #24
+        ANDCC   total,total,#&F0000000
+        MOVCS   total,#&F0000000                ; watch out for overflow!
+      [ Module_Version >= 6
+        CMP     total,#&10000000                ; remove very light pixels
+        MOVLS   total,#&00000000                ; due to overwriting problems
+      ]
+        ORR     outword,total,outword,LSR #4
+
+        LDR     R14,[sp,#sp_outptr]             ; not the last word
+        STR     outword,[R14],#4
+        STR     R14,[sp,#sp_outptr]
+        B       %BT02
+04
+        LDR     R14,[sp,#sp_outptr]             ; finish off the last word
+        MOV     outword,outword,LSR #4
+        STR     outword,[R14],#4
+        STR     R14,[sp,#sp_outptr]
+
+        STR     linegap,[sp,#sp_colcount]       ; ready for next time
+
+        ADD     inptr,inptr,#4                  ; skip 4 bytes + 3 rows
+        ADD     inptr,inptr,linegap
+        ADD     inptr,inptr,linegap,LSL #1
+        STR     inptr,[sp,#sp_inptr]
+
+        LDR     R14,[sp,#sp_rowcount]           ; row counter
+        SUBS    R14,R14,#4                      ; we're doing 4 rows at a time
+        STRGT   R14,[sp,#sp_rowcount]
+        BGT     %BT01
+
+        ADD     sp,sp,#sp_localsize             ; remove local stack frame
+        Pull    "R1-R11,PC"
+
+;
+; This table is generated by a BASIC program 'GenMatrix1'
+;
+
+        GET     Matrix1.s
+
+
+;-----------------------------------------------------------------------------
+;
+; Algorithm 2:
+;
+; Each point in the output sprite is produced by taking the weighted average
+; of the pixels in a 9x7 grid centred on the point:
+;
+;     0  0  0  0  1  0  0  0  0
+;     1  2  4  6  6  6  4  2  1       The sample grids are spaced exactly
+;     1  4  8 12 13 12  8  4  1       4 input pixels apart, overlapping by
+;     1  4  8 12 14 12  8  4  1       4 pixels on each side horizontally
+;     1  4  8 12 13 12  8  4  1       and 3 pixels vertically.
+;     1  2  4  6  6  6  4  2  1
+;     0  0  0  0  1  0  0  0  0
+;
+; Since all the input pixels are 0 or 1, we find that each row of input pixels
+; forms a 9-bit binary number, which can be used as the index into a lookup
+; table giving the right answer!
+;
+; Here the top and bottom rows are easy to calculate, and the middle row is
+; trivially different from the two around it, so 2 tables of 512 bytes are used
+;
+; The possible totals range from 0 to 256, so we add a rounding up value and
+; divide by 16 to obtain a value suitable for a 4-bpp sprite (ensuring that
+; 16 is rounded down to 15).
+;
+;-----------------------------------------------------------------------------
+
+; In    R1 = inptr
+;       R2 = linegap
+;       R3 = rowcount
+;       R4 = outptr
+
+extrabit        *       4               ; bit position of extra 1 bit
+                                        ; used on rows 1,4 and 7
+hex1FF  RN      hex7F
+
+SuperSample45 ROUT
+
+        AND     R0,rowcount,#&80000003
+        TEQ     R0,#3
+        TSTEQ   linegap,#&80000003
+        ADRNEL  R0,ErrorBlock_BadParameters
+        MOVNE   R1,#0
+        BNE     LookupError
+
+        Push    "R1-R11,LR"
+;
+        SUBS    rowcount,rowcount,#3
+        Pull    "R1-R11,PC",EQ                  ; treat as null if < 7 rows
+
+        Debug   ,"SuperSample45: R1,R2,R3,R4 =",R1,R2,R3,R4
+
+        ASSERT  linegap < rowcount
+        ASSERT  inptr < linegap
+        ASSERT  linegap < outptr
+
+        Push    "linegap,rowcount"              ; column,row counters
+        Push    "inptr,linegap,outptr"
+
+      [ Module_Version >= 5
+        ADRL    lookup,LookupTable2             ; point at MIDDLE of tables
+      |
+        ADR     lookup,LookupTable1             ; one of 2 tables used
+      ]
+        LDR     hex1FF,=(1:SHL:9)-1
+01
+        Debug   ,"New row: inptr,linegap =",inptr,linegap
+
+        LDR     inword1,[inptr],linegap
+        LDR     inword2,[inptr],linegap
+        LDR     inword3,[inptr],linegap
+        LDR     inword4,[inptr],linegap
+        LDR     inword5,[inptr],linegap
+        LDR     inword6,[inptr],linegap
+        LDR     inword7,[inptr],linegap
+02
+        MOV     outword,#&08000000              ; stop with 1 pixel to go
+        MOV     shift,#0                        ; loop is performed 7 times
+        MOV     Fmask,#&F0000000
+;
+; first 7 pixels are done in a loop, using all 14 available registers!
+; could be expanded out to get another register
+;
+03
+
+        ANDS    total,hex1FF,inword2,LSR shift
+      [ Module_Version >= 5
+        LDRNEB  total,[lookup,-total]           ; lookuptable1 (use -ve offsets)
+      |
+        LDRNEB  total,[lookup,total]            ; lookuptable1
+      ]
+
+        MOV     R14,inword1,LSR shift
+        TST     R14,#1:SHL:extrabit             ; bodge top row
+        ADDNE   total,total,#1
+
+      [ Module_Version < 5
+        ADD     lookup,lookup,#LookupSwap
+      ]
+
+        ANDS    R14,hex1FF,inword3,LSR shift
+        LDRNEB  R14,[lookup,R14]                ; lookuptable2
+        ADDNE   total,total,R14
+
+        AND     R14,hex1FF,inword4,LSR shift
+        TEQ     R14,R14,LSR #extrabit+1         ; sets up Z and C !!!
+        LDRNEB  r14,[lookup,R14]
+        ADCNE   total,total,R14                 ; adds 1 more if extrabit set
+
+        ANDS    r14,hex1FF,inword5,LSR shift
+        LDRNEB  r14,[lookup,R14]                ; lookuptable2
+        ADDNE   total,total,R14
+
+      [ Module_Version < 5
+        SUB     lookup,lookup,#LookupSwap
+      ]
+
+        ANDS    r14,hex1FF,inword6,LSR shift
+      [ Module_Version >= 5
+        LDRNEB  r14,[lookup,-R14]               ; lookuptable1 (use -ve offsets)
+      |
+        LDRNEB  r14,[lookup,R14]                ; lookuptable1
+      ]
+        ADDNE   total,total,R14
+
+        AND     r14,hex1FF,inword7,LSR shift    ; bodge bottom row
+      [ Module_Version >= 5
+        MOVS    r14, r14, LSR #extrabit+1       ; move into carry flag
+        ADC     total, total, #roundup          ; sneaky!
+      |
+        TST     r14,#1:SHL:extrabit
+        ADDNE   total,total,#1
+
+        ADD     total,total,#roundup            ; round to nearest colour
+      ]
+        ANDS    total,Fmask,total,LSL #24
+        MOVCS   total,#&F0000000                ; watch out for overflow!
+      [ Module_Version >= 6
+        CMP     total,#&10000000                ; remove very light pixels
+        MOVLS   total,#&00000000                ; due to overwriting problems
+      ]
+        ORRS    outword,total,outword,LSR #4
+        ADDCC   shift,shift,#4
+        BCC     %BT03                           ; stop when only 3 bits left
+;
+; for the last pixel, we must collect the bottom 4 bits of the next word
+; read in inword1..7 while we're at it!
+;
+        ASSERT  sp_inptr = 0
+        ASSERT  sp_linegap = 4
+
+        LDMIA   sp,{inptr,linegap}
+
+        LDR     R14,[sp,#sp_colcount]           ; column counter
+        SUBS    R14,R14,#4
+        BEQ     %FT04                           ; don't do last pixel of a row
+        STR     R14,[sp,#sp_colcount]
+
+        ASSERT  extrabit = 4
+        MOV     total,inword1,LSR #31           ; 0 or 1 depending on top bit!
+        LDR     inword1,[inptr,#4]!
+        STR     inptr,[sp,#sp_inptr]            ; update for next time
+
+        MOV     R14,inword2,LSR #4              ; 5 bits from the old word
+        LDR     inword2,[inptr,linegap]!        ; 4 bits from the new word
+        ORR     R14,R14,inword2,LSL #28
+
+      [ Module_Version >= 5
+        LDRB    R14,[lookup,-R14,LSR #23]       ; lookuptable1 (use -ve offsets)
+      |
+        LDRB    R14,[lookup,R14,LSR #23]        ; lookuptable1
+      ]
+        ADD     total,total,R14
+
+      [ Module_Version < 5
+        ADD     lookup,lookup,#LookupSwap
+      ]
+
+        MOV     R14,inword3,LSR #4
+        LDR     inword3,[inptr,linegap]!
+        ORR     R14,R14,inword3,LSL #28
+        LDRB    R14,[lookup,R14,LSR #23]        ; lookuptable2
+        ADD     total,total,R14
+
+        MOV     R14,inword4,LSR #4
+        LDR     inword4,[inptr,linegap]!
+        ORR     R14,R14,inword4,LSL #28
+        TEQ     R14,R14,LSR #23+extrabit+1      ; sets C accordingly
+        LDRB    R14,[lookup,R14,LSR #23]
+        ADC     total,total,R14                 ; adds 1 if extrabit set
+
+        MOV     R14,inword5,LSR #4
+        LDR     inword5,[inptr,linegap]!
+        ORR     R14,R14,inword5,LSL #28
+        LDRB    R14,[lookup,R14,LSR #23]        ; lookuptable2
+        ADD     total,total,R14
+
+      [ Module_Version < 5
+        SUB     lookup,lookup,#LookupSwap
+      ]
+
+        MOV     R14,inword6,LSR #4
+        LDR     inword6,[inptr,linegap]!
+        ORR     R14,R14,inword6,LSL #28
+      [ Module_Version >= 5
+        LDRB    R14,[lookup,-R14,LSR #23]       ; lookuptable1 (use -ve offsets)
+      |
+        LDRB    R14,[lookup,R14,LSR #23]        ; lookuptable1
+      ]
+        ADD     total,total,R14
+
+        ASSERT  extrabit = 4                    ; only top bit is significant
+        ADD     total,total,inword7,LSR #31
+        LDR     inword7,[inptr,linegap]         ; don't bother with writeback
+
+        ADD     total,total,#roundup            ; round to nearest colour
+        MOVS    total,total,LSL #24
+        ANDCC   total,total,#&F0000000
+        MOVCS   total,#&F0000000                ; watch out for overflow!
+      [ Module_Version >= 6
+        CMP     total,#&10000000                ; remove very light pixels
+        MOVLS   total,#&00000000                ; due to overwriting problems
+      ]
+        ORR     outword,total,outword,LSR #4
+
+        LDR     R14,[sp,#sp_outptr]             ; not the last word
+        STR     outword,[R14],#4
+        STR     R14,[sp,#sp_outptr]
+        B       %BT02
+04
+        LDR     R14,[sp,#sp_outptr]             ; finish off the last word
+        MOV     outword,outword,LSR #4
+        STR     outword,[R14],#4
+        STR     R14,[sp,#sp_outptr]
+
+        STR     linegap,[sp,#sp_colcount]       ; ready for next time
+
+        ADD     inptr,inptr,#4                  ; skip 4 bytes + 3 rows
+        ADD     inptr,inptr,linegap
+        ADD     inptr,inptr,linegap,LSL #1
+        STR     inptr,[sp,#sp_inptr]
+
+        LDR     R14,[sp,#sp_rowcount]           ; row counter
+        SUBS    R14,R14,#4                      ; we're doing 4 rows at a time
+        STRGT   R14,[sp,#sp_rowcount]
+        BGT     %BT01
+
+        ADD     sp,sp,#sp_localsize             ; remove local stack frame
+        Pull    "R1-R11,PC"
+
+; **********************************************************************
+;
+; Message token lookup function.  We only use Global messages.
+;
+
+LookupError
+        Push    "r1-r7,lr"
+        MOV     r4, r1
+        MOV     r1, #0
+        MOV     r2, #0
+        MOV     r5, #0
+        MOV     r6, #0
+        MOV     r7, #0
+        SWI     XMessageTrans_ErrorLookup
+        Pull    "r1-r7,pc"
+
+        LTORG
+
+;
+; The tables are held in the following file,
+; and are generated by a BASIC program 'GenMatrix2'
+; The new version is accessed via a central point using negative offsets
+;
+
+        GET     Matrix2.s
+
+      [ Module_Version < 5
+LookupSwap      *       LookupTable2 - LookupTable1
+      ]
+
+      [ debug
+        InsertNDRDebugRoutines
+      ]
+
+        END

@@ -1,0 +1,1283 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*textarea.c - rendering for text areas */
+
+/*From CLib */
+#include <ctype.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*From OSLib */
+#include "colourtrans.h"
+#include "draw.h"
+#include "macros.h"
+#include "os.h"
+#include "pdriver.h"
+
+/*From Support */
+#include "callback.h"
+#include "riscos.h"
+#include "jc_trace.h"
+#include "trfm.h"
+
+/*Local */
+#include "drawfile.h"
+#include "main.h"
+#include "render.h"
+#include "textarea.h"
+#include "verify.h"
+
+#define TEXT_BUFFER_SIZE 255
+
+typedef enum
+{
+  Align_Left, Align_Right, Align_Centre, Align_Double
+}
+Align;
+
+typedef enum
+{
+  Flush_All, Flush_Some, Flush_Complete
+}
+Flush_Type;
+
+/*Type of a text area control sequence. |Tag| is either a character from the
+   text area, or one of the command codes disjoined with 0x100.
+ */
+
+typedef
+struct
+{
+  int tag;
+
+  union
+  {
+    int argv[3];                       /* up to 3 arguments */
+    Align align;                       /* for \A */
+    struct
+    {
+      int font_no;
+      char font_name[font_NAME_LIMIT + 1];
+      int xsize, ysize;
+    }
+    font_no_def;                       /* for \F */
+  }
+  data;
+}
+Esc;
+
+/*Global state is kept in here. */
+typedef
+struct
+{
+  drawfile_object *object;
+  enum
+  {
+    Fsm_Normal, Fsm_New_Line, Fsm_New_Paragraph
+  }
+  fsm;
+  char *buffer;
+  int i;                               /* for filling |buffer| */
+
+  char buffer_minus_7[7 + TEXT_BUFFER_SIZE + 1];  /* needs a
+                                                     terminator */
+
+  drawfile_object *column;
+  os_coord pos;                        /* position within text column */
+  os_trfm *trfm, *hom_trfm;
+  os_box *clip;
+  bits flags;
+
+  osbool version_given;                /* had a \! command yet? */
+  Align align;                         /* \A command */
+  int font_no;                         /* \<digits> command */
+  os_colour fill, bg_hint;             /* \C, \B commands */
+  struct
+  {
+    byte position, thickness;
+  }
+  underline;                           /* \U command */
+  int ymove;                           /* \V command */
+  int line_spacing, paragraph_spacing; /* \L, \P commands */
+  struct
+  {
+    int left, right;
+  }
+  margins;                             /* \M commmand */
+  font_f f[100];                       /* font handle for given
+   font_no *//* \F command */
+}
+State;
+/*------------------------------------------------------------------------*/
+static os_error *Syntax(char c)
+
+{
+  char s[2];
+
+  return main_error_lookup(error_DRAW_FILE_SYNTAX, "Syntax",
+                           riscos_format_char(s, c));
+}
+/*------------------------------------------------------------------------*/
+static void Range_Check(int *i, int a, int b)
+
+{
+  if (*i < a)
+    *i = a;
+  else if (*i > b)
+    *i = b;
+}
+/*------------------------------------------------------------------------*/
+static char *Next_Char;
+
+static os_error *Lex_Next(Esc * esc)
+
+{
+  os_error *error = NULL;
+  char *ter;
+  int n;
+
+  if ((esc->tag = *Next_Char++) == '\\')
+    switch (esc->tag = *Next_Char++)
+    {
+    case '!':
+    case 'D':
+    case 'L':
+    case 'P':
+/* One integer argument expected. */
+      if (sscanf(Next_Char, "%d%n", &esc->data AS argv[0],
+                 &n) < 1 || strchr("\n/", Next_Char[n]) == NULL)
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char += n + 1;
+
+      if (esc->tag == '!')
+      {
+        if (esc->data AS argv[0] != 1)
+        {
+          char s[DEC_WIDTH + 1];
+
+          error = main_error_lookup(error_DRAW_FILE_AREA_VER,
+                                    "AreaVer", riscos_format_dec(s,
+                                                 esc->data AS argv[0], 0, 1));
+          goto finish;
+        }
+      }
+      else
+        Range_Check(&esc->data AS argv[0], esc->tag == 'P' ? 0 : 1,
+                    INT_MAX);
+
+      esc->tag |= 0x100;
+      break;
+
+    case 'A':
+      {                                /* One character argument with
+                                          optional '/' expected. */
+        char c[2];
+
+        if (sscanf(Next_Char, "%1[cCdDlLrR]%n", c, &n) < 1)
+        {
+          error = Syntax(esc->tag);
+          goto finish;
+        }
+
+        switch (c[0])
+        {
+        case 'c':
+        case 'C':
+          esc->data AS align = Align_Centre;
+          break;
+        case 'd':
+        case 'D':
+          esc->data AS align = Align_Double;
+          break;
+        case 'l':
+        case 'L':
+          esc->data AS align = Align_Left;
+          break;
+        case 'r':
+        case 'R':
+          esc->data AS align = Align_Right;
+          break;
+        }
+
+        Next_Char += n;
+        if (*Next_Char == '/' || *Next_Char == '\n')
+          Next_Char++;
+/* seems to be what Draw does ... */
+
+        esc->tag |= 0x100;
+      }
+      break;
+
+    case 'B':
+    case 'C':
+      {                                /* Three integer arguments
+                                          expected, or -1's for transparent */
+        int i;
+        osbool transparent = TRUE;
+
+        if (sscanf(Next_Char, "%d %d %d%n", &esc->data AS argv[0],
+                   &esc->data AS argv[1], &esc->data AS argv[2],
+                   &n) < 3 || strchr("\n/", Next_Char[n]) == NULL)
+        {
+          error = Syntax(esc->tag);
+          goto finish;
+        }
+
+        Next_Char += n + 1;
+
+        for (i = 0; i < 3; i++)
+          if (esc->data AS argv[i] != os_COLOUR_TRANSPARENT) transparent = FALSE;
+
+        if (!transparent)
+          for (i = 0; i < 3; i++)
+            Range_Check(&esc->data AS argv[i], 0, 255);
+
+        esc->tag |= 0x100;
+      }
+      break;
+
+    case 'F':
+/* Digits, font name, xsize, ysize expected, ysize is optional. */
+      if (sscanf(Next_Char, "%d %" STR(font_NAME_LIMIT) "s %d%n",
+                 &esc->data AS font_no_def.font_no,
+                 &esc->data AS font_no_def.font_name,
+                 &esc->data AS font_no_def.ysize, &n) < 3)
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char += n;
+
+      if (!(strchr("\n/", *Next_Char) == NULL))
+      {
+        n = 0;
+        esc->data AS font_no_def.xsize =
+            esc->data AS font_no_def.ysize;
+      }
+      else if (!(sscanf(Next_Char, "%d%n", &esc->data AS
+                        font_no_def.xsize, &n) < 1 || strchr("\n/",
+                                                       Next_Char[n]) == NULL))
+        ;
+      else
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char += n + 1;
+
+      Range_Check(&esc->data AS font_no_def.font_no, 0, 99);
+      Range_Check(&esc->data AS font_no_def.xsize, 1, INT_MAX);
+      Range_Check(&esc->data AS font_no_def.ysize, 1, INT_MAX);
+
+      esc->tag |= 0x100;
+      break;
+
+    case 'M':
+      if (sscanf(Next_Char, "%d %d%n", &esc->data AS argv[0],
+                 &esc->data AS argv[1], &n) < 2 || strchr("\n/",
+                                                        Next_Char[n]) == NULL)
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char += n + 1;
+
+      Range_Check(&esc->data AS argv[0], 1, INT_MAX);
+      Range_Check(&esc->data AS argv[1], 1, INT_MAX);
+
+      esc->tag |= 0x100;
+      break;
+
+    case 'U':
+      {
+        char c;
+
+        if (!(sscanf(Next_Char, " %c%n", &c, &n) < 1 || c != '.' ||
+              strchr("\n/", Next_Char[n]) == NULL))
+        {
+          esc->data AS argv[0] = 0;
+          esc->data AS argv[1] = 0;
+        }
+        else if (!(sscanf(Next_Char, "%d %d%n", &esc->data AS argv[0],
+                          &esc->data AS argv[1], &n) < 2 || strchr("\n/",
+                                                       Next_Char[n]) == NULL))
+          ;
+        else
+        {
+          error = Syntax(esc->tag);
+          goto finish;
+        }
+
+        Next_Char += n + 1;
+
+        Range_Check(&esc->data AS argv[0], -128, 127);
+        Range_Check(&esc->data AS argv[1], 0, 255);
+
+        esc->tag |= 0x100;
+      }
+      break;
+
+    case 'V':
+/* One integer argument with optional '/' expected. */
+      if (sscanf(Next_Char, "%d%n", &esc->data AS argv[0], &n) < 1)
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char += n;
+      if (*Next_Char == '/' || *Next_Char == '\n')
+        Next_Char++;
+/* blatant supposition */
+
+      Range_Check(&esc->data AS argv[0], -BINEXP(23) / font_POINT,
+                  (BINEXP(23) - 1) / font_POINT);  /* it's a 3-byte
+                                                      number */
+
+      esc->tag |= 0x100;
+      break;
+
+    case '-':
+/* No arguments. */
+      esc->tag |= 0x80;                /* soft hyphen */
+      break;
+
+    case '\n':
+/* No arguments. */
+      esc->tag |= 0x100;
+      break;
+
+    case '\\':
+/* No arguments. */
+      break;
+
+    case ';':
+/* Newline-terminated comment expected. */
+      if ((ter = strchr(Next_Char, '\n')) == NULL)
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char = ter + 1;
+
+      esc->tag |= 0x100;
+      break;
+
+    default:
+      if (!ISDIGIT(esc->tag))
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+/* One integer argument with optional '/' expected, already read the
+   first digit. */
+      Next_Char--;
+      if (sscanf(Next_Char, "%d%n", &esc->data AS argv[0], &n) < 1)
+      {
+        error = Syntax(esc->tag);
+        goto finish;
+      }
+
+      Next_Char += n;
+      if (*Next_Char == '/' || *Next_Char == '\n')
+        Next_Char++;
+/* more blatant supposition */
+
+      Range_Check(&esc->data AS argv[0], 0, 99);
+
+      esc->tag = '9' | 0x100;          /* '9' is the tag for
+                                          \<digits> */
+      break;
+    }
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *Flush(State * state, Flush_Type flush_type)
+
+   /* Empties the buffer, leaving |pos| at the end of the (possibly
+      partially-filled) line. |Flush_type| may be:
+
+      Flush_All: used at a line break to force everything in the
+      buffer to the screen
+
+      Flush_Some: used when the buffer is full and space is needed -
+      may force badly justified lines, but only if they are longer
+      than the buffer size
+
+      Flush_Complete: used when some parameter is changing to clear
+      out completed lines, with the expectation that the new value
+      will apply to line it lies within */
+
+{
+  char *text;
+  os_error *error = NULL;
+
+  trace_f(NULL _ 0 _
+          flush_type == Flush_All ? "[Flush_All]" :
+          flush_type == Flush_Some ? "[Flush_Some]" : "[Flush_Complete]");
+
+  if (!state->version_given)
+  {
+    error = main_error_lookup(error_DRAW_FILE_NO_AREA_VER, "NoAreaVer");
+    goto finish;
+  }
+
+  state->buffer[state->i] = font_COMMAND_NULL;
+  text = state->buffer;
+
+/* On entry, |pos| is at the end of the last text written. */
+
+  while (text < &state->buffer[state->i])
+  {
+    int max_width                      /* width of longest string
+       that will fit */ , line_width /* width of line available */ , true_width  /* width
+                                                                                    of
+                                                                                    string
+                                                                                    to
+                                                                                    be
+                                                                                    actually
+                                          written */ , sc, lc, y,
+                                       /* last values on line */
+        space_count, letter_count, ymove;  /* last real values on the
+                                              line */
+    byte p, t,                         /* last values on line */
+        position, thickness;           /* last real values on the
+                                          line */
+    char *split, *line_end, *line_start, *tt, previous;
+    os_coord pt;
+    font_paint_block paint_block =
+    {
+      {0, 0},
+      {0, 0},
+      {0, 0, 0, 0}};
+
+/* We now have something to paint, and although we may not paint it
+   if it doesn't fill a whole line, we're going to get a good
+   position in order to be able to tell whether this is the case. */
+    if (state->column == NULL)
+    {
+      state->column = (drawfile_object *) state->object->data AS
+          text_area.header.columns;
+      state->pos.y = state->column->data AS text_column.box.y1 -
+          state->line_spacing;
+      state->pos.x = state->column->data AS text_column.box.x0 +
+          state->margins.left;
+      trace_f(NULL _ 0 _ "[First column: pos (%d, %d)]" _ state->pos.x _
+              state->pos.y);
+    }
+    else
+    {
+      if (state->column->type == 0)
+/* Nowhere to paint it. */
+        break;
+
+/* Get a good |x|. */
+      if (state->pos.x >= state->column->data AS text_column.box.x1 -
+          state->margins.right)
+      {
+        state->pos.y -= state->line_spacing;
+        state->pos.x = state->column->data AS text_column.box.x0 +
+            state->margins.left;
+        trace_f(NULL _ 0 _ "[New line: pos (%d, %d)]" _ state->pos.x _
+                state->pos.y);
+      }
+
+/* Get a good |y|. */
+      if (state->pos.y < state->column->data AS text_column.box.y0)
+      {                                /* Get a good column. */
+        *(byte **) & state->column += state->column->size;
+
+        if (state->column->type == 0)
+/* Gone off the bottom of the last column. */
+          break;
+
+        state->pos.y = state->column->data AS text_column.box.y1 -
+            state->line_spacing;
+        state->pos.x = state->column->data AS text_column.box.x0 +
+            state->margins.left;
+        trace_f(NULL _ 0 _ "[New column: pos (%d, %d)]" _
+                state->pos.x _ state->pos.y);
+      }
+    }
+
+/* How much space does all that give us on this line? */
+    line_width = (state->column->data AS text_column.box.x1 -
+                  state->margins.right - state->pos.x) * 25 / 16;
+
+/* How much can we fit into that width? */
+    if ((error = xfont_scan_string(0, text, NONE, line_width, INT_MAX,
+                      NULL, NULL, 0, &split, &max_width, NULL, NULL)) != NULL)
+      goto finish;
+
+/* The string is painted if:
+
+   flush_type == Flush_All: regardless flush_type == Flush_Some: the
+   line is complete, or the first in the buffer flush_type ==
+   Flush_Complete: the line is complete
+
+   Otherwise, the loop is broken. */
+    if (!(flush_type == Flush_All || *split != font_COMMAND_NULL ||
+          (flush_type == Flush_Some && text == state->buffer)))
+      break;
+
+/* Delimit the string into a sequence of words, allowing for hyphens.
+   During this loop, we do three things: (a) count the number of
+   spaces (in order to calculate the additional offset on space); (b)
+   keep track of the current underline setting; (c) find the first
+   printable character - this is always painted if we are at the start
+   of a line. */
+    line_end = NULL;
+    tt = text;
+    previous = ' ';                    /* ensures the first char on
+                                          the line is not the last */
+    space_count = sc = 0;
+    letter_count = lc = 0;
+    position = p = 0;
+    thickness = t = 0;
+    ymove = y = 0;
+    while (tt <= split)
+    {
+      if
+          (                            /* is this a word-end? */
+            ((*tt == ' ' || *tt == font_COMMAND_NULL) && previous != ' ') ||
+
+/* is this a hyphenation point? */
+            previous == '-' ||
+
+/* is this a soft hyphenation point (not allowed at the end)? */
+            (*tt == font_COMMAND_COMMENT && tt != split)
+          )
+      {
+        position = p;
+        thickness = t;
+        letter_count = lc;
+        space_count = sc;
+        ymove = y;
+
+        line_end = tt;
+      }
+
+      previous = *tt;
+
+      switch (*tt)
+      {
+      case font_COMMAND_YMOVE:
+        y += *(tt + 1) | *(tt + 2) << 8 | *(tt + 3) << 16;
+        tt += 4;
+        break;
+
+      case font_COMMAND_TRUE_COLOURS:
+        tt += 8;
+        break;
+
+      case font_COMMAND_COMMENT:
+        tt += 2;
+        break;
+
+      case font_COMMAND_UNDERLINE:
+        p = *(tt + 1);
+        t = *(tt + 2);
+        tt += 3;
+        break;
+
+      case font_COMMAND_FONT:
+        tt += 2;
+        break;
+
+      case ' ':
+        sc++;
+      default:
+        lc++;
+        tt++;
+        break;
+      }
+    }
+    if (line_end == NULL)
+      line_end = split;
+
+    if (*line_end == font_COMMAND_COMMENT)
+    {
+      *line_end++ = '-';               /* replace
+                                          font_COMMAND_COMMENT with a
+                                          hyphen */
+      *line_end = ' ';                 /* replace '\0' with a space */
+    }
+
+/* Pass lightly on over trailing spaces. */
+    for (line_start = line_end; *line_start == ' '; line_start++)
+      ;
+
+/* For Align_Left, we don't need anything else: the string can be
+   painted immediately. For the others, we need the width of this new
+   string. */
+    if (state->align != Align_Left)
+    {
+      if ((error = xfont_scan_string(0, text, font_GIVEN_LENGTH, INT_MAX,
+                      INT_MAX, NULL, NULL, line_end - text, NULL, &true_width,
+                                     NULL, NULL)) != NULL)
+        goto finish;
+
+      switch (state->align)
+      {
+      case Align_Double:
+/* Only align if the string fills the line. */
+        if (*line_end != font_COMMAND_NULL)
+        {
+          pt.x = line_width - true_width;
+          pt.y = 0;
+
+          if (space_count > 0)
+          {
+            trfm_dir(&paint_block.space, state->trfm, &pt);
+
+            paint_block.space.x /= space_count;
+            paint_block.space.y /= space_count;
+          }
+          else if (letter_count > 1)
+          {
+            trfm_dir(&paint_block.letter, state->trfm, &pt);
+
+            paint_block.letter.x /= letter_count - 1;
+            paint_block.letter.y /= letter_count - 1;
+          }
+        }
+        break;
+
+      case Align_Centre:
+        state->pos.x += (line_width - true_width) * 8 / 25;
+        break;
+
+      case Align_Right:
+        state->pos.x += (line_width - true_width) * 16 / 25;
+        break;
+      }
+    }
+
+/* Paint it. */
+    trfm_point(&pt, state->trfm, &state->pos);
+/* Convert |pt| from DU to mpt. */
+    pt.x = pt.x * 25 / 16;
+    pt.y = pt.y * 25 / 16;
+
+    if (state->underline.position != 0 || state->underline.thickness != 0)
+    {
+      text -= 3;
+      text[0] = font_COMMAND_UNDERLINE;
+      text[1] = state->underline.position;
+      text[2] = state->underline.thickness;
+    }
+    if (state->ymove != 0)
+    {
+      text -= 4;
+      text[0] = font_COMMAND_YMOVE;
+      text[1] = state->ymove;
+      text[2] = state->ymove >> 8;
+      text[3] = state->ymove >> 16;
+    }
+     #ifdef XTRACE
+    {
+      char *tt;
+
+      for (tt = text; tt < line_end; tt++)
+        if (!iscntrl(*tt))
+          trace_f(NULL _ 0 _ "%c" _ * tt);
+        else
+          trace_f(NULL _ 0 _ "[%.2X]" _ * tt);
+    }
+     #endif
+
+/* N B If it is required to do source clipping at the level of
+   individual text columns, it will be necessary to keep track of the
+   state of the font number, colours, sizes, y-offset etc, in the same
+   way we do already for underlining. */
+    if (((state->flags & drawfile_RENDER_SUPPRESS) == NONE) &&
+        (state->fill != os_COLOUR_TRANSPARENT))
+    {
+      font_string_flags blend;
+      char tmp;                        /* 'coz |font_GIVEN_LENGTH|
+                                          doesn't work with pdrivers! */
+
+      blend = (render_can_blend && (state->bg_hint == os_COLOUR_TRANSPARENT)) ? font_BLEND_FONT : 0;
+      tmp = text[line_end - text], text[line_end - text] = '\0';
+      if ((error = xfont_paint(0, text, font_GIVEN_BLOCK |
+                               font_GIVEN_TRFM | font_GIVEN_LENGTH | blend,
+                               pt.x, pt.y, &paint_block, state->hom_trfm, line_end - text))
+                   != NULL)
+        goto finish;
+      text[line_end - text] = tmp;
+    }
+    state->underline.position = position;
+    state->underline.thickness = thickness;
+    state->ymove += ymove;
+
+    if (*line_end == font_COMMAND_NULL)
+/* Partial line just painted - update the width accurately. */
+      state->pos.x += max_width * 16 / 25;
+    else
+/* Full line painted - just set the width to the right margin. */
+      state->pos.x = state->column->data AS text_column.box.x1 -
+          state->margins.right;
+
+    text = line_start;
+  }
+
+  if (state->column->type != 0)
+  {
+    int left;
+
+    if ((left = &state->buffer[state->i] - text) > 0)
+      memmove(state->buffer, text, left);
+
+    state->i = left;
+  }
+  else
+    state->i = 0;
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *EmitC(State * state, char c)
+
+{
+  os_error *error = NULL;
+
+  trace_f(NULL _ 0 _ "%c" _ c);
+
+  if (state->i > TEXT_BUFFER_SIZE - 1)
+    if ((error = Flush(state, Flush_Some)) != NULL)
+      goto finish;
+
+  state->buffer[state->i++] = c;
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *EmitS(State * state, int c,...)
+
+  /* Puts a Font Manager command sequence into the buffer. */
+
+{
+  os_error *error = NULL;
+  va_list list;
+
+  switch (c)
+  {
+  case font_COMMAND_YMOVE:
+    {
+      int y;
+
+      while (state->i > TEXT_BUFFER_SIZE - 4)
+        if ((error = Flush(state, Flush_Some)) != NULL)
+          goto finish;
+
+      va_start(list, c);
+      y = va_arg(list, int);
+      va_end(list);
+
+      state->buffer[state->i++] = c;
+      state->buffer[state->i++] = y;
+      state->buffer[state->i++] = y >> 8;
+      state->buffer[state->i++] = y >> 16;
+    }
+    break;
+
+  case font_COMMAND_TRUE_COLOURS:
+    while (state->i > TEXT_BUFFER_SIZE - 8)
+      if ((error = Flush(state, Flush_Some)) != NULL)
+        goto finish;
+
+    va_start(list, c);
+    state->buffer[state->i++] = c;
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    va_end(list);
+
+    trace_f(NULL _ 0 _ "[%.2X]..." _ c);
+    break;
+
+  case font_COMMAND_COMMENT:
+    while (state->i > TEXT_BUFFER_SIZE - 2)
+      if ((error = Flush(state, Flush_Some)) != NULL)
+        goto finish;
+
+    state->buffer[state->i++] = c;
+    state->buffer[state->i++] = '\0';
+
+    trace_f(NULL _ 0 _ "[%.2X][00]" _ c);
+    break;
+
+  case font_COMMAND_UNDERLINE:
+    while (state->i > TEXT_BUFFER_SIZE - 3)
+      if ((error = Flush(state, Flush_Some)) != NULL)
+        goto finish;
+
+    va_start(list, c);
+    state->buffer[state->i++] = c;
+    state->buffer[state->i++] = va_arg(list, int);
+    state->buffer[state->i++] = va_arg(list, int);
+    va_end(list);
+
+    trace_f(NULL _ 0 _ "[%.2X]..." _ c);
+    break;
+
+  case font_COMMAND_FONT:
+    while (state->i > TEXT_BUFFER_SIZE - 2)
+      if ((error = Flush(state, Flush_Some)) != NULL)
+        goto finish;
+
+    va_start(list, c);
+    state->buffer[state->i++] = c;
+    state->buffer[state->i++] = va_arg(list, int);
+    va_end(list);
+
+    trace_f(NULL _ 0 _ "[%.2X]..." _ c);
+    break;
+  }
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *Emit_Line(State * state)
+
+{
+  os_error *error = NULL;
+
+  trace_f(NULL _ 0 _ "<new line>");
+
+  if ((error = Flush(state, Flush_All)) != NULL)
+    goto finish;
+
+/* Don't check for column overflow here - just wander off the bottom
+   of the column. When text is output, it will be done at the top of
+   the next column. */
+  state->pos.x = state->column->data AS text_column.box.x0 +
+      state->margins.left;
+  state->pos.y -= state->line_spacing;
+  trace_f(NULL _ 0 _ "[line break: pos (%d, %d)]" _ state->pos.x _
+          state->pos.y);
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *Emit_Paragraph(State * state)
+
+{
+  os_error *error = NULL;
+
+  trace_f(NULL _ 0 _ "<new paragraph>");
+
+  if ((error = Flush(state, Flush_All)) != NULL)
+    goto finish;
+
+/* Don't check for column overflow here - just wander off the bottom
+   of the column. When text is output, it will be done at the top of
+   the next column. */
+  state->pos.x = state->column->data AS text_column.box.x0 +
+      state->margins.left;
+  state->pos.y -= state->paragraph_spacing;
+  trace_f(NULL _ 0 _ "[paragraph break: pos (%d, %d)]" _ state->pos.x _
+          state->pos.y);
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+os_error *textarea_render(drawfile_object * object, os_trfm * trfm,
+                          os_box * clip, bits flags)
+
+{
+  os_error *error = NULL;
+  Esc esc;
+  drawfile_area_text *area_text;
+  State state;
+  os_trfm local_trfm;
+  drawfile_object *o;
+  byte r, g, b;
+
+  tracef("textarea_render\n");
+
+/* Find the start of the text proper. */
+  o = (drawfile_object *) object->data AS text_area.header.columns;
+  while (o->type != 0)
+  {
+        #if TRACE
+    {                                  /* Draw a nice grey rectangle
+                                          of the size of the text
+                                          column. */
+      os_coord t[3], u[3];
+      int i;
+
+      u[0].x = o->data AS text_column.box.x0;
+      u[0].y = o->data AS text_column.box.y0;
+      u[1].x = o->data AS text_column.box.x1;
+      u[1].y = o->data AS text_column.box.y0;
+      u[2].x = o->data AS text_column.box.x1;
+      u[2].y = o->data AS text_column.box.y1;
+
+      for (i = 0; i < 3; i++)
+      {
+        trfm_point(&t[i], trfm, &u[i]);
+
+        t[i].x /= draw_OS_UNIT, t[i].y /= draw_OS_UNIT;
+      }
+
+      if ((error = xcolourtrans_set_gcol(os_COLOUR_VERY_LIGHT_GREY,
+                      colourtrans_SET_FG_GCOL, os_ACTION_OVERWRITE, NULL, NULL)) !=
+          NULL)
+        goto finish;
+
+      if ((error = xos_plot(os_MOVE_TO, t[0].x, t[0].y)) != NULL)
+        goto finish;
+
+      if ((error = xos_plot(os_MOVE_TO, t[1].x, t[1].y)) != NULL)
+        goto finish;
+
+      if ((error = xos_plot(os_PLOT_PARALLELOGRAM | os_PLOT_TO, t[2].x,
+                            t[2].y)) != NULL)
+        goto finish;
+    }
+        #endif
+
+    *(byte **) & o += o->size;
+  }
+  area_text = (drawfile_area_text *) o;
+
+  local_trfm = *trfm;
+  local_trfm.entries[2][0] = 0;
+  local_trfm.entries[2][1] = 0;
+
+/* Set up the state structure. */
+  state.object = object;
+  state.fsm = Fsm_Normal;
+  state.buffer = state.buffer_minus_7 + 7;
+  state.i = 0;
+
+  state.column = NULL;                 /* not started yet */
+  state.pos.x = 0;
+  state.pos.y = 0;
+  state.trfm = trfm;
+  state.hom_trfm = &local_trfm;
+  state.clip = clip;
+  state.flags = flags;
+
+  state.version_given = FALSE;
+  state.align = Align_Left;
+  state.font_no = -1;                  /* no font selected initially */
+  state.fill = area_text->fill;
+  state.bg_hint = area_text->bg_hint;
+  state.underline.position = 0;
+  state.underline.thickness = 0;
+  state.ymove = 0;
+  state.line_spacing = 10 * draw_POINT;
+  state.paragraph_spacing = 10 * draw_POINT;
+  state.margins.left = draw_POINT;
+  state.margins.right = draw_POINT;
+  memset(state.f, font_SYSTEM, sizeof state.f);
+
+  if ((error = xcolourtrans_set_font_colours(colourtrans_CURRENT_FONT,
+                area_text->bg_hint, area_text->fill, 14, NULL, NULL, NULL)) !=
+      NULL)
+    goto finish;
+
+  Next_Char = area_text->text;
+
+  while (TRUE)
+  {
+    if ((error = Lex_Next(&esc)) != NULL)
+      goto finish;
+
+    if (esc.tag == '\0')
+/* No more input. */
+      break;
+
+        #ifdef XTRACE
+    if ((esc.tag & 0x100) == 0)
+      trace_f(NULL, 0, "%c" _ esc.tag);
+    else
+      trace_f(NULL, 0, "\\%c .../" _ esc.tag & 0xFF);
+        #endif
+
+/* Escape sequence. */
+    switch (esc.tag)
+    {
+    case '!' | 0x100:
+      state.version_given = TRUE;
+      break;
+
+    case 'A' | 0x100:
+      if ((error = Flush(&state, Flush_Complete)) != NULL)
+        goto finish;
+      state.align = esc.data AS align;
+      break;
+
+    case 'B' | 0x100:
+      r = esc.data AS argv[0];
+      g = esc.data AS argv[1];
+      b = esc.data AS argv[2];
+      if ((error = EmitS(&state, font_COMMAND_TRUE_COLOURS,
+                         r, g, b,
+                         state.fill >> 8, state.fill >> 16, state.fill >> 24,
+                         14)) != NULL)
+        goto finish;
+      if (esc.data AS argv[0] == os_COLOUR_TRANSPARENT)
+        state.bg_hint = os_COLOUR_TRANSPARENT;
+      else
+        state.bg_hint = (r << 8) | (g << 16) | (b << 24);
+      break;
+
+    case 'C' | 0x100:
+      r = esc.data AS argv[0];
+      g = esc.data AS argv[1];
+      b = esc.data AS argv[2];
+      if ((error = EmitS(&state, font_COMMAND_TRUE_COLOURS,
+                         state.bg_hint >> 8, state.bg_hint >> 16, state.bg_hint >> 24,
+                         r, g, b,
+                         14)) != NULL)
+        goto finish;
+      if (esc.data AS argv[0] == os_COLOUR_TRANSPARENT)
+        state.fill = os_COLOUR_TRANSPARENT;
+      else
+        state.fill = (r << 8) | (g << 16) | (b << 24);
+      break;
+
+    case 'F' | 0x100:
+      {
+        font_f f;
+
+        if ((error = xfont_find_font(esc.data AS
+                                     font_no_def.font_name,
+                                     16 * esc.data AS font_no_def.xsize,
+                           16 * esc.data AS font_no_def.ysize, 0, 0, &f, NULL,
+                                     NULL)) != NULL)
+          goto finish;
+        tracef("textarea_render: font_find_font () -> %d\n" _ f);
+
+        state.f[esc.data AS font_no_def.font_no] = f;
+      }
+      break;
+
+    case '9' | 0x100:
+      {
+        font_f f;
+
+/* Check that this font has been defined before setting it. */
+        if ((f = state.f[esc.data AS argv[0]]) == font_SYSTEM)
+        {
+          char s[DEC_WIDTH + 1];
+
+          error = main_error_lookup(error_DRAW_FILE_FONT_NO, "FontNo",
+                             riscos_format_dec(s, esc.data AS argv[0], 0, 1));
+          goto finish;
+        }
+
+        if ((error = EmitS(&state, font_COMMAND_FONT, f)) != NULL)
+          goto finish;
+        state.font_no = esc.data AS argv[0];
+      }
+      break;
+
+    case 'L' | 0x100:
+      if ((error = Flush(&state, Flush_Complete)) != NULL)
+        goto finish;
+      state.line_spacing = esc.data AS argv[0] * draw_POINT;
+      break;
+
+    case 'M' | 0x100:
+      if ((error = Flush(&state, Flush_Complete)) != NULL)
+        goto finish;
+      state.margins.left = esc.data AS argv[0] * draw_POINT;
+      state.margins.right = esc.data AS argv[1] * draw_POINT;
+      break;
+
+    case 'P' | 0x100:
+      if ((error = Flush(&state, Flush_Complete)) != NULL)
+        goto finish;
+      state.paragraph_spacing = esc.data AS argv[0] * draw_POINT;
+      break;
+
+    case 'U' | 0x100:
+      if ((error = EmitS(&state, font_COMMAND_UNDERLINE,
+                         esc.data AS argv[0], esc.data AS argv[1])) != NULL)
+        goto finish;
+      break;
+
+    case 'V' | 0x100:
+      if ((error = EmitS(&state, font_COMMAND_YMOVE,
+                         esc.data AS argv[0] * font_POINT)) != NULL)
+        goto finish;
+      break;
+
+    case '\n':
+      if (state.fsm == Fsm_New_Line)
+        if ((error = Emit_Line(&state)) != NULL)
+          goto finish;
+
+      if (state.fsm != Fsm_Normal)
+      {
+        if ((error = Emit_Paragraph(&state)) != NULL)
+          goto finish;
+
+        state.fsm = Fsm_New_Paragraph;
+      }
+      else
+        state.fsm = Fsm_New_Line;
+      break;
+
+    case ' ':
+    case '\t':
+      if (state.fsm == Fsm_New_Line)
+        if ((error = Emit_Line(&state)) != NULL)
+          goto finish;
+
+      if (state.fsm != Fsm_Normal)
+        if ((error = Emit_Paragraph(&state)) != NULL)
+          goto finish;
+
+      if ((error = EmitC(&state, ' ')) != NULL)
+        goto finish;
+
+      state.fsm = Fsm_Normal;
+      break;
+
+    case '\n' | 0x100:
+      if (state.fsm == Fsm_New_Line)
+        if ((error = EmitC(&state, ' ')) != NULL)
+          goto finish;
+
+      if ((error = Emit_Line(&state)) != NULL)
+        goto finish;
+
+      state.fsm = Fsm_Normal;
+      break;
+
+    case '-' | 0x80:
+      if (state.fsm == Fsm_New_Line)
+        if ((error = EmitC(&state, ' ')) != NULL)
+          goto finish;
+
+      if ((error = EmitS(&state, font_COMMAND_COMMENT)) != NULL)
+        goto finish;
+
+      state.fsm = Fsm_Normal;
+      break;
+
+    default:
+      if ((esc.tag & 0x100) == 0 && esc.tag >= ' ')
+      {
+        if (state.fsm == Fsm_New_Line)
+          if ((error = EmitC(&state, ' ')) != NULL)
+            goto finish;
+
+        if ((error = EmitC(&state, esc.tag)) != NULL)
+          goto finish;
+
+        state.fsm = Fsm_Normal;
+      }
+      break;
+    }
+
+    if (state.column->type == 0)
+/* No more columns for output. */
+      break;
+  }
+
+/* Flush pending output. */
+  if ((error = Flush(&state, Flush_All)) != NULL)
+    goto finish;
+
+  trace_f(NULL _ 0 _ "\n");
+
+finish:
+  {
+    int i;
+
+    for (i = 0; i < COUNT(state.f); i++)
+      if (state.f[i] != font_SYSTEM)
+      {
+        os_error *error1;
+
+        tracef("textarea_render: font_lose_font (%d)\n" _ state.f[i]);
+        error1 = xfont_lose_font(state.f[i]);
+        if (error == NULL)
+          error = error1;
+      }
+  }
+
+  return error;
+}
+/*------------------------------------------------------------------------*/
+os_error *textarea_declare(drawfile_object * object, bits flags)
+
+{
+  os_error *error = NULL;
+  Esc esc;
+  drawfile_area_text *area_text;
+  drawfile_object *o;
+
+  tracef("textarea_declare\n");
+
+/* Find the start of the text proper. */
+  o = (drawfile_object *) object->data AS text_area.header.columns;
+  while (o->type != 0)
+    *(byte **) & o += o->size;
+  area_text = (drawfile_area_text *) o;
+
+  Next_Char = area_text->text;
+
+  while (TRUE)
+  {
+    if ((error = Lex_Next(&esc)) != NULL)
+      goto finish;
+
+    if (esc.tag == '\0')
+/* No more input. */
+      break;
+
+    if (esc.tag == ('F' | 0x100))
+    {
+      tracef("declaring font \"%s\"\n" _ esc.data AS
+             font_no_def.font_name);
+      if ((error = xpdriver_declare_font(0, esc.data AS
+                                       font_no_def.font_name, flags)) != NULL)
+        goto finish;
+    }
+  }
+
+finish:
+  return error;
+}

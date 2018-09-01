@@ -1,0 +1,1229 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        SUBT    > Sources.StreamBits - Stream and buffer handling
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; +                                                                           +
+; +              All the nasty bits to do with stream handling                +
+; +                                                                           +
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Offsets in a stream control block
+
+                ^       0, scb
+scb_status      #       4       ; Stream status bits         }
+scb_fileptr     #       4       ; Current PTR# within file   } Keep together
+scb_extent      #       4       ; Current EXT# of file       }   in order
+scb_bufmask     #       4       ; Size of buffers to use     } at bottom of
+scb_bcb         #       4       ; Ptr to associated bcb list } scb (LDMIA)
+
+scb_shift       #       4       ; log2(buffersize)
+scb_exthandle   #       4       ; External handle, as seen by the punter
+
+scb_fshandle    #       4       ; Real Filing System handle  } Keep together
+scb_fscb        #       4       ; Ptr to associated fscb     }   in order
+
+scb_devid       #       4       ; Stream identifier, normally zero
+scb_allocsize   #       4       ; Size currently allocated on disc, buffer aligned (saturate at 4G-1)
+
+scb_special     #       4       ; Pointer to special field (SGetAreaed) or scb^ used to open this file
+scb_path        #       4       ; Pointer to path tail (SGetAreaed) used to open this file
+scb_NextImagescbInFile # 4      ; Next MultiFS image in list of MultiFS image scbs
+                                ; in this MultiFS image file or for this non-MultiFS
+                                ; filing system.
+scb_fscbForContents #   4       ; For a MultiFS image this is the fscb of the MultiFS
+                                ; which manages this image's contents.
+scb_ifsHandle   #       4       ; The handle to pass to the MultiFS to access something
+                                ; in this image
+scb_ImageList   #       4       ; List of MultiFS images in this MultiFS image.
+
+scb_size        *       :INDEX: @
+
+
+; Bits in scb_status - low set blocked (necessary for open r0 bits)
+
+scb_partitionbad * 1 :SHL: 14 ; 1 if stream is a partition which isn't ready
+                             ; yet (set whilst image FS sorts itself out).
+
+;                 1 :SHL: 13 reserved for data lost which no longer happens.
+
+scb_critical    * 1 :SHL: 12 ; 1 if stream is in critical region
+; Can do       TST   rn, #bits 4..11  in one go
+; Must then do TSTEQ rn, #bits 12..13 if we're interested in them too
+scb_unallocated * 1 :SHL: 11 ; 1 if stream is not allocated
+
+; **** MUST keep this set together in this order for OS 1.20 compatibility ****
+
+scb_unbuffered  * 1 :SHL: 10 ; 1 if stream is unbuffered, 0 if it is buffered
+scb_EOF_pending * 1 :SHL: 9  ; 1 if we have already read at EOF on this stream
+scb_modified    * 1 :SHL: 8  ; 1 if we have we written to this file, 0 if not
+
+scb_write       * 1 :SHL: 7  ; 1 if we have write access, 0 if not
+scb_read        * 1 :SHL: 6  ; 1 if we have read access, 0 if not
+scb_directory   * 1 :SHL: 5  ; 1 if it's a directory, 0 if not
+scb_unbuffgbpb  * 1 :SHL: 4  ; 1 if stream directly supports gbpb, 0 if not
+scb_interactive * 1 :SHL: 3  ; 1 if stream is interactive, 0 if not
+
+; *****************************************************************************
+
+; bits 0..2 unallocated
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; AllocateStream
+; ==============
+;
+; Look for an empty handle, attempt to get an scb, but don't put scb in
+; stream table here as it's not altogether kosher until all the fields are
+; filled. However, we can calculate and insert the backlink to the stream table
+; Must also have Nowt bcb^ for if we need to deallocate prior to insertion.
+
+; Out   VC: r3 = external handle and scb^ allocated
+;       VS: failed to allocate
+
+AllocateStream Entry "r1, r2, r4"
+
+ [ debugstream
+ DLINE "Entering AllocateStream"
+ ]
+        MOV     r1, #MaxHandle          ; Allocate handles from MaxHandle..1
+        ADR     r2, UnallocatedStream
+        ADR     r4, streamtable
+05      LDR     r14, [r4, r1, LSL #2]   ; Empty slot found ?
+        TEQ     r14, r2
+        BEQ     %FT20
+        SUBS    r1, r1, #1
+        BNE     %BT05                   ; If reached handle 0, naff up
+
+10      addr    r0, ErrorBlock_TooManyOpenFiles
+        BL      CopyError
+        EXIT
+
+
+; Try to get space for scb, and stick the backlink in
+
+20      MOV     r3, #scb_size
+        BL      SGetArea
+        EXIT    VS
+        BEQ     %BA10                   ; Now we can distiguish HeapFails
+        MOV     scb, r2                 ; (NE = ok)
+
+        STR     r1, scb_exthandle       ; Remember what handle we gave it
+
+        MOV     r14, #Nowt              ; No associated buffers yet !
+        STR     r14, scb_bcb
+        STR     r14, scb_fscb           ; Not associated with an fscb yet
+
+        ; unallocated (but critical)
+        MOV     r14, #scb_unallocated :OR: scb_critical
+        STR     r14, scb_status
+
+        ; Set a fileptr and extent to keep ReadStreamInfo from
+        ; writing it back!
+        MOV     r14, #0
+        STR     r14, scb_fileptr
+        MOV     r14, #&100
+        STR     r14, scb_extent
+
+        ; No strings allocated yet
+        MOV     r14, #NULL
+        STR     r14, scb_special
+        STR     r14, scb_path
+
+        ; Attach into the stream table to stop this entry being
+        ; reallocate if FileSwitch is reentered (possible under
+        ; MultiFS).
+        STR     scb, [r4, r1, LSL #2]
+
+ [ debugstream
+ DREG r1, "Allocated handle ",cc
+ DREG scb, ", scb "
+ ]
+        MOV     r3, r1                  ; Where caller prefers it
+        EXIT
+
+
+UnallocatedStream                       ; >>>a186<<< ensure ROM scb ok
+ ASSERT .-UnallocatedStream = :INDEX: scb_status
+        DCD     scb_unallocated         ; His is not a sausage
+ ASSERT .-UnallocatedStream = :INDEX: scb_fileptr
+        DCD     0                       ; Also need fileptr < extent so we
+ ASSERT .-UnallocatedStream = :INDEX: scb_extent
+        DCD     &100                    ; don't write back in ReadStreamInfo!
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; DeallocateStream
+; ================
+;
+; Attempt to free buffer and scb and zap stream table.
+
+; Check FileSwitch handle against Exec/Spool handles and zero them if needs be.
+
+; Also redirection handles? But Sam kills redirection on errors anyway.
+; Do this here rather than in a higher level routine as this gets called for
+; all close operations.
+
+; In    scb^ valid
+
+; Out   VC: ok
+;       VS: fail
+
+DeallocateStream Entry "r0-r4, bcb"
+
+ [ debugstream
+ DREG scb,"Deallocating scb ",cc
+ LDR r14,scb_exthandle
+ DREG r14,", ext handle "
+ ]
+        LDRB    r4, scb_exthandle
+
+        ADR     r0, streamtable         ; Remember external handle for below
+        ADR     r14, UnallocatedStream  ; Free entry in stream table
+        STR     r14, [r0, r4, LSL #2]
+
+        MOV     r0, #198                ; Read EXEC and SPOOL file handles
+        MOV     r1, #0
+        MOV     r2, #255
+        SWI     XOS_Byte
+        MOV     r3, r1                  ; Hide this away in case we close SPOOL
+
+        CMP     r2, r4                  ; Same as SPOOL handle ?
+        MOVEQ   r0, #199                ; Zero SPOOL handle if so
+        MOVEQ   r1, #0
+        MOVEQ   r2, #0
+        SWIEQ   XOS_Byte
+
+        CMP     r3, r4                  ; Same as EXEC handle ?
+        MOVEQ   r0, #198                ; Zero EXEC handle if so
+        MOVEQ   r1, #0
+        MOVEQ   r2, #0
+        SWIEQ   XOS_Byte
+
+        ; Free any strings allocated
+        LDR     r2, scb_special
+        TEQ     r2, #NULL
+        LDRNE   r14, scb_fscb
+        LDRNEB  r14, [r14, #fscb_info]
+        TEQNE   r14, #0
+        BLNE    SFreeArea
+        LDR     r2, scb_path
+        BL      SFreeArea
+
+        ; Delink scb from lists that it may be attached to
+        LDR     r2, scb_fscb
+        TEQ     r2, #Nowt
+        BEQ     %FT50
+
+        ; Determine which sort of attachment this scb might have - MultiFS or normal FS
+        LDRB    r14, [r2, #fscb_info]
+        TEQ     r14, #0
+        ADDNE   r2, r2, #fscb_FirstImagescb - :INDEX:scb_NextImagescbInFile
+        LDREQ   r2, scb_special
+        ADDEQ   r2, r2, #scb_ImageList - scb_NextImagescbInFile
+
+20
+ [ debugstream
+ DREG   r2, " SSchk ",cc
+ ]
+        LDR     r14, [r2, #:INDEX:scb_NextImagescbInFile]
+        TEQ     r14, #Nowt
+        BEQ     %FT50           ; Taking this branch means the scb being deallocated isn't a MultiFS image
+
+        ; Step to next entry if not the scb we're interested in
+        TEQ     r14, scb
+        MOVNE   r2, r14
+        BNE     %BT20
+
+        ; Delink this scb from the list
+        LDR     r14, scb_NextImagescbInFile
+        STR     r14, [r2, #:INDEX:scb_NextImagescbInFile]
+
+50
+ [ debugstream
+ DLINE  ""
+ ]
+        LDR     bcb, scb_bcb            ; Free buffer, if there is one
+        CMP     bcb, #Nowt              ; VClear
+        BLNE    DeallocateBuffer
+
+        MOV     r2, scb                 ; Free scb space
+        BL      SFreeArea               ; Accumulates V
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FindStream
+; ==========
+;
+; Find the scb associated with a FileSwitch handle
+
+; In    r1[1..MaxHandle] = FileSwitch handle
+
+; Out   VClear always
+;       NE: scb^
+;       EQ: no stream on this handle, scb -> UnallocatedStream
+
+FindStream Entry
+
+        ADR     r14, streamtable
+        LDR     scb, [r14, r1, LSL #2]
+        ADR     r14, UnallocatedStream
+        CMP     scb, r14                ; Valid scb^ ? VClear
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FindValidStream
+; ===============
+;
+; Validate a FileSwitch handle and find the scb associated with it
+
+; In    r1b = FileSwitch handle
+
+; Out   VC: scb^, flags preserved
+;       VS: no stream on this handle
+
+FindValidStream EntryS "r1"
+
+        AND     r1, r1, #&FF            ; Mask external handles with &FF always
+        ADR     r14, streamtable
+        LDR     scb, [r14, r1, LSL #2]
+        ADR     r14, UnallocatedStream
+        CMP     scb, r14                ; Valid scb^ ? VClear
+        EXITS   NE                      ; Preserve caller flags if ok
+                                        ; (makes life easier up there)
+        BL      SetErrorChannel
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Offsets in a buffer control block
+
+                ^       0, bcb
+bcb_actualsize  #       4       ; bufmask that buffer was allocated with
+bcb_status      #       1       ; Buffer validity / modified flags
+                #       3
+bcb_bufferbase  #       4       ; PTR# of buffer in file
+bcb_dataoffset  #       4       ; Hmm. Do LDR r14, bcb_dataoffset
+                                ;         SUB r14, fileptr, r14
+                                ;         xxRB r0, [bcb, r14]
+bcb_bufferdata  #       0       ; Actual data in the buffer. Word aligned
+
+bcb_size        *       :INDEX: @
+
+
+; Bits in bcb_status
+
+bcb_valid       *       1 :SHL: 1 ; Are the buffer contents valid ?
+bcb_modified    *       1 :SHL: 0 ; Have we written to this buffer ?
+
+bcb_status_bits *       bcb_valid :OR: bcb_modified
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; AllocateBuffer
+; ==============
+;
+; Get a new buffer for this stream
+
+; In    bufmask+1 = size of buffer wanted, scb^ valid
+
+; Out   VC: bcb^ -> new buffer, put on bcb list
+;       VS: failed to allocate buffer
+
+AllocateBuffer Entry "r0, r2-r3"
+
+ [ debugstream
+ DREG bufmask,"AllocateBuffer: bufmask "
+ ]
+        BL      ClaimBuffer             ; Go and get a buffer
+        EXIT    VS
+
+        MOV     r14, #0                 ; Buffer contents not valid
+        STRB    r14, bcb_status         ; or modified (by definition)
+
+        MOV     r14, #-1                ; Buffer is not in the file
+        STR     r14, bcb_bufferbase
+
+        STR     bcb, scb_bcb            ; bcb now valid enough to be added in
+ [ debugstream
+ DREG bcb,"Buffer allocated:"
+ ]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    scb^, bufmask valid
+
+; Out   bcb allocated
+
+ClaimBuffer Entry "r0-r3, bufmask"
+
+ [ debugstream
+ DREG bufmask,"ClaimBuffer: bufmask "
+ ]
+        ADD     r3, bufmask, #bcb_size+1 ; Try system heap first
+        BL      SGetArea
+        EXIT    VS                      ; [bad fail]
+        MOVNE   bcb, r2
+        STRNE   bufmask, bcb_actualsize ; Remember size of block
+ [ debugstream
+ BEQ    %FT01
+ DREG bcb, "Buffer claimed:"
+01
+ ]
+        EXIT    NE
+
+ [ sparebuffer
+        LDRB    r14, SpareBufferFree    ; Try our spare buffer
+        TEQ     r14, #0
+        MOVNE   r14, #0
+        STRNEB  r14, SpareBufferFree    ; Claim it
+        ADRNE   bcb, SpareBufferArea
+ [ debugstream
+ BEQ %FT00
+ DREG bcb,"Using SpareBuffer:"
+00
+ ]
+        EXIT    NE
+ ]
+
+
+10 ; Loop up from current bufmask to system limit until we find a victim
+
+; NB: must flush a buffer from a DIFFERENT file, so can't return I/O errors
+
+; Try flushing unmodified buffers first
+
+ [ debugstream
+ DREG bufmask, "Try flushing an unmodified buffer of size "
+ ]
+        MOV     r2, #bcb_modified
+        BL      FlushSomeone
+        EXIT    NE                      ; [flushed, bcb^ valid]
+
+; Try flushing any buffers of the right size
+
+ [ debugstream
+ DREG bufmask, "Try flushing any buffer of size "
+ ]
+        MOV     r2, #0
+        BL      FlushSomeone
+        EXIT    NE                      ; [flushed, bcb^ valid]
+
+        MOV     bufmask, bufmask, LSL #1 ; Try next size up
+        ORR     bufmask, bufmask, #1
+        CMP     bufmask, #Max_BuffSize
+        BLO     %BT10                   ; [not reached limit yet]
+
+
+90      ; Regenerate 'Heap Full' error
+        STR     r0, globalerror         ; fp is valid, of course ...
+        SETV
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Loop over streamtable and see if there are any streams that can be flushed
+
+; In    scb^ valid, bufmask = size wanted, r2 = bcb_status faulty bits
+
+; Out   VClear always (other stream marked as 'Data lost')
+;       EQ: no stream flushed
+;       NE: stream flushed, bcb -> buffer freed for our use
+
+FlushSomeone Entry "r0-r3, bufmask, scb"
+
+        LDRB    r1, scb_exthandle       ; Start at this handle
+        MOV     r3, r1
+
+10      SUBS    r3, r3, #1              ; Wrap from 1 back to MaxHandle
+        MOVEQ   r3, #MaxHandle
+
+        CMP     r3, r1                  ; If we've reached same handle, error
+        EXIT    EQ                      ; VC, EQ -> no luck this time
+
+        ADR     r14, streamtable        ; Like FindStream but with r3
+        LDR     scb, [r14, r3, LSL #2]
+
+        LDR     r14, scb_status
+        TST     r14, #scb_unallocated :OR: scb_unbuffered :OR: scb_directory
+        TSTEQ   r14, #scb_critical
+        BNE     %BT10                   ; This scb, he got duff status bits
+
+        LDR     bcb, scb_bcb
+        TEQ     bcb, #Nowt
+        BEQ     %BT10                   ; This scb, he got no buffer anyway
+
+        LDR     r14, bcb_actualsize
+        CMP     r14, bufmask
+        BNE     %BT10                   ; This bcb, he the wrong size
+
+        LDRB    r14, bcb_status
+        TST     r14, r2
+        BNE     %BT10                   ; This bcb, he got duff status bits
+
+; Got a victim, so flush to disc, unlink from stream, then eat his brain
+
+; <<< Question: if victim bigger, should we free to heap and then try claim
+;               again (friendlier, may get us more small buffers) or keep all
+;               of him (wasteful, but we can ensure that streams don't lose
+;               the ability to claim large buffers again) ... unresolved
+; SKS now believes the latter to be best
+; JSR: used to flush and ignore error - ie a random victim would suddenly become
+;       'Data lost' - no indication of why, nothing. IMHO, this was not good, so
+;       I fixed this to skip files which come back with an error, and use the non-
+;       Data lost version of FlushBuffer.
+
+ [ debugstream
+ LDRB r14, scb_exthandle
+ DREG r14, "Victim is external handle number "
+ ]
+        LDR     bufmask, scb_bufmask    ; This wants to know the stream bufmask
+        BL      FlushBuffer_Keep
+        BVC     %FT20
+
+        ; Got error - tidy up mess and try another stream
+        MOV     r14, #0
+        STR     r14, globalerror
+
+        CLRV
+
+        LDR     bufmask, [sp, #Proc_LocalStack + 4*4]
+
+        B       %BT10
+
+20
+; This may fail eg. Not listening, but that's tough.
+; JSR: yes it is tough, which is why I've fixed it so that error
+;       generating flush attempts are treated as unavailable buffers.
+; Note that globalerror also needs clearing otherwise OUR op will give an error
+; rather than the other stream going 'Data lost' (JSR: not any more it won't!)
+
+        MOV     r14, #Nowt              ; Unlink buffer from stream
+        STR     r14, scb_bcb
+
+        CMP     pc, #0                  ; VC, NE -> flushed one ok
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; DeallocateBuffer
+; ================
+;
+; Got bored with this one; let's get rid of it (don't care about the data)
+
+; In    scb^ valid, bcb^ to deallocate
+
+; Out   V accumulated
+
+DeallocateBuffer EntryS "r2"
+
+ [ debugstream
+ DREG bcb,"Deallocating bcb "
+ ]
+        MOV     r2, bcb                 ; Prepare for release !
+
+        MOV     r14, #Nowt              ; Unlink buffer from stream
+        STR     r14, scb_bcb
+
+ [ sparebuffer
+        ADR     r14, SpareBufferArea    ; Freeing our spare ?
+        CMP     r14, r2                 ; VClear
+        MVNEQ   r14, #0
+        STREQB  r14, SpareBufferFree
+        BLNE    SFreeArea
+ |
+        BL      SFreeArea
+ ]
+        EXITS   VC                      ; Accumulate V
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FindFileBuffer
+; ==============
+;
+; Look down bcb list of stream to see if there is a buffer at given file posn
+
+; In    fileptr = position, scb and bufmask valid
+
+; Out   EQ: not found, bcb^ = Nowt
+;       NE: found, bcb^ -> buffer control block
+; VClear always
+
+FindFileBuffer Entry "r0"
+
+        BIC     r0, fileptr, bufmask    ; Where buffer base would be
+ [ debugstream
+ DREG fileptr,"Looking for buffer at PTR ",cc
+ DREG r0,", with base ",cc
+ ]
+
+        LDR     bcb, scb_bcb
+        CMP     bcb, #Nowt
+ [ debugstream
+ BNE %FT11
+ DLINE " - buffer not found"
+11
+ ]
+        EXIT    EQ                      ; EQ -> not found, VClear
+
+        LDR     r14, bcb_bufferbase
+ [ debugstream
+ DREG r14,"; Checking buffer at base ",cc
+ ]
+        CMP     r14, r0                 ; VClear. Swap EQ <-> NE
+        TOGPSR  Z_bit, r14
+ [ debugstream
+ BNE %FT11
+ DLINE " - buffer not found"
+ EXIT
+11
+ DLINE " - buffer found"
+ ]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; GetFileBuffer
+; =============
+;
+; Get a buffer at given place and fill with data from file if not >= extent
+
+; In    fileptr = where to get it, scb, extent, bufmask valid
+
+GetFileBuffer Entry
+
+ [ debugstream
+ DREG fileptr, "GetFileBuffer: fileptr = "
+ ]
+        BL      InvalidateBGetCache     ; Replacing buffer contents, so can't
+                                        ; keep cache
+
+        LDR     bcb, scb_bcb            ; Already got a buffer?
+        CMP     bcb, #Nowt
+        BNE     %FT10                   ; [yes]
+
+        BL      AllocateBuffer          ; Get a new buffer please
+        B       %FA20
+
+10      BL      FlushBuffer_Keep        ; Dump current contents
+                                        ; but keep the bcb attached
+                                        ; Errors important here as they're on
+                                        ; the same stream - data lost not an
+                                        ; option here.
+20      EXIT    VS
+
+        MOV     r14, #bcb_valid         ; Buffer is about to become valid
+        STRB    r14, bcb_status         ; (and unmodified, of course)
+
+        BIC     r14, fileptr, bufmask   ; Base file address of block where
+        STR     r14, bcb_bufferbase     ; PTR is
+
+        CMP     r14, extent             ; If bufferbase >= old EOF
+                                        ; we don't read underlay
+                                        ; (current contents will do)
+ [ debugstream
+ BCC %FT00
+ DREG r14, "No underlay read as bufferbase ",cc
+ DREG extent, " >= extent "
+00
+ ]
+        SUB     r14, r14, #(:INDEX: bcb_bufferdata) ; Always set up dataoffset
+        STR     r14, bcb_dataoffset
+        CLRV    CS                      ; C still set, V clear
+        EXIT    CS
+
+        BL      CallFSGetBuffer
+ [ debugosgbpbirq
+ EXIT VS
+ Push "r0, lr"
+ MOV r0, psr
+ TST r0, #I_bit
+ MOVEQ r0, #"3"
+ MOVNE r0, #"c"
+ SWI XOS_WriteC
+ Pull "r0, lr"
+ ]
+        BLVS    DeallocateBuffer        ; Discard invalid buffer. Accumulates V
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; EnsureBufferValidForWrite
+; =========================
+;
+; If ensuring for write at EOF then must ask for more space on media or else
+; I'd accept data that might provoke a 'Disc full' error when flushing. NB. If
+; that gives an error then I'd better throw away the new buffer
+
+; No need to write zeroes into the file though
+
+; In    scb^ and streaminfo valid
+
+; Out   bcb^ valid, pertaining to fileptr
+
+EnsureBufferValidForWrite Entry "r1-r2"
+
+        BL      EnsureBufferValid       ; Get bcb^ valid for this fileptr
+        EXIT    VS
+
+        BIC     r14, fileptr, bufmask   ; Going to be writing at EOF ?
+        CMP     r14, extent
+        BEQ     %FT90
+        CLRV                            ; Ensure VClear for extents > 2G
+        EXIT
+90
+        ADD     r2, extent, #1
+        ADD     r2, r2, bufmask         ; Round up to nearest buffer multiple
+        BICS    r2, r2, bufmask
+        MOVEQ   r2, #&FFFFFFFF          ; Saturate at 4G-1
+        BL      EnsureFileSize
+
+        BLVS    DeallocateBuffer        ; Discard invalid buffer
+        EXIT                            ; Accumulates V
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; EnsureBufferValid
+; =================
+;
+; Get a valid buffer at the current file address, which mustn't be outside
+; the file !
+
+; If trying to get a buffer at extent then don't look to media for an underlay,
+; but tell the Filing System we need to be able to have a file of given length
+
+; In    scb^ and streaminfo valid
+
+; Out   VC: bcb^ and buffer data valid, pertaining to fileptr
+;       VS: failed to get buffer
+
+EnsureBufferValid Entry
+
+ [ debugstream
+ DREG fileptr,"Ensure valid buffer at fileptr "
+ ]
+        BL      FindFileBuffer                  ; Got the right buffer here ?
+        EXIT    NE
+
+        BL      GetFileBuffer                   ; Better run and get it if not
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; DiscardBuffersBetween
+; =====================
+;
+; Ensure that no valid buffers are present in the range r0..r1-1
+; (not necessarily buffer multiples)
+; Buffers discarded must be FULLY spanned by r0..r1-1
+
+; This is a discard (not flush), called on file contraction and gbpb write
+
+; In    r0 = lower limit, inclusive
+;       r1 = upper limit, exclusive
+;       scb^ and bufmask valid
+
+DiscardBuffersBetween Entry "r0-r1, bcb"
+
+ [ debugstream
+ DREG r0,"Discarding buffers between ",cc
+ DREG r1," and "
+ ]
+
+        LDR     bcb, scb_bcb
+        CMP     bcb, #Nowt              ; No buffer ?
+        EXIT    EQ                      ; VClear
+
+        LDR     r14, bcb_bufferbase
+ [ debugstream
+ DREG r14,"Checking buffer at base "
+ ]
+        CMP     r14, r0                 ; Discard if (bs => r0) and (r1 => be)
+        ADDHS   r14, r14, bufmask
+        ADDHS   r14, r14, #1
+        CMPHS   r1, r14
+ [ No26bitCode
+        BHS     %FT05
+        CLRV
+        EXIT
+05
+ |
+        EXITS   LO                      ; VClear
+ ]
+
+ [ debugstream
+ DREG bcb,"Discarding invalidated bcb "
+ ]
+        CLRV                            ; Unsure about V from above CMP
+        BL      DeallocateBuffer
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; ExtendFileWithZeroes
+; ====================
+;
+; Take one buffered stream, simmer for 20 mins at Gas Mark 3 ...
+
+; In    scb^ and streaminfo valid
+;       r2 = length of file to extend and fill with zeroes to
+
+; Out   VC: new extent NOT set (for GBPB porpoises !)
+
+ExtendFileWithZeroes Entry "r0-r2, fileptr, bcb, fscb" ; Nasty temporary
+
+ [ debugstream
+ DREG r2, "Extending to ",cc
+ DREG extent, " from "
+ ]
+        CMP     r2, extent              ; File growing ?
+ [ No26bitCode
+        BHI     %FT05
+        CLRV                            ; Ensure VClear for extents > 2G
+        EXIT
+05
+ |
+        EXITS   LS                      ; No - assumes VClear in entry lr
+ ]
+
+        BIC     fscb, extent, bufmask   ; base of eof buffer. Useful value
+
+; If eof unaligned then we need that buffer for writing zeroes
+
+        ANDS    r0, extent, bufmask     ; Offset of extent in buffer
+        BEQ     %FT20                   ; Partial update needed ? No, thank God
+
+        MOV     fileptr, fscb           ; Get buffer at eof for zero extension
+        BL      EnsureBufferValid
+        EXIT    VS
+
+        BL      ZeroBufferFromPosition  ; Clear from ext to eob. r0 from above
+
+; If new eof within (or aligned at end of) old eof buffer then there is no need
+; to involve Filing System at all.
+; The case of new eof = base of old eof has been trapped already (Phew !)
+
+        SUB     r14, r2, #1             ; Maps xx001..xx100 -> xx000..xx0FF
+        BIC     r14, r14, bufmask       ; Map to buffer base
+        TEQ     r14, fscb               ; In the same one as before ?
+        EXIT    EQ                      ; All done then ! VClear
+
+
+20 ; Best tell the Filing System now that the file is growing ...
+
+        ADD     r2, r2, bufmask         ; Reserve space on media
+        BICS    r2, r2, bufmask
+        MOVEQ   r2, #&FFFFFFFF          ; Saturate at 4G-1
+        BL      EnsureFileSize
+        EXIT    VS
+
+; Deal with the last bit left over at eof by pretending it's one block bigger !
+
+; zerostartinfile := (old.extent+bufmask) BIC bufmask
+; zeroendinfile   := (new.extent+bufmask) BIC bufmask
+
+        LDR     r14, [sp, #4*2]         ; End point (r2 in)
+        ADD     r14, r14, bufmask
+        BIC     r14, r14, bufmask
+
+        ADD     r2, extent, bufmask     ; Start point
+        BIC     r2, r2, bufmask
+
+        SUBS    r1, r14, r2             ; How much to do
+        BNE     %FT30
+
+; This is definitely a grow operation since "less than extent" was rejected earlier,
+; so the only way to end up with zero here is if 4G is required. However, the
+; interface for fsargs_WriteZeroes is defined to only take buffer multiples, so
+; split the 4G across two FS calls.
+
+        ADD     r1, bufmask, #1         ; One buffer
+        BL      ZeroFileFromPosition
+        ADD     r2, r2, r1              ; Adjust start point
+        RSB     r1, r1, #0              ; Remainder to do
+30
+        BL      ZeroFileFromPosition
+
+; In the interests of efficiency, we should really create a buffer full of
+; zeroes at new eof if new eof buffer is unaligned, as this saves getting an
+; underlay later when one does an op at this point.
+; But only when multiple buffers arrive, otherwise gain is lost !
+
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; ZeroBufferFromPosition
+; ======================
+;
+; Clear out a buffer from a given position to the end (inclusive)
+
+; In    r0 = offset in buffer;
+;       bufmask and bcb valid
+
+ZeroBufferFromPosition Entry "r0-r1"
+
+        LDRB    r14, bcb_status         ; Buffer modified
+        ORR     r14, r14, #bcb_modified
+        STRB    r14, bcb_status
+
+ [ debugstream
+ DREG r0,"Writing zeroes to buffer at offset "
+ ]
+        MOV     r14, #0
+        ADR     r1, bcb_bufferdata      ; r1 -> sob
+        TST     r0, #3                  ; can we do it fast ?
+        BEQ     %FT50
+
+20      CMP     r0, bufmask             ; Already at eob ?
+        STRLSB  r14, [r1, r0]           ; Zero last byte of buffer too !
+        ADDLO   r0, r0, #1
+        BLO     %BT20
+        EXIT                            ; VClear
+
+50      CMP     r0, bufmask             ; Already at eob ?
+        STRLO   r14, [r1, r0]           ; Includes last word of buffer
+        ADDLO   r0, r0, #4
+        BLO     %BT50
+        EXIT                            ; VClear
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; ZeroFileFromPosition
+; ====================
+;
+; Write zeroes to a file from a given point
+
+; In    r2 = offset in file, a buffer multiple
+;       r1 = number of bytes to zero (can be zero), a buffer multiple
+
+ZeroFileFromPosition Entry "r0-r3"
+
+ [ debugstream
+ DREG r1,"Writing ",cc
+ DREG r2," zeroes to file at "
+ ]
+        MOV     r0, #fsargs_WriteZeroes
+        MOVS    r3, r1                  ; Dont call FS if nothing to do. VClear
+        BLNE    CallFSArgs
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; EnsureFileSize
+; ==============
+;
+; Tell the Filing System how much space this file wants
+
+; In    r2 = required size (buffer multiple), scb^ valid
+
+; Out   r2 = given size, scb^.allocsize updated
+
+EnsureFileSize Entry "r0, r3"
+
+ [ debugstream
+ DREG r2,"Ensuring file size of "
+ ]
+        LDR     r3, scb_allocsize               ; Only do it if it's more than
+        CMP     r2, r3                          ; we've already got allocated
+ [ No26bitCode
+        BHI     %FT05
+        CLRV
+        EXIT
+05
+ |
+        EXITS   LS                              ; Assumes VClear in entry lr
+ ]
+
+        MOV     r0, #fsargs_EnsureSize          ; r2 = new size, r3 = old extent
+        LDR     r3, scb_extent
+        BL      CallFSArgs
+
+        STRVC   r2, scb_allocsize               ; New ensured size to keep
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; WriteRealExtentOnClose
+; ======================
+;
+; If the file is buffered and open for update, set the file's extent
+
+; In    scb^ and streaminfo valid
+
+WriteRealExtentOnClose ROUT
+
+        TST     status, #scb_unbuffered :OR: scb_directory ; Can we do this ?
+ [ No26bitCode
+        BEQ     %FT05
+03      CLRV
+        MOV     pc, lr
+05
+ |
+        BICNES  pc, lr, #V_bit
+ ]
+
+        TST     status, #scb_write      ; Should we do this ?
+ [ No26bitCode
+        BEQ     %BA03
+ |
+        BICEQS  pc, lr, #V_bit
+ ]
+
+        Entry   "r0, r2" ; FSArgs corrupts only r2
+ [ debugstream
+ DREG extent,"Setting final file extent to "
+ ]
+        MOV     r0, #fsargs_SetEXT      ; Write correct file length on media
+        MOV     r2, extent
+        BL      CallFSArgs
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FlushBuffer_IfNoError
+; =====================
+;
+; Flush a buffer to media (stream is known to be buffered).
+;
+; If an error occurs, don't deallocate the block, and don't mark 'data lost'
+; This allows the user to re-try on the same handle later.
+
+; FlushBuffer_Keep
+; ================
+;
+; As above, but buffer kept attached to stream on successful flush
+
+; In    scb^, bcb^ and bufmask valid
+
+; Out   V clear => buffer flushed and block deallocated
+;       V set => [globalerror] set and data intact in buffer
+
+
+FlushBuffer_IfNoError Entry "r1"
+
+        MOV     r1, #0
+
+10
+ [ debugstream
+ LDR r14,bcb_bufferbase
+ DREG r14,"Flushing buffer at base "
+ ]
+        BL      InvalidateBGetCache     ; Discarding buffer so can't keep cache
+
+        LDRB    r14, bcb_status         ; Only need to flush if
+ [ :LNOT: (bcb_status_bits = bcb_modified :OR: bcb_valid)
+        AND     r14, r14, #bcb_modified :OR: bcb_valid
+ ]
+        CMP     r14, #bcb_modified :OR: bcb_valid ; modified and valid      ; Clear V
+        BNE     %FT20
+
+        BL      CallFSPutBuffer
+        EXIT    VS
+
+20
+        TEQ     r1, #0
+        BLEQ    DeallocateBuffer        ; Throw away buffer if written OK and want to throw it away
+        EXIT
+
+FlushBuffer_Keep ALTENTRY
+        MOV     r1, #1
+        B       %BT10
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FlushStream
+; ===========
+;
+; Flush a stream to media
+
+; In    scb^ and streaminfo valid
+
+; Out   VC: ok
+;       VS: fail
+
+FlushStream Entry "r0, r2, bcb" ; FSArgs corrupts just r2
+
+ [ debugstream
+ DREG scb,"Flushing scb ",cc
+ DREG status,", status "
+ ]
+        TST     status, #scb_directory  ; You don't flush directories!
+        EXIT    NE
+
+        TST     status, #scb_unbuffered ; Unbuffered streams always get flushed
+        BNE     %FT90
+
+ [ debugstream
+ DREG scb,"Flushing buffers on scb "
+ ]
+        LDR     bcb, scb_bcb            ; Is there a buffer to flush ?
+        CMP     bcb, #Nowt
+        BLNE    FlushBuffer_IfNoError   ; Block hangs around if error
+        EXIT    VS
+
+        LDR     r14, scb_fscb           ; Does Filing System require written
+        LDR     r14, [r14, #fscb_info]  ; notice of flushing ?
+        TST     r14, #fsinfo_flushnotify
+        EXIT    EQ
+
+90
+        MOV     r0, #fsargs_Flush
+        BL      CallFSArgs
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FlushAndCloseStream
+; ===================
+;
+; Flush and close an scb, freeing the associated buffer space, scb and handle
+
+; NB. Any errors coming back up from the Filing System must be ignored until
+;     exit - we MUST deallocate the stream if there's any error on closing !
+
+; In    scb^ valid, fp not necessarily valid (called on death)
+
+; Out   VC: ok
+;       VS: fail
+
+FlushAndCloseStream Entry "r0-r2,$streaminfo" ; r3 and r6 in streaminfo
+
+ [ debugstream
+ Push r1
+ DREG scb,"Flush and close scb ",cc
+ LDR r1, scb_fscb
+ ADD r1, r1, #fscb_name
+ DSTRING r1," on Filing System "
+ Pull r1
+ ]
+
+        ; Close all files inside this image
+        Push    "scb,fscb"
+        MOV     r6, scb
+
+        MOV     r1, #MaxHandle
+05
+        BL      FindStream
+        BEQ     %FT10
+        LDR     r14, scb_special
+        TEQ     r14, r6
+ [ debugstream
+ BNE    %FT01
+ DREG   scb, "Nesting close stream on "
+01
+ ]
+        BLEQ    FlushAndCloseStream
+ [ debugstream
+ BVC    %FT01
+ DLINE  "Error from nesting close stream"
+01
+ ]
+ [ appendhandle
+        BLVS    AppendHandleToError
+ ]
+
+; Ignore any errors that this may give; we catch them on exit
+
+10
+        SUBS    r1, r1, #1
+        BNE     %BT05
+
+ [ debugstream
+ DREG   scb,"Actually closing stream now:"
+ ]
+
+15
+        LDR     scb, [sp]
+
+        ; If this stream is a MultiFS image, notify the MultiFS that this
+        ; image is closing
+        LDR     fscb, scb_fscbForContents
+        TEQ     fscb, #Nowt
+        BEQ     %FT19
+
+        ; Don't worry image FS with bad partitions
+        LDR     r14, scb_status
+        TST     r14, #scb_partitionbad
+        BNE     %FT19
+
+ [ debugstream
+ DLINE  "Notify MultiFS image is closing"
+ ]
+
+        ; Notify the ImageFS of closing image
+        MOV     r0, #fsfunc_ImageClosing
+        LDR     r1, scb_ifsHandle
+        BL      CallFSFunc_Given
+        ; Ignore any error back
+19
+        Pull    "scb,fscb"
+
+        ReadStreamInfo
+
+        BL      FlushStream             ; Dump all modified buffers
+                                        ; May set error 'Data lost' etc.
+                                        ; Pick these up later
+        BL      WriteRealExtentOnClose  ; Write correct file length on media
+        BVS     %FT20
+
+        TST     status, #scb_modified   ; Need to restamp file ?
+        MOVEQ   r2, #0                  ; Both zero -> fs should't restamp
+        MOVEQ   r3, #0
+        BEQ     %FT50
+
+        MOV     r0, #fsargs_ReadLoadExec
+        BL      CallFSArgs              ; r2,r3 := old load,exec address
+ [ debugosfind
+ DREG r2,"ReadLoadExec returns ",cc
+ DREG r3
+ ]
+20      MOVVS   r2, #0                  ; Both zero -> fs should't restamp
+        MOVVS   r3, #0
+        BVS     %FT50
+
+        CMN     r2, #&00100000          ; CSet if date stamped
+        LDRCC   r2, =&00000FFD          ; Stamp as type data if not dated
+        MOVCS   r2, r2, LSR #8          ; Need type in bottom 12 bits
+        BL      SReadTime               ; Read machine date into r2,r3
+
+        BL      CallFSClose             ; Close it on the Filing System
+        EXIT    VS                      ; On error return.
+        B       %FT60
+
+50      BL      CallFSClose             ; Close it on the Filing System
+                                        ; On error, don't return because
+                                        ; error wasn't necessarily from
+                                        ; this call.
+
+60      BL      DeallocateStream        ; Get rid of handle and scb
+
+        TEQ     fp, #0                  ; Forget errors if brain damaged
+        EXIT    EQ                      ; call state
+
+        LDR     r14, globalerror        ; Indicate error to caller
+        CMP     r14, #0                 ; VClear
+        SETV    NE
+ [ debugstream
+ EXIT VC
+ DLINE "Error in FlushAndCloseStream"
+ ]
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        LTORG
+
+        END

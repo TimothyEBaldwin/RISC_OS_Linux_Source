@@ -1,0 +1,3602 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;******************************************************************************
+;
+; DriverCode.s
+;
+; Author: Mark Watson (EESOX)
+;
+; Description
+; ===========
+; This carries out the CD_ SWI commands for ATAPI IDE CD-ROM drives.
+;
+; Change record
+; =============
+; 11-Mar-95  06:20  cpartington (Cambridge Systems Design)
+; * Special pleading for Sony CDU50E (dont use page D in mode select).
+; * Changed literal &28 in ReadData to ATAPI__READ_DATA_10.
+; * Added/corrected comments and debug.
+;
+; 14-Mar-95  12:33  cpartington (Cambridge Systems Design)
+; * Removed various bits of code added since 1.06 that MEW says were only
+;   added as debug.
+; * Fixed multisession code by correcting calculation of PVD after getting
+;   address of last session.
+;
+; 18-Mar-95  12:13  cpartington (Cambridge Systems Design)
+; * Added code dependent on use_readcd_for_mode_1 to work around Panasonic
+;   problem when data is read with READ(10) or READ(12).
+; * Change ReadData to convert ILLEGAL REQUEST error to WRONG DATA MODE
+;   error.
+; * Change EnquireDataMode to return mode 0 if READ HEADER fails with
+;   ILLEGAL REQUEST. This fixes "Compact disc is faulty" problem when trying
+;   to catalogue audio discs.
+;
+; 20-Mar-95  19:05  cpartington (Cambridge Systems Design)
+; * Rewrite ReadData to avoid use of READ(10)/READ(12) completely because
+;   of possible Panasonic problem. Now always uses READ CD and retries
+;   with different mode if current mode is 1 or 3 and read fails.
+; * Change read of mode 2 form 2 discs to pass the specific sector type to
+;   the drive rather than accept any type. I am unable to test this
+;   because I have no 2/2 discs but if it accepts ANY, then read of audio
+;   CDs succeeds when CDFS expects it to fail.
+;
+; 23-Mar-95  10:23  cpartington (Cambridge Systems Design)
+; * Change ReadData to convert mode 0 reads to mode 1 and to tell READ CD to
+;   accept any sort of sector when mode is 2.
+;
+; 24-Mar-95  09:55  cpartington (Cambridge Systems Design)
+; * Added code dependent on mode_select_ignore_page_d_error so drives other
+;   than the Sony CDU50E (which bounces the command) can be set up
+;   correctly.
+;
+; 30-Mar-95  12:09  cpartington (Cambridge Systems Design)
+; * Code in GP_FindModePage that insists on receiving either &3A or &3B in
+;   the length field of the mode sense data from the drive made conditional
+;   on check_mode_sense_length. It makes no sense to have this restriction
+;   (amount of mode sense data is drive-specific) and stops Wearnes RUBY
+;   (CDD-120A) drive working (it returns &3C bytes).
+;
+; 31-Mar-95  12:03  cpartington (Cambridge Systems Design)
+; * Change SetParameters to correct ordering of bytes sent to drive for
+;   speed selection and check expressly for double speed and send correct
+;   value for this speed (dependent on fix_speed_select).
+;
+; 06-Apr-95  17:45  cpartington (Cambridge Systems Design)
+; * Added debugging code to print bytes not transferred by ReadData.
+; * Added debugging code to SetParameters to issue REQUEST SENSE when
+;   SET CDROM SPEED fails.
+;
+; 12-Apr-95  10:08  cpartington (Cambridge Systems Design)
+; * Added debugging routine do_request_sense with calls from SetParameters
+;   and ReadData.
+;
+; 21-Jun-95  15:21  cpartington (Cambridge Systems Design)
+; * Added test code conditional on cdp_swi.
+;
+; 09-Aug-95  15:39  cpartington (Cambridge Systems Design)
+; * Removed code conditional on cdp_swi (unused).
+;
+;*end of change record*
+
+
+;------------------------------------------------------------------------------
+driver_handler_code ROUT
+;
+; on entry:
+;          r0  - r6= Whatever values the various CD_ SWIs use
+;          r7 -> control block
+;                control block + 0   = SCSI device id (0-7)
+;                control block + 4   = SCSI card number (0-3 usually 0)
+;                control block + 8   = Logical Unit Number (0-7 usually 0)
+;                control block + 12  = Drive type for this module
+;          r8  = full drive type
+;          r11 = the number of the CD_ SWI, ie/ 0 = CD_ReadData, 1 = CD_SeekTo etc;
+;          r12 -> workspace for this module
+;          r13 -> a full descending stack, approx. 1024 bytes
+;          r14 = address to return to
+; on exit:
+;          r0 must be preserved or be return value for the particular SWI
+;          r1 - r12 & r14 corrupted
+;------------------------------------------------------------------------------
+
+;--------------------
+; Special tag
+;--------------------
+ DCD       &EE50EE50
+
+;--------------------
+; Code
+;--------------------
+     MACRO__ENTER_DRIVER
+
+     [ OUTPUT_ON=1
+     MySTRIM "Z"
+     Push     "r0, r14"
+     ADD      r0, SWIN, # "A"
+       [ OUTPUT_TO_SCREEN<>0
+        SWI  0+(1:SHL:17) ; XOS_WriteC
+       |
+        SWI &a194a:OR:(1:SHL:17)   ; XStream_WriteC
+       ]
+     Pull     "r0, r14"
+;     Display SWIN
+     DisplayNewLine
+     ]
+ [ cdebug_debugging_all_ops
+        Push    "r0,r14"
+        ADD     r0,r11,#"A"
+        SWI     1<<17
+        Pull    "r0,r14"
+ ]
+;----------------------------------------------------------
+; Branch to the correct piece of code to handle the command
+; The two top bits of R11 (SWIN) are used to indicate the
+; number of retries
+;----------------------------------------------------------
+     BIC       SWIN, SWIN, #3:SHL:30
+
+; Make sure don't fall off table
+     CMP       SWIN, # (jump_table_end - jump_table_start) / 2
+     BHS       notsupported
+
+     ADR       r10, jump_table_start
+   [ NoARMv4
+     LDR       r14, [ r10, SWIN, LSL #1 ]
+     MOV       r14, r14, LSL #16
+     ADD       pc, pc, r14, LSR #16
+   |
+     ADD       r14, r10, SWIN, LSL #1
+     LDRH      r14, [r14]
+     ADD       pc, pc, r14
+   ]
+
+jump_table_start
+ DCW ReadData        - jump_table_start - 4      ; 0                 a
+ DCW SeekTo          - jump_table_start - 4      ; 1                 b
+ DCW DriveStatus     - jump_table_start - 4      ; 2                 c
+ DCW DriveReady      - jump_table_start - 4      ; 3                 d
+ DCW GetParameters   - jump_table_start - 4      ; 4                 e
+ DCW SetParameters   - jump_table_start - 4      ; 5                 f
+ DCW OpenDrawer      - jump_table_start - 4      ; 6                 g
+ DCW EjectButton     - jump_table_start - 4      ; 7                 h
+ DCW EnquireAddress  - jump_table_start - 4      ; 8                 i
+ DCW EnquireDataMode - jump_table_start - 4      ; 9                 j
+ DCW PlayAudio       - jump_table_start - 4      ; 10                k
+ DCW PlayTrack       - jump_table_start - 4      ; 11                l
+ DCW AudioPause      - jump_table_start - 4      ; 12                m
+ DCW EnquireTrack    - jump_table_start - 4      ; 13                n
+ DCW ReadSubChannel  - jump_table_start - 4      ; 14                o
+ DCW CheckDrive      - jump_table_start - 4      ; 15                p
+ DCW DiscChanged     - jump_table_start - 4      ; 16                q
+ DCW StopDisc        - jump_table_start - 4      ; 17                r
+ DCW DiscUsed        - jump_table_start - 4      ; 18                s
+ DCW AudioStatus     - jump_table_start - 4      ; 19                t
+ DCW Inquiry         - jump_table_start - 4      ; 20                u
+ DCW DiscHasChanged  - jump_table_start - 4      ; 21                v
+ DCW Control         - jump_table_start - 4      ; 22
+ DCW Supported       - jump_table_start - 4      ; 23
+ DCW notsupported    - jump_table_start - 4      ; 24
+ DCW Reset           - jump_table_start - 4      ; 25
+ DCW CloseDrawer     - jump_table_start - 4      ; 26
+ DCW IsDrawerLocked  - jump_table_start - 4      ; 27
+ DCW notsupported    - jump_table_start - 4      ; 28
+ DCW notsupported    - jump_table_start - 4      ; 29
+ DCW Identify        - jump_table_start - 4      ; 30
+ DCW ReadAudio       - jump_table_start - 4      ; 31
+ DCW ReadUserData    - jump_table_start - 4      ; 32
+ DCW notsupported    - jump_table_start - 4      ; 33
+ DCW GetAudioParms   - jump_table_start - 4      ; 34
+ DCW SetAudioParms   - jump_table_start - 4      ; 35
+ [ HAL
+ DCW SCSIUserOp      - jump_table_start - 4      ; 36
+ ]
+
+jump_table_end
+
+ ALIGN
+
+notsupported
+ ADRL      r0, not_supported_error
+ B         error_handler_lookup
+
+;-----------------------------------------------------------------------------------------------
+ReadData ROUT
+;
+; on entry:
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r2 =   number of blocks
+;          r3 ->  where to put data
+;          r4 =   number of bytes from each block wanted
+;          r7 ->  control block
+;          r12 -> my workspace
+;          r13 -> full descending stack
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+; Comments:
+;          This uses different read command depending on the mode of the
+;          disc - various drives have problems with certain read commands.
+;
+;-----------------------------------------------------------------------------------------------
+
+ [ cdebug
+        CDebug_StrReg8  "ReadData block ",r1,cc
+        CDebug_StrReg8  ", blocks ",r2,cc
+        CDebug_StrReg8  ", blksize ",r4
+ ]
+
+; Set
+;  r8 =  number of blocks
+;  r9 =  bytes per block
+; r10 -> put data here
+
+
+     MOV           r9, r4
+     MOV           r10, r3
+
+     MUL           r4, r2, r4
+
+; R0 = address mode, R1 = address, RETURNS R1 = address
+
+     SWI           XCD_ConvertToLBA
+     BVS           error_handler
+
+; If reading the PVD then make sure that we use the last session
+
+     CMP           r1, # 16
+     BGT           RD_MultiSessionSorted
+
+
+     [ MINCS=1
+     B             RD_MultiSessionSorted
+     ]
+
+
+     MySTRIM       "l"
+     DisplayNewLine
+ [ cdebug2
+        CDebug_WriteS   "ReadTOC...",cc
+ ]
+
+     Push          "r1-r8"
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, RD_CDBReadTOC
+     ADR           r3, buffer
+     MOV           r4, # 12
+ [ cdebug
+        MOV     r8,#0
+        STR     r8,inbytes
+ ]
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+     BL            ATAPI_Control
+ [ cdebug
+        SavePSR r2
+        LDR     r1,inbytes
+        SUBS    r1,r4,r1
+        BEQ     %F00
+        CDebug_StrReg8  "ReadTOC=",r4,cc
+        CDebug_StrReg8  " not transferred=",r1
+00
+        RestPSR r2
+ ]
+ [ cdebug2
+        BVC     %F01
+        CDebug_WriteS   "FAILED"
+        B       %F02
+01
+        CDebug_WriteS   "OK",cc
+03
+        LDRB    r0,[r3],#1
+        CDebug_StrReg2  " ",r0,cc
+        SUBS    r4,r4,#1
+        BNE     %B03
+        CDebug_NewLine
+02
+ ]
+
+     Pull          "r1-r8"
+
+     BVS           error_handler
+
+; This code reverses the byte order of the address of the last session
+; and then adds 16 to it - cpartington, by observation
+
+     LDR           r8, buffer + 4 + 4
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+     AND           r6, r5, r8, ROR #8
+     AND           r14, r5, r8
+     ORR           r6, r6, r14, ROR #24
+ |
+     REV           r6, r8
+ ]
+
+; r6 = reversed address
+; r1 = 16
+
+     ADD           r1, r1, r6
+
+RD_MultiSessionSorted
+
+     MOV           r8, r2
+
+; Find out what the current drive mode is
+
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     ADR           r14, DriveFlags
+     LDRB          r2, [ r0, r14 ]
+     ADR           r14, DriveMode
+     LDRB          r0, [ r0, r14 ]
+
+; r0 = drive mode (1, 2 or 3)
+; r2 = drive flags
+; r8 = number of blocks
+
+ [ cdebug2
+        CDebug_StrReg8  ", mode ",r0
+ ]
+
+; If only want one block, then load it into my buffer and copy it out later
+
+     TEQ           r8, # 1
+     BNE           RD_HowManyBlocks
+
+     TEQ           r0, # 1
+     TEQNE         r0, # 3
+     ASSERT        mode1datasize = USERDATA__MODE2FORM1
+     LDREQ         r4, = mode1datasize
+     LDRNE         r4, = mode2datasize
+
+     ADR           r3, buffer + 16
+
+RD_HowManyBlocks
+
+; Set up the CDB
+; Swap the byte order of the start LBA and number of blocks
+
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+
+     AND           r6, r5, r1, ROR #8
+     AND           r14, r5, r1
+     ORR           r6, r6, r14, ROR #24
+
+; Only 3 bytes available for transfer length
+     MOV           r14, r8, LSL # 8
+     AND           r1, r5, r14, ROR #8
+     AND           r14, r5, r14
+     ORR           r5, r1, r14, ROR #24
+ |
+     MOV           r14, r8, LSL #8
+     REV           r6, r1
+     REV           r5, r14
+ ]
+
+; r0 = mode we think this is
+; r2 = drive flags
+; r3 -> data buffer
+; r4 = byte count
+; r5 = reversed transfer length
+; r6 = reversed LBA
+; r8 = transfer length
+;
+; mode 1, 3 (mode 2 form 1) => user data only
+; mode 2 => all headers + user data, + EDC & ECC
+; According to MEW, Sony does not take notice of flags bits in READ CD CDB
+; if the expected sector type is set to ANY but sends back all headers etc.
+; so can't use READ CD(ANY) for all sectors but have to be clever.
+; Unfortunately, we can't use READ(10)/(12) for mode 1 and mode 2 form 1
+; sectors as the Panasonic 571 1.0e seems to corrupt blocks sometimes with
+; these commands - it doesn't seem to with READ CD. Unfortunately, CDFS
+; seems to rely on a read of a sector when mode=1 also reading a mode 2 form
+; 1 (i.e. internal mode 3) sector and vice versa - this is what
+; READ(10)/(12) do. Swapping between mode 1 and mode 2 form 1 discs messes
+; up if this doesn't happen. The solution is to emulate what READ(10)/(12)
+; do with two calls to READ CD. This shouldn't have a performance impact
+; because, once CDFS sees that it's a mode 2 form 1 disc, it changes mode to
+; internal mode 3 anyway.
+; However, other drives are very literal about READ CD and can only read
+; data from CDs and not DVDs with this command, so having worked round the
+; above problem with Panasonic/Sony drives we may end up rejecting perfectly
+; good DVDs instead, as a last attempt use READ(12) to read the data. Note
+; that READ(10) only has a 2 byte block count, which would be retrograde
+; having allowed 3 byte block counts for READ CD.
+;
+; Could match on model string "Matsushita CD-ROM CR-571B", but not sure
+; what the Sony model numbers were?
+; Look at the IDENTIFY PACKET DEVICE response and only apply the above
+; emulation logic for pre ATAPI-5 drives, since ATAPI-5 came out in 2000
+; that covers all the affected models.
+
+; First: trap access to mode 0 discs and treat them as 1/3 i.e. the same as
+; READ(10) would do. If the disc is not mode 0, the read will succeed.
+; MEW tells me that CDFS never calls ReadData when mode is 0 but this
+; appears not to be the case e.g. when swapping discs
+
+        TEQS    r0,#0
+        ADDEQ   r0,r0,#1
+
+; use bits 31 & 30 to indicate which retry it is
+; retry 2: READ CD mode 1, else
+; retry 1: READ CD mode 2 form 1, else
+; retry 0: READ(12), else error
+
+        TST     r2,#DriveFlag_Read12Unreliable  ; skip straight to READ(12) if possible
+        ORRNE   r0,r0,#1<<31                    ; retries 2/1/0 to be attempted
+        Push    "r0,r8"
+10
+; r0 = expected mode 1,2,3
+
+        TSTS    r0,#1                           ; mode 1 or mode 2 form 1?
+        ORRNE   r14,r5,#2_00010000 << 24        ; flags = just user data
+
+; internal mode 1 => expected sector type 2_010 = 2
+; internal mode 3 => expected sector type 2_100 = 4
+
+        ADDNE   r0,r0,#1                        ; 1->2, 3->4
+        MOVNE   r2,r0,LSL #(24 + 2)             ; expected sector type
+
+; EQ => not internal mode 1 or 3, assume it's 2 (0 = audio)
+
+        ORREQ   r14,r5,#2_01111000 << 24        ; flags = all headers/user/EDC/ECC
+        MOVEQ   r2,#2_000 << (24 + 2)           ; any type of sector
+
+        MOV     r1,r0,LSR #30                   ; look which retry this is
+        CMP     r1,#1
+        ORRCS   r2,r2,#ATAPI__READ_CD << 16     ; opcode
+        ORRCC   r2,r2,#ATAPI__READ_DATA_12 << 16
+        BICCC   r2,r2,#2_1111 << (24 + 1)       ; DPO=0 FUA=0
+        MOVCC   r14,r14,LSL #8                  ; knock out flags, make transfer length MSB=0
+
+; r2 = opcode + expected sector type
+; r3 -> data buffer
+; r4 = byte count
+; r5 = reversed transfer length
+; r6 = reversed LBA
+; r14 = reversed transfer length + flags
+
+        ADR     r1,buffer                       ; create CDB
+        STMIA   r1,{r2,r6,r14}
+        MOV     r0,#0
+        STR     r0,[r1,#3*4]                    ; zero end of CDB
+
+; issue the ATAPI command
+
+        MOV     r0,#readdata + ATAPIOP__COMMAND_PACKET
+        MOV     r1,#12                          ; r1 = CDB size
+        ADR     r2,buffer + 2                   ; r2 -> CDB
+ [ cdebug
+        MOV     r8,#0
+        STR     r8,inbytes
+ ]
+        MOV     r8,#ATAPICONTROL__SEND_COMMAND
+        BL      ATAPI_Control
+ [ cdebug
+        Push    "r1-r3"
+        SavePSR r2
+        LDR     r1,inbytes
+        SUBS    r1,r4,r1
+        BEQ     %F00
+        LDR     r3,buffer
+        CDebug_StrReg8  "Read(",r3,cc
+        CDebug_StrReg8  ")=",r4,cc
+        CDebug_StrReg8  " not transferred=",r1
+00
+        RestPSR r2
+        Pull    "r1-r3"
+        BLVS    do_request_sense
+ ]
+        BVS     %F20                            ; branch if error
+
+; sector read OK
+
+        Pull    "r0,r8"
+
+; Do I need to copy bytes out from the 1 block loaded ?
+;  r8 =  number of blocks
+;  r9 =  bytes per block
+; r10 -> put data here
+
+        CMP     r8,#1
+        MACRO__EXIT_DRIVER_OK NE        ; exit OK if no copy needed
+
+; copy data from our buffer
+
+        ADR     r1,buffer + 16
+        MOV     r2,r10
+        MOV     r3,r9
+        SWI     XCD_ByteCopy
+
+        CLRV
+        MACRO__EXIT_DRIVER_OK
+
+;;;;;;;;;;;;;;;;;
+
+20
+; Error reading data
+; Check for an illegal request error and assume it's because of the wrong
+; mode (like SCSI driver does). Really should issue request sense to get more
+; info on the error but none of the other error exits do.
+
+        BIC     r14,r0,#(1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+        TEQS    r14,#TARGETERROR__ILLEGAL_REQUEST       ; illegal request?
+        ADDNE   sp,sp,#4                ; if no, discard stacked r0
+        Pull    "r8",NE                 ; ...restore r8
+        BNE     error_handler           ; ...and branch
+
+; illegal request error, try again
+
+        LDR     r0,[sp]                 ; get stacked mode
+        TST     r0,#1                   ; internal mode 1 or 3?
+        BEQ     %FT30
+        SUBS    r0,r0,#1<<30            ; yes, tried other yet?
+        STRPL   r0,[sp]                 ; try again
+        BPL     %B10                    ; r0 = mode
+
+; illegal request error and done all modes
+30
+        Pull    "r0,r8"
+
+  [ cdebug
+        CDebug_WriteS   "wrong data mode"
+  ]
+        B       wrongdatamode
+
+;;;;;;;;;;;;;;;;;
+
+RD_CDBReadTOC
+     DCB           ATAPI__READ_TOC                    ; 0 opcode
+     DCB           0                                  ; 1 MSF bit
+     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 3 reserved
+     DCB           0                                  ; 4 reserved
+     DCB           0                                  ; 5 reserved
+     DCB           0                                  ; 6 start track or session
+     DCB           0                                  ; 7 - allocation length (hi)
+     DCB          12                                  ; 8 - allocation length (lo)
+     DCB        1:SHL:6                               ; 9 format bits
+     DCB           0                                  ; a reserved
+     DCB           0                                  ; b reserved
+
+;-----------------------------------------------------------------------------------------------
+SeekTo ROUT
+;
+; on entry:
+;          r0 = addressing mode
+;          r1 = address
+;
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+ [ cdebug2
+        CDebug_StrReg8  "SeekTo ",r1,cc
+ ]
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+;-------------------------------------
+; Make sure that I'm using LBAs
+;-------------------------------------
+
+     SWI           XCD_ConvertToLBA
+     BVS           error_handler
+
+; Swap the byte order of the start LBA and number of blocks
+
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+
+     AND           r6, r5, r1, ROR #8
+     AND           r14, r5, r1
+     ORR           r1, r6, r14, ROR #24
+ |
+     REV           r1, r1
+ ]
+
+ [ cdebug2
+        CDebug_StrReg8  "=",r1,cc
+ ]
+     MOV           r0, # ATAPI__SEEK:SHL:16
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+
+     ADR           r2, buffer
+     STMIA         r2, { r0, r1, r3, r4 }
+
+;-------------------------------------
+; Send the seek command
+;-------------------------------------
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+ [ cdebug2
+        BVS     %F01
+        CDebug_WriteS   "OK"
+        B       %F02
+01
+        CDebug_WriteS   "FAIL"
+02
+ ]
+     BVS           error_handler
+
+     MACRO__EXIT_DRIVER_OK
+
+;-----------------------------------------------------------------------------------------------
+DriveStatus ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          r0 = status { 1=OK, 2=BUSY, 4=NOTREADY, 8=UNAVAILABLE }
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MOV           r0, # 1
+     MACRO__EXIT_DRIVER_WITH_R0
+     ]
+
+; Send the test unit ready command
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, DR_CDBTestUnitReady
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+;---------------
+; Everything OK
+;---------------
+
+     MOVVC         r0, # 1
+     MACRO__EXIT_DRIVER_WITH_R0 VC
+
+;---------------------
+; What error occured ?
+;---------------------
+
+     BIC           r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+
+; Busy
+     CMP           r5, # TARGETERROR__NO_SENSE ; clears V
+     MOVEQ         r0, # 2
+     MACRO__EXIT_DRIVER_WITH_R0 EQ
+
+; Not ready
+     CMP           r5, # TARGETERROR__NOT_READY ; clears V
+     MOVEQ         r0, # 4
+     MACRO__EXIT_DRIVER_WITH_R0 EQ
+
+; No drive - unavailable
+     CMP           r5, # DRIVERERROR__SELECTION_TIMEOUT ; clears V
+     MOVEQ         r0, # 8
+     MACRO__EXIT_DRIVER_WITH_R0 EQ
+
+     B             error_handler
+
+
+ LTORG
+
+;-----------------------------------------------------------------------------------------------
+DriveReady ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          r0 = 0 if drive is OK, else r0 = 1
+;
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MOV           r0, # 0
+     MACRO__EXIT_DRIVER_WITH_R0
+     ]
+
+; Send the test unit ready command
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, DR_CDBTestUnitReady
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+; No problem
+     MOV           r0, # 0
+     ADDVSS        r0, r0, # 1 ; clears V
+     MACRO__EXIT_DRIVER_WITH_R0
+
+DR_CDBTestUnitReady
+     DCD           0
+     DCD           0
+     DCD           0
+
+;-----------------------------------------------------------------------------------------------
+GetParameters ROUT
+;
+; on entry:
+;          r0 -> parameter block
+;            +  0 = inactivity timer multiplier
+;            +  4 = read retry count
+;            +  8 = data mode (1, 2 or 3)
+;            + 12 = speed setting
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+; r6 -> parameter block
+     MOV           r6, r0
+
+;----------------------------------
+; Get all of the Mode pages
+;----------------------------------
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, GP_CurrentModeSense
+     ADR           r3, buffer
+     LDR           r4, = BUFFER_SIZE
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+ [ cdebug2
+        Push    "r0-r2"
+        ADR     r2,buffer
+        MOV     r1,#64
+        CDebug_WriteS   "mode sense data: ",cc
+00
+        LDRB    r0,[r2],#1
+        CDebug_StrReg2  " ",r0,cc
+        SUBS    r1,r1,#1
+        BNE     %B00
+        CDebug_NewLine
+        Pull    "r0-r2"
+ ]
+
+;-----------------------------------------------------
+; Find page &0d containing inactivity time multiplier
+;-----------------------------------------------------
+     MOV           r1, # &0d
+     ADR           r2, buffer
+     BL            GP_FindModePage
+
+     TEQ           r2, # 0
+     BEQ           GP_CouldntFindPage
+
+     LDRB          r3, [ r2, # 3 ]
+     AND           r3, r3, # 2_1111
+
+;-----------------------------------------------------
+; Find page &01 containing read retry count
+;-----------------------------------------------------
+     MOV           r1, # &01
+     ADR           r2, buffer
+     BL            GP_FindModePage
+
+     TEQ           r2, # 0
+     BEQ           GP_CouldntFindPage
+
+     LDRB          r4, [ r2, # 3 ]
+
+;-----------------------------------------------------
+; Find page &2a containing speed setting
+;-----------------------------------------------------
+     MOV           r1, # &2a
+     ADR           r2, buffer
+     BL            GP_FindModePage
+
+     TEQ           r2, # 0
+     BEQ           GP_CouldntFindPage
+
+     LDRB          r8, [ r2, # 15 ]
+     LDRB          r14, [ r2, # 14 ]
+     ORR           r14, r8, r14, LSL # 8
+
+     DivRem        r8, r14, # 176, r5, norem
+
+;----------------------------------
+; What's the current data mode ?
+;----------------------------------
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     ADR           r14, DriveMode
+     LDRB          r5, [ r14, r0 ]
+
+     STMIA         r6, { r3, r4, r5, r8 }
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+GP_CurrentModeSense
+     DCB           ATAPI__MODE_SENSE                   ;  0 opcode
+     DCB           0                                   ;  1 reserved
+     DCB           (2_00:SHL:6) + &3f                  ;  2 current values + all pages
+     DCB           0                                   ;  3 reserved
+     DCB           0                                   ;  4 reserved
+     DCB           0                                   ;  5 reserved
+     DCB           0                                   ;  6 reserved
+     DCB           BUFFER_SIZE:SHR:8                   ;  7 Allocation length (MSB)
+     DCB           BUFFER_SIZE:AND:&FF                 ;  8 Allocation length (LSB)
+     DCB           0                                   ;  9 reserved
+     DCB           0                                   ; 10 reserved
+     DCB           0                                   ; 11 reserved
+
+; This small routine will look through 'buffer' to find page number in r1, returning a pointer
+; in r2
+; on entry:
+;          r1 =  page number to look for
+;          r2 -> start of mode sense information (header then pages)
+; on exit:
+;          r2 -> place found at (start of page)
+
+GP_FindModePage
+
+     Push          "r3-r5, r14"
+
+; r5 = count of the number of bytes actually read in
+; this is just to prevent the hilarious 'abort on data
+; transfer' because a page is present for some reason
+; NEC where are your mandatory mode sense pages ?
+     LDRB          r3, [ r2, # 0 ]
+     LDRB          r5, [ r2, # 1 ]
+     ORR           r5, r5, r3, LSL # 8
+
+ [ check_mode_sense_length
+     TEQ           r5, # &3b
+     TEQNE         r5, # &3a
+     BNE           GP_Failed
+ ]
+
+     SUB           r5, r5, # 8 + 2
+     ADD           r2, r2, # 8
+
+GP_FindPageLoop
+     CMP           r5, # 0
+     MOVLE         r2,#0
+     Pull          "r3-r5,pc",LE
+
+     LDRB          r3, [ r2, # 0 ]                     ; page number
+     AND           r3, r3, # 2_111111
+     LDRB          r4, [ r2, # 1 ]                     ; page length
+     CMP           r3, r1
+     ADDLT         r3, r4, # 2                         ; + 2 bytes to reach next page
+     ADDLT         r2, r2, r3
+     SUBLT         r5, r5, r3
+     BLT           GP_FindPageLoop
+
+GP_Failed
+     MOVNE         r2,#0
+     Pull          "r3-r5, pc"
+
+; Report an error 'cause couldn't find the required ModeSense page
+GP_CouldntFindPage
+     ADRL          r0, EH__Invalid_Parameter
+     B             error_handler_lookup
+
+
+;-----------------------------------------------------------------------------------------------
+SetParameters ROUT
+;
+; on entry:
+;          r0 -> parameter block
+;            +  0 = inactivity timer multiplier
+;            +  4 = read retry count
+;            +  8 = data mode (1, 2 or 3)
+;            + 12 = speed setting
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+; set r6 -> parameter block
+
+     MOV           r6, r0
+
+ [ cdebug2
+        LDR     r1,[r6,#8]
+        CDebug_StrReg8   "SetParameters mode ",r1,cc
+        LDR     r1,[r6,#12]
+        CDebug_StrReg8  ", speed ",r1
+ ]
+
+;----------------------------------------------------------------
+; Set the CD-ROM speed
+;----------------------------------------------------------------
+     LDRB          r1, [ r6, # 12 ]
+     TEQ           r1, # 0
+     BEQ           SP_DoneSpeed                           ; [ don't want to change ]
+
+ [ fix_speed_select
+
+; if maximum speed, send &FFFF (defined in standard)
+; otherwise, send speed * 176.4 = kBytes/s (1000s of bytes - odd, but
+; what people seem to do)
+; *** WARNING: code below makes use of fact that speed is byte multiplied by 176
+;              so can't exceed 16 bits
+
+        TEQS    r1,#255                         ; maximum?
+        ORREQ   r1,r1,#&FF00                    ; ...send &FFFF
+        BEQ     %FT01
+        MOV     r14,#176:SHL:8                  ; ...else speed * 176.4 (ish)
+        ORR     r14,r14,#&66
+        MUL     r1,r14,r1
+        MOVS    r1,r1,LSR #8                    ; shift back down, round to nearest
+        ADDCS   r1,r1,#1
+01      MOV     r14,r1,LSR #8                   ; sort out byte order
+        ORR     r1,r14,r1,LSL #8
+        MOV     r1,r1,LSL #16                   ; move to high bits
+        ORR     r1, r1, # ATAPI__SET_CDROM_SPEED        ; or in opcode
+
+ |
+     TEQ           r1, # 255                              ; maximum speed
+     ORREQ         r1, r1, # 255:SHL:8                    ; r1 = &ffff
+     MOVNE         r14, # 176
+     MULNE         r1, r14, r1                            ; r1 = r1 * 176
+     MOV           r1, r1, LSL # 16
+     ORR           r1, r1, # ATAPI__SET_CDROM_SPEED
+ ]
+
+     ADR           r2, buffer
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     STMIA         r2, { r1, r3, r4 }
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+ [ cdebug
+        BLVS    do_request_sense
+ ]
+     BVS           error_handler
+
+SP_DoneSpeed
+
+;----------------------------------------------------------------
+; Get the inactivity and retry values
+;----------------------------------------------------------------
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, SP_CurrentModeSense
+     ADR           r3, buffer + 16
+     LDR           r4, = BUFFER_SIZE - 16
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+;----------------------------------------------------------------
+; Change the inactivity and retry values
+;----------------------------------------------------------------
+
+; inactivity
+     MOV           r1, # &0d
+     ADR           r2, buffer + 16
+     BL            GP_FindModePage
+
+     TEQ           r2, # 0
+     BEQ           GP_CouldntFindPage
+
+; r2 -> page &0D (CD-ROM parameters)
+
+     LDR           r14, [ r6, # 0 ]     ; get requested inactivity timer multiplier
+     AND           r14, r14, # 2_1111
+     LDRB          r3, [ r2, # 3 ]
+     BIC           r3, r3, # 2_1111
+     ORR           r14, r3, r14
+     STRB          r14, [ r2, # 3 ]
+     MOV           r5, r2
+
+; r5 -> page &0D
+
+     MOV           r1, # &01
+     ADR           r2, buffer + 16
+     BL            GP_FindModePage
+
+     TEQ           r2, # 0
+     BEQ           GP_CouldntFindPage
+
+; r2 -> page &01 (error recovery parameters)
+
+     LDRB          r14, [ r6, # 4 ]     ; get requested read retry count
+     STRB          r14, [ r2, # 3 ]     ; set it
+
+;----------------------------------------------------------------
+; Set the pages
+;----------------------------------------------------------------
+
+; Build up ModeSelect command for page 1
+
+     MOV           r0, # writedata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     SUB           r3, r2, # 8
+     MOV           r2, # 0              ; Sony requires this to be 0, what about Panasonic ?
+     MOV           r4, # 0
+     STMIA         r3, { r2, r4 }
+     ADR           r2, SP_ModeSelectPage1
+     MOV           r4, # 8+8            ; 8 for header, 8 for page data
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     BVC           SP_Page1Written
+
+     BIC           r14, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r14, # TARGETERROR__ILLEGAL_REQUEST
+     BNE           error_handler        ; An error other than read-only
+
+SP_Page1Written
+
+; Copy page &d over page 1
+     MOV           r1, r5
+     MOV           r5, r3
+     ADD           r2, r3, # 8
+     MOV           r3, # 8
+SP_CopyOverLoop
+     LDRB          r0, [ r1 ], # 1
+     STRB          r0, [ r2 ], # 1
+     SUBS          r3, r3, # 1
+     BGT           SP_CopyOverLoop
+
+; Build up ModeSelect command for page &d
+     MOV           r0, # writedata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, SP_ModeSelectPageD
+     MOV           r3, r5
+     MOV           r4, # 8+8            ; 8 for header, 8 for page data
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+ [ :LNOT: mode_select_dont_use_page_d
+     BL            ATAPI_Control
+  [ :LNOT: mode_select_ignore_page_d_error
+     BVS           error_handler
+  ]
+ ]
+
+;----------------------------------------------------------------
+; Set the current data mode, but also check that it's valid
+;----------------------------------------------------------------
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     ADR           r14, DriveMode
+     LDR           r8, [ r6, # 8 ]
+     CMP           r8, # 4
+     BCS           invalidparameter
+     STRB          r8, [ r14, r0 ]
+
+     CLRV
+     MACRO__EXIT_DRIVER_OK
+
+
+SP_ModeSelectPage1
+     DCB           ATAPI__MODE_SELECT                  ;  0 opcode
+     DCB           2_00010000                          ;  1 ??
+     DCB           1                                   ;  2 page 1
+     DCB           0                                   ;  3 reserved
+     DCB           0                                   ;  4 reserved
+     DCB           0                                   ;  5 reserved
+     DCB           0                                   ;  6 reserved
+     DCB           0                                   ;  7 Parameter list length (MSB)
+     DCB           8+8                                 ;  8 Parameter list length (LSB)
+     DCB           0                                   ;  9 reserved
+     DCB           0                                   ; 10 reserved
+     DCB           0                                   ; 11 reserved
+
+SP_ModeSelectPageD
+     DCB           ATAPI__MODE_SELECT                  ;  0 opcode
+     DCB           2_00010000                          ;  1 ??
+     DCB          &d                                   ;  2 page &d
+     DCB           0                                   ;  3 reserved
+     DCB           0                                   ;  4 reserved
+     DCB           0                                   ;  5 reserved
+     DCB           0                                   ;  6 reserved
+     DCB           0                                   ;  7 Parameter list length (MSB)
+     DCB           8+8                                 ;  8 Parameter list length (LSB)
+     DCB           0                                   ;  9 reserved
+     DCB           0                                   ; 10 reserved
+     DCB           0                                   ; 11 reserved
+
+
+
+SP_CurrentModeSense
+     DCB           ATAPI__MODE_SENSE                   ;  0 opcode
+     DCB           0                                   ;  1 reserved
+     DCB           (2_00:SHL:6) + &3f                  ;  2 current values + all pages
+     DCB           0                                   ;  3 reserved
+     DCB           0                                   ;  4 reserved
+     DCB           0                                   ;  5 reserved
+     DCB           0                                   ;  6 reserved
+     DCB           BUFFER_SIZE:SHR:8                   ;  7 Allocation length (MSB)
+     DCB           BUFFER_SIZE:AND:&FF                 ;  8 Allocation length (LSB)
+     DCB           0                                   ;  9 reserved
+     DCB           0                                   ; 10 reserved
+     DCB           0                                   ; 11 reserved
+
+
+;-----------------------------------------------------------------------------------------------
+
+ [ cdebug
+
+do_request_sense        ROUT
+;
+; Issue request sense to the drive
+; Only used for debugging
+
+        EntryS  "r0-r8"
+
+; error so issue REQUEST SENSE
+
+        ADRL    r2,sense_buffer
+        MOV     r1,#&03                 ; opcode
+        MOV     r3,#?sense_buffer - 12  ; allocation length
+        MOV     r4,#0                   ; reserved
+        STMIA   r2,{r1,r3,r4}           ; create CDB
+
+        MOV     r0,#readdata + ATAPIOP__COMMAND_PACKET
+        MOV     r1,#12                  ; cdb size
+        MOV     r4,r3                   ; bytes to be returned
+        ADD     r3,r2,r1                ; r3 -> where sense goes
+        MOV     r8,#ATAPICONTROL__SEND_COMMAND
+        BL      ATAPI_Control
+        BVS     %F02
+
+; got sense back
+; r3 -> data
+
+        CDebug_WriteS   "SENSE:",cc
+        LDRB    r2,[r3,#7]              ; get additional sense size
+        ADD     r2,r2,#8
+00
+        LDRB    r0,[r3],#1
+        CDebug_StrReg2  " ",r0,cc
+        SUBS    r2,r2,#1
+        BNE     %B00
+        CDebug_NewLine
+01
+        EXITS
+;;;;;;;;;;;;;;;;;;
+02
+        CDebug_StrReg8  "REQUEST SENSE ERROR ",r0
+        EXITS
+ ]
+
+;-----------------------------------------------------------------------------------------------
+OpenDrawer ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, OD_CDBOpenDrawer
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     MACRO__EXIT_DRIVER_OK VC
+
+; Is drawer locked ?
+     BIC           r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r5, # TARGETERROR__ILLEGAL_REQUEST
+     ADREQL        r0, drawer_locked_error
+     BEQ           error_handler_lookup
+
+     B             error_handler
+
+
+OD_CDBOpenDrawer
+ DCB      ATAPI__START_STOP_EJECT_UNIT      ;  0
+ DCB      1                                 ;  1 immediate bit (should set for Panasonic)
+ DCB      0                                 ;  2
+ DCB      0                                 ;  3
+ DCB      2                                 ;  4
+ DCB      0                                 ;  5
+ DCB      0                                 ;  6
+ DCB      0                                 ;  7
+ DCB      0                                 ;  8
+ DCB      0                                 ;  9
+ DCB      0                                 ; 10
+ DCB      0
+
+;-----------------------------------------------------------------------------------------------
+EjectButton ROUT
+;
+; on entry:
+;          r0 = 0 to allow eject, 1 to prevent
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+;-----------------------
+; Check for valid switch
+;-----------------------
+     CMP           r0, #2
+     BCS           invalidparameter
+
+;-----------------------
+
+     MOV           r6, r0
+
+;--------------------------------
+;  Prevent/allow command
+;--------------------------------
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer
+     MOV           r3, # 0
+     MOV           r4, # ATAPI__PREVENT_ALLOW
+     STMIA         r2, { r4, r6 }
+
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+     MOV           r1, r6
+     BL            Extras_SetDrawerStatus
+
+     CLRV
+     MACRO__EXIT_DRIVER_OK
+
+;-----------------------------------------------------------------------------------------------
+EnquireAddress ROUT
+;
+; on entry:
+;          r0 = addressing mode for returned data
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = current laser position
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+     Push          r0
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, EA_CDBEnquireAddress
+     ADR           r3, buffer + 16
+     MOV           r4, # 16
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     Pull          r4
+
+     BVS           error_handler
+
+
+;-----------------------------------
+; Get the LBAFormat absolute address
+;-----------------------------------
+     LDR           r2, buffer + 16 + 8
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+     AND           r6, r5, r2, ROR #8
+     AND           r1, r5, r2
+     ORR           r1, r6, r1, ROR #24
+ |
+     REV           r1, r2
+ ]
+
+;---------------------------------------
+; If caller wants return in MSF then ...
+;---------------------------------------
+
+     TEQ           r4, #MSFFormat
+     BNE           %FT10
+
+     MOV           r0, #LBAFormat
+
+     SWI           XCD_ConvertToMSF
+     BVS           error_handler
+
+     ADD           r1, r1, #2 * 256
+10
+
+;---------------------------------------
+; If caller wants return in PB format
+;---------------------------------------
+     CMP           r4, #PBFormat
+
+     ADDEQ         r1, r1, #( MaxNumberOfBlocks + 1 ) * 2
+
+     MOV           r0, r1
+
+
+
+     MACRO__EXIT_DRIVER_WITH_R0 ; V is clear
+
+EA_CDBEnquireAddress
+     DCB           ATAPI__READ_SUB_CHANNEL            ; command byte
+     DCB           0                                  ;
+     DCB          64                                  ; sub-channel q
+     DCB           1                                  ; data format
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+     DCB           0                                  ; track number
+     DCB           0                                  ; - Allocation length
+     DCB          16                                  ; -
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+
+
+;-----------------------------------------------------------------------------------------------
+EnquireDataMode ROUT
+;
+; on entry:
+;          r0 = addressing mode for block
+;          r1 = block
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = addressing mode (1 for mode 1, 2 for mode 2, 3 for mode 2 form 1)
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MOV           r0, # 1
+     MACRO__EXIT_DRIVER_WITH_R0
+     ]
+
+;----------------------------------
+; Make sure that LBA mode is used
+;----------------------------------
+     SWI           XCD_ConvertToLBA
+     BVS           error_handler
+
+;--------------------------
+; ReadHeader command
+;--------------------------
+
+; swap byte order of LBA
+ [ NoARMv6
+     MOV           r2, #&ff00
+     ORR           r2, r2, r2, LSL #16
+
+     AND           r14, r2, r1, ROR #8
+     AND           r8, r2, r1
+     ORR           r6, r14, r8, ROR #24
+ |
+     REV           r6, r1
+ ]
+
+; Build read header command
+     ASSERT        ((EDM_CDBReadHeader - .) :AND: 3) = 0
+     ADR           r2, EDM_CDBReadHeader
+     ADR           r3, buffer
+     LDMIA         r2, { r0, r4, r8, r14 }
+     STMIA         r3!, { r0, r6, r8, r14 }
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+     MOV           r4, # 8
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+ [ cdebug
+        BLVS    do_request_sense
+ ]
+
+; Assume any illegal request error is because it's a mode 0 disc (like Sony
+; 561 SCSI driver does). Really should issue request sense to get more info on
+; the error but none of the other error exits do.
+
+        TEQVCS  r0,r0           ; VC, set Z
+        BICVS   r14,r0,#(1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+        TEQVSS  r14,#TARGETERROR__ILLEGAL_REQUEST       ; illegal request?
+        BNE     error_handler
+
+; VS => audio (probably)
+
+  [ cdebug2
+        BVC     %F01
+        CDebug_WriteS   "VS:It's mode 0"
+01
+  ]
+        BVC     %F01
+        SUBS    r0,r0,r0                ; return mode 0, clear V
+        MACRO__EXIT_DRIVER_WITH_R0
+01
+
+; If mode 0 was not detected by a returned error (drive-specific?),
+; check for mode 0 when check for mode returned by drive
+
+        LDRB    r0,[r3,#0]              ; get returned mode
+        TEQS    r0,#1                   ; mode 1?
+        TEQNES  r0,#0                   ; if not, mode 0?
+  [ cdebug2
+        BNE     %F01
+        CDebug_StrReg2   "It's mode ",r0
+01
+  ]
+        MACRO__EXIT_DRIVER_WITH_R0 EQ   ; exit if so (V is clear)
+
+;---------------------------------------------------------------
+;    Mode 2 form 1 or 2 ?
+;---------------------------------------------------------------
+
+;---------------------------------------------------------------
+; ReadCD command to find out if mode 2 form 1 or mode 2 form 2
+; The reason it's done in this way is that the Sony drive likes
+; to return sync info and headers even if you don't want it to.
+; The Panasonic drive just goes ahead and works.
+;---------------------------------------------------------------
+
+; Build read cd command
+     ASSERT        ((EDM_CDBReadCD - .) :AND: 3) = 2
+     ADR           r2, EDM_CDBReadCD - 2
+     ADR           r3, buffer
+     LDMIA         r2, { r0, r4, r8, r14 }
+     STMIA         r3!, { r0, r6, r8, r14 }
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+     LDR           r4, =2352
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+     LDRB          r0, [ r3, # 12 + MODE2__HEADER_SIZE + MODE2__SUB_HEADER_SUBMODE ]
+     TST           r0, # SUBMODE__FORM
+     MOVEQ         r0, # 3
+     MOVNE         r0, # 2
+ [ cdebug2
+        CDebug_StrReg2  "It's mode ",r0
+ ]
+
+     MACRO__EXIT_DRIVER_WITH_R0 ; V is clear
+
+EDM_CDBReadHeader
+ DCB      0
+ DCB      0
+
+; This is deliberately offset by 2 bytes
+ DCB      ATAPI__READ_HEADER                ;  0     opcode
+ DCB      0                                 ;  1     msf bit
+ DCB      0                                 ;  2     LBA        (hi)
+ DCB      0                                 ;  3     LBA
+ DCB      0                                 ;  4     LBA
+ DCB      0                                 ;  5     LBA        (low)
+ DCB      0                                 ;  6     reserved
+ DCB      0                                 ;  7     allocation (hi)
+ DCB      8                                 ;  8     allocation (low)
+ DCB      0                                 ;  9     reserved
+ DCB      0                                 ; 10     reserved
+ DCB      0                                 ; 11     reserved
+
+ ALIGN
+
+; This is deliberately offset by 2 bytes
+
+ DCB      0
+ DCB      0
+
+EDM_CDBReadCD
+ DCB      ATAPI__READ_CD                    ;  0     opcode
+ DCB      0                                 ;  1     expected sector type
+ DCB      0                                 ;  2     LBA             (hi)
+ DCB      0                                 ;  3     LBA
+ DCB      0                                 ;  4     LBA
+ DCB      0                                 ;  5     LBA             (low)
+ DCB      0                                 ;  6     transfer length (hi)
+ DCB      0                                 ;  7     transfer length
+ DCB      1                                 ;  8     transfer length (low)
+ DCB      2_11111000                        ;  9     sync, flag bits, data + headers
+ DCB      0                                 ; 10     sub-channel bits
+ DCB      0                                 ; 11     reserved
+
+ ALIGN
+
+ LTORG
+
+;-----------------------------------------------------------------------------------------------
+PlayAudio ROUT
+;
+; on entry:
+;          r0 = addressing mode for returned data
+;          r1 = start address
+;          r2 = end address
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+;------------------------------------------------
+; Convert the start address to LBA
+;------------------------------------------------
+     SWI           XCD_ConvertToLBA
+
+;------------------------------------------------
+; Convert the end address to LBA
+;------------------------------------------------
+     MOVVC         r3, r1
+     MOVVC         r1, r2
+     SWIVC         XCD_ConvertToLBA
+     BVS           error_handler
+
+;------------------------------------------------
+; Subtract end and start to get transfer length
+;------------------------------------------------
+     SUB           r0, r1, r3
+
+;------------------------------------------------
+; Reverse start address to hi/lo
+;------------------------------------------------
+ [ NoARMv6
+     MOV           r2, #&ff00
+     ORR           r2, r2, r2, LSL #16
+
+     AND           r14, r2, r3, ROR #8
+     AND           r8, r2, r3
+     ORR           r3, r14, r8, ROR #24
+ |
+     REV           r3, r3
+ ]
+
+;------------------------------------------------
+; Reverse transfer length to hi/lo
+;------------------------------------------------
+ [ NoARMv6
+     AND           r14, r2, r0, ROR #8
+     AND           r8, r2, r0
+     ORR           r4, r14, r8, ROR #24
+ |
+     REV           r4, r0
+ ]
+
+;------------------------------------------------
+; Play audio
+;------------------------------------------------
+
+     ADR           r2, buffer
+     MOV           r0, # ATAPI__PLAY_AUDIO_12:SHL:16
+     MOV           r14, # 0
+     STMIA         r2, { r0, r3, r4, r14 }
+
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     MACRO__EXIT_DRIVER_OK VC
+
+;---------------------------------------------------
+; If the error is illegal request then nosuchtrack
+;---------------------------------------------------
+     BIC           r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r5, # TARGETERROR__ILLEGAL_REQUEST
+     BEQ           nosuchtrack
+
+     B             error_handler
+
+;-----------------------------------------------------------------------------------------------
+PlayTrack ROUT
+;
+; on entry:
+;          r0 = track number
+;          r1 = &ff end of disc, &fe play to end of track
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+;----------------------------
+; Make sure that r0 = 0 to 99
+;----------------------------
+     CMP           r0, #100
+     BCS           invalidparameter
+
+;----------------------------
+; Make sure that r1 = &ff or &fe
+;----------------------------
+     TEQ           r1, # &ff
+     TEQNE         r1, # &fe
+     BNE           invalidparameter
+
+;----------------------------
+
+     MOV           r5, r0
+     MOV           r6, r1
+
+;------------------------------------------------------------
+; Read in the first track details using ReadTOC
+;------------------------------------------------------------
+
+     ADR           r2, PT_CDBPlayTrack
+     ADR           r3, buffer
+     LDMIA         r2, { r0, r1, r4 }
+     ORR           r1, r1, r5, LSL # 16
+     MOV           r2, r3
+     STMIA         r3!, { r0, r1, r4 }
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     MOV           r4, # 12
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     BVC           PT_OKFirst
+
+     BIC           r14, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r14, # TARGETERROR__ILLEGAL_REQUEST
+     BEQ           nosuchtrack
+
+     B             error_handler
+
+PT_OKFirst
+
+;--------------------------------
+; Play to end of disc or track ?
+;--------------------------------
+
+     TEQ           r6, # &ff
+     BEQ           PT_EndOfDisc
+
+;--------------------------------
+; Play to end of track
+;--------------------------------
+
+; Is this a legal track ?
+     LDRB          r14, buffer + 12 + 3
+     CMP           r5, r14
+     BGT           nosuchtrack             ; [ no - not legal track number ]
+
+; Either look at the next track or the lead-out area on the disc
+     ADDLT         r14, r5, # 1
+     MOVEQ         r14, # &aa
+     STRB          r14, buffer + 6
+
+     B             PT_ReadLastTrackDetails
+
+;--------------------------------
+; Play to end of disc
+;--------------------------------
+PT_EndOfDisc
+
+     MOV           r14, # &aa
+     STRB          r14, buffer + 6
+
+
+;------------------------------------------------------------
+; Read in the last track details using ReadTOC
+;------------------------------------------------------------
+
+PT_ReadLastTrackDetails
+
+     ADR           r2, buffer
+     ADR           r3, buffer + 24
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     MOV           r4, # 12
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     BVC           PT_OKLast
+
+     BIC           r14, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r14, # TARGETERROR__ILLEGAL_REQUEST
+     BEQ           nosuchtrack
+
+     B             error_handler
+
+PT_OKLast
+;----------------------------------------------------------
+; Work out the amount to play
+;----------------------------------------------------------
+
+; Get start addresses and reverse them to ARM lo/hi
+     LDR           r0, buffer + 12 + 8
+     LDR           r1, buffer + 24 + 8
+
+ [ NoARMv6
+     MOV           r2, #&ff00
+     ORR           r2, r2, r2, LSL #16
+
+     AND           r14, r2, r0, ROR #8
+     AND           r8, r2, r0
+     ORR           r3, r14, r8, ROR #24
+
+     AND           r14, r2, r1, ROR #8
+     AND           r8, r2, r1
+     ORR           r4, r14, r8, ROR #24
+ |
+     REV           r3, r0
+     REV           r4, r1
+ ]
+
+; Subtract the end and start address to get a transfer length, then swap to hi/lo format
+     SUB           r4, r4, r3
+     SUB           r4, r4, # &1
+ [ NoARMv6
+     AND           r14, r2, r4, ROR #8
+     AND           r8, r2, r4
+     ORR           r4, r14, r8, ROR #24
+ |
+     REV           r4, r4
+ ]
+
+
+; Get back the start address in hi/lo format
+     MOV           r3, r0
+
+     ADR           r2, buffer
+     MOV           r0, # ATAPI__PLAY_AUDIO_12:SHL:16
+     MOV           r14, # 0
+     STMIA         r2, { r0, r3, r4, r14 }
+
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     MACRO__EXIT_DRIVER_OK VC
+
+;---------------------------------------------------
+; If the error is illegal request then nosuchtrack
+;---------------------------------------------------
+     BIC           r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r5, # TARGETERROR__ILLEGAL_REQUEST
+     BEQ           nosuchtrack
+
+     B             error_handler
+
+;----------------------------------------------------------
+
+
+
+PT_CDBPlayTrack
+     DCB           ATAPI__READ_TOC                    ; 0 command byte
+     DCB           0                                  ; 1
+     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 3 reserved
+     DCB           0                                  ; 4 reserved
+     DCB           0                                  ; 5 reserved
+     DCB           0                                  ; 6 track number
+     DCB           0                                  ; 7 - Allocation length
+     DCB          12                                  ; 8 -
+     DCB           0                                  ; 9 format
+     DCB           0                                  ; a reserved
+     DCB           0                                  ; b reserved
+
+;-----------------------------------------------------------------------------------------------
+AudioPause ROUT
+;
+; on entry:
+;          r0 = 0 to resume, 1 to pause
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     MOV           r6, r0
+
+
+;----------------------------
+; Make sure that r0 = 0 to 1
+;----------------------------
+     CMP           r0, #2
+     BCS           invalidparameter
+
+
+     LDMIA         r7, { r2, r3, r4 }
+     ADR           r7, temp_control_block
+     STMIA         r7, { r2, r3, r4, r8 }
+
+
+;-----------------------------------------
+; Read sub-channel to find current address
+;-----------------------------------------
+     MOV           r0, #64
+     ADR           r1, buffer + 100
+     SWI           XCD_ReadSubChannel
+
+     BVS           error_handler
+
+     LDRB          r4, buffer + 16 + 0
+
+;-----------------------------------------
+; If pause on and not playing then ignore
+;-----------------------------------------
+
+     TEQ           r1, #3
+     TEQEQ         r6, #1
+     MACRO__EXIT_DRIVER_OK EQ ; V is clear
+
+;-----------------------------------------
+; If pause off and playing then ignore
+;-----------------------------------------
+
+    ; TEQ       r1, #0
+    ; TEQEQ     r6, #0
+    ; MACRO__EXIT_DRIVER_OK EQ
+
+;-----------------------------------------
+; If pause on then still
+;-----------------------------------------
+     TEQ           r6, #1
+     BNE           AP_PlayToEndOfDisc
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, AP_PauseResume
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+; If the error was CheckCondition (because not playing audio) then ignore it
+     TEQVC         r0, r0
+     BICVS         r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQVS         r5, # TARGETERROR__ILLEGAL_REQUEST
+
+     CMPEQ         r0, r0 ; clear V, maintain Z set
+     MACRO__EXIT_DRIVER_OK EQ
+
+
+     B             error_handler
+
+
+AP_PlayToEndOfDisc
+;-----------------------------------------
+; If pause off then play to end of disc
+;-----------------------------------------
+     MOV           r0, #LBAFormat
+     ADR           r1, buffer + 100 + 8
+     SWI           XCD_DiscUsed
+
+     ADRVC         r14, buffer + 100 + 4
+     LDMVCIA       r14, { r1, r2 }
+     SWIVC         XCD_PlayAudio
+
+     BVS           error_handler
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+AP_PauseResume
+     DCB           ATAPI__PAUSE_RESUME        ;  0 opcode
+     DCB           0                          ;  1 reserved
+     DCB           0                          ;  2 reserved
+     DCB           0                          ;  3 reserved
+     DCB           0                          ;  4 reserved
+     DCB           0                          ;  5 reserved
+     DCB           0                          ;  6 reserved
+     DCB           0                          ;  7 reserved
+     DCB           0                          ;  8 resume bit
+     DCB           0                          ;  9 reserved
+     DCB           0                          ; 10 reserved
+     DCB           0                          ; 11 reserved
+
+;-----------------------------------------------------------------------------------------------
+EnquireTrack ROUT
+;
+; on entry:
+;          r0 = 0 start/end track, 1 to 99 info on that track
+;          r1 -> storage area
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+ [ cdebug
+        CDebug_StrReg8  "EnquireTrack ",r0
+ ]
+
+;----------------------------
+; Make sure that r0 = 0 to 99
+;----------------------------
+     CMP           r0, #100
+     BCS           invalidparameter
+
+;----------------------------
+
+     MOVS          r5, r0
+     MOV           r6, r1
+
+;----------------------------------------------------------
+; Build up the CDB block with the required track number in
+;----------------------------------------------------------
+     ADR           r2, ET_CDBEnquireTrack
+     ADR           r3, buffer
+
+     LDMIA         r2, { r0, r1, r4 }
+     MOV           r2, r3
+     ORRNE         r1, r1, r5, LSL # 16
+     ORREQ         r1, r1, # 1:SHL:16
+     STMIA         r3!, { r0, r1, r4 }
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+
+     MOV           r4, # 12
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     BVC           ET_OK
+
+     BIC           r14, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r14, # TARGETERROR__ILLEGAL_REQUEST
+     BEQ           nosuchtrack
+
+     B             error_handler
+
+ET_OK
+
+     MOVS          r0, r5
+     MOV           r1, r6
+
+
+;------------------------------
+; Just return start/end track ?
+;------------------------------
+     LDREQB        r14, buffer + 12 + 2
+     STREQB        r14, [ r1, #0 ]
+     LDREQB        r14, buffer + 12 + 3
+     STREQB        r14, [ r1, #1 ]
+
+;---------------------------
+; Return track start address - swap byte order
+;---------------------------
+     ADRNE         r5, buffer + 12 + 4
+     LDMNEIA       r5, { r2, r6 }
+
+ [ NoARMv6
+     MOVNE         r5, #&ff00
+     ORRNE         r5, r5, r5, LSL #16
+
+     ANDNE         r4, r5, r6, ROR #8
+     ANDNE         r3, r5, r6
+     ORRNE         r3, r4, r3, ROR #24
+ |
+     REVNE         r3, r6
+ ]
+
+     STRNE         r3, [ r1, #0 ]
+
+;-------------
+; Control bits
+;-------------
+     MOVNE         r2, r2, LSR#8+2
+     ANDNE         r2, r2, #3
+     STRNEB        r2, [ r1, #4 ]
+
+;------------------
+
+     MACRO__EXIT_DRIVER_OK ; V is still clear
+
+ET_CDBEnquireTrack
+     DCB           ATAPI__READ_TOC                    ; 0 command byte
+     DCB           0                                  ; 1 MSF bit
+     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 3 reserved
+     DCB           0                                  ; 4 reserved
+     DCB           0                                  ; 5 reserved
+     DCB           0                                  ; 6 track number
+     DCB           0                                  ; 7 - Allocation length (hi)
+     DCB          12                                  ; 8 - Allocation length (lo)
+     DCB           0                                  ; 9 format
+     DCB           0                                  ; a reserved
+     DCB           0                                  ; b reserved
+
+;-----------------------------------------------------------------------------------------------
+ReadSubChannel ROUT
+;
+; on entry:
+;          r0 = sub-channel = 64
+;          r1 -> storage area
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+
+;-------------------------------------
+; Make sure that it's sub-channel 'q'
+;-------------------------------------
+     TEQ           r0, # 64
+     ADRNEL        r0, channel_not_supported_error
+     BNE           error_handler_lookup
+
+;--------------------------------
+; Do the ReadSubChannel command
+;--------------------------------
+
+     Push          r1
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, RSC_CDBReadSubChannel
+     ADR           r3, buffer + 16
+     MOV           r4, # 16
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     Pull          r1
+
+     BVS           error_handler
+
+
+;-------------------------------
+; Pass back the sub-channel data
+; bytes       description
+; -----       -----------
+; 0 to 3      Relative LBA
+; 4 to 7      Absolute LBA
+;   8         Control bits
+;   9         Track number
+;  10         Index number
+;-------------------------------
+     ADR      r14, buffer + 16 + 4
+     LDMIA    r14, { r2, r3, r4 }
+
+; Swap byte order of LBAs
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+
+     AND           r8, r5, r3, ROR #8
+     AND           r14, r5, r3
+     ORR           r8, r8, r14, ROR #24
+
+     AND           r14, r5, r4, ROR #8
+     AND           r6, r5, r4
+     ORR           r6, r14, r6, ROR #24
+ |
+     REV           r8, r3
+     REV           r6, r4
+ ]
+
+     STMIA         r1!, { r6, r8 }           ; Absolute, relative LBA
+
+; Control bits
+     MOV           r14, r2, LSR # 8+2
+     AND           r14, r14, # 3
+     STRB          r14, [ r1 ], # 1
+
+; Track number
+     MOV           r14, r2, LSR # 16
+     STRB          r14, [ r1 ], # 1
+
+; Index number
+     MOV           r14, r2, LSR # 24
+     STRB          r14, [ r1 ], # 1
+
+
+
+     MACRO__EXIT_DRIVER_OK ; V is still clear
+
+RSC_CDBReadSubChannel
+     DCB           ATAPI__READ_SUB_CHANNEL            ; command byte
+     DCB           0                                  ;
+     DCB          64                                  ; sub-channel q
+     DCB           1                                  ; data format
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+     DCB           0                                  ; track number
+     DCB           0                                  ; - Allocation length
+     DCB          16                                  ; -
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+
+;-----------------------------------------------------------------------------------------------
+CheckDrive ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = drive status bits
+;-----------------------------------------------------------------------------------------------
+
+; This can't do anything.  The IDE CheckDrive command would force both IDE devices on the
+; cable to reset or perform diagnostics.  There is no ATAPI command to do this either.
+
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     MOV           r0, # 0
+     MACRO__EXIT_DRIVER_WITH_R0 ; V is clear
+
+
+;-----------------------------------------------------------------------------------------------
+DiscChanged ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = 0 if not changed, 1 if changed
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MOV           r0, # 0
+     MACRO__EXIT_DRIVER_WITH_R0
+     ]
+
+; Send the test unit ready command
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, DC_CDBTestUnitReady
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+;-----------------------------------------------------------------------
+; If there is no disc in the drive, then carry on and ignore the error
+;-----------------------------------------------------------------------
+     TEQVC         r0, r0
+     BICVS         r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQVS         r5, # TARGETERROR__NOT_READY
+     BNE           error_handler
+
+;-----------------------------------------------------------------------
+
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     BL            Extras_HasDiscChanged
+
+     CLRV
+     MACRO__EXIT_DRIVER_WITH_R0
+
+DC_CDBTestUnitReady
+     DCD           0
+     DCD           0
+     DCD           0
+
+;-----------------------------------------------------------------------------------------------
+StopDisc ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     [ MINCS=1
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, SD_CDBStartStopUnit
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+
+SD_CDBStartStopUnit
+ DCB      ATAPI__START_STOP_EJECT_UNIT      ;  0 opcode
+ DCB      0                                 ;  1 immediate bit
+ DCB      0                                 ;  2 reserved
+ DCB      0                                 ;  3 reserved
+ DCB      0                                 ;  4 load/eject and start bit
+ DCB      0                                 ;  5 reserved
+ DCB      0                                 ;  6 reserved
+ DCB      0                                 ;  7 reserved
+ DCB      0                                 ;  8 reserved
+ DCB      0                                 ;  9 reserved
+ DCB      0                                 ; 10 reserved
+ DCB      0                                 ; 11 reserved
+
+;-----------------------------------------------------------------------------------------------
+DiscUsed ROUT
+;
+; on entry:
+;          r0 =  addressing mode that the disc length should be returned in
+;          r1 -> storage area to put data in
+;          r7 -> control block
+; on exit:
+;
+;-----------------------------------------------------------------------------------------------
+
+ [ cdebug
+        CDebug_StrReg8  "DiscUsed ",r0
+ ]
+     [ MINCS=1
+     STR           r0, [ r1 ]
+     STR           r0, [ r1, # 4 ]
+     MACRO__EXIT_DRIVER_OK
+     ]
+
+     MOV           r5, r0
+     MOV           r6, r1
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, DU_CDBDiscUsed
+     ADR           r3, buffer
+     MOV           r4, # 12
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+ [ cdebug
+        BLVS    do_request_sense
+ ]
+     BVS           error_handler
+
+     MOV           r0, r5
+     MOV           r1, r6
+
+     LDR           r3, buffer + 8
+
+ [ NoARMv6
+     MOV           r5, #255
+     ORR           r5, r5, r5, LSL #16
+
+     AND           r2, r5, r3, ROR #24
+     AND           r4, r5, r3
+     ORR           r2, r2, r4, ROR #8
+ |
+     REV           r2, r3
+ ]
+
+; Blocksize = &800
+     MOV           r14, # &800
+     STR           r14, [ r1, # 4 ]
+
+; If not in mode 0 then convert to other
+     TEQ           r0, # LBAFormat
+     ADDNE         r2, r2, # ( MaxNumberOfBlocks + 1 ) * 2 + 1     ; ie point to lead out address
+
+     TEQ           r0, # MSFFormat
+     STRNE         r2, [ r1 ]
+     MACRO__EXIT_DRIVER_OK NE ; V is clear
+
+
+
+;------------------------
+; Convert from LBA to MSF
+;------------------------
+     MOV           r0, # LBAFormat
+     MOV           r3, r1
+     MOV           r1, r2
+
+     SWI           XCD_ConvertToMSF
+
+     BVS           error_handler
+
+; save the important bits in the users area
+     STR           r1, [ r3 ]
+
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+
+DU_CDBDiscUsed
+     DCB           ATAPI__READ_TOC                    ; 0 command byte
+     DCB           0                                  ; 1
+     DCB           0                                  ; 2 reserved
+     DCB           0                                  ; 3 reserved
+     DCB           0                                  ; 4 reserved
+     DCB           0                                  ; 5 reserved
+     DCB         &AA                                  ; 6 track number
+     DCB           0                                  ; 7 - Allocation length
+     DCB          12                                  ; 8 -
+     DCB           0                                  ; 9 format
+     DCB           0                                  ; a reserved
+     DCB           0                                  ; b reserved
+
+
+;-----------------------------------------------------------------------------------------------
+AudioStatus ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = 0 playing audio, 1 paused, 2 muted, 3 play completed, 4 error, 5 not requested
+;-----------------------------------------------------------------------------------------------
+
+;--------------------------------
+; Do the ReadSubChannel command
+;--------------------------------
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, AS_CDBReadSubChannel
+     ADR           r3, buffer
+     MOV           r4, # 16
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+;------------------------------------------------------------
+; Rearrange the ATAPI audio status to CDFSDriver audiostatus
+;------------------------------------------------------------
+     LDRB          r1, [ r3, # 1 ]
+
+     MOV           r0, # NOPLAY
+
+; Playing audio
+     TEQ           r1, # &11
+     MOVEQ         r0, # PLAYINGAUDIO
+
+; Paused
+     TEQ           r1, # &12
+     MOVEQ         r0, # PAUSED
+
+; Completed OK
+     TEQ           r1, # &13
+     MOVEQ         r0, # PLAYCOMPLETED
+
+; Error
+     TEQ           r1, # &14
+     MOVEQ         r1, # PLAYERROR
+
+; No current status to return
+
+     MACRO__EXIT_DRIVER_WITH_R0 ; V is clear
+
+AS_CDBReadSubChannel
+     DCB           ATAPI__READ_SUB_CHANNEL            ; command byte
+     DCB           0                                  ; MSF bit
+     DCB          64                                  ; sub-channel q
+     DCB           1                                  ; data format
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+     DCB           0                                  ; track number
+     DCB           0                                  ; - Allocation length
+     DCB          16                                  ; -
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+     DCB           0                                  ; reserved
+
+
+;-----------------------------------------------------------------------------------------------
+Inquiry ROUT
+;
+; on entry:
+;          r0 -> place to put the inquiry data
+;          r7 -> control block
+; on exit:
+;
+;-----------------------------------------------------------------------------------------------
+
+     MOV           r9, r0
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, I_CDBInquiry
+     ADR           r3, buffer
+     MOV           r4, # 96
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+; Copy first 36 bytes to caller
+     MOV           r1, r3
+     MOV           r2, r9
+     MOV           r3, # 36
+     SWI           XCD_ByteCopy
+
+
+     CLRV
+     MACRO__EXIT_DRIVER_OK
+
+I_CDBInquiry
+     DCB           ATAPI__INQUIRY                 ;   0 opcode
+     DCB           0                              ;   1
+     DCB           0                              ;   2 page code
+     DCB           0                              ;   3
+     DCB          96                              ;   4 allocation length
+     DCB           0                              ;   5
+     DCB           0                              ;   6
+     DCB           0                              ;   7
+     DCB           0                              ;   8
+     DCB           0                              ;   9
+     DCB           0                              ;  10
+     DCB           0                              ;  11
+
+;-----------------------------------------------------------------------------------------------
+DiscHasChanged ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+     MySTRIM       "CD_DiscHasChanged"
+     DisplayNewLine
+
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     BL            Extras_SetDiscChanged
+
+     CLRV
+     MACRO__EXIT_DRIVER_OK
+
+;-----------------------------------------------------------------------------------------------
+Control ROUT
+;
+; on entry:
+;          r0 =  0, 1 or 2 to set SCSI error response
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;-----------------------------------------------------------------------------------------------
+
+; This is inapropriate - so just check for drive then ignore
+     BL            Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+;-----------------------------------------------------------------------------------------------
+Supported ROUT
+;
+; on entry:
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r0 = information word with bits set to indicate level of support
+;-----------------------------------------------------------------------------------------------
+
+     LDR           r0, = ATAPI_VERSIONBITS
+
+     MACRO__EXIT_DRIVER_WITH_R0
+
+     LTORG
+
+;-----------------------------------------------------------------------------------------------
+Prefetch ROUT
+;
+; on entry:
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+     MACRO__EXIT_DRIVER_WITH_R0
+
+;-----------------------------------------------------------------------------------------------
+Reset ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+ [ :LNOT: HAL ; what was this for?
+ LDR r0, [ r7, # 0 ]
+ CMP r0, # -1
+ MOVEQ r8, # ATAPICONTROL__SOFT_RESET
+ MOVEQ r0, # 0 + ATAPIOP__DONT_USE_R7
+ ]
+
+     MOV           r8, # ATAPICONTROL__SOFT_RESET
+     BL            ATAPI_Control
+
+     BVS           error_handler
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+
+;-----------------------------------------------------------------------------------------------
+CloseDrawer ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+     MOV           r0, # nodata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, OD_CDBCloseDrawer
+     MOV           r3, # 0
+     MOV           r4, # 0
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     BVS           error_handler
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+OD_CDBCloseDrawer
+ DCB      ATAPI__START_STOP_EJECT_UNIT      ;  0
+ DCB      1                                 ;  1 immediate bit (should set for Panasonic)
+ DCB      0                                 ;  2
+ DCB      0                                 ;  3
+ DCB      3                                 ;  4
+ DCB      0                                 ;  5
+ DCB      0                                 ;  6
+ DCB      0                                 ;  7
+ DCB      0                                 ;  8
+ DCB      0                                 ;  9
+ DCB      0                                 ; 10
+ DCB      0
+
+;-----------------------------------------------------------------------------------------------
+IsDrawerLocked ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;          r0 = 0 if unlocked, 1 if locked
+;
+;-----------------------------------------------------------------------------------------------
+
+;----------------------------------
+; Get all of the Mode pages
+;----------------------------------
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADRL          r2, GP_CurrentModeSense
+     ADR           r3, buffer
+     LDR           r4, = BUFFER_SIZE
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BLVC          Extras_ConvertControlBlockToDrive
+     BVS           error_handler
+
+;-----------------------------------------------------
+; Find page &2a containing lock status
+;-----------------------------------------------------
+     MOV           r1, # &2a
+     ADR           r2, buffer
+     BL            GP_FindModePage
+
+     TEQ           r2, # 0
+     BEQ           %FT90
+
+; Check lock status
+     LDRB          r1, [ r2, # 1 ]
+     CMP           r1, #28
+     BLO           %FT90
+     LDRB          r1, [ r2, # 6 ]
+     MOV           r1, r1, LSR #1
+     AND           r1, r1, #1
+     BL            Extras_SetDrawerStatus
+90
+; Fall back to the cached status if we couldn't get real value from drive
+     BL            Extras_GetDrawerStatus
+
+;-----------------------------
+
+     CLRV
+     MACRO__EXIT_DRIVER_WITH_R0
+
+;-----------------------------------------------------------------------------------------------
+;AudioControl ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+;AudioLevel ROUT
+;
+; on entry:
+;          r7 ->  control block
+; on exit:
+;          if error then r0-> error block, else all regs preserved
+;
+;-----------------------------------------------------------------------------------------------
+
+; not supported
+
+;-----------------------------------------------------------------------------------------------
+Identify ROUT
+; on entry:
+;           r0  -> 36 byte SCSI inquiry data or 0
+;           r1  -> if r0 =0 THEN this -> an error block ie/ the reason inquiry data failed
+;           r7  -> control block, ignore the driver type, ie/ control block + 20
+;           r11 =  reason code for CD_Identify
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r2 = -1 if not recognised, else internal drive type
+;           r0-r1, r3-12 can be corrupted
+;-----------------------------------------------------------------------------------------------
+
+;-----------------------------------
+; Is there any SCSI inquiry data ?
+;-----------------------------------
+     TEQ           r0, # 0
+     BNE           I_NotATAPI             ; [ yes - so not mine ]
+
+; On module initialisation find out what ATAPI CD-ROM drives are connected (0 and 1)
+
+; On identify:
+;       If spare place for me:
+;                          If an ATAPI CD-ROM drive has not been given a control block:
+;                              grab this control block
+;                              return that I've grabbed it
+;                          If this is the control block of an existing ATAPI CD-ROM then:
+;                              return that I've grabbed it
+;       return that I haven't grabbed it
+
+
+     BL            Extras_ConvertControlBlockToDrive
+     BVC           I_IsATAPI
+
+;-----------------------------------------------------
+; Is there a spare place to grab this control block ?
+;-----------------------------------------------------
+     ADR           r0, DriveRecognisedStatus
+     ADR           r1, DriveMapList
+     MOV           r8, # 0
+I_SparePlaceLoop
+     LDRB          r2, [ r0, r8 ]
+     LDMIA         r1!, { r3, r4, r5, r6 }
+   [ HAL
+     TEQ           r2, # 12
+     TEQNE         r2, # 16
+   |
+     TEQ           r2, # TRUE
+   ]
+     CMPEQ         r3, # -1
+     BEQ           I_GrabControlBlock
+
+     ADD           r8, r8, # 1
+     CMP           r8, # MAX_NUMBER_OF_ATAPI_DRIVES
+     BLT           I_SparePlaceLoop
+
+; Allow to run on, 'cause it's not mine
+
+;-----------------------------------------------------
+I_NotATAPI
+;-----------------------------------------------------
+
+     MOV           r2, #-1
+     STR           r2, [sp, #2*4]
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+;-----------------------------------------------------
+I_GrabControlBlock
+;-----------------------------------------------------
+     SUB           r1, r1, # 4*4
+     LDMIA         r7, { r3, r4, r5 }
+     MOV           r6, # 0
+     STMIA         r1, { r3, r4, r5, r6 }
+
+; Allow to run on, 'cause it is mine
+
+;-----------------------------------------------------
+I_IsATAPI
+;-----------------------------------------------------
+     MOV           r2, # 0
+     STR           r2, [sp, #2*4]
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+;-----------------------------------------------------------------------------------------------
+ReadAudio ROUT
+; on entry:
+;           r0 =  addressing mode
+;           r1 =  block number
+;           r2 =  number of blocks
+;           r3 -> put data here
+;           r4  = flags, bits 0 to 7 = read PCM, bits 8 to 31 RESERVED
+;           r7 -> control block
+;           r11 =  reason code for CD_Identify
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r2 = -1 if not recognised, else internal drive type
+;           r0-r1, r3-12 can be corrupted
+;-----------------------------------------------------------------------------------------------
+
+;---------------------------------------------
+; Check that flag bits are set to to read PCM
+;---------------------------------------------
+     TST           r4, # &ff
+     BNE           invalidparameter
+
+;----------------------------------
+; Make sure that LBA mode is used
+;----------------------------------
+     SWI           XCD_ConvertToLBA
+     BVS           error_handler
+
+;----------------------------------
+; How many bytes of data expected ?
+;----------------------------------
+     MOV           r14, # 2352
+     MUL           r4, r14, r2
+
+;----------------------------------
+
+; Swap byte order of LBA and number of blocks
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+
+     AND           r14, r5, r1, ROR #8
+     AND           r8, r5, r1
+     ORR           r6, r14, r8, ROR #24
+
+; Only 3 bytes available or transfer length
+     MOV           r2, r2, LSL # 8
+
+     AND           r14, r5, r2, ROR #8
+     AND           r8, r5, r2
+     ORR           r8, r14, r8, ROR #24
+ |
+     MOV           r2, r2, LSL #8
+     REV           r6, r1
+     REV           r8, r2
+ ]
+
+
+;---------------------------------------------
+; Read CD-DA
+;---------------------------------------------
+; Build read cd command
+     ASSERT        ((RA_CDBReadCD - .) :AND: 3) = 2
+     ADR           r2, RA_CDBReadCD - 2
+     LDMIA         r2, { r0, r1, r5, r14 }
+     ORR           r8, r8, r5
+     ADR           r2, buffer
+     STMIA         r2, { r0, r6, r8, r14 }
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     MACRO__EXIT_DRIVER_OK VC
+
+; Convert IllegalRequest error into NotAudio error
+     BIC           r5, r0, # (1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+     TEQ           r5, # TARGETERROR__ILLEGAL_REQUEST
+     BEQ           nosuchtrack
+
+     B             error_handler
+
+
+
+
+
+ DCB      0
+ DCB      0
+
+RA_CDBReadCD
+ DCB      ATAPI__READ_CD                    ;  0     opcode
+ DCB      (1:SHL:2)                         ;  1     expected sector type (CD-DA)
+ DCB      0                                 ;  2     LBA             (hi)
+ DCB      0                                 ;  3     LBA
+ DCB      0                                 ;  4     LBA
+ DCB      0                                 ;  5     LBA             (low)
+ DCB      0                                 ;  6     transfer length (hi)
+ DCB      0                                 ;  7     transfer length
+ DCB      0                                 ;  8     transfer length (low)
+ DCB      (1:SHL:4)                         ;  9     flag bits, data + headers
+ DCB      0                                 ; 10     sub-channel bits
+ DCB      0                                 ; 11     reserved
+
+ ALIGN
+
+
+;-----------------------------------------------------------------------------------------------
+ReadUserData ROUT
+;
+; The purpose of this call: is to load just user data from mode 2 form 1 or 2 blocks.  This
+; part will also work out if it is possible to use a 'complex' scatter list method to improve
+; performance.
+;
+; on entry:
+;          r0 =  addressing mode (0, 1 or 2)
+;          r1 =  start block
+;          r2 =  number of bytes to load (also indicates size of 'r3' buffer)
+;          r3 -> put data here
+;          r4 =  byte offset in start block to start from
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r1 =  last block loaded
+;          r4 =  byte offset in last block of next byte
+;-----------------------------------------------------------------------------------------------
+
+ ; Allow to fall through
+
+;-----------------------------------------------------------------------------------------------
+ReadUserData_plain ROUT
+;
+; The purpose of this call: is to load just user data from mode 2 form 1 or 2 blocks.  This
+; 'plain' method will use normal CD_ReadData commands.  SCSI and non-SCSI drives should work
+; this way.
+;
+; on entry:
+;          r0 =  addressing mode
+;          r1 =  start block
+;          r2 =  number of bytes to load (also indicates size of 'r3' buffer)
+;          r3 -> put data here
+;          r4 =  byte offset in start block to start from
+;          r7 -> control block
+; on exit:
+;          usual error stuff
+;          r1 =  last block loaded
+;          r4 =  byte offset in last block of next byte
+;-----------------------------------------------------------------------------------------------
+
+ [ cdebug
+        CDebug_StrReg8  "ReadUserData block ",r1,cc
+        CDebug_StrReg8  ", bytes ",r2,cc
+        CDebug_StrReg8  ", offset ",r4
+ ]
+     MySTRIM       "m"
+     DisplayNewLine
+
+;---------------------------------------------
+; Convert block to logical block address
+;---------------------------------------------
+
+     SWI           XCD_ConvertToLBA
+     BVS           RUD_ExitError
+
+     MOV           r6, r4
+     MOV           r4, r1
+     MOV           r5, r3
+
+
+     MySTRIM       "n"
+     Display       r4
+     DisplayNewLine
+     MySTRIM       "o"
+     Display       r2
+     DisplayNewLine
+
+
+; r0 =
+; r1 =
+; r2 =  number of bytes to load
+; r3 =
+; r4 =  block
+; r5 -> memory
+; r6 =  byte offset in first block
+; r7 -> control block
+
+
+; Alogorithm:
+;            REPEAT
+;                work out number of blocks that can be loaded
+;                load the number of blocks
+;            UNTIL <= 1 block left to load
+;
+;            Load last block into my buffer
+;            Copy out last bytes
+
+
+RUDP_Repeat
+
+     MySTRIM       "p"
+     DisplayNewLine
+
+;----------------------
+;            REPEAT
+;----------------------
+
+;------------------------------------------------------------------
+;                work out number of bytes storage space available
+;------------------------------------------------------------------
+     MOV           r10, r2
+
+;------------------------------------------------------------------
+;                work out number of blocks that can be loaded
+;------------------------------------------------------------------
+     LDR           r9, =mode2datasize + SYNC_SIZE
+     DivRem        r8, r10, r9, r14
+
+     TEQ           r8, # 0
+     BEQ           RUDP_LastBlock
+
+;------------------------------------------------------------------
+;                load the number of blocks
+;------------------------------------------------------------------
+
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r2 =   number of blocks
+;          r3 ->  where to put data
+;          r4 =   number of bytes from each block wanted
+;          r7 ->  control block
+
+     Push          "r1 - r5"
+
+     MOV           r0, # LBAFormat
+     MOV           r1, r4
+     MOV           r2, r8
+     MOV           r3, r5
+
+     BL            RUD_ReadAll
+
+     Pull          "r1 - r5"
+
+     BVS           RUD_ExitError
+
+;------------------------------------------------------------------
+;                shuffle blocks
+;------------------------------------------------------------------
+
+; r0  =
+; r1  =  memory to copy from
+; r2  =  memory to copy to
+; r3  =  USERDATA_MODE2FORM2
+; r4  =  block
+; r5  -> memory to copy to
+; r6  =  number of blocks left to shuffle
+; r7  -> control block
+; r8  =  mode2datasize
+; r9  =  number of bytes loaded
+; r10 =  byte offset in first block
+
+     Push      "r0-r4, r6-r8, r10"
+
+     MOV       r10, r6
+     MOV       r6, r8
+
+     LDR       r8, =mode2datasize + SYNC_SIZE
+
+     ADD       r1, r5, # MODE2__TOTALHEADERSIZE + SYNC_SIZE
+     ADD       r1, r1, r10
+     MOV       r2, r5
+
+     MOV       r9, # 0
+
+RUDP_ShuffleBlocks
+
+     MOV       r4, # USERDATA__MODE2FORM1
+
+; Is the data in mode 2 form 2 ?
+     SUB       r14, r1, r10
+     LDRB      r14, [ r14, # (MODE2__HEADER_SIZE + MODE2__SUB_HEADER_SUBMODE) - (MODE2__TOTALHEADERSIZE + SYNC_SIZE ) ]
+     TST       r14, # SUBMODE__FORM
+     ADDNE     r4, r4, # USERDATA__MODE2FORM2 - USERDATA__MODE2FORM1
+
+
+
+     SUB       r3, r4, r10
+
+     SWI       XCD_ByteCopy
+
+     ADD       r1, r1, r8
+     SUB       r1, r1, r10
+
+     ADD       r2, r2, r3
+
+
+; count number of bytes copied
+     ADD       r9, r9, r3
+
+     MOV       r10, # 0
+
+     SUBS      r6, r6, # 1
+     BGT       RUDP_ShuffleBlocks
+
+     MOV       r5, r2
+
+     Pull      "r0-r4, r6-r8, r10"
+
+     MOV           r6, # 0
+
+; r0 =  drive number
+; r1 =
+; r2 =  number of blocks
+; r3 =
+; r4 =  block
+; r5 -> memory
+; r6 =  byte offset in block to start from (0 at the moment)
+; r7 -> control block
+
+     ADD           r4, r4, r8
+     SUB           r2, r2, r9
+
+;------------------------------------------------------------------
+;            UNTIL <= 1 block left to load
+;------------------------------------------------------------------
+
+     LDR           r14, =mode2datasize + SYNC_SIZE
+     CMP           r2, r14
+     BGT           RUDP_Repeat
+
+;------------------------------------------------------------------
+;            Load last block into my buffer
+;------------------------------------------------------------------
+RUDP_LastBlock
+
+;------------------------------------------------------------------
+;            Copy out last bytes
+;------------------------------------------------------------------
+
+     Push          "r0-r4"
+
+     SUBS          r9, r2, #0 ; clears V, also equivalent to CMP r2, #0
+
+     MOV           r0, # LBAFormat
+     MOV           r1, r4
+     MOV           r2, # 1
+     ADR           r3, buffer
+
+;          r0 =   addressing mode
+;          r1 =   block number
+;          r2 =   number of blocks
+;          r3 ->  where to put data
+;          r4 =   number of bytes from each block wanted
+;          r7 ->  control block
+
+     BLGT          RUD_ReadAll
+     BVS           RUD_ExitError
+
+; r1 =  memory to copy from (buffer + 12 + byte offset)
+     ADR           r1, buffer + MODE2__TOTALHEADERSIZE + SYNC_SIZE
+
+; r2 =  memory to copy to
+     MOV           r2, r5
+
+
+
+     MOV           r14, # USERDATA__MODE2FORM1
+
+; Is the data in mode 2 form 2 ?
+     LDRB      r3, buffer + (MODE2__HEADER_SIZE + MODE2__SUB_HEADER_SUBMODE)
+     TST       r3, # SUBMODE__FORM
+     ADDNE     r14, r14, # USERDATA__MODE2FORM2 - USERDATA__MODE2FORM1
+
+
+
+
+     SUB       r14, r14, r6
+
+     ADD       r1, r1, r6
+
+     CMP       r9, r14
+     MOVGT     r9, r14
+
+; r3 =  2324 - byte offset, or bytes left to copy, whichever is smaller
+     MOVS      r3, r9
+
+     ADD       r5, r5, r3
+
+     SWIGT     XCD_ByteCopy
+
+     Pull      "r0-r4"
+
+
+     SUBS      r2, r2, r9
+     MOVGT     r6, # 0
+     ADDGT     r4, r4, # 1
+     BGT       RUDP_LastBlock
+
+
+; return values
+;          r1 =  last block loaded
+;          r4 =  byte offset in last block of next byte
+
+     ADDS      r9, r9, r6
+
+     LDR       r14, =USERDATA__MODE2FORM2
+
+     MOVEQ     r9, r14
+
+     CMP       r9, r14
+     MOVGE     r9, # 0
+     ADDGE     r4, r4, # 1
+     ADDLT     r9, r9, # 1
+     STR       r9, [ r13, # 4*4 ]
+     STR       r4, [ r13, # 4*1 ]
+
+
+;--------------------------------------------------------
+;--------------------------------------------------------
+;--------------------------------------------------------
+
+;------------------------------------------------------------
+; Flag that all calls to ReadData should be normal
+;------------------------------------------------------------
+
+RUD_ExitOk
+
+
+     CLRV
+     MACRO__EXIT_DRIVER_OK
+
+
+;------------------------------------------------------------
+; Flag that all calls to ReadData should be normal
+;------------------------------------------------------------
+
+RUD_ExitError
+     B             error_handler
+
+
+
+ LTORG
+
+;-----------------------------------------------------------------------------------------------
+RUD_ReadAll
+;
+; r1 =  block number      in LBA format
+; r2 =  number of blocks
+; r3 -> storage area
+;-----------------------------------------------------------------------------------------------
+
+     Push          "r2-r8, r14"
+
+     MySTRIM       "ReadAll"
+     DisplayNewLine
+
+     LDR           r4, = mode2datasize + SYNC_SIZE
+     MUL           r4, r2, r4
+
+;---------------------
+; Set up the cdb block
+;---------------------
+
+; Swap the byte order of the start LBA and number of blocks
+
+ [ NoARMv6
+     MOV           r5, #&ff00
+     ORR           r5, r5, r5, LSL #16
+
+     AND           r6, r5, r1, ROR #8
+     AND           r14, r5, r1
+     ORR           r6, r6, r14, ROR #24
+
+; Only 3 bytes available for transfer length
+     MOV           r2, r2, LSL # 8
+     AND           r1, r5, r2, ROR #8
+     AND           r8, r5, r2
+     ORR           r8, r1, r8, ROR #24
+ |
+     MOV           r2, r2, LSL #8
+     REV           r6, r1
+     REV           r8, r2
+ ]
+
+     ORR           r8, r8, # 2_11111000:SHL:24 ; all headers + user + EDC & ECC + sync
+;     ORR           r8, r8, # 2_10000000:SHL:24 ; user
+     MOV           r5, # 2_000:SHL:(2+8+16)      ; any
+
+; opcode
+     ORR           r5, r5, # ATAPI__READ_CD:SHL:16
+
+     ADR           r2, buffer
+     MOV           r14, # 0
+     STMIA         r2, { r5, r6, r8, r14 }
+
+;--------------------
+; Do the IDE command
+;--------------------
+
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, buffer + 2
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+
+     Pull          "r2-r8, pc" ; pass V flag back to caller
+
+;-----------------------------------------------------------------------------------------------
+GetAudioParms ROUT
+; on entry:
+;           r0 =  reason code
+;           r1 to r6 depend on function of r0
+;           r7 -> control block
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r0 = -1 if reason code not supported (overflow clear)
+;           if error then r0-> error block
+;           if ok then overflow clear and r0 preserved from entry
+;-----------------------------------------------------------------------------------------------
+
+
+; Only volume levels supported currently
+     TEQ           r0, # GAP__VOLUME_LEVELS
+     MOVNE         r0, # -1
+     MACRO__EXIT_DRIVER_WITH_R0 NE
+
+
+;-----------------------------------------------------------------------------------------------
+GAP_VolumeLevels ROUT
+; on entry:
+;           r0 =  0
+;           r1 -> volume block (8 bytes, word aligned)
+;           +  0 = volume level for channel 0, 0 = mute, 0xffff = full volume
+;           +  4 = volume level for channel 1, 0 = mute, 0xffff = full volume
+;           r7 -> control block
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r0 = -1 if reason code not supported (overflow clear)
+;           if error then r0-> error block
+;           if ok then overflow clear and r0 preserved from entry
+;-----------------------------------------------------------------------------------------------
+
+; r6 -> volume control block
+     MOV           r6, r1
+
+;----------------------------------
+; Get audio page
+;----------------------------------
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, GAP_AudioPage
+     ADR           r3, buffer
+     LDR           r4, = BUFFER_SIZE
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+;------------------------------------
+; Extract audio parameters from page
+;------------------------------------
+
+     LDRB          r1, buffer + 8 + 9              ; port 0
+     LDRB          r2, buffer + 8 + 11             ; port 1
+
+; Multiply them up to make them 16 bit
+     ORR           r1, r1, r1, LSL # 8
+     ORR           r2, r2, r2, LSL # 8
+
+     STMIA         r6, { r1, r2 }
+
+;------------------------------------
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+;------------------------------------
+
+
+
+GAP_AudioPage
+     DCB           ATAPI__MODE_SENSE                   ;  0 opcode
+     DCB           0                                   ;  1 reserved
+     DCB           (2_00:SHL:6) + &0E                  ;  2 current values + page &e
+     DCB           0                                   ;  3 reserved
+     DCB           0                                   ;  4 reserved
+     DCB           0                                   ;  5 reserved
+     DCB           0                                   ;  6 reserved
+     DCB           BUFFER_SIZE:SHR:8                   ;  7 Allocation length (MSB)
+     DCB           BUFFER_SIZE:AND:&FF                 ;  8 Allocation length (LSB)
+     DCB           0                                   ;  9 reserved
+     DCB           0                                   ; 10 reserved
+     DCB           0                                   ; 11 reserved
+
+ ALIGN
+
+;-----------------------------------------------------------------------------------------------
+SetAudioParms ROUT
+; on entry:
+;           r0 =  reason code
+;           r1 to r6 depend on function of r0
+;           r7 -> control block
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r0 = -1 if reason code not supported (overflow clear)
+;           if error then r0-> error block
+;           if ok then overflow clear and r0 preserved from entry
+;-----------------------------------------------------------------------------------------------
+
+; Only volume levels supported currently
+     TEQ           r0, # SAP__VOLUME_LEVELS
+     MOVNE         r0, # -1
+     MACRO__EXIT_DRIVER_WITH_R0 NE
+
+                                           ; Allow to roll on
+
+;-----------------------------------------------------------------------------------------------
+SAP_VolumeLevels ROUT
+; on entry:
+;           r0 =  0
+;           r1 -> volume block (8 bytes, word aligned)
+;           +  0 = volume level for channel 0, 0 = mute, 0xffff = full volume
+;           +  4 = volume level for channel 1, 0 = mute, 0xffff = full volume
+;           r7 -> control block
+;           r12 -> their workspace
+;           r13 -> full descending stack
+; on exit:
+;           r0 = -1 if reason code not supported (overflow clear)
+;           if error then r0-> error block
+;           if ok then overflow clear and r0 preserved from entry
+;-----------------------------------------------------------------------------------------------
+
+; r6 -> volume control block
+     MOV           r6, r1
+
+     LDMIA         r6, { r1, r2 }
+
+; Make sure that volume levels are valid
+     CMP           r1, # &10000
+     CMPCC         r2, # &10000
+     BCS           invalidparameter
+
+
+;----------------------------------
+; Get audio page
+;----------------------------------
+     MOV           r0, # readdata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     ADR           r2, GAP_AudioPage
+     ADR           r3, buffer + 16
+     LDR           r4, = BUFFER_SIZE
+
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+;----------------------------------
+; Enter the page parameters
+;----------------------------------
+     LDMIA         r6, { r1, r2 }
+
+; Divide by 256 to make into an 8 bit  value
+     MOV           r1, r1, LSR # 8
+     MOV           r2, r2, LSR # 8
+
+     STRB          r1, buffer + 16 + 8 +  9    ; Port 0
+     STRB          r2, buffer + 16 + 8 + 11    ; Port 1
+
+;----------------------------------
+; Set audio page
+;----------------------------------
+     ADR           r2, SAP_SetAudioPage
+     LDMIA         r2, { r0, r1, r4 }
+
+     ADR           r2, buffer
+     MOV           r4, # 16 + 8
+     STMIA         r2, { r0, r1, r4 }
+
+     ADR           r3, buffer + 16
+
+; remove some reserved parameters
+     MOV           r0, # 0
+     MOV           r1, # 0
+     STMIA         r3, { r0, r1 }
+
+; execute the command
+     MOV           r0, # writedata + ATAPIOP__COMMAND_PACKET
+     MOV           r1, # 12
+     MOV           r8, # ATAPICONTROL__SEND_COMMAND
+
+     BL            ATAPI_Control
+     BVS           error_handler
+
+
+
+
+;------------------------------------
+
+     MACRO__EXIT_DRIVER_OK ; V is clear
+
+;------------------------------------
+
+
+SAP_SetAudioPage
+     DCB           ATAPI__MODE_SELECT                  ;  0 opcode
+     DCB           1:SHL:4                             ;  1 reserved
+     DCB           &0E                                 ;  2 page &e
+     DCB           0                                   ;  3 reserved
+     DCB           0                                   ;  4 reserved
+     DCB           0                                   ;  5 reserved
+     DCB           0                                   ;  6 reserved
+     DCB           0                                   ;  7 Allocation length (MSB)
+     DCB           0                                   ;  8 Allocation length (LSB)
+     DCB           0                                   ;  9 reserved
+     DCB           0                                   ; 10 reserved
+     DCB           0                                   ; 11 reserved
+
+ ALIGN
+
+ [ HAL
+;-----------------------------------------------------------------------------------------------
+SCSIUserOp ROUT
+; on entry:
+;     r0  bits 24-25 = 0 => no data transfer
+;                    = 1 => read
+;                    = 2 => write
+;                    = 3 reserved
+;     r1 = length of control block
+;     r2 -> control block
+;     r3 -> buffer for data transfer
+;     r4 = length of transfer
+;     r5 = timeout in cs (0 = default)
+;     r7 -> CDFS control block
+;     r11 = reason code (36)
+;     r12 = workspace
+; on exit:
+;     r3,r4 updated
+;     r5-r12 may be corrupted
+;     NZC flags may be corrupted
+;     If V set,
+;       r0-r2 are as for SWI SCSI_Op
+;       or r0 -> error not in SCSI range and r1,r2 may be corrupted
+;     Else r0-r2 may be corrupted
+;-----------------------------------------------------------------------------------------------
+        MOV     r8, #ATAPICONTROL__RAW_OP
+        BL      ATAPI_Control
+        MACRO__EXIT_DRIVER_WITHOUT_RESTORING_REGISTERS VC
+
+        ; Some internal error numbers need to be converted to SCSI error blocks
+        TEQ     r0, #DRIVERERROR__SELECTION_TIMEOUT
+        TEQNE   r0, #DRIVERERROR__OTHER_TIMEOUT
+        TEQNE   r0, #DRIVERERROR__UK_SCSI_ERROR
+        BNE     %FT30
+        TEQ     r0, #DRIVERERROR__SELECTION_TIMEOUT
+        ADREQL  r0, scsi_timeout1_error
+        TEQ     r0, #DRIVERERROR__OTHER_TIMEOUT
+        ADREQL  r0, scsi_timeout2_error
+        TEQ     r0, #DRIVERERROR__UK_SCSI_ERROR
+        ADREQL  r0, scsi_cc_error
+        LDR     r1, [r0]
+        MOV     r1, r1, LSL #24         ; need LSB of error number in MSB of R1
+        ORREQ   r1, r1, #1              ; and in this case need "check condition" status byte in LSB
+        STR     r1, [sp, #1*4]
+        STREQ   r3, [sp, #3*4]          ; r3,r4 undefined for SCSI driver errors
+        STREQ   r4, [sp, #4*4]
+        B       error_handler_lookup
+
+30      ; Other internal errors don't have SCSI equivalents, so just let the default error handler convert them
+        CMP     r0, #&1000
+        BCC     error_handler
+
+        ; Now we have an error pointer
+        ; If it's a "Driver in use" error, it needs converting to SCSI-like reservation error
+        LDR     r14, [r0]
+        SUB     r14, r14, #ADFSDriverInUse:AND:&FF000
+        CMP     r14, #ADFSDriverInUse:AND:&00FF0
+        ADREQL  r0, scsi_reservation_error
+        BEQ     error_handler_lookup
+        ; If it's a SCSI sense error, it needs looking up in our messages file
+        LDR     r14, [r0]
+        SUB     r14, r14, #SCSISenseNumber:AND:&FF000
+        SUB     r14, r14, #SCSISenseNumber:AND:&00FF0
+        CMP     r14, #&40
+        BCS     EH_SortOutError         ; not a SCSI error, so no lookup required
+
+        STMIB   sp, {r1-r4}
+        B       error_handler_lookup
+ ]
+
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+;-----------------------------------------------------------------------------------------------
+
+ END

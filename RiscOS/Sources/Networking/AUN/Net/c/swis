@@ -1,0 +1,1489 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* swis.c
+ *
+ * Author: Keith Ruttle (Acorn)
+ *
+ * Description
+ * ===========
+ * Code handling SWIs issued to the Net module (the "Econet" API).
+ *
+ * Environment
+ * ===========
+ * Acorn RISC OS 3.11 or later.
+ *
+ * Compiler
+ * ========
+ * Acorn Archimedes C release 5.06 or later.
+ *
+ * Change record
+ * =============
+ *
+ * JPD  Jem Davies (Cambridge Systems Design)
+ *
+ *
+ * 09-Dec-94  16:14  JPD  Version 1.00
+ * First version with change record. Modified: #includes to be ANSI-compliant,
+ * other constructs to remove compiler warnings. Added changes from
+ * KRuttle's 6.03 version (different to RISC OS SrcFiler 6.03 version!)
+ *
+ * 17-Jan-95  11:57  JPD  Version 1.01
+ * Commence changes to allow compilation with -fah option.
+ *
+ * 24-Jan-95  18:50  JPD  Version 1.02
+ * Added NetworkParameters().
+ *
+ * 10-Feb-95  17:26  JPD  Version 1.03
+ * Added some debug.
+ *
+ * 22-Feb-95  11:51  JPD  Version 1.04
+ * Removed OldCode.
+ *
+ * 14-Mar-95  12:45  JPD  Version 1.05
+ * Added include of mnscommon.h.
+ *
+ * 09-Oct-95  15:49  JPD  Version 1.06
+ * Added debug.
+ *
+ **End of change record*
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "sys/types.h"
+
+#include "configure.h"
+#include "module.h"
+#include "debug.h"
+#include "inetfn.h"
+#include "mns.h"
+#include "mnscommon.h"
+#include "netasm.h"
+#include "io.h"
+#include "swicode.h"
+#include "VersionNum"
+
+
+static void rx_attach(struct rxcb *rx, struct rxcb **p);
+static void tx_attach(struct txcb *tx);
+static int is_broadcast(u_char net, u_char station, int *local);
+static int cb_remque(struct cbh *cb, struct cbh **head);
+
+
+static int *swi_code = 0;
+static int *swi_data = 0;
+
+/******************************************************************************/
+
+_kernel_oserror *init_msgs(const char *filename, int *fd)
+{
+/*
+ * Open MessageTrans message file
+ *
+ * Parameters:
+ *    filename : pointer to the filename
+ *    fd       : pointer to where to return the MessageTrans file descriptor
+ *
+ * Returns:
+ *     0 : => success
+ *    !0 : => error (pointer to standard RISC OS error block)
+ */
+
+   _kernel_swi_regs r;
+   _kernel_oserror *e;
+
+#ifndef ROM
+   r.r[0] = (int)Resources();
+   e = _kernel_swi(ResourceFS_RegisterFiles, &r, &r);
+   if (e)
+      return e;
+#endif
+
+   r.r[0] = (int)fd;
+   r.r[1] = (int)filename;
+   r.r[2] = 0;
+   e = _kernel_swi(MessageTrans_OpenFile, &r, &r);
+
+   return e;
+
+} /* init_msgs() */
+
+/******************************************************************************/
+
+void release_msgs(int *fd)
+{
+   _kernel_swi_regs r;
+
+   r.r[0] = (int)fd;
+   (void) _kernel_swi(MessageTrans_CloseFile, &r, &r);
+
+#ifndef ROM
+   r.r[0] = (int)Resources();
+   (void) _kernel_swi(ResourceFS_DeregisterFiles, &r, &r);
+#endif
+
+} /* release_msgs() */
+
+/******************************************************************************/
+
+_kernel_oserror *call_econet(int swinum, _kernel_swi_regs *r)
+{
+/* Issue a SWI call to the real Econet module (X-form of the SWI)
+ *
+ * Parameters:
+ *    swinum : the SWI number
+ *    r      : pointer to the registers block
+ *
+ * Returns:
+ *    0 => no error
+ *   !0 => pointer to standard error block (the value of R0)
+ */
+
+   return (econet_not_present ? mns_error(Err_NoHware) :
+                         do_econet(swinum, r, r, swi_code, swi_data));
+} /* call_econet */
+
+/******************************************************************************/
+
+_kernel_oserror *init_econet(void)
+{
+/* When the Net module is initialised, it replaces the Econet module as the
+ * module that handles the "Econet" SWI chunk, i.e. Econet SWIs are now
+ * handed to us. In order to hand SWIs on to the real Econet module we must
+ * find the real Econet module and take note of its entries, so that we can
+ * call it directly.
+ *
+ * Parameters:
+ *    None
+ *
+ * Returns:
+ *     0 : => success
+ *    !0 : => error (pointer to standard RISC OS error block)
+ */
+
+   _kernel_swi_regs r;
+   _kernel_oserror *e = 0;
+   int *module;
+
+   r.r[0] = 18; /* OpCode look-up module name */
+   r.r[1] = (int)"Econet";
+   e = _kernel_swi(OS_Module, &r, &r);
+
+   /* if any error, return it */
+   if (e)
+      return (e);
+
+   module = (int *)(r.r[3]);    /* pointer to module code */
+   swi_code = module + (*(module + 8) / 4);     /* pointer to SWI handler */
+   swi_data = (int *)(r.r[4]);  /* contents of private word */
+
+   return NULL;
+
+} /* init_econet() */
+
+/******************************************************************************/
+
+_kernel_oserror *CreateReceive(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int port;
+      int station;
+      int network;
+      char *buf;
+      int bufsize;
+   } *up = (struct a *)r;
+   int oldstate, port, station, network, bufsize;
+   char *buffer;
+   struct rxcb *rx, **rxlist;
+   _kernel_oserror *err;
+   int eco = 0;
+   u_int handle = ALL_ONES;
+
+   port    = up->port;
+   station = up->station;
+   network = up->network;
+   buffer  = up->buf;
+   bufsize = up->bufsize;
+
+   err = range_check(port, station, network);
+   if (err)
+      return err;
+
+   if (network == ANY_NETWORK || network == 0)
+   {
+      if (connected_econet != -1)
+      {
+         err = call_econet(Econet_CreateReceive, r);
+         if (!err)
+         {
+            handle = (u_int)r->r[0];
+            eco = 1;
+         }
+      }
+   }
+   else
+      if (mns_to_ip(network, station) == 0)
+      {
+         if (connected_econet == 0)
+         {
+            r->r[2] = 0;
+            network = 0;
+         }
+         err = call_econet(Econet_CreateReceive, r);
+         if (err)
+            return err;
+         handle = (u_int)r->r[0];
+         eco = 2;
+      }
+
+   rxlist = is_wild(port, station, network) ? &mns.mns_rxwild : &mns.mns_rxlist;
+
+   /* Inserted from KRuttle's 6.03 changes */
+
+   if (rxlist == &mns.mns_rxlist && network == 0)
+      network = mns.mns_netnumber;
+
+   oldstate = ensure_irqs_off();
+   if (handle == ALL_ONES)
+   {
+      handle = mns.mns_rxhandle;
+      mns.mns_rxhandle += MNS_HANDLE_INCR;
+   }
+   rx = mns.mns_rxfree;
+   if (rx)
+      mns.mns_rxfree = rx->rx_next;
+   restore_irqs(oldstate);
+   if (rx == 0)
+   {
+      rx = (struct rxcb *)malloc(sizeof(struct rxcb));
+      if (rx == 0)
+      {
+         if (eco)
+            (void) call_econet(Econet_AbandonReceive, r);
+         return mns_error(Err_NoMem);
+      }
+   }
+   memset((char *)rx, 0, sizeof(struct rxcb));
+   rx->rx_status = Status_Init;
+   rx_attach(rx, rxlist);
+   rx->rx_wait    = 0;
+   rx->rx_ecotype = eco;
+   rx->rx_handle  = handle;
+   rx->rx_port    = port;
+   rx->rx_station = station;
+   rx->rx_network = network;
+   rx->rx_buf     = buffer;
+   rx->rx_bufsize = bufsize;
+   rx->rx_flag    = 0;
+   rx->rx_status  = Status_RxReady;
+   r->r[0] = handle;
+   r->r[2] = network;
+
+   return NULL;
+
+} /* CreateReceive() */
+
+/******************************************************************************/
+
+static void rx_freecb(struct rxcb *rx, struct rxcb **rxlist)
+{
+   int oldstate = ensure_irqs_off();
+
+   rx->rx_status = Status_Free;
+   if (cb_remque((struct cbh *)rx, (struct cbh **)rxlist))
+   {
+      rx->rx_next = mns.mns_rxfree;
+      mns.mns_rxfree = rx;
+   }
+   restore_irqs(oldstate);
+
+   return;
+
+} /* rx_freecb() */
+
+/******************************************************************************/
+
+static _kernel_oserror *rx_op(_kernel_swi_regs *r, int optype)
+{
+   struct a
+   {
+      u_int handle;
+      int delay;
+      int escflag;
+   } *up = (struct a *)r;
+   struct rxcb *rx, **rxlist;
+   _kernel_oserror *err = 0;
+   int oldstate;
+   int escflag, esccnt;
+   int tried = 0;
+
+   rxlist = &mns.mns_rxlist;
+   oldstate = ensure_irqs_off();
+   for (;;)
+   {
+      for (rx = *rxlist; rx; rx = rx->rx_next)
+         if (up->handle == rx->rx_handle)
+            break;
+      if (rx || tried)
+         break;
+      rxlist = &mns.mns_rxwild;
+      tried++;
+   }
+   restore_irqs(oldstate);
+
+   if (rx == 0 || rx->rx_ecotype == 2)
+   {
+      err = call_econet(optype, r);
+      if (rx == 0)
+         return (connected_econet == -1 ? mns_error(Err_Channel) : err);
+   }
+
+   switch (optype)
+   {
+      case Econet_ReadReceive:
+         if (rx->rx_ecotype == 2)
+         {
+            if (!err && r->r[0] == Status_Received)
+               mns.mns_states[r->r[4]] |= ECONET_IS_CONNECTED;
+            break;
+         }
+         goto examine;
+         break;
+
+      case Econet_ExamineReceive:
+         if (rx->rx_ecotype == 2)
+            break;
+examine:
+         if (rx->rx_status != Status_Received && rx->rx_ecotype == 1)
+         {
+            r->r[0] = rx->rx_handle;
+            err = call_econet(optype, r);
+            if (err)
+               return err;
+
+            if (r->r[0] == Status_Received || r->r[0] == Status_Receiving)
+            {
+               rx->rx_status = Status_EcoReceived;
+               if (optype == Econet_ReadReceive)
+                  mns.mns_states[r->r[4]] |= ECONET_IS_CONNECTED;
+            }
+            return NULL;
+         }
+         if (optype == Econet_ReadReceive)
+         {
+            r->r[1] = rx->rx_status == Status_Received ? rx->rx_flag : 0;
+            r->r[2] = rx->rx_port;
+            r->r[3] = rx->rx_station;
+            r->r[4] = rx->rx_network;
+            r->r[5] = (int)rx->rx_buf;
+            r->r[6] = rx->rx_bufsize;
+         }
+#ifndef EDDS
+         else
+         {
+            oldstate = ensure_irqs_on();
+            usermode_donothing();
+            restore_irqs(oldstate);
+         }
+#endif
+         r->r[0] = rx->rx_status;
+         break;
+
+      case Econet_AbandonReceive:
+         if (rx->rx_ecotype == 1)
+         {
+            rx->rx_status = Status_Dead;
+            r->r[0] = rx->rx_handle;
+            (void) call_econet(optype, r);
+         }
+         if (rx->rx_ecotype != 2)
+            r->r[0] = rx->rx_status;
+         rx_freecb(rx, rxlist);
+         break;
+
+      case Econet_WaitForReception:
+         if (rx->rx_ecotype == 2)
+         {
+            if (!err && r->r[0] == Status_Received)
+               mns.mns_states[r->r[4]] |= ECONET_IS_CONNECTED;
+            rx_freecb(rx, rxlist);
+            break;
+         }
+         rx->rx_wait = 1;
+         rx->rx_delay = up->delay;
+         escflag = up->escflag;
+         esccnt = escflag ? 100 : 0;
+         oldstate = ensure_irqs_on();
+         do
+         {
+            if (rx->rx_status == Status_Received)
+            {
+               restore_irqs(oldstate);
+               goto out;
+            }
+            if (escflag)
+            {
+               if (--esccnt == 0)
+               {
+                  if (escape_seen())
+                  {
+                     rx->rx_status = Status_Escape;
+                     restore_irqs(oldstate);
+                     goto out;
+                  }
+                  esccnt = 100;
+               }
+            }
+            if (rx->rx_ecotype == 1)
+            {
+               r->r[0] = rx->rx_handle;
+               if (!call_econet(Econet_ReadReceive, r) &&
+                                                     r->r[0] == Status_Received)
+               {
+                  rx->rx_delay = 0;
+                  r->r[0] = rx->rx_handle;
+                  mns.mns_states[r->r[4]] |= ECONET_IS_CONNECTED;
+                  (void) call_econet(Econet_AbandonReceive, r);
+                  restore_irqs(oldstate);
+                  rx_freecb(rx, rxlist);
+                  return (err);
+               }
+            }
+            usermode_donothing();
+         }
+         while (rx->rx_delay > 0);
+
+         restore_irqs(oldstate);
+         if (rx->rx_delay <= 0)
+         {
+            rx->rx_status = Status_NoReply;
+            rx->rx_bufsize = 0;
+         }
+out:
+         rx->rx_delay = 0;
+         r->r[0] = rx->rx_status;
+         r->r[1] = rx->rx_status == Status_Received ? rx->rx_flag : 0;
+         r->r[2] = rx->rx_port;
+         r->r[3] = rx->rx_station;
+         r->r[4] = rx->rx_network;
+         r->r[5] = (int)rx->rx_buf;
+         r->r[6] = rx->rx_bufsize;
+         rx_freecb(rx, rxlist);
+         break;
+
+      default:
+         break;
+    }
+
+   return err;
+
+} /* rx_op() */
+
+/******************************************************************************/
+
+_kernel_oserror *ExamineReceive(_kernel_swi_regs *r)
+{
+   return rx_op(r, Econet_ExamineReceive);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *ReadReceive(_kernel_swi_regs *r)
+{
+   return rx_op(r, Econet_ReadReceive);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *AbandonReceive(_kernel_swi_regs *r)
+{
+   return rx_op(r, Econet_AbandonReceive);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *WaitForReception(_kernel_swi_regs *r)
+{
+   return rx_op(r, Econet_WaitForReception);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *EnumerateReceive(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int index;
+   } *up = (struct a *)r;
+   struct rxcb *rx;
+   int i;
+   int oldstate = ensure_irqs_off();
+
+   rx = mns.mns_rxlist;
+   for (i = 0; i < up->index; i++)
+   {
+      if (rx == 0)
+         break;
+      rx = rx->rx_next;
+   }
+
+   if (rx)
+      goto out;
+
+   rx = mns.mns_rxwild;
+   for (i = 0; i < up->index; i++)
+   {
+      if (rx == 0)
+         break;
+      rx = rx->rx_next;
+   }
+
+out:
+   restore_irqs(oldstate);
+   r->r[0] = (rx == 0) ? 0 : rx->rx_handle;
+
+   return NULL;
+
+} /* EnumerateReceive() */
+
+/******************************************************************************/
+
+static void tx_freecb(struct txcb *tx)
+{
+   int oldstate = ensure_irqs_off();
+
+   tx->tx_status = Status_Free;
+   if (cb_remque((struct cbh *)tx, (struct cbh **)&mns.mns_txlist))
+   {
+      tx->tx_next = mns.mns_txfree;
+      mns.mns_txfree = tx;
+   }
+   restore_irqs(oldstate);
+
+   return;
+
+} /* tx_freecb() */
+
+/******************************************************************************/
+
+static _kernel_oserror *tx_op(_kernel_swi_regs *r, int optype)
+{
+   struct a
+   {
+      int flag;
+      int port;
+      int station;
+      int network;
+      char *buf;
+      int bufsize;
+      int count;
+      int delay;
+   } *up = (struct a *)r;
+   _kernel_oserror *err = 0;
+   int oldstate, flag, port, bufsize, count;
+   int network, station, local, delay;
+   int datatype, start, T;
+   char *buf;
+   struct txcb *tx;
+   u_long dst;
+   int resp      = 0;
+   int callb     = 0;
+   u_char status = 0;
+
+   if (mns.mns_flags == 0)
+      return mns_error(Err_Fatal);
+
+   station = up->station;
+   network = up->network;
+   flag    = up->flag & 0177;
+   port    = up->port;
+   buf     = up->buf;
+   bufsize = up->bufsize;
+   count   = up->count;
+   delay   = up->delay;
+
+#ifdef DEBUG
+   if (optype == Econet_DoTransmit)
+      DEBUGP2("#DoTranmsit: length = %d\n\r", bufsize);
+#endif
+   err = range_check(port, station, network);
+   if (err)
+      return err;
+
+   datatype = (optype == Econet_StartImmediate || optype == Econet_DoImmediate)
+                                                    ? IMMEDIATE_OP : DATA_FRAME;
+   start = (optype == Econet_StartImmediate || optype == Econet_StartTransmit)
+                                                    ? 1 : 0;
+
+   oldstate = ensure_irqs_off();
+   tx = mns.mns_txfree;
+   if (tx)
+      mns.mns_txfree = tx->tx_next;
+   restore_irqs(oldstate);
+
+   if (tx == 0)
+   {
+      tx = (struct txcb *)malloc(sizeof(struct txcb));
+      if (tx == 0)
+         return mns_error(Err_NoMem);
+   }
+   memset((char *)tx, 0, sizeof(struct txcb));
+   tx_attach(tx);
+   tx->tx_status = Status_TxReady;
+
+   if (is_broadcast(network, station, &local))
+   {
+      if (start)
+      {
+         callb = 1;
+         oldstate = ensure_irqs_off();
+         tx->tx_handle = mns.mns_txhandle;
+         mns.mns_txhandle += MNS_HANDLE_INCR;
+         restore_irqs(oldstate);
+      }
+      tx->tx_status  = Status_Transmitted;
+      if (connected_econet != -1)
+      {
+         (void) call_econet(optype, r);
+         if (local)
+         {
+            if (start)
+            {
+               callb = 0;
+               tx->tx_handle  = r->r[0];
+               tx->tx_ecotype = 1;
+               tx->tx_status  = Status_Transmitting;
+            }
+            goto out;
+         }
+      }
+      resp = (port == BRIDGE_PORT || datatype == IMMEDIATE_OP) ? 0 :
+              msg_broadcast(flag, port, buf, bufsize, local);
+      goto out;
+   }
+
+   switch (dst = mns_to_ip(network, station))
+   {
+      case -1:
+         tx->tx_status = Status_NotListening;
+         callb = 1;
+         break;
+
+      case 0:
+         if (connected_econet == 0)
+            r->r[3] = 0;
+         err = call_econet(optype, r);
+         if (err)
+         {
+            tx_freecb(tx);
+            return err;
+         }
+         if (start)
+         {
+            tx->tx_handle = r->r[0];
+            tx->tx_ecotype = 1;
+         }
+         else
+            tx->tx_status = r->r[0];
+         goto out;
+         break;
+
+      default:
+         if (bufsize > mns.mns_segsize)
+         {
+            tx_freecb(tx);
+            return mns_error(Err_TooBig);
+         }
+         oldstate = ensure_irqs_off();
+         tx->tx_handle = mns.mns_txhandle;
+         mns.mns_txhandle += MNS_HANDLE_INCR;
+         restore_irqs(oldstate);
+         tx->tx_control = flag;
+         tx->tx_network = network;
+         tx->tx_station = station;
+         tx->tx_dst     = dst;
+         tx->tx_flag    = start ? 0 : TX_WAIT;
+         tx->tx_buf     = buf;
+         tx->tx_bufsize = bufsize;
+         tx->tx_type    = datatype;
+         tx->tx_port    = port;
+         if (datatype == IMMEDIATE_OP)
+         {
+            if (flag != Econet_MachinePeek || count <= 1)
+            {
+               tx->tx_status = Status_NotListening;
+               callb = 1;
+               break;
+            }
+         }
+         else
+         {
+            if (count > 1)
+            {
+               T = (count * delay) / 100;
+               tx->tx_rtmax = (T < 5) ? 1 : T/5;
+               if (T < 5)
+               {
+                  tx->tx_rjmax = (T*10) + 10;
+                  tx->tx_rjdelayval = 10;
+               }
+               else
+               {
+                  tx->tx_rjmax = 60;
+                  tx->tx_rjdelayval = (T*100)/50;
+                  if (tx->tx_rjdelayval > 25 && in_local_aun_network(network))
+                  {
+                     tx->tx_rjmax = (T*4) + 10;
+                     tx->tx_rjdelayval = 25;
+                  }
+               }
+            }
+         }
+         tx->tx_status  = Status_Transmitting;
+         resp = msg_transmit(dst, flag, status, port, buf, bufsize, datatype,
+                                                                 tx->tx_handle);
+         if (start || resp < 0)
+            break;
+         oldstate = ensure_irqs_on();
+         while (tx->tx_status == Status_Transmitting)
+             usermode_donothing();
+         restore_irqs(oldstate);
+         break;
+
+   } /* endswitch */
+
+out:
+   if (resp < 0)
+   {
+      tx->tx_status = Status_NetError;
+      callb = 1;
+   }
+   if (start)
+   {
+      if (callb)
+         generate_event_on_callback(tx);
+      r->r[0] = tx->tx_handle;
+   }
+   else
+   {
+      r->r[0] = tx->tx_status;
+      tx_freecb(tx);
+   }
+   r->r[2] = (int)buf;
+   r->r[3] = station;
+   r->r[4] = network;
+
+   return err;
+
+} /* tx_op */
+
+/******************************************************************************/
+
+_kernel_oserror *StartTransmit(_kernel_swi_regs *r)
+{
+   return tx_op(r, Econet_StartTransmit);
+}
+
+/******************************************************************************/
+
+static struct txcb *find_tx(int handle)
+{
+   struct txcb *tx;
+   int oldstate = ensure_irqs_off();
+
+   for (tx = mns.mns_txlist; tx; tx = tx->tx_next)
+      if (handle == tx->tx_handle)
+         break;
+   restore_irqs(oldstate);
+
+   return tx;
+
+} /* find_tx() */
+
+/******************************************************************************/
+
+_kernel_oserror *PollTransmit(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      u_int handle;
+   } *up = (struct a *)r;
+   struct txcb *tx;
+#ifndef EDDS
+   int oldstate;
+#endif
+
+   if ((tx = find_tx(up->handle)) == (struct txcb *)0 && connected_econet == -1)
+      return (mns_error(Err_Channel));
+   if (tx == 0 || tx->tx_ecotype)
+      return call_econet(Econet_PollTransmit, r);
+
+#ifndef EDDS
+   oldstate = ensure_irqs_on();
+   user_mode_donothing();
+   restore_irqs(oldstate);
+#endif
+
+   r->r[0] = tx->tx_status;
+
+   return NULL;
+
+} /* PollTransmit() */
+
+/******************************************************************************/
+
+_kernel_oserror *AbandonTransmit(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      u_int handle;
+   } *up = (struct a *)r;
+   struct txcb *tx;
+   _kernel_oserror *e = 0;
+
+   if ((tx = find_tx(up->handle)) == (struct txcb *)0 && connected_econet == -1)
+      return mns_error(Err_Channel);
+
+   if (tx == 0 || tx->tx_ecotype)
+      e = call_econet(Econet_AbandonTransmit, r);
+   else
+      r->r[0] = tx->tx_status;
+   if (tx)
+       tx_freecb(tx);
+
+   return e;
+
+} /* AbandonTransmit() */
+
+/******************************************************************************/
+
+_kernel_oserror *DoTransmit(_kernel_swi_regs *r)
+{
+   return tx_op(r, Econet_DoTransmit);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *ReadLocalStationAndNet(_kernel_swi_regs *r)
+{
+   int no_econet_clock;
+
+   DEBUGP2("#ReadLocalStationAndNet(): connected_econet = %d\n\r",
+                                                              connected_econet);
+   if (connected_econet != -1)
+      (void) read_eco_info(&connected_econet, &no_econet_clock);
+   r->r[0] = mns.mns_stationnumber;
+   r->r[1] = local_net();
+   DEBUGP3("#ReadLocalStationAndNet(): returning %d.%d\n\r",r->r[0], r->r[1]);
+
+   return NULL;
+
+} /* ReadLocalStationAndNet() */
+
+/******************************************************************************/
+
+_kernel_oserror *ConvertStatusToString(_kernel_swi_regs *r)
+{
+   return do_ConvertStatusToString(r, msg_fd_mns);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *ConvertStatusToError(_kernel_swi_regs *r)
+{
+   return do_ConvertStatusToError(r, msg_fd_mns);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *AbandonAndReadReceive(_kernel_swi_regs *r)
+{
+   _kernel_swi_regs rsav;
+   _kernel_oserror *e;
+   int handle;
+
+   handle = r->r[0];
+   e = rx_op(r, Econet_ReadReceive);
+   if (e)
+      return e;
+
+   memcpy((char *)&rsav, (char *)r, sizeof(rsav));
+   r->r[0] = handle;
+   e = rx_op(r, Econet_AbandonReceive);
+   if (e)
+       return e;
+
+   memcpy((char *)r, (char *)&rsav, sizeof(rsav));
+
+   return NULL;
+
+} /* AbandonAndReadReceive() */
+
+/******************************************************************************/
+
+_kernel_oserror *ReadProtection(_kernel_swi_regs *r)
+{
+   if (connected_econet != -1)
+      return(call_econet(Econet_ReadProtection, r));
+   r->r[0] = 0577;
+
+   return NULL;
+
+} /* ReadProtection() */
+
+/******************************************************************************/
+
+_kernel_oserror *SetProtection(_kernel_swi_regs *r)
+{
+   DEBUGP4("#SetProtection(): R0: &%X, R1: &%X, connected_econet = %d\n\r",
+                                           r->r[0], r->r[1], connected_econet);
+   if (connected_econet != -1)
+      return(call_econet(Econet_SetProtection, r));
+
+   if (r->r[0] & 0x80000080)
+      return mns_error(Err_BadMask);
+
+   r->r[0] = 0577;
+
+   return NULL;
+
+} /* SetProtection() */
+
+/******************************************************************************/
+
+_kernel_oserror *ReadStationNumber(_kernel_swi_regs *r)
+{
+   return do_ReadStationNumber(r, msg_fd_mns);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *PrintBanner(_kernel_swi_regs *r)
+{
+   UNUSED(r);
+
+   printf("%s\n", mns_str(Str_MNSBan));
+
+   return NULL;
+
+} /* PrintBanner() */
+
+/******************************************************************************/
+
+_kernel_oserror *ReleasePort(_kernel_swi_regs *r)
+{
+   int i = r->r[0];
+
+   if (i < 1 || i > 254)
+      return mns_error(Err_BadPort);
+
+   mns.mns_states[i] &= ~PORTCLAIMED;
+
+   return NULL;
+
+} /* ReleasePort() */
+
+/******************************************************************************/
+
+_kernel_oserror *AllocatePort(_kernel_swi_regs *r)
+{
+   int i;
+
+   i = mns.mns_nextport;
+
+   for (;;)
+   {
+      if ((mns.mns_states[i] & (PORTALLOCATED|PORTCLAIMED)) == 0)
+      {
+         r->r[0] = i;
+         mns.mns_states[i] |= PORTALLOCATED;
+         if (++i == MAX_ALLOCATE)
+            i = 1;
+         mns.mns_nextport = i;
+         return NULL;
+      }
+      if (++i == 255)
+         i = 1;
+      if (i == mns.mns_nextport)
+         break;
+   }
+
+   return mns_error(Err_NoPorts);
+
+} /* AllocatePort() */
+
+/******************************************************************************/
+
+_kernel_oserror *DeAllocatePort(_kernel_swi_regs *r)
+{
+   int i = r->r[0];
+
+   if (i < 1 || i > 254)
+      return mns_error(Err_BadPort);
+
+   mns.mns_states[i] &= ~PORTALLOCATED;
+
+   return NULL;
+
+} /* DeAllocatePort() */
+
+/******************************************************************************/
+
+_kernel_oserror *ClaimPort(_kernel_swi_regs *r)
+{
+   int i = r->r[0];
+
+   if (i < 1 || i > 254)
+      return mns_error(Err_BadPort);
+
+   if (mns.mns_states[i] & (PORTALLOCATED | PORTCLAIMED))
+      return mns_error(Err_PortAlc);
+
+   mns.mns_states[i] |= PORTCLAIMED;
+
+   return NULL;
+
+} /* ClaimPort() */
+
+/******************************************************************************/
+
+_kernel_oserror *StartImmediate(_kernel_swi_regs *r)
+{
+   return tx_op(r, Econet_StartImmediate);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *DoImmediate(_kernel_swi_regs *r)
+{
+   return tx_op(r, Econet_DoImmediate);
+}
+
+/******************************************************************************/
+
+_kernel_oserror *ReadTransportType(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int station;
+      int network;
+   } *up = (struct a *)r;
+   u_long a;
+
+   if (range_check(0, up->station, up->network) != 0)
+   {
+      r->r[2] = 0;
+      goto out;
+   }
+   a = mns_to_ip(up->network, up->station);
+   if (a == -1)
+      r->r[2] = 0;
+   else
+      r->r[2] = (a == 0) ? econet_transport_type : 1;
+
+out:
+   return NULL;
+
+} /* ReadTransportType() */
+
+/******************************************************************************/
+
+_kernel_oserror *Version(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int station;
+      int network;
+   } *up = (struct a *)r;
+   u_long a;
+   _kernel_oserror *err;
+
+   err = range_check(0, up->station, up->network);
+   if (err)
+       return err;
+
+   a = (up->network == 0 && up->station == 0) ?
+                                        1 : mns_to_ip(up->network, up->station);
+   if (a == 0)
+      return call_econet(Econet_Version, r);
+   r->r[2] = Module_Version;
+
+   return NULL;
+
+} /* Version() */
+
+/******************************************************************************/
+
+_kernel_oserror *NetworkState(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int station;
+      int network;
+   } *up = (struct a *)r;
+   _kernel_oserror *err;
+
+   err = range_check(0, up->station, up->network);
+   if (err)
+       return err;
+
+   if (mns_to_ip(up->network, up->station) == 0)
+      return call_econet(Econet_NetworkState, r);
+
+   r->r[2] = 0;
+
+   return NULL;
+
+} /* NetworkState() */
+
+/******************************************************************************/
+
+_kernel_oserror *PacketSize(_kernel_swi_regs *r)
+{
+    struct a
+    {
+       int station;
+       int network;
+    } *up = (struct a *)r;
+    _kernel_oserror *err;
+
+    err = range_check(0, up->station, up->network);
+    if (err)
+       return err;
+
+    if (mns_to_ip(up->network, up->station) == 0)
+        return call_econet(Econet_PacketSize, r);
+
+    r->r[2] = mns.mns_segsize;
+
+    return NULL;
+
+} /* PacketSize() */
+
+/******************************************************************************/
+
+_kernel_oserror *ReadTransportName(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int station;
+      int network;
+   } *up = (struct a *)r;
+   _kernel_oserror *err;
+
+   err = range_check(0, up->station, up->network);
+   if (err)
+       return err;
+
+   if (mns_to_ip(up->network, up->station) == 0)
+       return call_econet(Econet_ReadTransportName, r);
+
+   r->r[2] = (int)"Network";
+
+   return NULL;
+
+} /* ReadTransportName() */
+
+/******************************************************************************/
+
+_kernel_oserror *InetRxDirect(_kernel_swi_regs *r)
+{
+   int oldstate = ensure_irqs_on();
+
+   if (r->r[0] == mns.mns_rxdsock)
+      process_data_input(r->r[1], r->r[2], (char *)(r->r[3]), r->r[4], r->r[5],
+                                                                       r->r[6]);
+   restore_irqs(oldstate);
+
+   return NULL;
+
+} /* InetRxDirect() */
+
+/******************************************************************************/
+
+_kernel_oserror *EnumerateMap(_kernel_swi_regs *r)
+{
+   struct address_q *q;
+
+   DEBUGP1("#SWI EnumerateMap\n\r");
+
+   q = (struct address_q *)r->r[4];
+   q = q ? q->q_next : mns.mns_mapq;
+
+   if (q == 0)
+      r->r[4] = -1;
+   else
+   {
+      r->r[1] = (int)q->q_net;
+      r->r[2] = (int)q->q_netname;
+      r->r[3] = (int)q->q_ip;
+      r->r[4] = (int)q;
+   }
+
+   return NULL;
+
+} /* EnumerateMap() */
+
+/******************************************************************************/
+
+_kernel_oserror *EnumerateTransmit(_kernel_swi_regs *r)
+{
+   struct a
+   {
+      int index;
+   } *up = (struct a *)r;
+   struct txcb *tx;
+   int i;
+   int oldstate = ensure_irqs_off();
+
+   tx = mns.mns_txlist;
+   for (i = 0; i < up->index; i++)
+   {
+      if (tx == 0)
+         break;
+      tx = tx->tx_next;
+   }
+   restore_irqs(oldstate);
+
+   r->r[0] = (tx == 0) ? 0 : tx->tx_handle;
+
+   return NULL;
+}
+
+/******************************************************************************/
+
+_kernel_oserror *HardwareAddresses(_kernel_swi_regs *r)
+{
+   _kernel_oserror *e;
+
+   e = call_econet(Econet_HardwareAddresses, r);
+   if (e)
+   {
+      r->r[1] = 0;
+      r->r[2] = 0;
+   }
+
+   return e;
+
+} /* HardwareAddresses() */
+
+/******************************************************************************/
+
+_kernel_oserror *NetworkParameters(_kernel_swi_regs *r)
+{
+   _kernel_oserror *e;
+
+   e = call_econet(Econet_NetworkParameters, r);
+   if (e)
+   {
+      r->r[1] = 0;
+      r->r[2] = 0;
+      r->r[3] = 0;
+   }
+
+   return e;
+
+} /* NetworkParameters() */
+
+/******************************************************************************/
+
+static void rx_attach(struct rxcb *rx, struct rxcb **p)
+/*
+ * Attach an rxcb to the list of active rxcbs.
+ */
+{
+   int oldstate = ensure_irqs_off();
+
+   while (*p)
+      p = &((*p)->rx_next);
+   *p = rx;
+   restore_irqs(oldstate);
+
+   return;
+
+} /* rx_attach() */
+
+/******************************************************************************/
+
+static int cb_remque(struct cbh *cb, struct cbh **head)
+{
+   struct cbh *prev, *next;
+
+   if (*head == 0)
+      return 0;
+
+   if (*head == cb)
+   {
+      *head = cb->cb_next;
+      goto found;
+   }
+   prev = *head;
+   next = prev->cb_next;
+   for (;;)
+   {
+      if (next == 0)
+         return 0;
+      if (next == cb)
+         break;
+      prev = next;
+      next = prev->cb_next;
+   }
+   prev->cb_next = cb->cb_next;
+
+found:
+   cb->cb_next = 0;
+
+   return 1;
+
+} /* cb_remque() */
+
+/******************************************************************************/
+
+static void tx_attach(struct txcb *tx)
+/*
+ * Attach a txcb to the list of active txcbs.
+ */
+{
+   int oldstate = ensure_irqs_off();
+   struct txcb **p = &(mns.mns_txlist);
+
+   while (*p)
+      p = &((*p)->tx_next);
+   *p = tx;
+   restore_irqs(oldstate);
+
+   return;
+
+} /* tx_attach() */
+
+/******************************************************************************/
+
+void check_rxcbs(void)
+/*
+ * called from tick handler
+ */
+{
+   struct rxcb *rx;
+
+   for (rx = mns.mns_rxlist; rx; rx = rx->rx_next)
+      if (rx->rx_status == Status_RxReady && rx->rx_delay > 0)
+         rx->rx_delay--;
+
+   for (rx = mns.mns_rxwild; rx; rx = rx->rx_next)
+      if (rx->rx_status == Status_RxReady && rx->rx_delay > 0)
+         rx->rx_delay--;
+
+   return;
+
+} /* check_rxcbs() */
+
+/******************************************************************************/
+
+void check_txcbs(void)
+{
+   struct txcb *tx;
+
+   for (tx = mns.mns_txlist; tx; tx = tx->tx_next)
+   {
+      if (tx->tx_status != Status_Transmitting || tx->tx_callb)
+         continue;
+
+      if (tx->tx_rjdelay > 0)
+      {
+         tx->tx_rjdelay--;
+         if (tx->tx_rjdelay == 0)
+         {
+            if (tx->tx_rjcount == tx->tx_rjmax)
+            {
+               tx->tx_status = Status_NotListening;
+               if ((tx->tx_flag & TX_WAIT) == 0)
+                  generate_event_on_callback(tx);
+            }
+            else
+            {
+               retransmit_on_callback(tx);
+               tx->tx_rjcount++;
+            }
+         }
+         continue;
+      }
+      tx->tx_rtdelay++;
+      if (tx->tx_rtdelay == TX_RETRY_DELAY)
+      {
+         if (tx->tx_rtcount == tx->tx_rtmax)
+         {
+            tx->tx_status = Status_NotListening;
+            if ((tx->tx_flag & TX_WAIT) == 0)
+               generate_event_on_callback(tx);
+         }
+         else
+         {
+             retransmit_on_callback(tx);
+             tx->tx_rtcount++;
+         }
+         tx->tx_rtdelay = 0;
+      }
+   }
+
+   return;
+
+} /* check_txcbs() */
+
+/******************************************************************************/
+
+void retry_tx(struct txcb *tx)
+{
+   u_int handle = tx->tx_handle;
+
+   mns.mns_txretry++;
+   if (msg_transmit(tx->tx_dst, tx->tx_control, MSG_IS_RETRY, tx->tx_port,
+                           tx->tx_buf, tx->tx_bufsize, tx->tx_type, handle) < 0)
+   {
+      tx->tx_status = Status_NetError;
+      (void) generate_event(0, handle, Status_NetError, tx->tx_port);
+   }
+
+   return;
+
+} /* retry_tx() */
+
+/******************************************************************************/
+
+static int is_broadcast(u_char net, u_char station, int *local)
+{
+   *local = 0;
+
+   if (station != 0xff)
+      return 0;
+
+   if (net == 0xfd)
+   {
+      *local = 1;
+      return 1;
+   }
+
+   return ((net == 0xff || net == 0xfe || net == 0xfc) ? 1 : 0);
+
+} /* is_broadcast() */
+
+/******************************************************************************/
+
+/* EOF swis.c */

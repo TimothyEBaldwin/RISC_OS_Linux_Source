@@ -1,0 +1,702 @@
+/* Copyright 2010 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* c.j2s - convert JPEG file to Sprite file.
+   14-Sep-93 WRS started
+   15-Oct-93 WRS overhaul, -p included, own scanning to find width/height.
+*/
+
+#include <stdlib.h>
+#include <time.h>
+#include <assert.h>
+#include <stdio.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+/* Register ranges for _swix: */
+#define _R(nin,nout) ((_IN(nin)-1) | ((~(_OUT(nout)-1) & 0x7fffffff) << 1))
+/* Note you can NOT provide 0s as missing output registers. */
+
+/* Include scanning and decoding code, for checking and for timing measurements. */
+#undef EMBED
+#define TIMINGS
+#define DEBUG
+#define STATS
+static int verbose = 0; /* boolean - spit out trace messages */
+static int stats = 0; /* boolean - collect statistics on DCTs */
+#include "rojpeg.c"
+
+/* Copied in from RISC_OSLib's h.sprite: */
+typedef struct
+{
+ int size; /* NB this first field does NOT get saved in a sprite file. */
+ int number;
+ int sproff;
+ int freeoff;
+}sprite_area;
+typedef struct
+{
+ int next;
+ char name[12];
+ int width;
+ int height;
+ int lbit;
+ int rbit;
+ int image;
+ int mask;
+ int mode;
+}sprite_header;
+
+/* -------------------------------------------------------------------------------------------------- */
+
+#define PROGNAME "j2s"
+
+/* For passing variable arguments to ERROR */
+#define _ ,
+
+/* Simple error handling */
+#define ERROR(message) {printf(message); exit(1);}
+#define CALL(expr) {_kernel_oserror *e_ = (expr); if (e_) ERROR("Error: %s\n" _ e_->errmess)}
+#define SYSERROR ERROR("Error: %s.\n" _ _kernel_last_oserror()->errmess)
+#define SYNERROR {help_message(); exit(1);}
+#define SCANERROR scanerror(cinfo);
+
+/* -------------------------------------------------------------------------------------------------- */
+
+static void scanerror(decompress_info_ptr cinfo)
+/* Produce error message in the case of an error from jpeg_scan_file. */
+{
+  int code = cinfo->error_code;
+  int arg1 = cinfo->error_argument1;
+  int arg2 = cinfo->error_argument2;
+  char *a;
+
+  switch(code)
+  {
+  case E_PRE_NOT_8:    a = "Unexpected data precision (%i), not 8"; break;
+  case E_RESTART:      a = "Unexpected restart interval (%i), not 0"; break;
+  case E_MULTI_SCAN:   a = "Multi-scan file, only single-scan allowed"; break;
+  case E_TOO_HIGH:     a = "Image is too high (%i), max is %i pixels"; break;
+  case E_BAD_SAMPLE:   a = "Unexpected sample factor (%i horizontal x %i vertical), not 2x2 (Y) or 1x1 (UV)"; break;
+  case E_COLOUR:       a = "Unexpected colour space (%i), not grey or YUV"; break;
+  case E_COMPONENTS:   a = "Unexpected number of components (%i), not 1 or 3"; break;
+  case E_TOO_WIDE:     a = "Image is too wide (%i), max is %i pixels"; break;
+  default:             a = "Unknown error code (arg1=%i, arg2=%i, code=%i)"; break;
+  }
+  printf("Error when reading JPEG data: ");
+  printf(a, arg1, arg2, code);
+  printf("\n");
+  exit(1);
+}
+
+static void title_message(void) {printf("%s - JPEG Sprite converter and utility version 1.1 (%s)\n", PROGNAME, __DATE__);}
+
+static void help_message(void)
+{
+  title_message();
+  printf("\n");
+  printf("Usage:    %s sourcefile [destfile] [-options]\n", PROGNAME);
+  printf("\n");
+  printf("Options and arguments:\n");
+  printf("sourcefile                 Source JPEG, as JFIF or Sprite or Draw file\n");
+  printf("destfile                   Output file (JPEG data in Sprite file by default)\n");
+  printf("-help                      Print this message\n");
+  printf("-v                         Verbose - give details of JPEG header contents\n");
+  printf("-p[<integer>,<integer>]    Plot the sprite at the given screen coordinates\n");
+  printf("-t[<clockspeed>]           Timings - do timings for decompress or plot\n");
+  printf("-s                         Statistics - show some statistics about DCTs\n");
+  printf("-d                         Draw - output a Draw file\n");
+  printf("-j                         JPEG - output a JFIF file\n");
+  printf("-r                         Run - Filer_Run the output file\n");
+}
+
+/* -------------------------------------------------------------------------------------------------- */
+
+#if 0
+static int filesize(char *filename)
+/* The size of this file, or -1 if not found, or -2 if a directory. */
+{
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+
+  r.r[0] = 5; /* Read file info - PRM page 850 */
+  r.r[1] = (int) filename;
+  if (0 != (e = _kernel_swi(XOS_Bit | OS_File, &r, &r))) ERROR("Error: %s\n" _ e->errmess)
+  if (r.r[0] == 0) /* not found */ return -1;
+  else if (r.r[0] == 2) /* directory found */ return -2;
+  else return r.r[4];
+}
+#else
+static int filesize(char *filename)
+/* The size of this file, or -1 if not found, or -2 if a directory. */
+{
+  int type, size;
+
+  CALL(_swix(OS_File, _IN(0)|_IN(1)|_OUT(0)|_OUT(4), 5/*read file info*/, filename, &type, &size))
+  return type == 0 ? -1 : type == 2 ? -2 : size;
+}
+#endif
+
+/* -------------------------------------------------------------------------------------------------- */
+
+/* Misc useful functions */
+
+static void do_fwrite(void *p, int size, FILE *f)
+{
+  if (fwrite(p, sizeof(char), size, f) != size) SYSERROR
+}
+
+static void *safe_malloc(size_t size)
+{
+  void *result = malloc(size);
+
+  if (result == 0) ERROR("Not enough space")
+  return result;
+}
+
+static int roundup(int i) {return (i + 3) & ~3;}
+
+static int readint(char **source)
+{
+  char *c = *source;
+  BOOL negative = *c == '-';
+  int result = 0;
+
+  if (negative) c++;
+  while (*c >= '0' && *c <= '9') result = result * 10 + (*c++ - '0');
+  *source = c;
+  if (negative) result = - result;
+  return result;
+}
+
+/* -------------------------------------------------------------------------------------------------- */
+
+/* Creating a sprite header, given a JPEG image. */
+
+static int image_width = 0;
+static int image_height = 0;
+/* These are determined when constructing a sprite header, but can be
+used later in constructing a Draw file header. */
+static int ticks_per_pixel = 25; /* used for timing output */
+
+extern void create_sprite_header(sprite_area *a, char *jdata, int size, BOOL oldformat)
+{
+  int greyscale;
+
+  if (0 != find_image_dims(jdata, &image_width, &image_height, &greyscale, 0, 0, 0)) ERROR("This is not a JPEG file")
+
+
+  /* Now we can fill in the sprite header as a type-8 new format sprite. */
+  {
+    sprite_header *h = (sprite_header*) (a + 1);
+
+    a->size = size;
+    a->number = 1;
+    a->sproff = sizeof(sprite_area);
+    a->freeoff = size;
+    h->next = size + sizeof(sprite_header) + sizeof(int);
+    h->name[0] = 'x';
+    h->width = image_width - 1; /* width in words - 1 */
+    h->height = image_height - 1;
+    h->lbit = 0;
+    h->rbit = 0;
+    h->image = sizeof(sprite_header);
+    h->mask = sizeof(sprite_header);
+    h->mode = 1 + (6<<27) + (90<<1) + (90<<14); /* new style type word - compressed 32bpp, 90dpi both ways */
+    ((int*)(h + 1))[0] = 1 + (greyscale == 1 ? 256 : 0); /* compression ID word for JPEG */
+
+    if (oldformat)
+    {
+      h->width = ((image_width + 7) >> 3) - 1; /* as though for a mode 20 sprite, ie number of words - 1*/
+      h->mode = 20;
+      h->rbit = (image_width & 7) * 4; /* number of bits used in right hand word */
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------------------------------- */
+
+typedef struct {int x0, y0, x1, y1;} draw_box;
+typedef draw_box draw_bboxtyp;
+typedef int draw_sizetyp;
+
+typedef enum
+{draw_OBJFONTLIST = 0,
+ draw_OBJTEXT = 1,
+ draw_OBJPATH = 2,
+ draw_OBJSPRITE = 5,
+ draw_OBJGROUP = 6,
+ draw_OBJTEXTAREA = 9,
+ draw_OBJTEXTCOL = 10
+}draw_tagtyp;
+typedef struct { int x,y; } draw_objcoord;
+
+typedef struct
+{char title[4];
+ int majorstamp;
+ int minorstamp;
+ char progident[12];
+ draw_bboxtyp bbox;
+}draw_fileheader;
+
+typedef struct
+{draw_tagtyp tag;
+ draw_sizetyp size;
+ draw_bboxtyp bbox;
+}draw_objhdr;
+
+#define DRAWHDRSIZE (sizeof(draw_fileheader) + sizeof(draw_objhdr))
+
+static void make_draw_file_header(char *buffer, int size)
+/* A suitable header structure in constructed. All we'll ever do with
+this is write it to a file. Size passed in is the complete size of the sprite,
+including header and JPEG data. */
+{
+  draw_fileheader *d = (draw_fileheader *) buffer;
+  draw_objhdr *o = (draw_objhdr*)(d + 1);
+
+  assert(image_width);
+  assert(image_height); /* determined in constructing the sprite header. */
+  strcpy(d->title, "Draw        j2s         "); /* does the progident field too */
+  d->majorstamp = 201;
+  d->minorstamp = 0;
+  d->bbox.x0 = 0;
+  d->bbox.y0 = 0;
+  d->bbox.x1 = image_width * 2 * 256; /* width in 256ths of an OS-unit */
+  d->bbox.y1 = image_height * 2 * 256;
+  o->tag = draw_OBJSPRITE;
+  o->size = size + sizeof(draw_objhdr);
+  o->bbox = d->bbox;
+}
+
+/* -------------------------------------------------------------------------------------------------- */
+
+static void print_microseconds(float micros)
+{
+  printf("%f microseconds (%f ticks @%iMHz) ", micros, micros * ticks_per_pixel, ticks_per_pixel);
+}
+
+/* Perform timings on the various phases of JPEG decompression */
+static void do_timings(decompress_info_ptr cinfo, char *buffer, int size)
+{
+  int ticks;
+  int t_scan;
+  int t_huff;
+  int t_dct;
+  int t_convert;
+  int t_diffuse;
+  int y;
+  BOOL was_verbose = verbose;
+#if 0
+  int band_buffer_size = 16 * ((cinfo->image_width + 15) & ~15); /* We already know how wide it has to be. */
+  int *band_buffer = safe_malloc(band_buffer_size * sizeof(int));
+#endif
+
+  verbose = FALSE; /* printing messages could mess up the timings */
+#if 0
+  cinfo->band_buffer = band_buffer;
+  cinfo->band_buffer_size = band_buffer_size;
+#endif
+
+  ticks = clock();
+  if (jpeg_scan_file(cinfo, buffer, size, 0, 9999999, -1, -1, jopt_HUFF_ONLY) != 0) SCANERROR
+  t_scan = clock() - ticks;
+  printf("Time to process header and do huffman scan=%i\n", t_scan);
+
+  for (y = 0; y < cinfo->image_height; y++) jpeg_find_line(cinfo, y);
+  t_huff = clock() - ticks - t_scan;
+  printf("Time to do huffman decode=%i\n", t_huff);
+
+  if (jpeg_scan_file(cinfo, buffer, size, 0, 9999999, -1, -1, jopt_DCT_ONLY) != 0) SCANERROR
+  ticks = clock();
+  for (y = 0; y < cinfo->image_height; y++) jpeg_find_line(cinfo, y);
+  t_dct = clock() - ticks - t_huff;
+  printf("Time to do DCTs=%i\n", t_dct);
+
+  if (jpeg_scan_file(cinfo, buffer, size, 0, 9999999, -1, -1, 0) != 0) SCANERROR
+  ticks = clock();
+  for (y = 0; y < cinfo->image_height; y++) jpeg_find_line(cinfo, y);
+  t_convert = clock() - ticks - t_huff - t_dct;
+  printf("Time to convert colours=%i\n", t_convert);
+
+  if (jpeg_scan_file(cinfo, buffer, size, 0, 9999999, -1, -1, jopt_OUTBPP_8) != 0) SCANERROR
+  ticks = clock();
+  for (y = 0; y < cinfo->image_height; y++) jpeg_find_line(cinfo, y);
+  t_diffuse = clock() - ticks - t_huff - t_dct - t_convert;
+  printf("Time to diffuse colours for 8bpp display=%i\n", t_diffuse);
+
+  if (jpeg_scan_file(cinfo, buffer, size, 0, 9999999, -1, -1, jopt_OUTBPP_8YUV) != 0) SCANERROR
+  ticks = clock();
+  for (y = 0; y < cinfo->image_height; y++) jpeg_find_line(cinfo, y);
+  t_diffuse = clock() - ticks - t_huff - t_dct - t_convert;
+  printf("Time to diffuse colours from YUV for 8bpp display=%i\n", t_diffuse);
+
+  printf("Time to huffman decode, dct, convert=%i.\n", t_huff + t_dct + t_convert);
+
+  print_microseconds((float)(t_huff + t_dct + t_convert) * 10000.0 / (float)(cinfo->image_width * cinfo->image_height));
+  printf("per pixel for huff,DCT,convert\n");
+  print_microseconds((float)(t_diffuse) * 10000.0 / (float)(cinfo->image_width * cinfo->image_height));
+  printf("per pixel for YUV 8bpp colour diffusion\n");
+  print_microseconds((float)(t_huff + t_dct + t_convert) * 10000.0 / (float)size);
+  printf("per byte of input\n");
+
+  verbose = was_verbose;
+}
+
+/* Collect and display statistics about DCTs. */
+static void do_statistics(decompress_info_ptr cinfo, char *buffer, int size)
+{
+  BOOL was_verbose = verbose;
+  int i;
+  int y;
+
+  if (cinfo->band_buffer == 0)
+  {
+    cinfo->band_buffer_size = 16 * ((cinfo->image_width + 15) & ~15); /* We already know how wide it has to be. */
+    cinfo->band_buffer = safe_malloc(cinfo->band_buffer_size * sizeof(int));
+  }
+  stats = TRUE;
+  for (y = 0; y < cinfo->image_height; y++) jpeg_find_line(cinfo, y);
+  stats = FALSE;
+  verbose = TRUE;
+  printf("DCT statistics, over %i blocks, making %i 1-D Inverse DCTs\n", cinfo->stats.n_jblocks, cinfo->stats.n_jblocks*16);
+
+  for (i = 0; i < DCTSIZE; i++)
+    printf("There were %7i row IDCTs and %7i column IDCTs with %i nonzero coefficients.\n",
+      cinfo->stats.n_lines_thismany_nonzero_coeffs_pass1[i],
+      cinfo->stats.n_lines_thismany_nonzero_coeffs_pass2[i],
+      i);
+  printf("There were %7i row IDCTs with all AC coefficients zero.\n", cinfo->stats.n_pass1_ac_zero);
+  printf("There were %7i row IDCTs with all even coefficients zero.\n", cinfo->stats.n_pass1_even_zero);
+  printf("There were %7i row IDCTs with all odd coefficients zero.\n", cinfo->stats.n_pass1_odd_zero);
+  verbose = was_verbose;
+}
+
+/* -------------------------------------------------------------------------------------------------- */
+
+extern int main(int argc, char **argv)
+{
+  char *buffer;
+  int size;
+  int hdrsize = sizeof(sprite_area) + sizeof(sprite_header) + sizeof(int);
+  int buffersize;
+  /* Things read in from the command line */
+  char *sourcefile = 0;
+  char *destfile = 0;
+  BOOL oldformat = TRUE;
+  BOOL plot = FALSE;
+  BOOL timings = FALSE;
+  BOOL collect_statistics = FALSE;
+  BOOL give_help = FALSE;
+  BOOL source_was_sprite = FALSE;
+  BOOL source_was_draw = FALSE;
+  BOOL makedrawfile = FALSE;
+  BOOL makejpegfile = FALSE;
+  BOOL runsavedfile = FALSE;
+  BOOL testinfocall = FALSE;
+  int plotx = 0;
+  int ploty = 0;
+
+  /* Decode arguments */
+  {
+    int nextarg = 1;
+    char *options = 0;
+
+    while (nextarg < argc)
+    {
+      if (argv[nextarg][0] == '-')
+      {
+        options = argv[nextarg] + 1;
+        while (*options != 0)
+        {
+          switch (*options)
+          {
+          case 'O':
+          case 'o': oldformat = TRUE; break;
+          case 'N':
+          case 'n': oldformat = FALSE; break;
+          case 'P':
+          case 'p': plot = TRUE;
+                    options++;
+                    if ((*options >= '0' && *options <= '9') || *options == '-') /* read coords to plot at */
+                    {
+                      plotx = readint(&options);
+                      if (*options++ != ',') SYNERROR
+                      ploty = readint(&options);
+                    }
+                    options--;
+                    break;
+          case 'T':
+          case 't': timings = TRUE;
+                    if (options[1] >= '0' && options[1] <= '9') {options++; ticks_per_pixel = readint(&options); options--;}
+                    break;
+          case 'S':
+          case 's': collect_statistics = TRUE; break;
+          case 'V':
+          case 'v': verbose = TRUE; break;
+          case 'D':
+          case 'd': makedrawfile = TRUE; break;
+          case 'I':
+          case 'i': testinfocall = TRUE; break;
+          case 'J':
+          case 'j': makejpegfile = TRUE; break;
+          case 'R':
+          case 'r': runsavedfile = TRUE; if (destfile == 0) destfile = "<Wimp$Scrap>"; break;
+          case 'H':
+          case 'h': give_help = TRUE;
+                    if (options[1] == 'e') options++;
+                    if (options[1] == 'l') options++;
+                    if (options[1] == 'p') options++;
+                    break;
+          default:  SYNERROR
+          }
+          options++;
+        }
+      }
+      else if (sourcefile == 0) sourcefile = argv[nextarg];
+      else destfile = argv[nextarg];
+      nextarg++;
+    }
+
+    if (give_help)
+    {
+      help_message();
+      if (sourcefile == 0) exit(0);
+    }
+    else if (sourcefile == 0) SYNERROR
+    if (verbose) title_message();
+  }
+
+  /* Allocate the buffer, load in the JPEG file */
+  tracef("Input file '%s'.\n" _ sourcefile);
+  size = filesize(sourcefile);
+  tracef("Input file size %i bytes.\n" _ size);
+  if (size == -1) ERROR("File '%s' not found\n" _ sourcefile)
+  if (size == -2) ERROR("'%s' is a directory\n" _ sourcefile)
+  buffersize = roundup(size) + hdrsize;
+  buffer = safe_malloc(buffersize);
+  MEMZERO(buffer, buffersize); /* ensure 0 bytes at end of file, so that output is deterministic */
+  buffer += hdrsize; /* point to where the file will go - room for sprite header before that */
+  {
+    FILE *f = fopen(sourcefile, "r");
+    if (f == 0) SYSERROR
+    if (size != fread(buffer, sizeof(char), size, f)) SYSERROR
+    fclose(f);
+  }
+
+  /* Check to see if the loaded file is in fact a Sprite file, eg. to be plotted. */
+  {
+    /* sprite_area *a = (sprite_area*) (buffer - sizeof(int)); */
+    /* sprite_header *h = (sprite_header*) ((char*)a + sizeof(sprite_area)); */
+
+    if (!looks_like_jpeg(buffer) /* certainly not a JPEG file */
+       && looks_like_jpeg(buffer + hdrsize - sizeof(int))
+       ) /* Looks like a JPEG sprite file - could do a whole lot more checking I guess */
+     {
+       source_was_sprite = TRUE;
+       buffer += hdrsize - sizeof(int); /* Just ignore the sprite header we were given */
+       size -= hdrsize - sizeof(int);
+       tracef("Input is a Sprite file containing JPEG data.\n");
+       if (destfile != 0) ERROR("Destination file can only be specified if input is not a Sprite file")
+       if (makedrawfile) ERROR("This program can only make a Draw file from a JPEG input file")
+     }
+  }
+
+  /* Check to see if the loaded file is in fact a Draw file, eg. containing a JPEG sprite to be plotted. */
+  {
+    draw_fileheader *d = (draw_fileheader *) buffer;
+    BOOL found = FALSE;
+
+    if (d->title[0] == 'D'
+       && d->title[1] == 'r'
+       && d->title[2] == 'a'
+       && d->title[3] == 'w'
+       )
+    {
+      draw_objhdr *obj = (draw_objhdr*) (d + 1);
+      draw_objhdr *lim = (draw_objhdr*) ((char*)d + size);
+
+      tracef("Input is a Draw file\n");
+      while (!found)
+      {
+        char *jdata = (char*)(obj + 1) + sizeof(sprite_header) + sizeof(int);
+
+        if (obj >= lim) ERROR("No JPEG can be found in that Draw file")
+        if (obj->tag == 5 && looks_like_jpeg(jdata))
+        {
+          buffer = jdata;
+          size = obj->size - sizeof(draw_objhdr) - sizeof(sprite_header) - sizeof(int);
+          tracef("Found JPEG object at %i, JPEG data size %i\n" _ (char*)obj - buffer _ size);
+          found = TRUE;
+          source_was_draw = TRUE;
+        }
+        else
+        {
+          tracef("Found Draw object of type %i at %i\n" _ obj->tag _ (char*)obj - buffer);
+          if (obj->size < sizeof(draw_objhdr)) ERROR("Badly formed Draw file")
+          obj = (draw_objhdr*) ((char*)obj + obj->size);
+        }
+      } /* while */
+    } /* if */
+    /* If it was JPEG data in a Draw file then 'buffer' and 'size' now show us where it is,
+    all of the rest of the data in the file is ignored. We generate a sprite header cos
+    we have to create a sprite area header too. */
+  }
+
+  /* Check the headers of the JPEG file, scan the data to check that all seems in order */
+  {
+    decompress_info_ptr cinfo;
+    int wsize;
+
+    if (0 != find_image_dims(buffer, 0, 0, 0, 0, &wsize, 0)) ERROR("Input data is not JPEG")
+    tracef("Workspace required to process this file %i bytes.\n" _ wsize);
+    cinfo = safe_malloc(wsize);
+    MEMZERO(cinfo, wsize);
+    cinfo->workspace_size = wsize;
+#if 0
+    cinfo->band_buffer = 0; /* just get it out of the way - not used */
+    cinfo->band_buffer_size = 100000000; /* Lie, to prevent error messages */
+#endif
+    if (jpeg_scan_file(cinfo, buffer, size, 0, 9999999, -1, -1, 0) != 0) SCANERROR
+    if (verbose || timings || collect_statistics)
+      printf("Image width=%i, height=%i, %i pixels, %i bytes, %f bits per pixel\n",
+        cinfo->image_width, cinfo->image_height, cinfo->image_width * cinfo->image_height, size,
+        ((float)size * 8.0)/((float)cinfo->image_width * (float)cinfo->image_height));
+    if (timings && (verbose || !plot)) do_timings(cinfo, buffer, size);
+      /* if he said -tp he probably just wants time for the plot operation. If verbose, however, give him everything. */
+    if (collect_statistics) do_statistics(cinfo, buffer, size);
+
+    if (testinfocall)
+    {
+      /* Test out sprite reason code SpriteReason_JPEGInfo - only do this if new SprExtend loaded */
+      #define SpriteReason_JPEGInfo 65
+      int dud, iwidth, iheight, iflags;
+
+      CALL(_swix(OS_CLI, _IN(0), "RMEnsure SpriteExtend 2.00 Error 0 You need a newer SpriteExtend module to get the JPEGInfo call"))
+      CALL(_swix(OS_SpriteOp, _R(4,4), SpriteReason_JPEGInfo, buffer, size, 0, &dud, &iflags, &iwidth, &iheight))
+      if (iwidth != cinfo->image_width) printf("JPEGInfo width disagreement: %i, %i\n", cinfo->image_width, iwidth);
+      if (iheight != cinfo->image_height) printf("JPEGInfo height disagreement: %i, %i\n", cinfo->image_height, iheight);
+      iflags &= 255;
+      printf("Testing sprite op JPEGInfo - returned flags are %i (1->grey, 3->colour)\n" _ iflags);
+      assert(iwidth == cinfo->image_width && iheight == cinfo->image_height && (iflags == 1 || iflags == 3));
+
+      if (plot) /* Plot via PutJPEGScaled call */
+      {
+        CALL(_swix(OS_SpriteOp, _R(6,0), 66, buffer, size, plotx, ploty, 0))
+      }
+    }
+  }
+
+  size = roundup(size); /* When creating Sprite file, round up image data to multiple of 4 bytes */
+
+  /* Create a sprite pool and sprite header */
+  if (!source_was_sprite) create_sprite_header((sprite_area*) (buffer - hdrsize), buffer, size, oldformat);
+
+  /* Save the sprite file */
+  if (destfile != 0)
+  {
+    FILE *f;
+    char a[256];
+
+    tracef("Output file '%s'\n" _ destfile);
+    f = fopen(destfile, "w");
+    if (f == 0) SYSERROR
+    if (makedrawfile)
+    {
+      char drawheader[DRAWHDRSIZE];
+
+      make_draw_file_header(drawheader, size + sizeof(int) + sizeof(sprite_header));
+      do_fwrite(drawheader, DRAWHDRSIZE, f);
+      do_fwrite(buffer - sizeof(sprite_header) - sizeof(int), sizeof(sprite_header) + sizeof(int), f); /* Just a sprite, not a sprite pool */
+    }
+    else if (makejpegfile)
+    {
+      /* no header needed */
+    }
+    else /* make a Sprite file */
+    {
+      /* Write the sprite and sprite pool header - don't save the 'size' field of the sprite pool header */
+      do_fwrite((int*) (buffer - hdrsize) + 1, hdrsize - sizeof(int), f); /* Save the header */
+    }
+    do_fwrite(buffer, size, f);                                         /* Write the data of the sprite */
+    if (fclose(f) != 0) SYSERROR                                        /* Close the file */
+    sprintf(a, "Settype %s %s", destfile, makedrawfile ? "AFF" : makejpegfile ? "C85" : "FF9"); /* Set file type */
+    CALL(_swix(OS_CLI, _IN(0), a))
+    if (runsavedfile)
+    {
+      sprintf(a, "Filer_Run %s", destfile);
+      CALL(_swix(OS_CLI, _IN(0), a))
+    }
+  }
+
+  /* Plot the sprite on the screen. Time how long it took, be prepared to print out time and pixels/sec. */
+  if (plot && !testinfocall)
+  {
+    sprite_area *a = (sprite_area*) (buffer - hdrsize);
+    sprite_header *h = (sprite_header*) ((char*)a + a->sproff);
+    char table[256];
+    int ticks;
+    int npixels;
+
+    /* find the number of pixels that will be plotted */
+    int xeig, yeig, xsize, ysize;
+
+    CALL(_swix(OS_ReadModeVariable, _R(2,0) | _OUT(2), -1, 4, &xeig))
+    CALL(_swix(OS_ReadModeVariable, _R(2,0) | _OUT(2), -1, 5, &yeig))
+    CALL(_swix(OS_ReadModeVariable, _R(2,0) | _OUT(2), -1, 11, &xsize))
+    CALL(_swix(OS_ReadModeVariable, _R(2,0) | _OUT(2), -1, 12, &ysize))
+    xsize++, ysize++;
+    tracef("Screen size %ix%i at %ix%i\n" _ xsize _ ysize _ xeig _ yeig);
+    if ((xsize << xeig) > 2 * image_width) xsize = image_width; /* xsize is now pixels */
+    if ((ysize << yeig) > 2 * image_height) ysize = image_height;
+    npixels = xsize * ysize;
+
+    CALL(_swix(OS_CLI, _IN(0), "RMEnsure SpriteExtend 2.00 Error 0 You need a newer SpriteExtend module to plot JPEG"))
+    CALL(_swix(OS_CLI, _IN(0), "Unset Sys$RC"))
+
+    /* Set up the translation table */
+    CALL(_swix(ColourTrans_SelectTable, _R(8,0), a, h, -1, -1, table, 1, 0, 0))
+
+    /* If doing timings then we avoid giving the time for the initial scan. Do this by plotting twice.
+    The first plot makes just one pixel appear, in the bot left of the screen. */
+    if (timings) CALL(_swix(OS_SpriteOp, _R(8,0), 52 + 512, a, h, (1<<xeig)-2*image_width, (1<<yeig)-2*image_height, 0, 0, table))
+
+    /* Now do the actual timed plot */
+    ticks = clock();
+    CALL(_swix(OS_SpriteOp, _R(8,0), 52 + 512, a, h, plotx, ploty, 0, 0, table))
+    ticks = clock() - ticks;
+
+    CALL(_swix(OS_CLI, _IN(0), "If \"<Sys$RC>\"<>\"\" Then Echo Error return code <Sys$RC> from plot operation"))
+
+    if (timings)
+    {
+      printf("That took %f seconds to plot %i pixels,\n", (float)ticks/100.0, npixels);
+      print_microseconds(((float)ticks*10000.0)/(float)npixels);
+      printf(" per pixel\n");
+    }
+
+    if (verbose) /* hack to discover effect on OS_SpriteOp 40, read sprite info */
+    {
+      int width, height, mask, mode;
+
+      CALL(_swix(OS_SpriteOp, _R(3,0) | _OUT(3)|_OUT(4)|_OUT(5)|_OUT(6),
+        40 + 512, a, h, &width, &height, &mask, &mode))
+      printf("OS says width=%i, height=%i, mask=%i, mode=%i\n", width, height, mask, mode);
+      /* This fails with type-9 sprites on RISC OS 3.10, because of tests deep in the OS. */
+    }
+  }
+
+  return 0;
+}

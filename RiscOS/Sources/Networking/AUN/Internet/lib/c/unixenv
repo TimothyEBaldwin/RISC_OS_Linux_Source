@@ -1,0 +1,874 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Copyright(c) 1994 Acorn Computers Ltd., Cambridge, England
+ */
+#include <string.h>
+#include <stdbool.h>
+#include <kernel.h>
+#include <swis.h>
+
+#include "sys/param.h"
+#include "sys/systm.h"
+#include "sys/queue.h"
+#include "sys/uio.h"
+#include "sys/time.h"
+#include "sys/kernel.h"
+#include "sys/callout.h"
+#include "sys/mbuf.h"
+#include "sys/proc.h"
+#include "sys/socket.h" //
+#include "sys/socketvar.h" //
+#include "sys/domain.h" //
+#include "sys/protosw.h" //
+
+#include "net/netisr.h"
+#include "net/route.h" //
+
+#include "netinet/in.h" //
+#include "netinet/in_systm.h"
+#include "netinet/ip.h"
+#include "netinet/in_pcb.h" //
+
+#include "debug.h"
+#include "swiveneers.h"
+
+#include "module.h"
+#include "AsmUtils/callbacks.h"
+#include "Global/HALEntries.h"
+#include "Global/RISCOS.h"
+
+#define NCALLOUT 20
+
+/*
+ * The callout structure is for
+ * a routine arranging
+ * to be called by the clock interrupt
+ * in a specified amount of time.
+ */
+
+struct	callout callout[NCALLOUT];
+
+struct	callout *callfree;
+struct	callout calltodo;
+
+int	ncallout = NCALLOUT;
+
+extern struct socket *getsock(int s);
+extern int escape_seen(void);
+static int generate_event(int sockid, int sig);
+
+volatile int callo_pending;
+extern void *module_wsp;
+extern int paniced;
+
+#ifdef DELAY_EVENTS
+long siglist[SOCKTABSIZE];
+#endif
+
+/*
+ * Queue a signal for later processing - ie as we exit a SWI or our
+ * callback handler
+ */
+void
+psignal(p, signum)
+	struct proc *p;
+	register int signum;
+{
+	register int sockid = (int) p - 1;
+
+	if (sockid < 0)
+		return;
+
+#ifdef DELAY_EVENTS
+	/* This was the behaviour in Internet 5.00-5.15 - it has now been restored to the
+	 * Internet 4 behaviour, to allow speed-critical apps, such as MPEG streaming, to
+	 * get their data faster. */
+	siglist[sockid] |= sigmask(signum);
+#else
+	generate_event(sockid, signum);
+#endif
+}
+
+#ifdef DELAY_EVENTS
+void
+sendallsignals()
+{
+	register int sockid;
+
+	for (sockid = 0; sockid < SOCKTABSIZE; sockid++)
+		if (siglist[sockid])
+			sendsignals(sockid);
+}
+
+/*
+ * Send pending signals on a socket id. Be careful not to erase signals
+ * that are raised by routines responding to the signals - save them for
+ * later processing
+ */
+void
+sendsignals(sockid)
+	register int sockid;
+{
+	register int signum;
+	register long mask;
+
+	mask = siglist[sockid];
+
+	for (;;) {
+		if (mask == 0)
+			return;
+		signum = ffs(mask);
+#ifdef DIAGNOSTIC
+		if (signum != SIGIO && signum != SIGURG && signum != SIGPIPE)
+			Printf("Unknown signal pending for socket %d: %d\n",
+				sockid, signum);
+#endif
+		siglist[sockid] &= ~sigmask(signum);
+		mask &= ~sigmask(signum);
+		generate_event(sockid, signum);
+	}
+}
+#endif
+
+static int
+generate_event(sockid, sig)
+	int sockid, sig;
+{
+    int event = 0;
+    int port = 0;
+    struct socket *so;
+
+#ifdef DEBUG
+    if( DODEBUG(DBGEVENTS) )
+	Printf("\021\04generate_event: SIG%s on socket %d\021\07\n",
+	       (sig == SIGIO) ? "IO" : (sig == SIGURG) ? "URG" : "PIPE",
+	       sockid);
+#endif
+
+    switch (sig)
+    {
+      case SIGIO:
+	event = Event_Internet_SocketAsync;
+	break;
+
+      case SIGURG:
+	event = Event_Internet_SocketUrgent;
+	break;
+
+      case SIGPIPE:
+	event = Event_Internet_SocketBroken;
+	break;
+
+      default:
+	return(NULL);
+    }
+
+#   ifdef NO_PORT_EVENT
+    return os_generate_event(Event_Internet, event, sockid, 0) ? -1 : 0;
+#   else
+    /* If it's an Inet socket, fill in R3 with the local port number */
+    so=getsock(sockid);
+    if (so && so->so_proto->pr_domain->dom_family == PF_INET)
+    {
+        struct inpcb *inp=(struct inpcb *) so->so_pcb;
+
+        if (inp)
+            port = inp->inp_lport;
+    }
+
+    return os_generate_event(Event_Internet, event, sockid, port) ? -1 : 0;
+#   endif
+}
+
+void rsignal(struct proc *p, struct mbuf **m, struct sockaddr *sa, char *esrc, int unit, int swinum, struct mbuf *n)
+{
+    int sockid;
+
+    sockid = (int)p - 1;
+    if (sockid < 0)
+	return;
+
+    *m = econet_inet_rx_direct(sockid, *m, sa, esrc, unit, swinum, n);
+}
+
+_kernel_oserror *calleverytick(void (*fun)(void))
+{
+    return os_claim(TickerV, fun, module_wsp);
+}
+
+void removetickerevent(void (*fun)(void))
+{
+    os_release(TickerV, fun, module_wsp);
+}
+
+void init_callout(void)
+{
+    int i;
+
+    callo_pending = 0;
+    calltodo.c_next = 0;
+    callfree = &callout[0];
+    for (i = 1; i < ncallout; i++)
+	callout[i-1].c_next = &callout[i];
+}
+
+/*
+ * This routine, plus its veneer, have been recrafted in assembler, and can
+ * be found in s.tick_entry - KJB
+ */
+#ifdef NoAsm
+int tick_handler(int *r, void *pw)
+{
+    struct callout *p1;
+    int needtocall = 0;
+
+    /*
+     * Update time ticker
+     */
+    if ((time.tv_usec += 10000) >= 1000000) {
+        time.tv_usec = 0;
+        time.tv_sec++;
+    }
+
+    /*
+     * Update real-time timeout queue.
+     * At front of queue are some number of events which are ``due''.
+     * The time to these is <= 0 and if negative represents the
+     * number of ticks which have passed since it was supposed to happen.
+     * The rest of the q elements (times > 0) are events yet to happen,
+     * where the time for each is given as a delta from the previous.
+     * Decrementing just the first of these serves to decrement the time
+     * to all events.
+     */
+    p1 = calltodo.c_next;
+    while (p1)
+    {
+	if( --p1->c_time > 0 )
+	    break;
+
+	needtocall = 1;
+
+	if( p1->c_time == 0 )
+	    break;
+
+	p1 = p1->c_next;
+    }
+
+    if (needtocall)
+	schednetisr(NETISR_CALLO);
+
+    return (1);
+}
+#endif
+
+/*
+ * callout handler
+ */
+void
+callo_handler(void)
+{
+    struct callout *p1;
+    void *arg;
+    timeout_func_t func;
+    int a;
+    int s;
+
+    for (;;)
+    {
+	if ((p1 = calltodo.c_next) == 0 || p1->c_time > 0)
+	    return;
+
+	arg = p1->c_arg; func = p1->c_func; a = p1->c_time;
+        s = splimp();
+	calltodo.c_next = p1->c_next;
+	p1->c_next = callfree;
+	callfree = p1;
+	splx(s);
+	(*func)(arg);
+    }
+}
+
+/*
+ * Arrange that (*fun)(arg) is called in t/hz seconds.
+ */
+void timeout(timeout_func_t fun, void *arg, int t)
+{
+	struct callout *p1, *p2, *pnew;
+	func_splimp();
+
+#if 0
+        Printf("timeout(%x,%x,%d)\n", fun, arg, t);
+#endif
+
+	if (t <= 0)
+		t = 1;
+
+	pnew = callfree;
+	if (pnew == NULL) {
+		panic("timeout table overflow");
+		func_splx();
+		return;
+	}
+
+	callfree = pnew->c_next;
+	pnew->c_arg = arg;
+	pnew->c_func = fun;
+	for (p1 = &calltodo; (p2 = p1->c_next) && p2->c_time < t; p1 = p2)
+		if (p2->c_time > 0)
+			t -= p2->c_time;
+
+	p1->c_next = pnew;
+	pnew->c_next = p2;
+	pnew->c_time = t;
+
+	if (p2)
+		p2->c_time -= t;
+
+	func_splx();
+}
+
+/*
+ * untimeout is called to remove a function timeout call
+ * from the callout structure.
+ */
+void untimeout(timeout_func_t fun, void *arg)
+{
+    struct callout *p1, *p2;
+    func_splimp();
+
+    for (p1 = &calltodo; (p2 = p1->c_next) != 0; p1 = p2)
+    {
+	if (p2->c_func == fun && p2->c_arg == arg)
+	{
+	    if (p2->c_next && p2->c_time > 0)
+		p2->c_next->c_time += p2->c_time;
+
+	    p1->c_next = p2->c_next;
+	    p2->c_next = callfree;
+	    callfree = p2;
+
+	    break;
+	}
+    }
+
+    func_splx();
+}
+
+int
+hzto(tv)
+	struct timeval *tv;
+{
+	long n;
+	func_splhi();
+
+	n = (tv->tv_sec - time.tv_sec) * 100 + (tv->tv_usec - time.tv_usec) / 10000;
+	if (n < 0)
+	    n = 0;
+
+	func_splx();
+	return n;
+}
+
+/*
+uiomove(char *cp, int n, enum uio_rw rw, struct uio *uio)
+{
+    struct iovec *iov;
+    u_int cnt;
+
+    while (n > 0 && uio->uio_resid)
+    {
+	iov = uio->uio_iov;
+	cnt = iov->iov_len;
+
+	if (cnt == 0)
+	{
+	    uio->uio_iov++;
+	    uio->uio_iovcnt--;
+	    continue;
+	}
+
+	if (cnt > n)
+	    cnt = n;
+
+	if (rw == UIO_READ)
+	    memcpy (iov->iov_base, cp, cnt);
+	else
+	    memcpy (cp, iov->iov_base, cnt);
+
+	iov->iov_base += cnt;
+	iov->iov_len -= cnt;
+	uio->uio_resid -= cnt;
+	uio->uio_offset += cnt;
+	cp += cnt;
+	n -= cnt;
+    }
+
+    return (0);
+} */
+
+extern char panicbuf[];
+
+void
+panic(const char *str, ...)
+{
+    if (paniced)
+	return;
+
+    paniced = 1;
+
+    strncpy(panicbuf, str, PANICBUFLEN - 1);
+    panicbuf[PANICBUFLEN - 1] = '\0';
+}
+
+#if 0
+# define NSTAB	12
+#else
+# define NSTAB	96
+#endif
+
+struct stab_entry
+{
+    char	 *event;
+    volatile int  flag;
+} stable[NSTAB];
+
+void sleeptabinit()
+{
+    struct stab_entry *s;
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+    {
+	s->event = (char *)NULL;
+	s->flag = 0;
+    }
+}
+
+static void endtsleep(struct stab_entry *s);
+
+/*
+ * Returns true if UpCall 6 was claimed - ie a task window or some other
+ * threading system let us sleep.
+ */
+static bool taskwindow_sleep(volatile int *pollword)
+{
+    /*
+     * Always call UpCall 6 - modern TaskWindow modules don't mind if we're
+     * not in a task window, and it allows other threading systems a look in.
+     */
+    return os_upcall(6, pollword) == 0;
+}
+
+int
+tsleep(event, prio, wmesg, wait, sleep_task)
+	void *event;
+	char *wmesg;
+	int prio, sleep_task, wait;
+{
+	struct stab_entry *s;
+	int ms;
+	int error = 0;
+
+	ms = splimp();
+
+#ifdef DEBUG
+	Printf("tsleep(0x%x,0x%x,%s,%d,%d)\n", event, prio, wmesg, wait, sleep_task);
+#endif
+	for (s = &stable[0]; s < &stable[NSTAB]; s++) {
+		if (s->event == 0) {
+			s->event = event;
+			s->flag = 0;
+			splx(ms);
+
+			if (wait)
+				timeout((timeout_func_t) endtsleep, s, wait);
+			while (s->flag == 0) {
+				bool slept = false;
+
+				if (sleep_task)
+					slept = taskwindow_sleep(&s->flag);
+
+				/*
+				 * Still waiting? Either not in a taskwindow, or it returned
+				 * early. Go to sleep, little processor.
+				 */
+				if (!slept &&
+				    (portable_features & PortableFeature_Idle) &&
+				    s->flag == 0)
+					portable_idle();
+
+				if ((prio & PCATCH) && os_read_escape_state()) {
+#ifdef DEBUG
+					Printf("Escape seen\n");
+#endif
+					error = EINTR;
+					goto out;
+				}
+
+				usermode_donothing();
+			}
+out:
+			if (wait)
+				untimeout((timeout_func_t) endtsleep, s);
+			ms = splimp();
+			s->event = 0;
+			s->flag = 0;
+			splx(ms);
+			return (error);
+		}
+	}
+
+	splx(ms);
+	panic("sleep");
+	return (EFAULT);
+}
+
+static void
+endtsleep(s)
+	struct stab_entry *s;
+{
+	s->flag = 1;
+}
+
+void
+wakeup(event)
+    void *event;
+{
+    struct stab_entry *s;
+    func_splimp();
+
+    for (s = &stable[0]; s < &stable[NSTAB]; s++)
+	if (s->event == event)
+	    s->flag = 1;
+
+    func_splx();
+}
+
+#define NBITS 32
+
+int
+ffs(mask)
+	long mask;
+{
+	int i;
+
+	for (i = 0; i < NBITS; i++) {
+		if (mask & 1)
+	    		return (i+1);
+		mask >>= 1;
+    	}
+
+    	return (0);
+}
+
+#ifdef NoAsm
+u_long
+ntohl(u_long x)
+{
+    return( ((x & 0xff) << 24) | ((x & 0xff00) << 8) | \
+	   ((x & 0xff0000) >> 8) | ((x & 0xff000000) >> 24) );
+}
+#endif
+
+int
+ntohs(int x)
+{
+    return ( (x & 0xff) << 8 | (x & 0xff00) >> 8 );
+}
+
+struct qelem
+{
+    struct qelem *q_forw;
+    struct qelem *q_back;
+    char *q_data;
+};
+
+void insque(void *e, void *p)
+{
+    struct qelem *elem, *pred;
+
+    func_splhi();
+
+    elem = (struct qelem *) e;
+    pred = (struct qelem *) p;
+
+    if (pred == 0 || elem == 0)
+    {
+	func_splrestore();
+	return;
+    }
+
+    if (pred->q_forw)
+	pred->q_forw->q_back = elem;
+
+    elem->q_forw = pred->q_forw;
+    pred->q_forw = elem;
+    elem->q_back = pred;
+
+    func_splrestore();
+}
+
+void remque(void *e)
+{
+    struct qelem *elem;
+
+    func_splhi();
+
+    elem = (struct qelem *) e;
+
+    if (elem == 0)
+    {
+	func_splrestore();
+	return;
+    }
+
+    if (elem->q_back != 0)
+	elem->q_back->q_forw = elem->q_forw;
+
+    if (elem->q_forw)
+	elem->q_forw->q_back = elem->q_back;
+
+    func_splrestore();
+}
+
+void callback_init(void)
+{
+    struct callback_record *cbptr;
+    extern void callb_entry(void);
+    extern void startup_entry(void);
+
+    /*
+     * manually fill in the callback tables here
+     */
+    cbptr = callbacks + CALLB_CALLB;
+    cbptr->cb_entry = callb_entry;
+    cbptr->cb_outstanding = 0;
+
+    cbptr = callbacks + CALLB_STARTUP;
+    cbptr->cb_entry = startup_entry;
+    cbptr->cb_outstanding = 0;
+}
+
+void callback_finalise(void)
+{
+    int i;
+    func_splimp();
+
+    /*
+     * loop over all possible callbacks
+     */
+    for( i = 0; i < NCALLBACKS; ++i )
+    {
+	struct callback_record *cbptr = callbacks + i;
+
+	while( cbptr->cb_outstanding > 0 )
+	{
+	    os_remove_call_back(cbptr->cb_entry, module_wsp);
+	    cbptr->cb_outstanding--;
+	}
+    }
+
+    func_splx();
+}
+
+void callback_entered(int callbackno)
+{
+    func_splimp();
+
+    callbacks[callbackno].cb_outstanding--;
+    func_splx();
+}
+
+int callback(int callbackno)
+{
+    struct callback_record *cbptr = callbacks + callbackno;
+    int s = splimp();
+
+    cbptr->cb_outstanding++;
+    splx(s);
+
+    return os_add_call_back(cbptr->cb_entry, module_wsp) ? -1 : 0;
+}
+
+/*
+ * Check that a proposed value to load into the .it_value or
+ * .it_interval part of an interval timer is acceptable, and
+ * fix it to have at least minimal value (i.e. if it is less
+ * than the resolution of the clock, round it up.)
+ */
+int
+itimerfix(tv)
+	struct timeval *tv;
+{
+
+	if (tv->tv_sec < 0 || tv->tv_sec > 100000000 ||
+	    tv->tv_usec < 0 || tv->tv_usec >= 1000000)
+		return (EINVAL);
+	if (tv->tv_sec == 0 && tv->tv_usec != 0 && tv->tv_usec < tick)
+		tv->tv_usec = tick;
+	return (0);
+}
+
+/*
+ * Add and subtract routines for timevals.
+ * N.B.: subtract routine doesn't deal with
+ * results which are before the beginning,
+ * it just gets very confused in this case.
+ * Caveat emptor.
+ */
+void
+timevaladd(t1, t2)
+	struct timeval *t1, *t2;
+{
+
+	t1->tv_sec += t2->tv_sec;
+	t1->tv_usec += t2->tv_usec;
+	timevalfix(t1);
+}
+
+void
+timevalsub(t1, t2)
+	struct timeval *t1, *t2;
+{
+
+	t1->tv_sec -= t2->tv_sec;
+	t1->tv_usec -= t2->tv_usec;
+	timevalfix(t1);
+}
+
+void
+timevalfix(t1)
+	struct timeval *t1;
+{
+
+	if (t1->tv_usec < 0) {
+		t1->tv_sec--;
+		t1->tv_usec += 1000000;
+	}
+	if (t1->tv_usec >= 1000000) {
+		t1->tv_sec++;
+		t1->tv_usec -= 1000000;
+	}
+}
+
+#define secs0070 (((unsigned)60*60*24) * (365 * 70 + 17)) /* less than 2^32 */
+
+static long machinetime_to_realtime(machinetime *t, long *csecs)
+{
+    machinetime bt, w, w2;
+
+    /* to two 3-byte things - for divide */
+    w.h = ((t->h & 255) << 8) | (t->l >> 24);
+    w.l = t->l & 0xffffff;
+
+    /* turn csecs to secs */
+    w2.h = w.h / 100;
+    w2.l = ((w.h % 100 << 24) | w.l) / 100;
+    if (csecs)
+        *csecs = ((w.h % 100L << 24) | w.l) % 100;
+
+    /* back to 8 byte binary */
+    bt.h = w2.h >> 8;
+    bt.l = (w2.h << 24) | w2.l;
+
+    /* normalise to Jan70 instead of Jan00... */
+    if (bt.l < secs0070) bt.h--;
+    bt.l -= secs0070;
+
+    /*
+     * if high word is non-zero then date
+     * is unset/out of unix range...
+     */
+    return bt.h ? -1 : bt.l;
+}
+
+/**********************************************************************/
+
+/*
+ * Return 1 if IOC/IOMD is present (OS_ReadSysInfo 2 reports I/O control
+ * chip = 0 or 1 - IOC or IOMD).
+ */
+static int iomd_present()
+{
+    return (osreadsysinfo_hardware0() & 0xFF00) <= 0x0100 ? 1 : 2;
+}
+
+/**********************************************************************/
+
+/*
+ * Access to the real-time clock. This is read from the RTC,
+ * so is not monotonic if some idiot changes the time. If you
+ * want a monotonic time, look at the time global variable.
+ *
+ * We do get microsecond precision though.
+ *
+ */
+void microtime(struct timeval *tv)
+{
+    static int iomd_check;  /* 0 = not checked, 1 = present, 2 = no counter present, 3 = use HAL */
+    static unsigned long timer_divider; /* ticks per microsecond */
+    machinetime t1, t2;
+    unsigned long timer_count;
+    unsigned long timer_period = 19999; /* default for non-HAL case */
+
+    /* Only poke the hardware if we're sure it's there :) */
+    if (!iomd_check)
+    {
+        if (_swix(OS_Hardware, _INR(8,9)|_OUT(0), 0, EntryNo_HAL_CounterRate, &timer_divider) != NULL)
+        {
+            iomd_check = iomd_present();
+            timer_divider = 2;
+        }
+        else
+        {
+            iomd_check = 3;
+            timer_divider /= 1000000;
+            if (timer_divider == 0) timer_divider = 1; /* avoid division by 0 */
+        }
+    }
+
+    if (iomd_check != 2)
+    {
+        if (iomd_check == 3)
+            _swix(OS_Hardware, _INR(8,9)|_OUT(0), 0, EntryNo_HAL_CounterPeriod, &timer_period);
+
+        /* Check initial time */
+        osword_read_realtime(&t1);
+
+        /* Read the Timer 0 value - it counts down from 19999 to 0,
+         * the clock tick occurring as it changes from 0 to 19999.
+         */
+        if (iomd_check == 1)
+            timer_count = get_t0_count();
+        else
+            _swix(OS_Hardware, _INR(8,9)|_OUT(0), 0, EntryNo_HAL_CounterRead, &timer_count);
+    }
+
+    /* Check new time */
+    osword_read_realtime(&t2);
+
+    tv->tv_sec = machinetime_to_realtime(&t2, &tv->tv_usec);
+    tv->tv_usec *= 10000;
+
+    if (iomd_check != 2 && t1.l == t2.l)
+    {
+        /* Clock didn't tick - add in timer count */
+        tv->tv_usec += (timer_period - timer_count) / timer_divider;
+    }
+    else
+    {
+        /* Clock ticked - let it rest at the 10000us boundary */
+    }
+}

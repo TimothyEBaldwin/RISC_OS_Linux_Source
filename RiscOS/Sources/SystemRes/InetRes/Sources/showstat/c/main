@@ -1,0 +1,580 @@
+/* Copyright 1999 Element 14 Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ *
+ * ShowStat - DCI4 driver/MbufManager statistics gathering
+ *
+ *
+ * Copyright (C) Element 14 Ltd.
+ *
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <limits.h>
+#include <ctype.h>
+#include <stdbool.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/Services.h"
+
+#include "sys/types.h"
+#include "netinet/in.h"
+#include "net/if_arp.h"
+#include "net/if.h"
+#include "netinet/if_ether.h"
+#include "arpa/inet.h"
+#include "netdb.h"
+
+#include "sys/dcistructs.h"
+#include "sys/mbuf.h"
+
+
+#include "msgs.h"
+#include "main.h"
+ 
+/* Bodge around unpublished service call in ROOL sources */
+#ifndef Service_StatisticEnumerate
+#define Service_StatisticEnumerate 0xA1
+#endif
+
+/* A few global options */
+static bool verbose = false;
+
+/**********
+ *
+ * This section is the only place which knows about the output device for this
+ * application.
+ */
+
+static FILE *output_device = stdout;
+static size_t width;
+
+static void newline(void)
+{
+	fputc('\n', output_device);
+}
+
+static void showstat_heading(const char *heading, const void *value)
+{
+	const char *real_value = value;
+	if (real_value && *real_value) {
+		(void) fprintf(output_device, "%-*s: %s\n", width, heading, value);
+	}
+}
+
+static void banner(const char *text)
+{
+	fputs(text, output_device);
+}
+
+/***********/
+
+static void showstat_heading_mid(msg_id mid, const void *value)
+{
+	showstat_heading(msgs_get(mid), value);
+}
+
+
+typedef union {
+		unsigned long *lp;
+		unsigned char *cp;
+		struct stats *sp;
+} u_ptr;
+
+typedef struct {
+	u_ptr	vp;	/* What's there */
+	u_ptr	p;	/* The values */
+} sp;
+
+typedef const char *(*array_fn)(unsigned int);
+
+static void stat_char_array(size_t index, sp *p, msg_id mid, array_fn fn)
+{
+	if (p->vp.cp[index] != 0) {
+		showstat_heading_mid(mid, (*fn)(p->vp.cp[index] & p->p.cp[index]));
+	}
+}
+
+static void stat_long_numeric(msg_id mid, unsigned long value)
+{
+	char number_buf[16];
+
+	sprintf(number_buf, "%lu", value);
+	showstat_heading_mid(mid, number_buf);
+}
+
+static void stat_opt_long_numeric(bool show_if_zero, size_t index, sp *p, msg_id mid)
+{
+	if (p->vp.lp[index] != 0) {
+		const unsigned long value = p->vp.lp[index] & p->p.lp[index];
+
+		if (value != 0 || show_if_zero || verbose) {
+			stat_long_numeric(mid, value);
+		}
+	}
+}
+
+static void showstat_display_interface_features(const unsigned int inquire_flags)
+{
+	size_t i;
+	const char *header = msgs_get(msg_FEATURE_HEADER);
+
+	for (i=0; i<(sizeof(size_t)*CHAR_BIT); ++i) {
+		if (inquire_flags & (1U<<i)) {
+			showstat_heading(header, feature_name(i));
+			header = "";
+		}
+	}
+}
+
+
+static int format_mac_address(const struct ether_addr *mac, char *buffer, char sep)
+{
+	int i;
+	int ok = 0;
+
+	for (i=0; i<sizeof(mac->octet); ++i) {
+		if (i > 0 && sep != '\0') {
+			*buffer++ = sep;
+		}
+		buffer += sprintf(buffer, "%02x", mac->octet[i]);
+		if (mac->octet[i]) ok = 1;
+	}
+	*buffer = '\0';
+
+	return ok;
+}
+
+static int showstat_get_mtu(struct dib *dib)
+{
+	int mtu;
+
+	_swix(dib->dib_swibase + DCI4GetNetworkMTU, _INR(0,1)|_OUT(2), 0, dib->dib_unit, &mtu);
+	return mtu;
+}
+
+static const char *showstat_value_sub(val_id base, unsigned int setting)
+{
+	return values_get((val_id) (base + setting));
+}
+
+static const char *showstat_bit(val_id base, unsigned int bit)
+{
+	return showstat_value_sub(base, !bit);
+}
+
+static void link_status(sp *p)
+{
+	const unsigned char link_status = p->p.sp->st_link_status;
+	const unsigned char mask_status = p->vp.sp->st_link_status;
+
+	if (mask_status & ST_STATUS_OK) {
+		showstat_heading_mid(msg_LINK_STATUS, showstat_bit(val_LINK_STATUS_OK,
+			link_status & ST_STATUS_OK));
+	}
+	if (mask_status & ST_STATUS_ACTIVE) {
+		showstat_heading_mid(msg_ACTIVE_STATUS, showstat_bit(val_STATUS_ACTIVE,
+			link_status & ST_STATUS_ACTIVE));
+	}
+	if (mask_status & ST_STATUS_RXMASK) {
+		showstat_heading_mid(msg_RX_VALUES, showstat_value_sub(val_RX_STATUS_VALUE_0,
+			(link_status & mask_status & ST_STATUS_RXMASK) >> 2));
+	}
+	if (mask_status & ST_STATUS_FULL_DUPLEX) {
+		showstat_heading_mid(msg_DUPLICITY, showstat_bit(val_HALF_DUPLEX,
+			~link_status & ST_STATUS_FULL_DUPLEX));
+	}
+}
+
+static void link_polarity(sp *p)
+{
+	const unsigned char link_status = p->p.sp->st_link_polarity;
+	const unsigned char mask_status = p->vp.sp->st_link_polarity;
+
+	if (mask_status & ST_LINK_POLARITY_CORRECT) {
+		showstat_heading_mid(msg_POLARITY, showstat_bit(val_POLARITY_CORRECT,
+			link_status & ST_LINK_POLARITY_CORRECT));
+	}
+}
+
+#define cfield(x) (offsetof(struct stats, x))	/* a char within the structure */
+#define lfield(x) (offsetof(struct stats, x)>>2)/* a long within the structure */
+
+static const struct {
+	bool	show_if_zero;
+	msg_id 	mid;
+	size_t	lfield_num;
+} stat_descr[] = {
+	{ false, msg_LINK_FAILURES,		lfield(st_link_failures) },
+	{ false, msg_COLLISIONS,		lfield(st_network_collisions) },
+	{ false, msg_TX_COLLISIONS,		lfield(st_collisions) },
+	{ false, msg_TX_EXCESS_COLL,		lfield(st_excess_collisions) },
+	{ false, msg_TX_HEARTBEAT,		lfield(st_heartbeat_failures) },
+	{ false, msg_TX_NOT_LISTENING,		lfield(st_not_listening) },
+	{ true,  msg_TX_FRAMES,			lfield(st_tx_frames) },
+	{ false, msg_TX_BYTES,			lfield(st_tx_bytes) },
+	{ false, msg_TX_GENERAL_ERRORS,		lfield(st_tx_general_errors) },
+	{ false, msg_RX_CRC_FAILURES,		lfield(st_crc_failures) },
+	{ false, msg_RX_ALIGNMENT,		lfield(st_frame_alignment_errors) },
+	{ false, msg_RX_DROPPED,		lfield(st_dropped_frames) },
+	{ false, msg_RX_RUNT,			lfield(st_runt_frames) },
+	{ false, msg_RX_OVERLONG,		lfield(st_overlong_frames) },
+	{ false, msg_RX_JABBERS,		lfield(st_jabbers) },
+	{ false, msg_RX_LATE_EVENTS,		lfield(st_late_events) },
+	{ false, msg_RX_UNWANTED_FRAMES,	lfield(st_unwanted_frames) },
+	{ true,  msg_RX_FRAMES,			lfield(st_rx_frames) },
+	{ false, msg_RX_BYTES,			lfield(st_rx_bytes) },
+	{ false, msg_RX_GENERAL_ERRORS,		lfield(st_rx_general_errors) },
+};
+
+static void showstat_get_stats(struct dib *dib)
+{
+	struct stats stats_valid, stats;
+	sp p;
+	size_t i;
+
+	memset(&stats_valid, '\0', sizeof(stats_valid));
+	_swix(dib->dib_swibase + DCI4Stats, _INR(0,2), 0, dib->dib_unit, &stats_valid);
+	_swix(dib->dib_swibase + DCI4Stats, _INR(0,2), 1, dib->dib_unit, &stats);
+	p.vp.sp = &stats_valid;
+	p.p.sp = &stats;
+
+	stat_char_array(cfield(st_interface_type), &p, msg_INTERFACE_TYPE, interface_type);
+	link_status(&p);
+	link_polarity(&p);
+	for (i=0; i<(sizeof(stat_descr)/sizeof(*stat_descr)); ++i) {
+		stat_opt_long_numeric(
+			stat_descr[i].show_if_zero,
+			stat_descr[i].lfield_num,
+			&p, stat_descr[i].mid);
+	}
+}
+
+static void showstat_driver(struct dib *dib)
+{
+	static char extra_buffer[BUFSIZ];
+
+	showstat_heading_mid(msg_DRIVER_NAME, dib->dib_name);
+	sprintf(extra_buffer, "%d", dib->dib_unit);
+	showstat_heading_mid(msg_UNIT_NUMBER, extra_buffer);
+	if (format_mac_address((struct ether_addr *) dib->dib_address, extra_buffer, ':')) {
+		showstat_heading_mid(msg_HW_ADDRESS, extra_buffer);
+	}
+	showstat_heading_mid(msg_PHYS_LOC, dib->dib_location);
+	showstat_heading_mid(msg_DRIVER_MODULE, dib->dib_module);
+	if (verbose) {
+	        sprintf(extra_buffer, "%#x", dib->dib_swibase);
+	        showstat_heading_mid(msg_SWI_BASE, extra_buffer);
+	}
+	showstat_display_interface_features(dib->dib_inquire);
+	sprintf(extra_buffer, "%d", showstat_get_mtu(dib));
+	showstat_heading_mid(msg_MTU, extra_buffer);
+	showstat_get_stats(dib);
+}
+
+static size_t showstat_check_width(spctl *s, size_t longest)
+{
+	if (s == NULL) {
+		return longest;
+	}
+	else {
+		statistic st;
+		size_t i;
+
+		i = strlen(s->title);
+		if (i > longest) longest = i;
+
+		for (i=0; i<=s->max_stat; ++i) {
+			size_t num;
+			if (!_swix(s->swi_num, _INR(0,4)|_OUT(5), 0, i, i, &st, sizeof(st), &num)) {
+				size_t len = strlen(st.name);
+				if (len > longest) longest = len;
+			}
+		}
+
+		return showstat_check_width(s->next, longest);
+	}
+}
+
+static statvalue *provider_stat_swi(unsigned int swi, size_t i, statistic *buf1)
+{
+	statvalue *sv = NULL;
+	size_t num;
+
+	if (_swix(swi, _INR(0,4)|_OUT(5), 0, i, i, buf1, sizeof(*buf1), &num) != NULL || !num) {
+		return 0;
+	}
+	sv = malloc(buf1->size);
+	if (sv == NULL) return sv;
+	if (_swix(swi, _INR(0,4)|_OUT(5), 1, i, i, sv, buf1->size, &num) != NULL || !num) {
+		free(sv);
+		return 0;
+	}
+	return sv;
+}
+
+static void showstat_stat_bool(statistic *st, int bit)
+{
+        if (st->presentation >= st_BOOL_ON_OFF && st->presentation <= st_BOOL_ONE_ZERO) {
+		val_id v = (val_id) (val_ST_OFF + st->presentation * 2 + bit);
+		showstat_heading(st->name, values_get(v));
+        }
+}
+
+static void showstat_display_stat(statistic *st, statvalue *val)
+{
+	char number_buf[32];
+
+	switch (st->type) {
+		case st_STRING:
+		        if (st->presentation == st_STRING_LITERAL) {
+		                if (st->format == st_STRING_ZEROTERM) {
+					showstat_heading(st->name, val->string);
+		                }
+		        }
+			break;
+		case st_BOOL:
+			if (st->format == st_BOOL_INVERTED) {
+				val->bool1 = !val->bool1;
+			}
+			showstat_stat_bool(st, val->bool1 & 1);
+			break;
+		case st_INT8:
+			val->ui16 = val->ui8 & 0xFF;
+			if (st->format == st_INT_BIGENDIAN) {
+				st->format = st_INT_NORMAL;
+			}
+			/*FALLTHROUGH*/
+		case st_INT16:
+			if (st->format == st_INT_BIGENDIAN) {
+				st->format = st_INT_NORMAL;
+				val->ui16 = htons(val->ui16);
+			}
+			val->ui32 = val->ui16 & 0xFFFF;
+			/*FALLTHROUGH*/
+		case st_INT32:
+			if (st->format == st_INT_BIGENDIAN) {
+				st->format = st_INT_NORMAL;
+				val->ui32 = htonl(val->ui32);
+			}
+		        switch (st->presentation) {
+		                case st_INT_HEX:
+					sprintf(number_buf, "%x", val->ui32);
+		                	break;
+                                case st_INT_DOTTED:
+	                                if (st->format != st_INT_BIGENDIAN) {
+	                                        val->ui32 = htonl(val->ui32);
+	                                }
+                                        strcpy(number_buf, inet_ntoa(val->in4));
+                                        break;
+                                case st_INT_DECIMAL:
+					if (st->format == st_INT_UNSIGNED) {
+						sprintf(number_buf, "%u", val->ui32);
+					}
+					else {
+						sprintf(number_buf, "%d", val->i32);
+					}
+					break;
+		        }
+			showstat_heading(st->name, number_buf);
+			break;
+		case st_INT64:
+		        switch (st->presentation) {
+		                case st_INT_HEX:
+		                        if (st->format == st_INT_BIGENDIAN) {
+		                                unsigned long ul = val->ul32[0];
+		                                val->ul32[0] = htonl(val->ul32[1]);
+		                                val->ul32[1] = htonl(ul);
+		                        }
+		                        sprintf(number_buf, "%lx%08lx", val->ul32[1], val->ul32[0]);
+		                        showstat_heading(st->name, number_buf);
+		                        break;
+		                case st_INT_DECIMAL:
+		                        break;
+		                default:
+		                        break;
+		        }
+			break;
+		default:
+			break;
+	}
+}
+
+static void showstat_provider(spctl *s)
+{
+	statistic	st;
+	statvalue	*val;
+	size_t		i;
+	val_id		v;
+
+	if (s->type >= 0 && s->type <= 3) {
+		v = (val_id) (val_GENERAL_SUPPLIER + s->type);
+	}
+	else {
+	        v = val_GENERAL_SUPPLIER;
+	}
+
+	fprintf(output_device, values_get(val_STATTYPE_HEADING), s->module, values_get(v));
+	newline();
+	newline();
+	if (s->title != NULL && s->description != NULL) {
+		showstat_heading(s->title, s->description);
+	}
+
+	for (i=0; i<=s->max_stat; ++i) {
+		val = provider_stat_swi(s->swi_num, i, &st);
+		if (val != NULL) {
+			showstat_display_stat(&st, val);
+			free(val);
+		}
+	}
+}
+
+/* This function returns true if the parameter list names the given interface. */
+static bool showstat_display(struct dib *dib, int argc, char *argv[], bool typespec)
+{
+	if (argc < 2) {
+		return typespec;
+	}
+	else for (; argc > 1; --argc, ++argv) {
+		int unit, scan_result;
+		size_t device_len;
+
+		/* OK - use the power of scanf to parse the device - we will allow the
+		 * user to specify a device name with or without a unit number.  Hence
+		 * "eb1" will match unit 1 of device "eb", whereas "eb" would match all
+		 * units of the device "eb".
+		 */
+		scan_result = sscanf(argv[1], "%*[^0123456789]%n%d", &device_len, &unit);
+		if (scan_result != EOF || *argv[1] != '\0') {
+			const char *dev = (const char *) (dib->dib_name);
+			if (strncmp(argv[1], dev, device_len) == 0 && dev[device_len] == '\0') {
+				/* Matched the device name .. now the unit number */
+				if (scan_result != 1 || dib->dib_unit == unit) {
+					return true;
+				}
+				/* Carry on - user may have said "eh0 eh1 eh2" for example. */
+			}
+		}
+	}
+
+	return false;
+}
+
+static void showstat_discard_spctl(spctl *sp)
+{
+	if (sp != NULL) {
+		spctl *const next = sp->next;
+		(void) _swix(OS_Module, _IN(0)|_IN(2), 7, sp);
+		showstat_discard_spctl(next);
+	}
+}
+
+static void showstat_discard_chdib(ChDib *ch)
+{
+	if (ch != NULL) {
+		ChDib *const next = ch->chd_next;
+		(void) _swix(OS_Module, _IN(0)|_IN(2), 7, ch);
+		showstat_discard_chdib(next);
+	}
+}
+
+static void *showstat_enumerate_service(unsigned int service_call)
+{
+	void *result;
+	return _swix(OS_ServiceCall, _INR(0,1)|_OUT(0), 0, service_call, &result) ? NULL : result;
+}
+
+static spctl *showstat_enumerate_stats_providers(void)
+{
+	return showstat_enumerate_service(Service_StatisticEnumerate);
+}
+
+static ChDib *showstat_enumerate_drivers(void)
+{
+	return showstat_enumerate_service(Service_EnumerateNetworkDrivers);
+}
+
+int main(int argc, char *argv[])
+{
+	ChDib *chd, *c;
+	spctl *ctl, *s;
+	unsigned long stat_providers_mask = ULONG_MAX;
+
+	while (argc > 1 && *(argv[1]) == '-') {
+	        const char *arg = argv[1] + 1;
+		if (strcmp(arg, "help") == 0) {
+			banner(msgs_get_banner());
+			banner(msgs_get_help());
+			exit(EXIT_SUCCESS);
+		}
+		else if (strcmp(arg, "file") == 0 && argc > 2) {
+		        --argc;
+		        ++argv;
+		        output_device = fopen(argv[1], "w");
+		        if (output_device == NULL) output_device = stdout;
+		}
+		else if (strcmp(arg, "type") == 0 && argc > 2) {
+		        --argc;
+		        ++argv;
+		        stat_providers_mask = 1UL << strtoul(argv[1], NULL, 10);
+		}
+		else if (strcmp(arg, "v") == 0) {
+		        verbose = true;
+		}
+		else {
+		        /* Unknown option */
+		}
+                --argc;
+                ++argv;
+	}
+
+	banner(msgs_get_banner());
+	chd = showstat_enumerate_drivers();
+	ctl = showstat_enumerate_stats_providers();
+
+	/* Take the longest extended stat and the longest standard header width as the indent */
+	width = showstat_check_width(ctl, msgs_max_width());
+
+	/* If specific interfaces were named and no -type was named, don't do extended stats */
+	if (stat_providers_mask == ULONG_MAX && argc > 1) {
+	        stat_providers_mask = 0;
+	}
+
+	/* For each DCI4 device driver ... check whether to display its stats, and then show them */
+	for (c = chd; c != NULL; c = c->chd_next) {
+		if (showstat_display(c->chd_dib, argc, argv, stat_providers_mask == ULONG_MAX)) {
+			newline();
+			showstat_driver(c->chd_dib);
+		}
+	}
+
+	/* For each extended statistic supplier, check if we're interested and show the stats */
+	for (s = ctl; s != NULL; s = s->next) {
+	        if ((1UL<<s->type) & stat_providers_mask) {
+			newline();
+			showstat_provider(s);
+	        }
+	}
+
+	showstat_discard_spctl(ctl);
+	showstat_discard_chdib(chd);
+
+	return 0;
+}

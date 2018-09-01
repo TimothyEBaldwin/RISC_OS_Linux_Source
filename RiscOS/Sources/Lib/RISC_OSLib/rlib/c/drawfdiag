@@ -1,0 +1,580 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: c.drawfdiag
+ * Purpose: render a draw diagram
+ * History: IDJ: 06-Feb-92: prepared for source release
+ *
+ */
+
+/*
+ *
+ * Implements the interface as seen by the outside world to the draw file
+ * module, at the level of diagrams.
+ *
+ * How to use the module (the simplest possible use)
+ *  allocate a block of memory and set a Diag to point to it.
+ *  read a Draw file into the block and set the length.
+ *  (maybe) call draw_verify_diag.
+ *  call draw_render_diag.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "os.h"
+#include "sprite.h"
+
+#define DRAWFILE_INTERNAL
+#include "DrawIntern/drawfile1.h"
+#include "drawfdiag.h"
+#include "drawfobj.h"
+#include "DrawIntern/drawfile2.h"
+#include "drawferror.h"
+
+/*------------------------ Version string ---------------------------*/
+/* The following literal string simply appears in the object file;
+   nothing uses it.
+   It contains the release version and date.
+   Note that it is the version number of the module of a whole, not of this
+   file.
+*/
+static char *Draw_versionString = "Release 0.2, 15 Feb 89";
+
+/*----------------------- Global data --------------------------------*/
+
+/* Memory allocation/freeing functions */
+draw_allocate Draw_allocator = NULL;
+draw_extend   Draw_extender  = NULL;
+draw_free     Draw_freer     = NULL;
+
+/* Unknown object handler, and its handle */
+draw_unknown_object_handler dr_unknown_handler;
+void *dr_unknown_handle;
+
+/*------------------------------ Internal functions ----------------------------*/
+/* These functions are local to the module */
+
+/*
+ Function    : dr_spaceCopy
+ Purpose     : copy memory
+ Parameters  : start of area to copy to
+               start of area to copy from
+               length of block
+ Returns     : void
+ Description : copies the block of memory - works even if blocks overlap.
+*/
+
+void dr_spaceCopy(char *to, char *from, int length)
+{
+  if (length <= 0) return;
+  if (to < from)
+    memcpy((void*)to, (void*)from, length);
+  else if (to > from)
+  { char *f = from + length - 1;
+    char *t = f + (int)(to - from);
+    char *limit = from;
+
+    while (f >= limit) *t-- = *f--;
+  }
+}
+
+
+/*
+ Function    : dr_findFontTable
+ Purpose     : find the font table object in a diagram
+ Parameters  : diagram structure
+               draw object pointer: set of font table found
+ Returns     : TRUE if found
+*/
+
+BOOL dr_findFontTable(draw_diag *diag, draw_objptr *hdrptr)
+{
+  char *limit  = diag->data + diag->length;
+
+  for (hdrptr->bytep = diag->data + sizeof(draw_fileheader);
+       hdrptr->bytep < limit; hdrptr->bytep += hdrptr->objhdrp->size)
+  {
+    if (hdrptr->objhdrp->tag == draw_OBJFONTLIST) return (TRUE);
+  }
+
+  return (FALSE);
+}
+
+/*
+ Function    : dr_mergeFontTables
+ Purpose     : merge font tables and convert text references
+ Parameters  : pointer to first diagram structure
+               object header for first font table [may be non-existent]
+               second diagram structure
+               object header for second font table [must exist]
+               number translation table
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : the two font tables are merged; this can change the references to
+               fonts in the second diagram, so we record the changes in the
+               translation table. The translation table in indexed by the old
+               font reference and yields the new one.
+               If this yields too many font refences, we report an error
+*/
+
+BOOL dr_mergeFontTables(draw_diag *diag1, draw_objptr fontTable1,
+                               draw_diag *diag2,  draw_objptr fontTable2,
+                               int *table, draw_error *error)
+{
+  int  fontref, maxref = -1;
+  char *names[256]; /* Pointer to names to place in final table */
+  char *from, *limit, *to;
+  int  size, newsize, sizeChange; /* In bytes */
+
+  for (fontref = 0 ; fontref < 256 ; fontref++) names[fontref] = NULL;
+
+  if (fontTable1.bytep)
+  {
+    /* Copy first table into names array */
+    from  = &(fontTable1.fontlistp->fontref);
+    limit = fontTable1.bytep + fontTable1.fontlisthdrp->size;
+    while (from < limit)
+    {
+      if ((fontref = (int)(*from++)) == 0) break;
+      names[fontref] = from;
+      from += strlen(from)+1;
+      if (fontref > maxref) maxref = fontref;
+    }
+  }
+
+  /* Scan second table */
+  from  = &(fontTable2.fontlistp->fontref);
+  limit = fontTable2.bytep + fontTable2.fontlisthdrp->size;
+  while (from < limit)
+  { int oldref, newref;
+    BOOL found = FALSE;
+
+    if ((fontref = (int)(*from++)) == 0) break;
+
+    /* Look for diag2 font in diag1 table */
+    for (oldref = 1 ; oldref <= maxref ; oldref++)
+    {
+      if (names[fontref] != NULL && strcmp(names[oldref], from) == 0)
+      { /* Font in diagram 2 also exists in diagram 1 - note reference number */
+        table[fontref] = oldref;
+        found = TRUE;
+        break;
+      }
+    }
+
+    if (!found)
+    {
+      /* Create new entry */
+      for (newref = 1 ; newref < 256 ; newref++)
+      {
+        if (names[newref] == NULL)
+        {
+          names[newref]  = from;
+          table[fontref] = newref;
+          break;
+        }
+      }
+
+      if (newref == 256)
+      {
+        /* Ran out of space in new table: give up */
+        error->type = DrawOwnError;
+        error->err.draw.code     = draw_TooManyFonts;
+        error->err.draw.location = (int)(from - diag2->data);
+        return (FALSE);
+      }
+    }
+
+    from += strlen(from)+1;
+  }
+
+  /* Count size of new font table */
+  for (newsize = sizeof(draw_fontliststrhdr), fontref = 1 ;
+       fontref < 256 ; fontref++)
+  {
+    if (names[fontref]) newsize += strlen(names[fontref]) + 2;
+  }
+  newsize = (newsize + sizeof(int) - 1) & (-sizeof(int));
+
+  /* See if the size has changed : always >= 0 */
+  if (fontTable1.bytep)
+  {
+    sizeChange = newsize - (size = fontTable1.fontlisthdrp->size);
+  }
+  else
+  {
+    sizeChange = newsize;
+    fontTable1.bytep = diag1->data + sizeof(draw_fileheader);
+    size = 0;
+  }
+
+  if (sizeChange > 0)
+  { /* Move rest of memory down */
+    char *from = fontTable1.bytep + size;
+    dr_spaceCopy(fontTable1.bytep + newsize, from,
+                 (int)(diag1->data + diag1->length - from));
+
+    /* Build new font table */
+    fontTable1.fontlisthdrp->size = newsize;
+    to = &(fontTable1.fontlistp->fontref);
+    for (fontref = 1 ; fontref < 256 ; fontref++)
+    {
+      if (names[fontref])
+      {
+        *to++ = (char)fontref;
+        strcpy(to, names[fontref]);
+        to += strlen(to);
+        *to++ = '\0';
+      }
+    }
+
+    /* Add final nulls */
+    limit = fontTable1.bytep + fontTable1.fontlistp->size;
+    while (to < limit) *to++ = '\0';
+    fontTable1.objhdrp->tag = draw_OBJFONTLIST; /* In case we created it */
+
+    /* Record new diagram size */
+    diag1->length += sizeChange;
+  }
+  return (TRUE);
+}
+
+/*
+ Function    : dr_unifyBoxes
+ Purpose     : unify two boxes
+ Parameters  : pointer to box 1 structure
+               pointer to box 2 structure
+ Returns     : void
+ Description : box1 is set to the union of box 1 and box 2.
+*/
+
+void dr_unifyBoxes(draw_bboxtyp *box1, draw_bboxtyp *box2)
+{
+  if (box2->x0 < box1->x0) box1->x0 = box2->x0;
+  if (box2->y0 < box1->y0) box1->y0 = box2->y0;
+  if (box2->x1 > box1->x1) box1->x1 = box2->x1;
+  if (box2->y1 > box1->y1) box1->y1 = box2->y1;
+}
+
+/*-------------------- Interface functions ---------------------------*/
+
+/*
+ Function    : draw_verify_diag
+ Purpose     : check a diagram for errors
+ Parameters  : diagram structure
+               OUT: error block
+ Returns     : TRUE on error
+ Description : Checks a diagram after it has been read in from a file. Each
+               object in the file is verified, and the first error returned.
+*/
+
+BOOL draw_verify_diag(draw_diag *diag, draw_error *error)
+{
+  int code, location;
+
+  if (check_Draw_file((char *)diag->data, diag->length, &code, &location))
+    return (TRUE);
+  else
+  { DrawFile_Error(code, location);
+    return (FALSE);
+  }
+}
+
+/*
+ Function    : draw_append_diag
+ Purpose     : append one diagram to another
+ Parameters  : pointer to structure for diagram to append to
+               pointer to structure for diagram to be appended
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Merge diag2 into diag1. Both diagrams must have been passed
+               through draw_verify_diag() first. The data block for diag1 must
+               be at least diag1.length+diag2.length bytes long. The length
+               field of diag1 is updated to the actual merged size which will
+               be at most equal to this sum.
+               The bounding box is diag1 is set to the union of the bounding
+               boxes of the two diagrams.
+               Note: after this call, the offsets of objects in diag1 may have
+               changed, because the font table object can change in size. No
+               other objects will change. Any errors which refer to a specific
+               location are in diag2.
+*/
+
+BOOL draw_append_diag(draw_diag *diag1, draw_diag *diag2, draw_error *error)
+{
+  draw_objptr fontTable1, fontTable2;
+  draw_objectType header1, header2;
+  header1.bytep = diag1->data;
+  header2.bytep = diag2->data;
+
+  if (dr_findFontTable(diag2, &fontTable2))
+  { draw_objptr hdrptr, dest;
+    char *end = diag2->data + diag2->length;
+    int transTable[256];
+    int i, length;
+
+    for (i = 0 ; i < 256 ; i++) transTable[i] = 0;
+
+    if (!dr_findFontTable(diag1, &fontTable1)) fontTable1.bytep = 0;
+    if (!dr_mergeFontTables(diag1, fontTable1, diag2, fontTable2, transTable,
+        error))
+      return (FALSE);
+
+    /* Copy all objects from diag2 to diag1, except font table(s) */
+    dest.bytep  = diag1->data + diag1->length;
+    for (hdrptr.bytep = diag2->data + sizeof(draw_fileheader) ;
+         hdrptr.bytep < end ; hdrptr.bytep += length)
+    {
+      length = hdrptr.objhdrp->size;
+      if (hdrptr.objhdrp->tag != draw_OBJFONTLIST)
+      {
+        memcpy(dest.bytep, hdrptr.bytep, length);
+
+        if (dest.objhdrp->tag == draw_OBJTEXT)
+        { /* Translate font number */
+          dest.textp->textstyle.fontref = transTable[dest.textp->textstyle.fontref];
+        }
+
+        dest.bytep += length;
+      }
+    }
+    diag1->length = (int)(dest.bytep - diag1->data);
+    dr_unifyBoxes(&header1.fileHeader->bbox, &header2.fileHeader->bbox);
+    return (TRUE);
+  }
+  else
+  { /* No font table in diag2 - just copy whole thing */
+    int length = diag2->length - sizeof(draw_fileheader);
+    memcpy(diag1->data + diag1->length, diag2->data + sizeof(draw_fileheader),
+           length);
+    diag1->length += length;
+    dr_unifyBoxes(&header1.fileHeader->bbox, &header2.fileHeader->bbox);
+    return (TRUE);
+  }
+}
+
+/*
+ Function    : draw_render_diag
+ Purpose     : render a diagram
+ Parameters  : diagram structure
+               wimp-style redraw structure
+               scale factor
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Render a diagram, which should have been passed through
+               draw_verify_diag() first, at a factor 'scale' of its definition
+               size. The object is rendered into the region of the screen
+               indicated by the redrawstr.
+
+               Note: the redrawstr is equivalent to a wimp_redrawstr, which may
+               be cast to it. The window handle is NOT used. For applications
+               not using the wimp, the structure should be set up as follows:
+               the graphics box determines the region in screen units which
+               will be drawn. Any objects wholly or partly in this region are
+               rendered. Clipping must be set by the caller;
+               the part of the diagram rendered is determined by mapping the
+               top left of the diagram, in Draw coordinate space, onto a point
+               (r->box.x0 - r->scx, r->box.y1 - r->scy), in screen coordinate
+               space.
+
+               After the call, the VDU5 character size is left at the default
+               for the current mode.
+*/
+
+BOOL draw_render_diag(draw_diag *diag, draw_redrawstr *r, double scale,
+                 draw_error *error)
+{ draw_objptr dummy;
+
+  /* Render the objects via the level 1 interface */
+  dummy.bytep = 0;
+  note_fontcat(dummy);
+  return (draw_doObjects(diag, draw_FirstObject, draw_LastObject, r,  scale,
+          error));
+}
+
+/*
+ Function    : draw_registerMemoryFunctions
+ Purpose     : register memory aloocate/free functions
+ Parameters  : allocate function
+               extend function
+               free function
+ Returns     : void
+ Description : This call is only needed if text area objects are to be
+               rendered. It specifies three functions, used to allocate, extend
+               and free blocks of memory. The memory is used only during the
+               rendering of a text area, and is freed before the rendering code
+               returns to the caller.
+
+               If this routine is never called, or if memory allocation fails,
+               then attempting to render a text area will produce no output.
+*/
+
+void draw_registerMemoryFunctions(draw_allocate alloc,
+                                  draw_extend   extend,
+                                  draw_free     free)
+{
+  Draw_allocator = alloc;
+  Draw_extender  = extend;
+  Draw_freer     = free;
+}
+
+/*
+ Function    : draw_shift_diag
+ Purpose     : Shift a diagram
+ Parameters  : diagram structure
+               shift to apply
+ Returns     : void
+ Description : All coordinates in the diagram are moved by the given distance.
+*/
+void draw_shift_diag(draw_diag *diag, int xMove, int yMove)
+{
+  shift_Draw_file(diag->data, diag->length, xMove, yMove);
+}
+
+/*
+ Function    : draw_queryBox
+ Purpose     : find the bounding box of the diagram
+ Parameters  : diagram structure
+               pointer to box structure
+               flag: screen units wanted?
+ Returns     : void
+ Description : Find the bounding box of the file. If the flag 'screenUnits' is
+               TRUE, this is returned in screen units, otherwise in draw units.
+*/
+
+void draw_queryBox(draw_diag *diag, draw_box *box, BOOL screenUnits)
+{
+  draw_objectType object;
+
+  object.bytep = diag->data;
+  if (screenUnits)
+  {
+    draw_convertBox((draw_box*)&object.fileHeader->bbox, box, TRUE);
+  }
+  else
+  { /* Fiddle type and copy box */
+    *box = *((draw_box*)(&object.fileHeader->bbox));
+  }
+}
+
+/*
+ Function    : draw_convertBox
+ Purpose     : convert a box to/from screen coordinates
+ Parameters  : pointer to box to convert
+               pointer to box for result
+               flag: to screen units?
+ Returns     : void
+ Description : from and to may point to the same box. If toScreen is TRUE, the
+               box is taken as being in Draw units, else it is in screen units.
+*/
+
+void draw_convertBox(draw_box *from, draw_box *to, BOOL toScreen)
+{
+  if (toScreen)
+  { to->x0 = draw_drawToScreen(from->x0);
+    to->y0 = draw_drawToScreen(from->y0);
+    to->x1 = draw_drawToScreen(from->x1);
+    to->y1 = draw_drawToScreen(from->y1);
+  }
+  else
+  { to->x0 = draw_screenToDraw(from->x0);
+    to->y0 = draw_screenToDraw(from->y0);
+    to->x1 = draw_screenToDraw(from->x1);
+    to->y1 = draw_screenToDraw(from->y1);
+  }
+}
+
+/*
+ Function    : draw_rebind_diag
+ Purpose     : rebind the diagram header
+ Parameters  : diagram structure
+ Returns     : void
+*/
+
+void draw_rebind_diag(draw_diag *diag)
+{
+  draw_objptr hdrptr, fileHeader;
+  Draw_bboxtyp *box;
+  char         *limit;
+
+  fileHeader.bytep = diag->data;
+  box = &fileHeader.filehdrp->bbox;
+
+  box->x0 = box->y0 = 0;
+  box->x1 = box->y1 = 0;
+  limit  = diag->data + diag->length;
+
+  /* Get first box */
+  for (hdrptr.bytep = diag->data + sizeof(draw_fileheader) ;
+       hdrptr.bytep < limit ; hdrptr.bytep += hdrptr.objhdrp->size)
+  {
+    if (hdrptr.objhdrp->tag != draw_OBJFONTLIST)
+    {
+      *box = hdrptr.objhdrp->bbox;
+      break;
+    }
+  }
+
+  /* Unify other boxes with current one */
+  for (hdrptr.bytep += hdrptr.objhdrp->size ;
+       hdrptr.bytep < limit ; hdrptr.bytep += hdrptr.objhdrp->size)
+  {
+    if (hdrptr.objhdrp->tag != draw_OBJFONTLIST)
+      dr_unifyBoxes(box, &hdrptr.objhdrp->bbox);
+  }
+}
+
+/*
+ Function    : draw_set_unknown_object_handler
+ Purpose     : register unknown object handler
+ Parameters  : object handler
+               artibrary handle
+ Returns     : previous handler
+ Description : Updates all font reference numbers for text objects following
+               creation of a font table. See draw_createObject.
+*/
+
+draw_unknown_object_handler draw_set_unknown_object_handler
+                           (draw_unknown_object_handler handler, void *handle)
+{
+  draw_unknown_object_handler oldhandler = dr_unknown_handler;
+
+  dr_unknown_handler = handler;
+  dr_unknown_handle  = handle;
+  return (oldhandler);
+}
+
+
+BOOL drawfdiag_init(void)
+{
+    return (drawfobj_init());
+}
+
+

@@ -1,0 +1,1152 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* mnsi.c
+ *
+ * Author: Keith Ruttle (Acorn)
+ *
+ * Description
+ * ===========
+ * Module code
+ *
+ * Environment
+ * ===========
+ * Acorn RISC OS 3.11 or later.
+ *
+ * Compiler
+ * ========
+ * Acorn Archimedes C release 5.06 or later.
+ *
+ * Change record
+ * =============
+ *
+ * JPD  Jem Davies (Cambridge Systems Design)
+ *
+ *
+ * 09-Dec-94  17:41  JPD  Version 1.00
+ * First version with change record. Modified: #includes to be ANSI-compliant,
+ * other constructs to remove compiler warnings, code to cope with DCI-4 and
+ * new mbuf structure.  Added changes from KRuttle's 6.03 version (different
+ * to RISC OS SrcFiler 6.03 version!)
+ *
+ * 13-Jan-95  15:44  JPD  Version 1.01
+ * Issue Service_ReAllocatePorts on reinitialisation (now done on callback).
+ *
+ * 25-Jan-95  09:58  JPD  Version 1.02
+ * Added NetworkParameters SWI. Reinitialise properly when Econet is killed.
+ *
+ * 10-Feb-95  16:18  JPD  Version 1.03
+ * Added special pleading to force reinitialisation when Internet starting
+ * service call is received after Internet was thought to be present.
+ * Initialise connected_econet to -1 not 0. This seems sensible anyway, but
+ * has the added bonus that when NetFS is started by the BootNet module
+ * before Callbacks have gone off, allowing the Net module is properly
+ * initialised, the NetFS initialisation does not fail. Tighten lock
+ * checking in setting of callbacks. Add removal of any callbacks set on
+ * finalisation.
+ *
+ * 28-Feb-95  12:52  JPD  Version 1.04
+ * Removed OldCode. Pass out-of-range SWIs on to Econet module, if present,
+ * to maximise chance of a change to Econet module not requiring change to
+ * Net module. Corrected error in SWI despatch allowing a slightly
+ * out-of-range SWI to cause a branch through zero exception. Corrected
+ * error message produced for other out-of-range SWIs. Added returning of
+ * different values for peek machine type depending on what machine we are
+ * running on. Simplify service call reinitialisation stategy.
+ *
+ * 14-Mar-95  15:37  JPD  Version 1.05
+ * Moved some code to mnscommon.c. Now compilable -fah. Keep *Addmaps info
+ * across a self_imposed reinitialisation.
+ *
+ * 21-Mar-95  18:17  JPD  Version 1.06
+ * Moved mns_sc_handler() and reset_is_soft() to mnscommon.c.
+ *
+ * 04-Oct-95  10:05  JPD  Version 1.07
+ * Corrected some extern declarations: added #include <string.h>, had to add
+ * a cast to correct compiler warning as a consequence. Corrected some
+ * comments: should not change code.
+ *
+ * 06-Oct-95  10:34  JPD  Version 1.03
+ * Moved machine_type and modules_present to mnscommon.c.
+ *
+ *
+ **End of change record*
+ */
+
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <stdio.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "socklib.h"
+#include "sys/types.h"
+#include "sys/uio.h"
+#include "sys/socket.h"
+#include "sys/time.h"
+#include "sys/ioctl.h"
+#include "netinet/in.h"
+#include "net/if.h"
+#include "sys/dcistructs.h"
+
+#include "configure.h"
+#include "netasm.h"
+#include "module.h"
+#include "mns.h"
+#include "io.h"
+#include "mnscommon.h"
+#include "debug.h"
+#include "text.h"
+#include "swicode.h"
+#include "NetIHdr.h" /* From CMHG */
+
+extern char *inet_ntoa();
+
+struct mns mns = { 0 };
+int connected_econet = -1;
+int econet_transport_type = 0;
+int econet_not_present = 0;
+
+static void mns_showmap(int argc, char **argv);
+static void mns_addmap(int argc, char **argv);
+static void mns_showif(int argc, char **argv);
+static void mns_info(int all);
+
+#ifndef DEBUG
+struct client mns_cli_call[5] =
+{
+   mns_addmap,
+   mns_showmap,
+   mns_showif,
+   mns_ping,
+   0,
+};
+#else
+static void mns_showcbs(int argc, char **argv);
+static void mns_showports(int argc, char **argv);
+
+struct client mns_cli_call[7] =
+{
+   mns_addmap,
+   mns_showmap,
+   mns_showif,
+   mns_ping,
+   mns_showcbs,
+   mns_showports,
+   0,
+};
+#endif
+
+#define MAXSWI 33
+struct swient
+{
+   _kernel_oserror *(*swi_call)(_kernel_swi_regs *);      /* SWI handler */
+};
+
+static _kernel_oserror *EnumMapNull(_kernel_swi_regs *r);
+
+static struct swient mns_ent[MAXSWI+1] =
+{
+   CreateReceive,  ExamineReceive, ReadReceive,
+   AbandonReceive, WaitForReception, EnumerateReceive,
+   StartTransmit, PollTransmit, AbandonTransmit,
+   DoTransmit, ReadLocalStationAndNet,
+   ConvertStatusToString, ConvertStatusToError,
+   ReadProtection, SetProtection, ReadStationNumber,
+   PrintBanner, ReadTransportType, ReleasePort, AllocatePort,
+   DeAllocatePort, ClaimPort, StartImmediate,
+   DoImmediate, AbandonAndReadReceive, Version, NetworkState,
+   PacketSize, ReadTransportName, InetRxDirect, EnumMapNull,
+   EnumerateTransmit, HardwareAddresses, NetworkParameters,
+};
+
+static void read_ifs(int print, int all);
+static void atp_add_newitem(struct atp_block *a);
+int init_sockets(void);
+
+static u_long inet_addr(register char *cp);
+
+static void namtomodule(char *nm);
+
+/******************************************************************************/
+
+_kernel_oserror *mns_init(const char *cmd_tail, int pbase, void *pw)
+{
+/*
+ * cmhg module initialisation entry
+ *
+ * Parameters:
+ *    cmd_tail : pointer to command line tail
+ *    pbase    : 0 unless code invoked from a podule
+ *    pw       : "R12" value established by module initialisation
+ *
+ * Returns:
+ *     0 : => successfully initialised
+ *    !0 : => a problem, pointer to standard RISC OS error block
+ */
+
+   _kernel_oserror *e;
+
+   UNUSED(pbase);
+   UNUSED(cmd_tail);
+
+   /* take note of our workspace pointer for future use */
+   module_wsp = pw;
+
+   DEBUGP1("\n\r#module initialisation\n\r");
+
+   xDEBUGP2("#pbase = %08X\n\r", pbase);
+
+   xDEBUGP5("#-- 1: %08X, %08X, %08X, %08X\n\r",
+                   *(unsigned int *)0x01c00000, *(unsigned int *)0x01c00004,
+                   ((*((unsigned int **)pw)))[1],((*((unsigned int **)pw)))[2]);
+
+   /* This must really be done now, cannot wait for do_mns_init() */
+   memset((char *)&mns, 0, sizeof(mns));
+   mns.mns_rxdsock = -1;
+   mns.mns_txdsock = -1;
+   mns.mns_atpsock = -1;
+   mns.mns_routedsock = -1;
+
+   /* Open message file for us */
+   e = init_msgs(Module_MessagesFile, msg_fd_mns);
+   if (e)
+      return e;
+
+   /* Install ticker code */
+   e = calleverytick(tick_entry);
+   if (e)
+      goto out3;
+
+   /* check machine type we are running on for later machine type peek */
+   check_machine_type();
+
+   /* Find real Econet module so SWIs can be handed on to it */
+   e = init_econet();
+   if (e)
+      econet_not_present = 1;
+
+   do_mns_init(1);
+
+  /* set flag and set a Callback, so that the service call to say that
+   * "Econet" has been reinitialised will be issued on a Callback after this
+   * initialisation has completed.
+   */
+   restarting = 1;
+   setcallback();
+
+   return NULL; /* return OK */
+
+out3:
+   release_msgs(msg_fd_mns);
+
+   return e;
+
+} /* mns_init() */
+
+/******************************************************************************/
+
+int do_mns_init(int booting)
+{
+/*
+ * Perform initialisation
+ *
+ * Parameters:
+ *    booting : !0 => initialisation for first time
+ *               0 => reinitialisation as result of service call
+ *
+ * Returns:
+ *    !0 : => successfully initialised
+ *     0 : => either a problem, or reinitialised
+ */
+
+   _kernel_swi_regs r;
+   int no_econet_clock = 0;
+   int rxd, txd, atp, routed;
+   struct address_q *q;
+
+   rxd = booting ? -1 : mns.mns_rxdsock;
+   txd = booting ? -1 : mns.mns_txdsock;
+   atp = booting ? -1 : mns.mns_atpsock;
+   routed = booting ? -1 : mns.mns_routedsock;
+   q = mns.mns_mapq;
+
+   memset((char *)&mns, 0, sizeof(mns));
+   mns.mns_rxdsock    = rxd;
+   mns.mns_txdsock    = txd;
+   mns.mns_atpsock    = atp;
+   mns.mns_routedsock = routed;
+   mns.mns_txhandle   = MNS_HANDLE_BASE;
+   mns.mns_rxhandle   = MNS_HANDLE_BASE;
+   mns.mns_nextport   = 1;
+   mns.mns_mapq       = q;
+
+   if (!booting)
+      return 0;
+
+   mns.mns_stationnumber = read_device_info(mns.mns_device, mns.mns_module,
+                                            &connected_econet, &no_econet_clock,
+                                            &mns.mns_segsize);
+   if (connected_econet != -1)
+   {
+      mns.mns_states[connected_econet] |= ECONET_IS_CONNECTED;
+      mns.mns_netnumber = connected_econet;
+   }
+   else
+      mns.mns_stationnumber = 0;
+
+#ifdef R1COMPAT
+   mns.mns_segsize = DFT_SEGSIZE;
+#endif
+
+   /* Read the actual transport type for the "Econet" */
+   r.r[0] = 0;
+   r.r[1] = 2;
+   econet_transport_type =
+                         call_econet(Econet_ReadTransportType, &r) ? 2 : r.r[2];
+   read_ifs(0, 0);
+
+   if (mns.mns_ifcnt > 0)
+      init_sockets();
+
+   return 0;
+
+} /* do_mns_init() */
+
+/******************************************************************************/
+
+_kernel_oserror *mns_swi_handler(int swinum, _kernel_swi_regs *r, void *pw)
+{
+/* cmhg module SWI handler
+ *
+ * Parameters:
+ *    swinum : SWI number within our SWI chunk
+ *    r      : pointer to registers structure
+ *    pw     : "R12" value
+ *
+ * Returns:
+ *    0 => all OK
+ *   !0 => some error occurred (pointer to RISC OS error block)
+ *
+ */
+
+   struct swient *callp;
+   _kernel_oserror *e = 0;
+   int oldstate;
+
+   UNUSED(pw);
+
+   if (swinum < 0 || swinum > 63)
+      return error_BAD_SWI;
+
+   if (swinum > MAXSWI)
+   {
+      if (connected_econet != -1)
+         return call_econet(swinum, r);
+      else
+         return error_BAD_SWI;
+   }
+
+   callp = &mns_ent[swinum];
+   oldstate = ensure_irqs_off();
+   e = (_kernel_oserror *)(*(callp->swi_call))(r);
+   restore_irqs(oldstate);
+
+   return e;
+}
+
+/******************************************************************************/
+
+static void mns_addmap(int argc, char **argv)
+{
+/*
+ * *AddMap code
+ *
+ * Parameters:
+ *    argc : }
+ *    argv : } command line parms
+ *
+ * Returns:
+ *    None
+ */
+
+   struct atp_block ablock;
+
+   UNUSED(argc);
+
+   memset(ablock.atpb_sitename, 0, 16);
+   memset(ablock.atpb_netname, 0, 16);
+   ablock.atpb_ipadr   = inet_addr(argv[0]) & ~0xff000000;
+   ablock.atpb_net     = (u_char)atoi(argv[1]);
+   ablock.atpb_station = 0;
+   atp_add_newitem(&ablock);
+
+   return;
+
+} /* mns_addmap() */
+
+/******************************************************************************/
+
+static void mns_showif(int argc, char **argv)
+{
+/*
+ * *NetStat code
+ *
+ * Parameters:
+ *    argc : }
+ *    argv : } command line parms
+ *
+ * Returns:
+ *    None
+ */
+
+   int all = 0;
+
+   UNUSED(argv);
+
+   if (!mns.mns_flags)
+      return;
+
+   if (argc > 0)
+      all = 1;
+
+   read_ifs(1, all);
+
+   mns_info(all);
+
+   return;
+
+} /* mns_showif() */
+
+/******************************************************************************/
+
+static void mns_showmap(int argc, char **argv)
+{
+/*
+ * *NetMap code: show mapping from pseudo-Econet numbers to Internet addresses
+ *
+ * Parameters:
+ *    argc : }
+ *    argv : } command line parms (optional net number)
+ *
+ * Returns:
+ *    None
+ */
+
+   struct address_q *q;
+   char abuf[32];
+   int n;
+
+   UNUSED(argc);
+   UNUSED(argv);
+
+   for (q = mns.mns_mapq; q; q = q->q_next)
+   {
+      sprintf(abuf, "%s", inet_ntoa(q->q_ip));
+      if (n = strlen(abuf))
+      {
+         abuf[n - 1] = 'x';
+         printf("%3d.x <==> %s\n", q->q_net, abuf);
+      }
+   }
+
+   return;
+
+} /* mns_showmap() */
+
+/******************************************************************************/
+
+#ifdef DEBUG
+static void mns_showcbs(int argc, char **argv)
+{
+   struct rxcb *rx;
+   struct txcb *tx;
+
+   UNUSED(argc);
+   UNUSED(argv);
+
+   printf("receive blocks:\n");
+   for (rx = mns.mns_rxlist; rx; rx = rx->rx_next)
+   {
+      printf("    station=%d.%d, port=%x, buffer=%x, bufsize=%d, handle=%x, status=%x\n",
+            rx->rx_network, rx->rx_station, rx->rx_port, rx->rx_buf,
+            rx->rx_bufsize, rx->rx_handle, rx->rx_status);
+   }
+
+   for (rx = mns.mns_rxwild; rx; rx = rx->rx_next)
+   {
+      printf("    station=%d.%d, port=%x, buffer=%x, bufsize=%d, handle=%x, status=%x\n",
+            rx->rx_network, rx->rx_station, rx->rx_port, rx->rx_buf,
+            rx->rx_bufsize, rx->rx_handle, rx->rx_status);
+   }
+   printf("\ntransmit blocks:\n");
+   for (tx = mns.mns_txlist; tx; tx = tx->tx_next)
+   {
+      printf("    station=%d.%d, port=%x, buffer=%x, bufsize=%d, handle=%x, status=%x\n",
+            tx->tx_network, tx->tx_station, tx->tx_port, tx->tx_buf,
+            tx->tx_bufsize, tx->tx_handle, tx->tx_status);
+   }
+
+   return;
+
+} /* mns_showcbs() */
+
+/******************************************************************************/
+
+static void mns_showports(int argc, char **argv)
+{
+   int i;
+
+   UNUSED(argc);
+   UNUSED(argv);
+
+   printf("Next portnumber is %x\n\n", mns.mns_nextport);
+
+   for (i = 1; i < 255; i++)
+   {
+      if ((mns.mns_states[i] & (PORTALLOCATED | PORTCLAIMED)) == 0)
+         continue;
+
+      if (mns.mns_states[i] & PORTALLOCATED)
+         printf("Port %x is allocated\n", i);
+
+      if (mns.mns_states[i] & PORTCLAIMED)
+         printf("Port %x is claimed\n", i);
+   }
+
+   return;
+
+} /* mns_showports() */
+
+#endif
+
+/******************************************************************************/
+
+
+int tick_handler(_kernel_swi_regs *r, void *pw)
+{
+/*
+ * cmhg ticker interrupt handler
+ *
+ * Parameters:
+ *    r  : pointer to registers block
+ *    pw : "R12" value established by module initialisation
+ *
+ * Returns:
+ *    0 => interrupt "claimed"
+ *   !0 => interrupt not "claimed"
+ */
+
+
+   UNUSED(r);
+   UNUSED(pw);
+
+   check_rxcbs();
+   check_txcbs();
+
+   return 1;
+
+} /* tick_handler() */
+
+/******************************************************************************/
+
+_kernel_oserror *mns_final(int fatal, int podule, void *pw)
+{
+/* Finalisation code
+ *
+ * Parameters:
+ *    None
+ *
+ * Returns:
+ *    None
+ */
+
+   DEBUGP1("#module finalisation\n\r");
+
+   UNUSED(fatal);
+   UNUSED(podule);
+   UNUSED(pw);
+
+  /* One could argue about the order of releasing the vectors and closing
+   * the sockets, but this is the way it was.
+   */
+
+   /* Close sockets */
+   free_sockets();
+
+   /* remove the installed ticker handler */
+   removetickerevent(tick_entry);
+
+   /* remove any added transient callback */
+   removecallback();
+
+   /* Close MessageTrans message files */
+   release_msgs(msg_fd_mns);
+
+   return NULL;
+
+} /* mns_final() */
+
+/******************************************************************************/
+
+static void read_ifs(int print, int all)
+{
+/*
+ * Obtain information about the network interfaces
+ *
+ * Parameters:
+ *    print : !0 => display details of interfaces
+ *    all   : !0 => print full information
+ *
+ * Returns:
+ *    None
+ */
+
+   int s, n, eco, no_econet_clock;
+   char buf[512], name[12];
+   struct ifconf ifc;
+   struct ifreq ifreq, *ifr;
+   struct sockaddr_in *sin;
+   u_long addr;
+   int inmap, net, station, first = 1;
+
+   DEBUGP3("#read_ifs(%d, %d)\n\r", print, all);
+
+   /* open a socket to use to obtain details */
+   if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+       return;
+
+   ifc.ifc_len = sizeof (buf);
+   ifc.ifc_buf = buf;
+
+   /* get the interface info list from the Internet module */
+   if (socketioctl(s, OSIOCGIFCONF, (char *)&ifc) < 0)
+   {
+      socketclose(s);
+      return;
+   }
+
+   /* if connected to Econet, get Econet info */
+   if (print && connected_econet != -1)
+   {
+      (void) read_eco_info(&connected_econet, &no_econet_clock);
+      printf("%-18s", mns_str(Str_NtvEco));
+      printf("%d.%d", connected_econet, mns.mns_stationnumber);
+      if (no_econet_clock)
+         printf(" (%s)", mns_str(Str_Noclck));
+      printf("\n\n");
+   }
+
+   mns.mns_ifcnt = 0;
+   mns.mns_econetipadr = 0;
+   ifr = ifc.ifc_req;
+
+   /* step forwards through interface info list */
+   for (n = ifc.ifc_len / sizeof (struct ifreq); n > 0; n--, ifr++)
+   {
+      if (((struct osockaddr *)&ifr->ifr_addr)->sa_family != AF_INET)
+         continue;
+
+      ifreq = *ifr;
+      /* Ignore the loopback interface */
+      if (socketioctl(s, SIOCGIFFLAGS, (char *)&ifreq) < 0 ||
+                                                 ifreq.ifr_flags & IFF_LOOPBACK)
+         continue;
+
+      if (print)
+      {
+         if (!first)
+            printf("\n");
+         /* Print "Interface" */
+         printf("\n%-18s", mns_str(Str_IfType));
+      }
+
+      eco = strcmp(ifreq.ifr_name, "ec0") == 0 ? 1 : 0;
+
+      if (print)
+      {
+         strcpy(name, ifreq.ifr_name);
+         name[strlen(name) - 1] = 0;
+         namtomodule(name);
+         printf("%s ", name);
+      }
+
+      if ((ifreq.ifr_flags & (IFF_BROADCAST|IFF_UP)) != (IFF_BROADCAST|IFF_UP))
+      {
+         if (print)
+            printf("(%s)\n", mns_str(Str_Down));
+         goto next;
+      }
+
+      if (print)
+         printf("\n");
+
+      /* get interface Internet address */
+      if (socketioctl(s, SIOCGIFADDR, (char *)&ifreq) < 0)
+         goto next;
+
+      sin = (struct sockaddr_in *)&ifreq.ifr_addr;
+      addr = ntohl(sin->sin_addr.s_addr);
+      inmap = ip_to_mns(sin->sin_addr.s_addr, &net, &station);
+      if (inmap && station != 0 && station != ALL_ONES)
+      {
+         if (mns.mns_stationnumber == 0)
+         {
+            mns.mns_stationnumber = station;
+            mns.mns_netnumber = net;
+         }
+         if (print)
+            printf("%-18s%d.%d\n", mns_str(Str_StaNum), net, station);
+      }
+
+      if (print && all)
+         printf("%-18s%s\n", mns_str(Str_FullAd),
+                                        inet_ntoa(*((u_long *)&sin->sin_addr)));
+
+      /* get Internet broadcast address for interface */
+      if (socketioctl(s, SIOCGIFBRDADDR, (char *)&ifreq) < 0)
+          goto next;
+
+      sin = (struct sockaddr_in *)&ifreq.ifr_addr;
+      if (print && all)
+          printf("%-18s%s\n", mns_str(Str_BrdCst), inet_ntoa(sin->sin_addr));
+      mns.mns_ifaddrs[(mns.mns_ifcnt)++] = sin->sin_addr.s_addr;
+next:
+      first = 0;
+   }
+
+   socketclose(s);
+   return;
+
+} /* read_ifs() */
+
+/******************************************************************************/
+
+static void atp_add_newitem(struct atp_block *a)
+{
+   struct address_q *q;
+   struct address_q **p;
+
+   p = &(mns.mns_mapq);
+   while (*p)
+   {
+      if ((*p)->q_ip == a->atpb_ipadr)
+         return;
+      p = &((*p)->q_next);
+   }
+
+   if ((*p) == 0)
+   {
+      q = (struct address_q *)malloc (sizeof(struct address_q));
+      if (q == (struct address_q *)0)
+         return;
+
+      q->q_bcast = 0;
+      q->q_next = (struct address_q *)0;
+      *p = q;
+   }
+
+   q->q_net = a->atpb_net;
+   q->q_ip  = a->atpb_ipadr;
+   memcpy(q->q_sitename, a->atpb_sitename, ITEM_NAMELEN);
+   memcpy(q->q_netname, a->atpb_netname, ITEM_NAMELEN);
+
+   if ((mns.mns_states[q->q_net] & ECONET_IS_CONNECTED) == 0)
+      mns.mns_states[q->q_net] |= MNS_IS_CONNECTED;
+   if (mns.mns_stationnumber == 0)
+      read_ifs(0, 0);
+
+   return;
+
+} /* atp_add_newitem() */
+
+
+/******************************************************************************/
+
+int init_sockets(void)
+{
+   if (mns.mns_flags & MNS_SOCKET)
+      return 0;
+
+   mns.mns_rxdsock = do_getsock(MNSDATAPORT, 1, 1);
+   if (mns.mns_rxdsock < 0)
+      return -1;
+
+   mns.mns_txdsock = do_getsock(MNSDATAPORT, 0, 0);
+   mns.mns_flags |= MNS_SOCKET;
+
+   return 0;
+
+} /* init_sockets() */
+
+/******************************************************************************/
+
+void free_sockets(void)
+{
+   if (mns.mns_rxdsock != -1)
+      (void) socketclose(mns.mns_rxdsock);
+
+   if (mns.mns_txdsock != -1)
+      (void) socketclose(mns.mns_txdsock);
+
+   return;
+
+} /* free_sockets() */
+
+/******************************************************************************/
+
+static void mns_info(int all)
+{
+    int i, found = 0;
+
+    printf("\n%-18s", mns_str(Str_AccNet));
+    for (i = 1; i < 256; i++) {
+        if (mns.mns_states[i] & (ECONET_IS_CONNECTED|MNS_IS_CONNECTED)) {
+            if ((++found % 8) == 0)
+                printf("\n%-18s", " ");
+            if (mns.mns_states[i] & ECONET_IS_CONNECTED)
+                printf("*%-5d", i);
+            else if (mns.mns_ifcnt > 0)
+                printf("%-6d", i);
+        }
+    }
+    printf("\n");
+    if (!all)
+        return;
+    printf("\n%-18s", mns_str(Str_TxStat));
+    printf("%s=%d, ", mns_str(Str_Data), mns.mns_txcnt);
+    printf("%s=%d, ", mns_str(Str_Immedt), mns.mns_tximmcnt);
+    printf("%s=%d, ", mns_str(Str_ImmRep), mns.mns_tximmrcnt);
+    printf("%s=%d\n",mns_str(Str_Retry), mns.mns_txretry);
+    printf("%-18s", " ");
+    printf("%s=%d, ", mns_str(Str_Error), mns.mns_txerrs);
+    printf("%s=%d, ", mns_str(Str_DtaAck), mns.mns_txacks);
+    printf("%s=%d, ", mns_str(Str_DtaRej), mns.mns_txrej);
+    printf("%s=%d\n", mns_str(Str_BrdCst), mns.mns_txbccnt);
+    printf("%-18s", " ");
+    printf("(%s=%d, ", mns_str(Str_Local), mns.mns_txlbc);
+    printf("%s=%d)\n", mns_str(Str_Global), mns.mns_txgbc);
+    printf("\n%-18s", mns_str(Str_RxStat));
+    printf("%s=%d, ", mns_str(Str_Data), mns.mns_rxcnt);
+    printf("%s=%d, ", mns_str(Str_Immedt), mns.mns_rximmcnt);
+    printf("%s=%d, ", mns_str(Str_BrdCst), mns.mns_rxbc);
+    printf("%s=%d\n", mns_str(Str_Dscard), mns.mns_rxdiscard);
+    printf("%-18s", " ");
+    printf("%s=%d, ", mns_str(Str_Retry), mns.mns_rxretries);
+    printf("%s=%d, ", mns_str(Str_Error), mns.mns_rxerrs);
+    printf("%s=%d, ", mns_str(Str_DtaAck), mns.mns_rxacks);
+    printf("%s=%d\n", mns_str(Str_DtaRej), mns.mns_rxrej);
+    printf("%-18s", " ");
+    printf("%s=%d, ", mns_str(Str_ImmRep), mns.mns_rximreply);
+    printf("%s=%d\n", mns_str(Str_InvRep), mns.mns_rxackdiscard);
+    printf("\n%-18s", mns_str(Str_ModSts));
+    printf("0%o", mns.mns_flags);
+    printf("\n");
+}
+
+/******************************************************************************/
+
+int ip_to_mns(u_long addr, int *net, int *station)
+{
+   struct address_q *q;
+   u_long i, m;
+
+   i = ntohl(addr);
+   m = i & ~0xff;
+   for (q = mns.mns_mapq; q; q = q->q_next)
+   {
+      if (m == htonl(q->q_ip)) {
+         *station = i & 0xff;
+         *net = (int)q->q_net;
+         return 1;
+      }
+   }
+   *net = (u_int)addr;
+   *station = ALL_ONES;
+
+   return 1;
+
+} /* ip_to_mns() */
+
+/******************************************************************************/
+
+int src_is_ok(struct rxcb *rx, int net, int station)
+{
+    if (rx->rx_station == ALL_ONES && rx->rx_network == ALL_ONES)
+        return (1);
+    if (((rx->rx_network > 0 && rx->rx_network < ANY_NETWORK) && net != rx->rx_network) ||
+        ((rx->rx_station > 0 && rx->rx_station < ANY_STATION) && station != rx->rx_station))
+        return (0);
+    return (1);
+}
+
+u_long mns_to_ip(int net, int station)
+{
+    struct address_q *q;
+
+    if (station == ALL_ONES)
+        return ((u_long)net);
+
+    if (net == 0)
+        net = local_net();
+
+    if ((mns.mns_states[net] & ECONET_IS_CONNECTED) != 0)
+        return ((u_long)0);
+
+    for (q = mns.mns_mapq; q; q = q->q_next) {
+        if (net == q->q_net)
+            return((q->q_ip | htonl(station)));
+    }
+    return ((connected_econet != -1) ? (u_long) 0 : (u_long) -1);
+}
+
+/******************************************************************************/
+
+int msg_broadcast(u_char flag, u_char port, char *data, int len, int local)
+{
+   int i;
+
+   for (i = 0; i < mns.mns_ifcnt; i++)
+      (void) msg_transmit(mns.mns_ifaddrs[i], flag, 0, port, data, len,
+                                                       BROADCAST_DATA_FRAME, 0);
+   if (local)
+      mns.mns_txlbc++;
+   else
+      mns.mns_txgbc++;
+   mns.mns_txbccnt++;
+
+   return 0;
+
+} /* msg_broadcast() */
+
+/******************************************************************************/
+
+static void namtomodule(char *nm)
+{
+/*
+ * Get the module name relating to a device name
+ *
+ * Parameters:
+ *    nm : pointer to a string holding the device name without the number,
+ *         e.g. "en"
+ *
+ * Returns:
+ *    None
+ *    nm : still points to the string, now holding the module name,
+ *         e.g. "Ether2"
+ */
+
+   _kernel_swi_regs r;
+   _kernel_oserror *e;
+   struct dib *d;
+   struct chaindib *chdp, *n;
+
+   r.r[0] = 0;         /* initialise to zero so that we can detect a response */
+   r.r[1] = Service_EnumerateNetworkDrivers;
+   /* Issue service call to find all DCI4 drivers */
+   e = _kernel_swi(OS_ServiceCall, &r, &r);
+
+
+   /* if no error issuing service call and received a response */
+   if ((e == 0) && (chdp = (struct chaindib *)(r.r[0]), chdp != 0))
+   {
+      n = chdp->chd_next;
+      d = chdp->chd_dib;
+
+      while (d != 0)
+      {
+         if (strcmp((char *)d->dib_name, nm) == 0)
+         {
+            r.r[0] = 0;
+            e = _kernel_swi(d->dib_swibase + DCI4Version, &r, &r);
+            if (!e && r.r[1] >= MINIMUM_DCI_VERSION)
+               strncpy(nm, (char *)d->dib_module, 24);
+            break;
+         }
+         else
+         {
+            if (n == 0)
+               break;
+
+            /* step on */
+            d = n->chd_dib;
+            n = n->chd_next;
+         }
+      }
+
+      /* Now, free all the chaindibs returned to us */
+      while (chdp != 0)
+      {
+         r.r[0] = 7;      /* reason code Free */
+         r.r[2] = (int) chdp;
+         chdp = chdp->chd_next;
+         if (e = _kernel_swi(OS_Module, &r, &r), e != 0);
+            /* if any error, probably should not continue freeing blocks */
+            break;
+      }
+   }
+
+   return;
+
+} /* namtomodule() */
+
+/******************************************************************************/
+
+int in_local_aun_network(int net)
+{
+   UNUSED(net);
+
+   return 0;
+
+}  /* in_local_aun_network() */
+
+/******************************************************************************/
+
+_kernel_oserror *range_check(int port, int station, int net)
+{
+   if (port < 0 || port > 255)
+      return mns_error(Err_BadPort);
+
+   if (station != ALL_ONES && (station < 0 || station > 255))
+      return mns_error(Err_BadStn);
+
+   if (station != ALL_ONES && (net < 0 || net > 255))
+      return mns_error(Err_BadNet);
+
+   return NULL;
+
+} /* range_check() */
+
+/******************************************************************************/
+
+int is_wild(int port, int station, int network)
+{
+    if (station == ALL_ONES)
+        return (network == ALL_ONES ? 1 : 0);
+/* Insert KRuttle's 6.03 changes */
+    return ((network == ANY_NETWORK || station == ANY_STATION ||
+            (network == 0 && station == 0) ||
+             port == ANY_PORT || port == 0) ? 1 : 0);
+}
+
+/******************************************************************************/
+
+static u_long inet_addr(register char *cp)
+{
+/*
+ * Internet address interpretation routine.
+ * The value returned is in network order.
+ */
+
+   u_long val, base, n;
+   char c;
+   u_long parts[4], *pp = parts;
+
+again:
+
+  /*
+   * Collect number up to ``.''.
+   * Values are specified as for C:
+   * 0x=hex, 0=octal, other=decimal.
+   */
+   val = 0; base = 10;
+   if (*cp == '0')
+      base = 8, cp++;
+   if (*cp == 'x' || *cp == 'X')
+      base = 16, cp++;
+
+   while (c = *cp)
+   {
+      if (isdigit(c)) {
+         val = (val * base) + (c - '0');
+         cp++;
+         continue;
+      }
+      if (base == 16 && isxdigit(c))
+      {
+         val = (val << 4) + (c + 10 - (islower(c) ? 'a' : 'A'));
+         cp++;
+         continue;
+      }
+      break;
+   }
+
+   if (*cp == '.')
+   {
+      /*
+       * Internet format:
+       *      a.b.c.d
+       *      a.b.c   (with c treated as 16-bits)
+       *      a.b     (with b treated as 24 bits)
+       */
+      if (pp >= parts + 4)
+         return -1;
+
+      *pp++ = val, cp++;
+      goto again;
+   }
+
+   /* Check for trailing characters */
+   if (*cp && !isspace(*cp))
+      return -1;
+
+   *pp++ = val;
+
+   /* Concoct the address according to the number of parts specified */
+   n = pp - parts;
+   switch (n)
+   {
+      case 1:                         /* a -- 32 bits */
+         val = parts[0];
+         break;
+
+      case 2:                         /* a.b -- 8.24 bits */
+         val = (parts[0] << 24) | (parts[1] & 0xffffff);
+         break;
+
+      case 3:                         /* a.b.c -- 8.8.16 bits */
+         val = (parts[0] << 24) | ((parts[1] & 0xff) << 16) |
+               (parts[2] & 0xffff);
+         break;
+
+      case 4:                         /* a.b.c.d -- 8.8.8.8 bits */
+         val = (parts[0] << 24) | ((parts[1] & 0xff) << 16) |
+              ((parts[2] & 0xff) << 8) | (parts[3] & 0xff);
+         break;
+
+      default:
+         return -1;
+   }
+
+   val = htonl(val);
+
+   return val;
+
+} /* inet_addr() */
+
+/******************************************************************************/
+
+static _kernel_oserror *EnumMapNull(_kernel_swi_regs *r)
+{
+   r->r[4] = -1;
+
+   return 0;
+
+} /* EnumMapNull() */
+
+/******************************************************************************/
+
+/* EOF mnsi.c */

@@ -1,0 +1,249 @@
+765 Floppy Disk Driver Design Notes
+===================================
+
+1) There are 2 entries into the driver that can cause disk operations. 
+Both are invoked by FileCore, these being:
+   a) DiscOp
+   b) Mount
+
+2) DiscOp calls are routed to either FlpLowLevel or WinLowLevel, depending
+on the drive number (0..3=floppy, 4..7=winchester).  These operations can
+result in data transfer and/or read/write head movement.
+
+3) Mount calls are similarly routed to either FlpMount or WinMount,
+depending on the drive number.  The operation requires the driver to read
+the free space map on the disk, to determine the format, and to construct a
+disk record from the data read.
+
+4) In summary the following "high level" operations will be required:
+
+        a) Read sectors
+        b) Write sectors
+        c) Format track
+        d) Restore to track 0
+        e) Seek
+
+5) To perform these functions the following operations are needed
+           
+        a) Select a drive
+        b) Start spindle motor
+        c) Time motor startup
+        d) Calculate track/head/sector
+        e) Seek/restore to track
+        f) Verify track no. - optional
+        g) Time head settling
+        h) Issue '765 command
+        i) Get '765 status
+        j) Setup pseudo DMA under FIQ
+        k) Read sector(s) in a track
+        l) Write sector(s) in a track 
+        m) Format a track
+        n) Implement command timeout
+        o) Set bit rate (125/250/500/1000 Kbps)
+        p) Reset '765
+        q) Read/reset disk changed
+        r) Count index pulses
+
+Note that because Acorn  L,D and E format disks start from sector no. 0 it
+will not be possible to use the "multitrack" function of the '765
+controller.  In addition because L format disks use 16x256 byte sectors per
+track (ECMA format - no IAM field), the '765 will not be able to format
+these disks exactly because of the IBM compatible IAM being written.  Still
+it may be possible, like BEEBDOS, to format these disks by overwriting the
+IAM with the last sector.  Some thought needs to go into gap sizes etc.
+
+6) In order to sequence these operations a finite state system (state
+machine) will be used.  It is essential to arbitrate access to the state
+machine (by foreground/background accesses) because it is a single threaded
+construct.  The objective of the machine is to sequence motor start, head
+settling and command completion.
+
+7) The following events will be recognized:
+       
+        a) TimeOut
+        b) Index pulse
+        c) FDC interrupt (Command done, seek done, ready)
+        d) Disk changed, interrupt or polled?
+
+7a) The following requests will be recognized:
+
+        a) Seek request(track 0..79 or any)
+        b) Reset request, reset '765 restore head
+        c) Lock drive
+        d) Unlock drive
+
+7b) The following messages will be passed to pending commands:
+
+        a) Track(0..79 or unknown)
+        b) TimeOut
+        c) DiskChanged
+        d) FDC interrupt
+
+
+8) The following states will exist
+
+        a) Drives idle
+        b) Motor started, motor speeding up
+        c) Motor ready, motor up to speed
+        d) Seeking, head being stepped
+        e) Settling, head settling after seek
+        f) Drive ready
+        g) Drive busy, read/write pending.  Is this necessary?
+
+9) What about retries?  Handled by command processor.
+9a) Retry algorithm?
+
+        a) Retry operation (disable VIDC if over/underrun)
+        b) Step out, step in, retry operation
+        c) Restore, seek, retry operation
+
+10) Scatter list updated after each transfer request (1 track max)
+
+11) A general disk command processor entry point, passed a pointer to a disk
+control block (DCB) structured as follows:
+
++00  BufferAddress & 1  ; Data buffer pointer
++04  BufferSize & 1     ; Data buffer size
++08  StaticBase & 1     ; R12 for post routine
++0c  PostRoutine & 1    ; Address to call on command completion
++10  CommandStatus & 1  ; -1 = pending, 0= no error else an error ptr
++14  TimeOut & 1        ; Command timeout in centiseconds, 0= none
++18  Retries = 1        ; Retries, 0= none
++19  ParamCount = 1     ; 0..13 bytes.  Bit7 = NoWait command
++1a  Command = 1
++1b  Parameters = 0d    ; Command specific
++28  Results = 08       ; 1..8 bytes, command specific
++30  Link & 1           ; Reserved, ptr to next DCB
++34  MessageHandler & 1 ; Reserved, ptr to message handler for this command
++38  Reserved = 08      ; Reserved for driver
+
+Total size 64 bytes
+
+In addition to device specific commands a "Cancel" function is necessary to
+cancel a pending DCB.  In this case "BufferAddress" -> DCB to cancel.
+
+Command processor action:
+
+        a) Check command valid, add MessageHandler address
+        b) Queue the DCB (sorted by track), status= pending
+        c) Call the DCB message handler with MessageIdle
+        d) MessageIdle will result in handler generating SeekRequest(n) to state m/c
+        e) State system starts drive motor and performs seek if required
+        f) State system generates EventTrack(n)
+        g) Message handler claims event if track ok and issues command
+        h) State system generates EventResult
+        i) Message handler reads '765 status
+        j) Command completed, post routine called
+        k) MessageIdle sent to pending DCB's, next DCB starts processing
+
+* FlpLowLevel processing would go something like:
+
+        - Calculate drive, track, head, start sector, stop sector, amount
+        - Foreground transfer?  Yes:
+          - Queue a read/write with implied seek DCB
+          - Wait for DCB to complete
+          - Error exit if necessary
+          - Repeat foreground transfer if more left
+        - Then calculate drive, track, head, start sector, stop sector, amount for
+          background transfer.
+        - Queue background read/write implied seek
+        - Return to caller with result of read
+
+        Under interrupt the following happens:
+
+        - Read/write completed, update scatter list if required.
+        - Calculate head, start sector, stop sector, amount for next transfer
+        - If more left, queue next DCB, Return
+        - All done so return process status in scatter list
+        - Return
+
+
+Parameter format:
+
+        a) Arranged like '765 command block.
+        b) Implied seek is bit 7 set of 1st parameter
+
+Supported commands:
+
+        a) Read/write data/deleted data inc. multitrack
+        b) Read track
+        c) Read ID
+        d) Format track
+        e) Scan
+        f) Seek, recalibrate -> state system
+        g) Sense interrupt status
+        h) Sense drive status
+        i) Specify
+        j) Invalid
+
+* FIQ code:
+
+        Determine source of FIQ (DRQ/IRQ), branch to Flp765IRQ if IRQ
+        a) Read block - FlpFIQread
+        b) Write block - FlpFIQwrite
+        c) Verify (read and throw away) - FlpFIQverify
+
+        d) All start:
+        LDRB    Temp, [IOCfiq, #IOCFIQSTA]      ; Read FIQ status from IOC
+        TSTS    Temp, IoDrqBit                  ; DRQ?
+        BEQ     Flp765IRQ                       ; No then jump, check IRQ
+
+        LDRB    Temp, [FDCdack], # 1            ; Read data with DACK/TC, FDCdack++
+
+
+
+
+* Flp765IRQ:
+
+        Call DCB's with MessageIRQ, this allows DCB's to get results
+        Queue next DCB from scatter list if required
+        Downgrade FIQ to IRQ if no DCB's 
+        Release FIQ to FileCore if all commands done.
+
+        Read '765 status register.  If RQM and DIO are set then read results
+          else issue sense interrupt to get ST0
+
+NOTES
+=====
+
+1) When mounting a new disk the calling sequence with the current 1772
+driver is:
+        i) DoPollChanged -> Maybe changed if no disk change support
+        ii) Mount
+        iii) DoPollChanged -> Maybe changed.  WHY? - motor still on
+        iv) DoPollChanged -> Not changed
+        v) Mount
+        vi) DoLockDrive.  !!This should precede mount!!
+        vii) DoPollChanged -> Not Changed
+        viii) FlpLowLevel
+        ix) FlpLowLevel to sector 0, ignore escape
+        x) FlpLowLevel to sector 2, no escape, no timeout!
+
+2)  FDC interrupts cause FIQ, in addition FDC data requests cause FIQ. 
+Reading IOC &3200034 FIQ request register has bit 0 set for DRQ's and bit 1
+set for real IRQ's.  FIQ's can be downgraded to IRQ's by setting bit 7 in
+&3200018 which forces an IRQ and results in a call to the routine registered
+for device 7 (FIQ downgrade).
+
+3) After format operation remember the double step and alternate side
+parameters from the disk record provided so that at mount time after format
+can use these to fill in disk record.  If motors stop then invalidate these
+values and use values in mount command.
+
+4) Disk record construction:
+  Start at MFM 500K, MFM 250K, FM 125K, MFM 1000K
+  Read ID headers, 1st attempt let 765 abort on 2nd index pulse (or
+timeout), subsequent attempts abort on next index pulse.  When density
+recognized determine max/min sector numbers and construct disk record
+
+
+State system:
+  a) Queued command comes to top of queue, do drive select.  When ready
+state system sends "FlpMsgDrvRdy" to command message handler.
+  b) Command tests implied seek bit and issues seek request if required. 
+'765 goes busy, then settling then idle and sends "FlpMsgSeekDone".
+  c) Command handler sends command to '765.
+  d) Interrupt calls command handler with "FlpMsgCmdDone" or "FlpMsgTimeOut"
+as required.
+  e) "FlpMsgCmdDone" invokes status read to get results.
+  f) "FlpMsgTimeOut" invokes Flp765reset to abort operation. 
