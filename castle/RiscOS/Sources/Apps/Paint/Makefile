@@ -233,7 +233,8 @@ bbe-paint: bbe-generic
 # debugging version:
 #
 abs.!RunImageD: ${OBJSD} ${RLIB} ${CLIB}
-        ${LD} -d -o $@ ${OBJSD} ${RLIB} ${CLIB}
+        ${LD} -o $@ ${OBJSD} ${RLIB} ${CLIB}
+        SetType $@ Absolute
 
 debug.${APP}.!Boot: ${RDIR}.!Boot
         ${CP} ${RDIR}.!Boot $@ ${CPFLAGS}
