@@ -141,7 +141,8 @@ endif
 ifeq ($(TARGET), Linux)
 	chmod +x 'Build/Images/$(TARGET)_rom'
 	ln -f Build/Images/Linux_rom Build/Images/Linux_rom_keep
-	mv Build/Images/Linux_rom_keep RISC_OS
+	mv Build/Images/Linux_rom_keep Built/RISC_OS
+	ln -sf Built/RISC_OS RISC_OS
 endif
 
 ifeq ($(TARGET), IOMD32)
