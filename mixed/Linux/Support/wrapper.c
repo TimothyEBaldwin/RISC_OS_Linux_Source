@@ -30,16 +30,17 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <error.h>
-#include <stdbool.h>
-#include <sys/wait.h>
-#include <sys/socket.h>
-#include <sys/prctl.h>
-#include <termios.h>
-#include <unistd.h>
-#include <signal.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
 
 struct termios oldTioIn, newTioIn;
 
@@ -52,7 +53,7 @@ static void stop_handler(int s) {
 static void fatal_handler(int s) {
   tcsetattr(0, TCSANOW, &oldTioIn);
   signal(s, SIG_DFL);
-  raise(signal);
+  raise(s);
 }
 
 int main(int argc, char **argv) {
