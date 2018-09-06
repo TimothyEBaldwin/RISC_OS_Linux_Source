@@ -52,6 +52,7 @@ SHELL=$(warning Building $@)$(BASH)
 .ONESHELL:
 .SILENT:
 
+.SUFFIXES:
 .DELETE_ON_ERROR:
 .PHONY: all script-all
 
@@ -112,6 +113,9 @@ Built/wrapper: Support/wrapper.c $(lib_depends) | Built
 
 Built/gen_seccomp: Support/gen_seccomp.c $(lib_depends) | Built
 	gcc -std=c99 -Wall -Os Support/gen_seccomp.c -o Built/gen_seccomp -lseccomp
+
+Built/seccomp%: Built/gen_seccomp
+	Built/gen_seccomp $* > $@
 
 Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
 	rm -rf Built/rpcemu*

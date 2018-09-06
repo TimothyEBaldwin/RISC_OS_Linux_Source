@@ -91,65 +91,75 @@ int main(int argc, char **argv) {
     tcsetattr(0, TCSANOW, &newTioIn);
   }
 
-  int sockets[2];
-  socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
+  int status = 0;
 
-  pid_t self = getpid();
-  pid_t pid = fork();
-  if (pid < 0) {
-    tcsetattr(0, TCSANOW, &oldTioIn);
-    return 109;
-  }
-  if (!pid) {
-    prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
-    int socket = fcntl(sockets[1], F_DUPFD, 32);
-    char s[48];
-    sprintf(s, "RISC_OS_Internet_SocketServer=%i", socket);
-    putenv(s);
+  do {
+    int sockets[2];
+    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
 
-    if (getppid() != self) _exit(110);
-    execvp(argv[1], argv + 1);
-    _exit(116);
-  }
-  close(sockets[1]);
+    pid_t self = getpid();
+    pid_t pid = fork();
+    if (pid < 0) {
+      tcsetattr(0, TCSANOW, &oldTioIn);
+      return 109;
+    }
+    if (!pid) {
+      prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+      if (getppid() != self) _exit(110);
 
-  while(true) {
-    int32_t socket_args[3];
-    int s = read(sockets[0], socket_args, sizeof(socket_args));
-    if (s == 0) break;
+      int socket = fcntl(sockets[1], F_DUPFD, 32);
+      char s[48];
+      sprintf(s, "RISC_OS_Internet_SocketServer=%i", socket);
+      putenv(s);
 
-    s = -1;
-    if (socket_args[0] == AF_INET) {
-      s = socket(socket_args[0], socket_args[1], socket_args[2]);
+      lseek(9, SEEK_SET, 0);
+
+      execvp(argv[1], argv + 1);
+      _exit(116);
+    }
+    close(sockets[1]);
+
+    while(true) {
+      int32_t socket_args[3];
+      int s = read(sockets[0], socket_args, sizeof(socket_args));
+      if (s == 0) break;
+
+      s = -1;
+      if (socket_args[0] == AF_INET) {
+        s = socket(socket_args[0], socket_args[1], socket_args[2]);
+      }
+
+      union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+      } u;
+
+      struct msghdr msg = {
+        .msg_control = u.buf,
+        .msg_controllen = sizeof(u.buf)
+      };
+      struct cmsghdr *cmsg;
+      cmsg = CMSG_FIRSTHDR(&msg);
+      cmsg->cmsg_level = SOL_SOCKET;
+      cmsg->cmsg_type = SCM_RIGHTS;
+      cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+      memcpy(CMSG_DATA(cmsg), &s, sizeof(s));
+
+      sendmsg(sockets[0], &msg, 0);
+      close(s);
     }
 
-    union {
-      char buf[CMSG_SPACE(sizeof(int))];
-      struct cmsghdr align;
-    } u;
+    close(sockets[0]);
 
-    struct msghdr msg = {
-      .msg_control = u.buf,
-      .msg_controllen = sizeof(u.buf)
-    };
-    struct cmsghdr *cmsg;
-    cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &s, sizeof(s));
+    // Write a new line to keep output tidy.
+    if (isatty(1)) write(1, "\n", 1);
 
-    sendmsg(sockets[0], &msg, 0);
-    close(s);
-  }
-
-  // Write a new line to keep output tidy.
-  if (isatty(1)) write(1, "\n", 1);
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
+    status = WEXITSTATUS(wstatus);
+  } while(status == 100);
 
   // Restore terminal
   tcsetattr(0, TCSANOW, &oldTioIn);
 
-  int wstatus;
-  waitpid(pid, &wstatus, 0);
-  return WEXITSTATUS(wstatus);
 }
