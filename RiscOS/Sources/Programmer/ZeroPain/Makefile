@@ -41,6 +41,6 @@ CMHGDEPENDS     = cmodule log config errors
 CUSTOMRES       = no
 
 include CModule
-
+ROM_SYMS       += ${PVLIBS}
 
 # Dynamic dependencies:
