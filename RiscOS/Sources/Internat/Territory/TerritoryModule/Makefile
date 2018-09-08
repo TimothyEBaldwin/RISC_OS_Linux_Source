@@ -25,7 +25,7 @@ include AAsmModule
 
 ${MERGEDMSGS}::
 	${MKDIR} ${MERGEDRDIR}${SEP}${TARGET}
-	${FAPPEND} $@ Resources${SEP}${LOCALE}${SEP}Messages Resources${SEP}${TARGET}${SEP}Territory
+	${FAPPEND} $@ Resources${SEP}${TARGET}${SEP}Territory Resources${SEP}${LOCALE}${SEP}Messages
 
 resources: ${MERGEDMSGS}
 	${MKDIR} ${RESFSDIR}
