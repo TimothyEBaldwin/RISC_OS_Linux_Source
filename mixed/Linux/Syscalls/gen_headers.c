@@ -76,8 +76,16 @@
   fprintf(ass, "ix_%s * %i\n", #x, x); \
   fprintf(c, "#define ix_%s %i\n", #x, x);
 
+static FILE *ass, *c;
+
+void swi(const char *name, unsigned n) {
+  fprintf(ass, "%s * 0x%06x\n", name, n);
+  fprintf(c, "#define %s 0x%06x\n", name, n);
+  fprintf(ass, "X%s * 0x%06x\n", name, 0x20000 | n);
+  fprintf(c, "#define X%s 0x%06x\n", name, 0x20000 | n);
+}
+
 int main(void) {
-  FILE *ass, *c;
 
   ass = fopen("LinuxSyscalls", "w");
   c = fopen("h/syscall_defs", "w");
@@ -427,10 +435,13 @@ int main(void) {
   DEF(XATTR_CREATE)
   DEF(__WALL)
 
-  DEF2("struct_ucontext_mcontext", offsetof(struct ucontext, uc_mcontext))
-  DEF2("struct_ucontext_registers", offsetof(struct ucontext, uc_mcontext.arm_r0))
+  DEF2("struct_ucontext_mcontext", offsetof(struct ucontext_t, uc_mcontext))
+  DEF2("struct_ucontext_registers", offsetof(struct ucontext_t, uc_mcontext.arm_r0))
 
 #include "syscall_list.h"
+
+  swi("IXSupport_LinuxSyscall", 0xC0200);
+  swi("IXSupport_ConvertError", 0xC0204);
 
   fputs("\n END\n", ass);
 
