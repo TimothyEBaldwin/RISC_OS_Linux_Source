@@ -60,6 +60,7 @@ union report {
     ev_resize    = CONST(4),
     ev_close     = CONST(5),
     ev_version   = CONST(6),
+    ev_changedbox= CONST(7),
   } reason;
   struct version version;
   struct {
@@ -82,6 +83,7 @@ union command {
     c_version     = CONST(6),
     c_activescreen = CONST(7),
     c_startscreen = CONST(8),
+    c_changedbox  = CONST(9),
   } reason;
   struct version version;
   struct {
@@ -114,5 +116,8 @@ union command {
     int32_t reason;
     ule32 address;
   } startscreen;
+  struct changedbox {
+    int32_t reason, left, bottom, right, top;
+  } changedbox;
   uint8_t pad[33 * 8];
 };
