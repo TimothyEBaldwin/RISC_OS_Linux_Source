@@ -45,11 +45,26 @@ SDL_Window *window;
 SDL_Surface *screen;
 int client_version;
 
-void update_screen() {
-  if (no_updates <= 0 && get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
-    SDL_BlitSurface(screen, nullptr, SDL_GetWindowSurface(window), nullptr);
-    SDL_UpdateWindowSurface(window);
+void update_screen(command *c) {
+  static bool force_fullscreen = true;
+  if (no_updates > 0 || get_file_size(screen_fd) < (height * width) << log2bpp >> 3) {
+    force_fullscreen = true;
+    return;
   }
+
+  if (c && !force_fullscreen) {
+    SDL_Rect r;
+    r.x = c->changedbox.left;
+    r.y = c->changedbox.top;
+    r.w = c->changedbox.right - c->changedbox.left + 1;
+    r.h = c->changedbox.bottom - c->changedbox.top + 1;
+    // cerr << r.x << ' ' << r.y << ' ' << r.w << ' ' << r.h << endl;
+    SDL_BlitSurface(screen, &r, SDL_GetWindowSurface(window), &r);
+  } else {
+    SDL_BlitSurface(screen, nullptr, SDL_GetWindowSurface(window), nullptr);
+  }
+  SDL_UpdateWindowSurface(window);
+  force_fullscreen = false;
 }
 
 void watcher() {
@@ -154,9 +169,12 @@ int main(int argc, char **argv) {
           r.reason = report::ev_mode_sync;
           write(sockets[0], &r.reason, sizeof(r.reason));
           break;
+        case command::c_changedbox:
+          update_screen(&c);
+          break;
         case command::c_suspend:
           no_updates = c.suspend.delay;
-          update_screen();
+          update_screen(nullptr);
           break;
         case command::c_set_palette: {
           SDL_Palette *p;
@@ -218,17 +236,32 @@ int main(int argc, char **argv) {
       case mode_change:
         break;
       case screen_update:
-        if (no_updates >= 0) no_updates -= refresh_period;
-        update_screen();
+        if (no_updates >= 0) {
+          no_updates -= refresh_period;
+          if (client_version >= 3) update_screen(nullptr);
+        }
+        if (client_version >= 3) {
+          report r;
+          r.reason = report::ev_changedbox;
+          send_report(r);
+        } else {
+          update_screen(nullptr);
+        }
         break;
       case SDL_WINDOWEVENT:
-        if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
-          report r;
-          r.reason = report::ev_resize;
-          r.mouse.x = e.window.data1;
-          r.mouse.y = e.window.data2;
-          send_report(r);
-          if (no_updates < 200) no_updates = 200;
+        switch(e.window.event) {
+          case SDL_WINDOWEVENT_RESIZED:{
+            report r;
+            r.reason = report::ev_resize;
+            r.mouse.x = e.window.data1;
+            r.mouse.y = e.window.data2;
+            send_report(r);
+            if (no_updates < 200) no_updates = 200;
+            break;
+          }
+          case SDL_WINDOWEVENT_EXPOSED:
+            SDL_UpdateWindowSurface(window);
+            break;
         }
         break;
       case SDL_QUIT:
