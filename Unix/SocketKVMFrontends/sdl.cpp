@@ -33,7 +33,7 @@ using std::endl;
 
 namespace {
 
-const int refresh_period = 50;
+const int refresh_period = 20;
 const int mode_change = 5555;
 const int screen_update = 5554;
 bool use_close_message;
