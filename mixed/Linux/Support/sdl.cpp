@@ -56,6 +56,7 @@ int width = 640;
 int no_updates = 0;
 SDL_Window *window;
 SDL_Surface *screen;
+int client_version;
 
 void update_screen() {
   if (no_updates <= 0 && get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
@@ -212,7 +213,7 @@ int main(int argc, char **argv) {
           break;
         case command::c_version: {
           resend_keys();
-          struct version v;
+          client_version = c.version.version;
           report r;
           r.reason = report::ev_version;
           r.version.version = 1;
@@ -267,7 +268,7 @@ int main(int argc, char **argv) {
         buttons = static_cast<uint32_t>(e.motion.state);
         r.reason = report::ev_mouse;
         r.mouse.x = static_cast<uint32_t>(e.motion.x);
-        r.mouse.y = height - static_cast<uint32_t>(e.motion.y);
+        r.mouse.y = client_version >= 2 ? static_cast<uint32_t>(e.motion.y):  (height - static_cast<uint32_t>(e.motion.y));
         r.mouse.buttons = buttons;
         send_report(r);
         //std::cerr << "Motion " << r.x << ' ' << r.y << ' ' << r.buttons << std::endl;
