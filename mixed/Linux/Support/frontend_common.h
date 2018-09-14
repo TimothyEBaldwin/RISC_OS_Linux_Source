@@ -40,7 +40,7 @@
 
 #include <bitset>
 
-#include "protocol.h"
+#include "SocketKVM_Protocol.h"
 #include "Keyboard.h"
 
 

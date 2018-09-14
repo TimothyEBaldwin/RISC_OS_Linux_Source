@@ -72,7 +72,7 @@ sandbox_build := $(sandbox_root) $(call robind,/usr /etc/alternatives) --dev /de
 sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
 ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
-frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/protocol.h $(wildcard mixed/Linux/SocketKVM/h/protocol) $(lib_depends)
+frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/SocketKVM_Protocol.h $(lib_depends)
 
 include $(wildcard Support/build.mk)
 
