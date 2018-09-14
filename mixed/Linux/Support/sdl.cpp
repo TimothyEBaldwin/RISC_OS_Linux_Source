@@ -162,6 +162,7 @@ int main(int argc, char **argv) {
               break;
           }
           SDL_SetWindowSize(window, width, height);
+          if (no_updates < 200) no_updates = 200;
           r.reason = report::ev_mode_sync;
           write(sockets[0], &r.reason, sizeof(r.reason));
           break;
