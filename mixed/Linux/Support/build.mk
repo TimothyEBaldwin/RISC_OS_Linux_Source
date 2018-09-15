@@ -177,6 +177,7 @@ endif
 	)
 	git submodule update
 	SOURCE=$$(git rev-parse HEAD)
+	BINARY=$$(cd mixed/Linux/Support/bin && git rev-parse HEAD)
 	#
 ifndef FAST
 	$(MAKE) JOBS=$(JOBS) METHOD=$(METHOD)
@@ -196,7 +197,7 @@ endif
 	echo "# Source and build GIT commits
 	SOURCE=$$SOURCE
 ifneq ($(METHOD), rpcemu)
-	BINARY=$$(cd Support/bin && git rev-parse HEAD)
+	BINARY=$$BINARY
 endif
 	LINUX='$$(uname -a)'
 	" > Support/bin/Support/source
