@@ -36,22 +36,25 @@ PHASES=export_hdrs export_libs resources rom install_rom join
 
 .PHONY: update-binary build check fast
 
-all: build
-ifneq ($(INSECURE), YES)
-all: check
-endif
+all check: Build/Images/$(TARGET)_rom_check
+build: Build/Images/$(TARGET)_rom
 
-RISC_OS: $(if $(wildcard RISC_OS),,all)
+ifeq ($(TARGET), Linux)
+all check: RISC_OS
+endif
 
 build_binds = $(foreach dir,bsd castle cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build /dev/fd/5/Build --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
+Build/src-stamp: $(shell find bsd castle cddl gpl mixed)
+	mkdir -p Build
+	touch Build/src-stamp
+
 ifeq ($(METHOD), rpcemu)
-build: Built/rpcemu/rpcemu Built/boot_iomd_rom
+Build/Images/%_rom: Build/src-stamp | Built/rpcemu/rpcemu Built/boot_iomd_rom
+else ifeq ($(INSECURE), YES)
+Build/Images/%_rom: Build/src-stamp | ${LINUX_ROM}
 else
-  ifneq ($(INSECURE), YES)
-build: Built/sandbox_config_sh
-  endif
-build: ${LINUX_ROM}
+Build/Images/%_rom: Build/src-stamp | Built/sandbox_config_sh ${LINUX_ROM}
 endif
 	set -o pipefail
 	uname -a
@@ -71,7 +74,7 @@ endif
 	  cd Build
 	  #
 	  # Remove old output
-	  ! rm 'Images/$(TARGET)_rom'*
+	  ! rm 'Images/$*_rom'*
 	  #
 	  # Create needed directories
 	  mkdir -p Apps "$${dirs[@]}"
@@ -92,11 +95,11 @@ endif
 	  echo
 	  }
 	  #
-ifeq ($(TARGET), Linux)
-	  # Create version header
-	  echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
-	  cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
-endif
+	  if [[ "$*" = "Linux" ]]; then
+	    # Create version header
+	    echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
+	    cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
+	  fi
 	  cp -ru --preserve=mode,timestamps ../castle/RiscOS/Export .
 	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
 	  cd Apps
@@ -110,7 +113,7 @@ else
 endif
 	#
 ifeq ($(METHOD), rpcemu)
-	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build rpcemu $(TARGET) $(PHASES)' | \
+	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build rpcemu $* $(PHASES)' | \
 	$(BWRAP) --unshare-pid --unshare-net $(sandbox_misc) \
 	--ro-bind /tmp/.X11-unix /tmp/.X11-unix \
 	--proc /proc \
@@ -124,10 +127,10 @@ ifeq ($(METHOD), rpcemu)
 	/r/rpcemu
 else
   ifeq ($(INSECURE), YES)
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
   else
 	. Built/sandbox_config_sh
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
   endif
 	*BASIC
 	VDU 7
@@ -135,25 +138,28 @@ else
 	END
 endif
 	find Build/Images -type l -delete
-	! mv 'Build/Images/$(TARGET)_rom',??? 'Build/Images/$(TARGET)_rom'
-	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build/Images/$(TARGET)_rom'
+	! mv 'Build/Images/$*_rom',??? 'Build/Images/$*_rom'
+	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build/Images/$*_rom'
 	true
-ifeq ($(TARGET), Linux)
-	chmod +x 'Build/Images/$(TARGET)_rom'
-	ln -f Build/Images/Linux_rom Build/Images/Linux_rom_keep
-	mv Build/Images/Linux_rom_keep Built/RISC_OS
+
+Build/Images/IOMD32_rom_check: Build/Images/IOMD32_rom Built/rpcemu/rpcemu
+	mixed/Linux/Tests/runner_rpcemu.sh Build/Images/IOMD32_rom
+	touch Build/Images/IOMD32_check
+
+ifeq ($(INSECURE), YES)
+Build/Images/Linux_rom_check: Build/Images/Linux_rom
+	chmod +x Build/Images/Linux_rom
+	touch Build/Images/Linux_rom_check
+else
+Build/Images/Linux_rom_check: Build/Images/Linux_rom Built/sandbox_config_sh
+	chmod +x Build/Images/Linux_rom
+	mixed/Linux/Tests/runner.sh Build/Images/Linux_rom
+	touch Build/Images/Linux_rom_check
+endif
+
+RISC_OS: Build/Images/Linux_rom_check
+	cp --preserve=mode,xattr --reflink=auto Build/Images/Linux_rom Built/RISC_OS
 	ln -sf Built/RISC_OS RISC_OS
-endif
-
-ifeq ($(TARGET), IOMD32)
-check: Built/rpcemu/rpcemu
-	mixed/Linux/Tests/runner_rpcemu.sh 'Build/Images/$(TARGET)_rom'
-endif
-
-ifeq ($(TARGET), Linux)
-check: Built/sandbox_config_sh
-	mixed/Linux/Tests/runner.sh ./RISC_OS
-endif
 
 fast: PHASES=install_rom join
 fast: check
