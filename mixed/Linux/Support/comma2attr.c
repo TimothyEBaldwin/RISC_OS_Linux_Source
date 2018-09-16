@@ -48,10 +48,9 @@
 #include <dirent.h>
 #include <getopt.h>
 
+#ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1 << 0)
-static inline int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, unsigned int flags) {
-  return syscall(SYS_renameat2, olddirfd, oldpath, newdirfd, newpath, flags);
-}
+#endif
 
 struct ro_attr {
   unsigned load, exec, attributes;
@@ -177,8 +176,11 @@ static void process(int dirfd, const char *source, char *path_end) {
 
   *end = 0;
   if (strcmp(source, dest)) {
-    r = renameat2(AT_FDCWD, source, AT_FDCWD, dest, RENAME_NOREPLACE);
-    if (r && errno == ENOSYS) r = rename(source, dest);
+#ifdef SYS_renameat2
+    r = syscall(SYS_renameat2, AT_FDCWD, source, AT_FDCWD, dest, RENAME_NOREPLACE);
+    if (r && errno == ENOSYS)
+#endif
+      r = rename(source, dest);
     if (r) {
       fprintf(stderr, "Unable to rename %s to %s: %s\n", path, dest, strerror(errno));
       return_code |= 16;
