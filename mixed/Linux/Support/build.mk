@@ -49,7 +49,7 @@ ifeq ($(METHOD), rpcemu)
 build: Built/rpcemu/rpcemu Built/boot_iomd_rom
 else
   ifneq ($(INSECURE), YES)
-build: Built/qemu_sandbox
+build: Built/sandbox_config_sh
   endif
 build: ${LINUX_ROM}
 endif
@@ -126,8 +126,8 @@ else
   ifeq ($(INSECURE), YES)
 	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
   else
-	. Built/qemu_sandbox
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${QEMU_sandbox[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+	. Built/sandbox_config_sh
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $(TARGET) $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
   endif
 	*BASIC
 	VDU 7
@@ -151,7 +151,7 @@ check: Built/rpcemu/rpcemu
 endif
 
 ifeq ($(TARGET), Linux)
-check: Built/qemu_sandbox
+check: Built/sandbox_config_sh
 	mixed/Linux/Tests/runner.sh ./RISC_OS
 endif
 
