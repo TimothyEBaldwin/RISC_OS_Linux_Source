@@ -69,7 +69,7 @@ endif
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
 sandbox_misc := $(sandbox_root) $(call robind,/usr/bin /usr/lib* /etc/alternatives)
 sandbox_build := $(sandbox_root) $(call robind,/usr /etc/alternatives) --dev /dev --tmpfs /usr/local
-sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
+sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all $(if $(use_seccomp), --seccomp 9 9< <(Built/gen_seccomp $(1)), --new-session) --proc /proc --dir /tmp --dir /dev/shm
 ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
 frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/SocketKVM_Protocol.h $(lib_depends)
@@ -186,6 +186,7 @@ Built/qemu-arm: Built/qemu_Makefile_stamp
 Built/sandbox_config_sh: $(QEMU) Built/gen_seccomp
 	set -o pipefail
 	exec > Built/sandbox_config_sh
+	echo use_seccomp=$(use_seccomp)
 ifeq ($(QEMU),/usr/bin/env)
 	echo QEMU=
 
@@ -207,6 +208,10 @@ Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
 	set -o pipefail
 	$(BWRAP) --ro-bind / /  true
 	#
+	if $(BWRAP) --seccomp 9 9< <(Built/gen_seccomp) --ro-bind / /  true; then
+	  use_seccomp=true
+	fi
+	#
 	for i in /bin /sbin /lib*; do
 	  if [[ -L $$i ]]; then
 	    sandbox_root+=(--symlink "$$(readlink "$$i")" "$$i")
@@ -221,7 +226,8 @@ Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
 	elif ! $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS $$($(call ldd2sandbox,"$$QEMU1")) --ro-bind "$$QEMU1" /qemu-arm /qemu-arm /RISC_OS; then
 	  QEMU1=Built/qemu-arm
 	fi
-	echo "sandbox_root:=$${sandbox_root[@]@Q}
+	echo "use_seccomp:=$$use_seccomp
+	sandbox_root:=$${sandbox_root[@]@Q}
 	QEMU:=$$QEMU1" > $@
 
 HardDisc4: | $(HARDDISC4)

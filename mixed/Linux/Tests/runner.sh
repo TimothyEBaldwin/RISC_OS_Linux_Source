@@ -16,15 +16,18 @@ exec </dev/null 3>/dev/null 2>&1 > >(cat)
 . Built/sandbox_config_sh
 
 run() {
+  if [[ $use_seccomp = "true" ]]; then
+    seccomp="--seccomp 9"
+  fi
   timeout --foreground -sKILL 60 \
-  ${BWRAP:=bwrap} --unshare-all --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp $1) \
+  ${BWRAP:=bwrap} --unshare-all --proc /proc --dev /dev --dir /tmp --new-session $seccomp 9< <(Built/gen_seccomp $1) \
   --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests "${auto_bwrap_args[@]}" $QEMU \
   /RISC_OS "${@:2}"
 }
 
 set -x
 
-if [[ $QEMU -eq "" ]]; then
+if [[ $QEMU = "" ]]; then
   # Test ptrace SWI implemnation
   RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run -p --noaborts
 fi
