@@ -71,14 +71,15 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 
 ## Linux RISC OS command line options
 
-| Option       | Action                                          |
-| ---          | ---                                             |
-| --help       | Display help message                            |
-| --isreboot   | Indicate hard reset to RISC OS (not power on)   |
-| --nvram FILE | Filename for nvram                              |
-| --noaborts   | Disable aborts - RISC OS will die with SIGSEGV  |
-| --noseccomp  | Disable seccomp support                         |
-| --notimers   | Disable HAL timers                              |
+| Option           | Action                                          |
+| ---              | ---                                             |
+| --abort-on-input | Abort on debug terminal input                   |
+| --help           | Display help message                            |
+| --isreboot       | Indicate hard reset to RISC OS (not power on)   |
+| --nvram FILE     | Filename for nvram                              |
+| --noaborts       | Disable aborts - RISC OS will die with SIGSEGV  |
+| --noseccomp      | Disable seccomp support                         |
+| --notimers       | Disable HAL timers                              |
 
 ## Linux RISC OS error codes
 
@@ -101,6 +102,7 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 |     114     | RISC OS kernel returned to HAL |
 |     115     | Interrupt test failed |
 |     116     | Exec failed |
+|     117     | HAL_DebugRX called and --abort-on-input given. |
 
 
 ## To do List
