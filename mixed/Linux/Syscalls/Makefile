@@ -27,7 +27,6 @@
 #
 
 include Makefiles:StdTools
-include Makefiles:HostTools
 
 COMPONENT = LinuxSyscalls
 
@@ -51,4 +50,4 @@ export_resources:
 	@Echo LinuxSyscalls: no resources
 
 clean:
-        ${RM} h.syscalls
+	${RM} h.syscalls

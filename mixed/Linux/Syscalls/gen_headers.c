@@ -69,8 +69,8 @@
 #define DEF(x) DEF2(#x, x)
   
 #define SYSDEF(x) \
-  fprintf(ass, "%s * 0x%x\n", #x, x); \
-  fprintf(c, "#define %s 0x%x\n", #x, x);
+  fprintf(ass, "%s * %i\n", #x, x); \
+  fprintf(c, "#define %s %i\n", #x, x);
 
 #define EDEF(x) \
   fprintf(ass, "ix_%s * %i\n", #x, x); \
