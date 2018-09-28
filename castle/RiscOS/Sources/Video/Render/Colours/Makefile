@@ -51,7 +51,6 @@ clean::
 # Static dependencies:
 #
 MakeTables: MkTables.maketables
-	${MKDIR} Tables
         ${XWIPE} Tables.* ${WFLAGS}
         ${RUN}MkTables.maketables @
         ${SQUASH} Tables.4greys
