@@ -16,11 +16,6 @@ this archive and type the command
 and wait for the erase/program/verify cycle to complete. This will take
 around 30 seconds single tasking.
 
-Some components in this archive are released under the licence (included in
-this archive as Licence_v1_1.pdf), or see:
-
-  http://www.castle-technology.co.uk/riscosbaselicence.htm
-
 
 IMPORTANT
 =========
