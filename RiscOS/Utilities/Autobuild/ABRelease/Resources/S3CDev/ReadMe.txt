@@ -9,9 +9,4 @@ Using this ROM image in your machine should only be done if you are confident
 that you know what you are doing! It is likely to be functionally incomplete
 and probably unstable in various ways.
 
-Some components in this archive are released under the licence (included in
-this archive as Licence_v1_1.pdf), or see:
-
-  http://www.castle-technology.co.uk/riscosbaselicence.htm
-
 -- RISC OS Open

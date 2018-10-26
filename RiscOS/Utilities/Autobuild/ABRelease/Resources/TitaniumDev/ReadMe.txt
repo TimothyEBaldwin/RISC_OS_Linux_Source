@@ -20,11 +20,6 @@ Alternatively, it is possible to temporarily 'soft load' the ROM image
 before committing it into the QSPI boot flash. Then, if something goes wrong
 it's possible to press the reset button and go back to the last flashed ROM.
 
-Some components in this archive are released under the licence (included in
-this archive as Licence_v1_1.pdf), or see:
-
-  http://www.castle-technology.co.uk/riscosbaselicence.htm
-
 
 IMPORTANT
 =========
