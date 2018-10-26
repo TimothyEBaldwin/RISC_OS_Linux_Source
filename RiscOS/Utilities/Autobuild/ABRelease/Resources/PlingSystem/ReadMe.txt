@@ -20,9 +20,4 @@ Double click on !SysMerge.
 message if it fails for any reason. It will copy each module into 
 your !System directory (unless an even later version is already installed).
 
-Some components in this archive are released under the licence (included in
-this archive as Licence_v1_1.pdf), or see:
-
-  http://www.castle-technology.co.uk/riscosbaselicence.htm
-
 -- RISC OS Open
