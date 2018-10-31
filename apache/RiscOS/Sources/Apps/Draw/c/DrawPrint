@@ -1,0 +1,633 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -> c.DrawPrint
+ *
+ * Print functions for Draw
+ *
+ * Author:  Richard Manby, David Elworthy
+ * Version: 0.13
+ * History: 0.10 - 12 June 1989 - header added. Old code weeded.
+ *                                upgraded to visdelay
+ *                 16 June 1989 - upgraded to msgs
+ *          0.11 - 16 Aug  1989 - movable printer limits
+ *                 23 Aug  1989 - bug fixes, encapsulated printer output.
+ *          0.12 - 25 Aug  1989 - fully settable printer limits
+ *          0.13 - 29 Aug  1989 - anticlockwise landscape printing.
+ *
+ * Since Draw always works on whole pages, printer output is generated as an
+ * 'illustration' (e.g. as encapsulated postscript). In future, we might
+ * want to have Draw split up the diagram into pages. In this case, the call
+ * at SINGLEPAGE must change.
+ * Ha! Now it doesn't do this any more!! J R C 18th Nov 1993
+ *
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <swis.h>
+#include <math.h>
+#include <swis.h>
+#include "Global/FileTypes.h"
+
+#include "os.h"
+#include "visdelay.h"
+#include "msgs.h"
+#include "werr.h"
+#include "print.h"
+#include "xferrecv.h"
+#include "xfersend.h"
+#include "drawmod.h"
+#include "jpeg.h"
+#include "dbox.h"
+#include "font.h"
+
+#include "ftrace.h"
+#include "guard.h"
+
+#include "Draw.h"
+#include "DrawAction.h"
+#include "DrawDispl.h"
+#include "DrawFileIO.h"
+#include "DrawObject.h"
+#include "DrawPrint.h"
+
+#define strnul(s) ((s) [0] == '\0')
+
+/* Defines for options that might want to be taken out again */
+#define SINGLEPAGE 0
+
+/* Shift applies to ensure box contains border pixels */
+#define BorderShift dbc_OnePoint /*was dbc_HalfInch. JRC 14 June 1990*/
+
+printer_typ draw_printer;        /* description of printer page size etc */
+
+int print_copies = 1;            /* global number of copies to print */
+
+/* Sensible values for no printer */
+printer_typ draw_no_printer =
+{ 0,                                /* Not present        */
+  { {0,0, dbc_A4short,dbc_A4long},  /* show limits as :- A4 portrait */
+    {0,0, dbc_A4short,dbc_A4long},  /*                               */
+  }
+};
+
+/* Check availability of printer, its paper size and visible area */
+static void pagelimits (printer_typ *detailsp)
+
+{ os_error *error;
+  print_infostr info;
+  print_pagesizestr page;
+
+  ftracef0 ("draw_print: pagelimits\n");
+
+  *detailsp = draw_no_printer;
+
+  if ((error = print_info (&info)) != NULL)
+  { ftracef1 ("print_info said '%s'\n", error->errmess);
+    return; /* No printer found */
+  }
+
+  ftracef2 ("Printer driver %s version %d\n",
+      info.description, info.version);
+  ftracef2 ("%d x %d resolution (pixels/inch)\n", info.xres, info.yres);
+  ftracef2 ("features 0x%X (driver %s support PDriver_DeclareFont)\n",
+      info.features, (info.features & 1 << 19) != 0? "does": "does not");
+
+  if ((error = print_pagesize (&page)) != NULL)
+  { ftracef1 ("print_pagesize said '%s'\n", error->errmess);
+    return; /*no printer, really*/
+  }
+
+  ftracef4 ("page size %d x %d (ie %d x %d inches)\n",
+      page.xsize, page.ysize, page.xsize/72000, page.ysize/72000);
+  ftracef4 ("visible portion %d, %d, %d, %d\n",
+      page.bbox.x0, page.bbox.y0, page.bbox.x1, page.bbox.y1);
+  detailsp->present = 1;
+
+  /* printer page size & visible area returned in 1/72000 inch */
+  /* so scale by 16/25 ((180/72000) << 8) to give dBase coords */
+  page.xsize = draw_fontToDraw (page.xsize);  /* top right in dBc */
+  page.ysize = draw_fontToDraw (page.ysize);
+
+  draw_box_scale ((draw_bboxtyp *) &page.bbox, (draw_bboxtyp *) &page.bbox,
+      (double) 16/25);
+
+  /*>>> Maybe we should check printer can do landscape here? */
+  detailsp->box.pagelimit.x0 = 0;           /* bottom left */
+  detailsp->box.pagelimit.y0 = 0;           /* always 0,0  */
+  detailsp->box.pagelimit.x1 = page.xsize;  /* top right in dBc */
+  detailsp->box.pagelimit.y1 = page.ysize;
+
+  detailsp->box.visiblelimit.x0 = page.bbox.x0; /* usable area  */
+  detailsp->box.visiblelimit.y0 = page.bbox.y0; /* in dBc       */
+  detailsp->box.visiblelimit.x1 = page.bbox.x1;
+  detailsp->box.visiblelimit.y1 = page.bbox.y1;
+}
+
+/* draw_print_recachepagelimits (void)                                   */
+/*                                                                       */
+/* Read the actual printer details,                                      */
+/*   if different from the current ones, force a redraw of any diagram   */
+/*   showing the limits                                                  */
+
+void draw_print_recachepagelimits (void)
+
+{ diagrec *diag;
+  printer_typ old = draw_printer;    /* For later comparison */
+
+  ftracef0 ("draw_print_recachepagelimits\n");
+  pagelimits (&draw_printer);
+
+  /*Compare the pagesize & usable area of the current details with the old.
+    If printer page details have changed, force a redraw of each diagram
+    (that exists) that is showing the printer limits*/
+  if (memcmp (&draw_printer.box, &old.box, sizeof (printmargin_typ)) != 0)
+    for (diag = draw_startdiagchain; diag != 0; diag = diag->nextdiag)
+    { paperstate_typ *paper = &diag->misc->paperstate;
+
+      if (/*(paper->options & Paper_Show) != 0 &&*/
+          (paper->options & Paper_Default) != 0)
+      { ftracef0 ("redrawing with new limits\n");
+        /*draw_displ_show_printmargins (diag);*/
+
+        /*Copy new limits into the diagram*/
+        if ((paper->options & Paper_Landscape) != 0)
+          draw_action_swap_box (&paper->setlimit,
+              &draw_printer.box.pagelimit);
+        else
+          paper->setlimit = draw_printer.box.pagelimit;
+
+        /*draw_displ_show_printmargins (diag);*/
+        draw_displ_forceredraw (diag);
+      }
+    }
+}
+
+/* Assumed to be called shortly after a 'print_recachepagelimits()' and
+    should have the same (is/not)present state*/
+char *draw_printer_name (void)
+
+{ print_infostr info;
+
+  ftracef0 ("draw_printer_name\n");
+  return print_info (&info) != NULL? NULL: info.description;
+}
+
+#if 0 /*Not used. J R C 28th Sep 1993*/
+/* Exit, closing files, whether in error state or not */
+static os_error *closefile_exit (os_error *err /*Error so far*/,
+    int currjob)
+
+{ os_regset  blk;   /* Close destination file */
+  os_error  *close_err = 0;
+
+  ftracef0 ("draw_print: closefile_exit\n");
+  blk.r[0]  = 0;
+  blk.r[1]  = currjob;
+  close_err = os_find (&blk);
+
+  if (!err && close_err) err = close_err;
+
+  visdelay_end ();
+
+  ftracef1 ("draw_print: closefile_exit: returning 0x%X\n", err);
+  return err;
+}
+
+/* End of job exit, whether in error state or not */
+static os_error *endjob_exit (os_error *err, int currjob, int oldjob)
+
+{ os_error *select_err = 0;
+
+  ftracef0 ("draw_print: endjob_exit\n");
+  if (!err) err = print_endjob (currjob);  /* end normally */
+  if (err) print_abortjob (currjob); /* Error - abort printing */
+
+  select_err = print_selectjob (oldjob, 0, &oldjob);/* Reselect old print job */
+  if (!err && select_err) err = select_err;
+
+  /* Return through close file */
+  return closefile_exit (err, currjob);
+}
+#endif
+
+/*Set transformation matrix, and position.
+  Entry
+      diag -> diagram to print
+      pagestr -> output from PDriver_PageSize
+  Exit
+      transmat, position -> data suitable for PDriver_GiveRectangle, except that the
+          clipping rectangle still has to be moved to the origin
+*/
+
+static void set_page (diagrec *diag, print_transmatstr *transmat,
+    print_pagesizestr *page, print_positionstr *position, draw_bboxtyp *pictureBB)
+
+{ draw_bboxtyp print_limit;
+  BOOL rotate;
+  double xscale, yscale;
+
+  ftracef0 ("draw_print: set_page\n");
+
+  /* Find the page limit as we would display it */
+  rotate = draw_print_get_limits (diag, &print_limit, NULL);
+
+  ftracef1 ("rotate %s\n", rotate? "TRUE": "FALSE");
+  ftracef2 ("pagesize is (%d, %d)\n", page->ysize, page->xsize);
+  ftracef4 ("print limits are ((%d %d) (%d %d))\n",
+      print_limit.x0, print_limit.y0, print_limit.x1, print_limit.y1);
+
+  if (rotate)
+  { xscale = (double) page->ysize/draw_drawToFont (print_limit.x1 -
+        print_limit.x0);
+    yscale = (double) page->xsize/draw_drawToFont (print_limit.y1 -
+        print_limit.y0);
+
+    ftracef0 ("Rotation needed (e.g. into landscape mode)\n");
+
+    transmat->xx = transmat->yy = 0;
+    transmat->xy = (int) (-0x10000*xscale);
+    transmat->yx = (int) ( 0x10000*yscale);
+
+    /* Form position (scale and convert to font units) */
+        /*Fix bug: use the right formula for this. JRC 18th Jan 1995*/
+    position->dx = draw_drawToFont (yscale*(pictureBB->y0 - print_limit.y0));
+    position->dy = draw_drawToFont (xscale*(-pictureBB->x0 + print_limit.x1));
+  }
+  else
+  { xscale = (double) page->xsize/draw_drawToFont (print_limit.x1 -
+        print_limit.x0);
+    yscale = (double) page->ysize/draw_drawToFont (print_limit.y1 -
+        print_limit.y0);
+
+    ftracef0 ("No rotation needed\n");
+    transmat->xx = (int) (0x10000*xscale);
+    transmat->xy = transmat->yx = 0;
+    transmat->yy = (int) (0x10000*yscale);
+
+    /* Form position (scale and convert to font units) */
+  #if 1 /*JRC 16th Jan 1995*/
+    position->dx = draw_drawToFont (xscale*(pictureBB->x0 - print_limit.x0));
+    position->dy = draw_drawToFont (yscale*(pictureBB->y0 - print_limit.y0));
+  #else
+    position->dx = -draw_drawToFont (xscale*(diag->misc->paperstate.setlimit.x0 - pictureBB->x0));
+    position->dy = -draw_drawToFont (yscale*(diag->misc->paperstate.setlimit.y0 - pictureBB->y0));
+  #endif
+  }
+
+  ftracef4 ("set_page() gives transmat ((%6.3f %6.3f) (%6.3f %6.3f))\n",
+      (double) transmat->xx/0x10000, (double) transmat->xy/0x10000,
+      (double) transmat->yx/0x10000, (double) transmat->yy/0x10000);
+}
+
+/*Most of the old draw_print_printall() moved to here to allow it be called
+  from draw_file: exportEPSF. J R C 28th Sep 1993*/
+
+os_error *draw_print_to_file (diagrec *diag, int file, BOOL illustration)
+
+{ os_error *error = NULL;
+  print_infostr info;
+  print_pagesizestr page;
+  print_transmatstr transmat; /*Transformation to apply to rect */
+  print_positionstr position; /*Place where BL is to appear on page */
+  print_box inputBB, clip; /*Rect to be plotted, and clip for it */
+  draw_bboxtyp pictureBB;
+  int oldjob, ident, i;
+  BOOL more, done_begin = FALSE, done_select = FALSE;
+  draw_objptr hdrptr, limit;
+  draw_objcoord org;
+  char fontusetab [256];
+
+  ftracef0 ("draw_print_to_file\n");
+  hdrptr.bytep = diag->paper + diag->misc->solidstart;
+  limit.bytep  = diag->paper + diag->misc->solidlimit;
+
+  draw_displ_scalefactor = 1.0;
+
+  ftracef0 ("draw_print_to_file: print_info\n");
+  if ((error = print_info (&info)) != NULL)
+    goto finish;
+
+  ftracef1 ("Printer driver: %s\n", (int) info.description);
+  ftracef1 ("  version  %d\n", info.version);
+  ftracef1 ("  identity %d\n", info.identity);
+  ftracef2 ("  resolution %d x %d (pixels/inch)\n", info.xres, info.yres);
+  ftracef2 ("  halftone  %d x %d (repeats/inch)\n", info.xhalf, info.yhalf);
+  ftracef1 ("  features=%8x\n", info.features);
+
+  ftracef0 ("draw_print_to_file: print_pagesize\n");
+  if ((error = print_pagesize (&page)) != NULL)
+    goto finish;
+
+  ftracef4 ("  page size %dx%d (ie %dx%d inches)\n",
+      page.xsize, page.ysize, page.xsize/72000, page.ysize/72000);
+  ftracef4 ("visible portion %d,%d,%d,%d\n",
+      page.bbox.x0, page.bbox.y0, page.bbox.x1, page.bbox.y1);
+  ftracef1 ("printing %d copies\n\n", print_copies);
+
+#if 1
+  /*Reinstated by popular demand ... JRC 6th Dec 1994*/
+  ftracef0 ("draw_print_to_file: bounding file\n");
+  draw_obj_bound_all (diag, &pictureBB);
+
+  if (pictureBB.x0 > pictureBB.x1 || pictureBB.y0 > pictureBB.y1)
+  { error = draw_make_oserror ("Print2");
+    goto finish;
+  }
+
+  /* Expand the BBox to stop missing pixel problems */
+  ftracef0 ("draw_print_to_file: draw_widen_box\n");
+  draw_widen_box (&pictureBB, BorderShift, BorderShift);
+
+  inputBB.x0 = draw_draw_to_os (pictureBB.x0); /* In OSCoords */
+  inputBB.y0 = draw_draw_to_os (pictureBB.y0);
+  inputBB.x1 = draw_draw_to_os (pictureBB.x1);
+  inputBB.y1 = draw_draw_to_os (pictureBB.y1);
+
+  ftracef4 ("inputBB: (%d, %d), (%d, %d))\n",
+      inputBB.x0, inputBB.y0, inputBB.x1, inputBB.y1);
+#else
+  inputBB.x0 = inputBB.y0 = 0;
+  /* SMC: Convert from 1/72000 inch to OS units */
+  inputBB.x1 = inputBB.y1 = draw_fontToOS (MAX (page.xsize, page.ysize));
+#endif
+
+  ftracef0 ("draw_print_to_file: set_page\n");
+  set_page (diag, &transmat, &page, &position, &pictureBB);
+
+  visdelay_begin ();
+  done_begin = TRUE;
+
+  if (illustration)
+  { /*Print as an illustration*/
+    if ((error = print_selectillustration (file, 0, &oldjob)) != NULL)
+      goto finish;
+  }
+  else
+  { /* Non encapsulated only */
+    ftracef0 ("calling print_selectjob\n");
+    if ((error = print_selectjob (file, 0, &oldjob)) != NULL)
+      goto finish;
+    ftracef0 ("called print_selectjob\n");
+  }
+  done_select = TRUE;
+
+  /*Get the list of fonts that this diagram uses.*/
+  for (i = 0; i < 256; i++)
+    fontusetab [i] = FALSE;
+
+  limit.bytep = diag->paper + diag->misc->solidlimit;
+  for (hdrptr.bytep = diag->paper + diag->misc->solidstart;
+      hdrptr.bytep < limit.bytep; hdrptr.bytep += hdrptr.objhdrp->size)
+    draw_file_fontuse_object (hdrptr, fontusetab);
+
+  if ((info.features & 1 << 29) != 0)
+  { /*Declare them to the printer driver.*/
+    for (i = 1; i < 256; i++) /*FIX RP-0161 JRC 21 Oct '91 Don't look at 0*/
+      if (fontusetab [i])
+      { ftracef1 ("declaring font %s\n", draw_fontcat.name [i]);
+        if ((error = os_swix3 (PDriver_DeclareFont, /*handle*/ 0,
+            /*name*/  draw_fontcat.name [i], /*flags*/ 0)) != NULL)
+          goto finish;
+      }
+
+    /*No more fonts*/
+    if ((error = os_swix3 (PDriver_DeclareFont, /*handle*/ 0,
+        /*name*/ NULL, /*flags*/ 0)) != NULL)
+      goto finish;;
+  }
+
+  ftracef4 ("calling PDriver_GiveRectangle with T = ((%d %d) (%d %d))\n",
+     transmat.xx, transmat.xy, transmat.yx, transmat.yy);
+  ftracef2 ("P = (%d %d)\n", position.dx, position.dy);
+  if ((error = print_giverectangle (42, &inputBB, &transmat, &position,
+      (int)WHITE)) != NULL)
+    goto finish;
+
+  /*If pdriver supports prescan, use it. J R C 4th Oct 1994*/
+  if ((error = print_drawpage
+      (print_copies | ((info.features & 1 << 13) != 0? 1 << 24: 0), 0, 0,
+      &clip, &more, &ident)) != NULL)
+    goto finish;
+
+  org.x = org.y = 0;
+
+  while (more)
+  { ftracef0 ("draw_print_to_file: draw_box_scale\n");
+    draw_box_scale ((draw_bboxtyp *) &clip, (draw_bboxtyp *) &clip,
+        256/draw_displ_scalefactor);
+
+    ftracef0 ("draw_print_to_file: draw_displ_do_objects\n");
+    if ((error = draw_displ_do_objects (diag, diag->misc->solidstart,
+        diag->misc->solidlimit, &org, (draw_bboxtyp *) &clip)) != NULL)
+      goto finish;
+
+    ftracef0 ("draw_print_to_file: print_getrectangle\n");
+    if ((error = print_getrectangle (&clip, &more, &ident)) != NULL)
+      goto finish;
+  }
+
+finish:
+  if (done_select)
+  { os_error *error1;
+
+    if (error == NULL)
+    { ftracef0 ("calling endjob\n");
+      error1 = print_endjob (file);  /* end normally */
+    }
+    else
+    { ftracef0 ("calling abortjob\n");
+      error1 = print_abortjob (file); /* Error - abort printing */
+    }
+    if (error == NULL) error = error1;
+
+    error1 = print_selectjob (oldjob, 0, &oldjob);
+    if (error == NULL) error = error1;
+  }
+
+  if (done_begin)
+    visdelay_end ();
+
+  return error;
+}
+
+/*This now just opens a file and then calls draw_print_to_file(). J R C
+  28th Sep 1993*/
+
+os_error *draw_print_printall (diagrec *diag)
+
+{ os_error *error = NULL;
+  int currjob = 0;
+  os_regset blk;
+
+  ftracef1 ("draw_print_printall (0x%X)\n", diag);
+
+  blk.r [0] = 0x8F; /*OpenOut, Ignore file$path, give err if a dir.! */
+  ftracef1 ("set R0 = %d\n", blk.r [0]);
+  blk.r [1] = (int) "<Draw$PrintFile>";
+  ftracef1 ("set R1 -> \"%s\"\n", blk.r [1]);
+  if ((error = os_find (&blk)) != NULL)
+    goto finish;
+  ftracef0 ("OS_Find returned successfully\n");
+  if (blk.r [0] == 0)
+  { error = draw_make_oserror ("Print3");
+    goto finish;
+  }
+  ftracef0 ("OS_Find returned a valid handle\n");
+  currjob = blk.r [0];
+  ftracef1 ("OSFind_OpenoutNoPath gave handle %d\n", currjob);
+
+  ftracef0 ("calling draw_print_to_file ...\n");
+  if ((error = draw_print_to_file (diag, currjob, FALSE)) != NULL)
+    goto finish;
+  ftracef0 ("calling draw_print_to_file ... done\n");
+
+finish:
+  ftracef0 ("gone to finish\n");
+  if (currjob != 0)
+  { os_error *error1;
+
+    blk.r [0] = 0;
+    blk.r [1] = currjob;
+    error1 = os_find (&blk);
+    if (error == NULL) error = error1;
+  }
+
+#if TRACE
+  if (error != NULL)
+    ftracef1 ("Error: %s\n", error->errmess);
+#endif
+
+  ftracef1 ("return 0x%X\n", error);
+  return error;
+}
+
+/*FIX G-RO-9224 JRC 18 Oct '91 New function to put the diagram on the
+  printer queue for later printing.*/
+
+os_error *draw_print_queue (diagrec *diag, int copies)
+
+{ char *leaf;
+
+  ftracef0 ("draw_print_queue\n");
+
+  /*Check that there is a printer.*/
+  if (draw_printer_name () == NULL)
+    return draw_make_oserror ("Print1");
+
+  print_copies = copies;
+
+  if (!strnul (diag->misc->filename) &&
+      (leaf = strrchr (diag->misc->filename, '.')) != NULL)
+    leaf++;
+  else
+    leaf = msgs_lookup ("DrawUn");
+
+  if (!xfersend_print (FileType_Draw, leaf,
+      diag->misc->solidlimit - diag->misc->solidstart,
+      &draw_file_file_saveall, &draw_file_ram_saveall, &draw_file_printall,
+      diag))
+    return draw_make_oserror ("Print3");
+
+  return NULL;
+}
+
+/* Returns the page and visible boxes, rotated so that the longer edge aligns
+ * with that of the given box. visi may be NULL.
+ */
+BOOL draw_print_get_limits (diagrec *diag, draw_bboxtyp *page,
+    draw_bboxtyp *visi)
+
+{ draw_bboxtyp *pset = &draw_printer.box.pagelimit;
+  draw_bboxtyp *vset = &draw_printer.box.visiblelimit;
+  BOOL
+    paper_landscape = pset->x1 - pset->x0 > pset->y1 - pset->y0,
+      /*whether the user has selected a sideways paper size (strange)*/
+    diagram_landscape =
+        (diag->misc->paperstate.options & Paper_Landscape) != 0,
+      /*whether the diagram is sideways*/
+    rotate = paper_landscape != diagram_landscape;
+
+  ftracef0 ("draw_print_get_limits\n");
+  ftracef4 ("page limit: (%d, %d), (%d, %d))\n",
+      pset->x0, pset->y0, pset->x1, pset->y1);
+  ftracef4 ("visible limit: (%d, %d), (%d, %d))\n",
+      vset->x0, vset->y0, vset->x1, vset->y1);
+  ftracef2 ("paper_landscape %s, diagram_landscape %s\n",
+      paper_landscape? "TRUE": "FALSE", diagram_landscape? "TRUE": "FALSE");
+
+  memcpy (page, &diag->misc->paperstate.setlimit, sizeof *page);
+      /*was *page = diag->misc->paperstate.setlimit; - corrupts LR in C4.00.
+         J R C 26th Jan 1994*/
+
+  if (visi)
+  { draw_bboxtyp shift;
+    double xscale, yscale;
+
+    /* Find size of printer margin */
+    shift.x0 = vset->x0 - pset->x0; /* > 0 */
+    shift.y0 = vset->y0 - pset->y0; /* > 0 */
+    shift.x1 = vset->x1 - pset->x1; /* < 0 */
+    shift.y1 = vset->y1 - pset->y1; /* < 0 */
+
+    if (rotate)
+    { /* Find scaling from printer's page size to user's one */
+      xscale = ((double) page->y1 - (double) page->y0)/
+          ((double) pset->x1 - (double) pset->x0);
+      yscale = ((double) page->x1 - (double) page->x0)/
+          ((double) pset->y1 - (double) pset->y0);
+
+      /* Rotation needed: by -90 degrees (anticlockwise) */
+      visi->x0 = page->x0 - (int) (yscale*shift.y1);
+      visi->y0 = page->y0 + (int) (xscale*shift.x0);
+      visi->x1 = page->x1 - (int) (yscale*shift.y0);
+      visi->y1 = page->y1 + (int) (xscale*shift.x1);
+    }
+    else
+    { /* Find scaling from printer's page size to user's one */
+      xscale = ((double) page->x1 - (double) page->x0)/
+          ((double) pset->x1 - (double) pset->x0);
+      yscale = ((double) page->y1 - (double) page->y0)/
+          ((double) pset->y1 - (double) pset->y0);
+
+      /* Form visible limit - no rotation */
+      visi->x0 = page->x0 + (int) (xscale*shift.x0);
+      visi->y0 = page->y0 + (int) (yscale*shift.y0);
+      visi->x1 = page->x1 + (int) (xscale*shift.x1);
+      visi->y1 = page->y1 + (int) (yscale*shift.y1);
+    }
+  }
+
+  ftracef1 ("draw_print_get_limits: rotate %s\n", rotate? "TRUE": "FALSE");
+  return rotate;
+}
+
+BOOL draw_print_have_postscript (void)
+
+{  os_error *error = NULL;
+   int current_driver;
+
+   if ((error = os_swix1r (PDriver_SelectDriver, 0, &current_driver)) !=
+         NULL) /*e g, 'SWI name not known' or 'Desired printer driver not
+         present'*/
+      goto finish;
+
+   if ((error = os_swix1 (PDriver_SelectDriver, current_driver)) != NULL)
+      goto finish;
+
+finish:
+   return error == NULL;
+}

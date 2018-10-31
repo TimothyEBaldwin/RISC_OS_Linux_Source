@@ -1,0 +1,601 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* io.c
+ *
+ * Author: Keith Ruttle (Acorn)
+ *
+ * Description
+ * ===========
+ * I/O routines
+ *
+ * Environment
+ * ===========
+ * Acorn RISC OS 3.11 or later.
+ *
+ * Compiler
+ * ========
+ * Acorn Archimedes C release 5.06 or later.
+ *
+ * Change record
+ * =============
+ *
+ * JPD  Jem Davies (Cambridge Systems Design)
+ *
+ *
+ * 09-Dec-94  17:41  JPD  Version 1.00
+ * First version with change record. Modified: #includes to be ANSI-compliant,
+ * other constructs to remove compiler warnings, code to cope with DCI-4 and
+ * new mbuf structure. Added some comments (hopefully accurate).
+ *
+ * 13-Jan-95  12:22  JPD  Version 1.01
+ * Changed to compile -fah.
+ *
+ * 27-Feb-95  15:03  JPD  Version 1.02
+ * Removed OldCode. Added returning of different values for peek machine
+ * type depending on what machine we are running on.
+ *
+ *
+ **End of change record*
+ */
+
+#include <string.h>
+#include <stddef.h>
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "netinet/in.h"
+#include "netinet/in_systm.h"
+#include "netinet/ip.h"
+#include "netinet/ip_var.h"
+#include "netinet/udp.h"
+#include "netinet/udp_var.h"
+#include "sys/errno.h"
+#include "sys/mbuf.h"
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "module.h"
+#include "swicode.h"
+#include "io.h"
+#include "mns.h"
+#include "mnscommon.h"
+#include "netasm.h"
+#include "socklib.h"
+#include "VersionNum"
+
+/******************************************************************************/
+
+static void tx_fast_response(struct mbuf *m, int type, int ack_unit,
+                                       char *ack_src, int ack_buf, int ack_swi);
+static void tx_response(u_char opcode, u_int handle, struct sockaddr_in *from);
+static void rx_response(u_char opcode, u_int handle, int cc, char *imp);
+static void do_immediate(u_int handle, struct sockaddr_in *from);
+
+/******************************************************************************/
+
+int local_net(void)
+{
+   return (connected_econet != -1 ? connected_econet : mns.mns_netnumber);
+}
+
+/******************************************************************************/
+
+static int msg_read(struct mbuf *m, char *c, int n)
+{
+   int len, moff, cnt;
+
+   m->m_off += UNHDRSIZE;
+   m->m_len -= UNHDRSIZE;
+   moff = 0;
+   cnt = 0;
+
+   if (m->m_len == 0)
+      m = m->m_next;
+
+   while (m && n > 0)
+   {
+      len = n;
+      if (len > m->m_len - moff)
+         len = m->m_len - moff;
+      memcpy (c, mtod(m, caddr_t) + moff, len);
+      if (len == m->m_len - moff)
+      {
+         m = m->m_next;
+         moff = 0;
+      }
+      else
+         moff += len;
+      c += len;
+      n -= len;
+      cnt += len;
+    }
+
+    return cnt;
+
+} /* msg_read() */
+
+/******************************************************************************/
+
+void process_data_input(int a, int b, char *ack_src, int ack_unit, int ack_swi,
+                                                                    int ack_buf)
+{
+   struct mbuf *ma0, *ma1;
+   struct sockaddr_in from, *d;
+   int fromlen, oldstate, station, doreply;
+   struct mns_msg *m;
+   u_char opcode, port, control, status;
+   struct rxcb *rx = 0;
+   struct rxcb *anyport = 0;
+   u_int handle, network;
+
+   ma0 = (struct mbuf *)a;
+   ma1 = (struct mbuf *)ack_buf;
+   if (ma0 == 0)
+      return;
+
+   /* Presumably it is possible that an mbuf exists at the beginning of
+    * this chain that has had its length field set to zero, but has not
+    * actually been trimmed from the chain.
+    */
+   while ((ma0->m_len == 0) && (ma0->m_next != 0))
+      ma0 = ma0->m_next;
+
+   if (ma0->m_len < UNHDRSIZE)
+   {
+      ma0->m_len = 0;
+      return;
+   }
+
+   d = (struct sockaddr_in *)b;
+   from.sin_port = d->sin_port;
+   from.sin_addr = d->sin_addr;
+   fromlen = sizeof (from);
+   if (ip_to_mns(from.sin_addr.s_addr, (int *)&network, &station) == 0)
+   {
+      ma0->m_len = 0;
+      return;
+   }
+
+   m = mtod(ma0, struct mns_msg *);
+   opcode  = m->mns_opcode;
+   port    = m->mns_port;
+   control = m->mns_control;
+   handle  = m->mns_handle;
+   status  = m->mns_status;
+   doreply = (opcode == DATA_FRAME) ? 1 : 0;
+   if (status & MSG_IS_RETRY)
+      mns.mns_rxretries++;
+
+
+   switch (opcode)
+   {
+      case DATA_FRAME:
+         mns.mns_rxcnt++;
+         goto dorx;
+
+      case BROADCAST_DATA_FRAME:
+         mns.mns_rxbc++;
+dorx:
+         oldstate = ensure_irqs_off();
+         anyport = 0;
+         for (rx = mns.mns_rxlist; rx; rx = rx->rx_next)
+         {
+            if (rx->rx_status == Status_RxReady && rx->rx_port == port &&
+                         rx->rx_network == network && rx->rx_station == station)
+               break;
+         }
+         if (rx == NULL)
+         {
+            for (rx = mns.mns_rxwild; rx; rx = rx->rx_next)
+            {
+               if (rx->rx_status != Status_RxReady)
+                  continue;
+               if (src_is_ok(rx, network, station))
+               {
+                  if (rx->rx_port == port)
+                     break;
+                  if (!anyport && (rx->rx_port == 0 || rx->rx_port == ANY_PORT))
+                     anyport = rx;
+               }
+            }
+            if (rx == NULL)
+            {
+               rx = anyport;
+               if (rx == NULL)
+               {
+                  restore_irqs(oldstate);
+                  if (doreply)
+                  {
+                     if (ack_buf)
+                     {
+                        tx_fast_response(ma1, DATA_FRAME_REJ, ack_unit, ack_src,
+                                                              ack_buf, ack_swi);
+                        mns.mns_txrej++;
+                     }
+                     else
+                        tx_response(DATA_FRAME_REJ, handle, &from);
+                  }
+                  break;
+               }
+            }
+         }
+         rx->rx_status = Status_Receiving;
+         if (rx->rx_ecotype)
+         {
+            _kernel_swi_regs r;
+
+            r.r[0] = rx->rx_handle;
+            if (!call_econet(Econet_ExamineReceive, &r) && r.r[0] !=
+                                                                 Status_RxReady)
+            {
+               restore_irqs(oldstate);
+               if (doreply)
+               {
+                  if (ack_buf)
+                  {
+                     tx_fast_response(ma1, DATA_FRAME_REJ, ack_unit, ack_src,
+                                                              ack_buf, ack_swi);
+                     mns.mns_txrej++;
+                  }
+                  else
+                     tx_response(DATA_FRAME_REJ, handle, &from);
+               }
+               break;
+            }
+            rx->rx_ecotype = 0;
+            r.r[0] = rx->rx_handle;
+            (void) call_econet(Econet_AbandonReceive, &r);
+         }
+         restore_irqs(oldstate);
+
+         if (doreply)
+         {
+            if (ack_buf)
+            {
+               tx_fast_response(ma1, DATA_FRAME_ACK, ack_unit, ack_src, ack_buf,
+                                                                       ack_swi);
+               mns.mns_txacks++;
+            }
+            else
+               tx_response(DATA_FRAME_ACK, handle, &from);
+         }
+
+         rx->rx_bufsize = msg_read(ma0, rx->rx_buf, rx->rx_bufsize);
+         rx->rx_port = (int)port;
+         rx->rx_flag    = (int)control;
+         rx->rx_station = station;
+         rx->rx_network = (station != ALL_ONES &&
+                                  network == (u_char)local_net()) ? 0 : network;
+         rx->rx_status  = Status_Received;
+         if (!rx->rx_wait)
+            generate_event(1, rx->rx_handle, Status_Received, rx->rx_port);
+         break;
+
+      case DATA_FRAME_ACK:
+      case DATA_FRAME_REJ:
+      case IMMEDIATE_OP_REPLY:
+         ma0->m_off += UNHDRSIZE;
+         ma0->m_len -= UNHDRSIZE;
+
+         while ((ma0->m_len == 0) && (ma0->m_next != 0))
+            ma0 = ma0->m_next;
+
+          rx_response(opcode, handle, ma0->m_len, mtod(ma0, char *));
+          break;
+
+      case IMMEDIATE_OP:
+         if (control == Econet_MachinePeek)
+            do_immediate(handle, &from);
+         break;
+
+      default:
+         break;
+
+   } /* endswitch */
+
+   ma0->m_len = 0;
+
+   return;
+
+} /* tx_op() */
+
+/******************************************************************************/
+
+static void rx_response(u_char opcode, u_int handle, int cc, char *imp)
+{
+   struct txcb *tx;
+   int oldstate = ensure_irqs_off();
+
+   for (tx = mns.mns_txlist; tx; tx = tx->tx_next)
+   {
+      if (tx->tx_status == Status_Transmitting && tx->tx_handle == handle)
+      {
+         switch(opcode)
+         {
+            case DATA_FRAME_ACK:
+               mns.mns_rxacks++;
+               restore_irqs(oldstate);
+               tx->tx_status = Status_Transmitted;
+               if ((tx->tx_flag & TX_WAIT) == 0)
+                  generate_event(0, handle, Status_Transmitted, tx->tx_port);
+               return;
+
+            case DATA_FRAME_REJ:
+               mns.mns_rxrej++;
+               restore_irqs(oldstate);
+               if (tx->tx_rjmax == 0)
+               {
+                  tx->tx_status  = Status_NotListening;
+                  if ((tx->tx_flag & TX_WAIT) == 0)
+                     generate_event(0,handle, Status_NotListening, tx->tx_port);
+               }
+               else
+               {
+                  if (tx->tx_rjcount > 5)
+                     tx->tx_rjdelay = tx->tx_rjdelayval;
+                  else
+                  {
+                     tx->tx_rjdelay = 0;
+                     tx->tx_rjcount++;
+                     retry_tx(tx);
+                  }
+               }
+               tx->tx_rtdelay = 0;
+               return;
+
+            case IMMEDIATE_OP_REPLY:
+               mns.mns_rximreply++;
+               restore_irqs(oldstate);
+               if (tx->tx_bufsize >= 4 && cc == 4)
+               {
+                  memcpy(tx->tx_buf, imp, 4);
+                  tx->tx_bufsize = 4;
+                  tx->tx_status  = Status_Transmitted;
+                  if ((tx->tx_flag & TX_WAIT) == 0)
+                     generate_event(0, handle, Status_Transmitted, tx->tx_port);
+               }
+               return;
+
+            default:
+               break;
+
+         } /* endswitch */
+
+      } /* endif */
+
+   } /* endfor */
+
+   mns.mns_rxackdiscard++;
+
+   return;
+
+} /* rx_response() */
+
+/******************************************************************************/
+
+static void tx_fast_response(struct mbuf *m, int type, int ack_unit,
+                                        char *ack_src, int ack_buf, int ack_swi)
+{
+/*
+ * Send an acknowledgement packet directly (through the DCI driver, rather
+ * than sending it through the Internet module).
+ *
+ * Parameters:
+ *    m        : pointer to the mbuf chain received
+ *    type     : type of ack frame to be sent e.g accept/reject
+ *    ack_unit : the DCI driver unit (e.g. card no.) on which to send ack
+ *    ack_src  : pointer to destination hardware address
+ *    ack_buf  : pointer to the mbuf chain containing the acknowledgement
+ *    ack_swi  : the SWI to issue to the DCI driver to send the ack, i.e. the
+ *               Transmit SWI in its chunk.
+ *
+ * Returns:
+ *    None
+ */
+
+   _kernel_swi_regs r;
+   _kernel_oserror *e;
+   struct mns_msg *msg;
+   char *p;
+#ifndef EDDS
+   int oldstate;
+#endif
+
+   p = mtod(m, char *) + sizeof(struct udpiphdr);
+   msg = (struct mns_msg *)p;
+   msg->mns_opcode = type;
+
+   r.r[0] = 0;                  /* use if's own hardware address */
+                                /* driver assumes ownership of mbuf chain */
+                                /* Internet now does not free mbuf */
+   r.r[1] = ack_unit;           /* unit number */
+   r.r[2] = 0x0800;             /* frame type = IP */
+   r.r[3] = ack_buf;            /* mbuf containing data to tranmsit */
+   r.r[4] = (int)ack_src;       /* destination hardware address */
+   r.r[5] = 0;                  /* no src hardware address supplied */
+
+#ifndef EDDS
+   oldstate = ensure_irqs_on();
+#endif
+   e = _kernel_swi(ack_swi, &r, &r);
+#ifndef EDDS
+   restore_irqs(oldstate);
+#endif
+
+   if (e)
+      mns.mns_txerrs++;
+
+   return;
+
+} /* tx_fast_response() */
+
+/******************************************************************************/
+
+static struct mns_msg m0;
+static struct mns_msg m1;
+
+/******************************************************************************/
+
+static void tx_response(u_char opcode, u_int handle, struct sockaddr_in *from)
+{
+   struct mns_msg *m;
+#ifndef EDDS
+    int oldstate;
+#endif
+
+   m = (mns.mns_flags & MNS_DSINUSE) ? &m0 : &m1;
+   m->mns_opcode  = opcode;
+   m->mns_port    = 0;
+   m->mns_control = 0;
+   m->mns_status  = 0;
+   m->mns_handle  = handle;
+   if (opcode == DATA_FRAME_ACK)
+      mns.mns_txacks++;
+   else
+      mns.mns_txrej++;
+   from->sin_family = AF_INET;
+   from->sin_len    = sizeof *from;
+   from->sin_port   = htons((u_short)MNSDATAPORT);
+
+#ifndef EDDS
+   oldstate = ensure_irqs_on();
+#endif
+
+   if (mns.mns_flags & MNS_DSINUSE)
+      (void)sendtosm(mns.mns_txdsock, m, UNHDRSIZE, 0, 0, (void *) from);
+   else
+   {
+      mns.mns_flags |= MNS_DSINUSE;
+      (void)sendtosm(mns.mns_rxdsock, m, UNHDRSIZE, 0, 0, (void *) from);
+      mns.mns_flags &= ~MNS_DSINUSE;
+   }
+
+#ifndef EDDS
+   restore_irqs(oldstate);
+#endif
+
+   return;
+
+} /* tx_response() */
+
+/******************************************************************************/
+
+static char i_buf[6];  /* why 6 bytes not 4? It probably does not even need */
+                       /* to be static, could be auto - JPD */
+
+/******************************************************************************/
+
+static void do_immediate(u_int handle, struct sockaddr_in *from)
+/*
+ * Deal with a machine type peek received
+ *
+ * Parameters:
+ *    handle : Tx CB handle
+ *    from   : sockaddr_in for machine from whence received
+ *
+ * Returns:
+ *    None
+ */
+{
+   mns.mns_rximmcnt++;
+   i_buf[0] = machine_type;
+   i_buf[1] = 0;
+   i_buf[2] = (char)(Module_Version % 100);
+   i_buf[2] = (i_buf[2] % 10) | ((i_buf[2] / 10) << 4); /* BCD */
+   i_buf[3] = (char)(Module_Version / 100);
+#if Module_Version >= 1000
+#error "Calculate top nybble correctly"
+#endif
+   (void) msg_transmit(from->sin_addr.s_addr, Econet_MachinePeek, 0, 0, i_buf,
+                                                 4, IMMEDIATE_OP_REPLY, handle);
+   return;
+
+} /* do_immediate() */
+
+/******************************************************************************/
+
+int msg_transmit(u_long host, u_char control, u_char status, u_int port,
+                                    char *data, int len, int type, u_int handle)
+{
+   struct sockaddr_in sin;
+   int r;
+   struct mns_msg *m;
+#ifndef EDDS
+   int oldstate;
+#endif
+
+   m = (mns.mns_flags & MNS_DSINUSE) ? &m0 : &m1;
+   m->mns_opcode       = type;
+   m->mns_port         = (u_char)port;
+   m->mns_control      = (u_char)control;
+   m->mns_status       = (u_char)status;
+   m->mns_handle       = handle;
+   sin.sin_family       = AF_INET;
+   sin.sin_len          = sizeof sin;
+   sin.sin_port         = htons((u_short)MNSDATAPORT);
+   sin.sin_addr.s_addr  = host;
+
+#ifndef EDDS
+   oldstate = ensure_irqs_on();
+#endif
+
+   if (mns.mns_flags & MNS_DSINUSE)
+      r = sendtosm(mns.mns_txdsock, m, UNHDRSIZE, data, len, (void *) &sin);
+   else
+   {
+      mns.mns_flags |= MNS_DSINUSE;
+      r = sendtosm(mns.mns_rxdsock, m, UNHDRSIZE, data, len, (void *) &sin);
+      mns.mns_flags &= ~MNS_DSINUSE;
+   }
+
+#ifndef EDDS
+   restore_irqs(oldstate);
+#endif
+
+   if (type == BROADCAST_DATA_FRAME)
+      return 0;
+
+   if (r < 0)
+   {
+      mns.mns_txerrs++;
+      return 0;
+   }
+
+   switch (type)
+   {
+      case DATA_FRAME:
+         mns.mns_txcnt++;
+         break;
+
+      case IMMEDIATE_OP:
+         mns.mns_tximmcnt++;
+         break;
+
+      case IMMEDIATE_OP_REPLY:
+         mns.mns_tximmrcnt++;
+         break;
+
+      default:
+         break;
+    }
+
+    return 0;
+
+} /* msg_transmit() */
+
+/******************************************************************************/
+
+/* EOF io.c */

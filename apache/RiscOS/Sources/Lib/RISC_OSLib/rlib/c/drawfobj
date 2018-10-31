@@ -1,0 +1,597 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/************************************************************************/
+/* © Acorn Computers Ltd, 1992.                                         */
+/*                                                                      */
+/* This file forms part of an unsupported source release of RISC_OSLib. */
+/*                                                                      */
+/* It may be freely used to create executable images for saleable       */
+/* products but cannot be sold in source form or as an object library   */
+/* without the prior written consent of Acorn Computers Ltd.            */
+/*                                                                      */
+/* If this file is re-distributed (even if modified) it should retain   */
+/* this copyright notice.                                               */
+/*                                                                      */
+/************************************************************************/
+
+/* Title: c.drawfobj
+ * Purpose: rendering an individual draw object
+ * History: IDJ: 06-Feb-92: prepared for source release
+ *
+ */
+
+/*
+ * This file supplements the level 0 interface with routines for dealing with
+ * individual objects.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "os.h"
+#include "bbc.h"
+#include "sprite.h"
+#include "wimpt.h"
+
+#define DRAWFILE_INTERNAL
+#include "DrawIntern/drawfile1.h"
+#include "drawfdiag.h"
+#include "drawfobj.h"
+#include "DrawIntern/drawfile2.h"
+#include "drawferror.h"
+
+/*----------------------------- Global data ---------------------------------*/
+
+/* Current mode state */
+currentmodestr currentmode;
+
+/* List of the mode variables we want */
+static int modevarlist[] =
+{ bbc_GCharSizeX, bbc_GCharSizeY, bbc_GCharSpaceX,bbc_GCharSpaceY,
+  bbc_NColour,
+  bbc_XEigFactor, bbc_YEigFactor,
+  -1
+};
+
+/* Flag needed for text areas */
+extern BOOL Draw_memoryError;
+BOOL Draw_memoryError;
+
+/* Font reference translation table */
+#ifdef SHARED_C_LIBRARY
+extern int *draw_transTable;   /*[256]*/
+#else
+int *draw_transTable;
+#endif
+static BOOL fontTableChanged = FALSE;
+
+/*------------------------------ Internal functions ----------------------------*/
+/* These functions are local to the module */
+
+/*
+ Function    : dr_setStart
+ Purpose     : set actual offset for start object
+ Parameters  : start object handle
+ Returns     : actual start offset
+ Description : translates the special 'first object' code.
+*/
+
+static int dr_setStart(draw_object start)
+{
+  return ((start == draw_FirstObject) ? sizeof(draw_fileheader) : start);
+}
+
+/*
+ Function    : dr_setEnd
+ Purpose     : set actual end object
+ Parameters  : diagram structure
+               end object handle
+               OUT: object header block
+ Returns     : void
+ Description : translates the 'end object' value. The offset returned is the
+               offset in the diagram AFTER the last object. If the end object
+               is not the special code, it is changed into an offset to the
+               object following.
+*/
+
+static void dr_setEnd(draw_diag *diag, draw_object end, draw_objptr *hdrptr)
+{
+  if (end == draw_LastObject)
+    hdrptr->bytep = diag->data + diag->length;
+  else
+  {
+    hdrptr->bytep = diag->data+end;
+    hdrptr->bytep += hdrptr->objhdrp->size;
+  }
+}
+
+/*
+ Function    : dr_setBox
+ Purpose     : set clipping box and origin (in draw units
+ Parameters  : pointer to redraw structure
+               scalefactor
+               OUT: x, y origin
+               OUT: clipping box
+ Returns     : void
+*/
+
+static void dr_setBox(draw_redrawstr *r, double scalefactor,
+                      int *orgx, int *orgy, draw_box *clipBox)
+{
+  int x = r->box.x0 - r->scx;
+  int y = r->box.y1 - r->scy;
+  *orgx = draw_screenToDraw(x);
+  *orgy = draw_screenToDraw(y);
+
+  clipBox->x0 = scaledown(r->g.x0 - x);
+  clipBox->y0 = scaledown(r->g.y0 - y);
+  clipBox->x1 = scaledown(r->g.x1 - x);
+  clipBox->y1 = scaledown(r->g.y1 - y);
+}
+
+/*
+ Function    : dr_setScreenState
+ Purpose     : cache mode variables and set up for output
+ Parameters  : void
+ Returns     : VDU status byte (as an int)
+ Description : records the mode variables needed for rendering; records the VDU
+               state and sets to VDU5 style output
+*/
+
+static int dr_setScreenState(void)
+{
+  int VDUstatus;           /* VDU status: only the VDU5 setting matters */
+  int dx = wimpt_dx(), dy = wimpt_dy();
+  int xeig = 0, yeig = 0;
+
+  while (dx > 1) { dx = dx>>1; xeig++; }
+  while (dy > 1) { dy = dy>>1; yeig++; }
+
+  /* Get mode variables */
+  bbc_vduvars(modevarlist, &currentmode.gcharsizex);
+
+  currentmode.gcharaltered = 0;
+
+  if (dx == 0 && dy == 0)
+  {
+  currentmode.pixsizex = 0x100 << currentmode.xeigfactor;
+  currentmode.pixsizey = 0x100 << currentmode.yeigfactor;
+  }
+  else
+  {
+    currentmode.pixsizex = 0x100 << xeig;
+    currentmode.pixsizey = 0x100 << yeig;
+  }
+
+  /* Get VDU status */
+  os_byte(117, &VDUstatus, 0);
+
+  /* Set to VDU5 mode */
+  bbc_vdu(5);
+
+  return (VDUstatus);
+}
+
+/*
+ Function    : dr_recoverScreenState
+ Purpose     : restore (some) changed mode variables and reset the VDU5 state
+ Parameters  : old vdu status
+ Returns     : void
+*/
+
+static void dr_recoverScreenState(int status)
+{
+  if (currentmode.gcharaltered)
+  { displ_setVDU5charsize(currentmode.gcharsizex,  currentmode.gcharsizey,
+                          currentmode.gcharspacex, currentmode.gcharspacey);
+    currentmode.gcharaltered = 0;
+  }
+
+  if (status & 0x20 == 0) bbc_vdu(4);
+}
+
+/*
+ Function    : dr_translateText
+ Purpose     : apply font number translation to a diagram
+ Parameters  : diagram structure
+               translation table
+ Returns     : void
+*/
+
+static void dr_translateText(draw_diag *diag, int * transTable)
+{
+  draw_objptr hdrptr;
+  char *limit = diag->data + diag->length;
+
+  for (hdrptr.bytep = diag->data+sizeof(draw_fileheader) ;
+       hdrptr.bytep < limit ; hdrptr.bytep += hdrptr.objhdrp->size)
+  {
+    if (hdrptr.objhdrp->tag == draw_OBJTEXT)
+    { /* Translate font number */
+      hdrptr.textp->textstyle.fontref
+        = transTable[hdrptr.textp->textstyle.fontref];
+    }
+  }
+}
+
+/*------------------------------ Interface functions ---------------------------*/
+
+/*
+ Function    : draw_create_diag
+ Purpose     : create an empty diagram
+ Parameters  : pointer to diagram structure
+               name of creating program
+               bounding box for diagram
+ Returns     : void
+ Description : Create an empty diagram (ie just the file header), with the
+               given bounding box, measured in Draw units. The memory for the
+               diagram must have already been allocated. The length field in
+               the diagram structure is set up. The first 12 characters of
+               the creator name are also logged in the file header; the
+               remaining fields are given standard values.
+*/
+
+void draw_create_diag(draw_diag *diag, char *creator, draw_box bbox)
+{
+  draw_objptr hdrptr;
+
+  /* Create file header */
+  hdrptr.bytep = diag->data;
+  strncpy(hdrptr.filehdrp->title, "Draw", 4);
+  hdrptr.filehdrp->majorstamp = majorformatversionstamp;
+  hdrptr.filehdrp->minorstamp = minorformatversionstamp;
+  strncpy(hdrptr.filehdrp->progident, creator, 12);
+
+  /* Copy box using a grotesque type fiddle */
+  hdrptr.filehdrp->bbox = *((draw_bboxtyp*)&bbox);
+
+  /* Record length field */
+  diag->length = sizeof(draw_fileheader);
+}
+
+/*
+ Function    : draw_doObjects
+ Purpose     : render a range of objects
+ Parameters  : diagram structure
+               handle for start object
+               handle for end object
+               pointer to redraw structure
+               scale factor
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Render the specified range of objects. The remaining parameters
+               are used in the same way as draw_render_diag() in level 0.
+               As with draw_render_diag the diagram should have been verified
+               first.
+*/
+
+BOOL draw_doObjects(draw_diag *diag, draw_object start, draw_object end,
+                    draw_redrawstr *r, double scale, draw_error *error)
+{
+  draw_objptr startObject, endObject;
+  char       *limit = diag->data + diag->length;
+  BOOL       err = FALSE;
+  int        orgx, orgy;
+  draw_box   clipBox;
+  int        vdu_status;
+
+  /* Locate the objects */
+  startObject.bytep = diag->data + dr_setStart(start);
+  dr_setEnd(diag, end, &endObject);
+
+  if (startObject.bytep < diag->data || startObject.bytep > limit)
+  {
+    DrawFile_Error(draw_BadObjectHandle, start);
+    return (FALSE);
+  }
+
+  if (endObject.bytep < diag->data || endObject.bytep > limit+1
+      || endObject.bytep < startObject.bytep)
+  {
+    DrawFile_Error(draw_BadObjectHandle, end);
+    return (FALSE);
+  }
+
+  /* Find where to plot */
+  dr_setBox(r, scale, &orgx, &orgy, &clipBox);
+
+  /* Draw the objects */
+  vdu_status = dr_setScreenState();
+  dr_scalefactor = scale;
+  Draw_memoryError = FALSE; /* Only relevant for text areas */
+  err = do_objects(startObject, endObject, orgx, orgy,
+                   clipBox.x0, clipBox.y0, clipBox.x1, clipBox.y1, error);
+  dr_recoverScreenState(vdu_status);
+
+  if (Draw_memoryError)
+  {
+    DrawFile_Error(draw_TextColMemory, 0)
+    return (FALSE);
+  }
+  else
+    return (err);
+}
+
+/*
+ Function    : draw_setFontTable
+ Purpose     : scan the diagram for a font table object
+ Parameters  : diagram structure
+ Returns     : void
+ Description : Scan the diagram for a font table object and record it for a
+               following call of draw_doObjects. This is needed if
+               draw_doObjects is to work on a sequence of objects that
+               includes text objects using anti-aliased fonts, but no font
+               table object. The result of draw_doObjects in this case is
+               unpredictable if it is not called first (may cause an
+               exception). The font table remains valid until either a
+               different one is encounted during draw_doObjects, or until
+               draw_render_diag is called, or until a different diagram is
+               rendered.
+*/
+
+void draw_setFontTable(draw_diag *diag)
+{
+  draw_objptr hdrptr;
+
+  hdrptr.bytep = 0; /* Dummy to reset fontcat */
+  note_fontcat(hdrptr);
+
+  if (dr_findFontTable(diag, &hdrptr)) note_fontcat(hdrptr);
+}
+
+/*
+ Function    : draw_verifyObject
+ Purpose     : check the data for an existing object
+ Parameters  : diagram structure
+               object handle
+               OUT: size of object
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Check the data for an existing object. 'size', if non-NULL
+               returns the amount of memory occupied by the object. Verifying
+               an object also ensures that its bounding box is consistent
+               with the data in it; if not, no error is reported; the box is
+               made consistent instead. On an error, the location is relative
+               to the start of the diagram.
+*/
+
+BOOL draw_verifyObject(draw_diag *diag, draw_object object, int *size,
+                       draw_error *error)
+{
+  int code, location;
+  draw_objptr hdrptr;
+  hdrptr.bytep = diag->data + object;
+  *size = hdrptr.objhdrp->size;
+
+  if (check_Draw_object(hdrptr, &code, &location))
+    return (TRUE);
+  else
+  { DrawFile_Error(code, location - (int)diag->data);
+    return (FALSE);
+  }
+}
+
+/*
+ Function    : draw_createObject
+ Purpose     : create an object
+ Parameters  : pointer to diagram structure
+               object data block
+               handle of object to insert after
+               flag: rebind diagram?
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Create an object with the given data. The object is inserted
+               in the diagram after the specified one, and the remaining data
+               moved down.
+               'after' may be draw_FirstObject/draw_LastObject for inserting at
+               the start/end of the diagram. The diagram must be large enough
+               for the new data; its length field is updated.
+               The diagram bounding box (in the file header) is updated to the
+               union of its existing value and that of the new object if the
+               flag 'rebind' is TRUE.
+               On an error, the location is not meaningful.
+               The handle for the new object (or the merged font table) is
+               returned in 'object'.
+               If the routine is used to create a font table, 'after' is
+               ignored, and the object merged with the existing one (if there
+               is one) or inserted at the start of the diagram (if not). This
+               can cause the font reference numbers to change; immediately
+               following this routine by a call to draw_translate text will
+               apply the change (only needed if there are text objects in
+               anti-aliased fonts.
+*/
+
+BOOL draw_createObject(draw_diag *diag, draw_objectType newObject,
+                       draw_object after, BOOL rebind, draw_object *object,
+                       draw_error *error)
+{
+  fontTableChanged = FALSE;
+
+  /* If the object is a font table, merge it with the current one */
+  if (newObject.object->tag == draw_OBJFONTLIST)
+  { int i;
+    draw_objptr fontTable1, fontTable2;
+
+    /* malloc draw_transTable to save space in shared library */
+    if (draw_transTable == 0) draw_transTable = malloc(256*sizeof(int));
+
+    for (i = 0 ; i < 256 ; i++) draw_transTable[i] = 0;
+
+    if (!dr_findFontTable(diag, &fontTable1)) fontTable1.bytep = 0;
+    fontTable2.bytep = newObject.bytep;
+    if (dr_mergeFontTables(diag, fontTable1, diag, fontTable2,
+                           draw_transTable, error))
+    {
+      *object = (fontTable1.bytep == 0) ? sizeof(draw_fileheader)
+                                        : (int)(fontTable1.bytep - diag->data);
+      fontTableChanged = TRUE;
+      return (TRUE);
+    }
+    else
+    {
+      return (FALSE);
+    }
+  }
+  else
+  { char *to;
+
+    /* Find where to insert object */
+    if (after == draw_LastObject)
+      to = diag->data + diag->length;
+    else
+    {
+      if (after == draw_FirstObject)
+        to = diag->data + sizeof(draw_fileheader);
+      else
+      { draw_objptr afterObject;
+        afterObject.bytep = diag->data + after;
+        to = afterObject.bytep + afterObject.objhdrp->size;
+      }
+    }
+
+    /* Check the insert location is sensible */
+    if (to < diag->data || to > diag->data + diag->length)
+    {
+      DrawFile_Error(draw_BadObjectHandle, after);
+      return (FALSE);
+    }
+
+    /* Move down rest of diagram, if necessary */
+    if (to < diag->data + diag->length)
+    {
+      dr_spaceCopy(to+newObject.object->size, to,
+                   (int)(diag->data + diag->length - to));
+    }
+
+    /* Copy in the new data */
+    memcpy(to, newObject.bytep, newObject.object->size);
+    diag->length += newObject.object->size;
+    *object = (int)(to - diag->data);
+
+    /* Unify with diagram header box if asked */
+    if (rebind)
+    { draw_objptr fileHeader;
+
+      fileHeader.bytep = diag->data;
+      dr_unifyBoxes(&fileHeader.filehdrp->bbox, &newObject.object->bbox);
+    }
+  }
+
+  return (TRUE);
+}
+
+/*
+ Function    : draw_deleteObjects
+ Purpose     : delete a range of objects
+ Parameters  : pointer to diagram structure
+               handle of first object to delete
+               handle of last object to delete
+               flag: rebind diagram?
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Delete the specified range of objects. If 'rebind' is TRUE, the
+               diagram bounding box is set to the union of those of the
+               remaining objects. The length field of the diagram is updated.
+*/
+
+BOOL draw_deleteObjects(draw_diag *diag, draw_object start, draw_object end,
+                        BOOL rebind, draw_error *error)
+{
+  draw_objptr startObject, endObject;
+  char *limit = diag->data + diag->length;
+
+  /* Locate first and last objects */
+  startObject.bytep = diag->data + dr_setStart(start);
+  dr_setEnd(diag, end, &endObject);
+  if (startObject.bytep < diag->data || startObject.bytep > limit)
+  {
+    DrawFile_Error(draw_BadObjectHandle, start);
+    return (FALSE);
+  }
+
+  if (endObject.bytep < diag->data || endObject.bytep > limit+1
+      || endObject.bytep < startObject.bytep)
+  {
+    DrawFile_Error(draw_BadObjectHandle, end);
+    return (FALSE);
+  }
+
+  /* Close up memory */
+  dr_spaceCopy(startObject.bytep, endObject.bytep,
+               (int)(diag->data + diag->length - endObject.bytep));
+  diag->length -= (int)(endObject.bytep - startObject.bytep);
+
+  /* Rebind diagram if asked */
+  if (rebind) draw_rebind_diag(diag);
+
+  return (TRUE);
+}
+
+/*
+ Function    : draw_extractObject
+ Purpose     : extract the definition of an object
+ Parameters  : diagram structure
+               object handle
+               object data block
+               OUT: error block
+ Returns     : TRUE if successful
+ Description : Extract the definition of the given object into the buffer at
+               'result', which must be large enough to contain it.
+*/
+
+BOOL draw_extractObject(draw_diag *diag, draw_object object,
+                        draw_objectType result, draw_error *error)
+{
+  draw_objptr hdrptr;
+
+  /* Find the object */
+  hdrptr.bytep = diag->data + object;
+  if (hdrptr.bytep < diag->data || hdrptr.bytep > diag->data + diag->length)
+  {
+    DrawFile_Error(draw_BadObjectHandle, object)
+    return (FALSE);
+  }
+
+  /* Copy out the data */
+  dr_spaceCopy(result.bytep, hdrptr.bytep, hdrptr.objhdrp->size);
+  return (TRUE);
+}
+
+/*
+ Function    : draw_translateText
+ Purpose     : translate font references
+ Parameters  : diagram structure
+ Returns     : void
+ Description : Updates all font reference numbers for text objects following
+               creation of a font table. See draw_createObject.
+*/
+
+void draw_translateText(draw_diag *diag)
+{
+  /* belt and braces check now that we are mallocing the table */
+  if (draw_transTable == 0) draw_transTable = malloc(256*sizeof(int));
+  if (fontTableChanged) dr_translateText(diag, draw_transTable);
+}
+
+
+extern BOOL drawtextc_init(void), drawfiles_init(void);
+
+BOOL drawfobj_init(void)
+{
+   return ((draw_transTable = malloc(256)) != 0
+         && drawtextc_init()
+         && drawfiles_init());
+}

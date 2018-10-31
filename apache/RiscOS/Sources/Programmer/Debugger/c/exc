@@ -1,0 +1,1139 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "exc.h"
+#include "excdump.h"
+#include "Global/OSRSI6.h"
+
+/* Dump buffer handling */
+
+excresult ExcPeekMem(exc_context_t *ctx, uint32_t addr)
+{
+	const uint32_t *pos = ctx->buffer;
+	while(*pos)
+	{
+		uint32_t blocklen = pos[0];
+		uint32_t blocktype = pos[1];
+		if ((blocktype == ExcDump_Chunk_Memory) && ((addr-pos[2]) < (blocklen-12)))
+		{
+			return (excresult) { pos[((addr-pos[2])/4)+3], true };
+		}
+		pos += blocklen/4;
+	}
+	/* Peek host OS */
+	return ExcPeekMem2(ctx, addr);
+}
+
+excresult ExcPeekRSI6(exc_context_t *ctx, uint32_t index)
+{
+	const uint32_t *pos = ctx->buffer;
+	while(*pos)
+	{
+		uint32_t blocklen = pos[0];
+		uint32_t blocktype = pos[1];
+		if ((blocktype == ExcDump_Chunk_OSRSI6) && ((index-pos[2]) < (blocklen-12)/4))
+		{
+			return (excresult) { pos[(index-pos[2])+3], true };
+		}
+		pos += blocklen/4;
+	}
+	/* TODO peek host OS */
+	return (excresult) { 0, false };
+}
+
+excresult ExcPeekReg(exc_context_t *ctx, uint32_t reg)
+{
+	const uint32_t *pos = ctx->buffer;
+	while(*pos)
+	{
+		uint32_t blocklen = pos[0];
+		uint32_t blocktype = pos[1];
+		if ((blocktype == ExcDump_Chunk_Regs) && (reg < (blocklen-8)/4))
+		{
+			return (excresult) { pos[reg+2], true };
+		}
+		pos += blocklen/4;
+	}
+	return (excresult) { 0, false };
+}
+
+bool ExcPeekOSMem16(exc_context_t *ctx, uint32_t index, uint32_t *out)
+{
+	const uint32_t *pos = ctx->buffer;
+	while(*pos)
+	{
+		uint32_t blocklen = pos[0];
+		uint32_t blocktype = pos[1];
+		if ((blocktype == ExcDump_Chunk_OSMem16) && ((index-pos[2])*3 < (blocklen-12)/4))
+		{
+			pos += 3 + (index-pos[2])*3;
+			out[0] = pos[0];
+			out[1] = pos[1];
+			out[2] = pos[2];
+			return true;
+		}
+		pos += blocklen/4;
+	}
+	/* TODO peek host OS */
+	return false;
+}
+
+/* Utility */
+
+static const char *ExcSwiName(exc_context_t *ctx, uint32_t swinum, char *buf, int buflen)
+{
+	(void) ctx;
+	/* N.B. avoiding _swix */
+	__asm
+	{
+		MOV R0,swinum
+		MOV R1,buf
+		MOV R2,buflen
+		SWI OS_SWINumberToString + XOS_Bit,{R0,R1,R2},{PSR},{R2,LR}
+		MOVVS buf,#0
+	}
+	if (buf && strcmp(buf,"User"))
+	{
+		return buf;
+	}
+	return ExcGetMsg(ctx, EXC_MSG_UNKNOWN);
+}
+
+static __value_in_regs excresult ExcFindFuncName(exc_context_t *ctx, uint32_t addr)
+{
+	for(int i=0;i<1024;i++)
+	{
+		addr -= 4;
+		excresult val = ExcPeekMem(ctx, addr);
+		if (!val.ok)
+		{
+			break;
+		}
+		if ((val.val & 0xffffff00) != 0xff000000)
+		{
+			continue;
+		}
+		int len = val.val & 0xff;
+		if ((len & 3) || (len < 4))
+		{
+			continue;
+		}
+		return (excresult) { addr, true };
+	}
+	return (excresult) { 0, false };
+}
+
+static void ExcDescribeFuncOffset(exc_context_t *ctx, char *buffer, size_t len, uint32_t addr, uint32_t nameaddr)
+{
+	uint32_t namelen = ExcPeekMem(ctx, nameaddr).val & 0xffffff;
+	uint32_t funcaddr = nameaddr+4;
+	if (len > 2)
+	{
+		strcpy(buffer, "= ");
+		buffer += 2;
+		len -= 2;
+	}
+	while (namelen)
+	{
+		uint32_t chars = ExcPeekMem(ctx, nameaddr-namelen).val;
+		namelen -= 4;
+		for(int i=0;i<4;i++)
+		{
+			int c = chars & 255;
+			chars >>= 8;
+			if (c && (len > 1))
+			{
+				*buffer++ = c;
+				len--;
+			}
+			else
+			{
+				goto offset;
+			}
+		}
+	}
+offset:
+	snprintf(buffer, len, " +%x", addr-funcaddr);
+}
+
+typedef struct {
+	uint32_t rom_start;
+	uint32_t rom_end;
+	uint32_t syms_start;
+	uint32_t syms_end;
+} symbols_index_entry;
+
+#define READ_SYMBOL_HEADER(NAMELEN, OFFSET, SYMS) \
+	uint32_t NAMELEN = 1; \
+	uint32_t OFFSET = 1; \
+	{ \
+		uint32_t shift = 0; \
+		uint16_t halfword; \
+		do { \
+			halfword = SYMS[0] | (SYMS[1] << 8); \
+			NAMELEN += (halfword & 0x1f) << shift; \
+			OFFSET += ((halfword >> 5) & 0x3ff) << (shift*2); \
+			SYMS += 2; \
+			shift += 5; \
+		} while (halfword & 0x8000); \
+	}
+
+
+static uint64_t ExcFindROMSymbol(uint32_t addr)
+{
+	const romsymtable romsyms = ExcGetROMSymbols();
+	if (!romsyms.symbols || (addr < romsyms.romaddr))
+	{
+		return 0;
+	}
+	/* Look for the chunk that contains the given address */
+	uint32_t index_count = *romsyms.symbols;
+	const symbols_index_entry *index = (const symbols_index_entry *) (romsyms.symbols+1);
+	const uint8_t *syms = (const uint8_t *) (index + index_count);
+	addr -= romsyms.romaddr;
+	do
+	{
+		if ((index->rom_start <= addr) && (index->rom_end > addr))
+		{
+			break;
+		}
+		index++;
+	}
+	while (--index_count);
+	if (!index_count)
+	{
+		return 0;
+	}
+	/* Look for the symbol */
+	addr += romsyms.romaddr;
+	uint32_t sym_addr = index->rom_start + romsyms.romaddr;
+	const uint8_t *syms_end = syms + index->syms_end;
+	syms += index->syms_start;
+	uint64_t ret = 0;
+	do
+	{
+		const uint8_t *this = syms;
+		READ_SYMBOL_HEADER(namelen, offset, syms)
+		sym_addr += offset<<2;
+		if (sym_addr > addr)
+		{
+			return ret;
+		}
+		/* Encode result with symbol start address in low 32 bits, symbol table entry ptr in upper 32 bits */
+		ret = ((uint64_t) sym_addr) | (((uint64_t) this)<<32);
+		syms += (namelen*6+7)>>3;
+	}
+	while (syms != syms_end);
+	return ret;
+}
+
+#define SYMBOLS_ENCODING "_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+static void ExcDescribeROMSymbolOffset(exc_context_t *ctx, char *buffer, size_t len, uint32_t addr, uint64_t state)
+{
+	uint32_t sym_addr = (uint32_t) state;
+	const uint8_t *syms = (const uint8_t *) (state >> 32);
+	READ_SYMBOL_HEADER(namelen,offset,syms)
+	if (len > 2)
+	{
+		strcpy(buffer, "= ");
+		buffer += 2;
+		len -= 2;
+	}
+	/* Convert the 6 bit character encoding back to ASCII */
+	uint32_t byte = 0;
+	uint32_t bits = 0;
+	while (namelen--)
+	{
+		if (bits < 6)
+		{
+			byte += (*syms++) << bits;
+			bits += 8;
+		}
+		char c = SYMBOLS_ENCODING[byte & 0x3f];
+		byte >>= 6;
+		bits -= 6;
+		if (len > 1)
+		{
+			*buffer++ = c;
+			len--;
+		}
+		else
+		{
+			goto offset;
+		}
+	}
+offset:
+	snprintf(buffer, len, " +%x", addr-sym_addr); 
+}
+
+/* Annotation management */
+
+static exc_annotation_block_t *NewAnnotationBlock(exc_context_t *ctx, uint32_t addr)
+{
+	/* Find a column that's free from addr to the end of the line buffer
+	   Avoid columns that are waiting for APCS frames, unless the opportunity has passed */
+	for(int i=0;i<LINEBUFFER_COLUMNS;i++)
+	{
+		if ((ctx->annotations[i].max <= addr) && (ctx->annotations[i].next_fp < ctx->lineaddr))
+		{
+			ctx->annotations[i].min = addr;
+			ctx->annotations[i].next_fp = 0;
+			return &ctx->annotations[i];
+		}
+	}
+	ctx->print(ctx->print_param, ExcGetMsg(ctx, EXC_MSG_OUT_OF_ANNOT));
+	return NULL;
+}
+
+static exc_annotation_block_t *FindAPCSFrameByNextFP(exc_context_t *ctx, uint32_t next_fp)
+{
+	for(int i=0;i<LINEBUFFER_COLUMNS;i++)
+	{
+		if (ctx->annotations[i].next_fp == next_fp)
+		{
+			return &ctx->annotations[i];
+		}
+	}
+	return NULL;
+}
+
+static const char *const ExcRegNames[] =
+{
+	"R0",
+	"R1",
+	"R2",
+	"R3",
+	"R4",
+	"R5",
+	"R6",
+	"R7",
+	"R8",
+	"R9",
+	"R10",
+	"R11",
+	"R12",
+	"R13",
+	"R14",
+	"R15",
+	"CPSR",
+	"R13_usr",
+	"R14_usr",
+	"R13_svc",
+	"R14_svc",
+	"SPSR_svc",
+	"R13_irq",
+	"R14_irq",
+	"SPSR_irq",
+	"R13_abt",
+	"R14_abt",
+	"SPSR_abt",
+	"R13_und",
+	"R14_und",
+	"SPSR_und",
+};
+
+static uint64_t FindSymbol(exc_context_t *ctx, uint32_t addr)
+{
+	/* Note: Bottom two bits of result are assumed to be clear, so they can be used as flags */
+	uint64_t romsym = ExcFindROMSymbol(addr);
+	if (romsym)
+	{
+		return romsym;
+	}
+	excresult res = ExcFindFuncName(ctx, addr);
+	return (res.ok ? res.val : 0);
+}
+
+static void DescribeSymbolOffset(exc_context_t *ctx, char *buffer, size_t len, uint32_t addr, uint64_t state)
+{
+	if (!(state & 0xffffffff00000000ull))
+	{
+		ExcDescribeFuncOffset(ctx, buffer, len, addr, state);
+	}
+	else
+	{
+		ExcDescribeROMSymbolOffset(ctx, buffer, len, addr, state);
+	}
+}
+
+static uint64_t GetAnnotationText(exc_context_t *ctx, char *buffer, size_t len, exc_msg msg, uint32_t addr1, uint32_t addr2, uint64_t state)
+{
+	const char *str = ExcGetMsg(ctx, msg);
+	switch(msg)
+	{
+	case EXC_MSG_SWI:
+		{
+			char buf[LINEBUFFER_COLWIDTH];
+			const char *swiname = ExcSwiName(ctx, addr1, buf, sizeof(buf));
+			snprintf(buffer, len, str, swiname);
+			return 0;
+		}
+	case EXC_MSG_CMHG_RN:
+		snprintf(buffer, len, str, addr1);
+		return 0;
+	case EXC_MSG_R14_DESC:
+	case EXC_MSG_RETURN_1DESC:
+	case EXC_MSG_APCS:
+		if (state == 0)
+		{
+			snprintf(buffer, len, str, addr1);
+			return 1;
+		}
+		else if (state == 1)
+		{
+			ExcDescribeAddr(ctx, addr1, buffer, len);
+			/* Check for a function name and store it in the state value */
+			return FindSymbol(ctx, addr1);
+		}
+		else
+		{
+			DescribeSymbolOffset(ctx, buffer, len, addr1, state);
+			return 0;
+		}
+	case EXC_MSG_ASMCALL:
+	case EXC_MSG_RETURN_2DESC:
+		if (state == 0)
+		{
+			snprintf(buffer, len, str, addr1, addr2);
+			return 1;
+		}
+		else if (state == 1)
+		{
+			snprintf(buffer, len, "%08x ", addr1);
+			if (len > 9)
+				ExcDescribeAddr(ctx, addr1, buffer+9, len-9);
+			state = FindSymbol(ctx, addr1);
+			if (state)
+			{
+				/* Use bottom bit as flag to indicate which address the function name is for */
+				return state | 1;
+			}
+			return 2;
+		}
+		else if (state & 1)
+		{
+			state -= 1;
+			DescribeSymbolOffset(ctx, buffer, len, addr1, state);
+			return 2;
+		}
+		else if (state == 2)
+		{
+			snprintf(buffer, len, "%08x ", addr2);
+			if (len > 9)
+			ExcDescribeAddr(ctx, addr2, buffer+9, len-9);
+			return FindSymbol(ctx, addr2);
+		}
+		else
+		{
+			DescribeSymbolOffset(ctx, buffer, len, addr2, state);
+			return 0;
+		}
+	case EXC_MSG_REGNO:
+		str = ExcRegNames[addr1];
+	default:
+		/* Just a simple message */
+		snprintf(buffer, len, "%s", str);
+		return 0;
+	}
+}
+
+static void EmitLine(exc_context_t *ctx);
+
+static void BreakChains(exc_context_t *ctx, uint32_t addr)
+{
+	/* Break any broken APCS chains */
+	if (addr < ctx->lineaddr)
+	{
+		return; /* Already output! */
+	}
+	while (addr >= (ctx->lineaddr + (LINEBUFFER_SIZE*4)))
+	{
+		/* N.B. this will call back into us, but shouldn't result in any further recursion */
+		EmitLine(ctx);
+	}
+	uint32_t lineidx = (ctx->line + ((addr - ctx->lineaddr)>>2)) & (LINEBUFFER_SIZE-1);
+	for(int i=0;i<LINEBUFFER_COLUMNS;i++)
+	{
+		exc_annotation_block_t *block = &ctx->annotations[i];
+		uint32_t lineflag = 1<<lineidx;
+		if ((block->lineflags & lineflag) && (block->next_fp == addr))
+		{
+			block->msgs[lineidx] = EXC_MSG_APCS_BROKEN;
+			block->next_fp = 0;
+			block->lineflags &= ~lineflag;
+		}
+	}
+}
+
+#define STRING2(X) #X
+#define STRING(X) STRING2(X)
+
+static void EmitLine(exc_context_t *ctx)
+{
+	BreakChains(ctx, ctx->lineaddr);
+	char buf[LINEBUFFER_COLWIDTH+8];
+	char buf2[LINEBUFFER_COLWIDTH];
+	int maxcolumn = 0;
+	int line = ctx->line;
+	uint64_t colstate[LINEBUFFER_COLUMNS] = { 0 };
+	for(int i=LINEBUFFER_COLUMNS-1;i>=0;i--)
+	{
+		exc_annotation_block_t *block = &ctx->annotations[i];
+		uint32_t lineflag = 1<<line;
+		if (block->msgs[line] || (block->lineflags & lineflag))
+		{
+			maxcolumn = i+1;
+			break;
+		}
+	}
+	bool active = false;
+	do {
+		if (!active)
+		{
+			sprintf(buf, "%08x : %08x :", ctx->lineaddr, ExcPeekMem(ctx, ctx->lineaddr).val);
+			ctx->print(ctx->print_param, buf);
+		}
+		else
+		{
+			ctx->print(ctx->print_param, "         :          :");
+		}
+		active = false;
+		for(int i=0;i<maxcolumn;i++)
+		{
+			exc_annotation_block_t *block = &ctx->annotations[i];
+			uint32_t lineflag = 1<<line;
+			char marker = ' ';
+			exc_msg msg = (exc_msg) block->msgs[line];
+			if (msg || (block->lineflags & lineflag))
+			{
+				if (msg == EXC_MSG_APCS_BROKEN)
+				{
+					marker = '?';
+				}
+				else
+				{
+					marker = ((block->lineflags & lineflag) ? '|' : '-');
+				}
+			}
+			colstate[i] = GetAnnotationText(ctx, buf2, sizeof(buf2), msg, block->addrs[line][0], block->addrs[line][1], colstate[i]);
+			sprintf(buf, (i==maxcolumn-1 ? " %c %s" : " %c %-" STRING(LINEBUFFER_COLWIDTH) "s"), marker, buf2);
+			ctx->print(ctx->print_param, buf);
+			if (!colstate[i])
+			{
+				/* Reset line */
+				block->msgs[line] = EXC_MSG_NONE;
+			}
+			else
+			{
+				/* Multi-line line */
+				active = true;
+				block->lineflags |= lineflag;
+			}
+		}
+		ctx->print(ctx->print_param, "\n");
+	} while(active);
+	/* Update line flags for next_fp */
+	for(int i=0;i<LINEBUFFER_COLUMNS;i++)
+	{
+		exc_annotation_block_t *block = &ctx->annotations[i];
+		uint32_t lineflag = 1<<line;
+		if (block->next_fp >= ctx->lineaddr + LINEBUFFER_SIZE*4)
+		{
+			block->lineflags |= lineflag;
+		}
+		else
+		{
+			block->lineflags &= ~lineflag;
+		}
+	}
+	/* Advance line counter */
+	ctx->line = (line+1) & (LINEBUFFER_SIZE-1);
+	ctx->lineaddr += 4;
+}
+
+static void AddAnnotation(exc_context_t *ctx, exc_annotation_block_t *block, uint32_t addr, exc_msg msg, uint32_t addr1, uint32_t addr2)
+{
+	/* Find correct line to use, or emit current line if necessary */
+	if ((addr < ctx->lineaddr) || !block)
+	{
+		return; /* Already output! */
+	}
+	while (addr >= (ctx->lineaddr + (LINEBUFFER_SIZE*4)))
+	{
+		EmitLine(ctx);
+	}
+	uint32_t lineidx = (ctx->line + ((addr - ctx->lineaddr)>>2)) & (LINEBUFFER_SIZE-1);
+	block->msgs[lineidx] = msg;
+	block->addrs[lineidx][0] = addr1;
+	block->addrs[lineidx][1] = addr2;
+	if (addr > block->max)
+	{
+		block->max = addr;
+	}
+	if (addr != block->min)
+	{
+		block->lineflags |= (1<<lineidx);
+	}
+}
+
+static void ClearAnnotations(exc_context_t *ctx)
+{
+	memset(ctx->annotations,0,sizeof(ctx->annotations));
+}
+
+static void DumpAnnotations(exc_context_t *ctx, uint32_t min, uint32_t max)
+{
+	(void) min;
+	while (ctx->lineaddr <= max)
+	{
+		EmitLine(ctx);
+	}
+}
+
+/* Utility */
+
+#ifdef MODULE
+typedef struct {
+	const char *area;
+	uint32_t offset;
+	const char *detail;
+} where_info_t;
+
+extern void Where_Util_FromC(uint32_t addr, where_info_t *result);
+
+void ExcDescribeAddr(exc_context_t *ctx, uint32_t addr, char *buf, size_t len)
+{
+	where_info_t info;
+	Where_Util_FromC(addr, &info);
+	if (info.detail)
+	{
+		snprintf(buf, len, "= %s +%x", info.detail, info.offset);
+	}
+	else if (info.offset != ~0)
+	{
+		snprintf(buf, len, "= +%x %s", info.offset, info.area);
+	}
+	else
+	{
+		snprintf(buf, len, "%s", info.area);
+	}
+}
+#endif
+
+#if 0
+static bool ExcLooksLikePSR(uint32_t val)
+{
+	return ((val & 0x0ffff010) == 0x10);
+}
+#endif
+
+static bool ExcLooksLikeSWINum(uint32_t val)
+{
+	return ((val & 0xff000000) == 0);
+}
+
+static __value_in_regs excresult ExcDecodeSWIInstr(exc_context_t *ctx, uint32_t addr)
+{
+	if (addr & 3)
+	{
+		return (excresult) { 0, false };
+	}
+	excresult instr = ExcPeekMem(ctx, addr);
+	if (!instr.ok)
+	{
+		return instr;
+	}
+	if (((instr.val & 0x0f000000) != 0x0f000000) || (instr.val >= 0xf0000000))
+	{
+		return (excresult) { 0, false };
+	}
+	return (excresult) { (instr.val & 0xffffff), true };
+}
+
+static __value_in_regs excresult ExcDecodeBL(exc_context_t *ctx, uint32_t addr)
+{
+	if (addr & 3)
+	{
+		return (excresult) { 0, false };
+	}
+	excresult instr = ExcPeekMem(ctx, addr);
+	if (!instr.ok)
+	{
+		return instr;
+	}
+	if (((instr.val & 0x0f000000) != 0x0b000000) || (instr.val >= 0xf0000000))
+	{
+		return (excresult) { 0, false };
+	}
+	int32_t offset = instr.val<<8;
+	offset >>= 6;
+	return (excresult) { addr+8+offset, true };
+}
+
+static __value_in_regs excresult ExcDecodeFuncCall(exc_context_t *ctx, uint32_t addr)
+{
+	excresult res = ExcDecodeBL(ctx, addr);
+	if (!res.ok)
+	{
+		return res;
+	}
+	/* If the target of the BL is a LDR PC,[PC,#...] then follow that too
+	   This allows us to follow calls which are made via the CLib stubs */
+	excresult instr = ExcPeekMem(ctx, res.val);
+	if ((instr.val & 0xff7ff000) != 0xe51ff000)
+	{
+		return res;
+	}
+	addr = res.val + 8 + ((instr.val & 0x800000) ? (instr.val & 0xfff) : -(instr.val & 0xfff));
+	excresult target = ExcPeekMem(ctx, addr);
+	if (!target.ok)
+	{
+		return res;
+	}
+	return target;
+}
+
+/* Main */
+
+static void Annotate(exc_context_t *ctx, uint32_t start, uint32_t end, eprocmode mode, uint32_t irqsema)
+{
+	ctx->lineaddr = start;
+	uint32_t r13 = start;
+	while(r13 < end)
+	{
+		/* Detect SWIs
+		   Do this just by looking for a SWI number on the stack - other markers (e.g. PSR) are unreliable (kernel SWI might not push PSR) or redundant (since we always check that the SWI exists at the return address) */
+		if (mode == SVC32)
+		{
+//			excresult psr = ExcPeekMem(ctx, r13-4);
+			excresult swinum = ExcPeekMem(ctx, r13);
+			excresult r14 = ExcPeekMem(ctx, r13+4);
+			excresult r10 = ExcPeekMem(ctx, r13+8);
+//			excresult r11 = ExcPeekMem(ctx, r13+12);
+			excresult r12 = ExcPeekMem(ctx, r13+16);
+			if (ExcLooksLikeSWINum(swinum.val))
+			{
+				excresult swinum2 = ExcDecodeSWIInstr(ctx, r14.val-4);
+				if (swinum2.ok && ((swinum2.val == swinum.val) || (((swinum2.val & ~XOS_Bit) == OS_CallASWI) && (swinum.val == r10.val)) || (((swinum2.val & ~XOS_Bit) == OS_CallASWIR12) && (swinum.val == r12.val))))
+				{
+					exc_annotation_block_t *block = NewAnnotationBlock(ctx, (start != r13 ? r13-4 : r13));
+					if (start != r13)
+						AddAnnotation(ctx, block, r13-4, EXC_MSG_MAYBEPSR, 0, 0);
+					AddAnnotation(ctx, block, r13, EXC_MSG_SWI, swinum.val, 0);
+					AddAnnotation(ctx, block, r13+4, EXC_MSG_R14_DESC, r14.val, 0);
+					AddAnnotation(ctx, block, r13+8, EXC_MSG_REGNO, 10, 0);
+					AddAnnotation(ctx, block, r13+12, EXC_MSG_REGNO, 11, 0);
+					AddAnnotation(ctx, block, r13+16, EXC_MSG_REGNO, 12, 0);
+				}
+			}
+		}
+		/* Detect IRQsema frames */
+		if ((mode == IRQ32) && (r13 == irqsema))
+		{
+			excresult r14 = ExcPeekMem(ctx, r13+32);
+			exc_annotation_block_t *block = NewAnnotationBlock(ctx, r13);
+			AddAnnotation(ctx, block, r13, EXC_MSG_IRQSEMA, 0, 0);
+			AddAnnotation(ctx, block, r13+4, EXC_MSG_REGNO, 1, 0);
+			AddAnnotation(ctx, block, r13+8, EXC_MSG_REGNO, 2, 0);
+			AddAnnotation(ctx, block, r13+12, EXC_MSG_REGNO, 3, 0);
+			AddAnnotation(ctx, block, r13+16, EXC_MSG_REGNO, 11, 0);
+			AddAnnotation(ctx, block, r13+20, EXC_MSG_REGNO, 12, 0);
+			AddAnnotation(ctx, block, r13+24, EXC_MSG_PSR, 0, 0);
+			AddAnnotation(ctx, block, r13+28, EXC_MSG_REGNO, 0, 0);
+			AddAnnotation(ctx, block, r13+32, EXC_MSG_R14_DESC, r14.val, 0);
+			irqsema = ExcPeekMem(ctx, r13).val;
+			/* IRQ frames are trustworthy, avoid making any further annotations for this block */
+			r13 += 36;
+			continue; 
+		}
+		bool apcs = false;
+		bool asm = false;
+		/* Detect (APCS) function calls */
+		{
+			/* Try and work out if this is an APCS stack frame
+			   Primary method is to just look for a STM {..r11, r12, lr, pc} at ExcPeekMem(ExcPeekMem(r13+4)-8)
+			*/
+			uint32_t funcaddr = ExcPeekMem(ctx, r13+4).val-8;
+			excresult entry = ExcPeekMem(ctx, funcaddr);
+			if (entry.ok && ((entry.val & 0xfffff800) == 0xe92dd800))
+			{
+				apcs = true;
+			}
+
+			/* Try and work out if this is an assembler stack frame
+			   Primary method is to just look for a BL at ExcPeekMem(ExcPeekMem(r13)-4)
+			   Finding an STM at the BL target is optional
+			*/
+			excresult addr = ExcPeekMem(ctx,r13);
+			if (!apcs)
+			{
+				excresult val = ExcDecodeFuncCall(ctx, addr.val-4);
+				if (val.ok)
+				{
+					funcaddr = val.val;
+					asm = true;
+					entry = ExcPeekMem(ctx, funcaddr);
+				}
+			}
+
+			/* Annotate appropriately if we found something */
+			if (asm || apcs)
+			{
+				exc_annotation_block_t *block = FindAPCSFrameByNextFP(ctx, r13+4);
+				if (!entry.ok || ((entry.val & 0xffff0000) != 0xe92d0000)) /* STMDB r13!,{...} ? */
+				{
+					if (!block)
+						block = NewAnnotationBlock(ctx, r13);
+					if (entry.val == 0xe52de004) /* STR r14,[r13,#-4]! */
+					{
+						AddAnnotation(ctx, block, r13, EXC_MSG_ASMCALL, addr.val, funcaddr);
+					}
+					else
+					{
+						AddAnnotation(ctx, block, r13, EXC_MSG_RETURN_2DESC, funcaddr, addr.val);
+					}
+				}
+				else
+				{
+					if (!block)
+					{
+						uint32_t annotaddr = r13;
+						for(int bit=13;bit>=0;bit--)
+						{
+							if (entry.val & (1<<bit))
+							{
+								annotaddr -= 4;
+							}
+						}
+						block = NewAnnotationBlock(ctx, annotaddr);
+					}
+					if (apcs)
+					{
+						/* TODO: Look for poked function names
+						   Will probably have to be done from [r13+4], to ensure correct name is used when dealing with tail recursion (build function name poking search into ExcDescribeAddr?) */
+						AddAnnotation(ctx, block, r13, EXC_MSG_R14_DESC, addr.val, 0);
+						AddAnnotation(ctx, block, r13+4, EXC_MSG_APCS, funcaddr, 0);
+					}
+					else
+					{
+						AddAnnotation(ctx, block, r13, EXC_MSG_ASMCALL, addr.val, funcaddr);
+					}
+					uint32_t annotaddr = r13;
+					for(int bit=13;bit>=0;bit--)
+					{
+						if (entry.val & (1<<bit))
+						{
+							annotaddr-=4;
+							AddAnnotation(ctx, block, annotaddr, EXC_MSG_REGNO, bit, 0);
+							if (apcs && (bit == 11))
+							{
+								/* Make a note of the address of the next frame */
+								excresult next_fp = ExcPeekMem(ctx, annotaddr);
+								block->next_fp = next_fp.val;
+								if (next_fp.ok)
+								{
+									if (!next_fp.val)
+									{
+										/* If we've reached the end of the trace then try probing further to see if we can spot a CMHG veneer
+										   The simplest way is to look for a SUB R10,R10,#540, STMIA R10,{R4,R5} sequence at the return address
+										   If we find this sequence, we can assume that the _kernel_swi block is the next thing on the stack */
+										if ((ExcPeekMem(ctx, addr.val).val == 0xe24aaf87) && (ExcPeekMem(ctx, addr.val+4).val == 0xe88a0030))
+										{
+											AddAnnotation(ctx, block, r13+8, EXC_MSG_CMHG_R0, 0, 0);
+											for(int i=1;i<10;i++)
+											{
+												AddAnnotation(ctx, block, r13+8+(i*4), (i==9?EXC_MSG_CMHG_R9:EXC_MSG_CMHG_RN), i, 0);
+											}
+										}
+									}
+									else
+									{
+										/* Forward-fill line flags */
+										for(int i=1;i<LINEBUFFER_SIZE;i++)
+										{
+											uint32_t lineaddr = ctx->lineaddr + i*4;
+											if ((lineaddr <= next_fp.val) && (lineaddr > r13))
+											{
+												uint32_t lineidx = (ctx->line + i) & (LINEBUFFER_SIZE-1);
+												block->lineflags |= 1<<lineidx;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		/* Detect other types of function call */
+		if (!apcs && !asm)
+		{
+			/* Assume [r13] is a return address, look for a function invocation at [[r13]-4] */
+			excresult addr = ExcPeekMem(ctx, r13);
+			excresult invoke = ExcPeekMem(ctx, addr.val-4);
+			excresult setlr = ExcPeekMem(ctx, addr.val-8);
+			if (((invoke.val & 0x0ffffff0) == 0x01a0f000) /* MOV PC, ... */
+			|| ((invoke.val & 0x0ffffff0) == 0x012fff30) /* BLX ... */
+			|| ((invoke.val & 0x0c50f000) == 0x0410f000) /* LDR PC, ... */
+			|| ((invoke.val & 0x0e508000) == 0x08108000) /* LDM ...,{...PC} */
+			|| ((setlr.val & 0x0fffffff) == 0x01a0e00f)) /* MOV LR,PC */
+			{
+				exc_annotation_block_t *block = FindAPCSFrameByNextFP(ctx, r13+4);
+				if (!block)
+					block = NewAnnotationBlock(ctx, r13);
+				AddAnnotation(ctx, block, r13, EXC_MSG_RETURN_1DESC, addr.val, 0);
+			}
+		}
+
+		r13+=4;
+
+		/* Break any APCS chains which we failed to find */
+		BreakChains(ctx, r13);
+	}
+}
+
+static bool DescribeBlocks(exc_context_t *ctx)
+{
+	/* Validate contents */
+	const uint32_t *pos = ctx->buffer;
+	size_t len = ctx->bufferlen-4;
+	char temp[64];
+	while(len)
+	{
+		uint32_t blocklen = pos[0];
+		if ((blocklen < 8) || (blocklen > len) || (blocklen & 3))
+		{
+			ctx->print(ctx->print_param,ExcGetMsg(ctx,EXC_MSG_DUMP_CORRUPT));
+			return false;
+		}
+		uint32_t blocktype = pos[1];
+		switch(blocktype)
+		{
+		case ExcDump_Chunk_Memory:
+			snprintf(temp,sizeof(temp),ExcGetMsg(ctx,EXC_MSG_BLOCK_MEM), pos[2], pos[2]+blocklen-12);
+			ctx->print(ctx->print_param,temp);
+			break;
+		case ExcDump_Chunk_OSRSI6:
+			for(int i=0;i<((blocklen-12)/4);i++)
+			{
+				snprintf(temp,sizeof(temp),ExcGetMsg(ctx,EXC_MSG_BLOCK_OSRSI6), pos[2]+i, pos[i+3]);
+				ctx->print(ctx->print_param,temp);
+			}
+			break;
+		case ExcDump_Chunk_Regs:
+			for(int i=0;i<((blocklen-8)/4);i++)
+			{
+				snprintf(temp,sizeof(temp),"%s = %08x\n", ExcRegNames[i], pos[i+2]);
+				ctx->print(ctx->print_param,temp);
+			}
+			break;
+		case ExcDump_Chunk_Error:
+			snprintf(temp,sizeof(temp),ExcGetMsg(ctx,EXC_MSG_BLOCK_ERROR), pos[2]);
+			ctx->print(ctx->print_param,temp);
+			ctx->print(ctx->print_param,(char *) &pos[3]);
+			ctx->print(ctx->print_param,"\n");
+			break;
+		case ExcDump_Chunk_OSMem16:
+			for(int i=0;(i*12)<(blocklen-12);i++)
+			{
+				int j=i*3;
+				snprintf(temp,sizeof(temp),ExcGetMsg(ctx,EXC_MSG_BLOCK_OSMEM16), pos[2]+i, pos[j+3], pos[j+4], pos[j+5]);
+				ctx->print(ctx->print_param,temp);
+			}
+			break;
+		default:
+			ctx->print(ctx->print_param,ExcGetMsg(ctx,EXC_MSG_DUMP_CORRUPT));
+			return false;
+		}
+		pos += blocklen/4;
+		len -= blocklen;
+	}
+	ctx->print(ctx->print_param,"\n");
+	return true;
+}
+
+static void DescribeAddr(exc_context_t *ctx, uint32_t addr, char *buffer, size_t len)
+{
+	ExcDescribeAddr(ctx, addr, buffer, len);
+	ctx->print(ctx->print_param, buffer);
+	uint64_t state = FindSymbol(ctx, addr);
+	if (state)
+	{
+		buffer[0] = ' ';
+		DescribeSymbolOffset(ctx, buffer+1, len-1, addr, state);
+		ctx->print(ctx->print_param, buffer);
+	}
+}
+
+static bool AnnotateReg(exc_context_t *ctx, uint32_t regno)
+{
+	excresult reg = ExcPeekReg(ctx, regno);
+	if (!reg.ok)
+	{
+		return false;
+	}
+	char buffer[256];
+	snprintf(buffer, sizeof(buffer), "%s = %08x ", ExcRegNames[regno], reg.val);
+	ctx->print(ctx->print_param, buffer);
+	DescribeAddr(ctx, reg.val, buffer, sizeof(buffer));
+	ctx->print(ctx->print_param, "\n");
+	/* Detect function calls */
+	if (regno != ExcDump_Reg_R15)
+	{
+		excresult val = ExcDecodeFuncCall(ctx, reg.val-4);
+		if (val.ok)
+		{
+			size_t ofs = strlen(ExcRegNames[regno]) + 3;
+			for(size_t i=0;i<ofs;i++)
+			{
+				buffer[i] = ' ';
+			}
+			snprintf(buffer+ofs, sizeof(buffer)-ofs, ExcGetMsg(ctx, EXC_MSG_CALLTO), val.val);
+			ctx->print(ctx->print_param, buffer);
+			DescribeAddr(ctx, val.val, buffer, sizeof(buffer));
+			ctx->print(ctx->print_param, "\n");
+		}
+	}
+	return true;
+}
+
+static void AnnotateAll(exc_context_t *ctx)
+{
+	AnnotateReg(ctx, ExcDump_Reg_R15);
+
+	eprocmode mode = (eprocmode) (ExcPeekReg(ctx, ExcDump_Reg_CPSR).val & 0x1f);
+	excresult r13;
+	uint32_t mem16[3];
+	bool mem16_ok;
+	uint32_t low,high;
+	bool nl = true;
+
+	/* The kernel doesn't tell us the original ABT/UND SP/R14, except for the case where the abort came from ABT/UND mode itself. So only attempt an ABT/UND stack dump if the abort came from that mode (otherwise we'll just be confusing the user by showing whatever junk the kernel has on the stack) */
+	if ((mode == ABT32) || (mode == UND32))
+	{
+		r13 = ExcPeekReg(ctx, ExcDump_Reg_R13);
+		mem16_ok = ExcPeekOSMem16(ctx, (mode == ABT32 ? 4 : 5), mem16);
+		low = mem16[0];
+		high = mem16[0] + mem16[2];
+		if (r13.ok && mem16_ok && (r13.val < high))
+		{
+			/* R14 may be &DEADDEAD if the CPU corrupted it in the process of raising the exception */
+			excresult r14 = ExcPeekReg(ctx, ExcDump_Reg_R14);
+			if ((r14.ok && (r14.val != 0xDEADDEAD) && AnnotateReg(ctx, ExcDump_Reg_R14)) || nl)
+			{
+				nl = false;
+				ctx->print(ctx->print_param, "\n");
+			}
+			if (r13.val < low)
+			{
+				r13.val = low;
+			}
+			ctx->print(ctx->print_param, ExcGetMsg(ctx, (mode == ABT32 ? EXC_MSG_ABT_STACK : EXC_MSG_UND_STACK)));
+			Annotate(ctx,r13.val,high,mode,0);
+			DumpAnnotations(ctx, r13.val, high-4);
+			ClearAnnotations(ctx);
+			ctx->print(ctx->print_param,"\n");
+		}
+	}
+
+	r13 = ExcPeekReg(ctx, ExcDump_Reg_R13_irq);
+	mem16_ok = ExcPeekOSMem16(ctx, 2, mem16);
+	low = mem16[0];
+	high = mem16[0] + mem16[2];
+	if (r13.ok && mem16_ok && (r13.val < high))
+	{
+		if (AnnotateReg(ctx, ExcDump_Reg_R14_irq) || nl)
+		{
+			nl = false;
+			ctx->print(ctx->print_param, "\n");
+		}
+		if (r13.val < low)
+		{
+			r13.val = low;
+		}
+		excresult irqsema = ExcPeekRSI6(ctx, OSRSI6_IRQsema);
+		if (irqsema.ok)
+		{
+			irqsema = ExcPeekMem(ctx, irqsema.val);
+		}
+		ctx->print(ctx->print_param, ExcGetMsg(ctx, EXC_MSG_IRQ_STACK));
+		Annotate(ctx,r13.val,high,IRQ32,(irqsema.ok ? irqsema.val : 0));
+		DumpAnnotations(ctx, r13.val, high-4);
+		ClearAnnotations(ctx);
+		ctx->print(ctx->print_param,"\n");
+	}
+
+	r13 = ExcPeekReg(ctx, ExcDump_Reg_R13_svc);
+	mem16_ok = ExcPeekOSMem16(ctx, 3, mem16);
+	low = mem16[0];
+	high = mem16[0] + mem16[2];
+	if (r13.ok && mem16_ok && (r13.val < high))
+	{
+		if (AnnotateReg(ctx, ExcDump_Reg_R14_svc) || nl)
+		{
+			nl = false;
+			ctx->print(ctx->print_param, "\n");
+		}
+		if (r13.val < low)
+		{
+			r13.val = low;
+		}
+		ctx->print(ctx->print_param, ExcGetMsg(ctx, EXC_MSG_SVC_STACK));
+		Annotate(ctx,r13.val,high,SVC32,0);
+		DumpAnnotations(ctx, r13.val, high-4);
+		ClearAnnotations(ctx);
+		ctx->print(ctx->print_param,"\n");
+	}
+
+	r13 = ExcPeekReg(ctx, ExcDump_Reg_R13_usr);
+	if (r13.ok)
+	{
+		if (AnnotateReg(ctx, ExcDump_Reg_R14_usr) || nl)
+		{
+			nl = false;
+			ctx->print(ctx->print_param, "\n");
+		}
+		high = r13.val + 1024;
+		ctx->print(ctx->print_param, ExcGetMsg(ctx, EXC_MSG_USR_STACK));
+		Annotate(ctx,r13.val,high,USR32,0);
+		DumpAnnotations(ctx, r13.val, high-4);
+		ClearAnnotations(ctx);
+		ctx->print(ctx->print_param,"\n");
+	}
+}
+
+#ifdef MODULE
+extern void ExcAnnotateAll(void (*print)(void *param, const char *str), void *print_param, const uint32_t *buffer, size_t bufferlen, uint32_t flags);
+
+void ExcAnnotateAll(void (*print)(void *param, const char *str), void *print_param, const uint32_t *buffer, size_t bufferlen, uint32_t flags)
+{
+	exc_context_t ctx;
+	memset(&ctx,0,sizeof(exc_context_t));
+	ctx.buffer = buffer;
+	ctx.bufferlen = bufferlen;
+	ctx.print = print;
+	ctx.print_param = print_param;
+	if ((flags & ExcAnnotateAll_DescribeBlocks) && !DescribeBlocks(&ctx))
+	{
+		return;
+	}
+	AnnotateAll(&ctx);
+	if (flags & ExcAnnotateAll_DescribeBlocks)
+	{
+		ctx.print(ctx.print_param, ExcGetMsg(&ctx, EXC_MSG_END));
+	}
+}
+#endif

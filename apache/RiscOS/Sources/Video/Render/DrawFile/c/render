@@ -1,0 +1,1234 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*render.c - implementation file for drawdata_render */
+
+   /* The error handling here is strange because we want to attempt
+      to plot all of the draw file before giving up. So all the
+      callbacks just store their error codes away, and return NULL.
+      In other words, instead of taking the form
+
+      os_error *fn (..., osbool *u) {  os_error *error = NULL; ...
+
+      finish: return error; }
+
+      they look like this
+
+      os_error *fn (..., osbool *u) {  os_error *error = NULL; ...
+
+      finish: if (state->error == NULL) state->error = error; return
+      NULL; }
+
+      Also, the callback system is used as follows: the callback list
+      is scanned for each object. If a function renders it, it claims
+      the callback. If the callback is not claimed, a service call is
+      sent round. This system is also used internally: if a text
+      object gives an error, it does not claim the callback, and the
+      system-font renderer has a go. */
+
+/*From CLib */
+#include <limits.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*From OSLib */
+#include "colourtrans.h"
+#include "draw.h"
+#include "jpeg.h"
+#include "macros.h"
+#include "os.h"
+
+/*From Support */
+#include "callback.h"
+#include "muldiv.h"
+#include "riscos.h"
+#include "jc_trace.h"
+#include "trfm.h"
+
+/*Local */
+#include "drawfile.h"
+#include "main.h"
+#include "render.h"
+#include "textarea.h"
+#include "verify.h"
+
+#define DEFAULT_FLATNESS (draw_OS_UNIT/2)
+   /* The value '0' here (which allows the Draw module to use a
+      default of its own choice) results in poor rendering. */
+
+osbool render_can_blend;
+
+/*------------------------------------------------------------------------*/
+static os_error *Sprite(osspriteop_header * header, os_trfm * trfm)
+
+{
+  os_error *error = NULL;
+  int entry_count;
+  osspriteop_TRANS_TAB(256) trans_tab;
+
+  entry_count = (header->image - sizeof(osspriteop_header)) /
+      sizeof(os_colour_pair);
+
+  if (entry_count > 0)
+  {
+    if ((error = xcolourtrans_select_table_for_sprite
+         (osspriteop_UNSPECIFIED, (osspriteop_id) header,
+          colourtrans_CURRENT_MODE, colourtrans_CURRENT_PALETTE,
+          (osspriteop_trans_tab *) & trans_tab, colourtrans_GIVEN_SPRITE))
+        != NULL)
+      goto finish;
+  }
+  else
+  {                                    /* Sprite has no palette. */
+    int log2_bpp;
+    os_PALETTE(20) palette;
+    bits flags;
+
+    if ((error = xos_read_mode_variable(header->mode, os_MODEVAR_LOG2_BPP,
+                                        &log2_bpp, &flags)) != NULL)
+      goto finish;
+
+    if ((flags & _C) != NONE)
+    {
+      char s[DEC_WIDTH + 1];
+
+      error = main_error_lookup(error_DRAW_FILE_BAD_MODE, "BadMode",
+                              riscos_format_dec(s, (int) header->mode, 0, 1));
+      goto finish;
+    }
+
+    if (log2_bpp < 3)
+      if ((error = xwimp_read_true_palette((os_palette *) & palette)) !=
+          NULL)
+        goto finish;
+
+/* Fix MED-4786: use the right entries for palettes < 16 entries. J R
+   C 6th Mar 1995 */
+    switch (log2_bpp)
+    {
+    case 0:
+      palette.entries[1] = palette.entries[7];
+      break;
+
+    case 1:
+      palette.entries[1] = palette.entries[2];
+      palette.entries[2] = palette.entries[4];
+      palette.entries[3] = palette.entries[7];
+      break;
+    }
+
+    if ((error = xcolourtrans_select_table(header->mode, log2_bpp < 3 ?
+                       (os_palette *) & palette : colourtrans_CURRENT_PALETTE,
+                        colourtrans_CURRENT_MODE, colourtrans_CURRENT_PALETTE,
+                               (osspriteop_trans_tab *) & trans_tab)) != NULL)
+      goto finish;
+  }
+
+  if ((error = xosspriteop_put_sprite_trfm(osspriteop_PTR,
+                   osspriteop_UNSPECIFIED, (osspriteop_id) header, NONE, NULL,
+           os_ACTION_USE_MASK, trfm, (osspriteop_trans_tab *) & trans_tab)) !=
+      NULL)
+    goto finish;
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *Text_System(char *text, os_colour fill, os_trfm * trfm)
+
+   /* Create a sprite, clear it to the text colour, and write the
+      character into the mask. */
+
+{
+  typedef
+  struct
+  {
+    osspriteop_area area;
+    osspriteop_header header;
+    os_colour_pair palette[2];
+    bits image[8];
+    bits mask[8];
+  }
+  mode0_8x8_sprite;
+
+  os_error *error = NULL;
+  int len, r0, r1, r2, r3, i;
+
+  mode0_8x8_sprite sprite =
+  {                                    /* area */
+    { /* size */ sizeof sprite,
+/* sprite_count */ 1,
+/* first */ offsetof(mode0_8x8_sprite, header),
+/* free */ sizeof sprite
+    },
+
+/* header */
+    { /* size */ sizeof sprite.header + sizeof sprite.palette +
+     sizeof sprite.image + sizeof sprite.mask,
+/* name */ "t",
+     /* width */ 0 /* 8 columns */ ,
+     /* height */ 7 /* 8 rows */ ,
+/* left_bit */ 0,
+/* right_bit */ 7,
+/* image */ sizeof sprite.header + sizeof sprite.palette,
+/* mask */ sizeof sprite.header + sizeof sprite.palette +
+     sizeof sprite.image,
+/* mode */ 0
+    },
+
+/* palette */
+    {
+      { /* on */ SKIP,
+                                       /* off */ SKIP
+                                       /* filled in with real colour */
+      },
+      { /* on */ SKIP,
+                                       /* off */ SKIP
+                                       /* never seen */
+      }
+    },
+
+/* bitmap */
+    {0, 0, 0, 0, 0, 0, 0, 0},
+
+/* mask */
+    {-1, -1, -1, -1, -1, -1, -1, -1}
+  };
+  osbool done_switch_output = FALSE;
+  os_coord base =
+  {16 * draw_OS_UNIT, 0}, step;
+  os_trfm char_trfm = *trfm;
+
+  static char gcol0[] =
+  {os_VDU_SET_GCOL, os_ACTION_OVERWRITE, 0};
+
+  tracef("Text_System: trfm_dir\n");
+  trfm_dir(&step, trfm, &base);
+
+  len = strlen(text);
+
+/* Fill in the colour to be used. */
+  sprite.palette[0].on = sprite.palette[0].off = fill;
+
+  for (i = 0; i < len; i++)
+  {
+    tracef("Text_System: osspriteop_switch_output_to_mask\n");
+    if ((error = xosspriteop_switch_output_to_mask(osspriteop_PTR,
+                          &sprite.area, (osspriteop_id) & sprite.header, NULL,
+                                                 &r0, &r1, &r2, &r3)) != NULL)
+      goto finish;
+    done_switch_output = TRUE;
+
+    tracef("Text_System: os_writen\n");
+    if ((error = xos_writen(gcol0, sizeof gcol0)) != NULL)
+      goto finish;
+
+    tracef("Text_System: os_plot\n");
+    if ((error = xos_plot(os_MOVE_TO, 0, 32)) != NULL)
+      goto finish;
+
+    tracef("Text_System: os_writec\n");
+    if ((error = xos_writec(text[i])) != NULL)
+      goto finish;
+
+    tracef("Text_System: osspriteop_unswitch_output (0x%X, %d, %d, %d)\n"
+           _ r0 _ r1 _ r2 _ r3);
+    if ((error = xosspriteop_unswitch_output(r0, r1, r2, r3)) != NULL)
+      goto finish;
+    done_switch_output = FALSE;
+
+/* Now we can plot the sprite. We use the internal sprite renderer
+   which makes a translation table. */
+    tracef("Text_System: Sprite\n");
+    if ((error = Sprite(&sprite.header, &char_trfm)) != NULL)
+      goto finish;
+
+    char_trfm.entries[2][0] += step.x;
+    char_trfm.entries[2][1] += step.y;
+  }
+
+finish:
+  if (done_switch_output)
+  {
+    os_error *error1 = xosspriteop_unswitch_output(r0, r1, r2, r3);
+
+    if (error == NULL)
+      error = error1;
+  }
+  return error;
+}
+/*------------------------------------------------------------------------*/
+static os_error *Bbox(os_box * box, os_trfm * trfm)
+
+{
+  os_error *error = NULL;
+  os_coord u[4], t[4];
+  int i;
+  char set_dot_style[] =
+  {os_VDU_MISC, os_MISC_SET_DOT_STYLE, 0xCC, 0,
+   0xCC, 0, 0xCC, 0, 0xCC, 0};
+
+  u[0].x = box->x0, u[0].y = box->y0;
+  u[1].x = box->x1, u[1].y = box->y0;
+  u[2].x = box->x1, u[2].y = box->y1;
+  u[3].x = box->x0, u[3].y = box->y1;
+
+  for (i = 0; i < 4; i++)
+  {
+    trfm_point(&t[i], trfm, &u[i]);
+    t[i].x /= draw_OS_UNIT, t[i].y /= draw_OS_UNIT;
+  }
+
+  if ((error = xcolourtrans_set_gcol(os_COLOUR_LIGHT_RED,
+                colourtrans_SET_FG_GCOL, os_ACTION_OVERWRITE, NULL, NULL)) != NULL)
+    goto finish;
+
+  if ((error = xos_writen(set_dot_style, sizeof set_dot_style)) != NULL)
+    goto finish;
+
+  if ((error = xos_plot(os_MOVE_TO, t[3].x, t[3].y)) != NULL)
+    goto finish;
+
+  for (i = 0; i < 4; i++)
+    if ((error = xos_plot(os_PLOT_TO | os_PLOT_DOTTED, t[i].x, t[i].y))
+        != NULL)
+      goto finish;
+
+finish:
+  return error;
+}
+/*------------------------------------------------------------------------*/
+os_error *render(bits flags, drawfile_diagram * diagram, int size,
+                 os_trfm * trfm, os_box * clip, int flatness)
+
+{
+  os_error *error = NULL;
+  drawfile_object *end, *o;
+  drawfile_render_state state;
+  os_box inv_clip;
+  osbool can_clip, unclaimed;
+  int version;
+
+  tracef("render\n");
+  xfont_cache_addr(&version, NULL, NULL);
+  render_can_blend = version >= 335; /* FontManager does background blending */
+
+  can_clip = clip != NULL && trfm_det(trfm) != 0;
+
+  if (can_clip)
+  {                                    /* Transform the clipping box
+                                          given back to the
+                                          coordinates it would have
+                                          had in paper coordinates,
+                                          and rebound it there. */
+    os_trfm inv;
+    int i;
+    os_box clip_draw;
+
+    for (i = 0; i < 4; i++)
+      (&clip_draw.x0)[i] = (&clip->x0)[i] * draw_OS_UNIT;
+
+    trfm_inv(&inv, trfm);
+    trfm_box(&inv_clip, &inv, &clip_draw);
+  }
+
+  state.diagram = diagram;
+  state.font_table = NULL;
+  state.flags = flags;
+  state.trfm = trfm;
+  state.clip = can_clip ? &inv_clip : NULL;
+  state.flatness = (flags & drawfile_RENDER_GIVEN_FLATNESS) != NONE ?
+      flatness : DEFAULT_FLATNESS;
+  state.error = NULL;
+
+  tracef("render: despatching\n");
+  end = (drawfile_object *) & ((byte *) diagram)[size];
+  for (o = diagram->objects; o < end; *(byte **) & o += o->size)
+  {
+    state.object = o;
+    if ((error = callback(main_render_callback, &state, &unclaimed, 1,
+                          o->type)) != NULL)
+      goto finish;
+
+    if (unclaimed && o->type >= 0x100)
+    {
+      if ((error = xservice_draw_object_render(o->type, &state, NULL)) !=
+          NULL)
+        goto finish;
+    }
+  }
+
+finish:
+  return error != NULL ? error : state.error;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_font_table(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+
+  tracef("render_font_table\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_FONT_TABLE);
+   #else
+  null = null;
+   #endif
+
+/* Save the pointer. */
+  state->font_table = state->object;
+
+  *unclaimed = FALSE;
+
+/*finish: */
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_font_table: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_text_system(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  os_trfm trfm, text_trfm;
+  drawfile_text *text = &state->object->data AS text;
+
+  tracef("render_text_system\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TEXT);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &text->bbox))
+  {
+    int len = strlen(text->text);
+
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&text->bbox, state->trfm);
+
+    if (text->fill != os_COLOUR_TRANSPARENT &&
+        (state->flags & drawfile_RENDER_SUPPRESS) == NONE && len > 0)
+    {                                  /* If the text is REALLY in
+                                          system font, we honour the
+                                          baseline and size fields in
+                                          the definition; otherwise,
+                                          we simply scale system text
+                                          to fit inside the bbox the
+                                          font claims to have. This
+                                          gives better results than
+                                          Draw's treatment, since
+                                          system text is usually much
+                                          wider for a given nominal x
+                                          size than an outline font. */
+
+      if (text->style.font_index == font_SYSTEM)
+      {                                /* Get the trfm needed to
+                                          scale the text to paper
+                                          coords. */
+        text_trfm.entries[0][0] = text->xsize * ((1 << 16) /
+                                                 (16 * draw_OS_UNIT));
+        text_trfm.entries[0][1] = 0;
+        text_trfm.entries[1][0] = 0;
+        text_trfm.entries[1][1] = text->ysize * ((1 << 16) /
+                                                 (32 * draw_OS_UNIT));
+        text_trfm.entries[2][0] = text->base.x;
+        text_trfm.entries[2][1] = text->base.y - text->ysize / 8;
+      }
+      else
+      {                                /* Which trfm takes the text
+                                          into its bounding box? */
+        text_trfm.entries[0][0] = (text->bbox.x1 - text->bbox.x0) *
+            ((1 << 16) / (16 * draw_OS_UNIT)) / len;
+        text_trfm.entries[0][1] = 0;
+        text_trfm.entries[1][0] = 0;
+        text_trfm.entries[1][1] = (text->bbox.y1 - text->bbox.y0) *
+            ((1 << 16) / (32 * draw_OS_UNIT));
+        text_trfm.entries[2][0] = text->bbox.x0;
+        text_trfm.entries[2][1] = text->bbox.y0;
+      }
+
+      tracef("render_text_system: trfm_mul\n");
+      trfm_mul(&trfm, state->trfm, &text_trfm);
+
+      if ((error = Text_System(text->text, text->fill, &trfm)) != NULL)
+        goto finish;
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_text_system: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_text(void *null, void *s, osbool * unclaimed)
+
+{
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  os_error *error = NULL;
+  drawfile_text *text = &state->object->data AS text;
+  char *font_name;
+  osbool done_find_font = FALSE;
+  font_string_flags blend;
+  font_f f;
+  os_trfm trfm;
+  os_coord base;
+
+  tracef("render_text\n");
+
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TEXT);
+   #else
+  null = null;
+   #endif
+
+  if (text->style.font_index != font_SYSTEM)
+  {
+    if (state->clip == NULL || verify_overlap(state->clip, &text->bbox))
+    {
+      if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+        (void) Bbox(&text->bbox, state->trfm);
+
+/* Get the font table pointer. */
+      font_name = verify_lookup_font_index(text->style.font_index,
+                                           state->font_table);
+/* we know that |state->font_table| is not NULL and that
+   |verify_lookup_font_index()| returns a value because of
+   |verify()|. */
+
+      if (text->fill != os_COLOUR_TRANSPARENT &&
+          (state->flags & drawfile_RENDER_SUPPRESS) == NONE)
+      {
+        tracef("finding font \"%s\", size (%d, %d)\n" _
+               font_name _ text->xsize / 40 _
+               text->ysize / 40);
+        if ((error = xfont_find_font(font_name, text->xsize / 40,
+                             text->ysize / 40, 0, 0, &f, NULL, NULL)) != NULL)
+          goto finish;
+        done_find_font = TRUE;
+
+        tracef("setting colours 0x%X, 0x%X\n" _
+               text->bg_hint _ text->fill);
+        if ((error = xcolourtrans_set_font_colours(f,
+                    text->bg_hint, text->fill, 14, NULL, NULL, NULL)) != NULL)
+          goto finish;
+
+/* For bitmapped fonts, the font manager can't cope with translations
+   in the matrix ... so move the translation part out of the matrix
+   into the baseline origin. */
+        trfm = *state->trfm;
+        trfm.entries[2][0] = 0;
+        trfm.entries[2][1] = 0;
+
+        trfm_point(&base, state->trfm, &text->base);
+
+        blend = (render_can_blend &&
+                (text->bg_hint == os_COLOUR_TRANSPARENT)) ? font_BLEND_FONT : 0;
+
+/* Paint the text. */
+        tracef("painting \"%s\" at (%d, %d) through ((%d, %d), "
+               "(%d, %d), (%d, %d))\n" _
+               text->text _ base.x _ base.y _
+               trfm.entries[0][0] _ trfm.entries[0][1] _
+               trfm.entries[1][0] _ trfm.entries[1][1] _
+               trfm.entries[2][0] _ trfm.entries[2][1]);
+        if ((error = xfont_paint(f, text->text, font_OS_UNITS |
+                     font_GIVEN_TRFM | font_GIVEN_FONT | blend, base.x / draw_OS_UNIT,
+                           base.y / draw_OS_UNIT, SKIP, &trfm, SKIP)) != NULL)
+          goto finish;
+      }
+    }
+
+    *unclaimed = FALSE;
+  }
+
+finish:
+  if (done_find_font)
+  {
+    os_error *error1 = xfont_lose_font(f);
+    if (error == NULL)
+      error = error1;
+  }
+
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_text: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_path(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_path *path = &state->object->data AS path;
+  draw_path *elements;
+  draw_dash_pattern *pattern;
+  draw_line_style line_style;
+
+  tracef("render_path\n");
+#ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_PATH);
+#else
+  null = null;
+#endif
+
+#if TRACE
+  if (state->clip != NULL)
+  {
+    tracef("clipping rectangle given as ((%d, %d), (%d, %d))\n" _
+           state->clip->x0 _ state->clip->y0 _
+           state->clip->x1 _ state->clip->y1);
+    tracef("testing against bbox of ((%d, %d), (%d, %d))\n" _
+           path->bbox.x0 _ path->bbox.y0 _
+           path->bbox.x1 _ path->bbox.y1);
+    tracef("-> overlap %s\n" _ WHETHER(verify_overlap(state->clip,
+                                                      &path->bbox)));
+  }
+#endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &path->bbox))
+  {
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&path->bbox, state->trfm);
+
+     #if TRACE
+    {
+      int i;
+      tracef("using style 0x");
+      for (i = 0; i < sizeof(drawfile_path_style); i++)
+        trace_f(NULL, 0, "%.2X" _
+                ((byte *) & path->style)[i]);
+      trace_f(NULL, 0, "\n");
+    }
+     #endif
+    if ((state->flags & drawfile_RENDER_SUPPRESS) == NONE)
+    {                                  /* Convert the
+                                          drawfile_path_style into a
+                                          draw_line_style. */
+      byte flags = path->style.flags;
+
+      line_style.join_style = (flags & drawfile_PATH_JOIN) >>
+          drawfile_PATH_JOIN_SHIFT;
+      line_style.start_cap_style = (flags & drawfile_PATH_START) >>
+          drawfile_PATH_START_SHIFT;
+      line_style.end_cap_style = (flags & drawfile_PATH_END) >>
+          drawfile_PATH_END_SHIFT;
+      line_style.reserved = 0;
+      line_style.mitre_limit = 10 << 16;  /* Postscript default */
+      line_style.start_cap_width = line_style.end_cap_width =
+          16 * path->style.cap_width;
+      line_style.start_cap_length = line_style.end_cap_length =
+          16 * path->style.cap_length;
+
+/* Get the draw_pattern. */
+      if ((flags & drawfile_PATH_DASHED) != NONE)
+      {
+        pattern = &state->object->data AS path_with_pattern.pattern;
+        elements = (draw_path *) ((byte *) pattern +
+                            draw_SIZEOF_DASH_PATTERN(pattern->element_count));
+      }
+      else
+      {
+        pattern = NULL;
+        elements = &path->path;
+      }
+
+      if (path->fill != os_COLOUR_TRANSPARENT)
+      {
+        if ((error = xcolourtrans_set_gcol(path->fill,
+                                    colourtrans_SET_FG_GCOL | colourtrans_USE_ECFS_GCOL,
+                                    os_ACTION_OVERWRITE, NULL, NULL)) != NULL)
+          goto finish;
+
+        if ((error = xdraw_fill(elements, draw_FILL_FULL_INTERIOR |
+                                draw_FILL_INTERIOR_BOUNDARY | ((flags &
+                                     drawfile_PATH_WINDING_EVEN_ODD) != NONE ?
+                         draw_FILL_EVEN_ODD : draw_FILL_NONZERO), state->trfm,
+                                state->flatness)) != NULL)
+          goto finish;
+      }
+
+      if (path->outline != os_COLOUR_TRANSPARENT)
+      {
+        if ((error = xcolourtrans_set_gcol(path->outline,
+                                    colourtrans_SET_FG_GCOL | colourtrans_USE_ECFS_GCOL,
+                                    os_ACTION_OVERWRITE, NULL, NULL)) != NULL)
+          goto finish;
+
+               #if TRACE
+        {
+          int i;
+          tracef("using line_style 0x");
+          for (i = 0; i < sizeof(draw_line_style); i++)
+            trace_f(NULL, 0, "%.2X" _((byte *) & line_style)[i]);
+          trace_f(NULL, 0, "\n");
+        }
+               #endif
+        if ((error = xdraw_stroke(elements, draw_FILL_FULL_INTERIOR |
+                    draw_FILL_INTERIOR_BOUNDARY | draw_FILL_EXTERIOR_BOUNDARY,
+                       state->trfm, state->flatness, path->width, &line_style,
+                                  pattern)) != NULL)
+          goto finish;
+      }
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_path: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_sprite(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_sprite *sprite = &state->object->data AS sprite;
+  int xeig, yeig, width, height;
+  bits flags1, flags2;
+  os_trfm trfm, sprite_trfm;
+
+  tracef("render_sprite\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_SPRITE);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &sprite->bbox))
+  {
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&sprite->bbox, state->trfm);
+
+    if ((error = xosspriteop_read_sprite_size(osspriteop_PTR,
+              osspriteop_UNSPECIFIED, (osspriteop_id) & state->object->data AS
+                         sprite.header, &width, &height, NULL, NULL)) != NULL)
+      goto finish;
+
+    if ((state->flags & drawfile_RENDER_SUPPRESS) == NONE &&
+        width > 0 && height > 0)
+    {
+      if ((error = xos_read_mode_variable(sprite->header.mode,
+                             os_MODEVAR_XEIG_FACTOR, &xeig, &flags1)) != NULL)
+        goto finish;
+
+      if ((error = xos_read_mode_variable(sprite->header.mode,
+                             os_MODEVAR_YEIG_FACTOR, &yeig, &flags2)) != NULL)
+        goto finish;
+
+      if (((flags1 | flags2) & _C) != NONE)
+      {
+        char s[DEC_WIDTH + 1];
+
+        error = main_error_lookup(error_DRAW_FILE_BAD_MODE, "BadMode",
+                       riscos_format_dec(s, (int) sprite->header.mode, 0, 1));
+        goto finish;
+      }
+
+/* Get the trfm needed to scale the sprite to paper coords. */
+      sprite_trfm.entries[0][0] = muldiv(sprite->bbox.x1 -
+                      sprite->bbox.x0, 1 << 16, width * draw_OS_UNIT << xeig);
+      sprite_trfm.entries[0][1] = 0;
+      sprite_trfm.entries[1][0] = 0;
+      sprite_trfm.entries[1][1] = muldiv(sprite->bbox.y1 -
+                     sprite->bbox.y0, 1 << 16, height * draw_OS_UNIT << yeig);
+      sprite_trfm.entries[2][0] = sprite->bbox.x0;
+      sprite_trfm.entries[2][1] = sprite->bbox.y0;
+
+/* Multiply the matrix in the sprite by the given matrix to get the
+   matrix to plot through. */
+      trfm_mul(&trfm, state->trfm, &sprite_trfm);
+
+      if ((error = Sprite(&sprite->header, &trfm)) != NULL)
+        goto finish;
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_sprite: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_group(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s  /* save
+                                                                 typing */ ;
+  drawfile_group *group = &state->object->data AS group;
+  drawfile_object *o, *end;
+  osbool u;
+
+  tracef("render_group\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_GROUP);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &group->bbox))
+  {
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&group->bbox, state->trfm);
+
+    end = (drawfile_object *) & ((byte *) state->object)
+        [state->object->size];
+    for (o = (drawfile_object *) & group->objects; o < end;
+         *(byte **) & o += o->size)
+    {
+      state->object = o;
+      if ((error = callback(main_render_callback, state, &u, 1,
+                            o->type)) != NULL)
+        goto finish;
+
+      if (u && o->type >= 0x100)
+      {
+        if ((error = xservice_draw_object_render(o->type, state, NULL))
+            != NULL)
+          goto finish;
+      }
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_group: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_tagged(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s  /* save
+                                                                 typing */ ;
+  drawfile_tagged *tagged = &state->object->data AS tagged;
+  drawfile_object *o, *end;
+  osbool u;
+
+  tracef("render_tagged\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TAGGED);
+   #else
+  null = null;
+   #endif
+
+  o = (drawfile_object *) & tagged->object;
+  end = (drawfile_object *) & ((byte *) state->object)
+      [state->object->size];
+  if ((drawfile_object *) & ((byte *) o)[o->size] > end)
+  {
+    error = main_error_lookup(error_DRAW_FILE_BAD_TAG, "BadTag");
+    goto finish;
+  }
+
+  state->object = o;
+  if ((error = callback(main_render_callback, state, &u, 1, o->type)) !=
+      NULL)
+    goto finish;
+
+  if (u && o->type >= 0x100)
+  {
+    if ((error = xservice_draw_object_render(o->type, state, NULL)) !=
+        NULL)
+      goto finish;
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_tagged: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_text_area(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_text_area *text_area = &state->object->data AS text_area;
+
+  tracef("render_text_area\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TEXT_AREA);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &text_area->bbox))
+  {
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&text_area->bbox, state->trfm);
+
+    if ((state->flags & drawfile_RENDER_SUPPRESS) == NONE)
+      if ((error = textarea_render(state->object, state->trfm,
+                                   state->clip, state->flags)) != NULL)
+        goto finish;
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_text_area: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_trfm_text_system(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_trfm_text *trfm_text = &state->object->data AS trfm_text;
+  os_trfm trfm, text_trfm;
+
+  tracef("render_trfm_text_system\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TRFM_TEXT);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &trfm_text->bbox))
+  {
+    int len = strlen(trfm_text->text);
+
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&trfm_text->bbox, state->trfm);
+
+    if (trfm_text->fill != os_COLOUR_TRANSPARENT &&
+        (state->flags & drawfile_RENDER_SUPPRESS) == NONE && len > 0)
+    {                                  /* If the text is REALLY in
+                                          system font, we honour the
+                                          baseline, transformation
+                                          and size fields in the
+                                          definition; otherwise, we
+                                          simply scale system text to
+                                          fit inside the bbox the
+                                          font claims to have,
+                                          without making any attempt
+                                          to apply the
+                                          transformation. To scale
+                                          the text to fit inside the
+                                          bounding box WITH the
+                                          transformation applied
+                                          would involve solving a
+                                          linear optimisation problem
+                                          (for the font width) with
+                                          eight constraints. */
+
+      if (trfm_text->style.font_index == font_SYSTEM)
+      {                                /* Get the trfm needed to
+                                          scale the text to the
+                                          coords it would have if it
+                                          were a "real" font. */
+        os_trfm trfm1, trfm2;
+
+        trfm1.entries[0][0] = trfm_text->xsize * ((1 << 16) /
+                                                  (16 * draw_OS_UNIT));
+        trfm1.entries[0][1] = 0;
+        trfm1.entries[1][0] = 0;
+        trfm1.entries[1][1] = trfm_text->ysize * ((1 << 16) /
+                                                  (32 * draw_OS_UNIT));
+        trfm1.entries[2][0] = 0;
+        trfm1.entries[2][1] = -trfm_text->ysize / 8;
+
+        trfm_mul(&trfm2, &trfm_text->trfm, &trfm1);
+
+        trfm1.entries[0][0] = 1 << 16;
+        trfm1.entries[0][1] = 0;
+        trfm1.entries[1][0] = 0;
+        trfm1.entries[1][1] = 1 << 16;
+        trfm1.entries[2][0] = trfm_text->base.x;
+        trfm1.entries[2][1] = trfm_text->base.y;
+
+        trfm_mul(&text_trfm, &trfm1, &trfm2);
+      }
+      else
+      {                                /* Which trfm takes the text
+                                          into its bounding box? */
+        text_trfm.entries[0][0] = (trfm_text->bbox.x1 -
+                trfm_text->bbox.x0) * ((1 << 16) / (16 * draw_OS_UNIT)) / len;
+        text_trfm.entries[0][1] = 0;
+        text_trfm.entries[1][0] = 0;
+        text_trfm.entries[1][1] = (trfm_text->bbox.y1 -
+                      trfm_text->bbox.y0) * ((1 << 16) / (32 * draw_OS_UNIT));
+        text_trfm.entries[2][0] = trfm_text->bbox.x0;
+        text_trfm.entries[2][1] = trfm_text->bbox.y0;
+      }
+
+      tracef("render_trfm_text_system: trfm_mul\n");
+      trfm_mul(&trfm, state->trfm, &text_trfm);
+
+      if ((error = Text_System(trfm_text->text, trfm_text->fill, &trfm))
+          != NULL)
+        goto finish;
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_trfm_text_system: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_trfm_text(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_trfm_text *trfm_text = &state->object->data AS trfm_text;
+  char *font_name;
+  osbool done_find_font = FALSE;
+  font_string_flags blend;
+  font_f f;
+  os_trfm trfm;
+  os_coord base;
+
+  tracef("render_trfm_text\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TRFM_TEXT);
+   #else
+  null = null;
+   #endif
+
+  if (trfm_text->style.font_index != font_SYSTEM)
+  {
+    if (state->clip == NULL || verify_overlap(state->clip,
+                                              &trfm_text->bbox))
+    {
+      if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+        (void) Bbox(&trfm_text->bbox, state->trfm);
+
+/* Check the font table pointer. */
+      font_name = verify_lookup_font_index(trfm_text->style.font_index,
+                                           state->font_table);
+/* we know that |state->font_table| is not NULL and that
+   |verify_lookup_font_index()| returns a value because of
+   |verify()|. */
+
+      if (trfm_text->fill != os_COLOUR_TRANSPARENT
+          && (state->flags & drawfile_RENDER_SUPPRESS) == NONE)
+      {
+        char tmp[3], *text;
+        tracef("finding font \"%s\", size (%d, %d)\n" _
+               font_name _ trfm_text->xsize / 40 _ trfm_text->ysize / 40);
+
+        if ((error = xfont_find_font(font_name, trfm_text->xsize / 40,
+                        trfm_text->ysize / 40, 0, 0, &f, NULL, NULL)) != NULL)
+          goto finish;
+        done_find_font = TRUE;
+
+        tracef("setting colours 0x%X, 0x%X\n" _
+               trfm_text->bg_hint _ trfm_text->fill);
+        if ((error = xcolourtrans_set_font_colours(f,
+                          trfm_text->bg_hint, trfm_text->fill, 14, NULL, NULL,
+                                                   NULL)) != NULL)
+          goto finish;
+
+/* Stupid Font_Paint wants OS Units in the matrix */
+        trfm_mul(&trfm, state->trfm, &trfm_text->trfm);
+        trfm.entries[2][0] /= draw_OS_UNIT;
+        trfm.entries[2][1] /= draw_OS_UNIT;
+
+        trfm_point(&base, state->trfm, &trfm_text->base);
+
+        blend = (render_can_blend &&
+                (trfm_text->bg_hint == os_COLOUR_TRANSPARENT)) ? font_BLEND_FONT : 0;
+
+/* Paint the text. */
+        text = trfm_text->text;
+        if ((trfm_text->flags & drawfile_TEXT_UNDERLINE) != NONE)
+        {
+          text -= 3;
+          memcpy(tmp, text, 3);
+          text[0] = font_COMMAND_UNDERLINE;
+          text[1] = -25 + 0x100;
+          text[2] = 15;
+        }
+        tracef("painting \"%s\" at (%d, %d)\n" _ text _
+               trfm_text->base.x _ trfm_text->base.y);
+        error = xfont_paint(f, text, font_OS_UNITS | font_GIVEN_TRFM |
+                    font_GIVEN_FONT | blend
+                    | ((trfm_text->flags & drawfile_TEXT_KERN)
+                            != NONE ? font_KERN : NONE) | ((trfm_text->flags &
+                   drawfile_TEXT_RIGHT_TO_LEFT) != NONE ? font_RIGHT_TO_LEFT :
+                    NONE), base.x / draw_OS_UNIT, base.y / draw_OS_UNIT, SKIP,
+                            &trfm, SKIP);
+        if ((trfm_text->flags & drawfile_TEXT_UNDERLINE) != 0)
+          memcpy(text, tmp, 3);
+      }
+
+      *unclaimed = FALSE;
+    }
+  }
+
+finish:
+  if (done_find_font)
+  {
+    os_error *error1 = xfont_lose_font(f);
+    if (error == NULL)
+      error = error1;
+  }
+
+  if (state->error == NULL)
+    state->error = error;
+/* Claim this call if everything went o k. (If not,
+   render_trfm_text_system() will have a go.) */
+  if (error != NULL)
+    tracef("render_trfm_text: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_trfm_sprite(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_trfm_sprite *trfm_sprite = &state->object->data AS trfm_sprite;
+  os_trfm trfm;
+
+  tracef("render_trfm_sprite\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_TRFM_SPRITE);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip,
+                                            &trfm_sprite->bbox))
+  {
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&trfm_sprite->bbox, state->trfm);
+
+    if ((state->flags & drawfile_RENDER_SUPPRESS) == NONE)
+    {                                  /* Multiply the matrix in the
+                                          sprite by the given matrix
+                                          to get the matrix  to plot
+                                          through. */
+      trfm_mul(&trfm, state->trfm, &trfm_sprite->trfm);
+
+      if ((error = Sprite(&trfm_sprite->header, &trfm)) != NULL)
+        goto finish;
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_trfm_sprite: \"%s\"\n" _ error->errmess);
+  return NULL;
+}
+/*------------------------------------------------------------------------*/
+os_error *render_jpeg(void *null, void *s, osbool * unclaimed)
+
+{
+  os_error *error = NULL;
+  drawfile_render_state *state = (drawfile_render_state *) s;  /* save
+                                                                  typing */
+  drawfile_jpeg *jpeg = &state->object->data AS jpeg;
+  os_trfm trfm;
+
+  tracef("render_jpeg\n");
+   #ifdef TEST
+  riscos_assert(null == NULL);
+  riscos_assert(state->object->type == drawfile_TYPE_JPEG);
+   #else
+  null = null;
+   #endif
+
+  if (state->clip == NULL || verify_overlap(state->clip, &jpeg->bbox))
+  {
+    if ((state->flags & drawfile_RENDER_BBOXES) != NONE)
+      (void) Bbox(&jpeg->bbox, state->trfm);
+
+    if ((state->flags & drawfile_RENDER_SUPPRESS) == NONE)
+    {                                  /* Multiply the matrix in the
+                                          JPEG by the given matrix to
+                                          get the matrix  to plot
+                                          through. */
+      trfm_mul(&trfm, state->trfm, &jpeg->trfm);
+
+      if ((error = xjpeg_plot_transformed(&jpeg->image,
+                          jpeg_TRANSFORM_DITHERED, &trfm, jpeg->len)) != NULL)
+        goto finish;
+    }
+  }
+
+  *unclaimed = FALSE;
+
+finish:
+  if (state->error == NULL)
+    state->error = error;
+  if (error != NULL)
+    tracef("render_jpeg: \"%s\"\n" _ error->errmess);
+  return NULL;
+}

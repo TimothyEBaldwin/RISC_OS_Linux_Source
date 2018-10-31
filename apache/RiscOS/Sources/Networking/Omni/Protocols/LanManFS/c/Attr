@@ -1,0 +1,690 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*  Lan Manager client
+*
+*  Attr.C --  RISCOS file-type subsystem
+*
+*  Versions
+*  18-08-94 INH Original
+*
+*/
+
+/* System includes */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+#include "Interface/MimeMap.h"
+#include "Global/FileTypes.h"
+
+/* Our includes */
+
+#include "stdtypes.h"
+
+#include "Attr.h"
+#include "SMB.h"
+#include "Xlate.h"
+#include "Omni.h"
+#include "LanMan.h"
+#include "LMVars.h"
+
+/* "Default" filetype logic ------------------------------------- */
+
+/* This is used when the file-type logic can't provide
+   RISCOS attributes for the given filename (e.g. when they're
+   DOS files, or someone's deleted the RISCOS.EA file).
+*/
+
+struct ext_type
+{
+  char *ext;
+  int   type;
+};
+
+static const struct ext_type FTypes[] =
+{
+  { "TXT", 0xFFF },  /* Text */
+  { "C",   0xFFF },
+  { "H",   0xFFF },
+  { "ASM", 0xFFF },
+  { "JPG", 0xC85 },  /* JPEG */
+  { "PS",  0xFF5 },  /* Postscript */
+  { NULL,  0     }
+};
+
+/* ---------------- */
+
+static void GetDefaultType ( char *leafname, RISCOS_ATTRIBS *ra )
+{
+  const struct ext_type *pET;
+  int ftype;
+  _kernel_swi_regs rset ;
+  
+  /* See if OmniFiler can help us */
+
+  if ( Omni_GetDefaultType(leafname, &ftype) == OK )
+  {
+    debug2("Omni gave default type %X for '%s'\n", ftype, leafname );
+    ra->loadaddr = (ra->loadaddr & 0xFFF000FF) |
+                   ((ftype << 8) & 0x000FFF00);
+    return;
+  }
+
+  leafname = strchr(leafname, '.');
+  if ( leafname == NULL )  /* No extension */
+  {
+    debug2("Assuming filetype %03x for '%s' due to no suffix\n", LM_Vars.default_type, leafname );
+    ra->loadaddr = (ra->loadaddr & 0xFFF000FF) |
+                   (LM_Vars.default_type << 8);
+    return;
+  }
+
+  leafname++;  /* Skip '.' */
+
+  /* Have a look in the mimemap */
+  rset.r[0] = MMM_TYPE_DOT_EXTN;
+  rset.r[1] = (int)leafname;
+  rset.r[2] = MMM_TYPE_RISCOS;
+  if (_kernel_swi(MimeMap_Translate, &rset, &rset) == NULL)
+  {
+    ra->loadaddr = (ra->loadaddr & 0xFFF000FF) |
+                   (rset.r[3] << 8);
+    debug2("Mimemap gave type %X for '%s'\n", rset.r[3], leafname );
+    return;
+  }
+
+  /* Look through the feable small table */
+  for ( pET = FTypes; pET->ext != NULL; pET++ )
+  {
+    if ( strcmp ( pET->ext, leafname ) == 0 )
+    {
+      ra->loadaddr = (ra->loadaddr & 0xFFF000FF) |
+                     (pET->type << 8);
+      return;
+    }
+  }
+}
+
+/* Attribute-file logic --------------------------- */
+
+/* We keep RISCOS attributes in a file "RISCOS.EA" in each
+   directory. This consists of one or more 'ATTR_REC'
+   structures as defined below.
+*/
+
+#define ATTR_FILENAME  "RISCOS.EA"
+
+typedef struct
+{
+  char           name[16];
+  RISCOS_ATTRIBS attr;
+}
+  ATTR_REC;
+
+#define ATTR_REC_SIZE sizeof(ATTR_REC)
+
+
+/* We also keep a cache of the attributes file, to avoid
+   continual network traffic when reading a whole directory.
+*/
+
+#define CACHE_SIZE 128
+
+/* This is set so that typically a whole RISCOS directory's
+   worth (77 files) can be kept in the cache.
+   13/6/96: change from 80 to 128 so that it's a whole number of
+   disk sectors.
+*/
+
+static char     AttrFileName[DOS_NAME_LEN];
+                               /* Name of file for which AttrCache
+                                  holds entries */
+static ATTR_REC AttrCache[CACHE_SIZE];
+static int      AttrCacheLen;  /* Number of valid entries in cache */
+static int      AttrCacheStart; /* Offset (in records) of first
+                                   record in cache */
+
+static bool     AttrAllInCache; /* This is set if the entire attrib file
+                                is held in the cache, or if there is no
+                                attrib. file. This cuts out a lot of
+                                network activity when it is set. */
+
+#define LEAFNAME_SIZE 16
+static char AttrLeafName[LEAFNAME_SIZE];
+
+/* ---------------------- */
+
+/* SetFileName makes sure AttrFileName is the name of the
+   attribute file for the file name given. If this involves
+   a change to AttrFileName, the cache is invalidated.
+
+   The name should always be in upper-case (as supplied by
+   the Xlate conversion functions) to ensure the match works.
+*/
+
+static err_t SetFileName ( char *name )
+{
+  char *tmp;
+  int path_len;  /* Length of file's pathname */
+
+  tmp = strrchr(name, '\\'); /* Get pathname */
+  if ( tmp == NULL )         /* Shouldn't actually happen! */
+    return EBADNAME;
+
+  strcpyn_upper ( AttrLeafName, tmp+1, LEAFNAME_SIZE );
+  path_len = (tmp-name)+1; /* Length including last '\' */
+
+  if ( strncmp ( AttrFileName, name, path_len ) == 0 &&
+       strcmp ( AttrFileName+path_len, ATTR_FILENAME ) == 0
+     )
+    return OK;  /* Still in cache! */
+
+  AttrCacheLen=0;  /* Invalidate cache */
+  AttrAllInCache = false;
+
+  /* Form filename */
+  strncpy ( AttrFileName, name, path_len );
+  strcpy ( AttrFileName+path_len, ATTR_FILENAME );
+  return OK;
+}
+
+
+
+/* ----------------------------------------- */
+
+static int GetEntryPos ( char *name )
+{
+  int i;
+  char ch = name[0];   /* Used as speedup */
+
+  for ( i=0; i<AttrCacheLen; i++ )
+    if ( ch == AttrCache[i].name[0] &&
+         strcmp ( name, AttrCache[i].name ) == 0 )
+      return i;
+
+  return -1;
+}
+
+
+/* ----------------------------- */
+
+static int SearchFileForEntry ( int FH, char *name )
+{
+  uint len;
+  int  pos;
+  AttrCacheStart = 0;
+  AttrAllInCache = false;
+
+  while(1)
+  {
+    len = 0;
+    SMB_Read ( FH, AttrCacheStart*ATTR_REC_SIZE,
+                     CACHE_SIZE * ATTR_REC_SIZE,
+               (BYTE *)AttrCache, &len );
+
+    AttrCacheLen = len / ATTR_REC_SIZE;
+
+    if ( AttrCacheStart == 0 && AttrCacheLen < CACHE_SIZE )
+      AttrAllInCache = true;
+
+    pos = GetEntryPos(name);
+    if ( pos >= 0 )
+      return pos;
+
+    if ( AttrCacheLen < CACHE_SIZE ) /* No more file */
+       return -1;
+
+    AttrCacheStart+= AttrCacheLen;
+  }
+}
+
+/* --------------------------- */
+
+static bool CacheEmpty (void)
+{
+  int i;
+  for ( i=0; i<AttrCacheLen; i++)
+  {
+    if (AttrCache[i].name[0] != 0)
+      return false;
+  }
+  return true;
+}
+
+/* --------------------------- */
+
+static void FileDataMove( int FH, uint from, uint to )
+{
+  /* ONLY WORKS IF FROM > TO */
+  uint req_len, len;
+
+  if (from <= to) return;
+  req_len = from - to;
+
+  do
+  {
+    len = 0;
+
+    SMB_Read ( FH, from, req_len, (BYTE *)AttrCache, &len );
+    if ( len != 0 )
+      SMB_Write ( FH, to, len, (BYTE *)AttrCache, NULL );
+
+    from += len;
+    to += len;
+  }
+    while ( len == req_len );
+
+  SMB_Truncate ( FH, to );
+  AttrCacheLen = len / ATTR_REC_SIZE;
+  AttrAllInCache = false;  /* Can't be sure, so assume not! */
+}
+
+/* ------------------------------------------------------ */
+
+/* This routine determines which of the saved attributes are
+   read back from the RISCOS.EA file, and which are still
+   generated by converting from DOS.
+*/
+
+static void InsertAttribs ( RISCOS_ATTRIBS *src, RISCOS_ATTRIBS *dst )
+{
+  if ( (src->loadaddr & 0xFFF00000) != 0xFFF00000 )
+  {
+    /* If it's a load/exec address rather than time/date stamp */
+    dst->loadaddr = src->loadaddr;
+    dst->execaddr = src->execaddr;
+  }
+  else
+  {
+    /* Preserve time & date stamp given by DOS */
+    dst->loadaddr = (dst->loadaddr & 0xFFF000FF) |
+                    (src->loadaddr & 0x000FFF00);
+  }
+}
+
+/* Attr_InvalidateDrive() --------------------------------- */
+
+/* Called when the meaning of a drive letter changes, so that
+   we can invalidate the cache.
+*/
+
+void Attr_InvalidateDrive( char drvletter )
+{
+  (void) drvletter; /* Ignore it */
+  AttrCacheLen=0;  /* Invalidate cache */
+  AttrAllInCache = false;
+  AttrFileName[0] = 0;
+}
+
+/* Attr_GetInfo() ----------------------------------------- */
+
+/*
+   This attempts to fill in the RISCOS_ATTRIBS structure
+   for the file given in 'filename'. As a convenience to the
+   'read-directory' routine, it allows the leaf name to be passed
+   in separately.
+*/
+
+#ifdef LONGNAMES
+static err_t Attr_GetInfoX2 ( char *filename, char *leafname,
+      RISCOS_ATTRIBS *pRA )
+{
+  char *lastcomma;
+  if (Xlt_SplitLeafnameX2 ( (leafname != NULL) ? leafname : filename, pRA, &lastcomma ) != OK) {
+    /* Something asked using a RISC OS name.  Need to do a lookup
+     * for the file.
+     */
+    //GetDefaultType ( leafname, pRA );
+    //return EATTRIBREAD;
+  }
+  return OK;
+}
+#endif
+
+err_t Attr_GetInfo ( char *filename, char *leafname,
+      RISCOS_ATTRIBS *pRA )
+{
+  int Attr_FH;  /* File handle for attrib file */
+  int pos;
+  DOS_ATTRIBS da;
+
+#ifdef LONGNAMES
+  if (SMB_IsLongNameFS(filename))
+    return Attr_GetInfoX2 ( filename, leafname, pRA );
+#endif
+
+  if ( SetFileName(filename) != OK )
+    return EBADNAME;
+
+  if ( leafname != NULL )
+    strcpyn_upper(AttrLeafName, leafname, LEAFNAME_SIZE);
+
+  /* Is it already in cache? */
+
+  pos = GetEntryPos(AttrLeafName);
+  if ( pos >= 0 )
+    goto got_pos;
+
+  if ( AttrAllInCache )
+    goto get_failed;
+
+  /* Else, try to read from file */
+
+  if ( SMB_Open ( MODE_RD, AttrFileName, &da, &Attr_FH, NULL ) == OK )
+  {
+    pos = SearchFileForEntry ( Attr_FH, AttrLeafName );
+    SMB_Close (Attr_FH, &da);
+
+    if ( pos >= 0 )
+      goto got_pos;
+  }
+  else
+  {
+    AttrCacheLen = 0;
+    AttrAllInCache = true;
+  }
+
+get_failed:
+  GetDefaultType ( AttrLeafName, pRA );
+  return EATTRIBREAD;
+
+got_pos:
+  InsertAttribs ( &AttrCache[pos].attr, pRA );
+
+
+  return OK;
+}
+
+/* Note:
+
+   This particular technique will leave behind data in the
+   attrib. cache after the file has been closed. Potentially,
+   another user could then change the contents of the attrib
+   file, and when the cache is next used it will have stale data
+   in. I don't think this is too much of a problem, however,
+   as most actions will flush the cache, and updates to type
+   information are relatively infrequent.
+
+*/
+
+/* ------------------------------------------ */
+
+/* For the 'Delete' and 'Set' calls, we do not make use of data
+   in the cache, as it is potentially stale and the consequences
+   of using it are more severe.
+
+   'Delete' works as follows:
+
+   First, the block of the .EA file containing the record to be
+   deleted is read into the cache. If no such record exists, we
+   finish now. The record is then deleted by writing zeros over
+   its 'name' field: this change is written back to disk.
+   However, if all the entries in this cache block now contain
+   zeroed names, the file is compacted by removing the whole
+   cache block from the file.
+*/
+
+err_t Attr_DeleteInfo ( char *pathname )
+{
+  int Attr_FH;  /* File handle for attrib file */
+  int pos;
+  DOS_ATTRIBS da;
+
+#ifdef LONGNAMES
+  if (SMB_IsLongNameFS(pathname))
+    return OK;
+#endif
+
+  if ( SetFileName(pathname) != OK )
+    return EBADNAME;
+
+  AttrAllInCache = false;
+
+  /* Try to read/write the file */
+
+  if ( SMB_Open ( MODE_RDWR, AttrFileName, &da, &Attr_FH, NULL ) != OK )
+    return EATTRIBWRITE;
+
+  /* Find position of entry */
+
+  pos = SearchFileForEntry ( Attr_FH, AttrLeafName );
+
+  if ( pos < 0 ) /* Can't find it: don't worry! */
+    goto close_file;
+
+  /* Found entry: zero it out */
+
+  AttrCache[pos].name[0] = 0;
+
+  if ( !CacheEmpty() )   /* Just update this one */
+  {
+    SMB_Write ( Attr_FH, (AttrCacheStart+pos)*ATTR_REC_SIZE,
+                 ATTR_REC_SIZE,
+               (BYTE *)&AttrCache[pos], NULL );
+  }
+  else
+  {
+    FileDataMove ( Attr_FH, (AttrCacheStart+AttrCacheLen) * ATTR_REC_SIZE,
+                        AttrCacheStart * ATTR_REC_SIZE );
+  }
+
+close_file:
+  SMB_Close(Attr_FH, &da);
+  return OK;
+}
+
+/* ---------------------- */
+
+/* Attr_SetInfo():
+
+   Saves the RISCOS attribs for a given file. If the attrib. file
+   doesn't exist it is created, & the new data is written to the
+   end. Otherwise, we search through the file looking for a 'free'
+   slot (with a 0 byte at the start of 'name'), which is filled
+   in.
+*/
+extern err_t Attr_SetInfo ( char *pathname, RISCOS_ATTRIBS *pRA )
+{
+  err_t err;
+  int Attr_FH;  /* File handle for attrib file */
+  int pos;
+  DOS_ATTRIBS da;
+
+  debug1("SetInfo for '%s'\n", pathname);
+
+#ifdef LONGNAMES
+  /* Wonderfully enough, we don't actually need an implementation
+   * of this at all!
+   */
+  if (SMB_IsLongNameFS(pathname))
+    return OK;
+#endif
+
+
+  if ( SetFileName(pathname) != OK )
+    return EBADNAME;
+
+  AttrAllInCache = false;
+
+  /* Try to read/write the file */
+
+  err = SMB_Open ( MODE_RDWR, AttrFileName, &da, &Attr_FH, NULL );
+
+  if ( err == OK )   /* File exists */
+  {
+    /* Look for existing entry - if there is one, amend it */
+    pos = SearchFileForEntry ( Attr_FH, AttrLeafName );
+    if ( pos >= 0 )
+    {
+      debug0("Found existing entry");
+      goto write_new;
+    }
+
+    /* Look for free entry - if there is one, use it */
+    pos = GetEntryPos ( "" );
+    if ( pos >= 0 )
+    {
+      debug0("Found in-cache free entry");
+      goto write_new;
+    }
+
+    pos = SearchFileForEntry ( Attr_FH, "" );
+    if ( pos >= 0 )
+    {
+      debug0("Found file free entry");
+      goto write_new;
+    }
+
+    /* Else, add new entry */
+
+    if ( AttrCacheLen == CACHE_SIZE )
+    {
+      debug0("Adding new block to file");
+      pos = 0;
+      AttrCacheStart += AttrCacheLen;
+      AttrCacheLen = 1;
+    }
+    else
+    {
+      debug0("Extending file");
+      pos = AttrCacheLen;
+      AttrCacheLen++;
+    }
+    goto write_new;
+  }
+  /* If attrib file doesn't exist, create one */
+  else if ( err == EFILENOTFOUND )
+  {
+    da.utime = 0;
+    da.attr = ATTR_HID | ATTR_NORM | ATTR_ARC;
+    da.length = 0;
+    err = SMB_Create ( AttrFileName, &da, &Attr_FH );
+    debug1("Create attr file, res %d\n", err);
+    if ( err == OK )
+    {
+      AttrCacheStart = 0;   /* Write new info at beginning of file */
+      AttrCacheLen = 1;
+      pos = 0;
+      goto write_new;
+    }
+  }
+  else
+    debug2("Open '%s' gave error %d\n", AttrFileName, err);
+
+  /* All attempts have failed! */
+  return EATTRIBWRITE;
+
+write_new:
+  debug2(" - new entry at base %d pos %d", AttrCacheStart, pos );
+  AttrAllInCache = false;
+  strcpy(AttrCache[pos].name, AttrLeafName);
+  AttrCache[pos].attr = *pRA;
+
+  SMB_Write ( Attr_FH, (AttrCacheStart+pos)*ATTR_REC_SIZE,
+                 ATTR_REC_SIZE,
+               (BYTE *)&AttrCache[pos], NULL );
+
+  SMB_Close(Attr_FH, &da);
+  return OK;
+}
+
+/* ---------------------------------- */
+
+/* This will remove the RISCOS.EA file from the given
+   dir if it's effectively redundant. It's called before
+   a 'delete directory' command, to make sure it doesn't
+   fail because the RISCOS.EA file is still there!
+
+   It works as follows: we read through RISCOS.EA, to see
+   if any of the files it refers to actually exist. If
+   none do, RISCOS.EA is deleted.
+
+   Note that we use the 'AttrFileName' buffer for this;
+   we clear it after use, because its must stay in step
+   with the contents of the cache, as checked by
+   SetFileName().
+*/
+
+void Attr_CheckEmptyDir (char *dirname)
+{
+  int  i, FH;
+  uint pos, len;
+  DOS_ATTRIBS da, da2;
+
+  AttrAllInCache = false;
+  AttrCacheLen = 0;
+
+#ifdef LONGNAMES
+  /* Shouldn't be any RISCOS.EA file present - user must delete it if
+   * there is one - we're not hiding it away on long filename shares
+   */
+  if (SMB_IsLongNameFS(dirname))
+    return;
+#endif
+
+  /* Open Attr file */
+
+  sprintf ( AttrFileName, "%s\\%s", dirname, ATTR_FILENAME );
+
+  if ( SMB_Open ( MODE_RD, AttrFileName, &da, &FH, NULL ) != OK )
+    return;
+
+  pos = 0;
+
+  do
+  {
+    len = 0;
+    SMB_Read ( FH, pos*ATTR_REC_SIZE,
+                     CACHE_SIZE * ATTR_REC_SIZE,
+               (BYTE *)AttrCache, &len );
+
+    len /= ATTR_REC_SIZE;
+
+    /* Try to find a file which exists */
+    for ( i=0; i<len; i++ )
+    {
+      if ( AttrCache[i].name[0] != 0 )
+      {
+        sprintf ( AttrFileName, "%s\\%s", dirname, AttrCache[i].name );
+        if (SMB_GetAttribs ( AttrFileName, &da2 ) == OK )
+        {
+          SMB_Close ( FH, &da );
+          AttrFileName[0] = 0;
+          return;
+        }
+      }
+    }
+
+    pos += len;
+  }
+    while ( len == CACHE_SIZE );
+
+  /* If it doesn't, delete the attrib file */
+
+  SMB_Close ( FH, &da );
+  sprintf ( AttrFileName, "%s\\%s", dirname, ATTR_FILENAME );
+  debug1("Deleting %s", AttrFileName);
+
+  da.utime = 0;
+  da.attr  = 0;  /* Reset hidden attribute */
+  SMB_SetAttribs ( AttrFileName, &da );
+  SMB_Delete ( AttrFileName );
+  AttrFileName[0] = 0;
+}
+
+

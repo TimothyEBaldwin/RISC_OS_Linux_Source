@@ -1,0 +1,1573 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*    C.LLC - C source for bottom layer of NetBEUI
+*
+*    05-02-93      INH Original
+*    22-08-95 1.57     No Tx sliding window
+*    18-12-95 	       Some Network.C functions moved here
+*/
+
+/* Standard includes */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#ifndef NO_NETBEUI
+
+/* RISCOS includes */
+
+#include "kernel.h"
+#include "os.h"
+#include "swis.h"
+#include "sys/dcistructs.h"
+#include "AsmUtils/callbacks.h"
+
+/* Our includes */
+
+#include "stdtypes.h"
+#include "Mbuf.h"
+#include "BufLib.h"
+#include "LLC.h"
+#include "Stats.h"
+#include "LanMan.h"  /* For LM_pw value */
+#include "LanMan_MH.h"
+
+/* Private definitions ******************** */
+
+typedef enum
+{
+  NO_CONNECT = 0,
+  AWAIT_CONNECT,
+  CONNECTED,
+  AWAIT_DISCONNECT,
+  FAILED
+}
+  LKSTATE;
+
+/* ----------- */
+
+typedef struct
+{
+  HCONN     hconn;
+  LKSTATE   Status;
+  NETADDR   farAddr;  /* Address of other end */
+  BYTE      SAP;      /* Service access point */
+
+  BUFQUEUE  TxPendingQ;
+  int  Tx_Ns;          /* No of Tx packets sent */
+  int  Tx_Outstanding; /* No of un-acked Tx packets */
+
+  struct Timer T1;     /* Timer for acks from far end */
+  int    T1Retries;
+  bool   RcvReady;
+
+  LLC_RCV_PROC RcvFunction;
+  void *       RcvPrivate;
+  int          Rx_Nr;    /* No. of packets received */
+
+  struct Timer T2;     /* Timer for sending acks back */
+}
+  LLC_CONN;
+
+/* Magic numbers ***************************************************** */
+
+#define T2_VALUE        10
+#define T1_VALUE       100
+#define T1_RETRIES      20
+#define CONNECT_TIME   100
+#define CONNECT_TRIES    5
+#define DISCONN_TIME   100
+#define DISCONN_TRIES    3
+
+
+/* IEEE 802.2 control bytes ************* */
+
+#define UFORMAT_UA    0x63
+#define UFORMAT_FRMR  0x87
+#define UFORMAT_SABME 0x6F
+#define UFORMAT_DISC  0x43
+#define UFORMAT_POLL  0x10
+#define UFORMAT_INFO  0x03
+
+#define SFORMAT_RRDY  0x01
+#define SFORMAT_RNRDY 0x05
+#define SFORMAT_REJ   0x09
+
+/* -------------- */
+
+#define SAVE_INT_STATE   \
+              int intstate = _kernel_irqs_disabled(); _kernel_irqs_off();
+
+#define RESTORE_INT_STATE \
+              if ( !intstate ) _kernel_irqs_on();
+
+/* Callback routines ************************************************* */
+
+static bool CallbackSet = false;
+
+int LLC_CallbackFn_handler(_kernel_swi_regs *r, void *pw)
+{
+  (void) r;
+  (void) pw;
+  CallbackSet = false;
+  LLC_BackgroundProcess();
+  return 1;
+}
+
+/* --------------------- */
+
+static void SetCallback(void)
+{
+  if (!CallbackSet)
+  {
+    CallbackSet = true;
+    _swi(OS_AddCallBack, _IN(0)|_IN(1), (int)LLC_CallbackFn, LM_pw);
+  }
+}
+
+/* Timer library ***************************************************** */
+
+#define TickerV        0x1C
+extern void TickerFn ( void );
+
+volatile int         LLC_TickerTime;
+static bool          TimerNeedsCheck;
+static struct Timer *ActiveTimers;
+static bool          TickerClaimed=false;
+
+/* ------------------ */
+
+/* Inserts a given timer at the head of the active timer list */
+
+static void TimerIns ( struct Timer *pT )
+{
+  pT->status = TMR_ACTIVE;
+
+  pT->prev = NULL;
+  pT->next = ActiveTimers;
+  if ( ActiveTimers != NULL ) ActiveTimers->prev = pT;
+  ActiveTimers = pT;
+}
+
+/* ------------------ */
+
+/* Deletes a given timer from the active timer list */
+
+static void TimerDel ( struct Timer *pT )
+{
+  pT->status = TMR_INACTIVE;
+
+  if ( pT->prev == NULL)     /* Start of list */
+    ActiveTimers = pT->next;
+  else
+    pT->prev->next = pT->next;
+
+  if ( pT->next != NULL )
+    pT->next->prev = pT->prev;
+}
+
+/* -------------------------------- */
+
+/* This may be called to give a running timer a new timeout,
+   or to activate an inactive one. We have to lock out interrupts
+   because TickerFn *and the callback* might happen halfway through,
+   and fiddle with the active list.
+*/
+
+void TimerStart ( struct Timer *pT, int timeout )
+{
+  SAVE_INT_STATE;
+  pT->expiretime = LLC_TickerTime + timeout;
+  if ( pT->status != TMR_ACTIVE )
+    TimerIns(pT);
+
+  RESTORE_INT_STATE;
+}
+
+/* ------------------------------ */
+
+/* Again, an interrupt might happen when this is in progress */
+
+void TimerClear ( struct Timer *pT )
+{
+  SAVE_INT_STATE;
+  if ( pT->status == TMR_ACTIVE )
+    TimerDel(pT);
+
+  RESTORE_INT_STATE;
+}
+
+/* ------------------------------ */
+
+/* Used to initialise a timer structure. Do not use if timer is
+   running.
+*/
+
+void TimerInit ( struct Timer *pT, pfnExpire pfE, void *pdata )
+{
+  pT->status = TMR_INACTIVE;
+  pT->prev = NULL;
+  pT->next = NULL;
+  pT->expirefn = pfE;
+  pT->prvdata = pdata;
+}
+
+/* ------------------------------------------- */
+
+/* TimerCheck()
+
+   This is called from BackgroundProcess(), either during a callback
+   or while we're waiting in one of our routines. It does a re-check
+   of all the active timers and calls the expiry functions of all
+   those that have expired.
+
+   The timer expiry functions are allowed to do what they want - they
+   may add/delete timers from the active list, and (unlike receive
+   packet processing) may call BackgroundProcess(), which makes
+   TimerCheck() reentrant. In either event, when an expiry function
+   has been called, we must restart the check from the top of the
+   ActiveTimers list.
+*/
+
+static void TimerCheck(void)
+{
+  struct Timer *pT;
+
+  if ( !TimerNeedsCheck )
+    return;
+
+restart:
+  for ( pT = ActiveTimers; pT != NULL; pT = pT->next )
+    if ( (LLC_TickerTime - pT->expiretime) >= 0 )
+    {
+      TimerDel(pT);
+      pT->expirefn ( pT->prvdata );
+      goto restart;
+    }
+
+  TimerNeedsCheck = false;
+}
+
+/* Ticker event handler  ------- */
+
+/* This merely updates the time, and sees if any of our active
+   timers have expired. If they have, it organises a callback.
+
+   The 'TimerCallbackSet' flag is used (i) to stop the callback
+   being set more than once, and (ii) to stop TickerFn_handler
+   interrupting anything until the callback is complete.
+*/
+
+int TickerFn_handler ( _kernel_swi_regs *R, void *pw )
+{
+  struct Timer *pT;
+
+  (void) pw;
+  (void) R;
+
+  LLC_TickerTime++;
+
+  if (!TimerNeedsCheck)
+  {
+    for ( pT = ActiveTimers; pT != NULL; pT = pT->next )
+    {
+      if ( (LLC_TickerTime - pT->expiretime) >= 0 )
+      {
+        TimerNeedsCheck = true;
+        SetCallback();
+        break;
+      }
+    }
+  }
+  return 1;
+}
+
+/* -------------------------------- */
+
+
+static void TimerSetup ( void )
+{
+  ActiveTimers = NULL;
+  LLC_TickerTime = 0;
+  _swi(OS_Claim, _INR(0,2), TickerV, (int)TickerFn, LM_pw);
+  TickerClaimed = true;
+}
+
+/* -------------------------------- */
+
+static void TimerShutdown ( void )
+{
+  ActiveTimers = NULL;
+  if (TickerClaimed)
+  {
+    TickerClaimed = false;
+    _swi(OS_Release, _INR(0,2), TickerV, (int)TickerFn, LM_pw);
+  }
+}
+
+/* DCI4 driver interface functions *********************************** */
+
+NETADDR         LLC_MachineAddress;
+static BUFQUEUE LLC_RxRawQueue;
+
+static int      Net_DriverSWIbase;
+static int      Net_DriverUnitNo;
+static bool	Net_Attached=false;
+static unsigned Net_DriverFlags;
+static NETADDR  Net_MultiAddr;
+static const NETADDR *Net_MultiPtr;
+
+
+/* -------------------------------- */
+
+int LLC_GetMTU ( void )  /* Returns LLC layer's maximum packet size */
+{
+  /* We can transmit the maximum packet size offered by the driver,
+     less 4 for the LLC header */
+
+  _kernel_swi_regs R;
+
+  R.r[0] = 0;
+  R.r[1] = Net_DriverUnitNo;
+
+  _kernel_swi ( Net_DriverSWIbase+DCI4GetNetworkMTU, &R, &R );
+  return R.r[2]-4;
+}
+
+/* -------------------------------- */
+
+/* TxSend will send a packet out onto the network
+   straight away. It is called with a destination address and
+   a pointer to an mbuf chain. The length of data will
+   be worked out from the chain.
+*/
+
+static bool TxSend ( NETADDR *dest, BUFCHAIN pB, bool DeleteAfterUse )
+{
+  int bytecount=ChainLen(pB);
+
+  debug1("    TxSend called for %d bytes to ",bytecount);
+  debug3("%02x:%02x:%02x:",dest->b[0],dest->b[1],dest->b[2]);
+  debug3("%02x:%02x:%02x\n",dest->b[3],dest->b[4],dest->b[5]);
+
+  if ( dest == NULL || bytecount == 0 || bytecount > 1500 )
+  {
+    if ( DeleteAfterUse )
+    {
+      FreeChain(pB);
+    }
+    debug0("    Ditching this packet\n");
+    return false;
+  }
+
+  STAT(STA_NETTX_PKTS);
+
+  if ( DeleteAfterUse )
+  {
+    pB->m_list = NULL;
+    _swi(Net_DriverSWIbase+DCI4Transmit,
+                _INR(0,5),
+                0,                /* Flags */
+                Net_DriverUnitNo,
+                bytecount,        /* FrameType */
+                (int) pB,
+                (int) dest,
+                NULL /* Src Addr */ );
+  }
+  else
+  {
+    struct mbuf *pBsave = pB->m_list;
+    pB->m_list = NULL;     /* Save m_list value */
+
+    _swi(Net_DriverSWIbase+DCI4Transmit,
+                _INR(0,5),
+                TX_PROTOSDATA, /* Flags */
+                Net_DriverUnitNo,
+                bytecount,      /* FrameType */
+                (int) pB,
+                (int) dest,
+                NULL /* Src Addr */ );
+
+     pB->m_list = pBsave;  /* Restore m_list after use */
+  }
+  debug0("    Finished TxSend\n");
+  return true;
+}
+
+
+/* Receive handler --------- */
+
+/* This module maintains a 'raw' receive queue, which is
+   filled up with Rx data at interrupt time. This is then
+   processed with LLC_RcvProcess() at a safe later time
+   (either during a callback or when calling BackgroundProcess()
+   manually).
+*/
+
+int ReceiveFn_handler ( _kernel_swi_regs *R, void *pw )
+{
+  struct mbuf *pData = (struct mbuf *) R->r[1];
+  struct mbuf *pDnext;
+
+  (void) pw;
+
+  STAT(STA_NETRX_EVTS);
+
+  /* Add all data to RxRawQueue in approximate order. Note that
+     QueueAdd corrupts m_list; we must save it first */
+
+  while ( pData != NULL )
+  {
+    STAT(STA_NETRX_PKTS);
+    pDnext = pData->m_list;
+    QueueAdd ( &LLC_RxRawQueue, pData );
+    pData = pDnext;
+  }
+
+  SetCallback();
+
+  return 1;
+}
+
+/* ---------------------- */
+
+static Dib *FindDCIDriver ( char *name, int unit )
+{
+  _kernel_swi_regs R;
+  ChDib *pCD, *pCD2;
+  Dib      *pD;
+
+  /* Get list of network drivers -------------- */
+
+  R.r[0] = 0;
+  R.r[1] = Service_EnumerateNetworkDrivers;
+
+  _kernel_swi ( OS_ServiceCall, &R, &R );
+
+  /* Search for correct one --------- */
+
+  pCD = (ChDib *)R.r[0];
+  pD  = NULL;
+
+  while ( pCD != NULL )
+  {
+    if ( unit == pCD->chd_dib->dib_unit &&
+         strcmp ( name, (char *) pCD->chd_dib->dib_name ) == 0 )
+    {
+      pD = pCD->chd_dib;
+    }
+
+    /* Free 'chaindib' back to RMA */
+    pCD2 = pCD->chd_next;
+    free ( pCD );
+    pCD = pCD2;
+  }
+
+  return pD;
+}
+
+
+/* DCI4 initialisation ----------- */
+
+#if DCIVERSION < 404
+# error "Multicast filtering requires DCI v4.04 or later (TCPIPLibs-5_01 or later)"
+#endif
+static void DetachDriver(void);
+
+
+err_t LLC_AttachDriver( char *name, const NETADDR *Multi_Addr )
+{
+  _kernel_swi_regs R;
+  Dib      *pD;
+  char dname[20];
+  int filter_flags = FILTER_NO_UNSAFE | FILTER_CLAIM;
+
+  if ( name == NULL ||
+       sscanf( name, "%[^0123456789]%d", dname, &Net_DriverUnitNo) != 2 )
+    return EDRIVERNAME;
+
+  debug2("  Using driver '%s' unit #%d\n", dname, Net_DriverUnitNo );
+
+  pD = FindDCIDriver ( dname, Net_DriverUnitNo );
+  if ( pD == NULL )
+  {
+    debug0("    Error - unable to match driver name\n");
+    return EDRIVERNAME;
+  }
+
+  if ( pD->dib_swibase==0 )
+  {
+    debug0("    Error - unable to get driver SWIbase\n");
+    return EDRIVERVER;
+  }
+
+  Net_DriverSWIbase = (pD->dib_swibase | os_X);
+
+  debug1("  Driver SWI base %Xh\n", Net_DriverSWIbase & ~os_X);
+
+  /* Get driver interface version: must be major version 4 */
+
+  R.r[0] = 0;
+  _kernel_swi ( Net_DriverSWIbase+DCI4Version, &R, &R );
+
+  debug1("  Driver version %d\n", R.r[1]);
+
+  if ( R.r[1] < 400 || R.r[1] > 499 )
+    return EDRIVERVER;
+
+  /* Check flags */
+
+  R.r[0] = 0;
+  R.r[1] = Net_DriverUnitNo;
+  _kernel_swi ( Net_DriverSWIbase+DCI4Inquire, &R, &R );
+
+  Net_DriverFlags = R.r[2];
+  debug1("  Driver flags: %Xh\n", R.r[2] );
+  if ( (R.r[2] & (INQ_MULTICAST | INQ_HWADDRVALID) )
+              != (INQ_MULTICAST | INQ_HWADDRVALID) )
+    return EDRIVERTYPE;
+
+  /* Save address */
+
+  memcpy ( LLC_MachineAddress.b, pD->dib_address, 6 );
+
+  /* Can the driver perform h/w multicast filtering? */
+
+  if (Net_DriverFlags & INQ_FILTERMCAST) {
+    filter_flags |= FILTER_SPECIFIC_MCAST;
+  }
+  else {
+    filter_flags |= FILTER_ALL_MCAST;
+  }
+
+  /* Now request ISO packets */
+
+  R.r[0] = filter_flags; /* Flags */
+  R.r[1] = Net_DriverUnitNo;
+  R.r[2] = 0;
+  SET_FRAMELEVEL(R.r[2], FRMLVL_IEEE);      /* Need 802.3 frames */
+  R.r[3] = ADDRLVL_MULTICAST;
+  R.r[4] = ERRLVL_NO_ERRORS;
+  R.r[5] = LM_pw;            /* Protocol handle (our PW) */
+  R.r[6] = (int) ReceiveFn;        /* Receive handler function */
+
+  if ( _kernel_swi ( Net_DriverSWIbase + DCI4Filter, &R, &R ) != NULL ) {
+    debug1("    Filter fail: %s\n", _kernel_last_oserror()->errmess);
+    return EPACKETTYPE;
+  }
+
+  Net_Attached = true;
+
+  if (Net_DriverFlags & INQ_FILTERMCAST) {
+    if (Multi_Addr) {
+      Net_MultiAddr = *Multi_Addr;
+      Net_MultiPtr = &Net_MultiAddr;
+      R.r[4] = R.r[3] = (int) Net_MultiPtr;
+      R.r[0] = MULTICAST_ADDR_REQ | MULTICAST_SPECIFIC_ADDR;
+    }
+    else {
+      Net_MultiPtr = NULL;
+      R.r[0] = MULTICAST_ADDR_REQ | MULTICAST_ALL_ADDR;
+      R.r[4] = R.r[3] = 0;
+    }
+    R.r[1] = Net_DriverUnitNo;
+    R.r[2] = 0;
+    SET_FRAMELEVEL(R.r[2], FRMLVL_IEEE);      /* Need 802.3 frames */
+    R.r[5] = LM_pw;
+    R.r[6] = (int) ReceiveFn;
+    if ( _kernel_swi ( Net_DriverSWIbase + DCI4MulticastRequest, &R, &R) != NULL ) {
+      DetachDriver();
+      Net_Attached = false;
+      return EPACKETTYPE;
+    }
+  }
+
+  return OK;
+}
+
+/* --------------------------------- */
+
+static void DetachDriver(void)
+{
+  _kernel_swi_regs R;
+
+  if ( Net_Attached )
+  {
+    int filter_flags = FILTER_NO_UNSAFE | FILTER_RELEASE;
+
+    /* Was the driver performing h/w multicast filtering? Release claims! */
+
+    if (Net_DriverFlags & INQ_FILTERMCAST) {
+      R.r[0] = MULTICAST_ADDR_REL | (Net_MultiPtr ? MULTICAST_SPECIFIC_ADDR : MULTICAST_ALL_ADDR);
+      R.r[1] = Net_DriverUnitNo;
+      R.r[2] = 0;
+      SET_FRAMELEVEL(R.r[2], FRMLVL_IEEE);      /* Need 802.3 frames */
+      R.r[3] = (int) Net_MultiPtr;
+      R.r[4] = (int) Net_MultiPtr;
+      R.r[5] = LM_pw;
+      R.r[6] = (int) ReceiveFn;
+      debug0("    Releasing driver multicast filter\n");
+      (void) _kernel_swi ( Net_DriverSWIbase + DCI4MulticastRequest, &R, &R);
+      filter_flags |= FILTER_SPECIFIC_MCAST;
+    }
+    else {
+      filter_flags |= FILTER_ALL_MCAST;
+    }
+
+    debug0("    Releasing driver claim\n");
+    Net_Attached = false;
+    R.r[0] = filter_flags; /* Flags */
+    R.r[1] = Net_DriverUnitNo;
+    R.r[2] = 0;
+    SET_FRAMELEVEL(R.r[2], FRMLVL_IEEE);      /* Need 802.3 frames */
+    R.r[3] = ADDRLVL_MULTICAST;
+    R.r[4] = ERRLVL_NO_ERRORS;
+    R.r[5] = LM_pw;            /* Protocol handle (our PW) */
+    R.r[6] = (int) ReceiveFn;        /* Receive handler function */
+
+    _kernel_swi ( Net_DriverSWIbase + DCI4Filter, &R, &R );
+  }
+}
+
+
+/* Receive processing ************************************************ */
+
+
+/* Subroutines ------------------------------------------ */
+
+static bool Match ( NETADDR *pa, NETADDR *pb )
+{
+  int i;
+  for ( i=5; i>=0; i-- )
+    if ( pa->b[i] != pb->b[i] )
+      return false;
+
+  return true;
+}
+
+/* ----------------------------- */
+
+/* LinkFail():
+
+   Used to free everything on the queues & stop
+   timers (etc), when a link is going down.
+*/
+
+static void LinkFail ( LLC_CONN *pC )
+{
+  QueueFlush ( &(pC->TxPendingQ) );
+
+  /* Stop timers */
+  TimerClear( &pC->T1 );
+  TimerClear( &pC->T2 );
+  pC->Status = FAILED;
+}
+
+
+/* Unnumbered-Information (UI) processing ---------------------------- */
+
+
+/* Connections for Unnumbered-information frames */
+#define MAX_UI_CONN 6
+static BYTE        UI_SAPtbl      [MAX_UI_CONN];
+static UI_RCV_PROC UI_RcvFunction [MAX_UI_CONN];
+static void *      UI_PrivateWord [MAX_UI_CONN];
+
+
+
+static void DispatchUI ( NETADDR *srcaddr, int SAP, BUFCHAIN pB )
+{
+  int i;
+
+  SAP &= 0xFE;
+
+  for ( i=0; i<MAX_UI_CONN; i++ )
+   if ( UI_SAPtbl[i] == SAP && UI_RcvFunction[i] != NULL )
+   {
+     UI_RcvFunction[i] ( srcaddr, pB, UI_PrivateWord[i] );
+     return;
+   }
+
+  /* No takers for packet */
+  FreeChain(pB);
+}
+
+/* ------------------- */
+
+err_t UI_SetReceiver ( int SAP, UI_RCV_PROC RcvFn, void *private )
+{
+  int i;
+
+  SAP &= 0xFE;
+
+  /* Replace handler for existing Service Access Point? */
+
+  for ( i=0; i<MAX_UI_CONN; i++ )
+    if ( UI_SAPtbl[i] == SAP )
+    {
+      UI_RcvFunction[i] = RcvFn;
+      UI_PrivateWord[i] = private;
+      return OK;
+    }
+
+  /* Add new handler ? */
+
+  for ( i=0; i<MAX_UI_CONN; i++ )
+    if ( UI_SAPtbl[i] == 0 )
+    {
+      UI_SAPtbl[i] = SAP;
+      UI_RcvFunction[i] = RcvFn;
+      UI_PrivateWord[i] = private;
+      return OK;
+    }
+
+  return ENOHANDLES;
+}
+
+
+/* ------------------------------------------------- */
+
+err_t UI_SendData ( NETADDR *dst, int SAP, BUFCHAIN pB )
+{
+  BYTE LLCHdr[3];
+
+  if ( pB == NULL )
+    return EBADPARAM;
+
+  LLCHdr[0] = SAP;
+  LLCHdr[1] = (SAP & 0xFE);
+  LLCHdr[2] = UFORMAT_INFO;    /* Un-numbered information frame */
+  pB = AddChain ( pB, LLCHdr, 3 );
+
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  TxSend ( dst, pB, true );
+  return OK;
+}
+
+
+/* LLC link processing ------------------------------------------ */
+
+/* Connections for 802.2 logical layer links */
+#define MAX_LLC_CONN 6
+static LLC_CONN LLC_Connections[MAX_LLC_CONN];
+
+/* ------------------------------ */
+
+/* GetConnect():
+
+   Returns a connection for a given source address and
+     SSAP, or NULL if no connection exists.
+*/
+
+static LLC_CONN *GetConnect ( NETADDR *src, int SSAP )
+{
+  int i;
+  LLC_CONN *pC = LLC_Connections;
+
+  SSAP &= 0xFE;
+
+  for (i=0; i<MAX_LLC_CONN; i++)
+  {
+    if ( (pC->Status != NO_CONNECT) &&
+         Match(src, &(pC->farAddr) ) &&
+         ( SSAP == pC->SAP )
+       )
+      return pC;
+    pC++;
+  }
+
+  return NULL;
+}
+
+
+/* ---------------------- */
+
+/* RcvProcessNr():
+
+   This is called whenever we get a Nr value acknowledgement from the other
+   end, in an I-frame or S-frame. When the right ack number comes along, we
+   take the corresponding packet out of the Tx Pending queue.
+*/
+
+static void RcvProcessNr ( LLC_CONN *pC, int Nr )
+{
+  int n_pkts_acked;
+
+  /* The Nr for a packet is one more than the Ns used to
+     send it (= the Ns of the next packet to be sent)  */
+
+  n_pkts_acked = pC->Tx_Outstanding - ((pC->Tx_Ns - Nr) & 0x7F);
+
+  while ( n_pkts_acked-- > 0 )
+  {
+    BUFCHAIN pB = QueueGet ( &(pC->TxPendingQ) );
+    pC->Tx_Outstanding--;
+    FreeChain ( pB );
+    STAT(STA_LLCRX_PKTACKS);
+  }
+
+  /* Has this emptied the Tx pending queue? */
+
+  if ( QueuePeek( &(pC->TxPendingQ) ) == NULL )
+  {
+    TimerClear(&pC->T1);    /* If so, stop timer */
+    pC->T1Retries = T1_RETRIES;
+  }
+}
+
+/* --------------------- */
+
+/* CheckResend re-sends the first packet in the TX Pending queue for
+   a channel. If nothing is present, all will be well.
+*/
+
+static void CheckResend ( LLC_CONN *pC )
+{
+  BUFCHAIN pB;
+  BYTE LLCHdr[4];
+
+  pB = QueuePeek ( &(pC->TxPendingQ) );
+  if ( pB == NULL )
+    return;
+
+  STAT(STA_LLCRX_RESENDS);
+
+  pB = GetData( pB, LLCHdr, 4 ); /* If error, not much we can do */
+
+  /* Recreate LLC header */
+
+  LLCHdr[0] = pC->SAP;  /* Restate the obvious */
+  LLCHdr[1] = pC->SAP;  /* Make it a 'command' pkt */
+  /* Retain original Ns value */
+  LLCHdr[3] = (pC->Rx_Nr << 1);
+
+  pB = AddChain ( pB, LLCHdr, 4 );
+  if ( pB == NULL )
+    STAT(STA_SERIOUS_BARF);
+  else
+  {
+    TimerStart( &pC->T1, T1_VALUE );      /* Start timer for ack */
+    TxSend ( &(pC->farAddr), pB, false );
+  }
+}
+
+/* ---------------------- */
+
+/* Sends an ack for all the packets received so far */
+
+static void SendAck ( LLC_CONN *pC, bool Final )
+{
+  BUFCHAIN pB;
+  BYTE LLCHdr[4];
+
+  /* Generate short packet */
+
+  LLCHdr[0] = pC->SAP;          /* Destination Access Point */
+  LLCHdr[1] = pC->SAP   | 1 ;   /* Send it as 'response' */
+  LLCHdr[2] = SFORMAT_RRDY;     /* Receive ready */
+  LLCHdr[3] = (pC->Rx_Nr << 1) | (Final ? 1 : 0); /* Set 'Final' bit */
+
+    /* Put it into data chain */
+
+  pB = AddChain ( NULL, LLCHdr, 4 );
+  if ( pB==NULL ) /* Run out of buffers */
+    return;
+
+  TimerClear(&pC->T2);  /* Clear ack timer */
+
+  TxSend ( &(pC->farAddr), pB, true );
+}
+
+/* Send Poll command (request for acks on received packets) */
+
+static void SendPoll ( LLC_CONN *pC )
+{
+  BUFCHAIN pB;
+  BYTE LLCHdr[4];
+
+  LLCHdr[0] = pC->SAP;    /* Destination Service Access Point */
+  LLCHdr[1] = pC->SAP;    /* Send it as 'command' */
+  LLCHdr[2] = SFORMAT_RRDY;       /* Receive ready */
+  LLCHdr[3] = (pC->Rx_Nr << 1) | 1; /* Send 'Poll' bit */
+
+  TimerStart( &pC->T1, T1_VALUE );      /* Start timer for ack */
+
+  /* Put it into data chain */
+
+  pB = AddChain ( NULL, LLCHdr, 4 );
+  if ( pB==NULL ) /* Run out of buffers */
+    return;
+
+  TxSend ( &(pC->farAddr), pB, true );
+}
+
+/* --------------------- */
+
+static void SendReject ( LLC_CONN *pC )
+{
+  BUFCHAIN pB;
+  BYTE LLCHdr[4];
+
+  LLCHdr[0] = pC->SAP;
+  LLCHdr[1] = pC->SAP | 1; /* Use as response */
+  LLCHdr[2] = SFORMAT_REJ;        /* REJ value */
+  LLCHdr[3] = (pC->Rx_Nr << 1); /* Don't Set Final bit 15/9/95*/
+
+  pB = AddChain ( NULL, LLCHdr, 4 );
+  if ( pB != NULL )
+    TxSend ( &(pC->farAddr), pB, true );
+}
+
+/* ---------------------- */
+
+static void SendUformat ( LLC_CONN *pC, int Cmd )
+{
+  BUFCHAIN pB;
+  BYTE LLCHdr[3];
+
+  LLCHdr[0] = pC->SAP;
+  LLCHdr[1] = pC->SAP;
+  LLCHdr[2] = Cmd;
+  pB = AddChain ( NULL, LLCHdr, 3 );
+  if ( pB != NULL )
+    TxSend ( &(pC->farAddr), pB, true );
+}
+
+/* Receive processing for S, I and U-format frames ---------------------- */
+
+
+/* Processing for received I-format (information) and S-format frames. */
+
+static void LLC_IorSformat ( NETADDR *src, BYTE *LLCHdr, BUFCHAIN pB )
+{
+  LLC_CONN *pC;
+  int SSAP = LLCHdr[1];
+  int Nr   = (LLCHdr[3] >> 1) & 0x7F;
+
+  pC = GetConnect ( src, SSAP );
+
+  if ( pC == NULL || pC->Status != CONNECTED ) /* Not recognised: drop it */
+  {
+    STAT(STA_LLCRX_NOCONN);
+    FreeChain(pB);
+    return;
+  }
+
+  /* Remove packets from Tx Pending queue according to Nr */
+
+  RcvProcessNr ( pC, Nr );
+
+  /* Process received command or information */
+
+  if ( LLCHdr[2] & 1 ) /* It's an S-format */
+  {
+    STAT(STA_LLCRX_SFORMAT);
+    FreeChain(pB);
+
+    switch ( LLCHdr[2] )
+    {
+      case SFORMAT_RRDY:  /* Receive ready */
+        pC->RcvReady = true;
+        break;
+
+      case SFORMAT_RNRDY:  /* Receive not ready */
+        pC->RcvReady = false;
+        break;
+
+      case SFORMAT_REJ:  /* Reject - resend first in Tx queue */
+        debug0("Reject from other end\n");
+        STAT(STA_LLCRX_REJECTS);
+        CheckResend(pC);
+        return;
+
+      default:
+        break;
+    }
+  }
+  else /* It's an I-format (received data) */
+  {
+    int Ns   = (LLCHdr[2] >> 1) & 0x7F;
+
+    STAT(STA_LLCRX_IFORMAT);
+
+    if ( Ns == (pC->Rx_Nr & 0x7F) )  /* It's OK */
+    {
+      debug0(".");
+      STAT ( STA_LLCRX_DATA );
+      pC->Rx_Nr++;
+
+      if ( pC->RcvFunction != NULL )
+        pC->RcvFunction ( pC->hconn, pB, pC->RcvPrivate );
+      else
+        FreeChain(pB);
+
+      /* Start ack timer, if not already running */
+
+      if ( !TimerRunning(&pC->T2) )
+        TimerStart ( &pC->T2, T2_VALUE );
+    }
+    else /* Send a REJ */
+    {
+      debug2("Rx Reject: we got %d, want %d", Ns, (pC->Rx_Nr & 0x7F) );
+      STAT(STA_LLCRX_REJDATA);
+      FreeChain(pB);
+      SendReject (pC);
+      return;
+    }
+  }
+
+  /* Check for poll/final bit */
+
+  if ( LLCHdr[3] & 1 )     /* Is Poll/Final bit set? */
+  {
+     if ( SSAP & 1 )   /* Response => it's a Final bit */
+     {
+       CheckResend(pC);
+     }
+     else              /* Command => it's a Poll bit */
+       SendAck ( pC, true );
+  }
+
+}
+
+/* ---------------- */
+
+
+static void LLC_Uformat ( NETADDR *src, BYTE *LLCHdr )
+{
+   LLC_CONN *pC = GetConnect ( src, LLCHdr[1] /* SSAP */ );
+   if ( pC == NULL )   /* Not recognised: drop it */
+     return;
+
+   switch ( LLCHdr[2] & 0xEF )
+   {
+     case UFORMAT_UA:
+       if ( pC->Status == AWAIT_CONNECT )
+       {
+         STAT(STA_LLCRX_CONN);
+         pC->Status = CONNECTED;
+       }
+       else if ( pC->Status == AWAIT_DISCONNECT )
+       {
+         STAT(STA_LLCRX_DISCON);
+         pC->Status   = NO_CONNECT;
+       }
+       break;
+
+     case UFORMAT_FRMR: /* Oh dear */
+       debug0("Link failed - FRMR packet");
+       STAT(STA_LLCRX_FRMR);
+       LinkFail(pC);
+       break;
+
+     case UFORMAT_DISC:
+       debug0("Link failed - other end sent DISC");
+       STAT(STA_LLCRX_DISC);
+       SendUformat ( pC, UFORMAT_UA | UFORMAT_POLL );
+       LinkFail(pC);
+       break;
+
+     default: /* Dunno. Hope it'll go away */
+       STAT(STA_LLCRX_UNKNOWNU);
+       break;
+   }
+}
+
+/* Timer expiry routines ----------------------------------- */
+
+/* T1 is started whenever we send data to the other end.
+   When all the data sent has been acknowledged, the timer
+   is cleared. If it isn't, and T1 expires, we a 'poll' cmd
+   is sent to the other end to check its receive status.
+*/
+
+static void T1ExpiryCallback ( void * data )
+{
+  LLC_CONN *pC = (LLC_CONN *)data;
+
+  if ( pC->Status != CONNECTED ) /* Brief check for rogue timers! */
+    return;
+
+  STAT(STA_LLC_T1EXPIRE);
+
+  if ( --(pC->T1Retries) > 0 )  /* Still has a chance! */
+    SendPoll ( pC );            /* Will restart timer */
+  else                          /* Oh dear! */
+  {
+    SendUformat ( pC, UFORMAT_DISC | UFORMAT_POLL );
+    STAT(STA_LLC_T1FAIL);
+    debug0("Link failed - T1 expired");
+    LinkFail(pC);
+  }
+}
+
+/* ---------------- */
+
+/* T2 expires during the normal run of play when we've
+   received data from the other end, but haven't acked
+   it yet. This will send an acknowledge back.
+*/
+
+static void T2ExpiryCallback ( void * data )
+{
+  LLC_CONN *pC = (LLC_CONN *)data;
+
+  debug2("\nT2 Expired, ack for %d, next send=%d\n", (pC->Rx_Nr) & 127,
+             (pC->Tx_Ns) & 127);
+  if ( pC->Status == CONNECTED ) /* Brief check for rogue timers! */
+    SendAck(pC, false);
+}
+
+
+
+
+
+/* General receive processing ------------------------------- */
+
+/* LLC_RcvProcess() ------------------------------ */
+
+/* RxProcess is called to process a packets from the
+   Rx input queue, and dispatch them to their various
+   handlers or LLC connections. This is called from
+   a 'safe' (non-interrupt, etc) point by the Network
+   module, so we needn't worry about reentrancy issues.
+*/
+
+static void LLC_RcvProcess( NETADDR *src, BUFCHAIN pB )
+{
+  BYTE LLChdr[4];
+
+  STAT(STA_LLCRX_PKTS);
+
+  /* Get 802.2 header */
+
+  pB = GetData(pB, LLChdr, 3);
+  if ( pB == NULL )
+  {
+    STAT(STA_LLCRX_TOOSHORT);
+    return;
+  }
+
+  /* Do I or S-format */
+
+  if ( (LLChdr[2] & 3) != 3 )  /* I-format or S-format */
+  {
+     pB = GetData(pB, &LLChdr[3], 1);  /* 4-byte header */
+     if ( pB != NULL )
+       LLC_IorSformat ( src, LLChdr, pB );
+     else
+       STAT(STA_LLCRX_TOOSHORT);
+     return;
+  }
+
+  /* U-type */
+
+  if ( (LLChdr[2] & 0xEF) == UFORMAT_INFO )  /* UI frame */
+  {
+    STAT(STA_LLCRX_UIDATA);
+    DispatchUI ( src, LLChdr[0], pB );
+    return;
+  }
+
+  /* Misc U-format packet */
+
+  STAT(STA_LLCRX_UFORMAT);
+  FreeChain(pB);
+  LLC_Uformat ( src, LLChdr );
+}
+
+/* ----------------------------------- */
+
+static void ReceiveProcess (BUFCHAIN pB)
+{
+  BUFCHAIN pB2;
+  RxHdr *pRH;
+  NETADDR srcaddr;
+  int     len;
+
+  pRH = mtod ( pB, RxHdr *);
+
+  /* Extract source address & length  */
+  memcpy ( srcaddr.b, pRH->rx_src_addr, 6 );
+
+  len = pRH->rx_frame_type;
+  debug1("Got pkt len %xh", len);
+
+  /* Ignore our own Tx's */
+  if ( Match ( &srcaddr, &LLC_MachineAddress ) )
+  {
+    STAT(STA_NETRX_OWNTX);
+    debug0("Own transmission:");
+    FreeChain(pB);
+    return;
+  }
+
+  /* Chop off first mbuf from chain & free it*/
+
+  pB2 = pB;
+  pB = pB->m_next;
+  FreeBuf (pB2);
+
+  /* Chop off any pad bytes */
+
+  for ( pB2 = pB; pB2 != NULL; pB2 = pB2->m_next )
+  {
+    if ( len < pB2->m_len )
+      pB2->m_len = len;
+
+    len -= pB2->m_len;
+  }
+
+  /* Process packet in LLC layer */
+  LLC_RcvProcess( &srcaddr, pB);
+}
+
+/* LLC_BackgroundProcess(void) -------------------------- */
+
+void LLC_BackgroundProcess(void)
+{
+  BUFCHAIN pB;
+
+  /* Receive processing */
+
+  while ( pB = QueueGet(&LLC_RxRawQueue), pB != NULL )
+  {
+    ReceiveProcess(pB);
+  }
+
+  /* Timer processing */
+
+  TimerCheck();
+}
+
+
+/* LLC Public routines ============================================== */
+
+err_t LLC_SendData ( HCONN hc, BUFCHAIN data )
+{
+  LLC_CONN *pC;
+  BYTE LLCHdr[4];
+
+  /* Validate handle -------------------- */
+
+  if ( hc < 0 || hc >= MAX_LLC_CONN || data == NULL )
+  {
+    FreeChain(data);
+    return EBADPARAM;
+  }
+
+  pC = LLC_Connections + hc;
+
+  if ( pC->Status != CONNECTED )
+  {
+    FreeChain(data);
+
+    if ( pC->Status == FAILED )
+      return ELINKFAILED;
+    else
+      return ENOCONN;
+  }
+
+  STAT(STA_LLC_TXPACKETS);
+
+  /* Check for other end receive ready ------- */
+
+  /* If receive not ready, poll the other end. This will also
+     set the T1 timer going, which will send a Poll regularly
+     until the far end acknowledges, and automatically fail if
+     it never responds.
+
+     If the T1 timer is already going, we just wait for it
+     to complete (successfully or otherwise).
+  */
+
+  while ( 1 )
+  {
+    LLC_BackgroundProcess();   /* Ensure we're up-to-date with Rx */
+
+    if ( pC->Status != CONNECTED )
+    {
+      FreeChain(data);
+      return ELINKFAILED;
+    }
+
+    if ( pC->RcvReady )    /* If receive is ready, we're OK */
+      break;
+
+    if ( !TimerRunning(&pC->T1) )
+      SendPoll(pC);        /* Will start timer */
+  }
+
+  /* Prepare packet to send */
+
+  LLCHdr[0] = pC->SAP;
+  LLCHdr[1] = pC->SAP;       /* Send as 'Command' */
+  LLCHdr[2] = (pC->Tx_Ns << 1);  /* I-format frame */
+  LLCHdr[3] = (pC->Rx_Nr << 1);  /* No Poll bit */
+
+  /* Check transmit window. For now, leave it at 2 pkts */
+
+  if ( pC->Tx_Outstanding >= 1 )
+  {
+    LLCHdr[3] |= 1;
+    pC->RcvReady = false;
+  }
+
+  data = AddChain ( data, LLCHdr, 4 );
+  if ( data == NULL )
+    return EOUTOFMEM;
+
+  /* Put in pending queue */
+  pC->Tx_Ns++;
+  pC->Tx_Outstanding++;
+
+  QueueAdd ( &(pC->TxPendingQ), data );
+
+  /* Actually transmit data */
+
+  TxSend ( &(pC->farAddr), data, false );
+
+  /* (Re)start timer for other end to ack packet */
+
+  TimerStart(&pC->T1, T1_VALUE);
+
+  return OK;
+}
+
+/* ----------------------------------------- */
+
+err_t LLC_OpenLink ( NETADDR *dst, int DSAP, LLC_RCV_PROC RcvFn,
+            void *Private, HCONN *pHandleOut )
+{
+  int i;
+  int timer;
+
+  LLC_CONN *pC;
+
+  STAT(STA_LLC_OPENREQ);
+
+  DSAP &= 0xFE;
+  pC = GetConnect ( dst, DSAP );
+  if ( pC != NULL )
+    return ELINKEXISTS;
+
+  for ( i=0; i<MAX_LLC_CONN; i++ )
+  {
+    pC = &LLC_Connections[i];
+    if ( pC->Status == NO_CONNECT )
+      goto GotGap;
+  }
+
+  return ENOHANDLES;
+
+GotGap:
+  pC->hconn       = i;
+  pC->farAddr     = *dst;
+  pC->SAP         = DSAP;
+  pC->RcvFunction = RcvFn;
+  pC->RcvPrivate = Private;
+
+  QueueFlush ( &(pC->TxPendingQ) ); /* Just in case! */
+
+  pC->Tx_Ns = pC->Rx_Nr = 0;
+  pC->Tx_Outstanding = 0;
+
+  TimerClear(&pC->T1);
+  TimerClear(&pC->T2);
+  pC->RcvReady = false;
+
+  /* Try 'connect' command to other end, with retries */
+
+  for ( i=0; i<CONNECT_TRIES; i++ )
+  {
+    pC->Status   = AWAIT_CONNECT;
+    SendUformat ( pC, UFORMAT_SABME | UFORMAT_POLL );
+
+    timer = LLC_TickerTime;
+
+    do
+    {
+      LLC_BackgroundProcess();
+      if ( pC->Status == CONNECTED )
+        goto LinkOpened;
+    }
+      while ( (LLC_TickerTime - timer) < CONNECT_TIME );
+  }
+
+  /* Get here if failed */
+
+  pC->Status = NO_CONNECT;
+  return ETIMEOUT;
+
+
+LinkOpened:
+
+  /* Else: see if the other end's ready - this will give it
+     approx 5 seconds to respond */
+
+  pC->T1Retries = T1_RETRIES;
+  SendPoll ( pC );
+
+  *pHandleOut = pC->hconn;
+  return OK;
+}
+
+/* ------------------------ */
+
+err_t LLC_CloseLink ( HCONN hc )
+{
+  int i, timer;
+
+  LLC_CONN *pC;
+
+  STAT(STA_LLC_CLOSEREQ);
+
+  if ( hc < 0 || hc >= MAX_LLC_CONN )
+    return EBADPARAM;
+
+  pC = LLC_Connections + hc;
+
+  if ( pC->Status == NO_CONNECT )
+    return ENOCONN;
+
+  /* Closing a failed link? */
+
+  if ( pC->Status != CONNECTED )
+    goto ShutIt;
+
+  /* Any acks for us to send ? */
+
+  if ( TimerRunning(&pC->T2) )
+    SendAck ( pC, false );   /* Will clear T2 */
+
+  /* Are we waiting for any acks - if so, hurry the process along! */
+
+  if ( TimerRunning(&pC->T1) )
+    SendPoll ( pC );
+
+  /* Wait for any acks which are due to us */
+
+  while ( TimerRunning(&pC->T1) )
+  {
+    LLC_BackgroundProcess();
+    if ( pC->Status != CONNECTED ) /* Link failed */
+      goto ShutIt;
+  }
+
+  /* Try 'disconnect' command to other end, with retries */
+
+  for ( i=0; i<DISCONN_TRIES; i++ )
+  {
+    pC->Status   = AWAIT_DISCONNECT;
+    SendUformat ( pC, UFORMAT_DISC | UFORMAT_POLL );
+
+    timer = LLC_TickerTime;
+
+    do
+    {
+      LLC_BackgroundProcess();
+      if ( pC->Status != AWAIT_DISCONNECT )
+        goto ShutIt;
+    }
+      while ( (LLC_TickerTime - timer) < DISCONN_TIME );
+
+  }
+
+  /* This link is now closed */
+
+ShutIt:
+  QueueFlush ( &(pC->TxPendingQ) );
+  pC->Status = NO_CONNECT;
+  return OK;
+}
+
+/* -------------------------------------- */
+
+bool LLC_LinkOK (HCONN hc)
+{
+  if ( hc < 0 || hc >= MAX_LLC_CONN ||
+       LLC_Connections[hc].Status != CONNECTED )
+    return false;
+
+  return true;
+}
+
+
+
+/* Initialise routines ===================================== */
+
+bool LLC_Init ( void )
+{
+  int i;
+
+  Net_Attached = false;
+  debug1("LLC_Init: Just about to call TimerSetup() - LLC_TickerTime=%d\n",LLC_TickerTime);
+  TimerSetup();
+  debug1("LLC_Init: Just called TimerSetup()        - LLC_TickerTime=%d\n",LLC_TickerTime);
+
+  LLC_RxRawQueue.Head = NULL;
+  LLC_RxRawQueue.Last = NULL;
+
+  for ( i=0; i < MAX_UI_CONN; i++ )
+  {
+    UI_RcvFunction[i] = NULL;
+    UI_SAPtbl[i] = 0;
+  }
+
+  for ( i=0; i < MAX_LLC_CONN; i++ )
+  {
+    LLC_Connections[i].Status = NO_CONNECT;
+    LLC_Connections[i].hconn = i;
+    LLC_Connections[i].TxPendingQ.Head = NULL;
+    LLC_Connections[i].TxPendingQ.Last = NULL;
+    TimerInit ( &LLC_Connections[i].T1,
+                      T1ExpiryCallback, &LLC_Connections[i] );
+    TimerInit ( &LLC_Connections[i].T2,
+                      T2ExpiryCallback, &LLC_Connections[i] );
+  }
+  debug1("LLC_Init: Just called TimerInit() several times - LLC_TickerTime=%d\n",LLC_TickerTime);
+  return true;
+}
+
+
+/* -------------------------------------- */
+
+void LLC_Shutdown ( void )
+{
+  int i;
+
+  DetachDriver();
+  TimerShutdown();
+
+  QueueFlush ( &LLC_RxRawQueue );
+
+  /* 25/3/96 - if our callback has been set, collect it now before
+       we leave. All rx packets have been flushed & timers deleted,
+       so it is safe to do this without fear of the consequences */
+  usermode_donothing();
+
+  for ( i=0; i < MAX_LLC_CONN; i++ )
+  {
+    LLC_Connections[i].Status = NO_CONNECT;
+    QueueFlush(&LLC_Connections[i].TxPendingQ);
+  }
+}
+
+#endif /* !NO_NETBEUI */

@@ -1,0 +1,1183 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        GET     Hdr:HALSize.<HALSize>
+        $GetCPU
+        $GetIO
+        $GetMEMC
+        $GetMEMM
+
+                GBLL    CheckProtectionLink
+CheckProtectionLink SETL {TRUE}         ; When TRUE, disallow CMOS RAM changes if link in protected position
+
+                GBLL    IgnoreVRAM
+IgnoreVRAM      SETL    {FALSE}         ; When TRUE, pretend there's no VRAM
+
+                GBLL    IgnoreDRAM
+IgnoreDRAM      SETL    {FALSE}         ; When TRUE, pretend there's no DRAM
+
+                GBLL    IgnoreKinetic
+IgnoreKinetic   SETL    {FALSE}         ; When TRUE, pretend we're not on Kinetic
+
+        GET     Hdr:Proc
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.StaticWS
+        GET     hdr.IOMD
+        GET     hdr.Copro15ops
+        GET     hdr.Debug
+
+        EXPORT  HAL_Base
+        EXPORT  start
+        EXPORT  DistinctAddresses
+        IMPORT  Video_Init
+        IMPORT  HALdescriptor
+        IMPORT  Decide_On_Memory_Layout
+        IMPORT  Power_On_Self_Test
+
+; R11 is used as pointer to RISC OS entry table during pre-MMU stage.
+        MACRO
+        CallOSM $entry, $reg
+        LDR     ip, [v8, #$entry*4]
+        MOV     lr, pc
+        ADD     pc, v8, ip
+        MEND
+
+
+        AREA    |!!!ROMStart|, CODE, READONLY, PIC
+
+        ENTRY
+
+HAL_Base
+
+vectors
+        LDR     pc, ResetInd            ; Reset
+        LDR     pc, HaltInd             ; Undefined instruction
+        LDR     pc, HaltInd             ; SWI
+        LDR     pc, HaltInd             ; Prefetch abort
+        LDR     pc, HaltInd             ; Data abort
+        LDR     pc, HaltInd             ; (Address exception)
+        LDR     pc, HaltInd             ; IRQ
+        LDR     pc, HaltInd             ; FIQ
+
+; The above 8 instructions will operate as expected in 32-bit ROM mode,
+; or in 16-bit ROM mode with a 16-bit ROM used.  In 16-bit ROM mode, and
+; with 32-bit wide ROMs in use, they will instead be intepreted as 4
+; NV-condition instructions (exact meaning not determined and should be
+; irrelevant) which should do nothing and so allow control to drop
+; through to this point, still in 16-bit mode.  Force IOMD into 32-bit
+; ROM mode for bank 0.  The following instruction sequence has been
+; produced in 16-in-32 form by extracting hex values from a listing...
+
+        DCD     &0000B632, &0000E3A0    ; 20: MOV  R11, #IOMDPhys - point at IOMD physical address
+        DCD     &00000000, &0000E3A0    ; 28: MOV  R0, #0 - ROMCR:32b, slow, 7xMEMCLK (218.75ns), no burst
+        DCD     &00000080, &0000E5CB    ; 30: STRB R0,[R11,#ROMCR0] - switch mode
+        DCD     &0000F000, &0000E3A0    ; 38: MOV  PC, #0 - jump to 0 (this instruction pre-fetched)
+
+ResetInd
+        DCD     start - HAL_Base
+HaltInd
+        DCD     halt - HAL_Base
+
+halt    B       halt
+
+        ASSERT  . - HAL_Base < 0x60
+        %       0x60 - (. - HAL_Base)
+ROMsize
+        DCD     0                       ; patched in by build system
+
+; Boot flow:
+; 1. start - CPU, IOMD, VIDC initialisation
+;    - init7500FEcpu for 7500FE
+;    - init7500cpu for 7500
+;    - MedusaInit for ARM6/7/StrongARM
+;    - Count_Hard_ROM
+; 2. Initialise_DRAM - Locate all DRAM and program control registers
+;    - Initialise_DRAM_RiscPC for original IOMD
+;    - Initialise_DRAM_A7000 for 7500/7500FE
+; 3. Find_WS_Page - Find a spare page for stack/workspace
+; 4. Power_On_Self_Test - Simple POST
+; 5. Decide_On_Memory_Layout - Decide how we're going to present the physical RAM to RISC OS, and where to relocate our ROM image (if necessary)
+; 6. Relocate_Forwards/Relocate_Backwards - ROM image relocation
+; 7. NoRelocate - Register DRAM with RISC OS
+; 8. Initialise_VRAM - Locate all VRAM, program control registers, register with RISC OS
+;    - Initialise_VRAM_RiscPC for IOMD
+;    - Initialise_VRAM_A7000 for 7500/7500FE
+; 9. RISCOS_Start
+
+
+start
+        ; Ensure SVC32 with IRQ+FIQ off
+        MSR     CPSR_c, #SVC32_mode+I32_bit+F32_bit
+
+        ADRL    R5, HAL_Base + OSROM_HALSize    ; R5 -> RISC OS image
+
+        LDR     R11, [R5, #OSHdr_Entries]
+        ADD     R11, R11, R5                    ; R11 -> RISC OS entry table
+
+        MOV     R0, #0
+        CallOSM OS_InitARM
+
+        MOV     r12, #IOMDPhys
+
+; Perform a dummy write to IOMD (some harmless register) to get it out of ROM force mode.
+; Reads from IOMD will return garbage before this has happened. If we're actually running out
+; of 32-bit wide ROMs on MORRIS, a write will already have happened to get ROMCR0 from
+; 16 to 32-bit wide mode, but we can't yet determine for sure (by reading it back), so do it
+; anyway.
+
+        STRB    r12, [r12, #IOMD_DMAREQ]              ; writes to DMAREQ are ignored
+
+        LDRB    r2,[r12,#IOMD_ID1]      ; load r2 with IOMD ID high byte
+        LDRB    r0,[r12,#IOMD_ID0]      ; load r0 with IOMD ID low byte
+        ORR     r0,r0,r2, LSL #8        ; Or r0 and r2 - shifted left 8, put in r0
+        LDR     r2,=IOMD_7500           ; get Ref IOMD ID code for IOMD in a 7500
+        CMP     r0,r2                   ; check for IOMD ID Code for IOMD in a 7500
+        BEQ     init7500cpu             ; If equal, got to init7500cpu
+
+        LDRNE   r2,=IOMD_7500FE         ; If not, get ID code for IOMD in a 7500FE
+        CMPNE   r0,r2                   ; If not, check for IOMD ID Code for IOMD in a 7500FE
+        BNE     MedusaInit              ; NOT MORRIS assume Medusa hardware
+
+init7500FEcpu
+; Here because its an ARM7500 'FE' variant
+; Program the CPU, Memory and IO clock prescalers
+; Set the prescalers to :-
+;       CPUCLK divide by 1
+;       MEMCLK divide by 2
+;       IOCLK  divide by 2
+;
+        MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkHalf + IOMD_CLKCTL_IOclkHalf
+        STRB    r0, [r12, #IOMD_CLKCTL] ; initialise all the prescalers.
+;
+; Set ROM speed, take care to preserve 16-bit mode bit, or all hell breaks loose...
+
+        LDRB    r0, [r12, #IOMD_ROMCR0]         ; Get contents of ROMCR0 in to r0
+        AND     r0, r0, #&40                    ; clear all but the 16-bit mode flag
+        ORR     r0, r0, #IOMD_ROMCR_HalfSpeed + IOMD_ROMCR_NSTicks_5 + IOMD_ROMCR_BTicks_3
+        STRB    r0, [r12, #IOMD_ROMCR0]         ; Prog. the regs
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; 2nd bank unused: program it the same anyway
+
+; Now program ASTCR to add wait states, since MEMCLK is fast relative to IOCLK
+
+        MOV     r0, #IOMD_ASTCR_WaitStates
+        STRB    r0, [r12, #IOMD_ASTCR]
+
+        B       init7500cpu_common              ; branch to common init code.
+
+init7500cpu
+; Here because its an ARM7500 variant - NON 'FE' device.
+; Program the CPU, Memory and IO clock prescalers
+; Set the prescalers to :-
+;       CPUCLK divide by 1
+;       MEMCLK divide by 1
+;       IOCLK  divide by 1
+;
+        MOV     r0, #IOMD_CLKCTL_CpuclkNormal + IOMD_CLKCTL_MemclkNormal + IOMD_CLKCTL_IOclkNormal
+        STRB    r0, [r12, #IOMD_CLKCTL] ; initialise all prescalers to div1
+;
+; Set ROM speed, take care to preserve 16-bit mode bit, or all hell breaks loose...
+
+        LDRB    r0, [r12, #IOMD_ROMCR0]         ; Get contents of ROMCR0 in to r0
+        AND     r0, r0, #&40                    ; clear all but the 16-bit mode flag
+        ORR     r0, r0, #IOMD_ROMCR_Normal + IOMD_ROMCR_NSTicks_5 + IOMD_ROMCR_BTicks_3
+        STRB    r0, [r12, #IOMD_ROMCR0]         ; Prog. the regs
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; 2nd bank unused: program it the same anyway
+
+; Now program ASTCR to *NOT* add wait states, since MEMCLK is slow relative to IOCLK
+
+        MOV     r0, #IOMD_ASTCR_Minimal
+        STRB    r0, [r12, #IOMD_ASTCR]
+
+init7500cpu_common
+; Common setup requirments for BOTH 7500 and 7500FE.
+;
+; MORRIS doesn't support VRAM. Kryten has same DRAM speed as Medusa
+;
+        MOV     r0, #IOMD_VREFCR_REF_16         ; select 16µs refresh
+        STRB    r0, [r12, #IOMD_VREFCR]
+
+        MOV     r0, #IOMD_IOTCR_Network_TypeA :OR: IOMD_IOTCR_Combo_TypeB :OR: IOMD_IOTCR_Sound_TypeB :OR: IOMD_IOTCR_Sound_Word
+        STRB    r0, [r12, #IOMD_IOTCR]
+
+        MOV     r0, #2_10                       ; Japanese format audio, LCD colour mux off 
+        STRB    r0, [r12, #IOMD_VIDMUX]
+
+        B       CommonInit
+
+        LTORG
+
+MedusaInit
+
+        ; we know we might meet StrongARM 110, enable fast core clock if so
+        ; (grey area - clocking regarded as HAL rather than kernel problem)
+        ;
+        ARM_read_ID r0                          ; read id
+        AND     r0, r0, #&F000
+        TEQ     r0, #&A000                      ; is that my old friend, StrongARM?
+        MCREQ   p15, 0, r0, c15, c1, 2          ; enable fast core clock
+
+        MOV     r0, #IOMD_ROMCR_NSTicks_5 + IOMD_ROMCR_BTicks_3
+
+        STRB    r0, [r12, #IOMD_ROMCR0]         ; 5-3 cycle ROM access
+        STRB    r0, [r12, #IOMD_ROMCR1]         ; 2nd bank unused: program it the same anyway
+
+        MOV     r0, #IOMD_VREFCR_VRAM_256Kx64 :OR: IOMD_VREFCR_REF_16   ; select 16µs refresh, assume 2 banks of VRAM
+        STRB    r0, [r12, #IOMD_VREFCR]
+
+        MOV     r0, #IOMD_IOTCR_Network_TypeA :OR: IOMD_IOTCR_Combo_TypeB :OR: IOMD_IOTCR_Sound_TypeB :OR: IOMD_IOTCR_Sound_Word
+        STRB    r0, [r12, #IOMD_IOTCR]
+
+CommonInit
+
+; Now bang IOMD (disable all but keyboard interrupts)
+
+        MOV     R1, #IOMDPhys
+
+        MOV     R0, #&FF                ; all inputs
+        STRB    R0, [R1, #IOCControl]   ; in case called by Tim
+
+        MOV     R0, #0
+        STRB    R0, [R1, #IOCIRQMSKA]   ; kein interrupts
+        STRB    R0, [R1, #IOCIRQMSKB]
+        STRB    R0, [R1, #IOCFIQMSK]    ; knob off, FIQ
+        STRB    R0, [R1, #IOMD_DMAMSK]  ; disable DMA interrupts, too
+        STRB    R0, [R1, #IOMD_IRQMSKC] ; and the rest...
+        STRB    R0, [R1, #IOMD_IRQMSKD]
+
+; Set the centisecond timer running so things can be timed properly
+
+        LDR     R0, =20000-1            ; R0 = Timer delay (units of 0.5 microsecond)
+                                        ; 20000*0.5E-6 = 0.01 Seconds (100Hz ticker)
+                                        ; TMD 21-May-93: "-1" correction applied
+
+        STRB    R0, [R1, #Timer0LL]     ; Set up the delay
+        MOV     R0, R0, LSR #8
+        STRB    R0, [R1, #Timer0LH]
+        STRB    R0, [R1, #Timer0GO]     ; and start the ticks
+
+        MOV     R0, #timer0_bit
+        STRB    R0, [R1, #IOCIRQCLRA]   ; Clear pending t0 interrupt j.i.c.
+
+; Power down the A to D convertor
+
+        MOV     R0, #0
+        STRB    R0, [R1, #IOMD_ATODICR]
+
+; Minimal VIDC setup
+
+        BL      Video_Init
+
+  [ Debug
+        IMPORT  Debug_Init
+        BL      Debug_Init
+        DebugTX "IOMD HAL init"
+  ]
+
+        BL      Count_Hard_ROM
+        MOV     r12, #IOMDPhys
+        MOV     r0, r0, LSR #20         ; No RAM yet, pack result into 5 bits (1->32MB => 0->31) and
+        SUB     r0, r0, #1              ; stash it in the 5 bit bank 1 timing reg since this code must
+        STRB    r0, [r12, #IOMD_ROMCR1] ; be in bank 0
+
+; Initialise_DRAM
+Initialise_DRAM ROUT
+        LDRB    r0, [r12, #IOMD_ID0]
+        LDRB    r1, [r12, #IOMD_ID1]
+        ORR     r0, r0, r1, LSL #8
+        DebugReg r0
+        DebugTX_inl " = IOMD ID", r1, r2, r3
+        LDR     r1, =IOMD_Original
+        CMP     r0, r1
+        BEQ     Initialise_DRAM_RiscPC
+        B       Initialise_DRAM_A7000
+
+
+; Initialise_DRAM_RiscPC
+;   Exit:  r0-r3 = address lines
+Initialise_DRAM_RiscPC ROUT
+        MOV     r11, #IOMD_DRAMCR_DRAM_Large * &55      ; set all banks to be large initially
+        CMP     pc, #VideoPhysRam
+        MOV     r14, #IOMDPhys
+        STRLOB  r11, [r14, #IOMD_DRAMCR]                ; Don't fiddle with DRAM config if softloaded
+        MOV     r0, #DRAM0PhysRam
+        MOV     r13, #IOMD_DRAMCR_DRAM_Small            ; bit to OR into DRAMCR
+10
+        ADD     r1, r0, #A10                            ; this should be OK for both configurations
+        BL      DistinctAddresses
+        MOVNE   r6, #0                                  ; move onto next bank
+        BNE     %FT15                                   ; [no RAM in this bank at all]
+
+        ADD     r1, r0, #A11                            ; test for 256K DRAM
+        BL      DistinctAddresses
+        BEQ     %FT12
+        ORR     r11, r11, r13                           ; it is, so select small multiplexing
+        MOV     r14, #IOMDPhys
+        CMP     pc, #VideoPhysRam
+        STRLOB  r11, [r14, #IOMD_DRAMCR]                ; store new value of DRAMCR, so we can use memory immediately
+12
+        BL      Probe_DRAM_bank
+15
+        ADD     r0, r0, #DRAMBankSize
+        MOV     r13, r13, LSL #2                        ; shunt up position in DRAMCR
+        CMP     r13, #&100                              ; if more banks to do
+        MOVCC   r10, r9                                 ; then shuffle everything up
+        MOVCC   r9, r8
+        MOVCC   r8, r6
+        BCC     %BT10                                   ; and loop
+        DebugTX "Initialise_DRAM_RiscPC done"
+        DebugReg r10
+        DebugTX " = bank 0"
+        DebugReg r9
+        DebugTX " = bank 1"
+        DebugReg r8
+        DebugTX " = bank 2"
+        DebugReg r6
+        DebugTX " = bank 3"
+        DebugReg r11
+        DebugTX " = DRAMCR"
+
+        ; Kinetic detection
+        ; There aren't any sensible registers that we can use to detect if we're running on a Kinetic.
+        ; However if a Kinetic is fitted, Probe_DRAM_bank should be able to detect the
+        ; first SDRAM bank, while failing on IOMD machines (due to it mapping to ROM bank 0).
+        ; The SODIMM is 64b wide, split as two identical 32b banks, so success with one infers the other.
+        ; While the SODIMM detect EEPROM is wired up, we'll try to guess the row/column/bank split
+        ; by just probing until there's a blob of RAM that looks contiguous (max 256MB).
+        MOV     r13, r6                                 ; Push "R6"
+
+        CMP     pc, #VideoPhysRam
+        BHS     %FT20                                   ; Don't fiddle with SDRAM config if softloaded
+
+        LDR     r0, =SDCfgReg
+        MOV     r14, #SDCfg_SIZE_13_2_9                 
+        STR     r14, [r0]                
+        MOV     r0, #SDRAM0PhysRam
+        BL      Probe_DRAM_bank
+        ADD     r0, r6, #1
+        TST     r0, r6                                  ; Implements IS_POWER_OF_TWO()
+        BEQ     %FT25                                   ; R6 has no missing address lines (or R6=0, not Kinetic)
+
+        LDR     r0, =SDCfgReg
+        MOV     r14, #SDCfg_SIZE_12_2_9                 
+        STR     r14, [r0]                
+        MOV     r0, #SDRAM0PhysRam
+        BL      Probe_DRAM_bank
+        ADD     r0, r6, #1
+        TST     r0, r6                                  ; Implements IS_POWER_OF_TWO()
+        BEQ     %FT25                                   ; R6 has no missing address lines
+
+        LDR     r0, =SDCfgReg
+        MOV     r14, #SDCfg_SIZE_12_2_8                 ; Last chance saloon
+        STR     r14, [r0]                
+20
+        MOV     r0, #SDRAM0PhysRam
+        BL      Probe_DRAM_bank
+25
+        MOV     r11, r6
+        MOV     r12, r6                                 ; Duplicate in other bank
+        MOV     r6, r13                                 ; Pull "R6"
+        DebugReg r11
+        DebugTX " = SDRAM bank 0"
+        DebugReg r12
+        DebugTX " = SDRAM bank 1"
+
+        ; Move results to correct regs
+        MOV     r0, r10
+        MOV     r1, r9
+        MOV     r2, r8
+        MOV     r3, r6
+        B       Find_WS_Page
+
+; Initialise_DRAM_A7000
+;   Exit:  r0-r3 = address lines
+Initialise_DRAM_A7000 ROUT
+        ; Initially assume 32 bit wide, EDO, and timing bits set in case 7500FE (don't care bits otherwise)
+        MOV     r11, #IOMD_DRAMWID_EDO_Enable :OR: \
+                      IOMD_DRAMWID_RASCAS_3 :OR: IOMD_DRAMWID_RASPre_4 :OR: \
+                      (IOMD_DRAMWID_DRAM_32bit * &0F)
+        CMP     pc, #VideoPhysRam
+        MOV     r14, #IOMDPhys
+        STRLOB  r11, [r14, #IOMD_DRAMWID]               ; Don't fiddle with DRAM config if softloaded
+        MOV     r13, #IOMD_DRAMWID_DRAM_16bit           ;bit to OR into DRAMWID to set 16bit
+        MOV     r0, #DRAM0PhysRam
+        ; r0    DRAM address
+        ; r11   current IOMD_DRAMWID register contents
+        ; r13   IOMD_DRAMWID_DRAM_16bit for current DRAM bank
+10                                                      ;examine first/next DRAM bank
+        LDMIA   r0, {r1, r2}                            ;Preserve the two locations that we widdle on
+
+        ADR     r3, funnypatterns                       ;We write different values to two locations
+        LDMIA   r3, {r3, r4}                            ; incase bus capacitance holds our value
+        STMIA   r0, {r3, r4}
+        LDMIA   r0, {r5, r6}                            ;Reread test locations
+        EORS    r5, r5, r3                              ;Both locations should read correctly
+        EOR     r6, r6, r4                              ; if memory is 32bits wide
+        TEQEQ   r6, #0
+        BEQ     %FT12                                   ;32bit wide memory
+
+        TST     r5, #&00FF                              ;If the bottom 16bits of each location
+        TSTEQ   r5, #&FF00                              ; are correct, the memory is 16bits wide
+        TSTEQ   r6, #&00FF
+        TSTEQ   r6, #&FF00
+        MOVNE   r6, #0                                  ; move onto next bank
+        BNE     %FT15                                   ;No memory in this bank
+
+        ORR     r11, r11, r13                           ;Bank is 16bits wide
+12
+        STMIA   r0, {r1, r2}                            ;Restore the two locations we widdled on
+        CMP     pc, #VideoPhysRam                       ;Must do BEFORE poking the DRAMWID register
+        MOV     r14, #IOMDPhys                          ;
+        STRLOB  r11, [r14, #IOMD_DRAMWID]               ; Don't fiddle with DRAM config if softloaded
+
+        BL      Probe_DRAM_bank
+
+15          
+        ADD     r0, r0, #DRAMBankSize
+        MOV     r13, r13, LSL #1                        ; shunt up position in DRAMWID
+        CMP     r13, #&0010                             ; if more banks to do
+        MOVLT   r10, r9                                 ; then shuffle everything up
+        MOVLT   r9, r8
+        MOVLT   r8, r6
+        BLT     %BT10                                   ; and loop
+        DebugTX "Initialise_DRAM_A7000 done"
+        DebugReg r10
+        DebugTX " = bank 0"
+        DebugReg r9
+        DebugTX " = bank 1"
+        DebugReg r8
+        DebugTX " = bank 2"
+        DebugReg r6
+        DebugTX " = bank 3"
+        DebugReg r11
+        DebugTX " = DRAMWID"
+        ; Move results to correct regs
+        MOV     r0, r10
+        MOV     r1, r9
+        MOV     r2, r8
+        MOV     r3, r6
+        MOV     r11, #0
+        MOV     r12, #0
+        B       Find_WS_Page
+
+funnypatterns
+        &       &66CC9933   ; 0110 1100 1001 0011
+        &       &CC993366   ; 1100 1001 0011 0110
+
+        LTORG
+
+
+; Probe_DRAM_bank
+;   Entry: r0  =  bank address
+;   Exit:  r6  =  address lines
+;          r1-r5, r7, r12 corrupt
+;   Probe a DRAM bank
+Probe_DRAM_bank ROUT
+        MOV     r12, lr                 ; r12 = return address
+      [ Debug
+        MOV     r5, r0
+        DebugTX "Probe_DRAM_bank"
+        DebugReg r5
+        DebugTX " = bank address"
+        MOV     r0, r5
+      ]
+        EOR     r1, r0, #A16            ; Check there is some RAM in the bank
+        MOV     r6, #0
+        BL      DistinctAddresses
+      [ Debug
+        BEQ     %FT05
+        DebugTX "Bank empty"
+        MOV     pc, r12
+05
+      |
+        MOVNE   pc, r12                 ; Return if no RAM in the bank
+      ]
+
+        ; Only some address lines are decoded by the SIMM.  For example, a 4M SIMM may be split
+        ; into 2 banks, with A2-A20 decoded on each, or A2-A19,A21 decoded.  First we need to
+        ; find out which address lines are decoded, and which are ignored.
+        CMP     r0, #SDRAM0PhysRam
+        MOVHS   r6, #SDRAMBankSize
+        MOVLO   r6, #DRAMBankSize
+        MOV     r7, #A17
+        SUB     r6, r6, #1              ; Get address lines which select address within bank.
+
+        ; Loop through the address lines, finding out which are decoded.  We clear the bits in r6
+        ; which correspond to non-decoded address lines.
+        ; r6 = address line mask
+        ; r7 = current address line
+10      EOR     r1, r0, r7              ; Toggle the address line
+        BL      DistinctAddresses       ; Check if address line has any effect.
+        BICNE   r6, r6, r7              ; Clear the bit if the address line doesn't appear to be wired up.
+        MOV     r7, r7, LSL #1          ; Move onto the next address line.
+        TST     r6, r7                  ; Have we reached the limit?
+        BNE     %BT10                   ; Repeat if not.
+
+        ; r6 = decoded address lines in bank. (ie in A0-A25)
+      [ Debug
+        MOV     r5, r0
+        DebugReg r6
+        DebugTX " = decoded address lines"
+        MOV     r0, r5
+      ]
+
+        MOV     pc, r12                 ; Done for this bank.
+
+; DistinctAddresses routine...
+; r0,r1 are the addresses to check
+; uses r2-5
+; writes interleaved patterns (to prevent dynamic storage...)
+; checks writing every bit low and high...
+; return Z-flag set if distinct
+
+; This routine must work in 32-bit mode
+
+DistinctAddresses ROUT
+        LDR     r2, [r0] ; preserve
+        LDR     r3, [r1]
+        LDR     r4, Pattern
+        STR     r4, [r0] ; mark first
+        MOV     r5, r4, ROR #16
+        STR     r5, [r1] ; mark second
+        LDR     r5, [r0]
+        CMP     r5, r4 ; check first
+        BNE     %10    ; exit with Z clear
+        LDR     r5, [r1] ; check second
+        CMP     r5, r4, ROR #16 ; clear Z if not same
+        BNE     %10
+; now check inverse bit writes
+        STR     r4, [r1] ; mark second
+        MOV     r5, r4, ROR #16
+        STR     r5, [r0] ; mark first
+        LDR     r5, [r1]
+        CMP     r5, r4 ; check second
+        BNE     %10   ; exit with Z clear
+        LDR     r5, [r0] ; check first
+        CMP     r5, r4, ROR #16 ; clear Z if not same
+10      STR     r3, [r1] ; restore
+        STR     r2, [r0]
+        MOV     pc, lr                  ; Z flag is already set up, and other flags don't matter
+
+Pattern
+        &       &AAFF5500 ; shiftable bit check pattern
+
+; Find_WS_Page_In_Bank
+;  Entry: r4 = bank base address
+;         r5 = address lines
+;  Exit:  r0-r4 preserved
+;         r5-r10 corrupt
+;         r13 = top of page if found
+Find_WS_Page_In_Bank ROUT
+        ; Mark the high bits of the address lines valid so we can mask an
+        ; address without losing which bank its in
+        CMP     r4, #SDRAM0PhysRam
+        ORRHS   r5, r5, #&F8000000
+        ORRLO   r5, r5, #&FC000000
+        ADRL    r7, HAL_Base + OSROM_HALSize
+        LDR     r8, [r7, #OSHdr_Flags]
+        TST     r8, #OSHdrFlag_SupportsCompression
+        LDRNE   r8, [r7, #OSHdr_CompressedSize]
+        LDREQ   r8, [r7, #OSHdr_ImageSize]
+        SUB     r7, r7, #OSROM_HALSize ; Start of ROM image
+        ADD     r8, r8, #OSROM_HALSize ; Size of compressed ROM image
+        ADD     r8, r8, r7 ; End of ROM image
+        LDR     r9, =4095
+        BIC     r7, r7, r9 ; Round down to page boundary
+        ADD     r8, r8, r9 ; Round up to page boundary
+        BIC     r8, r8, r9
+        SUB     r8, r8, #1 ; End addr inclusive
+        CMP     r4, r7 ; Is this bank below the bank the OS is in?
+        CMPHS   r8, r4 ; Is this bank above the bank the OS is in?
+        ADDLO   r13, r4, #4096
+        MOVLO   pc, lr
+        ; This bank at least partially intersects the OS. Search page by page for simplicity.
+        CMP     r7, r4
+        MOVLO   r7, r4 ; Clamp OS start addr to start of bank
+        CMP     r4, #SDRAM0PhysRam
+        ADDHS   r9, r4, #SDRAMBankSize
+        ADDLO   r9, r4, #DRAMBankSize
+        CMP     r8, r9
+        MOVHI   r8, r9 ; Clamp OS end addr to end of bank
+        AND     r7, r7, r5 ; Mask down to just the valid bits
+        AND     r8, r8, r5
+        MOV     r6, r4 ; Current search address
+        MVN     r10, r5 ; inverse lines
+10
+        CMP     r6, r7
+        CMPHS   r8, r6
+        ADDLO   r13, r6, #4096
+        MOVLO   pc, lr
+        ; Try next page
+        ADD     r6, r6, #4096 ; Add a page
+        ADD     r6, r6, r10 ; Add inverse mask to cause us to skip indistinct address lines
+        AND     r6, r6, r5 ; And mask to get back to a valid address we can check with the OS bounds
+        CMP     r6, r9
+        BLO     %BT10
+        ; No free page
+        MOV     pc, lr
+
+
+; Find_WS_Page
+;  Entry: r0-r3 = address lines for all 4 RAM banks
+;         r11-r12 = address lines for Kinetic SDRAM banks
+; Examine the banks and the OS location to find a free page we can use for workspace
+Find_WS_Page ROUT
+      [ IgnoreDRAM
+        ; Pretend there's no DRAM
+        ; Note: This won't have affected DRAMCR programming
+        MOV     r0, #0
+        MOV     r1, #0
+        MOV     r2, #0
+        MOV     r3, #0
+      ]
+      [ IgnoreKinetic
+        MOV     r11, #0
+        MOV     r12, #0
+      ]
+        MOV     r13, #0                 ; Result
+        MOV     r4, #DRAM0PhysRam       ; Current search address
+        MOVS    r5, r0
+        BLNE    Find_WS_Page_In_Bank
+        CMP     r13, #0
+        BNE     %FT10
+        MOV     r4, #DRAM1PhysRam
+        MOVS    r5, r1
+        BLNE    Find_WS_Page_In_Bank
+        CMP     r13, #0
+        BNE     %FT10
+        MOV     r4, #DRAM2PhysRam
+        MOVS    r5, r2
+        BLNE    Find_WS_Page_In_Bank
+        CMP     r13, #0
+        BNE     %FT10
+        MOV     r4, #DRAM3PhysRam
+        MOVS    r5, r3
+        BLNE    Find_WS_Page_In_Bank
+        CMP     r13, #0
+        BNE     %FT10
+        MOV     r4, #SDRAM0PhysRam
+        MOVS    r5, r11
+        BLNE    Find_WS_Page_In_Bank
+        CMP     r13, #0
+        BNE     %FT10
+        MOV     r4, #SDRAM1PhysRam
+        MOVS    r5, r12
+        BLNE    Find_WS_Page_In_Bank
+        ; Assume the last call succeeded (if not, we're pretty screwed)
+10
+        BL      Power_On_Self_Test
+      [ Debug
+        MOV     r4, r0
+        MOV     r5, r1
+        MOV     r6, r2
+        DebugReg r13
+        DebugTX " = top of workspace page"
+        MOV     r0, r4
+        MOV     r1, r5
+        MOV     r2, r6
+      ]
+        ; Now we have r13 = top of free page
+        ; i.e. a stack
+        ; Drop into some C code to make the memory analysis significantly easier
+        ADRL    r7, HAL_Base + OSROM_HALSize
+        LDR     r8, [r7, #OSHdr_Flags]
+        TST     r8, #OSHdrFlag_SupportsCompression
+        LDR     r9, [r7, #OSHdr_ImageSize]
+        LDRNE   r8, [r7, #OSHdr_CompressedSize]
+        MOVEQ   r8, r9
+        SUB     r7, r7, #OSROM_HALSize ; Start of ROM image
+        ADD     r8, r8, #OSROM_HALSize ; Size of compressed ROM image
+        ADD     r9, r9, #OSROM_HALSize ; Size of uncompressed ROM image
+        MOV     r4, r11
+        MOV     r5, r12
+        Push    "r0-r5,r7-r9"
+        DebugReg r7
+        DebugTX " = start of ROM image"
+        DebugReg r8
+        DebugTX " = size of compressed ROM image"
+        DebugReg r9
+        DebugTX " = size of uncompressed ROM image"
+        MOV     r0,sp
+        BL      Decide_On_Memory_Layout
+        ; Handle any relocation
+        AND     r4, r0, #63 ; spanflags for RAM setup
+        BIC     r5, r0, #63 ; ROM relocation address
+        DebugTX "Decide_On_Memory_Layout done"
+        DebugReg r4
+        DebugTX " = spanflags"
+        DebugReg r5
+        DebugTX " = ROM relocation address"
+        Pull    "r0-r3,r11-r12" ; Recover address lines (may get overwritten by relocation)
+        ORR     r0, r0, #&FC000000 ; Mark high bits valid so we can mask addresses without losing which bank they're in
+        ORR     r1, r1, #&FC000000
+        ORR     r2, r2, #&FC000000
+        ORR     r3, r3, #&FC000000
+        ORR     r11, r11, #&F8000000
+        ORR     r12, r12, #&F8000000
+        CMP     r5, r7
+        BEQ     NoRelocate
+
+        ; ROM relocation code
+        ; r5 = dest addr
+        ; r7 = src addr
+        ; r8 = length
+        LDR     r9, =4095
+        ADD     r8, r8, r9
+        BIC     r8, r8, r9 ; Round length up to page multiple
+        ; Work out whether we want to copy up or down
+        ; This is made easier by the fact that the copy loop is in the first page of the image
+        CMP     r7, #VideoPhysRam
+        BLO     Relocate_Backwards ; We're in ROM; just do simple relocation
+        CMP     r7, #SDRAM1PhysRam+SDRAMBankSize
+        BHI     Relocate_Backwards ; We're above RAM (hopefully): just do simple relocation
+        ; Else we're somewhere in RAM
+        ; Find which banks r5 & r7 are in, mask the addresses, and work out whether we need to go up or down
+        CMP     r5, #DRAM1PhysRam
+        ANDLT   r9, r5, r0
+        BLT     %FT15
+        CMP     r5, #DRAM2PhysRam
+        ANDLT   r9, r5, r1
+        BLT     %FT15
+        CMP     r5, #DRAM3PhysRam
+        ANDLT   r9, r5, r2
+        BLT     %FT15
+        CMP     r5, #SDRAM0PhysRam
+        ANDLT   r9, r5, r3
+        BLT     %FT15
+        CMP     r5, #SDRAM1PhysRam
+        ANDLT   r9, r5, r11
+        ANDGE   r9, r5, r12
+15
+        CMP     r7, #DRAM1PhysRam
+        ANDLT   r10, r7, r0
+        BLT     %FT20
+        CMP     r7, #DRAM2PhysRam
+        ANDLT   r10, r7, r1
+        BLT     %FT20
+        CMP     r7, #DRAM3PhysRam
+        ANDLT   r10, r7, r2
+        BLT     %FT20
+        CMP     r7, #SDRAM0PhysRam
+        ANDLT   r10, r7, r3
+        BLT     %FT20
+        CMP     r7, #SDRAM1PhysRam
+        ANDLT   r10, r7, r11
+        ANDGE   r10, r7, r12
+20
+        CMP     r9, r10
+        MOVEQ   r8, #0 ; After the masking it's possible we were in the right place after all. Set copy length to 0 and fall through to copy code (so we jump to the correct mirror of the ROM)
+        BHS     Relocate_Backwards
+        ; Fall through to Relocate_Forwards
+                
+Relocate_Forwards ROUT
+        ; Relocate the first page containing this copy loop
+        DebugTX_inl "Relocate_Forwards", r9, r10, lr
+        ADR     r6, Relocate_Forwards_2
+        MOV     r9, #4096
+        SUB     r8, r8, #4096
+        SUB     r6, r6, r7
+        ADD     r6, r6, r5 ; Relocated branch target
+10
+        SUBS    r9, r9, #4
+        LDRGE   r10, [r7], #4
+        STRGE   r10, [r5], #4
+        BGT     %BT10
+        B       Relocate_Done
+
+Relocate_Forwards_2
+        ; We're now in the relocated image; copy the rest of ourselves, still in the forwards direction 
+        MOV     r9, r8
+        ADR     r6, NoRelocate
+        B       %BT10
+
+        ; Relocate ourselves, from the top of the image down to the bottom
+Relocate_Backwards ROUT
+        DebugTX_inl "Relocate_Backwards", r9, r10, lr
+        ADR     r6, NoRelocate
+        SUB     r6, r6, r7
+        ADD     r6, r6, r5 ; Relocated branch target
+10
+        SUBS    r8, r8, #4
+        LDRGE   r9, [r7, r8]
+        STRGE   r9, [r5, r8]
+        BGT     %BT10
+Relocate_Done
+        ARM_flush_cacheandTLB r9
+        MOV     pc, r6
+
+        LTORG
+
+        ; Relocation code must be in first page in order to cope with overlapping target address (see Relocate_Forwards)
+        ASSERT (. - HAL_Base) <= 4096
+
+Count_Hard_ROM ROUT
+        ; Entry: Nothing
+        ; Exit:  r0 = amount of ROM found in bytes
+        ;        r1-r3 & r12 corrupt
+        ; This check is done before the MMU is turned on to save having to map in 32MB of logical
+        ; address space later (the result is likely to be less than half that). The check
+        ; looks for the alias of the first 256B of ROM appearing higher up in the memory map, using a
+        ; granularity of 1MB.
+        ; The probability of 2^2048 bits being the same in two places in any one ROM is hopefully small. 
+        ; By looking for the alias this also deals with the softloaded and compressed ROM case
+        ; where OSROM_ImageSize could contain some number larger than the physical chips.
+        ; It can't use the ROM checksum because the personalised RISC OS 4 ROMs have the wrong checksum.
+        ; For now, only ROM bank 0 is probed, bank 1 isn't tracked out on the RiscPC/A7000/A7000+ anyway.
+        MOV     r1, #ROMBank0Phys
+        ADD     r0, r1, #1*1024*1024
+10
+        MOV     r12, #256 - 4
+20
+        LDR     r2, [r0, r12]           ; Potential alias
+        LDR     r3, [r1, r12]           ; Real data
+        TEQ     r2, r3
+        BNE     %FT40                   ; No match, try next
+
+        SUBS    r12, r12, #4
+        BPL     %BT20
+30
+        SUB     r0, r0, #ROMBank0Phys   ; 256B matched, alias at real size
+        MOV     pc, lr
+40
+        ADD     r0, r0, #1*1024*1024
+        CMP     r0, #ROMBank1Phys
+        BCC     %BT10
+        B       %BT30                   ; End of bank
+
+AddBlock ROUT
+        ; Entry: r1 = base
+        ;        r2 = end
+        ;        r13 = stack (with pushed reference ptr)
+        ; Exit:  r0-r3 corrupt
+        ;        r13 updated
+        ; TODO - This mess of logic to avoid trashing the OS or registering small banks could be made simpler if we used Find_WS_Page?
+        CMP     r13, #0
+        Pull    "r0",NE ; Get OS_AddRAM reference
+        MOVEQ   r0, #0
+        CMP     r0, #0
+        BNE     %FT10
+        ; Check for any overlap with the OS image
+        ; This is only necessary if we don't have any workspace yet (since we want to use the first block as workspace)
+        ADRL    r0, HAL_Base
+        CMP     r0, r1
+        MOVHI   r0, #0
+        BHI     %FT10
+        ADD     r0, r0, #OSROM_HALSize
+        LDR     r3, [r0, #OSHdr_ImageSize]
+        ADD     r3, r0, r3 ; End of OS
+        CMP     r3, r1
+        MOVHI   r1, r3 ; Shift start of block up to end of OS
+        MOV     r0, #0
+10
+        CMP     r1, r2
+        BGE     %FT90 ; Zero/negative length, skip
+        CMP     r13, #0
+        ADDEQ   r13, r1, #4096 ; We have a stack!
+        ; HAL docs suggest first block must be at least 256K, so check for that
+        ; Any blocks which are too small will get collected on the stack and added at the end
+        ; (We're unlikely to receive blocks this small, but it's better to be safe than sorry)
+        CMP     r0, #0
+        BNE     %FT20
+        SUB     r0, r2, r1
+        CMP     r0, #256*1024
+        MOV     r0, #0
+        Push    "r0-r2",LT ; push empty OS_AddRAM reference + block details
+        MOVLT   pc, lr
+20
+        Push    "r0,r11-r12,lr"
+      [ Debug
+        Push    "r1-r2"
+        DebugTX "OS_AddRAM"
+        LDR     r0, [sp]
+        DebugReg r0
+        DebugTX " = start"
+        LDR     r0, [sp, #4]
+        DebugReg r0
+        DebugTX " = end"
+        LDR     r0, [sp, #8]
+        DebugReg r0
+        DebugTX " = reference"
+        Pull    "r1-r2"
+      ]
+        CMP     r1, #SDRAM0PhysRam
+        LDRHS   r0, =15*OSAddRAM_Speed + OSAddRAM_NoDMA ; Kinetic SDRAM
+        MOVLO   r0, #4*OSAddRAM_Speed                   ; Regular DRAM
+        LDR     r3, =&ffffffff
+        ADRL    R12, HAL_Base + OSROM_HALSize    ; R12 -> RISC OS image
+        LDR     R11, [R12, #OSHdr_Entries]
+        ADD     R11, R11, R12                    ; R11 -> RISC OS entry table
+        CallOSM OS_AddRAM
+        ADD     R13,R13,#4
+        Pull    "r11-r12,lr"
+90
+        CMP     r13, #0
+        Push    "r0",NE ; Remember reference
+        MOV     pc, lr
+
+        MACRO
+        Iterate_RAM $lines, $base, $flag, $limit
+        ; Must preserve r4-r8, r13
+        ; This is essentially an assembler version of the Iterate_RAM C function
+        ; See 'Different RAM configurations' in c.cbits for an explanation of what this does!
+        ; TODO - Looks like there are enough registers spare for this to be turned into a function?
+        CMP     $lines, #0
+        BEQ     %FT90
+        MVN     r10, $lines
+        SUB     r9, r10, #1
+        BIC     r9, r10, r9 ; r9 = smallest
+        SUB     r10, $lines, r9
+        ADDS    r11, r10, #1 ; mask-smallest+1
+        BNE     %FT10
+        ; Single block
+        TST     r4, #$flag
+        MOV     r1, #$base
+        ADDNE   r1, r1, #$limit
+        SUBNE   r1, r1, r9
+        ADD     r2, r1, r9
+        BL      AddBlock
+        B       %FT90
+10
+        ; Multiple blocks
+        BIC     r10, r11, r10 ; r10 = next
+        SUB     r11, r10, r9 ; r11 = offset
+        TST     r4, #$flag
+        MOVEQ   r10, #0 ; r10 = span
+        MOV     r12, #0 ; r12 = pos
+20
+        ADD     r12, r12, r11
+        CMP     r12, r10
+        MOV     r1, #$base
+        ADDGE   r1, r1, r12
+        SUBGE   r1, r1, r10
+        ADD     r2, r1, r9
+        ADDGE   r2, r2, r9
+        BL      AddBlock
+        MVN     r0, $lines
+        ADD     r12, r12, r0
+        ADD     r12, r12, r9, LSL #1
+        ANDS    r12, r12, $lines
+        BNE     %BT20
+        CMP     r10, #0
+        RSBNE   r1, r9, #$base+$limit
+        ADDNE   r2, r1, r9
+        BLNE    AddBlock 
+90
+        MEND
+
+NoRelocate ROUT
+        ; Arrive here with:
+        ; r0-r3,r11-r12 = address lines
+        ; r4 = spanflags
+        ; Now we want to go ahead and start calling OS_AddRAM
+        BIC     r5, r0, #&FC000000 ; Clear high bits (Iterate_RAM doesn't want them)
+        BIC     r6, r1, #&FC000000
+        BIC     r7, r2, #&FC000000
+        BIC     r8, r3, #&FC000000
+        DebugTX "Relocation complete"
+        ; Drop into FIQ mode to keep SDRAM results safe
+        MSR     CPSR_c, #FIQ32_mode+F32_bit+I32_bit
+        MOV     r13, #0
+        ; Once we find the first page, we'll use it both as stack and as somewhere to store the OS_AddRAM reference
+        ; Iterate through the available RAM
+        Iterate_RAM r5, DRAM0PhysRam, 1, A26
+        Iterate_RAM r6, DRAM1PhysRam, 2, A26
+        Iterate_RAM r7, DRAM2PhysRam, 4, A26
+        ; Back to SVC mode for remaining checks
+        MOV     r5, r13
+        MSR     CPSR_c, #SVC32_mode+F32_bit+I32_bit
+        MOV     r13, r5
+        BIC     r5, r11, #&F8000000
+        BIC     r6, r12, #&F8000000
+        Iterate_RAM r8, DRAM3PhysRam, 8, A26
+        Iterate_RAM r5, SDRAM0PhysRam, 16, A27
+        Iterate_RAM r6, SDRAM1PhysRam, 32, A27
+        ; Use SD0ENDA to store the Kinetic test results, for reading back in HAL_Init
+        ORRS    r5, r5, r6
+        MVNNE   r6, #0
+        MOV     r6, #IOMDPhys
+        STR     r5, [r6, #IOMD_SD0ENDA]
+        ; Handle any small blocks which we postponed registering
+        MOV     r5, r13, LSL #20
+        ADDS    r5, r5, #4<<20
+        BEQ     %FT20
+10
+        Pull    "r0-r2" ; Reference + block details
+        Push    "r0"
+        BL      AddBlock
+        ADDS    r5, r5, #8<<20
+        BNE     %BT10
+20
+        ; Now we can finally detect some VRAM, and then get on with starting the OS
+        B       Initialise_VRAM
+
+
+; Initialise_VRAM
+; Entry: r12 = IOMD
+;        r13 = stack pointer with OS_AddRAM reference
+; Exit:  r0 = VRAM base (0 if none)
+;        r1 = VIDCR setting
+;        r6 = VRAM size (MB)
+Initialise_VRAM ROUT
+        DebugTX "Initialise_VRAM"
+        MOV     r12, #IOMDPhys
+        LDRB    r0, [r12, #IOMD_ID0]
+        LDRB    r1, [r12, #IOMD_ID1]
+        ORR     r0, r0, r1, LSL #8
+        LDR     r1, =IOMD_Original
+        CMP     r0, r1
+        BEQ     Initialise_VRAM_RiscPC
+        B       Initialise_VRAM_A7000
+
+
+; Initialise_VRAM_RiscPC
+; Entry: r12 = IOMD
+;        r13 = stack pointer with OS_AddRAM reference
+; Exit:  r0 = VRAM base (0 if none)
+;        r1 = VIDCR setting
+;        r6 = VRAM size (MB)
+Initialise_VRAM_RiscPC ROUT
+        MOV     r0, #VideoPhysRam                       ; point at VRAM
+
+        MOV     r2, #IOMD_VREFCR_VRAM_256Kx64 :OR: IOMD_VREFCR_REF_16 ; assume 2 banks of VRAM by default
+        STRB    r2, [r12, #IOMD_VREFCR]
+        
+        ADD     r1, r0, #A22                            ; Check for 8M VRAM - for RPCemu
+        BL      DistinctAddresses
+        MOVEQ   r6, #8
+        BEQ     %FT20
+
+        ADD     r1, r0, #A2                             ; test A2
+        BL      DistinctAddresses
+        MOVEQ   r6, #2                                  ; we've got 2M of VRAM
+        BEQ     %FT20
+
+        MOV     r2, #IOMD_VREFCR_VRAM_256Kx32 :OR: IOMD_VREFCR_REF_16
+        STRB    r2, [r12, #IOMD_VREFCR]
+
+        ADD     r1, r0, #A2                             ; check for any VRAM at all
+        BL      DistinctAddresses
+        MOVEQ   r6, #1                                  ; we've got 1M of VRAM
+        MOVNE   r6, #0                                  ; no VRAM
+20
+ [ IgnoreVRAM
+        MOV     r6, #0                                  ; pretend there's no VRAM
+ ]
+        CMP     r6, #1
+        MOVCC   r1, #IOMD_VIDCR_DRAMMode :OR: &10       ; if no VRAM, then turn on DRAM mode, and set increment to &10
+        MOVEQ   r1, #SAMLength/2/256                    ; if 1M VRAM, then use VRAM mode, and set increment for 1/2 SAM
+        MOVHI   r1, #SAMLength/2/256*2                  ; if 2M VRAM, then use VRAM mode, and set increment for 2*1/2 SAM
+        MOVCC   r0, #0                                  ; Clear VRAM base if there is no VRAM
+        CMP     r6, #8
+        MOVEQ   r1, #SAMLength/2/256*3                  ; Fake SAM length for RPCEmu (purely so Video_init can detect that we've got 8MB)        
+        B       Add_VRAM
+
+; Initialise_VRAM_A7000
+; Entry: r12 = IOMD
+;        r13 = stack pointer with OS_AddRAM reference
+; Exit:  r0 = VRAM base (0 if none)
+;        r1 = VIDCR setting
+;        r6 = VRAM size (MB)
+Initialise_VRAM_A7000 ROUT
+        MOV     r6, #0                                  ; No VRAM
+        MOV     r0, #0
+        MOV     r1, #IOMD_VIDCR_DRAMMode :OR: &10       ; Turn on DRAM mode, and set increment to &10
+        B       Add_VRAM
+
+; Add_VRAM
+; Entry: r0 = VRAM base (0 if none)
+;        r1 = VIDCR setting
+;        r6 = VRAM size (MB)
+;        r13 = stack pointer with OS_AddRAM reference
+Add_VRAM ROUT
+      [ Debug
+        Push    "r0-r1"
+        DebugTX "Add_VRAM"
+        LDR     r0, [sp]
+        DebugReg r0
+        DebugTX " = base"
+        LDR     r0, [sp, #4]
+        DebugReg r0
+        DebugTX " = VIDCR"
+        DebugReg r6
+        DebugTX " = size"
+        Pull    "r0-r1"
+      ]
+        ; Tell IOMD about VRAM.
+        MOV     r14, #IOMDPhys
+        STRB    r1, [r14, #IOMD_VIDCR]
+
+        ADRL    R5, HAL_Base + OSROM_HALSize    ; R5 -> RISC OS image
+        LDR     R11, [R5, #OSHdr_Entries]
+        ADD     R11, R11, R5                    ; R11 -> RISC OS entry table
+
+        ; Tell OS about VRAM
+        CMP     R6,#0
+        Pull    "r3",EQ                 ; parameter for OS_Start
+        BEQ     %FT10
+        MOV     R1,R0
+        ADD     R2,R1,R6,LSL #20
+        LDR     R3,=&FFFFFFFF
+        LDR     R0,=4*OSAddRAM_Speed+OSAddRAM_IsVRAM
+        CallOSM OS_AddRAM
+        ADD     R13,R13,#4
+        MOV     R3,R0
+10
+        ; R3 = OS_AddRAM reference number
+        ; R5 = OS header
+        ; R11 = OS entry table
+
+; Check the various reset flags
+
+        MOV     R0, #0
+        MOV     R12, #IOMDPhys
+        LDRB    R1, [R12, #IOCIRQSTAA]
+        ANDS    R1, R1, #por_bit
+        STRNEB  R1, [R12, #IOCIRQCLRA]  ; clear POR if set
+        ORRNE   R0, R0, #OSStartFlag_POR
+
+ [ CheckProtectionLink
+        LDR     R2, =IOMD_MonitorType
+
+; on Issue A's the protection bit is only weakly pulled up,
+; so force it high, then read it back
+
+        LDRB    R1, [R2]
+        ORR     R1, R1, #IOMD_ProtectionLinkBit
+        STRB    R1, [R2]
+        LDRB    R1, [R2]
+        TST     R1, #IOMD_ProtectionLinkBit
+        ORREQ   R0, R0, #OSStartFlag_NoCMOSReset
+ ]
+
+     [ Debug
+        Push    "r0"
+        DebugTX "OS_Start"
+        LDR     r0, [sp]
+        DebugReg r0
+        DebugTX " = flags"
+        DebugReg r3
+        DebugTX " = OS_AddRAM reference"
+        Pull    "r0"
+     ]
+        MOV     R1, R5
+        ADRL    R2, HALdescriptor
+        CallOSM OS_Start
+        
+        END

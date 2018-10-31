@@ -1,0 +1,664 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Regular Expression pattern matching by NFA.
+ *
+ * LDS, 22-Jan-89
+ *
+ * Copyright (C) Acorn Computers Ltd., 1989
+ */
+
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "re.h"
+
+#ifndef NULL
+#  define NULL 0
+#endif
+
+#define  NULL_NODE          0
+#define  CHAR_NODE          1
+#define  NOT                2
+#define  NOT_CHAR_NODE      (NOT + CHAR_NODE)
+#define  SPECIAL_NODE       4
+#define  NOT_SPECIAL        (NOT + SPECIAL_NODE)
+#define  CHAR_SET           8
+#define  OR_NODE           16
+#define  END_NODE          32
+#define  SIGN_BIT          0x80000000
+#define  VISITED_NODE      64
+
+
+#ifdef LIB_DEBUGGING
+static int debugging = 0;
+#include <stdio.h>
+#endif
+
+/*
+ * An NFA is represented in store as this header, followed by a (possibly
+ * empty) array of CharSets (each 32 bytes long) followed by an array of
+ * 4-byte NFA nodes. In fact, the matching algorithm doesn't need to know
+ * the number of nodes - only the number of arcs in the NFA and the index
+ * of the entry node - so we don't retain n_nodes.
+ */
+struct re_nfa {
+    int n_arcs;             /* no of arcs in the NFA - i.e. deque size */
+    int n_charsets;         /* no of charsets in the NFA... */
+    int entry;              /* Node offset to entry node... */
+};
+
+/*
+ * Next and alt_next values - like the entry field of an re_nfa - are
+ * indexes into the array of nodes. All nodes have exactly one successor,
+ * except for OR ndes which have two and the END node which has none.
+ */
+typedef struct node {
+    char type;              /* the node's type */
+    char val;               /* ch val, charset idx */
+    unsigned char next;     /* pointer to next node in NFA */
+    unsigned char alt_next; /* if type == OR_NODE */
+} Node;
+
+#if 0
+/*
+ * Nodes are also treated as unsigned ints with the following access fns
+ */
+#define  type_(n)           ((n) & 255)
+#define  val_(n)            (((n) >> 8) & 255)
+#define  next_(n)           ((n) >> 16)
+#define  alt_next_(n)       ((n) >> 24)
+#else
+#define  type_(n)           ((n).type)
+#define  val_(n)            ((n).val)
+#define  next_(n)           ((n).next)
+#define  alt_next_(n)       ((n).alt_next)
+#endif
+
+typedef struct re_handle {  /* Used while building an NFA */
+    int n_nodes;            /* no of nodes in the NFA */
+    int n_ors;              /* of which this many OR nodes */
+    int n_charsets;         /* and this many CharSets... */
+    NFA *nfa;               /* during pass-2, if pass-1 is OK, else NULL */
+    Node *space;            /* during pass-2, points to nfa's node array */
+    Node *free;             /* during pass-2, points to next free node */
+    Node *orend;            /* end of last OR-branch */
+    unsigned begin;         /* offset of start of current sub-R.E. */
+    unsigned bra;           /* offset of last sub-R.E. opening bracket */
+    unsigned last;          /* ... start of last R.E. (for modification...) */
+    unsigned pass;          /* pass-1 or pass-2... */
+    unsigned modifier;      /* index of node after last modifier node... */
+};
+
+static Node *start_or;
+
+extern void re_begin1(REHandle *hh)
+{
+/*
+ * Initialise the REHandle for the information gathering pass.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  h->n_nodes = 1;                 /* 1 for the END node */
+  h->n_ors = 0;
+  h->n_charsets = 0;
+  h->nfa = NULL;
+  h->pass = 1;
+  h->modifier = 0;
+}
+
+extern void re_begin2(REHandle *hh)
+{
+/*
+ * Initialise the REHandle for the construction phase, allocating store
+ * to hold the NFA's compact representation.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  NFA *nfa;
+  int sz;
+/*
+ * If n_arcs > 254 there is a constraint violation, so we just
+ * repeat pass-1 and return NULL via re_end().
+ */
+  if ((h->n_nodes + h->n_ors) <= 254)
+  {
+    sz = sizeof(NFA) + sizeof(CharSet)*h->n_charsets + sizeof(Node)*h->n_nodes;
+    nfa = (NFA *) malloc(sz);
+    memset(nfa, 0, sz);
+    nfa->n_arcs = h->n_nodes + h->n_ors;
+    nfa->n_charsets = 0;
+    h->nfa = nfa;
+    h->space = h->free = (Node *)((char *)nfa + sizeof(NFA) +
+                                                sizeof(CharSet)*h->n_charsets);
+    h->orend = NULL;
+    h->begin = 0;
+    h->bra   = 255;    /* cunning choice... +1 == 0 mod 256... */
+    h->pass  = 2;
+    h->modifier = -1;  /* an impossible value... */
+  }
+}
+
+static void re_close_or(struct re_handle *h)
+{
+/*
+ * Close the currently open OR structure - if there is one.
+ * This requires back-patching the node.next values of the nodes at the ends
+ * of each arm of the OR structure so they point just past the entire OR.
+ * These nodes are chained together via their next fields, with the head of
+ * the chain - the end of the penultimate branch of the OR - identified by
+ * h->orend.
+ */
+  Node *n = h->orend;
+  if (n != NULL)
+  {
+    h->begin = (n - h->space) + 1;
+    while (n != NULL)
+    { int prev = n->next;
+      n->next = h->free - h->space;        /* just past the whole OR... */
+      n = (prev ? h->space + prev : NULL);
+    }
+    h->orend = NULL;
+  }
+}
+
+static int follow_possible_loop(char *base, unsigned char n, int next_link)
+{
+  Node *node = (Node *) (base) + n;
+  int found = 0;
+  if (node == start_or) {                 /* found a loop */
+    start_or->type = NULL_NODE;
+    return 2;                             /* signal loop found to parent proc */
+  } else if (node->type & VISITED_NODE) { /* been here before */
+    return 0;                             /* no loop, will be one later */
+  } else if (node->type == NULL_NODE) {   /* keep going */
+    node->type |= VISITED_NODE;
+    found = follow_possible_loop(base, node->next, next_link);
+    node->type &= ~VISITED_NODE;
+    return found;
+  } else if (node->type == OR_NODE) {     /* try each branch for a loop */
+    node->type |= VISITED_NODE;
+    found = follow_possible_loop(base, node->next, next_link);
+    if (found) {
+      node->type &= ~VISITED_NODE;
+      if (found > 1) {                    /* first OR in loop before start_or */
+        if (next_link)                    /* start_or->next is loop path */
+          node->next = start_or->alt_next;
+        else                              /* start_or->alt_next is loop path */
+          node->next = start_or->next;
+      }
+      return 1;
+    }
+    found = follow_possible_loop(base, node->alt_next, next_link);
+    node->type &= ~VISITED_NODE;
+    if (found) {
+      if (found > 1) {                    /* first OR in loop before start_or */
+        if (next_link)                    /* start_or->next is loop path */
+          node->alt_next = start_or->alt_next;
+        else                              /* start_or->alt_next is loop path */
+          node->alt_next = start_or->next;
+      }
+      return 1;
+    }
+  }
+  return 0;                               /* no loop */
+}
+
+static void remove_or_loops(NFA *nfa)
+{
+  int found_loop;
+  int posn;
+  char *base = (char *) nfa + (sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets);
+  do {
+    posn = 0; found_loop = 0;
+    for (;;)
+    { Node *n = (Node *)(base) + posn;
+      if (n->type == END_NODE) break;
+      if (n->type == OR_NODE) {
+        start_or = n;
+        n->type |= VISITED_NODE;
+        found_loop = follow_possible_loop(base, n->next, 1);
+        if (found_loop) break;
+        found_loop = follow_possible_loop(base, n->alt_next, 0);
+        if (found_loop) {
+          /* n is now a NULL_NODE so the link should be via next not alt_next */
+          n->next = n->alt_next;
+          break;
+        }
+        n->type &= ~VISITED_NODE;
+      }
+      ++posn;
+    }
+    /*
+     * Every time a loop is found, the nfa should be re-traversed from the start
+     * in case the structure has changed for something that was ok earlier.
+     */
+  } while (found_loop);
+}
+
+extern NFA *re_end(REHandle *hh)
+{
+  struct re_handle *h = (struct re_handle *) hh;
+  Node *n;
+  NFA *nfa;
+
+  re_close_or(h);                          /* just in case... */
+  n = h->free;                             /* add the END node... */
+  n->type = END_NODE;
+  nfa = h->nfa;                            /* pick up the NFA header... */
+  if (nfa) {                               /* and enter at the start of */
+    nfa->entry = h->begin;                 /* the first sub-R.E... */
+#ifdef LIB_DEBUGGING
+  if (debugging) {
+    fprintf(stderr, "NFA before any looping NULLS/ORS removed\n");
+    print_nfa(nfa);
+  }
+#endif
+    remove_or_loops(nfa);                  /* remove looping ors/nulls */
+  }
+  return nfa;
+}
+
+extern void re_bra(REHandle *hh)
+{
+/*
+ * Opening a bracket to introduce a sub-R.E. costs a NULL-node.
+ * This is a hook on which to hang data about 'enclosing' sub-R.E.s.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->n_nodes += 1;
+  }
+  else
+  { Node *n = h->free++;
+    n->type = NULL_NODE;
+    n->alt_next = h->bra;          /* point back to previous bra - if any */
+    n->next = h->begin = (h->bra = n - h->space) + 1;
+  }
+}
+
+extern void re_ket(REHandle *hh)
+{
+  struct re_handle *h = (struct re_handle *) hh;
+/*
+ * Close a sub-R.E.
+ * There may be no open OR constructs within a sub-R.E.
+ * After this call, the start of the last sub-R.E. (for modification
+ * purposes) is the NULL node corresponding to the bra being ket-ed.
+ * The start of the enclosing sub-R.E. (if any) is back-chained via the
+ * alt_next field of this bra node and is restored to h->bra. The beginning
+ * of the enclosing sub-R.E. is, of course, the node after the enclosing bra
+ * (if any) - henced the cunning choice of 255 as initial value for h->bra...
+ */
+  if (h->pass != 1)
+  { Node *bra = h->space + h->bra;
+    int prev_bra;
+    re_close_or(h);
+    prev_bra = bra->alt_next;
+    h->last  = h->bra;
+    h->bra   = prev_bra;
+    bra->next= h->begin;
+    h->begin = (prev_bra + 1) & 255;
+  }
+}
+
+extern void re_or(REHandle *hh)
+{
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  { /*
+     * If this OR node immediately follows a modified node then we must
+     * insert a NULL node. Otherwise an OR costs a node and 2 arcs.
+     */
+    if (h->modifier == h->n_nodes) h->n_nodes += 1;
+    h->n_nodes += 1;
+    h->n_ors += 1;
+  }
+  else
+  { Node *n;
+    if (h->modifier == (h->free - h->space))
+    { /* insert a required NULL node */
+      n = h->free++;
+      n->type = NULL_NODE;
+      n->next = h->free - h->space;
+    }
+    n = h->orend;
+    h->orend= h->free - 1;
+    if (n != NULL)
+    {
+      /*
+       * Make the new end of OR arm point at the previous end of OR arm
+       * and set the beginning of the current sub-R.E. to the start of that
+       * arm of the OR construct (make OR right associative?).
+       */
+      h->begin = (h->orend->next = n - h->space) + 1;
+    }
+    else h->orend->next = 0;
+    n = h->free++;
+    n->type = OR_NODE;
+    /*
+     * The next field of the OR node points to the start of its left branch.
+     * The alt_next field points to the start of the sub-R.E. about to be
+     * processed. Because modification (by *, ?, +) binds more tightly than OR,
+     * h->last is also set to point to the next free node (the whole OR cannot
+     * be modified unless it is bracketed).
+     */
+    n->next = h->begin;
+    n->alt_next = h->begin = h->last = h->free - h->space;
+  }
+}
+
+extern void re_modify(REHandle *hh, int modifier)
+{
+/*
+ * This procedure is best understood in pictures (so go draw some).
+ * In the cases of closure (*) and optionality (?), pre-modification
+ * is used. That is, an OR mode is made to precede the sub-R.E. being
+ * modified. This can always be done because the sub-R.E. is either the
+ * preceding simple node (which is swapped with the following free node)
+ * or is a bracketed expression (the NULL node of which is swapped with
+ * the following free node). In both cases, the alt_next field of the OR
+ * becomes the next free node after that. In the case of closure, the next
+ * field of the end of the sub-R.E. (prior to this call, the node immediately
+ * before h->free) is made to point back to the OR node.
+ * In the case of 1-closure, the OR node simply follows the sub-R.E. being
+ * modified and its next filed points to the beginning of that sub-R.E.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->modifier = (h->n_nodes += 1);   /* modification costs an OR node... */
+    h->n_ors += 1;                     /* and a NULL node if followed by OR */
+  }
+  else
+  {
+    Node *l = h->space + h->last;
+    Node *n = h->free++;
+    if (modifier != '+')
+    {
+      *n = *l;
+      n = l;
+      l = h->free - 1;
+      l->next = ((modifier == '?') ? h->free : n) - h->space;
+    }
+    else
+    {
+      n->next = h->last;
+    }
+    n->type = OR_NODE;
+    n->alt_next = h->modifier = h->free - h->space;
+  }
+}
+
+extern void re_char(REHandle *hh, int ch)
+{
+/*
+ * Add a node capable of matching a character or one of the 'special',
+ * builtin character classes.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->n_nodes += 1;
+  }
+  else
+  { Node *n = h->free++;
+    h->last = n - h->space;
+    n->next = h->free - h->space;
+    if (ch > (255+RE_NOT))
+    {
+      n->type = SPECIAL_NODE;
+      /* ANY, Start Of Buffer and End Of Buffer can't be negated... */
+      if (ch == RE_ANY || ch == RE_SOB || ch == RE_EOB) ch &= ~RE_NOT;
+      ch &= (255+RE_NOT);
+    }
+    else
+    {
+      n->type = CHAR_NODE;
+    }
+    if (ch & RE_NOT) n->type += NOT;
+    n->val = ch;
+  }
+}
+
+extern void re_charset(REHandle *hh, CharSet *charset)
+{
+/*
+ * Add a node capable of matching a custom-built class of characters.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->n_nodes += 1;
+    h->n_charsets += 1;
+  }
+  else
+  { Node  *n = h->free++;
+    NFA *nfa = h->nfa;
+    char *cs = (char *)nfa + sizeof (NFA) + sizeof(CharSet)*nfa->n_charsets;
+    h->last = n - h->space;
+    n->type = CHAR_SET;
+    n->val  = nfa->n_charsets++;
+    n->next = h->free - h->space;
+    memcpy(cs, charset, sizeof(CharSet));
+  }
+}
+
+extern void re_head(NFA *nfa, char *buf, int buflen)
+{
+  Node *nodes, *n;
+  nodes = (Node *)((char *)nfa +
+                   sizeof(NFA) + sizeof(CharSet)*nfa->n_charsets);
+  n = nodes + nfa->entry;
+  while ((n->type == CHAR_NODE) && (buflen > 1))
+  {
+    *buf++ = n->val;
+    n = nodes + n->next;
+    --buflen;
+  }
+  *buf = 0;
+}
+
+/*
+ * To Understand the following, read the relevant chapter of
+ * Robert Sedgewick's masterpiece entitled "Algorithms".
+ * (But beware: if you read the first edition, the code he gives
+ *  is wrong! This is corrected in the second edition. Because
+ *  there are 2 editions I don't quote page or chapter numbers.)
+ */
+
+#define  DQ_SIZE        256
+#define  SCAN           255    /* advance one character in this state */
+/* now define the deque operations */
+#define  rm_hd_()       (head = (head + 1) & (DQ_SIZE-1))
+#define  add_hd_(x)     (head = (head - 1) & (DQ_SIZE-1), dq[head] = (x))
+#define  add_tl_(x)     (tail = (tail + 1) & (DQ_SIZE-1), dq[tail] = (x))
+
+extern int re_match(char *buf, int len, NFA *nfa, int scanning)
+{
+  int j, p;
+  unsigned head, tail, dqh;
+  Node *nodes;
+  unsigned char dq[DQ_SIZE];
+
+  nodes = (Node *)((char *)nfa +
+                   sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets);
+  j = 0;
+  do
+  {
+    head = 0;  tail = 1;  dq[0] = nfa->entry;  dq[1] = SCAN;
+    p = j;
+    do
+    {
+      dqh = dq[head];  rm_hd_();
+      if (dqh == SCAN)
+      {
+        ++p;  add_tl_(SCAN);  j &= ~SIGN_BIT;  /* turn off exact match */
+      }
+      else
+      { Node n; n = nodes[dqh];
+        if (type_(n) & (CHAR_NODE + SPECIAL_NODE + CHAR_SET))
+        { int ch;
+          if (p >= len) continue;
+          ch = buf[p];
+          if (type_(n) & CHAR_NODE)
+          {
+            if ((ch == val_(n) && (type_(n) & NOT) != 0) ||
+                (ch != val_(n) && (type_(n) & NOT) == 0)) continue;
+          }
+          else if (type_(n) & SPECIAL_NODE)
+          { int match;
+            switch (val_(n))
+            {
+case  RE_ANY-512:      match = 1;            break;
+case  RE_SOB-512:      if (p == 0) {match = 1;  --p;} else match = 0;
+                                             break;
+case  RE_EOB-512:      match = (p == (len-1));   break;
+case  RE_ALPHA-512:    match = isalpha(ch);  break;
+case  RE_ALPHANUM-512: match = isalnum(ch);  break;
+case  RE_DIGIT-512:    match = isdigit(ch);  break;
+case  RE_XDIGIT-512:   match = isxdigit(ch); break;
+case  RE_UPPER-512:    match = isupper(ch);  break;
+case  RE_LOWER-512:    match = islower(ch);  break;
+case  RE_SPACE-512:    match = isspace(ch);  break;
+case  RE_CNTRL-512:    match = iscntrl(ch);  break;
+case  RE_GRAPHIC-512:  match = isgraph(ch);  break;
+case  RE_PRINT-512:    match = isprint(ch);  break;
+case  RE_PUNCT-512:    match = ispunct(ch);  break;
+default:               match = 0;
+            }
+            if (type_(n) & NOT) match = !match;
+            if (!match) continue;
+          }
+          else /* CHAR_SET */
+          { CharSet *s = (CharSet *)((char *) nfa +
+                         sizeof(NFA)) + val_(n);
+            if (((*s)[ch >> 5] & (1L << (int)(ch & 31))) == 0) continue;
+          }
+          /* matched a character... */
+          add_tl_(next_(n));
+        }
+        else if (type_(n) == NULL_NODE)
+        {
+          add_hd_(next_(n));
+        }
+        else if (type_(n) == OR_NODE)
+        {
+          if ((type_(nodes[next_(n)]) == OR_NODE) || (type_(nodes[next_(n)]) == NULL_NODE)) {
+            add_hd_(next_(n));
+            add_hd_(alt_next_(n));
+          } else {
+            add_hd_(alt_next_(n));
+            add_hd_(next_(n));
+          }
+        }
+        else if (type_(n) == END_NODE)
+        {
+           if (scanning) return j;
+           j |= SIGN_BIT;            /* try for exact match... */
+        }
+      }
+    } while (head != tail);
+
+    if (!scanning)
+    {
+      /* LH.
+       * p is incremented if a complete match was made but:
+       * I think j & SIGN_BIT means 'the nfa ran out of state (ENDNODE reached)
+       * and so a match was found'. It seems that it does not matter that the
+       * end of the input string was not also reached. So I have added the
+       * extra test that the end of input string was reached as well. It seems
+       * to work, but I don't understand all that is happening. Not enough time.
+       */
+#ifdef LIB_DEBUGGING
+  if (debugging) {
+    if (j & SIGN_BIT) {
+      if (p == len) fprintf(stderr, "'%s' matches the nfa completely\n", buf);
+      else fprintf(stderr, "end of nfa reached at character %d in '%s'\n", p+1, buf);
+    } else
+      fprintf(stderr, "end of nfa not reached, mismatch at character %d in '%s'\n", p+1, buf);
+  }
+#endif
+      if ((j & SIGN_BIT) && (p == len)) ++p;
+      return p;
+    }
+
+    ++j;
+  } while (j < len);
+  return -1;
+}
+
+#ifdef LIB_DEBUGGING
+
+extern void print_nfa(NFA *nfa)
+{
+  int posn;
+  char *base;
+  if (debugging) {
+    posn = sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets;
+    fprintf(stderr, "n_arcs = %d, entry = %d, NFA at %d\n",
+           nfa->n_arcs, nfa->entry, posn);
+    base = (char *) nfa + posn;
+    posn = 0;
+    for (;;)
+    { Node *n = (Node *)(base) + posn;
+      fprintf(stderr, "%d: ", posn);
+      switch (n->type)
+      {
+case NULL_NODE:
+        fprintf(stderr, "NULL");
+        break;
+case CHAR_NODE:
+        fprintf(stderr, "CHAR '%c'", n->val);
+        break;
+case NOT_CHAR_NODE:
+        fprintf(stderr, "NOT CHAR '%c'", n->val);
+        break;
+case CHAR_SET:
+        fprintf(stderr, "CHARSET[%u]", n->val);
+        break;
+case SPECIAL_NODE:
+        fprintf(stderr, "SPECIAL[%u]", n->val);
+        break;
+case NOT_SPECIAL:
+        fprintf(stderr, "NOT SPECIAL[%u]", n->val);
+        break;
+case OR_NODE:
+        fprintf(stderr, "OR, alt_next = %u", n->alt_next);
+        break;
+case END_NODE:
+        fprintf(stderr, "END\n");
+        return;
+        break;
+default:
+        fprintf(stderr, "Unrecognised node\n");
+      }
+      fprintf(stderr, ", next = %u\n", n->next);
+      if (n->type == CHAR_SET)
+      { CharSet *cs = (CharSet *) ((char *)nfa + sizeof(NFA)) + n->val;
+        int j;
+        for (j = 0;  j < 8;  ++j) fprintf(stderr, "|%.8lx", (*cs)[j]);
+        fprintf(stderr, "|\n");
+      }
+      ++posn;
+    }
+  }
+}
+
+extern void re_debug(int level)
+{
+  debugging = level;
+}
+
+#endif

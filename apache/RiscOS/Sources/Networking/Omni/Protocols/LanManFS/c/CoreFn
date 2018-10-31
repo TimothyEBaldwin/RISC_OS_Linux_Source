@@ -1,0 +1,989 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*   C.CoreFn -- C core functions for new filing system
+*
+*
+*   28-02-94 INH Original, derived from FSinC
+*   1997.04.21 INH  Don't pass time of 0 to SMB_Close, fixes W95 bug
+*
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "stdtypes.h"
+
+#include "LanMan.h"
+#include "Params.h"
+#include "CoreFn.h"
+#include "Xlate.h"
+#include "Attr.h"
+#include "SMB.h"
+#include "Omni.h"
+#include "Transact.h"
+#include "NameCache.h"
+
+
+#define NAMEBUF_LEN (2*DOS_NAME_LEN)
+#define name_R(x) ((char *)R[x])
+
+static char DOSnamebuf[NAMEBUF_LEN];
+static err_t FileGetAttribs ( char *filename, DOS_ATTRIBS *pda,
+    RISCOS_ATTRIBS *pra );
+
+/* Read-directory subroutines ======================================= */
+static int   RD_Reason;
+static char *RD_BufPtr;
+static int   RD_BufLen;
+static int   RD_ReqCount;  /* No. of entries required */
+static int   RD_CurCount;  /* No. of entries given */
+
+/* Write one directory entry to the supplied buffer
+ * The directory entries can take one of three forms, taking up
+ * a variable degree of space
+ */
+static char *WriteEntry ( int reason, char *ptr, BYTE *entry, int format )
+{
+  static char namebuf[DOS_NAME_LEN];
+  int name_len;
+  int rec_len;
+  DOS_ATTRIBS    da;
+  RISCOS_ATTRIBS ra;
+  int *IntPtr;
+
+#ifndef LONGNAMES
+  (void) format;
+#else
+  if (format == 1) {
+    Xlt_ExpandSearchEntryX2(entry, DOSnamebuf, namebuf, &da, &ra);
+  }
+  else
+#endif
+    Xlt_ExpandSearchEntry(entry, DOSnamebuf, namebuf, &da, &ra);
+
+  name_len = strlen(namebuf) + 1;
+  debug1("WriteEntry (%s)\n", namebuf);
+  
+  switch ( reason )
+  {
+    case FSEntry_Func_Reason_ReadDirectoryEntries:
+      rec_len = name_len;
+      if (rec_len <= RD_BufLen) {
+        memcpy(ptr, namebuf, name_len);
+      }
+      break;
+
+    case FSEntry_Func_Reason_ReadDirectoriesAndInformation:
+      rec_len = (20+name_len+3) & ~3;  /* Round up to whole word */
+      if (rec_len <= RD_BufLen) {
+        IntPtr = (int *)ptr;
+        IntPtr[0] = ra.loadaddr;
+        IntPtr[1] = ra.execaddr;
+        IntPtr[2] = da.length;
+        IntPtr[3] = ra.flags;
+        IntPtr[4] = (da.attr & ATTR_DIR) ? 2 : 1;
+        memcpy(ptr+20, namebuf, name_len);
+      }
+      break;
+
+    case FSEntry_Func_Reason_ReadDirectoryEntriesAndInformation:
+      rec_len = (29+name_len)+3 & ~3; /* Round up to whole word */
+      if (rec_len <= RD_BufLen) {
+        IntPtr = (int *)ptr;
+        IntPtr[0] = ra.loadaddr;
+        IntPtr[1] = ra.execaddr;
+        IntPtr[2] = da.length;
+        IntPtr[3] = ra.flags;
+        IntPtr[4] = (da.attr & ATTR_DIR) ? 2 : 1;
+        IntPtr[5] = 0;
+        IntPtr[6] = ra.execaddr;
+        ptr[28] = ra.loadaddr & 0xFF;
+        memcpy(ptr+29, namebuf, name_len);
+      }
+      break;
+
+    default:      /* Shouldn't get here */
+      return ptr;
+  }
+
+  if (rec_len > RD_BufLen) {
+    debug2("WriteEntry detects a buffer overflow (%d > %d)\n",
+            rec_len, RD_BufLen);
+    RD_BufLen = -1;
+    return NULL;
+  }
+
+  RD_BufLen -= rec_len;
+  return (ptr+rec_len);
+}
+
+/* ------------------------------ */
+
+static err_t Dir_CallbackFn ( BYTE *entry, int format, bool *taken, void *pw )
+{
+  (void) pw;
+
+  *taken = false;
+
+#ifdef LONGNAMES
+  /* Insert check for . and .. here */
+  if (format == 1) {
+    if (entry[23] == '.') {
+      if (entry[22] == 1 || entry[24] == '\0') {
+        return OK;
+      }
+      if (entry[24] == '.' && (entry[22] == 2 || entry[25] == '\0')) {
+        return OK;
+      }
+    }
+  }
+  else
+#endif
+  if ( entry[9] == '.' ) {
+    /* Ignore '.' and '..' directories */
+    if (entry[10] == '.' && entry[11] == '\0' || entry[10] == '\0') {
+      return OK;
+    }
+  }
+
+  if ( RD_ReqCount > 0 ) {
+    char *w_result = WriteEntry ( RD_Reason, RD_BufPtr, entry, format );
+    if (w_result != NULL) {
+      RD_BufPtr = w_result;
+      RD_ReqCount--;
+      RD_CurCount++;
+      *taken = true;
+    }
+    else {
+      debug0("Oh dear - client ran out of buffer space!\n");
+      return EOUTOFMEM;
+    }
+  }
+
+  return OK;
+}
+
+/* ----------------- */
+
+/* Called in 2 situations
+ *   - starting a search from scratch (dir_offset = 0)
+ *   - continuing a search (dir_offset != 0)
+ * The underlying SMB routine must track whether it has been called
+ * recursively or from within Xlt_NameROtoDOSX2_sub and deal with
+ * abandoning searches appropriately.
+ */
+static err_t Func_ReadDir ( int reason, char *path_name, char *buffer,
+       int n_names, int dir_offset, int buflen, int *pOutNread,
+       int *pOutNextOffset )
+{
+  static Transact_SearchContext con;
+  int    one_name;
+  err_t  res;
+
+  debug2 ( "\n\n>> ReadDir reason %d path %s", reason, path_name );
+  debug2 ( " offset %d count %d", dir_offset, n_names );
+  debug1 ( " buflen %d\n", buflen);
+
+  /* Make sure the number of names we read will fit into buffer */
+  one_name = (reason == FSEntry_Func_Reason_ReadDirectoryEntries) ? 16 :
+             (reason == FSEntry_Func_Reason_ReadDirectoriesAndInformation) ? 36 : 44;
+
+#ifdef LONGNAMES
+  /* Of course, the above calculation assumes that the filename is at most
+   * 16 characters long (8 + '.' + 3 + \0 + 3 bytes pad).  This is
+   * useless for long filename shares and so the n_names parameter is
+   * accepted in place, and the buffer writer updated to be able to
+   * avoid and flag buffer overflow.  In the worst case, this may mean
+   * multiple searches are required, however, as long as the directory
+   * reading function SMB_ReadDirEntriesX2 is intelligent, it can remember
+   * the resume keys and last successful filename data for the search and
+   * attempt to keep our caller in step with the remote server.
+   *
+   * The limit is still performed as it is still useful for avoiding
+   * unnecessary buffer overruns - especially when there are not very
+   * many files with long names or even no files with long names.
+   */
+#endif
+  if ( (n_names * one_name) > buflen ) n_names = buflen/one_name;
+  if ( n_names <= 0 ) return EBADPARAM;
+  debug1( "Adjusted count=%d\n", n_names );
+  RD_Reason = reason;
+  RD_BufPtr = buffer;
+  RD_BufLen = buflen;
+  RD_CurCount = 0;
+  RD_ReqCount = n_names;
+
+  /* Convert path adding wildcard search spec */
+  res = Xlt_ConvertPath( path_name, DOSnamebuf );
+  if ( res != OK ) return res;
+  if ( DOSnamebuf[strlen( DOSnamebuf ) - 1] != '\\' )
+    strcat( DOSnamebuf, "\\");
+#ifdef LONGNAMES
+  strcat( DOSnamebuf, "*" );
+#else
+  strcat( DOSnamebuf, "????????.???" );
+#endif
+
+  /* Start a new search? */
+  if (dir_offset == 0)
+  {
+    debug2( ">> Start search (%s) count %d\n", DOSnamebuf, RD_ReqCount);
+    con.resume_key = 0;
+    res = SMB_ReadDirEntries ( DOSnamebuf, RD_ReqCount,
+                               Dir_CallbackFn, NULL, &con );
+  }
+  else {
+    con.resume_key = dir_offset;
+    res = OK;
+  }
+
+  /* Continue search, if needs be */
+  while ( res == OK  &&     /* More names available */
+          RD_ReqCount > 0 ) /* More names wanted */
+  {
+    debug3( ">> Continue search (%s) count %d resume %08x\n", DOSnamebuf, RD_ReqCount, con.resume_key);
+    res = SMB_ReadDirEntries ( DOSnamebuf, RD_ReqCount,
+                               Dir_CallbackFn, NULL, &con );
+  }
+
+  /* Process results */
+  if (res == EOUTOFMEM && RD_BufLen == -1) {
+    /* Special result when client buffer space exhausted */
+    debug0("Client buffer space was exhausted\n");
+    res = OK;
+  }
+  debug2("End search, res=%d RD_ReqCount=%d\n", res, RD_ReqCount);
+
+  if ( res != OK ) {  /* Ran out of files, or error */
+    *pOutNextOffset = -1;
+  }
+  else
+    *pOutNextOffset = con.resume_key;
+
+  *pOutNread = RD_CurCount;
+  if ( res == ENOMOREFILES )
+    return OK;
+
+  return res;
+}
+
+/* Func ============================================================= */
+
+_kernel_oserror *fsentry_func ( int *R )
+{
+  err_t err;
+
+  debug1("FS_func(%d)", R[0] );
+
+  switch ( R[0] )
+  {
+    case FSEntry_Func_Reason_SetCurrentDirectory:
+      /* Although we don't maintain a current directory,
+         we use this to keep track of the current drive */
+
+      err = Xlt_ConvertPath( name_R(1), DOSnamebuf);
+      if ( err == OK ) Xlt_SetDefaultDrv ( DOSnamebuf );
+      break;
+
+    case FSEntry_Func_Reason_SetLibraryDirectory:
+    case FSEntry_Func_Reason_CatalogueDirectory:
+    case FSEntry_Func_Reason_ExamineCurrentDirectory:
+    case FSEntry_Func_Reason_CatalogueLibraryDirectory:
+    case FSEntry_Func_Reason_ExamineLibraryDirectory:
+    case FSEntry_Func_Reason_ExamineObjects:
+    case FSEntry_Func_Reason_ReadCurrentDirectoryNameAndPrivilegeByte:
+    case FSEntry_Func_Reason_ReadLibraryDirectoryNameAndPrivilegeByte:
+    case FSEntry_Func_Reason_SetDirectoryContexts:
+    case FSEntry_Func_Reason_AccessObjects:
+    case FSEntry_Func_Reason_OutputFullInformationOnObjects:
+      err = ENORISCOS2;
+      break;
+
+    case FSEntry_Func_Reason_RenameObject:
+      err = Xlt_ConvertPath( name_R(1), DOSnamebuf);
+      if ( err == OK ) err = Xlt_ConvertPath( name_R(2), DOSnamebuf+DOS_NAME_LEN );
+#ifdef LONGNAMES
+      {
+        DOS_ATTRIBS    da;
+        RISCOS_ATTRIBS ra;
+
+        err = FileGetAttribs ( DOSnamebuf, &da, &ra );
+        if ( err == EFILENOTFOUND || err == EPATHNOTFOUND )
+        {
+          err = OK;
+        }
+
+        if ( err == OK )
+        {
+          /* Trim any RO extension and append the ones from the source instead */
+          Xlt_RemoveROType ( DOSnamebuf + DOS_NAME_LEN );
+          if ((da.attr & ATTR_DIR) == 0)
+          {
+            Xlt_AddROType ( DOSnamebuf + DOS_NAME_LEN, ra.loadaddr );
+          }
+        }
+      }
+#endif
+      if ( err == OK )
+      {
+        err = SMB_Rename ( DOSnamebuf, DOSnamebuf+DOS_NAME_LEN );
+      }
+
+#ifdef LONGNAMES
+      if (SMB_IsLongNameFS(DOSnamebuf + DOS_NAME_LEN))
+      {
+         if ( err == EBADRENAME )
+         {
+           R[1] = 1;
+           err = OK;
+         }
+         else
+         {
+           R[1] = 0;
+         }
+         break;
+      }
+      /* Don't bother with any of this rubbish for long filename discs */
+#endif
+
+      if ( err == OK )  /* If rename worked, swap attribs */
+      {
+        RISCOS_ATTRIBS ra;
+        ra.loadaddr = 0xFFF00000;
+        ra.execaddr = 0;
+        ra.flags = ROA_READ | ROA_WRITE;   
+        if ( Attr_GetInfo ( DOSnamebuf, NULL, &ra ) == OK )
+        {
+          Attr_DeleteInfo ( DOSnamebuf );
+          Attr_SetInfo ( DOSnamebuf + DOS_NAME_LEN, &ra );
+        }
+        R[1] = 0;
+      }
+      else if ( err == EBADRENAME )
+      {
+        R[1] = 1; /* Indicate failure */
+        err = OK;
+      }
+      break;
+
+    case FSEntry_Func_Reason_SetFilingSystemOptions:
+    case FSEntry_Func_Reason_ReadNameAndBootOptionOfDisc:
+      err = ENOTPRESENT;
+      break;
+
+    /* SNB 980225.  Must identify and boot on request from OS! */
+    case FSEntry_Func_Reason_PrintStartUpBanner:
+      (void) _swix(OS_Write0, _IN(0), "Acorn LanManFS\n\r");
+      err = OK;
+      break;
+
+    case FSEntry_Func_Reason_BootFilingSystem:
+      LM_Boot();
+      err = OK;
+      break;
+
+    case FSEntry_Func_Reason_ShutDown:
+      /* On shutdown, disconnect all drives */
+      err = SMB_Shutdown();
+      break;
+
+    case FSEntry_Func_Reason_ReadDirectoryEntries:
+    case FSEntry_Func_Reason_ReadDirectoriesAndInformation:
+    case FSEntry_Func_Reason_ReadDirectoryEntriesAndInformation:
+      err = Func_ReadDir ( R[0], name_R(1), name_R(2),
+               R[3], R[4], R[5], &R[3], &R[4] );
+      break;
+
+    default:
+      err = EBADPARAM;
+      break;
+  }
+
+#ifdef LONGNAMES
+  NameCache_Flush(ncf_FSFUNC_EXIT);
+#endif
+
+  return MsgError(err);
+}
+
+
+/* File  =================================================== */
+
+static err_t FileGetAttribs ( char *filename, DOS_ATTRIBS *pda,
+    RISCOS_ATTRIBS *pra )
+{
+  err_t err;
+
+  debug1("FileGetAttribs(%s) ... \n", filename);
+  err = SMB_GetAttribs ( filename, pda );
+  if ( err == OK )
+  {
+    Xlt_CnvDOStoRO ( pda, pra, CNV_DATETIME | CNV_ATTRIBS );
+    Attr_GetInfo ( filename, NULL, pra );
+  }
+  return err;
+}
+
+/* ------------------- */
+
+_kernel_oserror *fsentry_file( int *R )
+{
+  err_t err;
+  int FH;
+  int tmp;
+  DOS_ATTRIBS    da;
+  RISCOS_ATTRIBS ra;
+  
+  debug1("FS_file(%d)", R[0] );
+
+  err = Xlt_ConvertPath ( name_R(1), DOSnamebuf );
+
+  /* This is a bodge to stop cmd-line 'copies' with wildcards
+     not working! */
+
+  if ( err == ENOWILDCARD  &&
+       (R[0] == FSEntry_File_Reason_ReadCatalogueInformationNoLength ||
+        R[0] == FSEntry_File_Reason_ReadCatalogueInformation )
+     )
+  {
+    R[0] = 0;
+    return MsgError(OK);
+  }
+
+  if ( err != OK )
+    return MsgError(err);
+
+  switch ( R[0] )
+  {
+    case FSEntry_File_Reason_CreateFile:
+    case FSEntry_File_Reason_SaveFile:
+      ra.loadaddr = R[2];
+      ra.execaddr = R[3];
+      ra.flags    = ROA_READ | ROA_WRITE;
+      Xlt_CnvROtoDOS(&ra, &da, CNV_DATETIME | CNV_ATTRIBS );
+#ifdef LONGNAMES
+      strncpy(DOSnamebuf + DOS_NAME_LEN, DOSnamebuf, DOS_NAME_LEN);
+      if (Xlt_AddROType(DOSnamebuf, ra.loadaddr)) {
+        /* We changed the filetype - therefore delete old file */
+        err = SMB_Delete(DOSnamebuf + DOS_NAME_LEN);
+        if (err != OK && err != EFILENOTFOUND) {
+           /* Oh dear - looks likely the create would fail anyway! */
+           break;
+        }
+      }
+#endif
+
+      err = SMB_Create ( DOSnamebuf, &da, &FH );
+      if ( err == OK )
+      {
+        if ( R[0] == FSEntry_File_Reason_SaveFile )
+        {
+          err = SMB_Write ( FH, 0, /* Offset */
+                            R[5]-R[4], /* Len */
+                   (BYTE *)(R[4]),     /* Where */
+                            NULL );
+        }
+        else if ( R[0] == FSEntry_File_Reason_CreateFile )
+        {
+          err = SMB_Truncate ( FH, R[5]-R[4] );
+        }
+        SMB_Close ( FH, &da );
+
+        Attr_SetInfo ( DOSnamebuf, &ra );
+      }
+
+      R[6] = (int) Xlt_GetRISCOSLeafName(name_R(1));
+      break;
+
+    case FSEntry_File_Reason_LoadFile:
+      err = SMB_Open ( MODE_RD, DOSnamebuf, &da, &FH, &tmp );
+
+      if ( err == OK )
+      {
+        err = SMB_Read ( FH, 0, da.length, (BYTE *)(R[2]), NULL );
+        SMB_Close ( FH, &da);
+
+        Xlt_CnvDOStoRO( &da, &ra, CNV_DATETIME | CNV_ATTRIBS );
+        Attr_GetInfo ( DOSnamebuf, NULL, &ra );
+        R[2] = ra.loadaddr;
+        R[3] = ra.execaddr;
+        R[4] = da.length;
+        R[5] = ra.flags;
+      }
+
+      R[6] = (int) Xlt_GetRISCOSLeafName(name_R(1));
+      break;
+
+
+    /* Read/write file attribute calls ------------------- */
+
+    case FSEntry_File_Reason_WriteLoadAddress:
+    case FSEntry_File_Reason_WriteExecutionAddress:
+    case FSEntry_File_Reason_WriteAttributes:
+      /* Get current attributes */
+      err = FileGetAttribs ( DOSnamebuf, &da, &ra );
+      if ( err == EFILENOTFOUND || err == EPATHNOTFOUND )
+      {
+        err = OK;
+        break;
+      }
+
+      if ( R[0] == FSEntry_File_Reason_WriteLoadAddress )
+      {
+        ra.loadaddr = R[2];
+        Xlt_CnvROtoDOS ( &ra, &da, CNV_DATETIME );
+#ifdef LONGNAMES
+      {
+        if (da.attr & ATTR_DIR)
+                ;
+        else {
+          strncpy(DOSnamebuf + DOS_NAME_LEN, DOSnamebuf, DOS_NAME_LEN);
+          if (Xlt_AddROType(DOSnamebuf + DOS_NAME_LEN, ra.loadaddr)) {
+            err = SMB_Rename(DOSnamebuf, DOSnamebuf + DOS_NAME_LEN);
+            if (err != OK) break;
+            strcpy(DOSnamebuf, DOSnamebuf + DOS_NAME_LEN);
+          }
+        }
+      }
+#endif
+      }
+      else if ( R[0] == FSEntry_File_Reason_WriteExecutionAddress )
+      {
+        ra.execaddr = R[3];
+        Xlt_CnvROtoDOS ( &ra, &da, CNV_DATETIME );
+      }
+      else if ( R[0] == FSEntry_File_Reason_WriteAttributes )
+      {
+        ra.flags = R[5];
+        Xlt_CnvROtoDOS ( &ra, &da, CNV_ATTRIBS );
+      }
+
+      Attr_SetInfo ( DOSnamebuf, &ra );
+      err = SMB_SetAttribs ( DOSnamebuf, &da );
+      break;
+
+    case FSEntry_File_Reason_WriteCatalogueInformation:
+      ra.loadaddr = R[2];
+      ra.execaddr = R[3];
+      ra.flags = R[5];
+
+#ifdef LONGNAMES
+      {
+        RISCOS_ATTRIBS test_ra;
+        err = FileGetAttribs ( DOSnamebuf, &da, &test_ra );
+        if (err == OK && (da.attr & ATTR_DIR))
+                ;
+        else {
+          strncpy(DOSnamebuf + DOS_NAME_LEN, DOSnamebuf, DOS_NAME_LEN);
+          if (Xlt_AddROType(DOSnamebuf + DOS_NAME_LEN, ra.loadaddr)) {
+            err = SMB_Rename(DOSnamebuf, DOSnamebuf + DOS_NAME_LEN);
+            if (err != OK) break;
+            strcpy(DOSnamebuf, DOSnamebuf + DOS_NAME_LEN);
+          }
+        }
+      }
+#endif
+
+      Xlt_CnvROtoDOS ( &ra, &da, CNV_ATTRIBS | CNV_DATETIME );
+      Attr_SetInfo ( DOSnamebuf, &ra );
+      err = SMB_SetAttribs ( DOSnamebuf, &da );
+      break;
+
+    case FSEntry_File_Reason_DeleteObject:
+      err = FileGetAttribs ( DOSnamebuf, &da, &ra );
+      if ( err == OK )
+      {
+        R[2] = ra.loadaddr;
+        R[3] = ra.execaddr;
+        R[4] = da.length;
+        R[5] = ra.flags;
+
+        if ( da.attr & ATTR_DIR )
+        {
+          R[0] = 2;
+          Attr_CheckEmptyDir ( DOSnamebuf );
+          err = SMB_RmDir ( DOSnamebuf );
+        }
+        else
+        {
+          R[0] = 1;
+          err = SMB_Delete ( DOSnamebuf );
+        }
+
+        if ( err==OK )
+          Attr_DeleteInfo ( DOSnamebuf );
+      }
+      break;
+
+    case FSEntry_File_Reason_CreateDirectory:
+#ifdef LONGNAMES
+      Xlt_RemoveROType ( DOSnamebuf );
+#endif
+      err = SMB_MkDir ( DOSnamebuf );
+      break;
+
+    /* Read information calls ---------------------------- */
+
+    case FSEntry_File_Reason_ReadCatalogueInformationNoLength:
+    case FSEntry_File_Reason_ReadCatalogueInformation:
+      err = FileGetAttribs ( DOSnamebuf, &da, &ra );
+      if ( err == OK )
+      {
+        if ( da.attr & ATTR_DIR )
+          R[0] = 2;
+        else
+          R[0] = 1;
+
+        R[2] = ra.loadaddr;
+        R[3] = ra.execaddr;
+        R[4] = da.length;
+        R[5] = ra.flags;
+      }
+      else if ( err == EFILENOTFOUND || err == EPATHNOTFOUND )
+      {
+        R[0] = 0;
+        err = OK;
+      }
+      break;
+
+    default:
+      err = EBADPARAM;
+      break;
+  }
+
+#ifdef LONGNAMES
+  NameCache_Flush(ncf_FSFILE_EXIT);
+#endif
+
+  return MsgError(err);
+}
+
+/* Open/Close subroutines --------------------------------------- */
+
+#define MAXFILES 30
+
+static struct FileInfo
+{
+  bool Free;        /* -1 indicates this file not in use */
+  int SMB_FH;       /* File handle for SMB use */
+
+  DOS_ATTRIBS da;
+  int filesw_id;    /* Fileswitch handle for the file */
+
+}
+  FileTbl[MAXFILES];
+
+static int NextHandle;
+
+/* --------------- */
+
+static int NewHandle(void)
+{
+  int i;
+
+  if ( NextHandle >= MAXFILES ) NextHandle = 0;
+
+  if ( FileTbl[NextHandle].Free )
+    return NextHandle++;
+
+  for ( i=0; i<MAXFILES; i++)
+  {
+    if (FileTbl[i].Free)
+    {
+      NextHandle=i+1;
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+
+/* Open  =================================================== */
+
+_kernel_oserror *fsentry_open( int *R )
+{
+  err_t err;
+  int fid;
+  int modes=0;
+  struct FileInfo *pFI;
+  RISCOS_ATTRIBS ra;
+
+  debug1("FS_open(%d)", R[0]);
+
+  /* Convert to DOS name & allocate handle */
+
+  err = Xlt_ConvertPath ( name_R(1), DOSnamebuf );
+
+  if ( err != OK )
+    return MsgError(err);
+
+  fid = NewHandle();
+  if ( fid < 0 )
+    return MsgError(ENOHANDLES);
+
+  pFI = &FileTbl[fid];
+  pFI->filesw_id = R[3];
+
+  switch ( R[0]  )
+  {
+    case FSEntry_Open_Reason_OpenRead:
+      err = SMB_Open ( MODE_RD, DOSnamebuf,
+            &pFI->da, &pFI->SMB_FH, &modes );
+      break;
+
+    case FSEntry_Open_Reason_Update:
+      err = SMB_Open ( MODE_RDWR, DOSnamebuf,
+              &pFI->da, &pFI->SMB_FH, &modes );
+
+      if ( err == ENOACCESS )
+      {
+        err = SMB_Open ( MODE_RD, DOSnamebuf,
+                &pFI->da, &pFI->SMB_FH, &modes );
+      }
+
+      break;
+
+    case FSEntry_Open_Reason_CreateUpdate:
+      ra.execaddr = 0;  /* Not called by RISCOS 3?? */
+      ra.loadaddr = 0;  /* If so, should be the current time */
+      ra.flags  = ROA_READ | ROA_WRITE;
+      Xlt_CnvROtoDOS ( &ra, &pFI->da, CNV_DATETIME | CNV_ATTRIBS );
+      err = SMB_Create ( DOSnamebuf, &pFI->da, &pFI->SMB_FH );
+      pFI->da.length = 0;
+      modes = MODE_RDWR;
+      break;
+
+    default:
+      err = EBADPARAM;
+      break;
+
+  }
+
+  if ( err == OK )
+  {
+    pFI -> Free = false;
+    R[0] = (modes == MODE_RD ) ? OPEN_Readable :
+           (modes == MODE_RDWR ) ? OPEN_Readable | OPEN_Writable :
+           (modes == MODE_WR ) ? OPEN_Writable : 0;
+
+    R[1] = fid+1;
+    R[2] = 512; /* Buffer size - doesn't really matter */
+    R[3] = pFI->da.length;
+    R[4] = (R[3] + 511) & ~511;
+
+  }
+  else
+  {
+    R[1] = 0;
+#ifdef LONGNAMES
+    /* Take a risk to enhance cacheing :-) */
+    NameCache_Flush(ncf_FSOPEN_EXIT);
+#endif
+  }
+  return MsgError(err);
+}
+
+/* GetBytes  =================================================== */
+
+_kernel_oserror *fsentry_getbytes( int *R )
+{
+  int fid = R[1]-1;
+
+  if ( fid < 0 || fid >= MAXFILES || FileTbl[fid].Free )
+    return MsgError(EBADPARAM);
+
+  return MsgError( SMB_Read (FileTbl[fid].SMB_FH,
+                      R[4],      /* Offset */
+                      R[3],      /* Length */
+             (BYTE *)(R[2]),     /* Where */
+                      NULL ) );
+
+}
+
+/* PutBytes  =================================================== */
+
+_kernel_oserror *fsentry_putbytes( int *R )
+{
+  int fid = R[1]-1;
+
+  if ( fid < 0 || fid >= MAXFILES || FileTbl[fid].Free )
+    return MsgError(EBADPARAM);
+
+  return MsgError ( SMB_Write (FileTbl[fid].SMB_FH,
+                      R[4],      /* Offset */
+                      R[3],      /* Length */
+             (BYTE *)(R[2]),     /* Where */
+                      NULL ) );
+}
+
+/* GBPB  =================================================== */
+
+_kernel_oserror *fsentry_gbpb( int *R )
+{
+  (void)R;
+  return MsgError(ENOGBPB);
+}
+
+/* Close  =================================================== */
+
+_kernel_oserror *fsentry_close( int *R )
+{
+  err_t err;
+  RISCOS_ATTRIBS ra;
+
+  int fid = R[1]-1;
+
+  if ( fid < 0 || fid >= MAXFILES || FileTbl[fid].Free )
+    return MsgError(EBADPARAM);
+
+  /* On entry, R2/R3 contain new timestamp for file.
+     This call will be unable to alter the file-type as
+     recorded by Attr_SetInfo: we don't know the file name */
+
+  if ( R[2] != 0 || R[3] != 0 )
+  {
+    /* IH: Windows 95 doesn't recognise a NULL timestamp field. */
+    ra.loadaddr = R[2];
+    ra.execaddr = R[3];
+    Xlt_CnvROtoDOS ( &ra, &FileTbl[fid].da, CNV_DATETIME );
+  }
+
+  err=SMB_Close( FileTbl[fid].SMB_FH, &FileTbl[fid].da);
+  FileTbl[fid].Free = true;
+  return MsgError(err);
+}
+
+/* Args ========================================== */
+
+static err_t WriteZeros ( int FH, uint offset, uint len )
+{
+  uint  tmp;
+  err_t res=OK;
+
+  memset ( DOSnamebuf, 0, NAMEBUF_LEN );
+
+  while ( len > 0 )
+  {
+#if 0
+    tmp = min(NAMEBUF_LEN, len);
+    res = SMB_Write ( FH, offset, tmp, (BYTE *)DOSnamebuf, NULL );
+#else
+    /* SMB_Write uses the write bytes command (v1-spec-02 section 5.22)
+     * which states that any bytes between the previous EOF and the new
+     * one are filled to zero by the server - so don't waste time
+     * sending them over the network. However, very large extends can
+     * end up with a timeout, so the extend is chopped up a bit assuming
+     * the server can write at least 1MB/s to the disc.
+     * SMB_Truncate pends all the zero filling which leads to a timeout
+     * when closing the file, so we just write 1 byte of 0 each jump.
+     */
+    tmp = min(1024 * 1024 * (REPLY_TIMEOUT / 100), len);
+    if ( offset == 0 )
+      res = SMB_Write ( FH, 0, 1, (BYTE *)DOSnamebuf, NULL );
+    else
+      res = SMB_Write ( FH, offset - 1, 1, (BYTE *)DOSnamebuf, NULL );
+#endif
+    if ( res != OK ) break;
+    offset += tmp;
+    len -= tmp;
+  }
+  return res;
+}
+
+/* --------------------- */
+
+_kernel_oserror *fsentry_args( int *R )
+{
+  err_t err=OK;
+  int fid = R[1]-1;
+  uint tmp;
+
+  debug1("FS_args(%d)\n", R[0]);
+
+  if ( fid < 0 || fid >= MAXFILES || FileTbl[fid].Free )
+    return MsgError(EBADPARAM);
+
+  switch( R[0] )
+  {
+    case FSEntry_Args_Reason_ReadSequentialFilePointer:
+    case FSEntry_Args_Reason_WriteSequentialFilePointer:
+    case FSEntry_Args_Reason_ReadFileExtent:
+    case FSEntry_Args_Reason_EOFCheck:
+      err = ENOUNBUFF;
+      break;
+
+    case FSEntry_Args_Reason_WriteFileExtent:
+      err = SMB_Truncate ( FileTbl[fid].SMB_FH, R[2] );
+      break;
+
+    /* We ignore this call - WriteFileExtent is used to truncate */
+
+    case FSEntry_Args_Reason_EnsureFileSize:
+      err = OK;
+      break;
+
+    case FSEntry_Args_Reason_ReadSizeAllocatedToFile:
+      err = SMB_GetLength ( FileTbl[fid].SMB_FH, &tmp );
+      if ( err == OK )
+        R[2] = tmp;
+      break;
+
+    case FSEntry_Args_Reason_FlushFileBuffer:
+      err = SMB_Flush ( FileTbl[fid].SMB_FH );
+      break;
+
+    case FSEntry_Args_Reason_WriteZerosToFile:
+      err = WriteZeros ( FileTbl[fid].SMB_FH,
+                         (uint)R[2], /* Offset */
+                         (uint)R[3]  /* Length */  );
+      break;
+
+    case FSEntry_Args_Reason_ReadFileDateStamp:
+      {
+        /* This call will be unable to correctly get the file type */
+        /* If this is needed, it must be done when the file is opened */
+        RISCOS_ATTRIBS ra;
+        Xlt_CnvDOStoRO ( &FileTbl[fid].da, &ra, CNV_DATETIME );
+
+        R[2] = ra.loadaddr;
+        R[3] = ra.execaddr;
+      }
+      err = OK;
+      break;
+
+    default:
+      err = EBADPARAM;
+      break;
+  }
+
+  return MsgError(err);
+}
+
+/* Init --------------------------------- */
+
+bool FS_Init(void)
+{
+  int i;
+  for ( i=0; i<MAXFILES; i++ )
+    FileTbl[i].Free = true;
+  NextHandle = 0;
+
+  return true;
+}
+

@@ -1,0 +1,2161 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > $.Source.VduTTX
+
+;       Teletext (MODE 7) emulation
+;       ---------------------------
+
+;       Author          Tim Dobson
+;       Started         24-Feb-87
+
+; *****************************************************************************
+
+; Teletext control codes
+
+TTX_AlphaRed     *      &01
+TTX_AlphaGreen   *      &02
+TTX_AlphaYellow  *      &03
+TTX_AlphaBlue    *      &04
+TTX_AlphaMagenta *      &05
+TTX_AlphaCyan    *      &06
+TTX_AlphaWhite   *      &07
+TTX_Flash        *      &08
+TTX_Steady       *      &09
+TTX_EndBox       *      &0A
+TTX_StartBox     *      &0B
+TTX_NormalHeight *      &0C
+TTX_DoubleHeight *      &0D
+
+TTX_GraphRed     *      &11
+TTX_GraphGreen   *      &12
+TTX_GraphYellow  *      &13
+TTX_GraphBlue    *      &14
+TTX_GraphMagenta *      &15
+TTX_GraphCyan    *      &16
+TTX_GraphWhite   *      &17
+TTX_Conceal      *      &18
+TTX_Contiguous   *      &19
+TTX_Separated    *      &1A
+TTX_BlackBackgd  *      &1C
+TTX_NewBackgd    *      &1D
+TTX_HoldGraph    *      &1E
+TTX_RelGraph     *      &1F
+
+TTXGraphContFontA * TTXSoftFonts +0    ; Contiguous graphics font (&20-&3F)
+TTXGraphSepaFontA * TTXSoftFonts +&140 ; Separated graphics font  (&20-&3F)
+TTXGraphContFontB * TTXSoftFonts +&280 ; Contiguous graphics font (&60-&7F)
+TTXGraphSepaFontB * TTXSoftFonts +&3C0 ; Separated graphics font  (&60-&7F)
+
+; Bits in the map
+
+;       Bits 0-7        8 bit character
+;       Bit  8          0 => Alpha, 1 => Graphics
+;       Bit  9          0 => Contiguous, 1 => Separated
+;       Bit  10         0 => Steady, 1 => Flash
+;       Bit  11         0 => Release, 1 => Hold
+;       Bit  12         0 => Reveal, 1 => Conceal
+;       Bits 13-14      Bit 13  Bit 14
+;                       0       0       Single Height
+;                       1       0       Undefined
+;                       0       1       Double Height Top
+;                       1       1       Double Height Bottom
+;       Bit  15         1 => Pending Start Box
+;       Bit  16         1 => Pending End Box
+;       Bits 17-19      Foreground colour
+;       Bit  20         0 => Unboxed, 1 => Boxed
+;       Bits 21-23      Background colour
+;       Bit  24         0 => Unboxed, 1 => Boxed
+;       Bits 25-29,31   Held graphic
+;       Bit  30         0 => Held graphic contiguous, 1 => separated
+
+MapBit_Char     *       1 :SHL: 0
+MapBit_Graph    *       1 :SHL: 8
+MapBit_Separated *      1 :SHL: 9
+MapBit_Flash    *       1 :SHL: 10
+MapBit_Hold     *       1 :SHL: 11
+MapBit_Conceal  *       1 :SHL: 12
+MapBit_Bottom   *       1 :SHL: 13
+MapBit_Double   *       1 :SHL: 14
+MapBit_PendingStart *   1 :SHL: 15
+
+MapBit_PendingEnd *     1 :SHL: 16
+MapBit_ForeMask *       7 :SHL: 17
+MapBit_BackMask *       7 :SHL: 21
+MapBits_Boxed   *       (1 :SHL: 20) :OR: (1 :SHL: 24)
+MapBit_HeldMask *       &7F :SHL: 25
+MapBit_HeldSeparated *  1 :SHL: 30
+
+MapForeShift    *       17
+MapBackShift    *       21
+MapHeldShift    *       25
+
+MapBit_Default  *       (7 :SHL: MapForeShift)+32 ; default at start of line
+
+; *****************************************************************************
+;
+;       TeletextAlloc - Allocate teletext workspace for pending mode change
+;       Entered with R0 -> mode workspace
+;
+
+TeletextAlloc ROUT
+        Entry   "r1-r7"
+        ; We allocate one block from the system heap which is large enough to contain:
+        ; * TTXMap: (columns+1)*rows*4
+        ; * TTXLineStarts: rows*4
+        ; * TTXDoubleCounts: rows*1
+        LDR     R4, [R0, #wkScrRCol]
+        ADD     R4, R4, #2
+        LDR     R5, [R0, #wkScrBRow]
+        ADD     R5, R5, #1
+        MUL     R6, R4, R5
+        MOV     R6, R6, LSL #2 ; TTXMap size, TTXLineStarts offset
+        ADD     R7, R6, R5, LSL #2 ; TTXMap+TTXLineStarts size, TTXDoubleCounts offset
+        ADD     R3, R7, R5 ; Total size
+        BL      ClaimSysHeapNode
+        ; Remember new workspace pointer for later
+        STRVC   R2, [WsPtr, #TTXNewWorkspace]
+        EXIT
+
+; *****************************************************************************
+;
+;       TeletextInit - Initialise teletext workspace
+;       Called when MODE 7 (or 135) is selected
+;
+
+TeletextInit ROUT
+        Entry
+        ; Claim the workspace that was previously allocated by TeletextAlloc
+        LDR     R2, [WsPtr, #TTXNewWorkspace]
+        TEQ     R2, #0
+        BEQ     %FT05 ; If there's no pending workspace pointer then VDU output is switching from sprite back to screen and we should skip most of this
+        BL      TeletextFinalise ; Ensure old workspace is freed
+        MOV     R0, #0
+        STR     R0, [WsPtr, #TTXNewWorkspace]
+
+        ; Calculate offsets to the different components
+        ; NOTE: TTXFastCLS relies on TTXLineStarts directly following TTXMap
+        LDR     R4, [WsPtr, #ScrRCol]
+        ADD     R4, R4, #2
+        LDR     R5, [WsPtr, #ScrBRow]
+        ADD     R5, R5, #1
+        MUL     R6, R4, R5
+        MOV     R6, R6, LSL #2 ; TTXMap size, TTXLineStarts offset
+        ADD     R7, R6, R5, LSL #2 ; TTXMap+TTXLineStarts size, TTXDoubleCounts offset
+
+        ; Fill in the pointers
+        STR     R2, [WsPtr, #TTXMapPtr]
+        ADD     R6, R2, R6
+        STR     R6, [WsPtr, #TTXLineStartsPtr]
+        ADD     R7, R2, R7
+        STR     R7, [WsPtr, #TTXDoubleCountsPtr]
+
+
+        ; Initialise TTXLineStarts
+        ; Everything else is initialised later on
+01
+        STR     R2, [R6], #4
+        ADD     R2, R2, R4, LSL #2
+        TEQ     R6, R7
+        BNE     %BT01
+
+05        
+        MOV     R0, #1                          ; set to flash immediately
+        STR     R0, [WsPtr, #TeletextCount]
+
+        MOV     R0, #TTXFlag_Conceal
+        ORR     R0, R0, #TTXFlag_FgTransBIC :OR: TTXFlag_BgTransBIC
+        STR     R0, [WsPtr, #TTXFlags]
+
+      [ :LNOT: HiResTTX
+; compute the graphics fonts
+
+        ADD     R0, WsPtr, #TTXSoftFonts ; R0 -> contiguous font
+        MOV     R2, #&20                ; R2 = character number
+        MOV     R3, #0                  ; R3 = byte to store
+10
+        ADD     R1, R0, #&140           ; R1 -> separated font
+20
+        TST     R2, #1                  ; top left
+        ORRNE   R3, R3, #&F0
+        TST     R2, #2                  ; top right
+        ORRNE   R3, R3, #&0F
+        STRB    R3, [R0], #1            ; 3 pixel rows for top
+        STRB    R3, [R0], #1
+        STRB    R3, [R0], #1
+        AND     R3, R3, #&77            ; do separated
+        STRB    R3, [R1], #1
+        STRB    R3, [R1], #1
+        MOV     R3, #0
+        STRB    R3, [R1], #1
+
+        TST     R2, #4                  ; middle left
+        ORRNE   R3, R3, #&F0
+        TST     R2, #8                  ; middle right
+        ORRNE   R3, R3, #&0F
+        STRB    R3, [R0], #1            ; 4 pixel rows for middle
+        STRB    R3, [R0], #1
+        STRB    R3, [R0], #1
+        STRB    R3, [R0], #1
+        AND     R3, R3, #&77            ; do separated
+        STRB    R3, [R1], #1
+        STRB    R3, [R1], #1
+        STRB    R3, [R1], #1
+        MOV     R3, #0
+        STRB    R3, [R1], #1
+
+        TST     R2, #&10                ; bottom left
+        ORRNE   R3, R3, #&F0
+        TST     R2, #&40                ; bottom right
+        ORRNE   R3, R3, #&0F
+        STRB    R3, [R0], #1            ; 3 pixel rows for bottom
+        STRB    R3, [R0], #1
+        STRB    R3, [R0], #1
+        AND     R3, R3, #&77            ; do separated
+        STRB    R3, [R1], #1
+        STRB    R3, [R1], #1
+        MOV     R3, #0
+        STRB    R3, [R1], #1
+
+        ADD     R2, R2, #1
+        TEQ     R2, #&40                ; if at end of 1st part
+        MOVEQ   R2, #&60                ; then start 2nd
+        ADDEQ   R0, R0, #&140           ; skipping separated already done
+        BEQ     %BT10                   ; and resetting R1 too
+
+        TEQ     R2, #&80                ; finished
+        BNE     %BT20
+      ]
+
+        EXIT
+
+; *****************************************************************************
+;
+;       TeletextFinalise - Free teletext workspace
+;       Called when switching out of teletext mode
+;
+
+TeletextFinalise ROUT
+        Entry   "r0-r2"
+        ; TTXMapPtr is the pointer to the allocated block
+        LDR     R2, [WsPtr, #TTXMapPtr]
+        CMP     R2, #0
+        BLNE    FreeSysHeapNode
+        MOV     R0, #0
+        STR     R0, [WsPtr, #TTXMapPtr]
+        STR     R0, [WsPtr, #TTXLineStartsPtr]
+        STR     R0, [WsPtr, #TTXDoubleCountsPtr]
+        CLRV
+        EXIT
+
+; *****************************************************************************
+;
+;       Vdu23_18 - Miscellaneous Teletext operations
+;
+
+Vdu23_18
+        LDRB    R2, [WsPtr, #QQ+1]
+        CMP     R2, #(Vdu23_18_TabEnd - Vdu23_18_TabStart) / 4
+        BCS     UnknownVdu23
+        LDR     R0, [WsPtr, #CursorFlags]
+        TST     R0, #TeletextMode
+        ADDNE   PC, PC, R2, LSL #2
+        MOV     PC, LR
+Vdu23_18_TabStart
+        B       Vdu23_18_0
+        B       Vdu23_18_1
+        B       Vdu23_18_2
+        B       Vdu23_18_3
+Vdu23_18_TabEnd
+
+; *****************************************************************************
+;
+;       Vdu23_18_0 - Set transparency
+;
+
+Vdu23_18_0 ROUT
+        Push    "R14"
+        LDRB    R5, [WsPtr, #QQ+2]
+        AND     R5, R5, #3
+        LDR     R6, [WsPtr, #TTXFlags]
+        AND     R14, R6, #TTXFlag_TransModeMask
+        TEQ     R14, R5, LSL #TTXFlag_TransModeShift
+        Pull    "PC", EQ                ; fast exit if nothing's changed
+
+        ; Because the border is being reprogrammed, switches in and out of mode 0 (solid)
+        ; look messy unless we reprogram the palette too (on the non-solid side of the switch)
+        TEQ     R5, #0                  ; switching into mode 0?
+        ADREQ   R2, TTXPalette_Solid    ; if so, program a solid palette
+        MOVEQ   R7, #0                  ; use a black border
+        BLEQ    SetTTXPalette
+
+        ; Munge the TTXFlags to match the transparency mode
+        ORR     R6, R6, #TTXFlag_FgTransEOR :OR: TTXFlag_BgTransEOR
+        ORR     R6, R6, #TTXFlag_FgTransBIC :OR: TTXFlag_BgTransBIC
+        TEQ     R5, #3                  ; already adjusted for mode 3 (transparent)
+        BEQ     %FT10
+        TEQ     R5, #2                  ; in modes 0 (solid) and 1 (mix)
+        BICNE   R6, R6, #TTXFlag_FgTransEOR ; we just clear the fg transparency bit
+        BICEQ   R6, R6, #TTXFlag_FgTransBIC ; in mode 2 (box) we just toggle it
+        TEQ     R5, #0                  ; in modes 1 (mix) and 2 (box)
+        BICNE   R6, R6, #TTXFlag_BgTransBIC ; we just toggle the bg transparency bit
+        BICEQ   R6, R6, #TTXFlag_BgTransEOR ; in mode 0 (solid) we just clear it
+10
+        ; Move the mode bits from TTXFlags to R7, and then from R5 to TTXFlags
+        MOV     R7, R6
+        BIC     R6, R6, #TTXFlag_TransModeMask
+        ORR     R6, R6, R5, LSL #TTXFlag_TransModeShift
+        STR     R6, [WsPtr, #TTXFlags]
+
+        ; Redraw the screen (paletted case)
+        Push    "R7"
+        LDR     R7, [WsPtr, #Log2BPP]
+        CMP     R7, #3
+        BLLS    RefreshBitmap
+        Pull    "R7"
+
+        ; Deal with the opposite palette programming case (switching away from mode 0)
+        TST     R7, #TTXFlag_TransModeMask
+        ADREQ   R2, TTXPalette_Mixed    ; use a mixed palette for all other modes
+        MOVEQ   R7, #&FF                ; and they all have a transparent border, too
+        BLEQ    SetTTXPalette
+
+        ; Redraw the screen (true colour case)
+        LDR     R7, [WsPtr, #Log2BPP]
+        CMP     R7, #3
+        MOVHI   R7, #-1
+        STRHI   R7, [WsPtr, #TForeCol]  ; ensure TTXUpdateColours gets called on next char plot
+        BLHI    RefreshBitmap
+
+        Pull    "PC"
+
+SetTTXPalette
+        Push    "R14"
+        LDR     R0, [WsPtr, #Log2BPP]
+        CMP     R0, #3
+        BHI     %FT20
+        ; Set 1st flash states
+        MOV     R0, #0                  ; start at colour 0
+        MOV     R1, #16                 ; program 16 colours
+        ORR     R1, R1, #17:SHL:24      ; program 1st flash state
+        MOV     R4, #paletteV_BulkWrite
+        BL      CallPaletteV
+        ; Set 2nd flash states
+        MOV     R0, #0                  ; start at colour 0
+        MOV     R1, #16                 ; program 16 colours
+        ORR     R1, R1, #18:SHL:24      ; program 2nd flash state
+        MOV     R4, #paletteV_BulkWrite
+        BL      CallPaletteV
+20
+        ; Set up the border colour
+        MOV     R0, #0                  ; logical colour 0
+        MOV     R1, #24                 ; type 24 (border)
+        MOV     R2, R7                  ; palette entry passed in R7
+        MOV     R4, #paletteV_Set
+        BL      CallPaletteV
+        Pull    "PC"
+
+TTXPalette_Solid
+        &       &00000000       ; black
+        &       &0000FF00       ; red
+        &       &00FF0000       ; green
+        &       &00FFFF00       ; yellow
+        &       &FF000000       ; blue
+        &       &FF00FF00       ; magenta
+        &       &FFFF0000       ; cyan
+        &       &FFFFFF00       ; white
+TTXPalette_Mixed
+        &       &00000000       ; black
+        &       &0000FF00       ; red
+        &       &00FF0000       ; green
+        &       &00FFFF00       ; yellow
+        &       &FF000000       ; blue
+        &       &FF00FF00       ; magenta
+        &       &FFFF0000       ; cyan
+        &       &FFFFFF00       ; white
+        &       &000000FF       ; transparent
+        &       &0000FFFF       ; transparent
+        &       &00FF00FF       ; transparent
+        &       &00FFFFFF       ; transparent
+        &       &FF0000FF       ; transparent
+        &       &FF00FFFF       ; transparent
+        &       &FFFF00FF       ; transparent
+        &       &FFFFFFFF       ; transparent
+
+; *****************************************************************************
+;
+;       Vdu23_18_1 - Suspend/resume bitmap updates
+;
+
+Vdu23_18_1 ROUT
+        Push    "R14"
+        LDRB    R0, [WsPtr, #QQ+2]
+        LDR     R1, [WsPtr, #TTXFlags]
+        TST     R0, #1                          ; bit 0 of 3rd parameter
+        BICEQ   R2, R1, #TTXFlag_Suspend        ; determines new setting of suspend flag
+        ORRNE   R2, R1, #TTXFlag_Suspend
+        STR     R2, [WsPtr, #TTXFlags]
+        BICS    R14, R1, R2                     ; if coming out of suspension
+        BLNE    RefreshBitmap                   ; then redraw screen
+        Pull    "PC"
+
+; *****************************************************************************
+;
+;       Vdu23_18_2 - Reveal/conceal
+;
+
+Vdu23_18_2 ROUT
+        Push    "R14"
+        LDRB    R0, [WsPtr, #QQ+2]
+        LDR     R1, [WsPtr, #TTXFlags]
+        TST     R0, #1                          ; bit 0 of 3rd parameter
+        ORREQ   R1, R1, #TTXFlag_Conceal        ; determines new setting of reveal flag
+        BICNE   R1, R1, #TTXFlag_Conceal
+        STR     R1, [WsPtr, #TTXFlags]
+        TST     R1, #TTXFlag_Suspend            ; unless suspended,
+        BLEQ    RefreshBitmap                   ; redraw the screen
+        Pull    "PC"
+
+; *****************************************************************************
+;
+;       Vdu23_18_3 - Enable/disable black foreground control codes
+;
+
+Vdu23_18_3 ROUT
+        Push    "R14"
+        LDRB    R0, [WsPtr, #QQ+2]
+        LDR     R1, [WsPtr, #TTXFlags]
+        TST     R0, #1                          ; bit 0 of 3rd parameter
+        BICEQ   R2, R1, #TTXFlag_BlackEnable    ; determines new setting of blackenable flag
+        ORRNE   R2, R1, #TTXFlag_BlackEnable
+        EOR     R1, R1, R2
+        TST     R1, #TTXFlag_BlackEnable        ; has blackenable changed?
+        Pull    "PC", EQ                        ; if not, then exit
+
+        Push    "R2"                            ; save R2 for later
+        ORR     R2, R2, #TTXFlag_Suspend        ; temporarily suspend bitmap update
+        STR     R2, [WsPtr, #TTXFlags]
+
+        MOV     R0, #0                          ; start at left
+        MOV     R1, #0                          ; start at top
+        LDR     R2, [WsPtr, #TTXMapPtr]         ; R2 -> start of map
+        ADD     R7, R2, #4*1                    ; R7 -> map entry for first real char
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R7, R5, LSL #2              ; R5 -> map entry for last char on first line
+        MOV     R11, #0                         ; R11 = top line
+        LDR     R10, [WsPtr, #ScrBRow]
+        ADD     R10, R10, #1                    ; R10 = bottom line + 1
+        ADR     R14, %FT50
+        Push    "R14"                           ; set up return address on stack
+        B       TTXScanZap2                     ; recalculate the map
+50
+        Pull    "R2"                            ; retrieve the final TTXFlags
+        STR     R2, [WsPtr, #TTXFlags]          ; save them
+        TST     R2, #TTXFlag_Suspend            ; and unless we were suspended on entry
+        BLEQ    RefreshBitmap                   ; then redraw the screen
+        Pull    "PC"
+
+; *****************************************************************************
+;
+;       RefreshBitmap - Brings bitmap up-to-date with TTXMap
+;
+
+RefreshBitmap ROUT
+        Entry   "R9-R11"
+        MOV     R0, #0
+        MOV     R1, #0
+        BL      AddressR0R1             ; R2 -> top-left character in bitmap
+        LDR     R7, [WsPtr, #RowLength]
+        LDR     R11, [WsPtr, #CharWidth]
+        LDR     R8, [WsPtr, #ScrRCol]
+        MLA     R8, R11, R8, R11
+        SUB     R7, R7, R8              ; R7 = offset from end of one row to start of next
+        LDR     R8, [WsPtr, #TTXLineStartsPtr]
+        MOV     R6, #0                  ; R6 is line number: 0 <= R11 <= 24
+        LDR     R10, [WsPtr, #ScrBRow]
+10
+        LDR     R4, [R8, R6, LSL #2]    ; R4 -> map entry for magic 0th character
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R5, #1
+        ADD     R5, R4, R5, LSL #2      ; R5 -> last map entry on line
+20
+        LDR     R1, [R4], #4            ; load map entry for previous character
+        LDR     R0, [R4]                ; load map entry for current character
+        BIC     R1, R1, #&FF
+        AND     R0, R0, #&FF
+        ORR     R0, R1, R0              ; construct R0 and R1 as required by DoPreControl
+        AND     R1, R0, #&7F
+        CMP     R1, #&20                ; is it a control char
+        BLCC    DoPreControl            ; [do pre-control things]
+        BL      UpdateHeldBits
+        BL      TTXPaintChar            ; paint it to the screen
+        ADD     R2, R2, R11
+        CMP     R4, R5
+        BCC     %BT20
+        ADD     R2, R2, R7              ; and drop down to start of next line
+        ADD     R6, R6, #1
+        CMP     R6, R10
+        BLS     %BT10
+        EXIT
+
+ [ HiResTTX
+; *****************************************************************************
+;
+;       ComputeGraphic - Called on a character-by-character basis
+;       Generates a graphic character on the fly
+;
+; in:   R1 -> space to build character in
+;       R3 = character: bits 0-4,6 are block flags, bit 5 is separated flag
+;
+; out:  Character built in R1
+;       All regs preserved
+;
+
+ComputeGraphic ROUT
+        Push    "R1,mask,R10,R14"
+        MOV     mask, #&FF000000
+        ORR     mask, mask, mask, LSR #16       ; mask for setting left-hand blocks (shift for right-hand)
+        MOV     R10, #&C0000000
+        ORR     R10, R10, R10, LSR #16
+        ORR     R10, R10, R10, LSR #8           ; mask for separated graphics vertical lines
+
+        MOV     R14, #0                         ; holds each word of the character as we build it up
+        TST     R3, #1:SHL:0
+        ORRNE   R14, R14, mask
+        TST     R3, #1:SHL:1
+        ORRNE   R14, R14, mask, LSR #8
+        TST     R3, #1:SHL:5
+        BICNE   R14, R14, R10
+        STR     R14, [R1], #4                   ; first 4 lines identical
+        STR     R14, [R1], #4
+        MOVNE   R14, #0                         ; if separated, then 2 horizontal lines, else same as above
+        STR     R14, [R1], #4
+
+        MOV     R14, #0
+        TST     R3, #1:SHL:2
+        ORRNE   R14, R14, mask
+        TST     R3, #1:SHL:3
+        ORRNE   R14, R14, mask, LSR #8
+        TST     R3, #1:SHL:5
+        BICNE   R14, R14, R10
+        STR     R14, [R1], #4                   ; 8 lines total for middle blocks
+        STR     R14, [R1], #4
+        STR     R14, [R1], #4
+        MOVNE   R14, #0
+        STR     R14, [R1], #4
+
+        MOV     R14, #0
+        TST     R3, #1:SHL:4
+        ORRNE   R14, R14, mask
+        TST     R3, #1:SHL:6
+        ORRNE   R14, R14, mask, LSR #8
+        TST     R3, #1:SHL:5
+        BICNE   R14, R14, R10
+        STR     R14, [R1], #4                   ; 6 lines total for bottom blocks
+        STR     R14, [R1], #4
+        MOVNE   R14, #0
+        STR     R14, [R1], #4
+        Pull    "R1,mask,R10,PC"
+ ]
+
+; *****************************************************************************
+;
+;       TTXFastCLS - Called when clearing whole screen
+;       Clears the teletext map to default
+;
+
+TTXFastCLS ROUT
+        LDR     R0, [WsPtr, #TTXMapPtr] ; R0 -> map
+        LDR     R1, [WsPtr, #TTXLineStartsPtr] ; R1 -> end of map
+        LDR     R2, =MapBit_Default     ; R2 = default status at start of line
+10
+        STR     R2, [R0], #4
+        CMP     R0, R1
+        BLO     %BT10
+
+        LDR     R0, [WsPtr, #TTXDoubleCountsPtr] ; zero double counts on each line
+        LDR     R1, [WsPtr, #ScrBRow]
+        ADD     R1, R1, #1
+        ADD     R1, R1, R0
+        MOV     R2, #0
+20
+        STRB    R2, [R0], #1
+        TEQ     R0, R1
+        BNE     %BT20
+
+        MOV     PC, R14
+
+; *****************************************************************************
+;
+;       TTXUpdateColours - Update colour table for new colours
+;
+; in:   R5 = new foregd colour
+;       R6 = new backgd colour
+;
+; out:  R0, R2 preserved
+;
+
+TTXUpdateColours ROUT
+        Push    "R0,R2,R14"
+        ADD     R14, WsPtr, #TForeCol
+        STMIA   R14, {R5,R6}
+        MOV     fore, R5
+        MOV     back, R6
+        LDR     bpp, [WsPtr, #BitsPerPix]
+      [ HiResTTX
+        CMP     bpp, #8
+        BLS     %FT10
+        ; Convert colour index to pixel value
+        ADRL    R14, TTXPalette_Solid
+        LDR     R0, [R14, fore, LSL #2]
+        LDR     back, [R14, back, LSL #2]
+        SWI     XColourTrans_ReturnColourNumber
+        MOV     fore, R0
+        MOV     R0, back
+        SWI     XColourTrans_ReturnColourNumber
+        ; Fixup the supremacy/alpha channel if necessary
+        ; (ColourTrans always sets it to default!)
+        TST     R5, #8
+        TSTEQ   R6, #8
+        LDRNE   R14, [WsPtr, #TTXFlags]
+        TSTNE   R14, #TTXFlag_TransModeMask
+        BEQ     %FT09
+        Push    "fore"
+        BL      GetAlphaSupremacyBits
+        Pull    "fore"
+        TST     R5, #8
+        EORNE   fore, fore, back
+        TST     R6, #8
+        EORNE   R0, R0, back
+09
+        MOV     back, R0
+        LDR     bpp, [WsPtr, #BitsPerPix] ; (R0)        
+10
+      ]
+        BL      SetColours
+        Pull    "R0,R2,PC"
+
+ [ :LNOT: HiResTTX
+; *****************************************************************************
+;
+;       PrintDoubleHeight - Process font for double height
+;
+; in:   R0 = char + attributes
+;       tophalf    contains bytes 0123
+;       bottomhalf contains bytes 4567
+;       R10        contains bytes xx89
+;       We know that at least one of MapBit_Bottom or MapBit_Double is set
+;
+; out:  tophalf, bottomhalf, R10 updated
+;       R3 corrupted
+;
+
+PrintDoubleHeight ROUT
+        TST     R0, #MapBit_Double              ; if not double height,
+        MOVEQ   tophalf, #0                     ; then must be single height
+        MOVEQ   bottomhalf, #0                  ; part on line below double,
+        MOVEQ   R10, #0                         ; so make it invisible
+        MOVEQ   PC, R14
+
+        TST     R0, #MapBit_Bottom
+        BNE     %FT10                           ; [bottom half of double]
+
+        [ 1=1 ;                 0 1              2 3         4
+; do top half, we want tophalf=0112, bottomhalf=2334, R10=xx45
+        MOV     R10, bottomhalf, LSL #16        ; R10 := o o 4 5
+        ORR     R10, R10, R10, LSL #8           ; R10 := o o 4 4/5
+        AND     R3, tophalf, #&FF000000         ; R3 := o o o 3
+        ORR     bottomhalf, R3, bottomhalf, LSL #24 ; bot := o o o 3/4
+        MOV     R3, tophalf, LSR #16            ; R3 := 2 3 o o
+        ORR     R3, R3, R3, LSL #8              ; R3 := 2 2/3 3 o
+        ORR     bottomhalf, bottomhalf, R3      ; bot := 2 2/3 3 3/4
+        MOV     tophalf, tophalf, LSL #16       ; top := o o 0 1
+        ORR     tophalf, tophalf, tophalf, LSR #8 ; top := o 0 0/1 1
+        MOV     tophalf, tophalf, LSR #8        ; top := 0 0/1 1 o
+        ORR     tophalf, tophalf, bottomhalf, LSL #24 ; top := 0 0/1 1 2
+        AND     R3, tophalf, #&00FF0000         ; R3 := o o 1 o
+        ORR     tophalf, tophalf, R3, LSL #8    ; top := 0 0/1 1 1/2
+        MOV     PC, R14
+
+10 ;                               5 6              7 8         9
+; do bottom half, we want tophalf=5667, bottomhalf=7889, R10=xx9o
+        AND     tophalf, bottomhalf, #&FF000000 ; top := o o o 7
+        MOV     R3, bottomhalf, LSL #8          ; R3 := o 4 5 6
+        MOV     R3, R3, LSR #16                 ; R3 := 5 6 o o
+        ORR     tophalf, tophalf, R3            ; top := 5 6 o 7
+        ORR     tophalf, tophalf, R3, LSL #8    ; top := 5 5/6 6 7
+        AND     R3, R3, #&0000FF00              ; R3 := o 6 o o
+        ORR     tophalf, tophalf, R3, LSL #16   ; top := 5 5/6 6 6/7
+        MOV     bottomhalf, bottomhalf, LSR #24 ; bot := 7 o o o
+        AND     R3, R10, #&00FF0000             ; R3 := o o 8 o
+        ORR     bottomhalf, bottomhalf, R3, LSR #8 ; bot := 7 8 o o
+        ORR     bottomhalf, bottomhalf, bottomhalf, LSL #8 ; bot := 7 7/8 8 o
+        ORR     R3, R10, R10, LSL #8            ; R3 := x x x 8/9
+        AND     R3, R3, #&FF000000              ; R3 := o o o 8/9
+        ORR     bottomhalf, bottomhalf, R3      ; bot := 7 7/8 8 8/9
+        MOV     R10, R10, LSR #24               ; R10 := 9 o o o
+        ORR     R10, R10, R10, LSL #8           ; R10 := 9 9 o o
+        MOV     R10, R10, LSL #16               ; R10 := o o 9 9
+        MOV     PC, R14
+        |
+; do top half, we want tophalf=0011, bottomhalf=2233, R10=xx44
+
+        MOV     R10, bottomhalf, LSL #24        ; R10 := ooo4
+        ORR     R10, R10, R10, LSR #8           ; R10 := oo44
+        AND     bottomhalf, tophalf, #&00FF0000 ; bottom := oo2o
+        ORR     bottomhalf, bottomhalf, tophalf, LSR #24 ; bottom := 3o2o
+        ORR     bottomhalf, bottomhalf, bottomhalf, LSL #8 ; bottom := 3322
+        MOV     bottomhalf, bottomhalf, ROR #16 ; bottom := 2233
+        AND     R3, tophalf, #&0000FF00         ; R3 := o1oo
+        AND     tophalf, tophalf, #&FF          ; top := 0ooo
+        ORR     tophalf, tophalf, R3, LSL #8    ; top := 0o1o
+        ORR     tophalf, tophalf, tophalf, LSL #8 ; top := 0011
+        MOV     PC, R14
+
+; do bottom half, we want tophalf=5566, bottomhalf=7788, R10=xx99
+
+10
+        AND     tophalf, bottomhalf, #&0000FF00         ; top := o5oo
+        MOV     bottomhalf, bottomhalf, LSR #16         ; bot := 67oo
+        ORR     tophalf, tophalf, bottomhalf, LSL #24   ; top := o5o6
+        ORR     tophalf, tophalf, tophalf, LSR #8       ; top := 5566
+        MOV     bottomhalf, bottomhalf, LSR #8          ; bot := 7ooo
+        MOV     R10, R10, LSR #16                       ; R10 := 89oo
+        ORR     bottomhalf, bottomhalf, R10, LSL #16    ; bot := 7o89
+        BIC     bottomhalf, bottomhalf, #&FF000000      ; bot := 7o8o
+        ORR     bottomhalf, bottomhalf, bottomhalf, LSL #8 ; bot := 7788
+        BIC     R10, R10, #&FF                          ; R10 := o9oo
+        ORR     R10, R10, R10, LSR #8                   ; R10 := 99oo
+        MOV     R10, R10, LSL #16                       ; R10 := oo99
+        MOV     PC, R14
+        ]
+ ]
+
+; *****************************************************************************
+;
+;       TTXWrch - Print a character in the range &20-&FF
+;
+; in:   R0 = character
+; out:  cursor has been moved on if appropriate
+;
+
+TTXWrch ROUT
+        Push    R14
+        BL      TTXDoChar
+        Pull    R14
+        B       PostCharMove
+
+; *****************************************************************************
+;
+;       TTXDoChar - Print a character (don't move cursor)
+;
+; in:   R0 = character
+;
+
+TTXDoChar ROUT
+        Push    R14
+
+        MOV     R3, R0
+        TEQ     R3, #"#"                        ; swap around the three
+        MOVEQ   R0, #"_"                        ; old favourites
+        TEQ     R3, #"_"
+        MOVEQ   R0, #"`"
+        TEQ     R3, #"`"
+        MOVEQ   R0, #"#"
+
+        LDR     R11, [WsPtr, #CursorY]          ; R11 = current Y position
+        LDR     R3, [WsPtr, #CursorX]           ; R3=start X posn on this line
+        LDR     R2, [WsPtr, #CursorAddr]        ; screen address
+TTXScanFromHere
+        MOV     R4, #0                          ; Xmin and
+        MOV     R5, #0                          ; Xmax are irrelevant
+        MOV     R10, #0                         ; Ymax always <= Y so no zap
+;
+;       TTXScanZap - Plot multiple characters from map, or plot spaces
+;
+; in:   R0 = current (initial) character
+;       R2 = current screen addr
+;       R3 = current X
+;       R4 = X min of area
+;       R5 = X max of area
+;       R10 = Y max of area
+;       R11 = current Y
+;       R12 -> VDU workspace
+;       R14 = non-zero to plot from map, zero to plot spaces
+;       Return address stacked
+;
+; out:  R0-R11 corrupt
+;
+TTXScanZap
+        LDR     R1, [WsPtr, #TTXLineStartsPtr]  ; R1 -> table of line starts
+        LDR     R8, [R1, R11, LSL #2]           ; R8 -> map entry at st.of line
+        LDR     R7, [WsPtr, #ScrRCol]
+        ADD     R7, R7, #1
+        ADD     R7, R8, R7, LSL #2              ; R7 -> end of this line
+        LDR     R1, [R8, R3, LSL #2]!           ; R1 = prev. char+attr
+        LDR     R6, [WsPtr, #CharWidth]
+08
+        LDR     R3, [WsPtr, #TTXDoubleCountsPtr]
+        LDRB    R9, [R3, R11]                   ; R9 = no. of dbls on this line
+10
+        BIC     R1, R1, #&FF                    ; clear char bits
+        ORR     R0, R1, R0                      ; store new char
+        AND     R1, R0, #&7F                    ; just look at char bits
+
+        Push    R14
+        CMP     R1, #&20                        ; is it a control char
+        BLCC    DoPreControl                    ; [do pre-control things]
+
+        BL      UpdateHeldBits                  ; this needs doing irrespective of suspension
+        LDR     R14, [WsPtr, #TTXFlags]
+        TST     R14, #TTXFlag_Suspend
+        BLEQ    TTXPaintChar
+
+        BIC     R0, R0, #(MapBit_PendingStart :OR: MapBit_PendingEnd)
+
+        CMP     R1, #&20
+        BLCC    DoPostControl                   ; [do post-control things]
+        Pull    R14                             ; restore zap flag
+
+        LDR     R1, [R8, #4]!                   ; get old character
+        STR     R0, [R8]                        ; store character away
+
+        AND     R3, R1, #&7F                    ; if overwriting double height
+        TEQ     R3, #TTX_DoubleHeight
+        SUBEQ   R9, R9, #1                      ; then one less
+
+        EOR     R1, R0, R1                      ; get difference
+        BIC     R3, R1, #&FF                    ; difference in attributes
+        MOV     R1, R0                          ; R1 = prev char + new attr
+
+        CMP     R11, R10                        ; if Y >= Ymax
+        BCS     %FT20                           ; then load from map
+        CMPCC   R8, R5                          ; else if X <= Xmax
+        MOVLS   R3, #1                          ; then pretend attr different
+        CMPCC   R4, R8                          ; if Xmin < X < Xmax
+        CMPCC   R14, #1                         ; and we're zapping (not scan)
+        MOVCC   R0, #32                         ; then zap to space
+20
+        LDRCSB  R0, [R8, #4]                    ; else load from map
+
+        TEQ     R3, #0                          ; if attributes different
+        TEQNE   R8, R7                          ; and not at end of line
+        ADDNE   R2, R2, R6                      ; then move to next char
+        BNE     %BT10                           ; and loop
+
+        LDR     R3, [WsPtr, #TTXDoubleCountsPtr]
+        STRB    R9, [R3, R11]                   ; update no. of doubles
+
+        LDR     R3, [WsPtr, #ScrBRow]
+        TEQ     R11, R3
+        ADD     R11, R11, #1                    ; go to next line
+        Pull    PC, EQ                          ; if off bottom of screen then finished
+
+        MOVS    R3, R9                          ; if no doubles
+                                                ; then next line is top line
+        EORNE   R3, R1, #MapBit_Bottom          ; else next line is opposite
+                                                ; to this line
+
+        LDR     R1, [R7, #4]                    ; get dummy word on next line
+        EOR     R3, R1, R3                      ; difference
+        ANDS    R3, R3, #MapBit_Bottom          ; difference in 'bottom' bit
+        EORNE   R1, R1, #MapBit_Bottom          ; if different then toggle bit
+        STR     R1, [R7, #4]!                   ; always store back
+        BNE     %FT30                           ; and do another row
+
+        CMP     R11, R10                        ; else if finished zap
+        Pull    PC, CS                          ; then exit
+30
+
+; now compute new R2
+
+        SUB     R3, R7, R8                      ; (no. of chars before eol) * 4
+        LDR     R9, [WsPtr, #ScrRCol]
+        ADD     R9, R9, #1
+        RSB     R3, R3, R9, LSL #2              ; (current char number) * 4
+        MUL     R3, R6, R3                      ; (number of bytes) * 4
+        SUB     R2, R2, R3, LSR #2              ; back to start of old line
+        LDR     R3, [WsPtr, #RowLength]
+        ADD     R2, R2, R3                      ; move down a row
+
+        MOV     R8, R7                          ; R8 -> dummy char on new line
+        ADD     R7, R7, R9, LSL #2              ; R7 -> last char on new line
+
+        ADD     R9, R9, #1
+        ADD     R4, R4, R9, LSL #2              ; move Xmin to next line
+        ADD     R5, R5, R9, LSL #2              ; move Xmax to next line
+
+        CMP     R11, R10                        ; if Y < Ymax
+        CMPCC   R8, R5                          ; and X < Xmax
+        CMPCC   R4, R8                          ; if also Xmin < X
+        CMPCC   R14, #1                         ; & we're zapping not scanning
+        MOVCC   R0, #32                         ; then zap to space
+        LDRCSB  R0, [R8, #4]                    ; else load from map
+        B       %BT08
+
+; *****************************************************************************
+;
+;       TTXClearBox - Fill a rectangle with spaces, and update screen
+;
+; in:   R0 = left column
+;       R1 = bottom row
+;       R2 = right column
+;       R3 = top row
+;       Return address already stacked
+;
+
+TTXClearBox
+        ADD     R10, R1, #1                     ; R10 := bottom +1
+        MOV     R11, R3                         ; R11 := top
+        ADD     R5, R2, #1                      ; R5 := right + 1
+
+        MOV     R1, R3
+        BL      AddressR0R1                     ; R2 := address(topleft)
+                                                ; R1, R3, R4 corrupted
+        MOV     R3, R0                          ; R3 := left
+
+        LDR     R4, [WsPtr, #TTXLineStartsPtr]
+        LDR     R0, [R4, R11, LSL #2]           ; R0 -> dummy(top)
+        ADD     R5, R0, R5, LSL #2              ; R5 := map(topright)
+        ADD     R4, R0, R3, LSL #2              ; R4 := map(topleft)-4
+        SUB     R4, R4, #4                      ; R4 := map(topleft)-8
+        MOV     R0, #32                         ; start with a space
+        MOV     R14, #0                         ; indicate zapping
+        B       TTXScanZap                      ; go and do it
+
+; *****************************************************************************
+;
+;       TTXHardScrollUp - Scroll teletext screen upwards
+;
+
+TTXHardScrollUp ROUT
+
+; first scroll map up
+
+        LDR     R0, [WsPtr, #RowLength]         ; save real RowLength
+        Push    "R0, R6, R14"                   ; and save CursorFlags
+
+        MOV     R0, #1                          ; pretend rowmult = 1
+        LDR     R2, [WsPtr, #TTXMapPtr]         ; R2 -> TTXMap
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R5, #2
+        MOV     R5, R5, LSL #2                  ; R5 = no. of bytes horiz
+        STR     R5, [WsPtr, #RowLength]         ; pretend rowlength
+        LDR     R6, [WsPtr, #ScrBRow]           ; no. of 'pixel' rows
+        MOV     R7, R5                          ; linelength
+        ADD     R6, R6, #1
+        BL      SoftScrollUp2
+
+        Pull    "R0, R6"
+        STR     R0, [WsPtr, #RowLength]         ; restore RowLength
+
+; now 'scroll' DoubleCounts
+
+        LDR     R0, [WsPtr, #TTXDoubleCountsPtr]
+        LDR     R1, [WsPtr, #ScrBRow]
+        ADD     R1, R0, R1
+10
+        LDRB    R2, [R0, #1]
+        STRB    R2, [R0], #1
+        TEQ     R0, R1
+        BNE     %BT10
+
+; now see if top line was a 'bottom' row
+; if so, we need to rescan from the top
+
+        LDR     R8, [WsPtr, #TTXMapPtr]         ; R8 -> top left map
+        LDR     R1, [R8]                        ; R1 = dummy word
+        TST     R1, #MapBit_Bottom              ; if not bottom
+        BEQ     %FT20                           ; then OK
+
+        BIC     R1, R1, #MapBit_Bottom          ; make into a 'top' line
+        STR     R1, [R8]                        ; store back
+        LDRB    R0, [R8, #4]                    ; R0 = first char
+        MOV     R3, #0                          ; X = 0
+        MOV     R11, #0                         ; Y = 0
+        LDR     R2, [WsPtr, #ScreenStart]       ; screen address for top-left
+        LDR     R14, [WsPtr, #TextOffset]       ; plus the offset
+        ADD     R2, R2, R14
+
+        ADR     R14, %FT20
+        Push    R14
+        B       TTXScanFromHere
+
+20
+
+; now see if new bottom line should be a 'bottom' or a 'top' line
+
+        LDR     R1, [WsPtr, #ScrBRow]
+        SUB     R1, R1, #1
+        LDR     R0, [WsPtr, #TTXLineStartsPtr]
+        LDR     R0, [R0, R1, LSL #2]            ; R0 -> dummy word on line 23
+        LDR     R14, [WsPtr, #TTXDoubleCountsPtr]
+        LDRB    R1, [R14, R1]                   ; no. of dbls on line 23
+        TEQ     R1, #0                          ; if R1=0 then line 24 is 'top'
+        LDRNE   R1, [R0]                        ; else line 24 is opposite
+        EORNE   R1, R1, #MapBit_Bottom          ; of line 23
+        ANDNE   R1, R1, #MapBit_Bottom
+        LDR     R14, [WsPtr, #ScrRCol]
+        ADD     R14, R14, #2
+        LDR     R2, [R0, R14, LSL #2]           ; R2 = dummy word on line 24
+        BIC     R2, R2, #MapBit_Bottom          ; clear that bit
+        ORR     R2, R2, R1                      ; OR in new bit
+        STR     R2, [R0, R14, LSL #2]           ; and store back
+
+        Pull    PC
+
+; *****************************************************************************
+;
+;       TTXSoftScrollUp - Scroll screen up by software in teletext mode
+;
+
+TTXSoftScrollUp ROUT
+
+; first scroll map up
+
+        LDR     R0, [WsPtr, #RowLength]         ; save real RowLength
+        LDR     R1, [WsPtr, #TWTRow]            ; top row
+        LDR     R3, [WsPtr, #TWBRow]            ; bottom row
+
+        LDR     R2, [WsPtr, #TTXLineStartsPtr]
+        LDR     R2, [R2, R1, LSL #2]            ; R2 -> dummy char top row
+        ADD     R2, R2, #4                      ; R2 -> 0th char top row
+        LDR     R4, [WsPtr, #TWLCol]
+        LDR     R5, [WsPtr, #TWRCol]
+
+        Push    "R0-R6,R14"                     ; and save CursorFlags
+
+        ADD     R2, R2, R4, LSL #2              ; R2 -> top left char
+
+        SUB     R5, R5, R4
+        ADD     R5, R5, #1                      ; R5 = no. of chars wide
+        MOV     R5, R5, LSL #2                  ; R5 = no. of bytes / line
+
+        SUB     R6, R3, R1
+        ADD     R6, R6, #1                      ; R6 = no. of 'pixel' rows
+
+        LDR     R7, [WsPtr, #ScrRCol]
+        ADD     R7, R7, #2
+        MOV     R7, R7, LSL #2                  ; R7 = line length
+        STR     R7, [WsPtr, #RowLength]         ; pretend row length
+        MOV     R0, #1                          ; pretend rowmult =1
+
+        BL      SoftScrollUp2
+
+        Pull    "R0-R6"
+        STR     R0, [WsPtr, #RowLength]         ; restore RowLength
+
+; now R1=top row, R2 -> char 0 on row R1, R3=bottom row, R4=left, R5=right
+
+; now clear bottom row
+
+        LDR     R7, [WsPtr, #TTXLineStartsPtr]
+        LDR     R7, [R7, R3, LSL #2]            ; R7 -> dummy word(bottom)
+        ADD     R8, R7, R5, LSL #2              ; R8 -> char before bottom rt
+        ADD     R7, R7, R4, LSL #2              ; R7 -> char before bottom left
+        MOV     R0, #32
+30
+        STRB    R0, [R7, #4]!                   ; zap to space
+        CMP     R7, R8                          ; if <= char before bottom rt
+        BLS     %BT30                           ; then loop
+
+        MOV     R9, R2
+CountAndRescan
+        BL      CountDoubles
+
+; now rescan from top of window
+
+        ADD     R10, R3, #1                     ; R10 = bottom + 1
+        MOV     R11, R1                         ; R11 = top
+        ADD     R7, R2, R4, LSL #2              ; R7 = map(left,top)
+        ADD     R5, R2, R5, LSL #2              ; R5 = map(right,top)
+        MOV     R0, R4                          ; R0 = left
+TTXScanZap2
+        BL      AddressR0R1                     ; R2 = screen(left,top)
+                                                ; (R1,R3,R4 corrupted)
+        SUB     R4, R7, #8                      ; R4 = map(left,top)-8
+        MOV     R3, R0                          ; R3 = left
+        LDRB    R0, [R4, #8]                    ; R0 = first char
+        MOV     R14, #1                         ; scan not zap
+        B       TTXScanZap
+
+; *****************************************************************************
+;
+;       CountDoubles - Count double height characters in a range of rows
+;
+; in:   R1 = top row to count
+;       R3 = bottom row to count
+;       R9 -> map(0,top)
+;
+; out:  R1-R6 preserved
+;
+
+CountDoubles ROUT
+        Entry
+        LDR     R7, [WsPtr, #TTXDoubleCountsPtr]
+        ADD     R7, R7, R1                      ; R7 -> current double count
+        MOV     R11, R1
+        LDR     R14, [WsPtr, #ScrRCol]
+        ADD     R14, R14, #1
+10
+        ADD     R8, R9, R14, LSL #2             ; R8 -> dummy char next row
+        MOV     R10, #0                         ; count so far
+20
+        LDR     R0, [R9], #4                    ; load char word
+        AND     R0, R0, #&7F                    ; only look at bottom 7 bits
+        TEQ     R0, #TTX_DoubleHeight           ; if double height
+        ADDEQ   R10, R10, #1                    ; then increment count
+        TEQ     R9, R8                          ; if not at end of row
+        BNE     %BT20                           ; then loop
+
+        STRB    R10, [R7], #1                   ; store double count
+        ADD     R9, R9, #4                      ; skip dummy char
+        ADD     R11, R11, #1                    ; goto next row
+        CMP     R11, R3                         ; if <= bottom
+        BLS     %BT10                           ; then loop
+
+        EXIT
+
+; *****************************************************************************
+;
+;       TTXHardScrollDown - Scroll teletext screen downwards
+;
+
+TTXHardScrollDown ROUT
+
+; first scroll map down
+
+        LDR     R0, [WsPtr, #RowLength]         ; save real RowLength
+        Push    "R0, R6, R14"                   ; and save CursorFlags
+
+        MOV     R0, #1                          ; pretend rowmult = 1
+        LDR     R6, [WsPtr, #ScrBRow]
+        LDR     R2, [WsPtr, #TTXLineStartsPtr]
+        LDR     R2, [R2, R6, LSL #2]            ; R2 -> dummy char on bottom
+        LDR     R5, [WsPtr, #ScrRCol]
+        ADD     R5, R5, #2
+        MOV     R5, R5, LSL #2                  ; R5 = no. of bytes horiz
+        STR     R5, [WsPtr, #RowLength]         ; pretend rowlength
+        ADD     R6, R6, #1                      ; no. of 'pixel' rows
+        MOV     R7, R5                          ; linelength
+        BL      SoftScrollDown2
+        SUB     R14, R6, #1
+
+        Pull    "R0, R6"
+        STR     R0, [WsPtr, #RowLength]         ; restore RowLength
+
+; now 'scroll' DoubleCounts
+
+        LDR     R0, [WsPtr, #TTXDoubleCountsPtr]
+        ADD     R1, R0, R14
+10
+        LDRB    R2, [R1, #-1]
+        STRB    R2, [R1], #-1
+        TEQ     R1, R0
+        BNE     %BT10
+
+; now make top row a 'top' row
+
+        LDR     R0, [WsPtr, #TTXMapPtr]         ; R0 -> top line dummy word
+        LDR     R1, [R0]                        ; R1 = dummy word
+        BIC     R1, R1, #MapBit_Bottom          ; clear 'bottom' bit
+        STR     R1, [R0]                        ; and store back
+
+        Pull    PC
+
+; *****************************************************************************
+;
+;       TTXSoftScrollDown - Scroll screen down by software in teletext mode
+;
+
+TTXSoftScrollDown ROUT
+
+; first scroll map down
+
+        LDR     R0, [WsPtr, #RowLength]         ; save real RowLength
+        LDR     R1, [WsPtr, #TWTRow]            ; top row
+        LDR     R3, [WsPtr, #TWBRow]            ; bottom row
+
+        LDR     R2, [WsPtr, #TTXLineStartsPtr]
+        LDR     R2, [R2, R3, LSL #2]            ; R2 -> dummy char bottom row
+        ADD     R2, R2, #4                      ; R2 -> 0th char bottom row
+        LDR     R4, [WsPtr, #TWLCol]
+        LDR     R5, [WsPtr, #TWRCol]
+
+        Push    "R0-R6,R14"                     ; and save CursorFlags
+
+        ADD     R2, R2, R4, LSL #2              ; R2 -> bottom left char
+
+        SUB     R5, R5, R4
+        ADD     R5, R5, #1                      ; R5 = no. of chars wide
+        MOV     R5, R5, LSL #2                  ; R5 = no. of bytes / line
+
+        SUB     R6, R3, R1
+        ADD     R6, R6, #1                      ; R6 = no. of 'pixel' rows
+
+        LDR     R7, [WsPtr, #ScrRCol]
+        ADD     R7, R7, #2
+        MOV     R7, R7, LSL #2                  ; R7 = line length
+        STR     R7, [WsPtr, #RowLength]         ; pretend row length
+        MOV     R0, #1                          ; pretend rowmult =1
+
+        BL      SoftScrollDown2
+
+        Pull    "R0-R6"
+        STR     R0, [WsPtr, #RowLength]         ; restore RowLength
+
+; now R1=top row, R2 -> char 0 on row R3, R3=bottom row, R4=left, R5=right
+
+; now clear top row
+
+        LDR     R7, [WsPtr, #TTXLineStartsPtr]
+        LDR     R7, [R7, R1, LSL #2]            ; R7 -> dummy word(top)
+        ADD     R8, R7, R5, LSL #2              ; R8 -> char before top rt
+        ADD     R7, R7, R4, LSL #2              ; R7 -> char before top left
+        MOV     R0, #32
+30
+        STRB    R0, [R7, #4]!                   ; zap to space
+        CMP     R7, R8                          ; if <= char before bottom rt
+        BLS     %BT30                           ; then loop
+
+        SUB     R9, R8, R5, LSL #2              ; R9 -> dummy word(top)
+        ADD     R9, R9, #4                      ; R9 -> map(0,top)
+        MOV     R2, R9
+        B       CountAndRescan                  ; count doubles and rescan
+                                                ; from top of window
+
+; *****************************************************************************
+;
+;       TTXScrollLeft - Scroll left (by software) in Teletext mode
+;
+; in:   R0 bit0=0 => scroll window
+;               1 => scroll screen
+;
+
+TTXScrollLeft ROUT
+        Push    R14
+        BL      TTXSideScroll1
+        MOV     R5, R0                          ; R5 = left = column to check
+                                                ; for double height chars
+        BL      TTXSideScroll2                  ; do second part
+        BL      ScrollLeft2
+
+; now store spaces in right hand column
+
+        Pull    "R0-R3, R6, R9"
+        ADD     R4, R9, R2, LSL #2              ; R4 -> map(right,top)
+TTXSideScroll3
+        MOV     R7, R3                          ; R7 = current row
+        MOV     R8, #32                         ; poke spaces
+        LDR     R10, [WsPtr, #ScrRCol]
+        ADD     R10, R10, #2
+20
+        STRB    R8, [R4], R10, LSL #2           ; store space and move down
+        ADD     R7, R7, #1                      ; next row
+        CMP     R7, R1                          ; if row <= bottom
+        BLS     %BT20                           ; then loop
+
+; now rescan from top of window/screen
+
+        ADD     R10, R1, #1                     ; R10 = bottom+1
+        MOV     R11, R3                         ; R11 = top
+        ADD     R7, R9, R0, LSL #2              ; R7 -> map(left,top)
+        ADD     R5, R9, R2, LSL #2              ; R5 -> map(right,top)
+        MOV     R1, R3                          ; R1 = top
+        B       TTXScanZap2
+
+; *****************************************************************************
+;
+;       TTXScrollRight - Scroll right (by software) in Teletext mode
+;
+; in:   R0 bit0=0 => scroll window
+;               1 => scroll screen
+;
+
+TTXScrollRight ROUT
+        Push    R14
+        BL      TTXSideScroll1
+        MOV     R5, R2                          ; R5 = right = column to check
+                                                ; for double height chars
+        BL      TTXSideScroll2
+        BL      ScrollRight2
+
+; now store spaces in left hand column
+
+        Pull    "R0-R3, R6, R9"
+        ADD     R4, R9, R0, LSL #2              ; R4 -> map(left,top)
+        B       TTXSideScroll3
+
+; *****************************************************************************
+;
+;       TTXSideScroll1 - Do first part of sideways scroll
+;
+
+TTXSideScroll1 ROUT
+        MOVS    R0, R0, LSR #1
+
+; C=0 => scroll window
+
+        ADDCC   R0, WsPtr, #TWLCol              ; R0 = left, R1 = bottom
+        LDMCCIA R0, {R0-R3}                     ; R2 = right, R3 = top
+
+; C=1 => scroll screen
+
+        MOVCS   R0, #0                          ; left
+        LDRCS   R1, [WsPtr, #ScrBRow]           ; bottom
+        LDRCS   R2, [WsPtr, #ScrRCol]           ; right
+        MOVCS   R3, #0                          ; top
+
+        MOV     PC, R14
+
+; *****************************************************************************
+;
+;       TTXSideScroll2 - Do second part of sideways scroll
+;
+; in:   R5 = left or right hand column for left or right scroll respectively
+;
+
+TTXSideScroll2 ROUT
+
+; first check char R5 on each line and decrement double count if a double
+
+        LDR     R4, [WsPtr, #TTXLineStartsPtr]
+        LDR     R4, [R4, R3, LSL #2]            ; R4 -> map(dummy,top)
+        ADD     R9, R4, #4                      ; R9 -> map(0,top)
+        ADD     R4, R9, R5, LSL #2              ; R4 -> map(left or right,top)
+        Push    "R9"
+
+        LDR     R9, [WsPtr, #ScrRCol]
+        ADD     R9, R9, #2
+
+        LDR     R5, [WsPtr, #TTXDoubleCountsPtr]
+        MOV     R7, R3                          ; R7 = current row
+10
+        LDR     R8, [R4], R9, LSL #2            ; get char+attr
+        AND     R8, R8, #&7F
+        TEQ     R8, #TTX_DoubleHeight           ; test if double height char
+
+        LDREQB  R8, [R5, R7]                    ; if so then load double count
+        SUBEQ   R8, R8, #1                      ; decrement it
+        STREQB  R8, [R5, R7]                    ; and store back
+
+        ADD     R7, R7, #1                      ; next row
+        CMP     R7, R1                          ; if row <= bottom
+        BLS     %BT10                           ; then loop
+
+; now scroll map
+
+        MOV     R7, R9, LSL #2                  ; linelength
+        LDR     R9, [sp]
+        Push    "R0-R3, R6"
+        SUB     R5, R2, R0                      ; R5 = right-left
+        ADD     R5, R5, #1                      ; R5 = right-left+1
+        MOV     R5, R5, LSL #2                  ; R5 = (right-left+1)*4
+        ADD     R2, R9, R0, LSL #2              ; R2 -> map(left,top)
+        SUB     R6, R1, R3                      ; R6 = bottom-top
+        ADD     R6, R6, #1                      ; R6 = bottom-top+1
+        MOV     R9, #4                          ; no. of bytes to scroll by
+
+        MOV     PC, R14
+
+; *****************************************************************************
+;
+;       UpdateHeldBits - change the held graphic bits of R0 if necessary
+;       TTXPaintChar used to have this functionality
+;
+
+UpdateHeldBits ROUT
+        TST     R0, #&60 :OR: MapBit_Hold       ; if a control code and not holding,
+        BICEQ   R0, R0, #MapBit_HeldMask        ; clear mask
+        MOVEQ   PC, R14
+
+        TST     R0, #MapBit_Graph
+        TSTNE   R0, #&20                        ; if not a graphic character,
+        MOVEQ   PC, R14                         ; preserve the bits that were copied from the previous character
+
+        BIC     R0, R0, #MapBit_HeldMask        ; else copy the character to the held graphic bits
+        ORR     R0, R0, R0, LSL #MapHeldShift
+        TST     R0, #MapBit_Separated
+        BICEQ   R0, R0, #MapBit_HeldSeparated
+        ORRNE   R0, R0, #MapBit_HeldSeparated
+        MOV     PC, R14
+
+; *****************************************************************************
+;
+;       TTXPaintChar - Paint char according to attributes
+;
+; in:   R0 = character + attributes word
+;       R2 -> screen (for the time being)
+;
+; out:  R3, R12 corrupt
+
+TTXPaintChar ROUT
+        Entry   "R1,R4-R11"
+        VDWS    WsPtr                           ; for now
+
+; first set up the colours
+
+        ADD     R1, WsPtr, #TForeCol
+        LDMIA   R1, {R1, R3}                    ; R1 = TForeCol; R3 = TBackCol
+        MOV     R4, #&0F
+        LDR     R14, [WsPtr, #TTXFlags]
+        BIC     R5, R0, R14                     ; apply BIC masks
+        EOR     R14, R5, R14, LSL #8            ; apply EOR masks
+        AND     R5, R4, R14, LSR #MapForeShift  ; R5 = new foregd colour
+        AND     R6, R4, R14, LSR #MapBackShift  ; R6 = new backgd colour
+
+        TEQ     R1, R5                          ; if foregd different
+        TEQEQ   R3, R6                          ; or backgd different
+        BLNE    TTXUpdateColours                ; then update colour table
+
+      [ HiResTTX
+        ADRL    R1, TTXHardFont-32*40           ; R1 -> base for font
+      |
+        ADRL    R1, TTXHardFont-32*10           ; R1 -> base for font
+      ]
+        MOVS    R3, R0, LSL #26                 ; C := bit6, N := bit5
+        AND     R3, R0, #&7F                    ; R3 = char
+        BMI     %FT10                           ; [&20-&3F or &60-&7F]
+        BCS     %FT20                           ; [&40-&5F (definitely Alpha)]
+
+; control code, so display as space or held graphic
+
+        TST     R0, #MapBit_Hold                ; zero if not holding
+        MOVEQ   R3, #&20                        ; pretend to be space
+        BEQ     %FT20                           ; [display as space]
+
+; next instruction assumes no valid bits above held graphic bits
+
+        MOV     R3, R0, LSR #MapHeldShift       ; R3 = char to display
+        B       %FT30                           ; [display as held graphic]
+
+; char in range &20-&3F or &60-&7F, so check for alpha/graphics
+
+10
+        TST     R0, #MapBit_Graph               ; in graphics mode
+        BEQ     %FT20                           ; [no, so definitely Alpha]
+        TST     R0, #MapBit_Separated           ; separated graphics ?
+        BICEQ   R3, R3, #&20                    ; no, then make &00-&1F,&40-&5F
+30
+        ADD     R1, WsPtr, #TTXSoftFonts
+      [ HiResTTX
+        TST     R3, #&5F                        ; if a space
+        ADREQL  R1, TTXHardFont                 ; then just use the hard font, for speed
+        BLNE    ComputeGraphic                  ; else generate the bitmap
+        B       %FT40
+20
+        ADD     R1, R1, R3, LSL #5              ; add 32*char
+        ADD     R1, R1, R3, LSL #3              ; add 8*char
+40
+      |
+20
+        ADD     R1, R1, R3, LSL #3              ; add 8*char
+        ADD     R1, R1, R3, LSL #1              ; add 2*char
+      ]
+
+        TST     R0, #MapBit_Conceal             ; concealing ?
+        LDRNE   R14, [WsPtr, #TTXFlags]
+        TSTNE   R14, #TTXFlag_Conceal           ; and reveal is off?
+        ADRNEL  R1, TTXHardFont                 ; yes, then display as space
+
+ [ :LNOT: HiResTTX
+; now load font bytes
+; 0..3 into tophalf
+; 4..7 into bottomhalf
+; 8..9 into R10 (top 2 bytes)
+
+        TST     R1, #2                          ; starting on a word bdy ?
+
+        SUBNE   R1, R1, #2                      ; if not, move back
+        LDMIA   R1, {tophalf, bottomhalf, R10}  ; yes, so load all 3 up
+        MOVEQ   R10, R10, LSL #16
+        MOVNE   tophalf, tophalf, LSR #16
+        ORRNE   tophalf, tophalf, bottomhalf, LSL #16
+        MOVNE   bottomhalf, bottomhalf, LSR #16
+        ORRNE   bottomhalf, bottomhalf, R10, LSL #16
+
+        TST     R0, #(MapBit_Bottom :OR: MapBit_Double)
+        BLNE    PrintDoubleHeight
+
+        LDR     bigfont, [WsPtr, #TextExpandArea]
+        MOV     mask, #&FF000000
+        LDR     linelen, [WsPtr, #LineLength]
+        Push    "R0, screen"
+        MOV     R0, #0                          ; indicate 10 rows
+        BL      Wrch4bitTTX                     ; do 1st bank
+
+        LDMFD   R13, {R0, screen}               ; restore char + scr. addr
+        LDR     byte, [WsPtr, #ScreenSize]
+        ADD     screen, screen, byte, LSR #1    ; point to 2nd bank
+        TST     R0, #MapBit_Flash
+        MOVNE   mask, #0                        ; flash => 2nd bank is space
+        MOV     R0, #0
+        BL      Wrch4bitTTX
+        Pull    "R0, screen"
+        EXIT
+ |
+; here we do the two screen banks in an outer loop and have a
+; 5-stage inner loop each time plotting 4 rows (1/5th of the character)
+
+        TST     R0, #MapBit_Bottom              ; for bottom-half characters
+        ADDNE   R1, R1, #2*10                   ; start half-way through the character
+
+        LDR     bigfont, [WsPtr, #TextExpandArea]
+
+        MOV     mask, #&FF000000
+        LDR     linelen, [WsPtr, #LineLength]
+        LDR     byte, [WsPtr, #CharWidth]
+        SUB     linelen, linelen, byte, LSR #1  ; adjust line offset to account for performing two screen writes per row
+
+        Push    "R1, screen"
+        BL      WrchHiResTTX                    ; do 1st bank
+
+        LDMFD   R13, {R1, screen}               ; restore pointers to character and screen address
+        LDR     byte, [WsPtr, #ScreenSize]
+        ADD     screen, screen, byte, LSR #1    ; point to 2nd bank
+        TST     R0, #MapBit_Flash
+        MOVNE   mask, #0                        ; flash => 2nd bank is space
+        BL      WrchHiResTTX                    ; do 2nd bank
+
+        Pull    "R1, screen"
+        EXIT
+
+
+; *****************************************************************************
+;
+;       WrchHiResTTX - Write a high-res teletext char to screen
+;
+; in:   R0 = character + attributes word
+;       R1 -> character definition
+;       screen -> screen
+;       bigfont -> font definition
+;       mask = &FF000000 for normal, &0 for blank
+;       linelen = LineLength-(CharWidth/2)
+;
+; out:  tophalf, bottomhalf, byte, scrbyte, scrbyte2, R7 corrupt
+;
+
+WrchHiResTTX ROUT
+        Entry
+        LDR     R7, [WsPtr, #Log2BPP]
+        ADR     R14, WrchHiResTTXTab - 8
+        LDR     R14, [R14, R7, LSL #2]
+
+        MOV     R7, #4                          ; do each plot in 5 stages; R7 holds stage number
+01      TST     R0, #MapBit_Double
+        LDMEQIA R1!, {tophalf, bottomhalf}      ; single height characters, load 4 rows
+        LDRNE   tophalf, [R1], #4               ; double height characters, load 2 rows
+        MOVNE   bottomhalf, tophalf, LSR #16    ; and double up
+        ORRNE   bottomhalf, bottomhalf, bottomhalf, LSL #16
+        MOVNE   tophalf, tophalf, LSL #16
+        ORRNE   tophalf, tophalf, tophalf, LSR #16
+        AND     byte, R0, #(MapBit_Double :OR: MapBit_Bottom) ; byte is used here as a scratch register
+        TEQ     byte, #MapBit_Bottom            ; if single height on line below top-half double height,
+        MOVEQ   tophalf, #0                     ; make it invisible
+        MOVEQ   bottomhalf, #0
+        MOV     PC, R14                         ; call routine
+
+WrchHiResTTX8
+        AND     byte, mask, tophalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, tophalf
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, bottomhalf
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #21
+        LDMIA   byte, {scrbyte, scrbyte2}
+        STMIA   screen, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        SUBS    R7, R7, #1
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTX4
+        AND     byte, mask, tophalf, LSL #16
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, tophalf, LSL #24
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+        AND     byte, mask, tophalf
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, tophalf, LSL #8
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, bottomhalf, LSL #24
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+        AND     byte, mask, bottomhalf
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], #4
+        AND     byte, mask, bottomhalf, LSL #8
+        LDR     scrbyte, [bigfont, byte, LSR #22]
+        STR     scrbyte, [screen], linelen
+
+        SUBS    R7, R7, #1
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTX16
+        SUB     linelen, linelen, #16
+        AND     byte, mask, tophalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, tophalf
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, bottomhalf
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #20
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        SUBS    R7, R7, #1
+        ADD     linelen, linelen, #16
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTX32
+        SUB     linelen, linelen, #32
+        AND     byte, mask, tophalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, tophalf
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, tophalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        AND     byte, mask, bottomhalf, LSL #16
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #24
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+        AND     byte, mask, bottomhalf
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        AND     byte, mask, bottomhalf, LSL #8
+        ADD     byte, bigfont, byte, LSR #19
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        LDMIA   byte!, {scrbyte, scrbyte2}
+        STMIA   screen!, {scrbyte, scrbyte2}
+        ADD     screen, screen, linelen
+
+        SUBS    R7, R7, #1
+        ADD     linelen, linelen, #32
+        BPL     %BT01
+        EXIT
+
+WrchHiResTTXTab
+        &       WrchHiResTTX4
+        &       WrchHiResTTX8
+        &       WrchHiResTTX16
+        &       WrchHiResTTX32
+ ]
+
+; *****************************************************************************
+
+        LTORG
+
+; *****************************************************************************
+;
+;       DoPreControl  - Process 'at'    action of control char
+;       DoPostControl - Process 'after' action of control char
+;
+; in:   R0 = new char + attributes of current previous char
+;       R1 = new char AND &7F
+;       (0 <= R1 <= 31)
+;       R9 = double height char counter
+;
+; out:  R0 = updated char + attributes
+;       R3 = corrupt
+;       R9 = updated
+;
+
+DoPreControl ROUT
+        ADD     PC, PC, R1, LSL #3
+DoPostControl ROUT
+        ADD     PC, PC, R1, LSL #3
+        MOV     PC, R14                 ; &00 Pre
+        B       DoAlphaBlack            ; &00 Post
+        MOV     PC, R14                 ; &01 Pre
+        B       DoAlphaColour           ; &01 Post
+        MOV     PC, R14                 ; &02 Pre
+        B       DoAlphaColour           ; &02 Post
+        MOV     PC, R14                 ; &03 Pre
+        B       DoAlphaColour           ; &03 Post
+        MOV     PC, R14                 ; &04 Pre
+        B       DoAlphaColour           ; &04 Post
+        MOV     PC, R14                 ; &05 Pre
+        B       DoAlphaColour           ; &05 Post
+        MOV     PC, R14                 ; &06 Pre
+        B       DoAlphaColour           ; &06 Post
+        MOV     PC, R14                 ; &07 Pre
+        B       DoAlphaColour           ; &07 Post
+        MOV     PC, R14                 ; &08 Pre
+        B       DoFlash                 ; &08 Post
+        BIC     R0, R0, #MapBit_Flash   ; &09 Pre       ; clear flash mode
+        MOV     PC, R14                 ; &09 Post
+        B       DoPreEndBox             ; &0A Pre
+        B       DoPostEndBox            ; &0A Post
+        B       DoPreStartBox           ; &0B Pre
+        B       DoPostStartBox          ; &0B Post
+        B       DoSingleHeight          ; &0C Pre
+        MOV     PC, R14                 ; &0C Post
+        B       DoDoubleHeight          ; &0D Pre
+        MOV     PC, R14                 ; &0D Post
+        MOV     PC, R14                 ; &0E Pre
+        MOV     PC, R14                 ; &0E Post
+        MOV     PC, R14                 ; &0F Pre
+        MOV     PC, R14                 ; &0F Post
+        MOV     PC, R14                 ; &10 Pre
+        B       DoGraphBlack            ; &10 Post
+        MOV     PC, R14                 ; &11 Pre
+        B       DoGraphColour           ; &11 Post
+        MOV     PC, R14                 ; &12 Pre
+        B       DoGraphColour           ; &12 Post
+        MOV     PC, R14                 ; &13 Pre
+        B       DoGraphColour           ; &13 Post
+        MOV     PC, R14                 ; &14 Pre
+        B       DoGraphColour           ; &14 Post
+        MOV     PC, R14                 ; &15 Pre
+        B       DoGraphColour           ; &15 Post
+        MOV     PC, R14                 ; &16 Pre
+        B       DoGraphColour           ; &16 Post
+        MOV     PC, R14                 ; &17 Pre
+        B       DoGraphColour           ; &17 Post
+        ORR     R0, R0, #MapBit_Conceal ; &18 Pre       ; set conceal mode
+        MOV     PC, R14                 ; &18 Post
+        MOV     PC, R14                 ; &19 Pre
+        BIC     R0, R0, #MapBit_Separated ; &19 Post    ; clear separated
+        MOV     PC, R14                 ; &1A Pre
+        ORR     R0, R0, #MapBit_Separated ; &1A Post    ; set separated
+        MOV     PC, R14                 ; &1B Pre
+        MOV     PC, R14                 ; &1B Post
+        BIC     R0, R0, #MapBit_BackMask ; &1C Pre      ; clear backgd colour
+        MOV     PC, R14                 ; &1C Post
+        B       DoNewBackgd             ; &1D Pre
+        MOV     PC, R14                 ; &1D Post
+        ORR     R0, R0, #MapBit_Hold    ; &1E Pre       ; set hold graph mode
+        MOV     PC, R14                 ; &1E Post
+        MOV     PC, R14                 ; &1F Pre
+        BIC     R0, R0, #MapBit_Hold    ; &1F Post      ; clear hold graph mode
+        MOV     PC, R14
+
+; *****************************************************************************
+
+DoAlphaBlack
+        LDR     R3, [WsPtr, #TTXFlags]
+        TST     R3, #TTXFlag_BlackEnable        ; unless enabled,
+        MOVEQ   PC, R14                         ; do nothing
+        ; drop through...
+DoAlphaColour
+        BIC     R0, R0, #MapBit_HeldMask        ; clear held graphic
+        BIC     R0, R0, #(MapBit_ForeMask :OR: MapBit_Conceal)
+                                                ; clear colour + conceal
+        ORR     R0, R0, R1, LSL #MapForeShift   ; put in new colour
+        BIC     R0, R0, #MapBit_Graph           ; set alpha mode
+        MOV     PC, R14
+
+DoGraphBlack
+        LDR     R3, [WsPtr, #TTXFlags]
+        TST     R3, #TTXFlag_BlackEnable        ; unless enabled,
+        MOVEQ   PC, R14                         ; do nothing
+        ; drop through...
+DoGraphColour
+        BIC     R0, R0, #(MapBit_ForeMask :OR: MapBit_Conceal)
+                                                ; clear colour + conceal
+        AND     R3, R1, #&07                    ; ensure only colour bits
+        ORR     R0, R0, R3, LSL #MapForeShift   ; put in new colour
+        ORR     R0, R0, #MapBit_Graph           ; set graph mode
+        MOV     PC, R14
+
+DoFlash
+        ORR     R0, R0, #MapBit_Flash           ; set flash mode
+        MOV     PC, R14
+
+DoNewBackgd
+        AND     R3, R0, #MapBit_ForeMask        ; R5 = fore colour
+        BIC     R0, R0, #MapBit_BackMask        ; clear old backgd
+        ORR     R0, R0, R3, LSL #(MapBackShift-MapForeShift) ; new backgd
+        MOV     PC, R14
+
+DoDoubleHeight
+        TST     R0, #MapBit_Double              ; if currently single height
+        BICEQ   R0, R0, #MapBit_HeldMask        ; then cancel held graphic
+        ORR     R0, R0, #MapBit_Double          ; set double height mode
+        ADD     R9, R9, #1                      ; one more double char
+        MOV     PC, R14
+
+DoSingleHeight
+        TST     R0, #MapBit_Double              ; if currently double height
+        BICNE   R0, R0, #MapBit_HeldMask        ; then cancel held graphic
+        BIC     R0, R0, #MapBit_Double          ; set single height mode
+        MOV     PC, R14
+
+DoPreStartBox
+        TST     R0, #MapBit_PendingStart        ; if prev char was start box
+        ORRNE   R0, R0, #MapBits_Boxed          ; then start boxed area
+        MOV     PC, R14
+
+DoPostStartBox
+        ORR     R0, R0, #MapBit_PendingStart    ; "Previous char is Start Box"
+        MOV     PC, R14
+
+DoPreEndBox
+        TST     R0, #MapBit_PendingEnd          ; if prev char was end box
+        BICNE   R0, R0, #MapBits_Boxed          ; then end boxed area
+        MOV     PC, R14
+
+DoPostEndBox
+        ORR     R0, R0, #MapBit_PendingEnd      ; "Previous char is End Box"
+        MOV     PC, R14
+
+; *****************************************************************************
+
+TTXHardFont
+ [ HiResTTX
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; space
+        DCW     &0000,&0000,&0300,&0300,&0300,&0300,&0300,&0300,&0300,&0300,&0300,&0300,&0000,&0000,&0300,&0300,&0000,&0000,&0000,&0000 ; !
+        DCW     &0000,&0000,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; "
+        DCW     &0000,&0000,&03F0,&07F8,&0E1C,&0C0C,&0C00,&0C00,&3F80,&3F80,&0C00,&0C00,&0C00,&0C00,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; £
+        DCW     &0000,&0000,&0FF0,&1FF8,&399C,&318C,&3180,&3980,&1FF0,&0FF8,&019C,&018C,&318C,&399C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; $
+        DCW     &0000,&0000,&3C00,&3C0C,&3C1C,&3C38,&0070,&00E0,&01C0,&0380,&0700,&0E00,&1C3C,&383C,&303C,&003C,&0000,&0000,&0000,&0000 ; %
+        DCW     &0000,&0000,&0E00,&1F00,&3B80,&3180,&3380,&3F00,&1E00,&1F00,&3F8C,&31DC,&30F8,&3878,&1FFC,&0FCC,&0000,&0000,&0000,&0000 ; &
+        DCW     &0000,&0000,&0180,&0180,&0180,&0180,&0180,&0180,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; '
+        DCW     &0000,&0000,&0060,&00E0,&01C0,&0380,&0700,&0600,&0600,&0600,&0600,&0700,&0380,&01C0,&00E0,&0060,&0000,&0000,&0000,&0000 ; (
+        DCW     &0000,&0000,&0600,&0700,&0380,&01C0,&00E0,&0060,&0060,&0060,&0060,&00E0,&01C0,&0380,&0700,&0600,&0000,&0000,&0000,&0000 ; )
+        DCW     &0000,&0000,&0180,&318C,&399C,&1DB8,&0FF0,&07E0,&03C0,&03C0,&07E0,&0FF0,&1DB8,&399C,&318C,&0180,&0000,&0000,&0000,&0000 ; *
+        DCW     &0000,&0000,&0000,&0000,&0180,&0180,&0180,&0180,&3FFC,&3FFC,&0180,&0180,&0180,&0180,&0000,&0000,&0000,&0000,&0000,&0000 ; +
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0180,&0180,&0180,&0180,&0380,&0300,&0000,&0000 ; ,
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0FF0,&0FF0,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; -
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0180,&0180,&0000,&0000,&0000,&0000 ; .
+        DCW     &0000,&0000,&0000,&0018,&0038,&0070,&00E0,&01C0,&0380,&0700,&0E00,&1C00,&1800,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; /
+        DCW     &0000,&0000,&03C0,&07E0,&0E70,&1C38,&381C,&300C,&300C,&300C,&300C,&381C,&1C38,&0E70,&07E0,&03C0,&0000,&0000,&0000,&0000 ; 0
+        DCW     &0000,&0000,&0180,&0180,&0F80,&0F80,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0FF0,&0FF0,&0000,&0000,&0000,&0000 ; 1
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&000C,&001C,&07F8,&0FF0,&1C00,&3800,&3000,&3000,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; 2
+        DCW     &0000,&0000,&3FFC,&3FFC,&001C,&0038,&0070,&00E0,&01F8,&01FC,&000C,&000C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; 3
+        DCW     &0000,&0000,&0070,&00F0,&01F0,&03B0,&0730,&0E30,&1C30,&3830,&3FFC,&3FFC,&0030,&0030,&0030,&0030,&0000,&0000,&0000,&0000 ; 4
+        DCW     &0000,&0000,&3FFC,&3FFC,&3000,&3000,&3FF0,&3FF8,&001C,&000C,&000C,&000C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; 5
+        DCW     &0000,&0000,&01F0,&07F0,&0F00,&1C00,&3800,&3000,&3FF0,&3FF8,&301C,&300C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; 6
+        DCW     &0000,&0000,&3FFC,&3FFC,&000C,&001C,&0038,&0070,&00E0,&01C0,&0380,&0700,&0600,&0600,&0600,&0600,&0000,&0000,&0000,&0000 ; 7
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&300C,&381C,&1FF8,&1FF8,&381C,&300C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; 8
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&300C,&380C,&1FFC,&0FFC,&000C,&001C,&0038,&00F0,&0FE0,&0F80,&0000,&0000,&0000,&0000 ; 9
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0180,&0180,&0000,&0000,&0000,&0000,&0000,&0000,&0180,&0180,&0000,&0000,&0000,&0000 ; :
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0180,&0180,&0000,&0000,&0000,&0000,&0180,&0180,&0180,&0180,&0380,&0300,&0000,&0000 ; ;
+        DCW     &0000,&0000,&0060,&00E0,&01C0,&0380,&0700,&0E00,&1C00,&1C00,&0E00,&0700,&0380,&01C0,&00E0,&0060,&0000,&0000,&0000,&0000 ; <
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&3FFC,&3FFC,&0000,&0000,&3FFC,&3FFC,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; =
+        DCW     &0000,&0000,&0600,&0700,&0380,&01C0,&00E0,&0070,&0038,&0038,&0070,&00E0,&01C0,&0380,&0700,&0600,&0000,&0000,&0000,&0000 ; >
+        DCW     &0000,&0000,&0FE0,&1FF0,&3838,&3018,&0038,&0070,&00E0,&01C0,&0180,&0180,&0000,&0000,&0180,&0180,&0000,&0000,&0000,&0000 ; ?
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&31FC,&31FC,&318C,&318C,&31FC,&31FC,&3000,&3800,&1FF0,&0FF0,&0000,&0000,&0000,&0000 ; @
+        DCW     &0000,&0000,&0180,&03C0,&07E0,&0E70,&1C38,&381C,&300C,&300C,&3FFC,&3FFC,&300C,&300C,&300C,&300C,&0000,&0000,&0000,&0000 ; A
+        DCW     &0000,&0000,&3FF0,&3FF8,&301C,&300C,&300C,&301C,&3FF8,&3FF8,&301C,&300C,&300C,&301C,&3FF8,&3FF0,&0000,&0000,&0000,&0000 ; B
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&3000,&3000,&3000,&3000,&3000,&3000,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; C
+        DCW     &0000,&0000,&3FF0,&3FF8,&301C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&301C,&3FF8,&3FF0,&0000,&0000,&0000,&0000 ; D
+        DCW     &0000,&0000,&3FFC,&3FFC,&3000,&3000,&3000,&3000,&3FF0,&3FF0,&3000,&3000,&3000,&3000,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; E
+        DCW     &0000,&0000,&3FFC,&3FFC,&3000,&3000,&3000,&3000,&3FF0,&3FF0,&3000,&3000,&3000,&3000,&3000,&3000,&0000,&0000,&0000,&0000 ; F
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&3000,&3000,&3000,&3000,&303C,&303C,&300C,&380C,&1FFC,&0FFC,&0000,&0000,&0000,&0000 ; G
+        DCW     &0000,&0000,&300C,&300C,&300C,&300C,&300C,&300C,&3FFC,&3FFC,&300C,&300C,&300C,&300C,&300C,&300C,&0000,&0000,&0000,&0000 ; H
+        DCW     &0000,&0000,&0FF0,&0FF0,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0FF0,&0FF0,&0000,&0000,&0000,&0000 ; I
+        DCW     &0000,&0000,&000C,&000C,&000C,&000C,&000C,&000C,&000C,&000C,&000C,&000C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; J
+        DCW     &0000,&0000,&1818,&1838,&1870,&18E0,&19C0,&1B80,&1F00,&1F00,&1B80,&19C0,&18E0,&1870,&1838,&1818,&0000,&0000,&0000,&0000 ; K
+        DCW     &0000,&0000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; L
+        DCW     &0000,&0000,&300C,&300C,&381C,&3C3C,&3E7C,&37EC,&33CC,&318C,&300C,&300C,&300C,&300C,&300C,&300C,&0000,&0000,&0000,&0000 ; M
+        DCW     &0000,&0000,&300C,&300C,&380C,&3C0C,&3E0C,&370C,&338C,&31CC,&30EC,&307C,&303C,&301C,&300C,&300C,&0000,&0000,&0000,&0000 ; N
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; O
+        DCW     &0000,&0000,&3FF0,&3FF8,&301C,&300C,&300C,&301C,&3FF8,&3FF0,&3000,&3000,&3000,&3000,&3000,&3000,&0000,&0000,&0000,&0000 ; P
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&300C,&300C,&300C,&300C,&30CC,&30EC,&3078,&3838,&1FFC,&0FCC,&0000,&0000,&0000,&0000 ; Q
+        DCW     &0000,&0000,&3FF0,&3FF8,&301C,&300C,&300C,&301C,&3FF8,&3FF0,&31C0,&30E0,&3070,&3038,&301C,&300C,&0000,&0000,&0000,&0000 ; R
+        DCW     &0000,&0000,&0FF0,&1FF8,&381C,&300C,&3000,&3800,&1FF0,&0FF8,&001C,&000C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; S
+        DCW     &0000,&0000,&3FFC,&3FFC,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0000,&0000,&0000,&0000 ; T
+        DCW     &0000,&0000,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; U
+        DCW     &0000,&0000,&300C,&300C,&300C,&300C,&381C,&1818,&1C38,&0C30,&0E70,&07E0,&03C0,&03C0,&0180,&0180,&0000,&0000,&0000,&0000 ; V
+        DCW     &0000,&0000,&300C,&300C,&300C,&300C,&300C,&300C,&318C,&318C,&318C,&318C,&318C,&3FFC,&1FF8,&0E70,&0000,&0000,&0000,&0000 ; W
+        DCW     &0000,&0000,&300C,&300C,&381C,&1C38,&0E70,&07E0,&03C0,&03C0,&07E0,&0E70,&1C38,&381C,&300C,&300C,&0000,&0000,&0000,&0000 ; X
+        DCW     &0000,&0000,&300C,&300C,&381C,&1C38,&0E70,&07E0,&03C0,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0000,&0000,&0000,&0000 ; Y
+        DCW     &0000,&0000,&3FFC,&3FFC,&001C,&0038,&0070,&00E0,&01C0,&0380,&0700,&0E00,&1C00,&3800,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; Z
+        DCW     &0000,&0000,&0000,&0000,&0300,&0700,&0E00,&1C00,&3FFC,&3FFC,&1C00,&0E00,&0700,&0300,&0000,&0000,&0000,&0000,&0000,&0000 ; ˆ
+        DCW     &0000,&0000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&3000,&31F0,&31F8,&000C,&000C,&0018,&0070,&00C0,&0180,&01FC,&01FC ; ½
+        DCW     &0000,&0000,&0000,&0000,&00C0,&00E0,&0070,&0038,&3FFC,&3FFC,&0038,&0070,&00E0,&00C0,&0000,&0000,&0000,&0000,&0000,&0000 ; ‰
+        DCW     &0000,&0000,&0000,&0000,&0180,&03C0,&07E0,&0FF0,&1DB8,&1998,&0180,&0180,&0180,&0180,&0000,&0000,&0000,&0000,&0000,&0000 ; ‹
+        DCW     &0000,&0000,&0630,&0630,&0630,&0630,&1FFC,&1FFC,&0630,&0630,&1FFC,&1FFC,&0630,&0630,&0630,&0630,&0000,&0000,&0000,&0000 ; #
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&FFFF,&FFFF,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000,&0000 ; ˜
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&1FF0,&1FF8,&001C,&000C,&1FFC,&3FFC,&300C,&300C,&3FFC,&1FFC,&0000,&0000,&0000,&0000 ; a
+        DCW     &0000,&0000,&3000,&3000,&3000,&3000,&3FF0,&3FF8,&301C,&300C,&300C,&300C,&300C,&301C,&3FF8,&3FF0,&0000,&0000,&0000,&0000 ; b
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0FFC,&1FFC,&3800,&3000,&3000,&3000,&3000,&3800,&1FFC,&0FFC,&0000,&0000,&0000,&0000 ; c
+        DCW     &0000,&0000,&000C,&000C,&000C,&000C,&0FFC,&1FFC,&380C,&300C,&300C,&300C,&300C,&380C,&1FFC,&0FFC,&0000,&0000,&0000,&0000 ; d
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0FF0,&1FF8,&381C,&300C,&3FFC,&3FFC,&3000,&3800,&1FF8,&0FF8,&0000,&0000,&0000,&0000 ; e
+        DCW     &0000,&0000,&0030,&00F0,&01C0,&0180,&0180,&0180,&0FF0,&0FF0,&0180,&0180,&0180,&0180,&0180,&0180,&0000,&0000,&0000,&0000 ; f
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0FFC,&1FFC,&380C,&300C,&300C,&300C,&300C,&380C,&1FFC,&0FFC,&000C,&001C,&0FF8,&0FF0 ; g
+        DCW     &0000,&0000,&3000,&3000,&3000,&3000,&3FF0,&3FF8,&301C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&0000,&0000,&0000,&0000 ; h
+        DCW     &0000,&0000,&0180,&0180,&0000,&0000,&0F80,&0F80,&0180,&0180,&0180,&0180,&0180,&0180,&0FF0,&0FF0,&0000,&0000,&0000,&0000 ; i
+        DCW     &0000,&0000,&0180,&0180,&0000,&0000,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0380,&0F00,&0C00 ; j
+        DCW     &0000,&0000,&1800,&1800,&1800,&1800,&1818,&1838,&18F0,&1BC0,&1F80,&1F80,&19C0,&18F0,&1838,&1818,&0000,&0000,&0000,&0000 ; k
+        DCW     &0000,&0000,&0F80,&0F80,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0180,&0FF0,&0FF0,&0000,&0000,&0000,&0000 ; l
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&3E30,&3FF8,&33FC,&318C,&318C,&318C,&318C,&318C,&318C,&318C,&0000,&0000,&0000,&0000 ; m
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&3FF0,&3FF8,&301C,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&0000,&0000,&0000,&0000 ; n
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0FF0,&1FF8,&381C,&300C,&300C,&300C,&300C,&381C,&1FF8,&0FF0,&0000,&0000,&0000,&0000 ; o
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&3FF0,&3FF8,&301C,&300C,&300C,&300C,&300C,&301C,&3FF8,&3FF0,&3000,&3000,&3000,&3000 ; p
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0FFC,&1FFC,&380C,&300C,&300C,&300C,&300C,&380C,&1FFC,&0FFC,&000C,&000C,&000C,&000C ; q
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&31FC,&33FC,&3E00,&3C00,&3000,&3000,&3000,&3000,&3000,&3000,&0000,&0000,&0000,&0000 ; r
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&0FFC,&1FFC,&3000,&3000,&1FF0,&0FF8,&000C,&000C,&3FF8,&3FF0,&0000,&0000,&0000,&0000 ; s
+        DCW     &0000,&0000,&0180,&0180,&0180,&0180,&0FF0,&0FF0,&0180,&0180,&0180,&0180,&0180,&01C0,&00F0,&0030,&0000,&0000,&0000,&0000 ; t
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&380C,&1FFC,&0FFC,&0000,&0000,&0000,&0000 ; u
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&300C,&300C,&300C,&381C,&1818,&1C38,&0E70,&07E0,&03C0,&0180,&0000,&0000,&0000,&0000 ; v
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&300C,&300C,&300C,&300C,&318C,&318C,&318C,&3FFC,&1FF8,&0E70,&0000,&0000,&0000,&0000 ; w
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&300C,&381C,&1E78,&0FF0,&03C0,&03C0,&0FF0,&1E78,&381C,&300C,&0000,&0000,&0000,&0000 ; x
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&300C,&300C,&300C,&300C,&300C,&300C,&300C,&380C,&1FFC,&0FFC,&000C,&001C,&0FF8,&0FF0 ; y
+        DCW     &0000,&0000,&0000,&0000,&0000,&0000,&3FFC,&3FFC,&0038,&00F0,&01E0,&0780,&0F00,&1C00,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; z
+        DCW     &0000,&0000,&1800,&1800,&1800,&1800,&1800,&1800,&1800,&1800,&1818,&1838,&00F8,&0198,&0318,&0318,&03F8,&03F8,&0018,&0018 ; ¼
+        DCW     &0000,&0000,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0C60,&0000,&0000,&0000,&0000 ; ||
+        DCW     &0000,&0000,&3E00,&3F00,&0180,&0180,&3F00,&3F00,&0180,&0180,&3F0C,&3E1C,&007C,&00CC,&018C,&018C,&01FC,&01FC,&000C,&000C ; ¾
+        DCW     &0000,&0000,&0000,&0000,&0180,&0180,&0000,&0000,&3FFC,&3FFC,&0000,&0000,&0180,&0180,&0000,&0000,&0000,&0000,&0000,&0000 ; ÷
+        DCW     &0000,&0000,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&3FFC,&0000,&0000,&0000,&0000 ; block
+ |
+        =       &00,&00,&00,&00,&00,&00,&00,&00,&00,&00 ; space
+        =       &00,&08,&08,&08,&08,&08,&00,&08,&00,&00 ; !
+        =       &00,&14,&14,&14,&00,&00,&00,&00,&00,&00 ; "
+        =       &00,&0C,&12,&10,&38,&10,&10,&3E,&00,&00 ; `
+        =       &00,&1C,&2A,&28,&1C,&0A,&2A,&1C,&00,&00 ; $
+        =       &00,&30,&32,&04,&08,&10,&26,&06,&00,&00 ; %
+        =       &00,&10,&28,&28,&10,&2A,&24,&1A,&00,&00 ; &
+        =       &00,&08,&08,&08,&00,&00,&00,&00,&00,&00 ; '
+        =       &00,&04,&08,&10,&10,&10,&08,&04,&00,&00 ; (
+        =       &00,&10,&08,&04,&04,&04,&08,&10,&00,&00 ; )
+        =       &00,&08,&2A,&1C,&08,&1C,&2A,&08,&00,&00 ; *
+        =       &00,&00,&08,&08,&3E,&08,&08,&00,&00,&00 ; +
+        =       &00,&00,&00,&00,&00,&00,&08,&08,&10,&00 ; ,
+        =       &00,&00,&00,&00,&1C,&00,&00,&00,&00,&00 ; -
+        =       &00,&00,&00,&00,&00,&00,&00,&08,&00,&00 ; .
+        =       &00,&00,&02,&04,&08,&10,&20,&00,&00,&00 ; /
+        =       &00,&08,&14,&22,&22,&22,&14,&08,&00,&00 ; 0
+        =       &00,&08,&18,&08,&08,&08,&08,&1C,&00,&00 ; 1
+        =       &00,&1C,&22,&02,&0C,&10,&20,&3E,&00,&00 ; 2
+        =       &00,&3E,&02,&04,&0C,&02,&22,&1C,&00,&00 ; 3
+        =       &00,&04,&0C,&14,&24,&3E,&04,&04,&00,&00 ; 4
+        =       &00,&3E,&20,&3C,&02,&02,&22,&1C,&00,&00 ; 5
+        =       &00,&0C,&10,&20,&3C,&22,&22,&1C,&00,&00 ; 6
+        =       &00,&3E,&02,&04,&08,&10,&10,&10,&00,&00 ; 7
+        =       &00,&1C,&22,&22,&1C,&22,&22,&1C,&00,&00 ; 8
+        =       &00,&1C,&22,&22,&1E,&02,&04,&18,&00,&00 ; 9
+        =       &00,&00,&00,&08,&00,&00,&08,&00,&00,&00 ; :
+        =       &00,&00,&00,&08,&00,&00,&08,&08,&10,&00 ; ;
+        =       &00,&04,&08,&10,&20,&10,&08,&04,&00,&00 ; <
+        =       &00,&00,&00,&3E,&00,&3E,&00,&00,&00,&00 ; =
+        =       &00,&10,&08,&04,&02,&04,&08,&10,&00,&00 ; >
+        =       &00,&1C,&22,&04,&08,&08,&00,&08,&00,&00 ; ?
+        =       &00,&1C,&22,&2E,&2A,&2E,&20,&1C,&00,&00 ; @
+        =       &00,&08,&14,&22,&22,&3E,&22,&22,&00,&00 ; A
+        =       &00,&3C,&22,&22,&3C,&22,&22,&3C,&00,&00 ; B
+        =       &00,&1C,&22,&20,&20,&20,&22,&1C,&00,&00 ; C
+        =       &00,&3C,&22,&22,&22,&22,&22,&3C,&00,&00 ; D
+        =       &00,&3E,&20,&20,&3C,&20,&20,&3E,&00,&00 ; E
+        =       &00,&3E,&20,&20,&3C,&20,&20,&20,&00,&00 ; F
+        =       &00,&1C,&22,&20,&20,&26,&22,&1E,&00,&00 ; G
+        =       &00,&22,&22,&22,&3E,&22,&22,&22,&00,&00 ; H
+        =       &00,&1C,&08,&08,&08,&08,&08,&1C,&00,&00 ; I
+        =       &00,&02,&02,&02,&02,&02,&22,&1C,&00,&00 ; J
+        =       &00,&22,&24,&28,&30,&28,&24,&22,&00,&00 ; K
+        =       &00,&20,&20,&20,&20,&20,&20,&3E,&00,&00 ; L
+        =       &00,&22,&36,&2A,&22,&22,&22,&22,&00,&00 ; M
+        =       &00,&22,&22,&32,&2A,&26,&22,&22,&00,&00 ; N
+        =       &00,&1C,&22,&22,&22,&22,&22,&1C,&00,&00 ; O
+        =       &00,&3C,&22,&22,&3C,&20,&20,&20,&00,&00 ; P
+        =       &00,&1C,&22,&22,&22,&2A,&24,&1A,&00,&00 ; Q
+        =       &00,&3C,&22,&22,&3C,&28,&24,&22,&00,&00 ; R
+        =       &00,&1C,&22,&20,&1C,&02,&22,&1C,&00,&00 ; S
+        =       &00,&3E,&08,&08,&08,&08,&08,&08,&00,&00 ; T
+        =       &00,&22,&22,&22,&22,&22,&22,&1C,&00,&00 ; U
+        =       &00,&22,&22,&22,&14,&14,&08,&08,&00,&00 ; V
+        =       &00,&22,&22,&22,&2A,&2A,&2A,&14,&00,&00 ; W
+        =       &00,&22,&22,&14,&08,&14,&22,&22,&00,&00 ; X
+        =       &00,&22,&22,&14,&08,&08,&08,&08,&00,&00 ; Y
+        =       &00,&3E,&02,&04,&08,&10,&20,&3E,&00,&00 ; Z
+        =       &00,&00,&08,&10,&3E,&10,&08,&00,&00,&00 ; [
+        =       &00,&20,&20,&20,&20,&2C,&02,&04,&08,&0E ; \ 
+        =       &00,&00,&08,&04,&3E,&04,&08,&00,&00,&00 ; ]
+        =       &00,&00,&08,&1C,&2A,&08,&08,&00,&00,&00 ; ^
+        =       &00,&14,&14,&3E,&14,&3E,&14,&14,&00,&00 ; #
+        =       &00,&00,&00,&00,&3E,&00,&00,&00,&00,&00 ; _
+        =       &00,&00,&00,&1C,&02,&1E,&22,&1E,&00,&00 ; a
+        =       &00,&20,&20,&3C,&22,&22,&22,&3C,&00,&00 ; b
+        =       &00,&00,&00,&1E,&20,&20,&20,&1E,&00,&00 ; c
+        =       &00,&02,&02,&1E,&22,&22,&22,&1E,&00,&00 ; d
+        =       &00,&00,&00,&1C,&22,&3E,&20,&1C,&00,&00 ; e
+        =       &00,&04,&08,&08,&1C,&08,&08,&08,&00,&00 ; f
+        =       &00,&00,&00,&1E,&22,&22,&22,&1E,&02,&1C ; g
+        =       &00,&20,&20,&3C,&22,&22,&22,&22,&00,&00 ; h
+        =       &00,&08,&00,&18,&08,&08,&08,&1C,&00,&00 ; i
+        =       &00,&08,&00,&08,&08,&08,&08,&08,&08,&10 ; j
+        =       &00,&10,&10,&12,&14,&18,&14,&12,&00,&00 ; k
+        =       &00,&18,&08,&08,&08,&08,&08,&1C,&00,&00 ; l
+        =       &00,&00,&00,&34,&2A,&2A,&2A,&2A,&00,&00 ; m
+        =       &00,&00,&00,&3C,&22,&22,&22,&22,&00,&00 ; n
+        =       &00,&00,&00,&1C,&22,&22,&22,&1C,&00,&00 ; o
+        =       &00,&00,&00,&3C,&22,&22,&22,&3C,&20,&20 ; p
+        =       &00,&00,&00,&1E,&22,&22,&22,&1E,&02,&02 ; q
+        =       &00,&00,&00,&16,&18,&10,&10,&10,&00,&00 ; r
+        =       &00,&00,&00,&1E,&20,&1C,&02,&3C,&00,&00 ; s
+        =       &00,&08,&08,&1C,&08,&08,&08,&04,&00,&00 ; t
+        =       &00,&00,&00,&22,&22,&22,&22,&1E,&00,&00 ; u
+        =       &00,&00,&00,&22,&22,&14,&14,&08,&00,&00 ; v
+        =       &00,&00,&00,&22,&22,&2A,&2A,&14,&00,&00 ; w
+        =       &00,&00,&00,&22,&14,&08,&14,&22,&00,&00 ; x
+        =       &00,&00,&00,&22,&22,&22,&22,&1E,&02,&1C ; y
+        =       &00,&00,&00,&3E,&04,&08,&10,&3E,&00,&00 ; z
+        =       &00,&10,&10,&10,&10,&12,&06,&0A,&0E,&02 ; {
+        =       &00,&14,&14,&14,&14,&14,&14,&14,&00,&00 ; |
+        =       &00,&30,&08,&30,&08,&32,&06,&0A,&0E,&02 ; }
+        =       &00,&00,&08,&00,&3E,&00,&08,&00,&00,&00 ; ~
+        =       &00,&3E,&3E,&3E,&3E,&3E,&3E,&3E,&00,&00 ; &FF
+ ]
+
+        END

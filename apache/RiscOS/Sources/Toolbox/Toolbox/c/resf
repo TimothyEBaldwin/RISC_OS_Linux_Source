@@ -1,0 +1,619 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:    resf.c
+ * Purpose: Resource file processing
+ * Author:  Ian Johnson
+ * History: 22-July-93: IDJ:   created
+ *          22-Apr-94:  IDJ:   module's resources get loaded into a single list.
+ *          18-Dec-94:  IDJ:   bug-fix AQU-00289 - check for module resources already loaded
+ *
+ */
+
+
+#include <string.h>
+#include <stdio.h>
+#include <stddef.h>
+#include "swis.h"
+#include "kernel.h"
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "messages.h"
+#include "objects/toolbox.h"
+
+#include "globals.h"
+
+
+/* --- Toolbox includes --- */
+#include "resf.h"
+#include "task.h"
+#include "object.h"
+
+
+#define NO_ENTRY -1
+
+
+
+#define resf__next_template(t,n) (ResourceFileObjectTemplateHeader *)\
+                                 ((char*)t+\
+                                  offsetof(ResourceFileObjectTemplateHeader, hdr)+\
+                                  t->hdr.total_size+\
+                                  sizeof(int)+\
+                                  (n*sizeof(Relocation)))
+
+
+static resf_Template     *resf__module_templates_list = NULL;
+static resf_ResourceFile *resf__module_resources_list = NULL;
+static BOOL               resf__module_resources      = FALSE;
+
+
+int resource_file_being_loaded = 0;   /* set to non-zero means res file is being loaded:
+                                         used to decide whether to raise an auto-created
+                                         event when object is created.
+                                       */
+
+static int resf__module_swi = 0;      /* used to hold swi no of object module which is
+                                         currently loading its res file
+                                       */
+
+/* ---------------------------------- template handling ------------------------------------- */
+
+static _kernel_oserror *resf__add_to_resources_list (ResourceFileHeader *h, resf_ResourceFile **listhead)
+{
+    /*
+     * Function to add a resource file to the list of resource files loaded.
+     * Module resource files are held in a single, separate list.
+     */
+
+    resf_ResourceFile *new_r;
+
+    DEBUG mem_chk(h, CHECK_NONZERO | CHECK_HEAP);
+    DEBUG mem_chk(listhead, CHECK_NONZERO);
+    DEBUG mem_chk(*listhead, CHECK_HEAP);
+
+    if ((new_r = mem_allocate (sizeof(resf_ResourceFile), "resource file list entry")) == NULL)
+    {
+        return make_error (Toolbox_NoMem, 0);
+    }
+
+    if (resf__module_resources)
+    {
+        new_r->module_swi = resf__module_swi;
+        DEBUG debug_output("modres", "Module resources registered with SWI %x\n", resf__module_swi);
+    }
+
+    new_r->next = *listhead;
+    *listhead = new_r;
+    new_r->hdr = h;
+
+    return NULL;
+}
+
+
+static _kernel_oserror *resf__add_to_templates_list (ObjectTemplateHeader *h, resf_Template **listhead)
+{
+    /*
+     * function to add a new template to the list of available templates for
+     * this task.
+     * Module templates are held in a separate, single list.
+     */
+
+    resf_Template *new_t;
+
+    DEBUG mem_chk(h, CHECK_NONZERO | CHECK_HEAP);
+    DEBUG mem_chk(listhead, CHECK_NONZERO);
+    DEBUG mem_chk(*listhead, CHECK_HEAP);
+
+    if ((new_t = mem_allocate (sizeof(resf_Template), "template name")) == NULL)
+    {
+        return make_error (Toolbox_NoMem, 0);
+    }
+
+    if (resf__module_resources)
+    {
+        new_t->module_swi = resf__module_swi;
+        DEBUG debug_output("modres", "Module templates registered with SWI %x\n", resf__module_swi);
+    }
+
+    new_t->next = *listhead;
+    *listhead = new_t;
+    new_t->hdr = h;
+
+    return NULL;
+}
+
+
+extern void resf_remove_module_resources (int module_swi)
+{
+    /*
+     * Function to remove resources for this object module
+     */
+
+    resf_ResourceFile *r = resf__module_resources_list, *prev_r = r;
+    resf_Template     *t = resf__module_templates_list, *prev_t = t;
+
+    while (r != NULL)
+    {
+        resf_ResourceFile *next = r->next;
+
+        DEBUG mem_chk(r, CHECK_HEAP);
+
+        if (r->module_swi == module_swi)
+        {
+            DEBUG debug_output("modres", "Removing resource file for SWI %x\n", r->module_swi);
+
+            if (r == resf__module_resources_list)
+                resf__module_resources_list = next;
+            else
+            {
+                prev_r->next = next;
+            }
+
+            if (r->hdr != NULL)
+                mem_free ((void *)r->hdr, "removing module resource file buffer");
+
+            mem_free ((void *)r, "removing module resources list");
+        }
+        else
+            prev_r = r;
+
+        r = next;
+    }
+
+
+    while (t != NULL)
+    {
+        resf_Template *next = t->next;
+
+        if (t->module_swi == module_swi)
+        {
+            DEBUG debug_output("modres", "Removing template for SWI %x\n", t->module_swi);
+            if (t == resf__module_templates_list)
+                resf__module_templates_list = next;
+            else
+            {
+                prev_t->next = next;
+            }
+
+            mem_free ((void *)t, "removing module templates list");
+        }
+        else
+            prev_t = t;
+
+        t = next;
+    }
+
+}
+
+
+extern void resf_remove_list (void)
+{
+    /*
+     * Function to remove the resources list and templates list for a task
+     */
+
+    resf_ResourceFile *r = task->resources_list;
+    resf_Template     *t = task->templates_list;
+
+    while (r != NULL)
+    {
+        resf_ResourceFile *next = r->next;
+
+        DEBUG mem_chk(r, CHECK_HEAP);
+
+        if (r->hdr != NULL)
+            mem_free ((void *)r->hdr, "removing resource file buffer");
+
+        mem_free ((void *)r, "removing resources list");
+
+        r = next;
+    }
+    task->resources_list = NULL;
+
+    while (t != NULL)
+    {
+        resf_Template *next = t->next;
+
+        mem_free ((void *)t, "removing templates list");
+
+        t = next;
+    }
+    task->templates_list = NULL;
+
+}
+
+
+extern ObjectTemplateHeader *resf_find_template (char *name)
+{
+    /*
+     * Function to return a pointer to a template header, given a
+     * template name.  First we look in the current task's list, then
+     * we try the list of "module" templates.
+     */
+
+    resf_Template *t = task->templates_list;
+
+    DEBUG debug_output ("resf_find", "T:Looking for %s\n", name);
+
+    while (t != NULL)
+    {
+        DEBUG mem_chk(t, CHECK_HEAP);
+
+        if (!strcmp (name, t->hdr->name))
+            return t->hdr;
+
+        t = t->next;
+    }
+
+    t = resf__module_templates_list;
+
+    while (t != NULL)
+    {
+        DEBUG mem_chk(t, CHECK_HEAP);
+
+        if (!strcmp (name, t->hdr->name))
+            return t->hdr;
+
+        t = t->next;
+    }
+
+    return NULL;
+}
+
+
+/* ------------------------------- loading a Resource File ---------------------------------- */
+
+static _kernel_oserror *resf__relocate_object (ResourceFileObjectTemplateHeader *header, void *sprite_area)
+{
+    /*
+     * Function to relocate a Resource File Object Template.  The template is in memory pointed at by
+     * header, and the sprite_area is the one allocated by Toolbox_Initialise.
+     * Relocations are:
+     *      1   StringReference     -- add base of strings table
+     *      2   MessageReference    -- add base of messages table
+     *      3   SpriteAreaReference -- set to point at sprite_area
+     *      4   ObjectOffset        -- add address of object hdr
+     *
+     * An Object template has its tables following its body in memory,
+     * so each object template is thus:
+     *
+     *             string table offset
+     *             msgs table offset
+     *             relocs table offset
+     *             object header
+     *             (possible gap)
+     *             object body
+     *             (possible gap)
+     *             string table
+     *             messages table
+     *             relocs table
+     * All offsets are from the start of the object template.
+     *
+     * On exit from this function, the block of memory is in a format suitable for use
+     * to create an Object from.
+     *
+     */
+
+    char *template_base       = (char *)header;
+    char *string_table_base   = template_base + header->string_table_offset;
+    char *message_table_base = template_base + header->message_table_offset;
+    RelocationTable *table    = (RelocationTable *)(template_base + header->relocation_table_offset);
+
+    /*
+     * first we need to relocate things in the object header:
+     *    object body == given as offset, we change it to a real pointer
+     *
+     */
+
+    DEBUG mem_chk(header, CHECK_HEAP | CHECK_NONZERO);
+
+    DEBUG debug_output ("relocate", "T:Relocating object of class %x\n", header->hdr.class_id);
+
+    header->hdr.body = (void *)((int)header->hdr.body + (char *)&header->hdr);
+
+    DEBUG debug_output ("relocate", "T:Body @ %p\n", header->hdr.body);
+
+    /* --- do the relocations from relocation table --- */
+    if (header->relocation_table_offset != NO_ENTRY)
+    {
+        int r;
+        int nrelocs = table->num_relocations;
+        Relocation *reloc_table = table->relocations;
+
+        DEBUG debug_output ("relocate", "T:%d relocations\n", nrelocs);
+
+        for (r = 0; r < nrelocs; r++)
+        {
+            int *word_to_relocate = (int *)((char *)(header->hdr.body) + reloc_table[r].word_to_relocate);
+
+            DEBUG mem_chk(word_to_relocate, CHECK_HEAP | CHECK_NONZERO);
+
+            switch (reloc_table[r].directive)
+            {
+                case Relocate_StringReference:
+                    DEBUG debug_output ("relocate", "T:(String) @ %p to %p\n", word_to_relocate, (int*)(*word_to_relocate+(int)string_table_base));
+                    if (*word_to_relocate == -1)
+                        *word_to_relocate = 0;
+                    else
+                        *word_to_relocate += (int)string_table_base;
+                    break;
+
+                case Relocate_MsgReference:
+                    DEBUG debug_output ("relocate", "T:(Message) @ %p to %p\n", word_to_relocate, (int*)(*word_to_relocate+(int)message_table_base));
+                    if (*word_to_relocate == -1)
+                        *word_to_relocate = 0;
+                    else
+                        *word_to_relocate += (int)message_table_base;
+                    break;
+
+                case Relocate_SpriteAreaReference:
+                    DEBUG debug_output ("relocate", "T:(Sprite)\n @ %p to %p\n", word_to_relocate, (int *)sprite_area);
+                    if (*word_to_relocate == -1)
+                        *word_to_relocate = 1;     /* wimp sprite area */
+                    else
+                        *word_to_relocate = (int)sprite_area;
+                    break;
+
+                case Relocate_ObjectOffset:
+                    DEBUG debug_output ("relocate", "T:(ObjectOffset) @ %p to %p\n", word_to_relocate, (int*)(*word_to_relocate+(int)header->hdr.body));
+                    if (*word_to_relocate == -1)
+                        *word_to_relocate = 0;
+                    else
+                        *word_to_relocate += (int)header->hdr.body;
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+
+    return 0;
+}
+
+
+
+extern _kernel_oserror *resf_template_lookup (_kernel_swi_regs *r)
+{
+    /*
+     * Function to lookup a given template and return a pointer to its
+     * object header (to the client) - just uses the function resf_find_template.
+     *
+     */
+
+    ObjectTemplateHeader *h = resf_find_template ((char *)r->r[1]);
+
+    r->r[0] = (int)h;
+
+    return NULL;
+}
+
+
+extern void resf_module_resources (void)
+{
+    resf__module_resources = TRUE;
+}
+
+extern void resf_module_swi (int swi_no)
+{
+    resf__module_swi = swi_no;
+}
+
+
+extern _kernel_oserror *resf_load_resource_file (_kernel_swi_regs *r)
+{
+    /*
+     * Function to load a resource file into memory.  The file is relocated, and then
+     * the memory block is linked to the calling task's list of templates
+     *
+     */
+
+    _kernel_oserror                  *e;
+    _kernel_swi_regs                  regs;
+    ResourceFileHeader               *buffer;
+    ResourceFileObjectTemplateHeader *t_hdr;
+    int                               buffer_size;
+    ResourceFileObjectTemplateHeader *eof;
+    resf_Template                    *old_templates_list = NULL, *t;
+    void                             *sprite_area;
+
+
+    resource_file_being_loaded = 1;
+
+    /*
+     * get sprite area used by this task for use in sprite references
+     */
+
+    if (!resf__module_resources)
+    {
+        regs.r[0] = Toolbox_GetSysInfo_SpriteArea;
+        if ((e = _kernel_swi (Toolbox_GetSysInfo, &regs, &regs)) != NULL)
+        {
+            resource_file_being_loaded = 0;
+            return e;
+        }
+        sprite_area = (void *)regs.r[0];
+    }
+    else
+        sprite_area = (void *)1;  /* wimp sprite area */
+
+
+    /*
+     * allocate a buffer for the file
+     */
+
+    regs.r[0] = 17;             /* no path */
+    regs.r[1] = r->r[1];        /* filename */
+
+    if ((e = _kernel_swi (OS_File, &regs, &regs)) != NULL)
+        goto error;
+
+    if (regs.r[0] == 1)   /* file found */
+    {
+        buffer_size = regs.r[4];
+        if ((buffer = mem_allocate (buffer_size, "buffer for resources")) == 0)
+        {
+                e = make_error (Toolbox_NoMem, 0);
+                goto error;
+        }
+    }
+    else
+    {
+        resource_file_being_loaded = 0;
+        return make_error (Toolbox_BadResFile, 0);
+    }
+
+    /*
+     * load resource file into buffer
+     */
+
+    regs.r[0] = 16;   /* no path */
+    regs.r[1] = r->r[1];     /* filename */
+    regs.r[2] = (int)buffer;
+    regs.r[3] = 0;    /* load at given address */
+
+    if ((e = _kernel_swi (OS_File, &regs, &regs)) != NULL)
+        goto error_free_memory;
+
+
+    /* check res file vsn and resf id here */
+
+#define magic_RESF 0x46534552
+    if (buffer->file_id != magic_RESF)
+    {
+        e = make_error (Toolbox_NotaResFile, 0);
+        goto error_free_memory;
+    }
+
+    if (buffer->version_number > ResourceFileVersion)
+    {
+        e = make_error_hex (Toolbox_BadResFileVersion, 1, buffer->version_number);
+        goto error_free_memory;
+    }
+
+    /*
+     * remember the old templates list, so that we can determine which
+     * are new ones, later when we go through to see which objects should
+     * be auto-created
+     */
+
+    if (!resf__module_resources)
+        old_templates_list = task->templates_list;
+
+
+    /*
+     * relocate Resource file:
+     *    take each object in turn and:
+     *        relocate it
+     *        add its templates to the list of known templates
+     *
+     */
+
+    t_hdr = (ResourceFileObjectTemplateHeader *)((char *)buffer + buffer->object_offset);
+    eof   = (ResourceFileObjectTemplateHeader *)((char *)buffer + buffer_size);
+
+    DEBUG mem_chk(t_hdr, CHECK_HEAP | CHECK_NONZERO);
+    DEBUG debug_output ("resf_load", "T:t_hdr %p eof %p\n", t_hdr, eof);
+
+    while (t_hdr < eof && buffer->object_offset != NO_ENTRY)
+    {
+        int nrelocs = ((RelocationTable *)((char*)t_hdr + t_hdr->relocation_table_offset))->num_relocations;
+
+        DEBUG debug_output ("resf_load", "T:t_hdr now %p\n", t_hdr);
+
+        if ((e = resf__relocate_object (t_hdr, sprite_area)) != NULL)
+            goto error_free_memory;
+
+        if (resf__module_resources)
+        {
+            if ((e = resf__add_to_templates_list (&t_hdr->hdr, &resf__module_templates_list)) != NULL)
+                goto error_free_memory;
+        }
+        else
+        {
+            if ((e = resf__add_to_templates_list (&t_hdr->hdr, &task->templates_list)) != NULL)
+                goto error_free_memory;
+        }
+
+        t_hdr = resf__next_template (t_hdr, nrelocs);
+    }
+
+
+    /*
+     * now we go through all the newly loaded templates, creating objects
+     * from the ones which have the auto-create bit set.
+     *
+     */
+
+    if (!resf__module_resources)
+    {
+        t = task->templates_list;
+
+        DEBUG mem_chk(t, CHECK_HEAP);
+
+        while (t != NULL && t != old_templates_list)
+        {
+            _kernel_swi_regs regs;
+
+            DEBUG mem_chk(t, CHECK_HEAP);
+            DEBUG debug_output ("resf_load", "T:Looking at %s\n", t->hdr->name);
+
+            if (t->hdr->flags & Object_CreateOnLoad)
+            {
+                regs.r[0] = Toolbox_CreateObject_InCore;
+                regs.r[1] = (int)t->hdr;
+
+                DEBUG debug_output ("resf_load", "T:Auto-creating %s\n", t->hdr->name);
+
+                if ((e = object_create (&regs)) != NULL)
+                    goto error_free_memory;
+            }
+
+            t = t->next;
+        }
+    }
+
+
+    /*
+     * add to list of resource files for this task (or for module)
+     */
+
+    if (resf__module_resources)
+    {
+        if ((e = resf__add_to_resources_list (buffer, &resf__module_resources_list)) != NULL)
+            goto error_free_memory;
+    }
+    else
+    {
+        if ((e = resf__add_to_resources_list (buffer, &task->resources_list)) != NULL)
+            goto error_free_memory;
+    }
+
+    resf__module_resources = FALSE;
+    resource_file_being_loaded = 0;
+    return NULL;
+
+
+error_free_memory:
+    DEBUG mem_chk(buffer, CHECK_HEAP | CHECK_NONZERO);
+    mem_free(buffer, "Freeing resource file block after load error");
+
+error:
+    resf__module_resources = FALSE;
+    resource_file_being_loaded = 0;
+    return e;
+}

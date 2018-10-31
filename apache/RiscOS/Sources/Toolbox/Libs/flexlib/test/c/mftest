@@ -1,0 +1,865 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* This is a program to test malloc and flex. It reads simple commands
+from an input file and executes calls to the malloc and flex system
+under their control. Each block of store is filled with a byte pattern,
+and all blocks are checked for corruption after each operation.
+
+Written by Philip Hazel, March 1993. */
+
+
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "flex.h"
+#include "kernel.h"
+
+#define maxblocks 2000
+#define maxrepeat  100
+
+#define Wimp_SlotSize  0x400ec
+
+
+/* Structure for remembering store blocks */
+
+typedef struct {
+  int *address;
+  int length;
+  int filler;
+} block;
+
+
+
+/* The input file */
+
+FILE *infile;
+
+/* Vectors for keeping track of up to n blocks */
+
+block malloc_blocks[2000];
+block flex_blocks[2000];
+
+/* Pointers in same */
+
+int next_malloc = 0;
+int next_flex = 0;
+
+/* The next block's filler word */
+
+int filler = 0x12345678;
+
+/* The current line number */
+
+int linecount = 0;
+
+/* Repeat information vectors */
+
+long int repeat_position[maxrepeat];
+int repeat_count[maxrepeat];
+int repeat_left[maxrepeat];
+int repeat_ptr = 0;
+
+/* Registers for SWI calls */
+
+_kernel_swi_regs swi_regs;
+
+
+
+
+/*************************************************
+*          Call SWI and check for error          *
+*************************************************/
+
+int SWI(int swi, int count, ...)
+{
+int i;
+_kernel_oserror *error;
+va_list ap;
+va_start(ap, count);
+
+for (i = 0; i < count; i++) swi_regs.r[i] = va_arg(ap, int);
+
+error = _kernel_swi(swi, &swi_regs, &swi_regs);
+if (error != NULL)
+  {
+  printf("Error %d (%s) when calling SWI %d", error->errnum, error->errmess, swi);
+  exit(EXIT_FAILURE);
+  }
+
+va_end(ap);
+return swi_regs.r[0];  /* Commonly needed value */
+}
+
+
+
+/*************************************************
+*          Give error on corruption              *
+*************************************************/
+
+static void corrupt(char *s, char *w, block *b, int offset,
+  int found, int expected)
+{
+printf("** Validation error in %s block (%s)\n", s, w);
+printf("   Address = &%x length = %d (&%x)  Error at byte %d (&%x)\n",
+  (int)b->address, b->length, b->length, offset, offset);
+printf("   Expected &%x but found &%x\n", expected, found);
+}
+
+
+
+
+/*************************************************
+*         Check for corruption                   *
+*************************************************/
+
+static int check_memory(char *w)
+{
+int i;
+for (i = 0; i < next_malloc; i++)
+  {
+  block *b = malloc_blocks + i;
+  int *p = b->address;
+  int j = b->length / 4;
+  int c = b->filler;
+
+  while (j--) if (*p++ != c)
+    {
+    corrupt("malloc", w, b, sizeof(int)*(p - b->address - 1), p[-1], c);
+    return 1;
+    }
+
+  if ((j = b->length % 4) != 0)
+    {
+    char *pp = (char *)p;
+    int cc = c & 255;
+    while (j--) if (*pp++ != cc)
+      {
+      corrupt("malloc", w, b, pp - (char *)(b->address) - 1, pp[-1], cc);
+      return 1;
+      }
+    }
+  }
+
+for (i = 0; i < next_flex; i++)
+  {
+  block *b = flex_blocks + i;
+  int *p = b->address;
+  int j = b->length / 4;
+  int c = b->filler;
+
+  if ((int)p == -1) continue;   /* skip unused blocks */
+
+  while (j--) if (*p++ != c)
+    {
+    corrupt("flex", w, b, sizeof(int)*(p - b->address - 1), p[-1], c);
+    return 1;
+    }
+
+  if ((j = b->length % 4) != 0)
+    {
+    char *pp = (char *)p;
+    int cc = c & 255;
+    while (j--) if (*pp++ != cc)
+      {
+      corrupt("flex", w, b, pp - (char *)(b->address) - 1, pp[-1], cc);
+      return 1;
+      }
+    }
+  }
+
+return 0;
+}
+
+
+/*************************************************
+*             Fill block with data               *
+*************************************************/
+
+static void fill_block(block *b)
+{
+int i;
+int *p = b->address;
+for (i = 0; i < b->length/4; i++) *p++ = filler;
+if ((i = b->length %4) != 0)
+  {
+  char *pp = (char *)p;
+  int c = filler & 255;
+  while (i--) *pp++ = c;
+  }
+b->filler = filler;
+filler = rand();
+}
+
+
+
+
+/*************************************************
+*         Read size value from command line      *
+*************************************************/
+
+static char *read_size(char *p, int *value, char *cmd)
+{
+int n;
+if (sscanf(p, "%d%n", value, &n) != 1)
+  {
+  if (*p == '\n') return NULL;
+  printf("** Failed to decode \"%s\" argument in line %d:\n%s",
+    cmd, linecount, p);
+  return (char *)(-1);
+  }
+
+p += n;
+if (*p == 'k' || *p == 'K')
+  {
+  *value *= 1024;
+  p++;
+  }
+else if (*p == 'm' || *p == 'M')
+  {
+  *value *= 1024*1024;
+  p++;
+  }
+
+return p;
+}
+
+
+
+
+
+/*************************************************
+*         Corrupt a byte for testing             *
+*************************************************/
+
+static int do_corrupt(char *p, char *s)
+{
+int size, offset, next, n;
+char *cc;
+block *b;
+
+if ((p = read_size(p, &size, "m/fcorrupt")) == NULL)
+  {
+  printf("** Size missing from m/fcorrupt\n");
+  return 1;
+  }
+if (p == (char *)(-1)) return 1;
+
+if ((p = read_size(p, &offset, "m/fcorrupt")) == NULL)
+  {
+  printf("** Offset missing from m/fcorrupt\n");
+  return 1;
+  }
+if (p == (char *)(-1)) return 1;
+
+if (offset >= size)
+  {
+  printf("** Offset (%d) greater than size (%d) in m/fcorrupt in line %d\n",
+    offset, size, linecount);
+  return 1;
+  }
+
+if (strcmp(s, "flex") == 0)
+  {
+  next = next_flex;
+  for (n = 0; n < next_flex; n++)
+    {
+    b = flex_blocks + n;
+    if (b->address != (int *)(-1) && b->length == size) break;
+    }
+  }
+else
+  {
+  next = next_malloc;
+  for (n = 0; n < next_malloc; n++)
+    {
+    b = malloc_blocks + n;
+    if (b->length == size) break;
+    }
+  }
+
+if (n >= next)
+  {
+  printf("** Unable to find %s block of size %d to corrupt in line %d\n",
+    s, size, linecount);
+  return 1;
+  }
+
+cc = (char *)(b->address);
+cc[offset] = cc[offset] +1;
+
+return 0;
+}
+
+
+
+/*************************************************
+*         Handle call to stack                   *
+*************************************************/
+
+/* This function has to call subroutines recursively to get
+stacks of certain sizes allocated */
+
+static void stack1k(int size)
+{
+char dummy[1024];
+dummy[0] = size & 255;
+
+if (size > 1024) stack1k(size - 1024);
+}
+
+static void stack10k(int size)
+{
+char dummy[10240];
+dummy[0] = size & 255;
+if (size > 20480) stack10k(size - 10240);
+  else stack1k(size - 10240);
+}
+
+
+static int do_stack(char *p)
+{
+if (check_memory("before stack")) return 1;
+for (;;)
+  {
+  int size;
+  if ((p = read_size(p, &size, "stack")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+  if (size > 10240) stack10k(size); else stack1k(size);
+  if (check_memory("after stack")) return 1;
+  }
+return 0;
+}
+
+
+
+/*************************************************
+*         Handle call to malloc                  *
+*************************************************/
+
+static int do_malloc(char *p)
+{
+if (check_memory("before malloc")) return 1;
+for (;;)
+  {
+  int size;
+  block *b;
+
+  if ((p = read_size(p, &size, "malloc")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+
+  if (next_malloc >= maxblocks)
+    {
+    printf("** Attempt to get more than %d malloc blocks\n", maxblocks);
+    return 1;
+    }
+  b = malloc_blocks + next_malloc++;
+
+  if ((b->address = malloc(size)) == NULL)
+    {
+    printf("** Malloc failed for %d bytes\n", size);
+    return 1;
+    }
+  b->length = size;
+  fill_block(b);
+  if (check_memory("after malloc")) return 1;
+  }
+
+return 0;
+}
+
+
+
+/*************************************************
+*            Handle call to mfree                *
+*************************************************/
+
+static int do_mfree(char *p)
+{
+if (check_memory("before mfree")) return 1;
+for (;;)
+  {
+  int size, n;
+
+  if ((p = read_size(p, &size, "mfree")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+
+  for (n = 0; n < next_malloc; n++)
+    {
+    if (malloc_blocks[n].length == size) break;
+    }
+
+  if (n >= next_malloc)
+    {
+    printf("** Unable to find malloc block of size %d to free in line %d\n",
+      size, linecount);
+    return 1;
+    }
+
+  free(malloc_blocks[n].address);
+  for (; n < next_malloc - 1; n++) malloc_blocks[n] = malloc_blocks[n+1];
+  next_malloc--;
+  if (check_memory("after mfree")) return 1;
+  }
+
+return 0;
+}
+
+
+
+
+/*************************************************
+*         Handle call to flex                    *
+*************************************************/
+
+static int do_flex(char *p)
+{
+if (check_memory("before flex")) return 1;
+for (;;)
+  {
+  int size, n;
+  block *b;
+
+  if ((p = read_size(p, &size, "flex")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+
+  /* Find an unused block if any, else take the next one */
+
+  for (n = 0; n < next_flex; n++)
+    if (flex_blocks[n].address == (int *)(-1)) break;
+
+  if (n >= next_flex)
+    {
+    if (next_flex >= maxblocks)
+      {
+      printf("** Attempt to get more than %d flex blocks\n", maxblocks);
+      return 1;
+      }
+    b = flex_blocks + next_flex++;
+    }
+  else b = flex_blocks + n;
+
+  if (flex_alloc((flex_ptr)(&(b->address)), size) == 0)
+    {
+    printf("** Flex failed for %d bytes\n", size);
+    return 1;
+    }
+
+  b->length = flex_size((flex_ptr)(&(b->address)));
+  fill_block(b);
+  if (check_memory("after flex")) return 1;
+  }
+
+return 0;
+}
+
+
+
+
+/*************************************************
+*            Handle call to ffree                *
+*************************************************/
+
+static int do_ffree(char *p)
+{
+if (check_memory("before ffree")) return 1;
+for (;;)
+  {
+  int size, n;
+
+  if ((p = read_size(p, &size, "mfree")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+
+  for (n = 0; n < next_flex; n++)
+    {
+    if (flex_blocks[n].address != (int *)(-1) &&
+      flex_blocks[n].length == size) break;
+    }
+
+  if (n >= next_flex)
+    {
+    printf("** Unable to find flex block of size %d to free in line %d\n",
+      size, linecount);
+    return 1;
+    }
+
+  flex_free((flex_ptr)(&(flex_blocks[n].address)));
+
+  /* For flex, you can't move the blocks down to fill the gaps,
+  because the address field is known to the flex system. We use
+  -1 to indicate an empty slot. */
+
+  flex_blocks[n].address = (int *)(-1);
+  if (check_memory("after ffree")) return 1;
+  }
+
+return 0;
+}
+
+
+
+
+/*************************************************
+*            Handle call to flexextend           *
+*************************************************/
+
+static int do_flexextend(char *p)
+{
+if (check_memory("before flexextend")) return 1;
+for (;;)
+  {
+  int size, newsize, n;
+  block *b;
+
+  if ((p = read_size(p, &size, "flexextend")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+  if ((p = read_size(p, &newsize, "flexextend")) == NULL)
+    {
+    printf("** New size missing from flexextend\n");
+    return 1;
+    }
+  if (p == (char *)(-1)) return 1;
+
+  for (n = 0; n < next_flex; n++)
+    {
+    b = flex_blocks + n;
+    if (b->address != (int *)(-1) && b->length == size) break;
+    }
+
+  if (n >= next_flex)
+    {
+    printf("** Unable to find flex block of size %d to extend in line %d\n",
+      size, linecount);
+    return 1;
+    }
+
+  if (flex_extend((flex_ptr)(&(b->address)), newsize) != 1)
+    {
+    printf("** Failed to extend flex block of size %d to %d in line %d\n",
+      size, newsize, linecount);
+    return 1;
+    }
+
+  b->length = newsize;
+  fill_block(b);
+  if (check_memory("after flexextend")) return 1;
+  }
+
+return 0;
+}
+
+
+
+
+
+
+/*************************************************
+*            Handle call to flexmidextend        *
+*************************************************/
+
+static int do_flexmidextend(char *p)
+{
+if (check_memory("before flexmidextend")) return 1;
+for (;;)
+  {
+  int size, newsize, at, by, n;
+  int sign = 1;
+  block *b;
+
+  if ((p = read_size(p, &size, "flexmidextend")) == NULL) break;
+  if (p == (char *)(-1)) return 1;
+
+  if ((p = read_size(p, &at, "flexmidextend")) == NULL)
+    {
+    printf("** Offset missing from flexmidextend\n");
+    return 1;
+    }
+  if (p == (char *)(-1)) return 1;
+
+  while (*p == ' ') p++;
+  if (*p == '-') { sign = -1; p++; }
+
+  if ((p = read_size(p, &by, "flexmidextend")) == NULL)
+    {
+    printf("** Amount missing from flexmidextend\n");
+    return 1;
+    }
+  if (p == (char *)(-1)) return 1;
+
+  by *= sign;
+
+  for (n = 0; n < next_flex; n++)
+    {
+    b = flex_blocks + n;
+    if (b->address != (int *)(-1) && b->length == size) break;
+    }
+
+  if (n >= next_flex)
+    {
+    printf("** Unable to find flex block of size %d to mid-extend in line %d\n",
+      size, linecount);
+    return 1;
+    }
+
+  if (flex_midextend((flex_ptr)(&(b->address)), at, by) != 1)
+    {
+    printf("** Failed to mid-extend flex block of size %d at %d by %d in line %d\n",
+      size, at, by, linecount);
+    return 1;
+    }
+
+  newsize = size + by;
+
+  b->length = newsize;
+  fill_block(b);
+  if (check_memory("after flexmidextend")) return 1;
+  }
+
+return 0;
+}
+
+
+
+
+
+/*************************************************
+*        Set/unset flex budging                  *
+*************************************************/
+
+static int do_flexbudge(char *p)
+{
+char word[100];
+if (sscanf(p, "%s", word) != 1)
+  {
+  printf("** Missing argument for flexbudge in line %d:\n", linecount);
+  return 1;
+  }
+
+if (strcmp(word, "on") == 0)
+  {
+  _kernel_register_slotextend(flex_budge);
+  }
+else if (strcmp(word, "off") == 0)
+  {
+  _kernel_register_slotextend(flex_dont_budge);
+  }
+else
+  {
+  printf("** Unknown argument \"%s\" for flexbudge in line %d\n",
+    word, linecount);
+  return 1;
+  }
+return 0;
+}
+
+
+
+
+/*************************************************
+*           Echo text with substitution          *
+*************************************************/
+
+static int do_echo(char *p)
+{
+while (*p == ' ') p++;
+
+while (*p != 0)
+  {
+  int c = *p++;
+  if (c == '%')
+    {
+    c = *p++;
+    if (c == '%') fputc(c, stdout);
+    else if (c == 's')
+      {
+      int size = SWI(Wimp_SlotSize, 2, -1, -1);
+      int k = size/1024;
+      int rem = size % 1024;
+      printf("%dK", k);
+      if (rem) printf("%d", rem);
+      }
+    else
+      {
+      int n = 0;
+      while (isdigit(c))
+        {
+        n = n*10 + c - '0';
+        c = *p++;
+        }
+      if (n < repeat_ptr) printf("%d",
+        repeat_count[repeat_ptr - n - 1] -
+        repeat_left [repeat_ptr - n - 1] + 1);
+      p--;
+      }
+    }
+  else fputc(c, stdout);
+  }
+
+return 0;
+}
+
+
+
+
+/*************************************************
+*             Start of repeat                    *
+*************************************************/
+
+static int do_repeat(char *p)
+{
+if (repeat_ptr >= maxrepeat)
+  {
+  printf("** Too deeply nested repeats: max depth is %d\n", maxrepeat);
+  return 1;
+  }
+
+if (sscanf(p, "%d", repeat_count+repeat_ptr) != 1)
+  {
+  printf("** Failed to decode repeat argument in line %d:\n%s",
+    linecount, p);
+  return 1;
+  }
+
+repeat_left[repeat_ptr] = repeat_count[repeat_ptr];
+repeat_position[repeat_ptr] = ftell(infile);
+
+if (repeat_position[repeat_ptr] == -1L)
+  {
+  printf("** Cannot save file position in input file for repeat command"
+    " in line %d\n", linecount);
+  return 0;
+  }
+
+repeat_ptr++;
+return 0;
+}
+
+
+
+/*************************************************
+*             Loop repeater                      *
+*************************************************/
+
+static int do_loop(char *p)
+{
+if (repeat_ptr <= 0)
+  {
+  printf("** Unexpected loop command in line %d\n", linecount);
+  return 1;
+  }
+
+if (repeat_left[repeat_ptr-1]-- > 1)
+  {
+  if (fseek(infile, repeat_position[repeat_ptr-1], SEEK_SET))
+    {
+    printf("** fseek failed on input file for loop command in line %d\n",
+      linecount);
+    return 1;
+    }
+  }
+else repeat_ptr--;
+return 0;
+}
+
+
+
+
+
+
+/*************************************************
+*          Entry point and main program          *
+*************************************************/
+
+int main(int argc, char **argv)
+{
+int i;
+int yield = 0;
+char buffer[256];
+
+printf("Malloc/flex tester version 1.0\n");
+flex_init("Flex Test", 0);
+srand(filler);
+
+if (argc < 2) infile = stdin; else infile = fopen(argv[1], "r");
+if (infile == NULL)
+  {
+  printf("** Failed to open \"%s\"\n", argv[1]);
+  yield = 1;
+  }
+
+while (yield == 0 && fgets(buffer, 256, infile) != NULL)
+  {
+  char *p = buffer;
+  int n;
+  char word[20];
+
+  linecount++;
+  if (buffer[0] == '\n' || buffer[0] == '#') continue;
+
+  if (sscanf(p, "%s%n", word, &n) != 1)
+    {
+    printf("** Missing command word in line %d:\n%s", linecount, buffer);
+    yield = 1;
+    break;
+    }
+
+       if (strcmp(word, "malloc") == 0)  yield = do_malloc(p+n);
+  else if (strcmp(word, "mfree")  == 0)  yield = do_mfree(p+n);
+  else if (strcmp(word, "mcorrupt")== 0) yield = do_corrupt(p+n, "malloc");
+  else if (strcmp(word, "flex")   == 0)  yield = do_flex(p+n);
+  else if (strcmp(word, "flexbudge") == 0) yield = do_flexbudge(p+n);
+  else if (strcmp(word, "flexextend") == 0) yield = do_flexextend(p+n);
+  else if (strcmp(word, "flexmidextend") == 0) yield = do_flexmidextend(p+n);
+  else if (strcmp(word, "ffree")  == 0)  yield = do_ffree(p+n);
+  else if (strcmp(word, "fcorrupt") ==0) yield = do_corrupt(p+n, "flex");
+  else if (strcmp(word, "echo")   == 0)  yield = do_echo(p+n);
+  else if (strcmp(word, "repeat") == 0)  yield = do_repeat(p+n);
+  else if (strcmp(word, "loop")   == 0)  yield = do_loop(p+n);
+  else if (strcmp(word, "stack")  == 0)  yield = do_stack(p+n);
+  else
+    {
+    printf("** Unknown command \"%s\" in line %d\n", word, linecount);
+    yield =1;
+    }
+  }
+
+if (infile != NULL) fclose(infile);
+printf("Malloc/flex tester finishing\n");
+
+printf("Malloc blocks left: ");
+for (i = 0; i < next_malloc; i++)
+  {
+  block *b = malloc_blocks + i;
+  printf("%d ", b->length);
+  }
+
+printf("\nFlex blocks left:   ");
+for (i = 0; i < next_flex; i++)
+  {
+  block *b = flex_blocks + i;
+  if ((int)(b->address) == -1) continue;
+  printf("%d ", b->length);
+  }
+printf("\n");
+return yield;
+}
+
+/* End of mftest.c */
+
+
+
+

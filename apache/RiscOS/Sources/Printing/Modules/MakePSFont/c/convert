@@ -1,0 +1,884 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -*-C-*-
+ * Make a PostScript font from an Acorn font.
+ *
+ * Need to check correctness of encoding(s) before writing anything!
+ * Need to check for write failure!
+ */
+
+#include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
+
+#include "module.h"
+#include "convert.h"
+#include "modulefp.h"
+#include "VersionNum"
+
+#define CHARF_12BITCOORDS       (1 << 0)
+#define CHARF_OUTLINE           (1 << 3)
+#define CHARF_COMPOSITE         (1 << 4)
+#define CHARF_ACCENT            (1 << 5)
+#define CHARF_16BITINDICES      (1 << 6)
+
+extern int get_angle(int);
+
+static char buildchar[] =
+"/BuildGlyph {\n"
+"  exch begin\n"
+"    CharProcs exch 2 copy\n"
+"    known not {pop /.notdef} if\n"
+"    get\n"
+"    true exch\n"
+"    FontInfo /decode85 get begin\n"
+"      exec\n"
+"    end\n"
+"  end\n"
+"} bind def\n"
+"/BuildChar {\n"
+"  1 index /Encoding get\n"
+"  exch get\n"
+"  1 index /BuildGlyph get  exec\n"
+"} bind def\n";
+
+static char decode85[] =
+"  /decode85 11 dict def  decode85 begin\n"
+"    /str 0 def  /ind 0 def\n"
+"    /getc {str  ind dup 1 add /ind exch store  get} bind def\n"
+"    /getn {getc 42 sub  getc 42 sub  85 mul  add  3500 sub} bind def\n"
+"    101 {PaintType 0 eq {%s} {StrokeWidth setlinewidth stroke} ifelse exit} bind def\n"
+"    109 {getn getn moveto} bind def\n"
+"    108 {getn getn lineto} bind def\n"
+"    99 {getn getn getn getn getn getn curveto} bind def\n"
+"    112 {closepath} bind def\n"
+"    /D85 {/str exch store  /ind 0 store  {getc load exec} loop} bind def\n"
+"    /SCD {setcachedevice} bind def\n"
+"  end\n";
+
+static int designsize;          /* des size of last Outlines read in */
+
+/* Set by skip_char_header() */
+static char charflags;
+static int coordsize;           /* 2 or 3 (bytes) */
+static int indexsize;           /* 1 or 2 (bytes) */
+
+
+typedef struct { int x0, y0, x1, y1; } BBoxRec, *BBoxPtr;
+
+typedef struct
+{
+    char name[40];
+    int pad1, pad2;
+    unsigned char nlo;
+    unsigned char version;
+    unsigned char flags;
+    unsigned char nhi;
+} MetricsHeaderRec, *MetricsHeaderPtr;
+
+#define MINSIZE_METRICS (sizeof(MetricsHeaderRec))
+
+
+typedef struct
+{
+    MetricsHeaderPtr header;
+    int numchars;
+    int mapsize;                /* 0 for no map table */
+    unsigned char *map;         /* meaningless if mapsize == 0 */
+    short *widths;              /* NULL if none */
+    short def_width;            /* used if widths == NULL */
+    short *heights;             /* NULL if none */
+    short def_height;           /* used if heights == NULL */
+    signed int under_pos;       /* 1000th em */
+    unsigned int under_thick;   /* 1000th em */
+    int italic_angle;           /* degrees, scaled up x100 */
+} MetricsRec, *MetricsPtr;
+
+
+typedef struct
+{
+    char font[4];               /* F O N T */
+    unsigned char bpp;          /* 0 for outlines */
+    unsigned char version;
+    unsigned short designsize;
+    short bbox_x0, bbox_y0;     /* font bounding box */
+    short bbox_w, bbox_h;
+    union
+    {
+        int pre_v8[9];          /* 8 chunks referenced here */
+        struct
+        {
+            int area_offset;    /* file offset of array holding chunk offsets */
+            int num_chunks;
+            int nscafs;
+            int scafflags;
+            int pad[5];
+        } v8;
+    } chunks;
+    unsigned short tablesize;   /* &tablesize is "table start" */
+    /* ... much more follows, but we'll have to grub that out by hand */
+} OutlinesHeaderRec, *OutlinesHeaderPtr;
+
+#define MINSIZE_OUTLINES (sizeof(OutlinesHeaderRec))
+
+
+typedef struct
+{
+    OutlinesHeaderPtr header;
+    int nchunks;
+    int *chunkindex;
+} OutlinesRec, *OutlinePtr;
+
+
+typedef struct
+{
+    int ntotal;                 /* total number in encoding */
+    int ndistinct;              /* number of different names */
+    char *data;                 /* the whole file */
+    char **name;                /* ptrs to all glyphs */
+    int  *distinct;             /* indices in above of distinct glyphs */
+} EncodingRec, *EncodingPtr;
+
+
+/* Find the type of a file, or -1 for problems */
+
+#define TOP12    0xfff00000
+#define TYPEMSK  0x000fff00
+#define TYPESHFT 8
+
+static int filetype (char *filename)
+{
+    int type, flags;
+    _swix (OS_File, _INR(0,1) | _OUT(0) | _OUT(2),
+           OSFile_ReadNoPath, filename, &type, &flags);
+    if (type != object_file || (flags & TOP12) != TOP12)
+        return -1;
+    return (flags & TYPEMSK) >> TYPESHFT;
+}
+
+
+/* Scale coord in design units into 1/1000 em */
+
+static int scale(int value)
+{
+  return((value * 1000) / designsize);
+}
+
+/*
+ * Insists on 0 termination
+ */
+
+char *read_whole_file (char *name, int *sizeret)
+{
+    char *data;
+    int size;
+    FILE *f = fopen(name, "r");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    size = (int) ftell(f);
+
+    if (size <= 0 || (data = malloc(size + 1)) == NULL)
+    {
+        fclose(f);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_SET);
+    fread(data, (size_t)size, 1, f);
+    data[size] = 0;
+    fclose(f);
+    if (sizeret) *sizeret = size;
+    return data;
+}
+
+
+static void free_metrics (MetricsPtr met)
+{
+    free((char *)met->header);
+}
+
+static void free_outlines (OutlinePtr out)
+{
+    free((char *)out->header);
+}
+
+
+/*
+ * Read metrics file, check for validity.
+ */
+
+static int read_metrics (MetricsPtr met, char *file)
+{
+    int size;
+    if (filetype(file) != FileType_Font)
+        return -1;
+
+    met->header = (MetricsHeaderPtr) read_whole_file(file, &size);
+    if (met->header == NULL)
+        return -1;
+
+    /* Validation: exceeds a minimum size;
+     * words at word offsets 10 and 11 and both 16L;
+     * version number is 0 or 2.
+     */
+
+    if (size < MINSIZE_METRICS ||
+        met->header->pad1 != 16 ||
+        met->header->pad2 != 16 ||
+        ( met->header->version != 0 && met->header->version != 2 ) )
+    {
+        free_metrics(met);
+        return -1;
+    }
+
+    met->numchars = met->header->nlo + (met->header->nhi * 256);
+    met->map = (&(met->header->nhi)) + 1;
+    met->mapsize = 256;
+
+    if (met->header->flags & (1<<5))
+    {
+        /* map size precedes map */
+        met->mapsize = *((short *) met->map);
+        met->map += 2;
+    }
+
+    if (met->header->flags & (1<<1))
+        met->widths = NULL;
+    else
+    {
+        met->widths = (short *)(met->map + met->mapsize);
+        if ((met->header->flags & 1) == 0)
+            met->widths += met->numchars * 4;
+    }
+
+    if (met->header->flags & (1<<2))
+        met->heights = NULL;
+    else
+    {
+        if (met->widths) met->heights = met->widths + met->numchars;
+        else
+        {
+            met->heights = (short *)(met->map + met->mapsize);
+            if ((met->header->flags & 1) == 0)
+                met->heights += met->numchars * 4;
+        }
+    }
+    met->def_height = 0;
+
+    met->def_width = 0;
+    met->under_pos = 0;
+    met->under_thick = 0;
+    met->italic_angle = 0;
+
+    if (met->header->flags & (1<<3))
+    {
+        short *misc;
+        char *table = ((char *) (met->header)) + 52;
+        signed char *under;
+
+        int flags = met->header->flags;
+        if (!(flags & 32)) table += 256; else table += met->mapsize + 2;
+        if (!(flags & 1)) table += 8 * met->numchars;
+        if (!(flags & 2)) table += 2 * met->numchars;
+        if (!(flags & 4)) table += 2 * met->numchars;
+        misc = (short *) (table  + *((unsigned short *) table));
+
+        if (flags & (1<<1))
+            met->def_width = misc[4];
+        if (flags & (1<<2))
+            met->def_height = misc[5];
+
+        under = (signed char *) (misc + 7);
+        met->under_pos = (*under) * 4;
+        met->under_thick = (*(unsigned char *) (under + 1)) * 4;
+        /* met->italic_angle = RAD_TO_DEG * atan(((double) (misc[6])) / -1000.0); */
+        met->italic_angle = get_angle(misc[6]);
+    }
+    return 0;
+}
+
+
+static int read_outlines (OutlinePtr out, char *file)
+{
+    int size;
+    if (filetype(file) != FileType_Font)
+        return -1;
+
+    out->header = (OutlinesHeaderPtr) read_whole_file(file, &size);
+    if (out->header == NULL)
+        return -1;
+
+    /* Validation: size exceeds a minimum;
+     * first four bytes are F, O, N, T.
+     */
+
+    if (size < MINSIZE_OUTLINES ||
+        strncmp(out->header->font, "FONT", 4))
+    {
+        free_outlines(out);
+        return -1;
+    }
+
+    /* Address of chunk index */
+    if (out->header->version < 8)
+    {
+        out->chunkindex = out->header->chunks.pre_v8;
+        out->nchunks = 8;
+    } else
+    {
+        out->chunkindex = (int *) (((char *)out->header)
+                                   + out->header->chunks.v8.area_offset);
+        out->nchunks = out->header->chunks.v8.num_chunks;
+    }
+    designsize = out->header->designsize;
+    return 0;
+}
+
+
+/* Return pointer to start of chunk data (skipping flags) */
+
+static int *chunkdata_addr (OutlinePtr out, int chunkno)
+{
+    int *chunk;
+    if (chunkno >= out->nchunks ||
+        out->chunkindex == NULL ||
+        out->chunkindex[chunkno] == out->chunkindex[chunkno + 1])
+        return NULL;
+    chunk = (int *) (((int) out->header) + out->chunkindex[chunkno]);
+    if (out->header->version >= 7)
+        chunk += 1;                     /* skip flags */
+    return chunk;
+}
+
+
+/* Return pointer to start of data for char n, or NULL */
+
+static unsigned char *chardata_addr (OutlinePtr out, int n)
+{
+    int chunkno = n / 32;
+    int charno = n % 32;
+    int *chunk = chunkdata_addr(out, chunkno);
+    if (!chunk || chunk[charno] == 0) return NULL;
+    return (unsigned char *) (chunk[charno] + (int) chunk);
+}
+
+
+/* Read character index from composite section or
+ * inclusion.
+ */
+
+static int getindex (unsigned char **pptr)
+{
+    unsigned char *ptr = *pptr;
+    int ind = *ptr++;
+    if (indexsize == 2)
+        ind += *ptr++ << 8;
+    *pptr = ptr;
+    return ind;
+}
+
+
+/* Read coordinate from body of character definition (or header)
+ * charflags is read from the first byte of the character header
+ */
+
+static void getcoords (unsigned char **pptr, int *x, int *y)
+{
+    register unsigned char *ptr = *pptr;
+    if (coordsize == 3)
+    {
+        register int b1 = ptr[1];
+        *x = ((ptr[0] << 20) | (b1 << 28)) >> 20;
+        *y = ((b1 << 16) | (ptr[2] << 24)) >> 20;
+        ptr += 3;
+    } else
+    {
+        *x = (*ptr++ << 24) >> 24;
+        *y = (*ptr++ << 24) >> 24;
+    }
+    *pptr = ptr;
+}
+
+
+static void read_char_flags (unsigned char **pptr)
+{
+    charflags = *(*pptr)++;
+    coordsize = (charflags & CHARF_12BITCOORDS) ? 3 : 2;
+    indexsize = (charflags & CHARF_16BITINDICES) ? 2 : 1;
+}
+
+
+/* You should have called read_char_flags */
+
+static void read_char_bbox(unsigned char **pptr, BBoxPtr bboxp)
+{
+    int x0, y0, x1, y1;
+    if (*pptr == NULL)
+        x0 = y0 = x1 = y1 = 0;
+    else
+    {
+        getcoords(pptr, &x0, &y0);
+        getcoords(pptr, &x1, &y1);
+        x1 += x0; y1 += y0;     /* make into x0,y0,x1,y1 */
+    }
+    if (bboxp)
+    {
+        bboxp->x0 = x0; bboxp->y0 = y0;
+        bboxp->x1 = x1; bboxp->y1 = y1;
+    }
+}
+
+
+/*
+ * Encode n as a 2 digit base-85 number shifted up by 3500.
+ */
+
+static char *encode (int n)
+{
+    static char res[5];
+    int i = 0;
+    n += 3500;
+    res[i++] = 42 + (n % 85);
+    if (res[i - 1] == 92)
+        res[i++] = 92;
+    res[i++] = 42 + (n / 85);
+    if (res[i - 1] == 92)
+        res[i++] = 92;
+    res[i] = 0;
+    return res;
+}
+
+
+/* Write a PostScript command corresponding to one segment */
+
+static void fprintps(FILE *outfile, unsigned char **pptr, int ncoords, char *psproc)
+{
+    int i, x, y;
+    fputs(psproc, outfile);
+    for (i = 0; i < ncoords; i++)
+    {
+        getcoords(pptr, &x, &y);
+        fputs(encode(scale(x)), outfile);
+        fputs(encode(scale(y)), outfile);
+    }
+}
+
+
+/*
+ * Recursively determine bbox.  bbox should be zeroed at the start.
+ * Pass x0 and y0 of 0 for the first call.
+ */
+
+static void _get_merged_bbox(BBoxPtr bbox, int charnum, OutlinePtr out, EncodingPtr enc,
+                             int x0, int y0)
+{
+    unsigned char *addr = chardata_addr(out, charnum);
+    if (!addr)
+        return;
+    read_char_flags(&addr);
+    if (charflags & (CHARF_COMPOSITE | CHARF_ACCENT))
+    {
+        int basech, accch;
+        basech = (charflags & CHARF_COMPOSITE) ? getindex(&addr) : -1;
+        accch = (charflags & CHARF_ACCENT) ? getindex(&addr) : -1;
+        if (basech >= 0)
+            _get_merged_bbox(bbox, basech, out, enc, x0, y0);
+        if (accch >= 0)
+        {
+            int xo, yo;
+            getcoords(&addr, &xo, &yo);
+            _get_merged_bbox(bbox, accch, out, enc, x0 + xo, y0 + yo);
+        }
+    } else
+    {
+        BBoxRec temp;
+        read_char_bbox(&addr, &temp);
+        temp.x0 += x0; temp.y0 += y0;
+        temp.x1 += x0; temp.y1 += y0;
+        if (temp.x0 < bbox->x0) bbox->x0 = temp.x0;
+        if (temp.y0 < bbox->y0) bbox->y0 = temp.y0;
+        if (temp.x1 > bbox->x1) bbox->x1 = temp.x1;
+        if (temp.y1 > bbox->y1) bbox->y1 = temp.y1;
+    }
+    return;
+}
+
+
+static void get_merged_bbox(BBoxPtr bbox, int charnum, OutlinePtr out, EncodingPtr enc)
+{
+    bbox->x0 = bbox->y0 = 999999;
+    bbox->x1 = bbox->y1 = -999999;
+    _get_merged_bbox(bbox, charnum, out, enc, 0, 0);
+}
+
+
+/* Write character procedure for a given character number.
+ * The number is an index into the encoding and therefore
+ * into the outlines file.
+ *
+ * Return 0 for success, else -1.  Called once for every
+ * character known to be in the encoding (base if applicable).
+ */
+
+static int write_charproc (OutlinePtr out, MetricsPtr met, EncodingPtr enc, int ch, FILE *f)
+{
+    unsigned char *addr = chardata_addr(out, ch);
+    int ind = met->mapsize ? met->map[ch] : ch;
+    int width = met->widths ? met->widths[ind] : met->def_width;
+    int height = met->heights ? met->heights[ind] : met->def_height;
+    BBoxRec bbox;
+    int nitems = 0;
+
+    if (!addr)
+        return -1;
+
+    /* Read bbox now to avoid overwriting charflags */
+    get_merged_bbox(&bbox, ch, out, enc);
+
+    read_char_flags(&addr);
+    if (!(charflags & CHARF_OUTLINE))
+        return -1;
+
+    fprintf(f, "%s\n", enc->name[ch]);
+
+    if (charflags & (CHARF_COMPOSITE | CHARF_ACCENT))
+    {
+        fprintf(f, "{%d %d %d %d %d %d SCD\n", width, height,
+                scale(bbox.x0), scale(bbox.y0), scale(bbox.x1), scale(bbox.y1));
+        if (charflags & CHARF_COMPOSITE)
+        {
+            int basech = getindex(&addr);
+            fprintf(f, " false CharProcs %s get exec", enc->name[basech]);
+        }
+        if (charflags & CHARF_ACCENT)
+        {
+            int xo, yo, accch = getindex(&addr);
+            getcoords(&addr, &xo, &yo);
+            if (charflags & CHARF_COMPOSITE) fputs("\n ", f);
+            if (xo || yo)
+            {
+                fprintf(f, "%d %d translate ", scale(xo), scale(yo));
+            }
+            fprintf(f, "false CharProcs %s get exec", enc->name[accch]);
+        }
+        fputs("} /if cvx\n", f);
+        nitems += 2;
+    } else
+    {
+        Bool going = TRUE, pathopen = FALSE, started = FALSE;
+        fprintf(f, "/dup cvx { %d %d %d %d %d %d SCD } /if cvx\n", width, height,
+                scale(bbox.x0), scale(bbox.y0), scale(bbox.x1), scale(bbox.y1));
+        nitems += 3;
+        read_char_bbox(&addr, NULL);
+        while (going)
+        {
+            switch (3 & *addr++)
+            {
+            case 0x00:
+                if (pathopen)
+                {
+                    /* assert: started == TRUE */
+                    fputc('p', f); pathopen = FALSE;
+                }
+                going = 0; break;
+            case 0x01:
+                if (pathopen)
+                {
+                    /* assert: started == TRUE */
+                    fputc('p', f); pathopen = FALSE;
+                }
+                if (!started) { fputc('(', f); started = TRUE;}
+                fprintps(f, &addr, 1, "m");
+                break;
+            case 0x02:
+                if (!started) { fputc('(', f); started = TRUE;}
+                fprintps(f, &addr, 1, "l"); pathopen = TRUE;
+                break;
+            case 0x03:
+                if (!started) { fputc('(', f); started = TRUE;}
+                fprintps(f, &addr, 3, "c"); pathopen = TRUE;
+                break;
+            }
+        }
+        if (started)
+        {
+            fputs("e) /D85 cvx\n", f);
+            nitems += 2;
+        }
+
+        /* skip skeleton section if present */
+
+        if (addr[-1] & 4) going = 1;
+        while (going)
+        {
+            switch(*addr++ & 3)
+            {
+            case 0x00: going = 0; break;   /* there can only be one skeleton section */
+            case 0x01:
+            case 0x02: addr += coordsize; break;
+            case 0x03: addr += 3*coordsize; break;
+            }
+        }
+
+        /* put in references to composite character sections */
+
+        if (addr[-1] & 8)
+        {
+            int x0 = 0, y0 = 0;
+            int ch;
+            int n = 0;
+            fputc('{', f);
+            while ((ch = getindex(&addr)) != 0)
+            {
+                int x, y;
+                getcoords(&addr, &x, &y); /* offset of this composite section */
+                if (n++) fputc(' ', f);
+                if (x != x0 || y != y0)
+                {
+                    fprintf(f, "%d %d translate ", scale(x - x0), scale(y - y0));
+                }
+                fprintf(f, "false CharProcs %s get exec\n", enc->name[ch]);
+                x0 = x; y0 = y;
+            }
+            fputs("} /if cvx ", f);
+            nitems += 2;
+        }
+        else
+        {
+            fputs("/pop cvx ", f);
+            nitems += 1;
+        }
+    }
+    fprintf(f, "%d packedarray cvx bind def\n", nitems);
+    return 0;
+}
+
+static void zero_encoding (EncodingPtr enc)
+{
+    enc->ntotal = enc->ndistinct = 0;
+    enc->data = NULL;
+    enc->name = NULL;
+    enc->distinct = NULL;
+}
+
+static void free_encoding (EncodingPtr enc)
+{
+    free(enc->data);
+    free((char *)enc->name);
+    free((char *)enc->distinct);
+}
+
+static void add_name (EncodingPtr enc, char *name)
+{
+    int i;
+    enc->name[enc->ntotal++] = name;
+    for (i = 0; i < enc->ndistinct; i++)
+        if (strcmp(enc->name[enc->distinct[i]], name) == 0)
+            return;
+    enc->distinct[enc->ndistinct++] = enc->ntotal - 1;
+}
+
+static int get_encoding (EncodingPtr enc, char *file)
+{
+    char *p;
+    int dummy;
+    zero_encoding(enc);
+    if ((enc->data = read_whole_file(file, &dummy)) == NULL)
+        return -1;
+    for (p = enc->data; *p; p++)
+        if (*p == '%')
+            for (; *p && *p != '\n' && *p != '\r'; p++)
+                *p = ' ';       /* wipe out comments */
+        else if (*p == '/')
+            enc->ntotal++;
+
+    enc->distinct = (int *) malloc(enc->ntotal * sizeof(int));
+    enc->name = (char **) malloc(enc->ntotal * sizeof(char *));
+
+    if (enc->distinct == NULL || enc->name == NULL)
+    {
+        free((char *) enc->distinct);
+        free((char *) enc->name);
+        free(enc->data);
+        return -1;
+    }
+
+    enc->ntotal = 0;
+    for (p = enc->data; *p; p++)
+        if (*p == '/')
+        {
+            char *s = p + 1;
+            char c;
+            while ((c = *s) != 0 && c != ' ' && c != '\t' && c != '\n'
+                   && c != '\r' && c != '%' && c != '/')
+                s++;
+            *s = 0;
+            add_name(enc, p);
+            p = s - (c == 0);
+        }
+    return 0;
+}
+
+
+static void output_names (FILE *out, char *name)
+{
+    char *n;
+    if (strncmp(name, "RO_", 3) == 0)
+        name += 3;
+
+    fputs("  /FullName (", out);
+    for (n = name; *n && *n != '_'; n++)
+        putc(*n, out);
+    fputs(") def\n", out);
+
+    fputs("  /FamilyName (", out);
+    for (n = name; *n && *n != '.' && *n != '_'; n++)
+        putc(*n, out);
+    fputs(") def\n", out);
+
+    fputs("  /Weight (", out);
+    if (*n) n++;
+    for (; *n && *n != '.' && *n != '_'; n++)
+        putc(*n, out);
+    fputs(") def\n", out);
+}
+
+
+/*
+ * There MUST be an encoding file and an encoding name.  The encoding
+ * is always referred to by name.
+ */
+
+int make_t3 (FILE *out,             /* where to write output */
+             char *alienname,       /* name to give it */
+             char *outlinesfile,    /* outlines filename */
+             char *metricsfile,     /* metrics filename */
+             char *encodingname,    /* Registered name of encoding, must be non-null */
+             char *encodingfile)    /* encoding file, must be non-null */
+{
+    EncodingRec encoding;
+    MetricsRec metrics;
+    OutlinesRec outlines;
+    int i;
+    char *fontname;
+    modulefp_buf fpbuf;
+
+    modulefp_enable(&fpbuf);
+
+    if (read_metrics(&metrics, metricsfile) == -1)
+    {
+        modulefp_disable(&fpbuf);
+dstringc("*");dstringc(metricsfile);dstringc("* -- ");
+dstring("It really failed");
+        return EBADMETRICS;
+    }
+    modulefp_disable(&fpbuf);
+    if (read_outlines(&outlines, outlinesfile) == -1)
+    {
+        free_metrics(&metrics);
+        return EBADOUTLINES;
+    }
+
+    if (alienname)
+        fontname = alienname;
+    else
+        fontname = ((char *)&(outlines.header->tablesize)) + outlines.header->tablesize;
+
+/*
+ * Output initial stuff.  Should do the font name better.
+ */
+    fprintf(out, "/%s 11 dict dup begin\n/FontInfo 10 dict dup begin\n", fontname);
+    fprintf(out, "  /Notice (Converted by MakePSFont " Module_FullVersion ") def\n");
+    output_names(out, fontname);
+    fputs("  /Version (001.001) def\n", out);
+
+    /* %f conversions not possible in module code */
+    fprintf(out, "  /ItalicAngle %d.%02d def\n",
+            metrics.italic_angle / 100,
+            abs(metrics.italic_angle % 100));
+
+    fprintf(out, "  /isFixedPitch %s def\n", metrics.widths ? "false" : "true");
+    fprintf(out, "  /UnderlinePosition %d def\n", metrics.under_pos);
+    fprintf(out, "  /UnderlineThickness %d def\n", metrics.under_thick);
+
+    /* Insert the decode85 dictionary for unencoding */
+
+    if (outlines.header->version >= 8 &&
+        (outlines.header->chunks.v8.scafflags & 4))
+        fprintf(out, decode85, "fill");
+    else
+        fprintf(out, decode85, "eofill");
+    fputs("end def\n", out);
+
+    fputs("/FontType 3 def\n/PaintType 0 def\n/FontMatrix [.001 0 0 .001 0 0] def\n", out);
+    fprintf(out, "/FontBBox [%d %d %d %d] def\n",
+            scale(outlines.header->bbox_x0),
+            scale(outlines.header->bbox_y0),
+            scale(outlines.header->bbox_x0 + outlines.header->bbox_w),
+            scale(outlines.header->bbox_y0 + outlines.header->bbox_h));
+
+    if (encodingfile && *encodingfile)
+    {
+        if (get_encoding(&encoding, encodingfile) < 0)
+        {
+            free_metrics(&metrics);
+            free_outlines(&outlines);
+            free_encoding(&encoding);
+            return EBADENCODING;       /* XXX should do this before any output! */
+        }
+        fprintf(out, "/Encoding %s def\n", encodingname);
+    } else
+        return EBADENCODING;
+
+/*
+ * Output the charprocs
+ */
+    fprintf(out, "/CharProcs %d dict def  FontInfo /decode85 get begin  CharProcs begin\n",
+            encoding.ndistinct + 1);
+
+    if (metrics.def_width || metrics.def_height)
+        fprintf(out, "/.notdef {{%d %d setcharwidth} if} def\n", metrics.def_width, metrics.def_height);
+    else
+        fprintf(out, "/.notdef {pop} def\n");
+
+    for (i = 0; i < encoding.ndistinct; i++)
+    {
+        int charnum = encoding.distinct[i];
+        if (write_charproc(&outlines, &metrics, &encoding, charnum, out) == -1)
+        {
+            /* If it's a fixed width font, move by the default offsets */
+            if (metrics.def_width || metrics.def_height)
+                fprintf(out, "%s {{%d %d setcharwidth} if} def\n", encoding.name[charnum],
+                        metrics.def_width, metrics.def_height);
+            else
+                fprintf(out, "%s {pop} def\n", encoding.name[charnum]);
+        }
+    }
+    fputs("end end\n", out);
+
+/*
+ * Output the BuildChar proc and install the font
+ */
+    fputs(buildchar, out);
+    fputs("end definefont pop\n", out);
+
+/*
+ * Tidy up
+ */
+    free_encoding(&encoding);
+    free_metrics(&metrics);
+    free_outlines(&outlines);
+
+    return 0;
+}

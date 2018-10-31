@@ -1,0 +1,1096 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:    object.c
+ * Purpose: Processing objects
+ * Author:  Ian Johnson
+ * History: 10-Aug-93: IDJ:   created
+ *          16-Mar-94: IDJ:   fixed bug in object_create.  When passing template
+ *                            name, user's r1 gets overwritten with a description
+ *                            block pointer (and restored later).
+ *          17-Aug-94: IDJ:   removed copy object
+ *           4-Oct-94: IDJ:   bug-fix AQU-00125 (raise event when creating obj
+ *                            as result of creating another obj - use call count
+ *          13-Oct-94: IDJ:   bug-fix AQU-00180 (set parent comp id to -1 for
+ *                            auto-show objects)
+ *          21-Nov-94: IDJ:   bug-fix AQU-00329 (problems deleting objects).
+ *          30-Nov-94: IDJ:   make comparison for shared objects case-sensitive
+ *          22-Dec-94: IDJ:   bug-fix AQU-00861 set flags to 0 for deleted event.
+ *          24-Jan-95: IDJ:   when object is created, set parent and ancestor components to -1
+ *          30-Mar-95: IDJ:   post-product fix - make toolbox id's more unique.
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "string32.h"
+#include "messages.h"
+#include "objects/toolbox.h"
+#include "objects/window.h"
+
+#include "globals.h"
+
+#include "task.h"
+#include "resf.h"
+#include "event.h"
+
+#include "object.h"
+#include "memory.h"
+
+
+
+/* NOTE: IDs are formed by taking an RMA address, and OR'ing into the top
+         6 bits and bottom 2 bits, an 8-bit counter value.  This counter
+         value is stored in the top 8 bits of the object's reference count
+         if it is a shared object
+*/
+
+/* NOTE (2): With objects stored in a dynamic area with Toolbox 1.39 and later,
+ *           this scheme is hereby modified that the object ID is an offset into
+ *           the dynamic area if a dynamic area is being used.  Since the base
+ *           address of the DA is initialised to zero, if the fallback of using
+ *           RMA is in operation, behaviour will be the same.
+ */
+
+#define  XXIDtoPtr(id)   ((object_t *) (!(id)?0:(((id) & 0x03fffffc) + ((unsigned int)mem_base_address()))))
+
+#define  XXPtrtoIDunique(unique) ( ((unique) & 3) | (((unique) & 0xFC) << 24) )
+#define  XXPtrtoID(ptr,unique)  ((ObjectID) (((unsigned int)(ptr)-(unsigned int)mem_base_address())| PtrtoIDunique(unique)))
+
+
+#define RefCountMinusUnique(rc) ((rc)&~0xFF000000)
+#define RefCountToUnique(rc) (((rc)>>24)&0xFF)
+#define RefCountAddUnique(rc,unique) ((RefCountMinusUnique(rc))|(((unique)&0xFF)<<24))
+
+
+static int create_has_been_called = 0;    /* used to see if object_create is called recursively
+                                            bug fix AQU-00125
+                                          */
+
+static unsigned char counter = 0;
+
+
+static object_t *IDtoPtr(ObjectID id)
+{
+        if (id == 0) {
+                return NULL;
+        }
+        else {
+                unsigned int id_int = ((unsigned int) id) & 0x03FFFFFC;
+        	id_int += (unsigned int) mem_base_address();
+                return (object_t *) id_int;
+        }
+}
+
+static ObjectID PtrtoID(object_t *t, unsigned char unique)
+{
+        if (t == NULL) {
+                return (ObjectID) 0;
+        }
+        else {
+	        unsigned int ptr = ((unsigned int) t) - ((unsigned int) mem_base_address());
+        	unsigned int unique_word = ((unique << 26) | (unique >> 6)) & 0xFC000003;
+
+	        return (ObjectID) (ptr | unique_word);
+        }
+}
+
+/**************************************** object validation ******************************/
+
+static _kernel_oserror *object__validate (ObjectID id)
+{
+    /*
+     * Function to validate an Object ID.  First we check it's a valid address, then
+     * we check the guard word
+     *
+     */
+
+    object_t        *object = IDtoPtr(id);
+
+    /*
+     * validate the address of the object
+     */
+
+    if (memory_validate_address(object) == 0) {
+        return make_error_hex (Toolbox_InvalidObjectID, 3, id, object, 1);
+    }
+
+
+    /*
+     * check guard word
+     */
+
+    if (object->guard != GUARD_WORD)
+        return make_error_hex (Toolbox_InvalidObjectID, 3, id, object, 2);
+
+    /*
+     * ObjectID cross-check
+     */
+
+    if (object->self_id != id)
+        return make_error_hex (Toolbox_InvalidObjectID, 3, id, object, 3);
+
+    return NULL;
+}
+
+
+/********************************* class module SWIs *************************/
+
+/*
+ * The Toolbox may choose to maintain a mapping between Object classes and SWI
+ * numbers which is not one-to-one.
+ *
+ */
+
+
+static _kernel_oserror *object__class_swi (int class_swi,
+                                           int reason,
+                                           ObjectID object,
+                                           void *internal_handle,
+                                           int task_handle,
+                                           _kernel_swi_regs *user_regs,
+                                           int *return_R0)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e = NULL;
+
+    r.r[0] = reason;
+    r.r[1] = (int)object;
+    r.r[2] = (int)internal_handle;
+    r.r[3] = task_handle;
+    r.r[4] = (int)user_regs;
+
+    e = _kernel_swi (class_swi, &r, &r);
+
+    if (return_R0 != NULL)
+        *return_R0 = r.r[0];
+
+    return e;
+}
+
+
+static int object__find_class_swi (ObjectClass classid)
+{
+    /*
+     * Function to find the swi number for a given object class
+     * Currently class==swi_number !!!
+     */
+
+    return (int)classid;
+}
+
+
+extern _kernel_oserror *object_register_module (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object Class
+     *         R2  =  Class SWI Number
+     *         R3  -> resource filename (or 0)
+     *
+     *   Exit:
+     *         R1-R9 preserved
+     *
+     */
+
+    /*
+     * NOTE: currently object class == swi number
+     */
+
+    /*
+     * if there is a res file given, then this is loaded into the single list
+     * of such files, which is scanned after the task's own list when
+     * Toolbox_ObjectCreate is called.  This is indicated by calling
+     * resf_module_resources()
+     */
+
+    /*
+     * NOTE: we send round a Service_ToolboxTaskborn for each active
+     * task, so that obj modules know about them, if they are
+     * started after the task has initialised! (mainly done to
+     * help ResTest.
+     */
+
+    _kernel_swi_regs regs;
+    _kernel_oserror *e = NULL;
+
+    if (r->r[3] != 0)
+    {
+        resf_module_resources();
+        resf_module_swi(r->r[2]);
+
+        DEBUG debug_output ("register", "T:Loading module resources\n");
+        regs.r[0] = 0;
+        regs.r[1] = r->r[3];  /* filename */
+        e = resf_load_resource_file (&regs);
+    }
+
+    if (e == NULL)
+    {
+        object_modules++;
+        if (task_any_active())
+            task_inform_object_modules();
+    }
+
+    DEBUG debug_output ("register", "T:%d object modules registered\n", object_modules);
+
+    return e;
+}
+
+
+extern _kernel_oserror *object_deregister_module (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object Class
+     *
+     *   Exit:
+     *         R1-R9 preserved
+     *
+     */
+
+    if (object_modules > 0)
+        object_modules--;
+
+    DEBUG debug_output ("register", "T:%d object modules registered\n", object_modules);
+
+    /*
+     * IDJ: 18-Dec-94: remove object module's res file templates
+     *                 bug-fix AQU-00289
+     */
+
+    resf_remove_module_resources(r->r[1]);
+
+    return NULL;
+}
+
+
+extern _kernel_oserror *object_get_internal_handle (_kernel_swi_regs *r)
+{
+
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *
+     *   Exit:
+     *         R0  =  internal handle
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    r->r[0] = (int)object->internal_handle;
+
+    return NULL;
+}
+
+
+
+/********************************* linked list of Objects handling ***********************/
+
+static void object__add_to_list (object_t *o)
+{
+    /*
+     * Function to add an element to a task's list of active Objects
+     * (add to head of list)
+     *
+     */
+
+    DEBUG mem_chk(o, CHECK_HEAP | CHECK_NONZERO);
+
+    o->next = task->object_list;
+    o->prev = NULL;
+    if (task->object_list != NULL)
+        (task->object_list)->prev = o;
+    task->object_list = o;
+}
+
+
+static void object__remove_from_list (object_t *o)
+{
+    /*
+     * Function to remove an element from the list of a task's active Objects
+     *
+     */
+
+    DEBUG mem_chk(o, CHECK_HEAP | CHECK_NONZERO);
+
+    if (o == task->object_list)
+        task->object_list = o->next;
+    else
+        o->prev->next = o->next;
+
+    if (o->next != NULL)
+        o->next->prev = o->prev;
+}
+
+
+extern void object_remove_list (void)
+{
+    /*
+     * Function to remove the entire list of objects for a task.
+     */
+
+    object_t *o = task->object_list;
+
+    while (o != NULL)
+    {
+        object_t *next = o->next;
+
+        mem_free ((void *)o, "removing object list");
+
+        o = next;
+    }
+
+    task->object_list = NULL;
+}
+
+
+/***************************************** client SWIs ***********************************/
+
+extern _kernel_oserror *object_create (_kernel_swi_regs *r)
+{
+
+    /*
+     *   Entry:  R0 = flags
+     *           R1 -> name of template
+     *      OR   R1 -> description block (if bit 1 of flags set)
+     *
+     *   Exit:
+     *           R0 = ID of created Object
+     *
+     */
+
+    ObjectTemplateHeader *hdr = NULL;
+    object_t             *object;  /* the new Object */
+    ObjectID              id;
+    _kernel_oserror      *e;
+    int                   old_user_r1 = r->r[1];
+    int                   save_create_has_been_called;
+
+
+    DEBUG debug_output("stack", "T: Stack in object_create @ %p\n", &save_create_has_been_called);
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG debug_output ("object", "T:object_create (");
+
+    /*
+     * get pointer to the template description
+     */
+
+    /*
+     * Note: we have taken a copy of the user's r1 register, since we will overwrite
+     * it with a pointer to a description block, if the user has passed a template name.
+     * We restore the user's r1 before return
+     */
+
+    if (r->r[0] & Toolbox_CreateObject_InCore)
+        hdr = (ObjectTemplateHeader *)r->r[1];
+    else
+    {
+        hdr = resf_find_template ((char *)r->r[1]);
+
+        if (hdr == NULL)
+        {
+            /* bug-fix AQU-00149: tell the client which template couldn't be found! */
+
+            return make_error (Toolbox_TemplateNotFound, 1, (char *)r->r[1]);
+        }
+
+        r->r[1] = (int)hdr;
+    }
+
+
+    /* check validity of object flags */
+
+    if (hdr->flags & ~Object_ValidFlags)
+        return make_error_hex (Toolbox_BadFlags, 1, hdr->flags);
+
+    DEBUG debug_output ("object", "%x, %s)\n", r->r[0], (hdr == NULL)?"<no object>":hdr->name);
+    DEBUG mem_chk(hdr, CHECK_NONZERO);
+
+    /*
+     * if shared and already exists, just increase reference count
+     */
+
+    if (hdr->flags & Object_Shared)
+    {
+        /*
+         * search in list of Objects, for one created with this name
+         * NB there should be ONLY one since this is a shared Object
+         */
+
+        object_t *o = task->object_list;
+
+        while (o != NULL)
+        {
+            DEBUG mem_chk(o, CHECK_HEAP | CHECK_NONZERO);
+
+            if (!strcmp(o->header.name, hdr->name))
+            {
+                unsigned char unique = RefCountToUnique(o->reference_count);
+                o->reference_count++;
+                r->r[0] = PtrtoID(o,unique);
+                DEBUG debug_output ("object", "T:*** Shared *** count %d\n", o->reference_count);
+                r->r[1] = old_user_r1;
+                return NULL;
+            }
+            o = o->next;
+        }
+    }
+
+
+    /*
+     * create a new Object
+     */
+
+    if ((object = mem_allocate (sizeof(object_t), "new object")) == NULL)
+    {
+        r->r[1] = old_user_r1;
+        return make_error (Toolbox_NoMem, 0);
+    }
+    object->guard  =              GUARD_WORD;
+    object->header =             *hdr;
+    object->state  =              0;
+    object->client_handle =       NULL;
+    object->parent_id =           (ObjectID)NULL;
+    object->parent_component =    -1;               /* bug-fix for Black ROM (IDJ:24-1-95) */
+    object->ancestor_id =         (ObjectID)NULL;
+    object->ancestor_component =  -1;               /* bug-fix for Black ROM (IDJ:24-1-95) */
+    object->internal_handle =     NULL;
+    object->reference_count =     1;
+
+
+    /*
+     * get class module to create the actual Object (and store internal handle)
+     * NOTE: user regs (pointed at by r) are filled in by the class module
+     */
+
+    /*
+     * increment call count, so if we get re-entered, we know to raise an
+     * AutoCreated event - bug fix AQU-00125
+     */
+
+    save_create_has_been_called = create_has_been_called;
+    if (create_has_been_called == 0)
+        create_has_been_called = 1;
+
+
+    {
+        /* see note at head of file re:uniqueness of IDs */
+        unsigned char unique = ++counter;
+        id = PtrtoID(object, unique);
+        object->self_id = id;
+        /*if (hdr->flags & Object_Shared) {*/
+            object->reference_count = RefCountAddUnique(object->reference_count, unique);
+        /*}*/
+    }
+
+    DEBUG debug_output ("object", "T:Making class SWI 0x%x\n", object__find_class_swi (object->header.class_id));
+
+    if ((e = object__class_swi (object__find_class_swi (object->header.class_id),
+                                Toolbox_CreateObject - Toolbox_SWIChunkBase,
+                                id,
+                                NULL,
+                                task->info.wimp_handle,
+                                r,
+                                (int *)&object->internal_handle)) != NULL)
+    {
+        DEBUG debug_output ("object", "T:Error from object module (create) %s\n", e->errmess);
+
+        r->r[1] = old_user_r1;
+        mem_free ((void *)object, "error when creating object");
+        create_has_been_called = 0; /* IDJ: 9-Jan-95: ALWAYS reset flag on error during create */
+        return e;
+    }
+
+    if (save_create_has_been_called == 0) /* ie top level create */
+        create_has_been_called = 0;
+
+    /*
+     * ... and add it to the list of Objects for the current task
+     */
+
+    DEBUG debug_output ("object", "T:Adding to list of Objects\n");
+
+    object__add_to_list (object);
+
+    DEBUG debug_output ("object", "T:Added to list of Objects (%p) ih == %p\n", (void *)object, object->internal_handle);
+
+
+    /*
+     * inform the client via a ToolboxObjectAutoCreated event, if we are loading a resource file,
+     * or creation is due to another object being created (eg window attached to menu clicks),
+     * also checking that it's not an internal template (starting with underscore).
+     */
+
+    if ((resource_file_being_loaded || create_has_been_called)
+#ifndef DEBUG_INTERNAL_TEMPLATES
+        && hdr->name[0] != '_'
+#endif
+       )
+    {
+        ToolboxObjectAutoCreatedEvent event;
+        _kernel_swi_regs              regs;
+
+        event.hdr.size = sizeof(ToolboxObjectAutoCreatedEvent);
+        event.hdr.event_code = Toolbox_ObjectAutoCreated;
+        event.hdr.flags = 0;  /* IDJ: 9-Jan-95 */
+
+        string_copy (event.template_name, hdr->name);
+
+        regs.r[0] = 0;
+        regs.r[1] = (int)id;
+        regs.r[2] = -1;
+        regs.r[3] = (int)&event;
+
+        event_raise_toolbox_event (&regs);
+    }
+
+
+    /*
+     * check to see if it needs showing after creation
+     */
+
+    if (hdr->flags & Object_ShowOnCreate)
+    {
+        _kernel_swi_regs show;
+        _kernel_oserror *show_error;
+
+        DEBUG debug_output ("object", "T:Show on creation ... ");
+
+        show.r[0]    = 0;                 /* flags */
+        show.r[1]    = (int)id;           /* object id */
+        show.r[2]    = 0;                 /* show in default place */
+        show.r[3]    = 0;
+        show.r[4]    = (int)NULL;         /* no parent */
+        show.r[5]    = -1;                /* bug-fix AQU-00180 */
+
+        if ((show_error = object_show(&show)) != NULL)
+        {
+            r->r[1] = old_user_r1;
+            return show_error;
+        }
+
+        DEBUG debug_output ("object", "T:shown\n");
+    }
+
+    /*
+     * return Object ID in user's R0
+     */
+
+    r->r[0] = (int)id;
+
+    /*
+     * restore possibly corrupted user's r1
+     */
+
+    r->r[1] = old_user_r1;
+
+    return NULL;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_delete (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *           R0  =  flags
+     *                  bit 0 set means delete recursively
+     *           R1  =  Object ID
+     *
+     *   Exit:
+     *                  R1-R9 preserved.
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    ObjectID id = r->r[1];
+    _kernel_oserror *e = NULL;
+
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+    DEBUG debug_output ("object", "T:object_delete (%x, %p)\n", r->r[0], (void *)object);
+
+    if ((e = object__validate (id)) != NULL)
+        return e;
+
+    /*
+     * decrement reference count, and only delete if it reaches zero
+     */
+
+    --(object->reference_count);
+    if (RefCountMinusUnique(object->reference_count) == 0)
+    {
+
+        /*
+         * get class module to delete its data about the object
+         */
+
+        ToolboxObjectDeletedEvent event;
+        _kernel_swi_regs          regs;
+
+        DEBUG debug_output ("object", "T:Reference count has reached zero\n");
+        DEBUG debug_output ("object", "T:Making class SWI\n");
+
+        if ((e = object__class_swi (object__find_class_swi (object->header.class_id),
+                                    Toolbox_DeleteObject - Toolbox_SWIChunkBase,
+                                    id,
+                                    object->internal_handle,
+                                    task->info.wimp_handle,
+                                    r,
+                                    NULL)) != NULL)
+        {
+            /* object->reference_count++; IDJ 15-Nov-94: keep ref count at zero
+              cos object modules always delete the object even if an error has
+              occurred */
+
+            /* return e;
+               Actually we do nothing, except remember the error.  We rely
+               on the fact that the object module has done the delete.
+            */
+        }
+
+        /*
+         * inform user about deletion
+         */
+
+
+        event.hdr.size = sizeof(ToolboxObjectDeletedEvent);
+        event.hdr.event_code = Toolbox_ObjectDeleted;
+        event.hdr.flags = 1;  /* bug fix AQU-00861 - set flags to 0 */
+        /* sbrodie (16/01/99): Bit 0 set means class_id and client_handle valid */
+        event.class_id = object->header.class_id;
+        event.client_handle = object->client_handle;
+
+        regs.r[0] = 0;
+        regs.r[1] = (int)id;
+        regs.r[2] = -1;
+        regs.r[3] = (int)&event;
+
+        event_raise_toolbox_event (&regs);
+
+
+        /*
+         * remove the Toolbox's list of Object's for this task
+         */
+
+        object__remove_from_list (object);
+
+        /* ensure that Object ID is now invalid */
+        object->guard = 0;
+
+        mem_free ((void *)object, "deleting object");
+    }
+
+    return e;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_show (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *           R0  =  flags
+     *           R1  =  Object ID
+     *           R2  =  "show type"
+     *   OR      R3  -> buffer giving Object-specific data for showing this
+     *                  Object
+     *           R4  =  Parent Object ID
+     *           R5  =  Parent Component ID
+     *
+     *   Exit:
+     *           R1-R9 preserved
+     *
+     */
+
+    _kernel_oserror *e                = NULL;
+    ObjectID         parent_id        = (ObjectID)r->r[4];
+    object_t        *object           = IDtoPtr(r->r[1]);
+    object_t        *parent           = IDtoPtr(r->r[4]);
+    ComponentID      parent_component = (ComponentID)r->r[5];
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG debug_output ("object", "T:object_show (%x, %p) parent %p (%d)\n", r->r[0], (void *)object, (void *)parent, parent_component);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    /*
+     * validate parent Object ID (supplied by client, so may be bogus)
+     * 0 is OK cos it means no parent.
+     */
+
+    if (parent_id != NULL)
+    {
+        if ((e = object__validate (parent_id)) != NULL)
+            return e;
+    }
+
+    /*
+     * If the object was being shown as a sub-menu show, then let Window
+     * know about it.
+     */
+
+    if (r->r[0] & Toolbox_ShowObject_AsSubMenu)
+    {
+        DEBUG debug_output("object", "T:Submenu show.  Informing Window module\n");
+
+        (void) _swix(Window_PreSubMenuShow, _IN(0), 0);
+    }
+
+    /*
+     * we don't even know if object is showing so just pass it on
+     */
+
+    DEBUG debug_output ("object", "T:Making Class SWI\n");
+
+    e = object__class_swi (object__find_class_swi (object->header.class_id),
+                            Toolbox_ShowObject - Toolbox_SWIChunkBase,
+                            (ObjectID)r->r[1],
+                            object->internal_handle,
+                            task->info.wimp_handle,
+                            r,
+                            &r->r[0]);
+
+    DEBUG debug_output ("object", "T:Class Show SWI returned %x\n", r->r[0]);
+
+    /*
+     * make note of new parent, and new ancestor
+     */
+
+    if (e == NULL)
+    {
+        object->parent_id = parent_id;
+        object->parent_component = parent_component;
+
+        if (parent != NULL)
+        {
+            /*
+             * ancestor field of Object is set to ancestor of its parent
+             * unless the parent is marked as an ancestor, in which case
+             * the parent's ID is recorded
+             */
+
+            if (parent->header.flags & Object_Ancestor)
+            {
+                object->ancestor_id = parent_id;
+                object->ancestor_component = parent_component;
+            }
+            else
+            {
+                object->ancestor_id = parent->ancestor_id;
+                object->ancestor_component = parent->ancestor_component;
+            }
+        }
+    }
+
+    return e;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_hide (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *           R0  =  flags
+     *           R1  =  Object ID
+     *
+     *   Exit:
+     *           R1-R9 preserved
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    /*
+     * we don't even know if object is showing so just pass it on
+     */
+
+    return object__class_swi (object__find_class_swi (object->header.class_id),
+                              Toolbox_HideObject - Toolbox_SWIChunkBase,
+                              (ObjectID)r->r[1],
+                              object->internal_handle,
+                              task->info.wimp_handle,
+                              r,
+                              NULL);
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_get_state (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *           R0  =  flags
+     *           R1  =  Object ID
+     *
+     *   Exit:
+     *           R0  =  state.
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    /*
+     * just pass it on to the Class SWI
+     */
+
+    return object__class_swi (object__find_class_swi (object->header.class_id),
+                              Toolbox_GetObjectState - Toolbox_SWIChunkBase,
+                              (ObjectID)r->r[1],
+                              object->internal_handle,
+                              task->info.wimp_handle,
+                              r,
+                              &r->r[0]);
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_miscop (_kernel_swi_regs *r)
+{
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    /*
+     * just pass it on to the Class SWI
+     */
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    return object__class_swi (object__find_class_swi (object->header.class_id),
+                              Toolbox_ObjectMiscOp - Toolbox_SWIChunkBase,
+                              (ObjectID)r->r[1],
+                              object->internal_handle,
+                              task->info.wimp_handle,
+                              r,
+                              NULL);
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_set_client_handle (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *         R2  =  client handle
+     *
+     *   Exit:
+     *         R1-R9 preserved
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    object->client_handle = (void *)r->r[2];
+
+    return NULL;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_get_client_handle (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *
+     *   Exit:
+     *         R0 = client handle for this Object
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    r->r[0] = (int)object->client_handle;
+
+    return NULL;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_get_class (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *
+     *   Exit:
+     *         R0 = Object class
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    r->r[0] = (int)object->header.class_id;
+
+    return NULL;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_get_parent (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *
+     *   Exit:
+     *         R0 = Parent ID
+     *         R1 = Parent component ID
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    r->r[0] = (int)object->parent_id;
+    r->r[1] = (int)object->parent_component;
+
+    return NULL;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_get_ancestor (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *
+     *   Exit:
+     *         R0 = Ancestor ID
+     *         R1 = Ancestor component ID
+     *
+     */
+
+    object_t *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    r->r[0] = (int)object->ancestor_id;
+    r->r[1] = (int)object->ancestor_component;
+
+    return NULL;
+}
+
+
+/*****************************************************************************************/
+extern _kernel_oserror *object_get_template_name (_kernel_swi_regs *r)
+{
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  Object ID
+     *         R2  -> buffer
+     *         R3  =  size of buffer
+     *
+     *   Exit:
+     *        if R2 was zero
+     *           R3 = length of buffer required
+     *        else
+     *           Buffer pointed at by R2 holds template name
+     *           R3 holds number of bytes written to buffer
+     *
+     */
+
+    object_t        *object = IDtoPtr(r->r[1]);
+    _kernel_oserror *e;
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+    DEBUG mem_chk(object, CHECK_HEAP | CHECK_NONZERO);
+
+    if ((e = object__validate(r->r[1])) != NULL)
+        return e;
+
+    string_to_buffer ((char *)r->r[2], object->header.name, &r->r[3]);
+
+    return NULL;
+}

@@ -1,0 +1,463 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:VFPSupport
+
+        ARM ; Avoid UAL syntax warnings
+
+; 'Compile' the NEON mu-law to 16-bit code
+; This doesn't do any compilation, it just sets up the per-channel stereo scale
+; factors used by the main code
+; Entry conditions:
+;   SVC or IRQ mode, IRQs disabled
+; Parameters:
+;   r0 = log2nchan, i.e. 0 -> 1 channel, 1 -> 2 chans, 2 -> 4 chans, 3 -> 8 chans
+;   r1 = pointer to module workspace
+;   r2 = compacted array of stereo position values, 8x3 bits each (1-based)
+;        in bits 0..23, with soundgain (0..7) in top byte.
+compile ROUT
+        Entry   "r2,r3,r5,r6,r7,r8,r9"
+        ; Calculate Q0 & Q1
+        ; Note that although we calculate a full set of 8 scale factors, in
+        ; 1/2/4 channel mode it's assumed that the stereo positions are
+        ; correctly set up to mirror each other, as only parts of Q0 & Q1 will
+        ; be used
+        ; TODO - Should store straight into context registers.
+        ; Or use temp context held on stack.
+        ADD     r3, r1, #NEON_Q0_Q1
+        MOV     r5, #8
+        ADR     r6, neon_vols
+        ; Access appropriate subtable for current soundgain setting
+        AND     r7, r2, #&7000000
+        ADD     r6, r6, r7, LSR #20
+10
+        AND     r7, r2, #7
+        MOV     r2, r2, LSR #3
+        ADD     r8, r6, r7, LSL #1
+        SUB     r9, r6, r7, LSL #1
+        LDRH    r8, [r8] ; Right channel
+        LDRH    r9, [r9, #16] ; Left channel
+        SUBS    r5, r5, #1
+        STRH    r8, [r3], #2
+        STRH    r9, [r3, #14]
+        BNE     %BT10
+        EXIT
+
+
+; Volume scale factors
+; The maximum value that the log -> lin code will produce is +/-7904
+; We want to scale this up to +/-32767, and apply up to +21dB (*11.22) of boost
+; from the current soundgain setting
+; This results in a maximum scale factor of 46.5146491
+; To fit this into a signed halfword, we multiply by 512, producing a 7.9
+; fixed point number
+; To make sure the scale factors are as accurate as possible, the table below
+; was generated using BASIC instead of objasm's integer math. Note magic
+; constant of &FFFFFF = 32768*512-1
+;
+;  10 FOR DB=0 TO 21 STEP 3
+;  20 PRINT '"; Table for +";DB;"dB"'"        DCW     0";
+;  30 FOR VOL=0 TO 6
+;  40 PRINT ",&";~(&FFFFFF*VOL*10^(DB/20)/(6*7904));
+;  50 NEXT VOL,DB
+;
+; Note that the maximum scale factor is &5D08. &5D08*7904*8 fits happily within
+; a 32bit int, so the only point at which we need to saturate is when we do the
+; final 32bit -> 16bit conversion.
+
+neon_vols
+; Table for +0dB
+        DCW     0,&0,&161,&2C3,&425,&587,&6E8,&84A
+; Table for +3dB
+        DCW     0,&0,&1F3,&3E7,&5DB,&7CE,&9C2,&BB6
+; Table for +6dB
+        DCW     0,&0,&2C1,&583,&845,&B07,&DC9,&108B
+; Table for +9dB
+        DCW     0,&0,&3E5,&7CA,&BAF,&F94,&1379,&175E
+; Table for +12dB
+        DCW     0,&0,&580,&B00,&1081,&1601,&1B81,&2102
+; Table for +15dB
+        DCW     0,&0,&7C5,&F8A,&1750,&1F15,&26DA,&2EA0
+; Table for +18dB
+        DCW     0,&0,&AFA,&15F4,&20EE,&2BE8,&36E2,&41DC
+; Table for +21dB
+        DCW     0,&0,&F81,&1F02,&2E84,&3E05,&4D86,&5D08
+ 
+; Integer NEON routine for converting mu-law to 16-bit linear data
+; This processes the source data one quadword at a time, producing between
+; 16 and 2 words of output data per source quadword
+;
+; Note that unlike MuLawARM, we don't attempt to detect and skip empty portions
+; of the buffer. I did try adding code for that, but it only made things slower.
+; Maybe someone else can come up with a better approach?
+; (My approach was to load all the input data into ARM registers so it can be
+; easily checked for 0's before passing onto NEON. If 0's were detected it
+; would branch off into a tight loop that would return to the main loop once
+; a non-zero source quadword was detected. Both ARM and NEON instructions were
+; tried for storing 0's to the output buffer. Maybe loading from non-cacheable,
+; bufferable regions to ARM regs is just too slow?)
+; 
+; In:
+; r0 = SoundRMA
+; r4 = physical length
+; r6 = Config word, log2numchan in bits 24-25
+; r10 = logical buffer end
+; r11 = physical buffer start or end, according to log2numchan
+; r12 = logical buffer start
+; IRQ32, IRQs off
+; Out:
+; r3 = 1 if buffer contains sound, 2 if silent
+; r0-r2,r4-r12,r14 corruptible
+MuLawNEON_code
+        Push    "lr"
+        ; Interrupts on for main code. R14 unpredictable from here on out.
+        CPSIE   i
+        ; Set up our NEON registers
+        ; Need:
+        ; Q0, Q1 loaded with scale factors from workspace
+        ADD     r1,r0,#NEON_Q0_Q1
+        VLDMIA  r1,{Q0-Q1}
+        ; Q15 loaded with #&0001...
+        VMOV.I16 Q15,#&0001
+        ; Q14 loaded with #&0020...
+        VMOV.I16 Q14,#&0020
+        ; Use Q12 as our buffer empty check register
+        VMOV.I16 Q12,#0
+        ; Work out which fill routine we're using
+        AND     r1,r6,#3<<24
+        ADR     r5,MuLaw_fillcode
+        LDR     r1,[r5,r1,LSR #22]
+        ADD     r1,r5,r1
+        MOV     pc,r1
+
+MuLaw_fillcode
+        DCD     MuLaw_fill1 - MuLaw_fillcode
+        DCD     MuLaw_fill2 - MuLaw_fillcode
+        DCD     MuLaw_fill4 - MuLaw_fillcode
+        DCD     MuLaw_fill8 - MuLaw_fillcode
+
+MuLaw_exit
+        ; Check our zero flag
+        VORR    D24,D24,D25 ; Pack into a doubleword ready for transfer
+        VMOV    r4,r5,D24
+        ; IRQs back off
+        CPSID   i
+        Pull    "lr" ; Something to do while waiting for r4,r5 to transfer
+        ; Check zero flag
+        ORRS    r4,r4,r5
+        MOVEQ   r3,#2
+        MOVNE   r3,#1
+        ; Return
+        MOV     pc,lr
+
+
+MuLaw_fill1         ROUT
+        ; 1-channel code
+        ; Load backwards from R10 until we hit R12
+        ; Store backwards to R11
+        VLDMDB      r10!,{Q13} ; Load 16 samples
+        ; Convert
+        B           MuLaw_main
+        ; Preload next block
+        CMP         r10,r12
+        VLDMDBNE    r10!,{Q13}
+        ; Mono results in Q8, Q9
+        ; Apply volume scaling, and mix together
+        ; Must use long multiply as result isn't suitable for VQDMULH-type
+        ; instructions
+        VMULL.S16   Q2,D16,D0[0] ; R0-3
+        VMULL.S16   Q3,D17,D0[0] ; R4-7
+        VMULL.S16   Q4,D16,D2[0] ; L0-3
+        VMULL.S16   Q5,D17,D2[0] ; L4-7
+        VMULL.S16   Q6,D18,D0[0] ; R8-11
+        VMULL.S16   Q7,D19,D0[0] ; R12-15
+        VMULL.S16   Q10,D18,D2[0] ; L8-11
+        VMULL.S16   Q11,D19,D2[0] ; L12-15
+        ; Shift down and saturate
+        VQSHRN.S32  D4,Q2,#9 ; R0-3
+        VQSHRN.S32  D5,Q3,#9 ; R4-7
+        VQSHRN.S32  D6,Q4,#9 ; L0-3
+        VQSHRN.S32  D7,Q5,#9 ; L4-7
+        VQSHRN.S32  D8,Q6,#9 ; R8-11
+        VQSHRN.S32  D9,Q7,#9 ; R12-15
+        VQSHRN.S32  D10,Q10,#9 ; L8-11
+        VQSHRN.S32  D11,Q11,#9 ; L12-15
+        ; Interleave the stereo channels
+        VZIP.16     Q2,Q3 ; 0-7 interleaved
+        VZIP.16     Q4,Q5 ; 8-15 interleaved
+        VSTMDB      r11!,{Q2-Q5}
+        BNE         MuLaw_main
+        B           MuLaw_exit
+        
+MuLaw_fill2         ROUT
+        ; 2-channel code
+        ; Load backwards from R10 until we hit R12
+        ; Store backwards to R11
+        VLDMDB      r10!,{Q13} ; Load 16 samples
+        ; Convert
+        B           MuLaw_main
+        ; Preload next block
+        CMP         r10,r12
+        VLDMDBNE    r10!,{Q13}
+        ; Mono results in Q8, Q9
+        ; Apply volume scaling, and mix together
+        ; We want to use VMLAL to mix each sample pair together
+        ; This means the samples need ordering as follows:
+        ; {0 2 4 6} {8 10 12 14} {1 3 5 7} {9 11 13 15}
+        VUZP.16     Q8,Q9 ; Generate required sample ordering
+        VMULL.S16   Q2,D16,D0[0] ; R0,2,4,6
+        VMLAL.S16   Q2,D18,D0[1] ; R1,3,5,7
+        VMULL.S16   Q3,D17,D0[0] ; R8,10,12,14
+        VMLAL.S16   Q3,D19,D0[1] ; R9,11,13,15
+        VMULL.S16   Q4,D16,D2[0] ; L0,2,4,6
+        VMLAL.S16   Q4,D18,D2[1] ; L1,3,5,7
+        VMULL.S16   Q5,D17,D2[0] ; L8,10,12,14
+        VMLAL.S16   Q5,D19,D2[1] ; L9,11,13,15
+        ; Shift down and saturate
+        VQSHRN.S32  D4,Q2,#10 ; R0-3
+        VQSHRN.S32  D5,Q3,#10 ; R4-7
+        VQSHRN.S32  D6,Q4,#10 ; L0-3
+        VQSHRN.S32  D7,Q5,#10 ; L4-7
+        ; Interleave the stereo channels
+        VZIP.16     Q2,Q3 ; 0-7 interleaved
+        VSTMDB      r11!,{Q2-Q3}
+        BNE         MuLaw_main
+        B           MuLaw_exit
+
+MuLaw_fill4         ROUT
+        ; 4-channel code
+        ; Load forwards from R12 until we hit R10
+        ; Store forwards to R11
+        VLDMIA      r12!,{Q13} ; Load 16 samples
+        ; Convert
+        B           MuLaw_main
+        ; Preload next block
+        CMP         r10,r12
+        VLDMIANE    r12!,{Q13}
+        ; Mono results in Q8, Q9
+        ; Apply volume scaling, and mix together
+        ; To use VMLAL we need the data to be in the following order:
+        ; {0 4 8 12} {1 5 9 13} {2 6 10 14} {3 7 11 15}
+        VUZP.16     Q8,Q9 ;-> {0 2 4 6} {8 10 12 14} {1 3 5 7} {9 11 13 15}
+        VUZP.16     Q8,Q9 ;-> {0 4 8 12} {1 5 9 13} {2 6 10 14} {3 7 11 15}
+        VMULL.S16   Q2,D16,D0[0] ; R0,4,8,12
+        VMLAL.S16   Q2,D17,D0[1] ; R1,5,9,13
+        VMLAL.S16   Q2,D18,D0[2] ; R2,R6,R10,R14
+        VMLAL.S16   Q2,D19,D0[3] ; R3,R7,R11,R15
+        VMULL.S16   Q3,D16,D2[0] ; L0,4,8,12
+        VMLAL.S16   Q3,D17,D2[1] ; L1,5,9,13
+        VMLAL.S16   Q3,D18,D2[2] ; L2,L6,L10,L14
+        VMLAL.S16   Q3,D19,D2[3] ; L3,L7,L11,L15
+        ; Shift down and saturate
+        VQSHRN.S32  D4,Q2,#11 ; R0-3
+        VQSHRN.S32  D5,Q3,#11 ; L0-3
+        ; Interleave the stereo channels
+        VZIP.16     D4,D5 ; 0-3 interleaved
+        VSTMIA      r11!,{D4-D5}
+        BNE         MuLaw_main
+        B           MuLaw_exit
+
+MuLaw_fill8         ROUT
+        ; 8-channel code
+        ; Load forwards from R12 until we hit R10
+        ; Store forwards to R11
+        VLDMIA      r12!,{Q13} ; Load 16 samples
+        ; Convert
+        B           MuLaw_main
+        ; Preload next block
+        CMP         r10,r12
+        VLDMIANE    r12!,{Q13}
+        ; Mono results in Q8, Q9
+        ; Apply volume scaling, and mix together
+        ; This case is a bit tricky, since we can't use our usual tactic of
+        ; multiplying by scalars to calculate 4 output samples in parallel
+        ; We'll have to multiply by vectors, then use pairwise adds to boil
+        ; the data down to just four samples
+        VMULL.S16   Q2,D16,D0 ; R0-3
+        VMLAL.S16   Q2,D17,D1 ; R4-7
+        VMULL.S16   Q3,D16,D2 ; L0-3
+        VMLAL.S16   Q3,D17,D3 ; L4-7
+        VMULL.S16   Q4,D18,D0 ; R8-11
+        VMLAL.S16   Q4,D19,D1 ; R12-15
+        VMULL.S16   Q5,D18,D2 ; L8-11
+        VMLAL.S16   Q5,D19,D3 ; L12-15
+        ; Pairwise add. We can interleave the stereo channels at the same time.
+        ; Note that although this only operates on D regs, it's faster than
+        ; transposing the 4x4 matrix Q2-Q5 and adding in parallel using Q regs
+        VPADD.I32   D4,D4,D5 ; R01,R23
+        VPADD.I32   D6,D6,D7 ; L01,L23
+        VPADD.I32   D8,D8,D9 ; R45,R67
+        VPADD.I32   D10,D10,D11 ; L45,L67
+        VPADD.I32   D4,D4,D6 ; R0123,L0123
+        VPADD.I32   D5,D8,D10 ; R4567,L4567
+        ; Stereo channels are already interleaved, so we just need to shift and saturate
+        VQSHRN.S32  D4,Q2,#12        
+        VSTMIA      r11!,{D4}
+        BEQ         MuLaw_exit
+        ; NOTE: Fall through!
+
+MuLaw_main
+        ; Main conversion code
+        ; r1 = return address, minus 8
+        ; (not using r14 due to being in IRQ mode with IRQs enabled)
+        ; Input is in Q13, output goes to Q8 & Q9
+        VORR        Q12,Q12,Q13 ; Update our zero flag
+        VMOVL.U8    Q6,D26 ; Expand each sample to 16bit (top 8 bits empty)
+        VMOVL.U8    Q7,D27
+        VTST.16     Q8,Q6,Q15 ; get sign
+        VTST.16     Q9,Q7,Q15
+        VSHR.U16    Q10,Q6,#5 ; get chords
+        VSHR.U16    Q11,Q7,#5
+        VBIC.I16    Q6,Q6,#&00E1 ; get points(*2)
+        VBIC.I16    Q7,Q7,#&00E1
+        ; We want base+(point*2)*halfstep
+        ; Where base = ((1<<chord)-1)<<5 and halfstep = 1<<chord
+        ; This can be rearranged to:
+        ; (32+point*2)<<chord - 32
+        VORR.I16    Q6,Q6,Q14 ; 32+point*2
+        VORR.I16    Q7,Q7,Q14
+        VSHL.U16    Q6,Q6,Q10 ; (32+point*2)<<chord
+        VSHL.U16    Q7,Q7,Q11
+        VSUB.I16    Q6,Q6,Q14 ; (32+point*2)<<chord - 32
+        VSUB.I16    Q7,Q7,Q14
+        VNEG.S16    Q10,Q6 ; negate ready for sign application
+        VNEG.S16    Q11,Q7
+        VBSL        Q8,Q10,Q6 ; select pos/neg version
+        VBSL        Q9,Q11,Q7
+        ; results are 16-bit signed, range +/-7904
+        ADD         pc,r1,#8 ; Return to correct place
+
+; Buffer processing routines - out-of-line code sequences which all return to
+; "BufferDone"
+
+        MACRO
+        MonoReverseMix $reg,$temp,$flags
+      [ ($flags :AND: DoMono) <> 0
+        VREV32.16   $temp,$reg
+        VRHADD.S16  $reg,$reg,$temp
+      ELIF ($flags :AND: DoReverse) <> 0
+        VREV32.16   $reg,$reg
+      ]
+      [ ($flags :AND: DoSoftMix) <> 0
+        VQDMULH.S16 $reg,$reg,D6[0]
+      ]
+        MEND
+
+; DoFunc_Mono
+;
+;     Convert stereo into mono (in same buffer space)
+;
+;   r0 = base address of current buffer
+;   r1 = limit address (last+1) of source (Fs*1)
+;   r7 = SoundRMA
+;   r14 = unavailable (IRQs enabled)
+; On exit:
+;   r0-r12,r14 corrupted
+
+        MACRO
+        SimpleCore $flags
+      [ ($flags :AND: DoSoftMix) <> 0
+        ADD         r8, r7, #SoftMixAmount
+        VLD1.32     {D6[0]}, [r8]
+      ]
+        MOV         r7, r1
+01      VLDMDB      r1!,{Q0}
+        MonoReverseMix Q0,Q1,$flags
+        CMP         r1, r0
+        VSTMDB      r7!,{Q0}
+        BNE         %BT01
+        B           BufferDone
+        MEND
+        
+
+DoFunc_Mono         ROUT
+        SimpleCore  DoMono
+
+DoFunc_Reverse      ROUT
+        SimpleCore  DoReverse
+
+DoFunc_SoftMix ROUT
+        SimpleCore  DoSoftMix
+
+DoFunc_SoftMix_Mono ROUT
+        SimpleCore  DoSoftMix+DoMono
+
+DoFunc_SoftMix_Reverse ROUT
+        SimpleCore  DoSoftMix+DoReverse
+
+; Macro for generation of oversampling code
+; Oversampling is implemented as a simple 2x linear interpolation between each
+; pair of samples. Buffer is processed in reverse order to avoid overwriting
+; the sample data (requires caller to have set up correct buffer pointers in
+; r1 & r2). The sample at the start of the buffer is interpolated with a copy
+; of the processed sample from the end of the previous buffer - so it will
+; have already been subjected to any of the optional extra processing (mono
+; conversion, stereo reversal, software mixing)
+;
+; In:
+;   r0 = base address of current buffer
+;   r1 = limit address (last+1) of source (Fs*1)
+;   r2 = limit address (last+1) of dest (Fs*2)
+;   r6 = last sample pair from previous buffer
+;   r7 = SoundRMA
+;   r14 = unavailable (IRQs enabled)
+; On exit:
+;   r0-r12,r14 corrupted
+        MACRO
+        OversampleCore $flags
+        VLDMDB      r1!,{Q2} ; Load initial 4 samples
+      [ ($flags :AND: DoSoftMix) <> 0
+        ADD         r8, r7, #SoftMixAmount
+        VLD1.32     {D6[0]}, [r8]
+      ]
+        MonoReverseMix Q2,Q1,$flags
+        ADD         r0,r0,#8*4 ; Need to do last group seperately, so move base
+01      VLDMDB      r1!,{Q0} ; Load 4 new samples
+        MonoReverseMix Q0,Q1,$flags
+02
+        ; Interpolate samples 4-7 with samples 3-6
+        VEXT.32     Q1,Q0,Q2,#3 ; Select samples 3-6
+        VRHADD.S16  Q1,Q2,Q1 ; Average samples 4-7 with 3-6
+        VZIP.32     Q1,Q2 ; <3+4> <4> <4+5> <5> <5+6> <6> <6+7> <7>
+        VSTMDB      r2!,{Q1-Q2} ; Store results
+        CMP         r2, r0
+        VMOV        Q2,Q0 ; Samples 0-3 become samples 4-7 in next iteration
+        BHI         %BT01
+        BLO         BufferDone
+        VMOV.32     D1[1],r6 ; Last sample from previous buffer loaded as sample 3
+        B           %BT02
+        MEND
+
+DoFunc_Oversample ROUT
+        OversampleCore 0
+
+DoFunc_Reverse_Oversample ROUT
+        OversampleCore DoReverse
+
+DoFunc_Mono_Oversample ROUT
+        OversampleCore DoMono
+
+DoFunc_SoftMix_Oversample ROUT
+        OversampleCore DoSoftMix
+
+DoFunc_SoftMix_Reverse_Oversample ROUT
+        OversampleCore DoSoftMix+DoReverse
+
+DoFunc_SoftMix_Mono_Oversample ROUT
+        OversampleCore DoSoftMix+DoMono
+
+        CODE32
+
+        END

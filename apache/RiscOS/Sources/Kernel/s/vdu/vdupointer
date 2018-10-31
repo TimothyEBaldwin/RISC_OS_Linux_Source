@@ -1,0 +1,1127 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > $.Source.VduPointer
+
+; mjs Sep 2000
+;
+; kernel/HAL split
+; display pointer updating is no longer VIDC/IOMD specific
+;
+
+; *****************************************************************************
+;
+;       DoPointerStuff - Entry point for OSWORD nn
+;
+; in:   R1 -> control block
+;       [R1, #0] : Reason code
+;
+;       Reason code 0 - Define pointer size, shape and active point
+;
+;       [R1, #1] : Shape number (1..4)
+;       [R1, #2] : Width (w) in bytes (0..8)
+;       [R1, #3] : Height (h) in pixels (0..32)
+;       [R1, #4] : ActiveX in pixels from left (0..w*4-1)
+;       [R1, #5] : ActiveY in pixels from top (0..h-1)
+;       [R1, #6..9] : Pointer (P) to data
+;       [P, #0..w*h-1] : Data bytes in rows from top to bottom,
+;       left to right in each row.
+;
+;       Reason code 1 - Define mouse coordinate bounding box
+;
+;       [R1, #1..2] : left      ; all treated as
+;       [R1, #3..4] : bottom    ; signed 16-bit values,
+;       [R1, #5..6] : right     ; relative to screen origin at the time
+;       [R1, #7..8] : top       ; the command is issued
+;
+;       If (left > right) or (bottom > top) then the command is ignored
+;       An infinite box can be obtained by setting
+;       left=&8000, right=&7FFF, bottom=&8000, top=&7FFF
+;
+;       If the current mouse position is outside the box, it is moved to
+;       the nearest point inside the box
+;
+;       The mouse buffer is NOT flushed - any buffered coords will be moved
+;       inside the bounding box when they are read.
+;
+;       Reason code 2 - Define mouse multipliers
+;
+;       [R1, #1] : X multiplier         ; both treated as
+;       [R1, #2] : Y multiplier         ; signed 8-bit values
+;
+;       Reason code 3 - Set mouse position
+;
+;       [R1, #1..2] : X position        ; both treated as
+;       [R1, #3..4] : Y position        ; signed 16-bit values
+;       The mouse buffer is flushed
+;
+;       Reason code 4 - Read mouse position (not buffered)
+;
+;       out: [R1, #1..2] : X position   ; both treated as
+;            [R1, #3..4] : Y position   ; signed 16-bit values
+;
+;       Reason code 5 - Set pointer position
+;
+;       [R1, #1..2] : X position        ; both treated as
+;       [R1, #3..4] : Y position        ; signed 16-bit values
+;
+;       Reason code 6 - Read pointer position
+;
+;       out: [R1, #1..2] : X position   ; both treated as
+;            [R1, #3..4] : Y position   ; signed 16-bit values
+;
+
+DoPointerStuff ROUT
+        LDRB    R0, [R1, #0]
+
+        CMP     R0, #7
+
+        LDRCC   PC, [PC, R0, LSL #2]
+        MOV     PC, R14                 ; ***** WHY NO ERROR????????
+        DCD     DoDefinePointer
+        DCD     DoMouseBox
+        DCD     SetMouseMult
+        DCD     SetMousePosn
+        DCD     ReadMousePosn
+        DCD     SetPointerPosn
+        DCD     ReadPointerPosn
+
+; *****************************************************************************
+
+DoDefinePointer
+
+        ; We allow interrupts during time we copy shape, but we copy into a
+        ; holding descriptor, so shape will never be displayed (whether its the
+        ; current one, or becomes the current one with an OSByte 6A) until the
+        ; vsync after we have a complete definition.
+        ;
+        ; We have two holding buffers, so that we can always choose a holding
+        ; buffer that is not currently being used for display by the HAL,
+        ; despite multiple definitions between vsyncs. This all assumes we
+        ; are never re-entered, but the documentation for OS_Word 21,0 says
+        ; re-entrancy undefined anyway - should really say not re-entrant.
+
+        Push    "R1-R7, R14"
+
+        ; interrupts still off for critical choosing of buffer
+        ;
+        ADD     R6, WsPtr, #PointerShapesH
+        MOV     R7, #0                          ; try holding shape 1
+        LDR     R14, [R6, R7, LSL #2]           ; R14 -> shape
+        LDR     R2, [R14, #PointerBuffLA]       ; shape buffer we propose to use
+        LDR     R0, [WsPtr, #PointerShapeLA]    ; shape buffer owned by HAL
+        TEQ     R0, R2                          ; identical?
+        MOVEQ   R7, #1                          ; alright then, holding shape 2
+        LDREQ   R14, [R6, R7, LSL #2]           ; R14 -> shape
+
+        ; now R7 = holding shape index (0,1), R14 -> shape, not owned by HAL
+
+        CLRPSR  I_bit, R0                       ; re-enable interrupts
+
+        LDRB    R6, [R1, #1]                    ; shape number we're defining
+        SUB     R6, R6, #1
+        CMP     R6, #4                          ; now in range 0..3 ?
+        BCS     %FT90                           ; bad shape number
+
+        LDRB    R0, [R1, #2]                    ; R0 = width (bytes)
+        LDRB    R2, [R1, #3]                    ; R2 = height
+        LDRB    R3, [R1, #4]                    ; R3 = ActiveX
+        LDRB    R4, [R1, #5]                    ; R4 = ActiveY
+
+        CMP     R2, #0                          ; C=1 if EQ
+        STREQB  R2, [R14, #PointerWidth]
+        STREQB  R2, [R14, #PointerHeight]
+        BEQ     %FT80                           ; empty shape (off)
+
+        CMP     R0, #0                          ; C=1 if EQ
+        STREQB  R0, [R14, #PointerWidth]
+        STREQB  R0, [R14, #PointerHeight]
+        CMPNE   R0, #8+1
+        BCS     %FT90                           ; bad width
+
+        CMP     R2, #32+1                       ; C=1 => bad height
+        CMPCC   R3, R0, LSL #2                  ; ActiveX >= (width * 4) ?
+        CMPCC   R4, R2                          ; ActiveY >= height
+
+        BCS     %FT90                           ; bad definition
+
+        STRB    R0, [R14, #PointerWidth ]       ; actual width in bytes, before padding to constant 8
+        STRB    R2, [R14, #PointerHeight]
+        STRB    R3, [R14, #PointerActiveX]
+        STRB    R4, [R14, #PointerActiveY]
+
+        ADD     R4, R1, #6
+        LDW     R1, R4, R3, R5                  ; load word from
+                                                ; unknown alignment
+; Now R1 -> user's data
+
+        LDR     R3, [R14, #PointerBuffLA]       ; R3 -> buffer to receive shape
+20
+        ADD     R4, R3, R0                      ; terminating R3 for this row
+30
+        LDRB    R5, [R1], #1
+40
+        STRB    R5, [R3], #1                    ; store to buffer
+        CMP     R3, R4                          ; still within user data
+        BCC     %BT30                           ; for this row ?
+
+; now fill up rest of row
+
+        MOV     R5, #0
+        TST     R3, #7                          ; are we on a multiple of 8
+        BNE     %BT40                           ; no, then store 0
+
+        SUBS    R2, R2, #1                      ; done all rows ?
+        BNE     %BT20                           ; no, then loop
+
+80
+        ; we now have a completely defined shape in a holding buffer
+        ;
+        PHPSEI  R0                              ; disable interrupts for critical shape logic
+        ADD     R3, WsPtr, #PointerShapes
+        ADD     R4, WsPtr, #PointerShapesH
+        LDR     R1, [R3, R6, LSL #2]            ; swap the holding shape (R7=0,1) into
+        LDR     R2, [R4, R7, LSL #2]            ; the shape we've just defined (R6 = 0..3)
+        STR     R2, [R3, R6, LSL #2]
+        STR     R1, [R4, R7, LSL #2]
+        PLP     R0                              ; restore interrupts
+90
+        Pull    "R1-R7,PC"
+
+
+; *****************************************************************************
+;
+;       SetMouseRectangle - Called on mode change to set appropriate mouse
+;                           rectangle and mouse position
+;
+; in:   WsPtr -> VDWS
+;
+
+SetMouseRectangle ROUT
+        Push    R14
+
+        ASSERT  DisplayYWindLimit = DisplayXWindLimit +4
+        ASSERT  DisplayXEigFactor = DisplayXWindLimit +8
+        ASSERT  DisplayYEigFactor = DisplayXWindLimit +12
+
+        ADD     R2, WsPtr, #DisplayXWindLimit
+        LDMIA   R2, {R2-R5}
+
+        ADD     R2, R2, #1              ; XWindLimit+1
+        MOV     R2, R2, LSL R4          ; (XWindLimit+1) << XEigFactor
+        SUB     R4, R2, #1              ; ((XWindLimit+1) << XEigFactor)-1
+        MOV     R2, R2, LSR #1          ; centre x of window
+
+        ADD     R3, R3, #1              ; YWindLimit+1
+        MOV     R3, R3, LSL R5          ; (YWindLimit+1) << YEigFactor
+        SUB     R5, R3, #1              ; ((YWindLimit+1) << YEigFactor)-1
+        MOV     R3, R3, LSR #1          ; centre y of window
+
+        BL      SetMousePosnRegs
+
+        MOV     R2, #0                  ; left = 0
+        MOV     R3, #0                  ; bottom = 0
+
+        Push    "R1-R6"
+        B       DoMouseBoxRegs
+
+
+DoMouseBox ROUT
+        Push    "R1-R6, R14"
+
+      [ NoARMv6 :LOR: NoUnaligned
+        LDRB    R2, [R1, #1]            ; R2 = left
+        LDRB    R0, [R1, #2]
+        ORR     R2, R2, R0, LSL #8
+
+        LDRB    R3, [R1, #3]            ; R3 = bottom
+        LDRB    R0, [R1, #4]
+        ORR     R3, R3, R0, LSL #8
+
+        LDRB    R4, [R1, #5]            ; R4 = right
+        LDRB    R0, [R1, #6]
+        ORR     R4, R4, R0, LSL #8
+
+        LDRB    R5, [R1, #7]            ; R5 = top
+        LDRB    R0, [R1, #8]
+        ORR     R5, R5, R0, LSL #8
+      |
+        ; Use unaligned loads from ARMv6
+        LDRH    R2, [R1, #1]            ; R2 = left
+        LDRH    R3, [R1, #3]            ; R3 = bottom
+        LDRH    R4, [R1, #5]            ; R4 = right
+        LDRH    R5, [R1, #7]            ; R5 = top
+      ]
+
+DoMouseBoxRegs
+
+; now add on graphics origin
+
+        LDR     R0, [WsPtr, #OrgX]
+        ADD     R2, R2, R0
+        ADD     R4, R4, R0
+        LDR     R0, [WsPtr, #OrgY]
+        ADD     R3, R3, R0
+        ADD     R5, R5, R0
+
+; now sign extend all coords
+
+      [ NoARMv6
+        MOV     R2, R2, LSL #16
+        MOV     R2, R2, ASR #16
+        MOV     R3, R3, LSL #16
+        MOV     R3, R3, ASR #16
+        MOV     R4, R4, LSL #16
+        MOV     R4, R4, ASR #16
+        MOV     R5, R5, LSL #16
+        MOV     R5, R5, ASR #16
+      |
+        ; ARMv6 lets you do this using SXTH
+        SXTH    R2, R2
+        SXTH    R3, R3
+        SXTH    R4, R4
+        SXTH    R5, R5
+      ]
+
+; now check right >= left and top >= bottom
+
+        CMP     R4, R2
+        CMPGE   R5, R3
+        BLT     %FT10                   ; bad definition
+
+; everything seems OK, so disable IRQs while we update vars
+
+        MRS     R14, CPSR
+        ORR     R0, R14, #I32_bit
+        MSR     CPSR_c, R0
+
+        Push    R11
+        LDR     R11, =ZeroPage+KeyWorkSpace
+
+        ADR     R0, MouseBounds
+        STMIA   R0, {R2-R5}
+
+; check mouse position is within box
+
+        LDR     R0, MouseX
+        CMP     R0, R2                  ; if X < left
+        STRLT   R2, MouseX              ; then X := left
+        CMP     R4, R0                  ; if right < X
+        STRLT   R4, MouseX              ; then X := right
+
+        LDR     R0, MouseY
+        CMP     R0, R3                  ; if Y < bottom
+        STRLT   R3, MouseY              ; then Y := bottom
+        CMP     R5, R0                  ; if top < Y
+        STRLT   R5, MouseY              ; then Y := top
+
+        Pull    R11
+
+        MSR     CPSR_c, R14             ; restore old IRQ state
+10
+        Pull    "R1-R6, PC"
+
+; *****************************************************************************
+;
+;       UpdatePointer - Called on vsync to update pointer position
+;
+; in:   WsPtr (R12) -> VduDriverWorkSpace
+;       IRQs disabled, but can be enabled (n.b. may be in IRQ mode)
+;
+UpdatePointer ROUT
+        Push    "R14"
+
+        LDRB    R5, [WsPtr, #PointerShapeNumber]
+
+        TST     R5, #&80                   ; pointer unlinked if bit 7 set
+
+        LDREQ   R6, MouseX
+        STREQ   R6, [WsPtr, #PointerX]
+        LDREQ   R6, MouseY
+        STREQ   R6, [WsPtr, #PointerY]
+
+        ANDS    R5, R5, #&7F                 ; clear bit 7 and set Z if 0 ie off
+        BNE     %FT20
+
+10
+        MOV     R0, #0                       ; flags = 0 (pointer off)
+        MOV     R1, #0                       ; x = 0
+        MOV     R2, #0                       ; y = 0
+        MOV     R3, #0                       ; shape descriptor = NULL
+        STR     R3, [WsPtr, #PointerShapeLA] ; NULL passed as last buffer address
+        B       %FT40
+
+20
+        ADD     R3, WsPtr, #PointerShapes-4
+        LDR     R3, [R3, R5, LSL #2]         ; R3 -> current shape block (R5 = shape 1..4)
+
+        LDRB    R0, [R3, #PointerHeight]     ; height of 0 switches pointer off
+        TEQ     R0, #0
+        BEQ     %BT10
+
+        MOV     R0, #1                       ; R0 = flags, set pointer on (bit 0 = 1)
+
+        LDR     R1, [WsPtr, #PointerShapeLA] ; last shape buffer given to HAL
+        LDR     R4, [R3, #PointerBuffLA]     ; shape buffer we're about to give
+        TEQ     R1, R4                       ; same as last time?
+        STRNE   R4, [WsPtr, #PointerShapeLA] ; update
+        ORRNE   R0, R0, #2                   ; flag new shape (bit 1 = 1)
+
+        LDR     R1, [WsPtr, #PointerX]
+        LDRB    R4, [WsPtr, #PointerXEigFactor]
+        MOV     R1, R1, ASR R4                     ; R1 = pointer x, pixels
+        LDRB    R4, [R3, #PointerActiveX]
+        SUB     R1, R1, R4                         ; R1 = pointer x, adjusted for active point
+
+        LDR     R2, [WsPtr, #PointerY]
+        LDR     R4, [WsPtr, #DisplayYEigFactor]
+        LDR     R5, [WsPtr, #DisplayYWindLimit]    ; R5 = display height -1
+        SUB     R2, R5, R2, ASR R4                 ; R2 = pointer y, pixels, inverted
+        LDRB    R4, [R3, #PointerActiveY]
+        SUB     R2, R2, R4                         ; R2 = pointer y, adjusted for active point
+
+        ; and its up to the HAL to handle clipping according to h/w capabilities
+40
+        LDR     R4, [WsPtr, #CurrentGraphicsVDriver]
+        MOV     R4, R4, LSL #24
+        ORR     R4, R4, #GraphicsV_UpdatePointer
+        BL      CallGraphicsV
+
+        ; Software pointer required?
+        LDR     R5, [WsPtr, #GraphicsVFeatures]
+        TST     R5, #GVDisplayFeature_HardwarePointer
+        Pull    "pc", NE
+
+        ; Software pointer code can run with IRQs enabled; drop into SVC mode
+        MRS     R6, CPSR                     ; Currently we should always be in IRQ mode here, but read current mode just in case
+        MSR     CPSR_c, #SVC32_mode
+        MOV     R5, R14
+
+        ; If the call wasn't claimed, pass on to software pointer code
+        ; If the call was claimed, we need to make sure the software pointer is off
+        TEQ     R4, #0
+        MOVEQ   R0, #0
+        BL      UpdateSoftwarePointer
+
+        MOV     R14, R5
+        MSR     CPSR_c, R6
+        Pull    "pc"
+
+        LTORG
+
+; *****************************************************************************
+
+SetMouseMult ROUT
+        Push    "R11,R14"
+        LDR     R11, =ZeroPage+KeyWorkSpace
+
+      [ NoARMv4
+        LDRB    R0, [R1, #1]
+        MOV     R0, R0, ASL #24         ; sign extend to 32 bits
+        MOV     R0, R0, ASR #24
+      |
+        LDRSB   R0, [R1, #1]
+      ]
+        STR     R0, MouseXMult
+
+      [ NoARMv4
+        LDRB    R0, [R1, #2]
+        MOV     R0, R0, ASL #24         ; sign extend to 32 bits
+        MOV     R0, R0, ASR #24
+      |
+        LDRSB   R0, [R1, #2]
+      ]
+        STR     R0, MouseYMult
+
+        Pull    "R11,PC"
+
+; *****************************************************************************
+;
+;       GetCoordPair - get pair of 2-byte coords from R1+1..R1+4
+;       adds on graphics origin and sign extends to 32 bits
+;       and puts X into R2, Y into R3
+;
+
+GetCoordPair ROUT
+      [ NoARMv6 :LOR: NoUnaligned
+        LDRB    R0, [R1, #1]            ; get X coordinate
+        LDRB    R2, [R1, #2]
+        ORR     R0, R0, R2, LSL #8
+      |
+        ; Use unaligned loads and SXTH from ARMv6
+        LDRH    R0, [R1, #1]            ; get X coordinate
+      ]
+
+        LDR     R2, [WsPtr, #OrgX]      ; add on origin
+        ADD     R0, R0, R2
+
+      [ NoARMv6
+        MOV     R0, R0, ASL #16         ; sign extend 16 to 32
+        MOV     R2, R0, ASR #16
+      |
+        SXTH    R2, R0
+      ]
+
+      [ NoARMv6 :LOR: NoUnaligned
+        LDRB    R0, [R1, #3]            ; get Y coordinate
+        LDRB    R3, [R1, #4]
+        ORR     R0, R0, R3, LSL #8
+      |
+        LDRH    R0, [R1, #3]            ; get Y coordinate
+      ]
+
+        LDR     R3, [WsPtr, #OrgY]      ; add on origin
+        ADD     R0, R0, R3
+
+      [ NoARMv6
+        MOV     R0, R0, ASL #16         ; sign extend 16 to 32
+        MOV     R3, R0, ASR #16
+      |
+        SXTH    R3, R0
+      ]
+
+        MOV     PC, R14
+
+; *****************************************************************************
+
+SetMousePosn ROUT
+        Push    "R2, R3, R11, R14"
+        LDR     R11, =ZeroPage+KeyWorkSpace
+
+        BL      GetCoordPair
+
+; now check point is within bounding box
+
+        LDR     R0, MouseBoundLCol
+        CMP     R2, R0
+        LDRGE   R0, MouseBoundRCol
+        CMPGE   R0, R2
+        LDRGE   R0, MouseBoundBRow
+        CMPGE   R3, R0
+        LDRGE   R0, MouseBoundTRow
+        CMPGE   R0, R3
+
+        BLGE    SetMousePosnRegs
+
+        Pull    "R2, R3, R11, PC"
+
+SetMousePosnRegs
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        STR     R2, MouseX
+        STR     R3, MouseY
+        B       FlushMouse
+
+; *****************************************************************************
+;
+;       StoreCoordPair - Stores X,Y coords in R2,R3 in R1+1..R1+4
+;       subtracts graphics origin
+
+StoreCoordPair ROUT
+
+        LDR     R0, [WsPtr, #OrgX]      ; subtract off origin
+        SUB     R2, R2, R0
+
+      [ NoARMv6 :LOR: NoUnaligned
+        STRB    R2, [R1, #1]            ; store lo-byte of X
+        MOV     R2, R2, LSR #8
+        STRB    R2, [R1, #2]            ; store hi-byte of X
+      |
+        ; Use unaligned store from ARMv6
+        STRH    R2, [R1, #1]            ; store X
+      ]
+
+        LDR     R0, [WsPtr, #OrgY]      ; subtract off origin
+        SUB     R3, R3, R0
+
+      [ NoARMv6 :LOR: NoUnaligned
+        STRB    R3, [R1, #3]            ; store lo-byte of Y
+        MOV     R3, R3, LSR #8
+        STRB    R3, [R1, #4]            ; store hi-byte of Y
+      |
+        ; Use unaligned store from ARMv6
+        STRH    R3, [R1, #3]            ; store X
+      ]
+
+        MOV     PC, R14
+
+; *****************************************************************************
+
+ReadMousePosn ROUT
+        Push    "r0-r3, r9-r11, lr"
+        BL      PollPointer             ; update mouse position on a read
+        LDR     r1, [sp, #1*4]          ; reload pointer to buffer
+        LDR     R11, =ZeroPage+KeyWorkSpace
+
+        LDR     R2, MouseX              ; get mouse X
+        LDR     R3, MouseY              ; get mouse Y
+        BL      StoreCoordPair
+        Pull    "r0-r3, r9-r11, pc"
+
+; *****************************************************************************
+
+SetPointerPosn ROUT
+        Push    "R2, R3, R14"
+
+        BL      GetCoordPair
+
+        STR     R2, [WsPtr, #PointerX]
+        STR     R3, [WsPtr, #PointerY]
+
+        Pull    "R2, R3, PC"
+
+; *****************************************************************************
+
+ReadPointerPosn ROUT
+        Push    "R2, R3, R14"
+
+        LDR     R2, [WsPtr, #PointerX]
+        LDR     R3, [WsPtr, #PointerY]
+        BL      StoreCoordPair
+
+        Pull    "R2, R3, PC"
+
+; *****************************************************************************
+;
+;       FlushMouse - Flush mouse buffer
+;
+; out:  All registers preserved
+
+FlushMouse ROUT
+        Push    "R0-R2, R14"
+        MOV     R0, #21
+        MOV     R1, #Buff_Mouse
+        SWI     XOS_Byte
+        Pull    "R0-R2, PC"
+
+        LTORG
+
+; *****************************************************************************
+;
+;       RemovePointer - Remove soft mouse pointer from screen
+;
+; in:   WsPtr -> VduDriverWorkspace
+; out:  flags preserved
+
+RemovePointer ROUT
+        EntryS  "r10-r11"
+        LDRB    r10, [WsPtr, #SWP_Mutex]
+        TEQ     r10, #0
+        BNE     %FT90
+        ; Lock mutex
+        MOV     r10, #1
+        STRB    r10, [WsPtr, #SWP_Mutex]
+        ; We need to set SWP_Restore so that we know to release the mutex once we're done
+        ; However if the software pointer currently isn't visible (hardware pointer in use) then there might not be an image to restore
+        ; So SWP_Restore can take three values:
+        ; 0 -> not in RemovePointer block
+        ; 1 -> in RemovePointer but no restore needed
+        ; 2 -> in RemovePointer and restore needed
+        LDR     r11, [WsPtr, #SWP_Pos]
+        TEQ     r11, #0
+        MOVNE   r10, #2
+        STRB    r10, [WsPtr, #SWP_Restore]
+        ; Remove pointer if necessary
+        LDRNE   r10, [WsPtr, #SWP_Under]
+        BLNE    RemoveSoftwarePointer
+        ; Exit with mutex still locked
+90
+        EXITS
+
+; *****************************************************************************
+;
+;       RestorePointer - Restore soft mouse pointer to previous state
+;
+; in:   WsPtr -> VduDriverWorkspace
+;       Software pointer restore assumed to be needed
+
+RestorePointer ROUT
+        STMFD   R13!,{R0-R7,R14}
+        PHPSEI  R7                           ; IRQs off while we work out what to do
+        LDRB    R1, [WsPtr, #SWP_Restore]
+        MOV     R0, #0
+        STRB    R0, [WsPtr, #SWP_Restore]
+        STRB    R0, [WsPtr, #SWP_Mutex]
+        LDRB    R6, [WsPtr, #PointerShapeNumber]
+        TST     R1, #2                       ; Was the software pointer actually on?
+        ANDNES  R6, R6, #&7F
+        BEQ     %FT90
+
+        ADD     R3, WsPtr, #PointerShapes-4
+        LDR     R3, [R3, R6, LSL #2]         ; R3 -> current shape block (R6 = shape 1..4)
+
+        MOV     R0, #1                       ; R0 = flags, set pointer on (bit 0 = 1)
+
+        LDR     R1, [WsPtr, #PointerShapeLA] ; last shape buffer given to HAL
+        LDR     R4, [R3, #PointerBuffLA]     ; shape buffer we're about to give
+        TEQ     R1, R4                       ; same as last time?
+        STRNE   R4, [WsPtr, #PointerShapeLA] ; update
+        ORRNE   R0, R0, #2                   ; flag new shape (bit 1 = 1)
+
+        LDR     R1, [WsPtr, #PointerX]
+        LDRB    R4, [WsPtr, #PointerXEigFactor]
+        MOV     R1, R1, ASR R4                     ; R1 = pointer x, pixels
+        LDRB    R4, [R3, #PointerActiveX]
+        SUB     R1, R1, R4                         ; R1 = pointer x, adjusted for active point
+
+        LDR     R2, [WsPtr, #PointerY]
+        LDR     R4, [WsPtr, #DisplayYEigFactor]
+        LDR     R5, [WsPtr, #DisplayYWindLimit]    ; R5 = display height -1
+        SUB     R2, R5, R2, ASR R4                 ; R2 = pointer y, pixels, inverted
+        LDRB    R4, [R3, #PointerActiveY]
+        SUB     R2, R2, R4                         ; R2 = pointer y, adjusted for active point
+
+        ; The pointer may have moved while we had it disabled.
+        ; If it has moved, it's possible the hardware pointer has taken over
+        ; and the software pointer isn't needed anymore
+        ; Potentially we could deal with this inside UpdateSoftwarePointer
+        ; (i.e. cache the new parameters if it gets called with the mutex
+        ; locked), but that will add a fair bit of complexity. So for now go
+        ; with the simpler approach of comparing the current position against
+        ; the last position used by the software pointer and calling through to
+        ; GraphicsV if it's changed (otherwise, call software pointer directly)
+
+      [ NoARMv6
+        MOV     R5, R1, LSL #16
+        MOV     LR, R2, LSL #16
+        ORR     R5, LR, R5, LSR #16
+      |
+        PKHBT   R5, R1, R2, LSL #16
+      ]
+        LDR     LR, [WsPtr, #SWP_Coords]
+        TEQ     LR, R5
+        BEQ     %FT50
+
+        ; Pointer has moved - call GraphicsV
+        LDR     R4, [WsPtr, #CurrentGraphicsVDriver]
+        MOV     R4, R4, LSL #24
+        ORR     R4, R4, #GraphicsV_UpdatePointer
+        BL      CallGraphicsV
+
+        TEQ     R4, #0
+        BEQ     %FT90
+
+50
+        ; IRQs on for software pointer call
+        ; This does open up the possibility for the pointer shape/location to
+        ; change under IRQ while we're still rendering it - so a more advanced
+        ; locking mechanism may be desirable in future
+        PLP     R7
+
+        BL      UpdateSoftwarePointer
+90
+        PLP     R7
+        LDMFD   R13!,{R0-R7,PC}
+
+; *****************************************************************************
+;
+;       UpdateSoftwarePointer - Like GraphicsV_UpdatePointer, but for the
+;                               software pointer
+;
+; in:   r0-r3 as per GraphicsV_UpdatePointer
+;       WsPtr -> VduDriverWorkSpace
+
+UpdateSoftwarePointer ROUT
+        Entry   "r10-r11"
+        ; Is the pointer possible?
+        LDR     r10, [WsPtr, #SWP_Under]
+        TEQ     r10, #0
+        BEQ     %FT99
+        ; Is mutex locked?
+        LDRB    r11, [WsPtr, #SWP_Mutex]
+        TEQ     r11, #0
+        BNE     %FT99
+        MOV     r11, #1
+        STRB    r11, [WsPtr, #SWP_Mutex]
+        ; Is pointer in same state as last time?
+      [ NoARMv6
+        MOV     r11, r1, LSL #16
+        MOV     lr, r2, LSL #16
+        ORR     r11, lr, r11, LSR #16
+      |
+        PKHBT   r11, r1, r2, LSL #16
+      ]
+        LDR     lr, [WsPtr, #SWP_Coords]
+        TEQ     r11, lr ; Have coords changed?
+        STRNE   r11, [WsPtr, #SWP_Coords]
+        TSTEQ   r0, #2 ; Has shape changed?
+        LDREQB  lr, [WsPtr, #SWP_Dirty]
+        LDR     r11, [WsPtr, #SWP_Pos]
+        TEQEQ   lr, #0 ; Has palette changed?
+        BNE     %FT20
+        ; The above state variables only track correctly for when the pointer is on. So we can only skip if it's currently on, and it's staying on.
+        TEQ     r11, #0
+        TSTNE   r0, #1
+        BNE     %FT90
+20
+        ; Remove from previous position, if any
+        TEQ     r11, #0
+        BLNE    RemoveSoftwarePointer
+        ; Plot in new position, if any
+        TST     r0, #1
+        BLNE    PlotSoftwarePointer
+90
+        ; Release mutex
+        MOV     r11, #0
+        STRB    r11, [WsPtr, #SWP_Mutex]
+99
+        EXIT
+
+; *****************************************************************************
+;
+;       PlotSoftwarePointer - Plot software pointer to the screen
+;
+; in:   r1 = X position
+;       r2 = Y position
+;       r3 -> PointerBlkHAL
+;       WsPtr -> VduDriverWorkSpace
+
+PlotSoftwarePointer ROUT
+        Entry   "r0-r11"
+        ; Load shape info
+        LDRB    r5, [r3, #PointerHeight]
+        LDRB    r4, [r3, #PointerWidth]
+        CMP     r5, #32
+        LDR     r3, [r3, #PointerBuffLA]
+        MOVGT   r5, #32
+        ; Load screen info
+        ; Must be careful to only use variables which aren't affected by output redirection
+        LDR     r0, [WsPtr, #DisplayBankAddr]
+        LDR     r6, [WsPtr, #DisplayXWindLimit]
+        LDR     r7, [WsPtr, #DisplayYWindLimit]
+        LDRB    r9, [WsPtr, #DisplayLog2BPP]
+        ADD     r6, r6, #1
+        ADD     r7, r7, #1
+        MOV     r8, #0 ; Start X offset into pointer image (bits)
+        MOV     r4, r4, LSL #2 ; byte width -> pixel width
+        STRB    r8, [WsPtr, #SWP_Dirty]
+
+        ; Do a quick scan of the image to see if the LHS is fully transparent
+        ; This is the case for the default pointer image, at least
+        CMP     r5, #0 ; Height can be zero on startup!
+        ADD     r11, r3, r5, LSL #3
+        BLE     %FT99
+        MOV     r10, #0
+10
+        LDR     lr, [r11, #-8]!
+        CMP     r11, r3
+        ORR     r10, r10, lr
+        BNE     %BT10
+        TEQ     r10, #0
+        ADDEQ   r8, r8, #32
+        ADDEQ   r1, r1, #16
+        SUBEQ   r4, r4, #16
+
+        ; Crop image to screen
+        CMP     r1, #0
+        ADDLT   r4, r4, r1
+        SUBLT   r8, r8, r1, LSL #1
+        MOVLT   r1, #0
+        ADD     lr, r1, r4
+        SUBS    lr, lr, r6
+        SUBGT   r4, r4, lr
+
+        CMP     r2, #0
+        ADDLT   r5, r5, r2
+        SUBLT   r3, r3, r2, LSL #3
+        MOVLT   r2, #0
+        ADD     lr, r2, r5
+        SUBS    lr, lr, r7
+        SUBGT   r5, r5, lr
+
+        ; Bail if fully off-screen
+        CMP     r4, #0
+        CMPGT   r5, #0
+        BLE     %FT99
+
+        LDR     r7, [WsPtr, #DisplayLineLength]
+        MLA     r0, r7, r2, r0 ; First screen row to touch
+
+        MOV     r1, r1, LSL r9 ; Screen X start, in bits
+
+        ; Save the rectangle under the pointer
+        ADR     lr, %FT30
+        Push    "r0-r12,lr" ; For RemoveSoftwarePointerAltEntry
+        ; Make things easier by converting to word-aligned coordinates
+        ADD     lr, r1, r4, LSL r9 ; Screen X end, in bits
+        ADD     lr, lr, #31
+        MOV     r1, r1, LSR #5 ; X start in words
+        RSB     r4, r1, lr, LSR #5 ; width in words
+
+        ; Calculate screen addr to copy from
+        ADD     r10, r0, r1, LSL #2 ; Copy dest
+
+        ; Remember image size, position for restore later on
+        STR     r10, [WsPtr, #SWP_Pos]
+        STRB    r4, [WsPtr, #SWP_W]
+        STRB    r5, [WsPtr, #SWP_H]
+
+        ; Copy to SWP_Under
+        ; Can reuse copy loop in RemoveSoftwarePointer
+        SUB     r6, r7, r4, LSL #2 ; Src stride
+        MOV     r7, #0 ; Dest stride
+        LDR     r11, [WsPtr, #SWP_Under] ; Copy src
+        B       RemoveSoftwarePointerAltEntry
+30
+        ; Arrive back here with r0-r12 restored
+        ; Important values:
+        ; r0 -> initial screen row
+        ; r1 = screen X start, in bits
+        ; r3 -> initial pointer row
+        ; r4 = pointer pixel width
+        ; r5 = height
+        ; r7 = LineLength
+        ; r8 = pointer X start, in bits
+        ; r9 = Log2BPP
+        ; For 32bpp modes we have a faster plotter available
+        TEQ     r9, #5
+        BEQ     %FT70
+        ; Calculate end-of-row shift amount
+        ADD     lr, r1, r4, LSL r9
+        AND     lr, lr, #31
+        RSB     lr, lr, #32
+        ORR     lr, lr, lr, LSR #5 ; Use 33 to represent case where no shift is needed - ensures the MOVS clears C
+        Push    "lr"
+        ; Convert Log2BPP to BPP
+        MOV     lr, #1
+        MOV     r9, lr, LSL r9
+        LDR     r10, =ZeroPage+VduDriverWorkSpace+SWP_Palette-4
+        ; Conveniently, we can read screen words from SWP_Under, avoiding slow read-modify-write of screen memory
+        LDR     r11, [WsPtr, #SWP_Under]
+        ; Offset r0 to point at first word in row, compute initial mask word
+        AND     lr, r1, #31
+        ADD     r0, r0, r1, LSR #3
+        MOV     r6, #&80000000
+        BIC     r0, r0, #3 ; Row ptr assumed to be word aligned!
+        MOV     r6, r6, LSR lr
+        Push    "r0,r4,r6,r7,r8"
+40
+        ; Since the pointer is padded out to 32 pixels wide, it's easiest to
+        ; just load an entire row and treat it as a 64 bit value
+        LDMIA   r3!, {r1, r2}
+        ; Skip the initial pixels
+        TST     r8, #32
+        AND     lr, r8, #31
+        MOVNE   r1, r2
+        RSB     r7, lr, #32
+        MOV     r1, r1, LSR lr
+        MVN     r8, #0
+        ORR     r1, r1, r2, LSL r7
+        MOV     r2, r2, LSR lr
+        BIC     r8, r8, r8, LSR r9 ; Value to merge into mask word
+        MOV     r7, #0
+50
+        ANDS    lr, r1, #3
+        MOV     r1, r1, LSR #2
+        LDRNE   lr, [r10, lr, LSL #2]
+        ORR     r1, r1, r2, LSL #30
+        ORR     r7, lr, r7, LSR r9 ; Merge in output pixel, 0 if transparent
+        MOVNE   lr, r8
+        MOV     r2, r2, LSR #2
+        ORRS    r6, lr, r6, LSR r9 ; Merge in mask, 0 if transparent
+        BCC     %FT60
+        ; Store completed screen word
+        ; EQ condition if fully transparent
+        BEQ     %FT55
+        LDR     lr, [r11]
+        BIC     lr, lr, r6
+        ORR     lr, lr, r7
+        STR     lr, [r0]
+55
+        ADD     r11, r11, #4
+        ADD     r0, r0, #4
+        MOV     r6, #&80000000
+60
+        SUBS    r4, r4, #1
+        BGT     %BT50
+        ; Next row
+        ; However, we may have a partial word to store
+        ; Shift it down to the low end of the word, ready to store
+        LDR     lr, [sp, #5*4] ; Grab precomputed shift amount
+        MOVS    r6, r6, LSR lr
+        MOV     r7, r7, LSR lr
+        BLS     %FT65 ; ~C if no shift needed (actually, lr=33 to ensure C gets cleared), C+Z if word is transparent, C+~Z if visible
+        LDR     lr, [r11]
+        BIC     lr, lr, r6
+        ORR     lr, lr, r7
+        STR     lr, [r0]
+65
+        ADDCS   r11, r11, #4
+        ; Last word dealt with
+        ; Advance to next row
+        LDMIA   sp, {r0,r4,r6,r7,r8}
+        SUBS    r5, r5, #1
+        ADD     r0, r0, r7
+        STRNE   r0, [sp]               
+        BNE     %BT40
+        ; Junk stack contents
+        ADD     sp, sp, #6*4
+99
+        EXIT
+
+70
+        ; Plotter for 32bpp modes
+        ; No need to read from the screen, just blast out any non-transparent
+        ; pixels
+        LDR     r10, =ZeroPage+VduDriverWorkSpace+SWP_Palette-4
+        ; Offset r0 to point at first word in row
+        ADD     r0, r0, r1, LSR #3
+        ; Calculate shift amount for pointer row
+        AND     r6, r8, #31
+        RSB     r11, r6, #32
+        Push    "r0,r4"
+75
+        ; Since the pointer is padded out to 32 pixels wide, it's easiest to
+        ; just load an entire row and treat it as a 64 bit value
+        LDMIA   r3!, {r1, r2}
+        ; Skip the initial pixels
+        TST     r8, #32
+        MOVNE   r1, r2
+        MOV     r1, r1, LSR r6
+        ORR     r1, r1, r2, LSL r11
+        MOV     r2, r2, LSR r6
+80
+        ANDS    lr, r1, #3
+        MOV     r1, r1, LSR #2
+        LDRNE   lr, [r10, lr, LSL #2]
+        ORR     r1, r1, r2, LSL #30
+        MOV     r2, r2, LSR #2
+        STRNE   lr, [r0]
+        SUBS    r4, r4, #1
+        ORRNES  lr, r1, r2 ; Stop if remainder of row is transparent
+        ADD     r0, r0, #4
+        BNE     %BT80
+        ; Next row
+        LDMIA   sp, {r0,r4}
+        SUBS    r5, r5, #1
+        ADD     r0, r0, r7
+        STRNE   r0, [sp]               
+        BNE     %BT75
+        ; Junk stack contents
+        ADD     sp, sp, #2*4
+        EXIT
+        
+
+
+; *****************************************************************************
+;
+;       RemoveSoftwarePointer - Remove software pointer from the screen
+;
+; in:   r10 -> SWP_Under
+;       r11 -> SWP_Pos
+;       WsPtr -> VduDriverWorkSpace
+
+RemoveSoftwarePointer
+        Entry   "r0-r12" ; n.b. keep in sync with call from PlotSoftwarePointer
+        ; Get parameters needed for unplot
+        LDRB    r4, [WsPtr, #SWP_W]
+        LDRB    r5, [WsPtr, #SWP_H]
+        LDR     r6, [WsPtr, #DisplayLineLength]
+        SUB     r7, r6, r4, LSL #2 ; Dest stride
+        MOV     r6, #0 ; Src stride
+        STR     r6, [WsPtr, #SWP_Pos]
+RemoveSoftwarePointerAltEntry        
+        ; Width assumed to be max of 32 words
+        ; r0-r3, r8-r9, r12, lr free for use
+        Push    "r4"
+05
+        ; Width will almost always be >= 8, so transfer groups of 8 first
+        CMP     r4, #8
+06
+        LDMGEIA r10!, {r0-r3, r8-r9, r12, lr}
+        SUBGE   r4, r4, #8
+        STMGEIA r11!, {r0-r3, r8-r9, r12, lr}
+        BEQ     %FT90
+        CMP     r4, #8
+        BGE     %BT06
+        ; Transfer remainder
+        MOVS    r4, r4, LSR #1
+        LDRCS   r0, [r10], #4
+        STRCS   r0, [r11], #4
+        BEQ     %FT90
+        MOVS    r4, r4, LSR #1
+        LDMCSIA r10!, {r0-r1}
+        STMCSIA r11!, {r0-r1}
+        BEQ     %FT90
+        ; NE so must be 4 left
+        LDMIA   r10!, {r0-r3}
+        STMIA   r11!, {r0-r3}
+90
+        LDR     r4, [sp]
+        ADD     r10, r10, r6
+        SUBS    r5, r5, #1
+        ADD     r11, r11, r7
+        BNE     %BT05
+        ADD     sp, sp, #4
+        EXIT
+
+; *****************************************************************************
+;
+;       RegisterSoftwarePointerCallback - Register callback for palette update
+;
+; in:   WsPtr -> VduDriverWorkSpace
+
+RegisterSoftwarePointerCallback
+        Entry   "r0-r2"
+        ; We may be in IRQ mode, so switch to SVC before calling SWI
+        MRS     r2, CPSR
+        ORR     r1, r2, #SVC32_mode
+        MSR     CPSR_c, r1
+        Push    "lr"
+        ADR     r0, SoftwarePointerCallback
+        MOV     r1, WsPtr
+        SWI     XOS_AddCallBack
+        MOVVC   r0, #1
+        STRVCB  r0, [WsPtr, #SWP_Callback]
+        Pull    "lr"
+        MSR     CPSR_c, r2
+        EXIT
+
+; *****************************************************************************
+;
+;       SoftwarePointerCallback - Recalculate software pointer palette
+;
+; in:   WsPtr -> VduDriverWorkSpace
+
+SoftwarePointerCallback
+        Entry   "r0-r3"
+        MOV     r0, #0
+        STRB    r0, [WsPtr, #SWP_Callback]
+        ; Can now enable IRQs (ColourTrans may be slow!)
+        MSR     CPSR_c, #SVC32_mode
+        ; Grab the three pointer colours and translate them
+        ; We want to shift the result up to the high end of each word
+        LDRB    r0, [WsPtr, #DisplayLog2BPP]
+        MOV     r1, #1
+        MOV     r0, r1, LSL r0
+        RSB     r3, r0, #32
+        LDR     r2, [WsPtr, #FirPalAddr]
+        LDR     r1, [WsPtr, #DisplayModeNo]
+        LDR     r0, [r2, #257*4]
+        SWI     XColourTrans_ReturnColourNumberForMode
+        MOV     r0, r0, LSL r3
+        STR     r0, [WsPtr, #SWP_Palette]
+        LDR     r0, [r2, #258*4]
+        SWI     XColourTrans_ReturnColourNumberForMode
+        MOV     r0, r0, LSL r3
+        STR     r0, [WsPtr, #SWP_Palette+4]
+        LDR     r0, [r2, #259*4]
+        SWI     XColourTrans_ReturnColourNumberForMode
+        MOV     r0, r0, LSL r3
+        STR     r0, [WsPtr, #SWP_Palette+8]
+        STRB    r1, [WsPtr, #SWP_Dirty]
+        EXIT
+
+        LTORG
+
+        END

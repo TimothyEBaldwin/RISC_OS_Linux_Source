@@ -1,0 +1,2707 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; >FileCore20
+
+        TTL     "Operations involving disc <-> drive mapping"
+
+; SBP: 19 Aug 1997: Changed to be aware of the Zones2 field.
+
+; Remove conditional assemblies from this file
+
+
+; ========
+; WhatDisc
+; ========
+
+; Return the disc record for a given drive
+; Create a new record if unknown
+
+; entry: R1 = drive number
+; exit:
+; IF error V set, R0 result
+; ELSE
+;        R1 = drive number
+;        R2 = disc number
+;        R3 = disc rec ptr
+;
+; Algorithm:
+; discstate = PollChange( drive )
+; if ( Uncertain:discstate )
+;   determine uncertain disc( drive )
+; else if ( Empty:discstate )
+;   return DriveEmptyErr
+; else if ( Bad:discstate )
+;   disc bad, return drive error associated with drive
+; else
+;   disc good, return disc rec associated with drive
+
+WhatDisc ROUT
+        Push    "r0,r4,r5,r6,lr"
+
+ [ Debug4 :LOR: DebugL
+
+        DREG    R1, "<WhatDisc(Drv=",cc
+        DLINE   ")"
+ ]
+
+        BL      CheckDriveNumber
+        BVS     %FT80
+05
+        ; Test the disc's presence in the drive
+        MOV     r0, r1
+        BL      PollChange      ;(R0->LR)
+
+        ; Get to the drive record
+        DrvRecPtr r4,r1
+
+        ; Start with no error
+        MOV     r0, #0
+
+        TSTS    lr, #Uncertain
+        BEQ     %FT10
+
+        ;Uncertain
+ [ DebugL
+
+        DLINE   "Having to mount and determine.."
+ ]
+        BL      MountDiscOnDrive                ; (r1,r4->V+r0,r1,r2,r4,r5,r6)
+        BVS     %FT80
+        BL      DetermineDiscType               ; (r1,r2,r4,r5,r6->V+r0,r2,r5,r6)
+        MOVVC   r3, r5
+        MOVVC   r0, #0
+        B       %FT80
+
+10
+        ; Disc not uncertain, but...
+
+        ; It might be empty...
+        TSTS    lr, #Empty
+        MOVNE   r0, #DriveEmptyErr
+        BNE     %FT80
+
+        ; or, just possibly, it might be good...
+        MOV     r2, lr
+        DiscRecPtr r3, r2               ; It's good return the disc record
+
+
+        ; If disc hasn't been identified and we're interested in that....
+        LDR     lr, [r3, #DiscFlags]
+        TST     lr, #DiscNotIdentified
+        BEQ     %FT80
+
+ [ DebugL
+
+        DLINE   "Having to determine..."
+ ]
+        BL      DetermineDiscType
+        MOVVC   r3, r5
+        MOVVC   r0, #0
+
+80
+        BL      SetVOnR0
+ [ Debug4 :LOR: DebugL
+
+        LDR     lr, [r3, #DiscRecord_Root]
+        DREG    lr, "RootDir on Exit WhatDisc is: "
+
+        DREG    R1, "<WhatDisc(Drv=",cc
+        DREG    R2, ",Dsc=",cc
+        DREG    R3, ",Rec=",cc
+        DLINE   ")"
+        DebugError "     WhatDisc error"
+ ]
+        BVS     %FT90
+        ; DetermineDiscType can cause the disc and drive records to become
+        ; unlinked due to the PollChanged within the DiscOps used to load the
+        ; boot block - this was designed to support ADFS floppies, but interacts
+        ; badly in particular with SDFS for removable drives with no disc detect
+        ; (e.g. Raspberry Pi B+). If this happens, loop round and try again.
+        LDRB    r0, [r3, #DiscsDrv]
+        TEQ     r0, #8
+        BEQ     %BT05
+        Pull    "r0,r4,r5,r6,pc"
+
+90      ADD     sp, sp, #4
+        Pull    "r4,r5,r6,pc"
+
+; ================
+; CheckDriveNumber
+; ================
+;
+; Entry
+;   r1 = internal drive number
+; Exit
+;   V, r0=error
+
+CheckDriveNumber ROUT
+        Push    "lr"
+        CMP     r1, #4
+        LDRLOB  lr, Winnies
+        LDRHSB  lr, Floppies
+        ADDHS   lr, lr, #4
+        CMP     r1, lr
+ [ Debug4
+        BLO     %FT01
+        DREG    r1, "Bad drive specified:"
+01
+ ]
+        MOVHS   r0, #BadDriveErr
+        SETV    HS
+        Pull    "pc"
+
+        LTORG
+
+; =================
+; DetermineDiscType (r1,r2,r4,r5,r6->V+r0,r2,r5,r6)
+; =================
+
+; Given that the drive doesn't know what type of disc is in it
+; determine what it is. The disc is assumed mounted and certain.
+
+; Entry:
+;   r1 = drive number
+;   r2 = disc number
+;   r4 ->drive record
+;   r5 ->disc record
+;   r6 = read sectors cache
+;
+; Exit:
+;   V and r0=error is possible
+;   r2 = new disc number
+;   r5 ->new disc record
+;   r6 = read sectors cache discarded
+;
+; Algorithm:
+;
+; identify the disc (return error, keep cache)
+; Search the disc records for a matching disc (not the same as the one we've got)
+; if ( not found )
+;   Fill in filetype in disc record
+;   use the disc record we were allocated
+; else if ( found )
+;   detach allocated disc from this drive
+;   free allocated disc
+;   detach found disc from original drive
+;   attach found disc to this drive
+;   use found disc record
+; If ( identity==FileCore_FloppyDisc or FileCore_HardDisc )
+;   StartupFileCoreDisc
+; else
+;   StartupNonFileCoreDisc
+
+DetermineDiscType ROUT
+        Push    "r0,r1,r3,r4,r7,r11,lr"
+
+ [ DebugL
+
+        DLINE   "Determining disc type"
+ ]
+
+        MOV     r0, r1
+        LDRB    r7, [r4, #DrvFlags]
+        BL      IdentifyDisc            ; (r0,r5->r0,r6)
+        STR     r0, [r5, #DiscRecord_DiscType]
+
+        ; Disc now identified
+        LDRB    lr, [r5, #DiscFlags]
+        BIC     lr, lr, #DiscNotIdentified
+        STRB    lr, [r5, #DiscFlags]
+
+        ; If disc is data then don't attempt to match against other discs
+        LDR     lr, =FileType_Data
+        TEQ     r0, lr
+        BNE     %FT02
+
+        ; Disc failed to identify, so, if last disc op was format before
+        ; identification then use those parameters
+        TST     r7, #LastDiscOpWasFormat
+        LDRNEB  lr, [r4, #PrevFormSectorSize]
+        STRNEB  lr, [r5, #DiscRecord_Log2SectorSize]
+        LDRNEB  lr, [r4, #PrevFormSecsPerTrk]
+        STRNEB  lr, [r5, #DiscRecord_SecsPerTrk]
+        LDRNEB  lr, [r4, #PrevFormHeads]
+        STRNEB  lr, [r5, #DiscRecord_Heads]
+        LDRNEB  lr, [r4, #PrevFormDensity]
+        STRNEB  lr, [r5, #DiscRecord_Density]
+        LDRNEB  lr, [r4, #PrevFormLowSector]
+        STRNEB  lr, [r5, #DiscRecord_LowSector]
+        LDRNE   lr, [r4, #PrevFormDiscSize]
+        STRNE   lr, [r5, #DiscRecord_DiscSize]
+ [ BigDisc
+        LDRNE   lr, [r4, #PrevFormDiscSize2]
+        STRNE   lr, [r5, #DiscRecord_BigMap_DiscSize2]
+ ]
+
+ [ DebugLm
+        DLINE   "Blanking out disc name"
+ ]
+
+        ; Blank out the disc name
+        MOV     lr, #0
+        ASSERT  ?DiscRecord_DiscName = 10
+        ASSERT  DiscRecord_DiscName :MOD: 4 = 2
+        STRB    lr, [r5, #DiscRecord_DiscName+0]
+        STRB    lr, [r5, #DiscRecord_DiscName+1]
+        STR     lr, [r5, #DiscRecord_DiscName+2]
+        STR     lr, [r5, #DiscRecord_DiscName+6]
+
+        B       %FT60
+02
+
+ [ DebugLm
+
+        Push    "r0"
+        LDR     r0, [r5, #DiscRecord_DiscType]
+        DREG    r0, "Disc identified...Type=",cc
+        ASSERT  DiscRecord_DiscId :MOD: 4 = 0
+        LDR     r0, [r5, #DiscRecord_DiscId]
+        MOV     r0, r0, ASL #16
+        MOV     r0, r0, LSR #16
+        DREG    r0, " DiscId=",cc
+        ADD     r0, r5, #DiscRecord_DiscName
+        DSTRING r0, " name=",cc
+        LDR     r0, [r5, #DiscRecord_DiscSize]
+        DREG    r0, " DiscSize="
+        DLINE   "trying to match against other records..."
+        Pull    "r0"
+ ]
+ [ DebugLi
+        Push    "r0"
+        DREG    r2, "Mount: Id on Disc ",cc
+        LDR     r0, [r5, #DiscRecord_DiscId]
+        MOV     r0, r0, ASL #16
+        MOV     r0, r0, LSR #16
+        DREG    r0, " is "
+        Pull    "r0"
+ ]
+
+        ; Find for a matching disc in the disc records array starting at
+        ; the old disc record
+        MOV     r7, #1
+        B       %FT10
+
+05
+        ; Move to next disc record
+        ADD     r7, r7, #1
+        CMP     r7, #8
+        BHS     %FT60
+
+10
+        EOR     r3, r7, r2
+ [ DebugLm
+        DREG    R3, "Matching against record ",cc
+ ]
+        DiscRecPtr r3, r3
+ [ DebugLm
+        DREG    R3, " at "
+ ]
+        LDRB    lr, [r3, #Priority]
+        TEQ     lr, #0
+ [ DebugLm
+
+        BNE     %FT01
+        DLINE   "Record empty"
+01
+ ]
+        BEQ     %BT05           ; Disc record empty
+
+        ; Compare the disc record. The fields which must match are:
+        ; DiscType
+        ; Log2SectorSize
+        ; SecsPerTrk
+        ; Heads
+        ; Density
+        ; LowSector
+        ; DiscSize
+ [ BigDisc
+        ; DiscSize2
+ ]
+        ; DiscId
+        ; DiscName
+        LDR     r0, [r3, #DiscRecord_DiscType]
+        LDR     lr, [r5, #DiscRecord_DiscType]
+        TEQ     r0, lr
+        ASSERT  (DiscRecord_Log2SectorSize :MOD: 4) = 0
+        ASSERT  DiscRecord_SecsPerTrk = DiscRecord_Log2SectorSize+1
+        ASSERT  DiscRecord_Heads = DiscRecord_SecsPerTrk+1
+        ASSERT  DiscRecord_Density = DiscRecord_Heads+1
+        LDREQB  r0, [r3, #DiscRecord_Log2SectorSize]
+        LDREQB  lr, [r5, #DiscRecord_Log2SectorSize]
+        TEQEQ   r0, lr
+        LDREQB  r0, [r3, #DiscRecord_LowSector]
+        LDREQB  lr, [r5, #DiscRecord_LowSector]
+        TEQEQ   r0, lr
+
+        LDREQ   r0, [r3, #DiscRecord_DiscSize]
+        LDREQ   lr, [r5, #DiscRecord_DiscSize]
+        TEQEQ   r0, lr
+ [ BigDisc
+        LDREQ   r0, [r3, #DiscRecord_BigMap_DiscSize2]
+        LDREQ   lr, [r5, #DiscRecord_BigMap_DiscSize2]
+        TEQEQ   r0, lr
+ ]
+        ASSERT  (DiscRecord_DiscId :MOD: 4) = 0
+        LDREQ   r0, [r3, #DiscRecord_DiscId]
+        LDREQ   lr, [r5, #DiscRecord_DiscId]
+        EOREQ   r0, r0, lr
+        MOVEQS  r0, r0, ASL #16
+ [ DebugLm
+
+        BEQ     %FT01
+        DLINE   "Not a match - type, sectsize, lowsector, discsize, discsize2, discid"
+01
+ ]
+        BNE     %BT05
+
+        ; Check the disc name matches
+        MOV     r11, #?DiscRecord_DiscName
+        ADD     r3, r3, #DiscRecord_DiscName + ?DiscRecord_DiscName
+        ADD     r5, r5, #DiscRecord_DiscName + ?DiscRecord_DiscName
+11
+        LDRB    lr, [r3, -r11]
+        CMP     lr, #" "
+        TEQHI   lr, #DeleteChar
+        MOVLS   lr, #0
+        LDRB    r0, [r5, -r11]
+        CMP     r0, #" "
+        TEQHI   r0, #DeleteChar
+        MOVLS   r0, #0
+        MOVLS   r11, #1         ; To terminate early
+        TEQ     r0, lr
+ [ DebugLm
+        DREG    r0, "ChMatch:",cc
+        MOV     r0, lr
+        DREG    r0, "=?"
+ ]
+        BNE     %FT12
+        SUBS    r11, r11, #1
+        BNE     %BT11
+12
+        SUB     r3, r3, #DiscRecord_DiscName + ?DiscRecord_DiscName
+        SUB     r5, r5, #DiscRecord_DiscName + ?DiscRecord_DiscName
+ [ DebugLm
+
+        BEQ     %FT01
+        DLINE   "Not a match - discname"
+01
+ ]
+        BNE     %BT05
+ [ DebugLm
+
+        DLINE   "It's a match"
+ ]
+
+        ; Disc found amoungst known discs
+
+        ; Detach allocated disc from drive and free it
+        MOV     r0, r2
+        BL      FreeDiscRec
+
+        ; Construct parameters for original disc
+        EOR     r2, r7, r2      ; number
+        MOV     r5, r3          ; record
+
+        ; Detach found disc from its original drive
+        MOV     r0, r2
+        BL      UnlinkByDisc
+
+        ; Adjust FloppyFlag in old record to match new drive
+        ; Also set NeedNewIdFlag so that if this disc has just been seen
+        ; by another machine and we now update it the sequence number gets
+        ; updated too so that other machine doesn't get confused as to which
+        ; disc is changed or not changed.
+        LDRB    r0, [r5, #DiscFlags]
+ [ DebugL
+        DREG    r0, "DiscFlags in DetermineDiscType are "
+ ]
+        TST     r1, #4
+        BICEQ   r0, r0, #FloppyFlag
+        ORRNE   r0, r0, #FloppyFlag
+        ORR     r0, r0, #NeedNewIdFlag
+ [ DebugL
+        DREG    r0, "DiscFlags set to "
+ ]
+        STRB    r0, [r5, #DiscFlags]
+
+        ; Adjust FcbFloppyFlag in Fcbs attached to old disc to match new drive
+        LDR     r11, FirstFcb
+        B       %FT25
+
+15
+        ; Reject if attached to a different disc
+        LDR     r0, [r11, #FcbIndDiscAdd]
+        TEQ     r2, r0, LSR #(32-3)
+        BNE     %FT20
+
+ [ DebugL
+        LDR     r0, [r11, #FcbExtHandle]
+        DREG    r0, "Adjusting disc type of file "
+ ]
+
+        ; Adjust FcbFlags to match
+        LDRB    r0, [r11, #FcbFlags]
+        TST     r1, #4
+        BICEQ   r0, r0, #FcbFloppyFlag
+        ORRNE   r0, r0, #FcbFloppyFlag
+        STRB    r0, [r11, #FcbFlags]
+
+20
+        ; Next Fcb
+        LDR     r11, [r11, #FcbNext]
+25
+        ; Test for end of Fcb list
+        CMP     r11, #-1
+        BNE     %BT15
+
+        ; attach found disc to this drive
+        STRB    r2, [r4, #DrvsDisc]
+        STRB    r1, [r5, #DiscsDrv]
+
+  [ DebugL
+        DREG    r1, "************************ DiscsDrv set to ",cc
+        DLINE   " in DetermineDiscType *****************************"
+  ]
+
+        ; Make sure it isn't discarded too soon!
+        MOV     r0, r2
+        BL      UpdatePriority
+
+        ; If this is a non-FileCore disc poke all clients that they should
+        ; update discid on update
+        LDRB    r0, [r5, #DiscFlags]
+        TST     r0, #DiscNotFileCore
+        BEQ     %FT60
+
+        ; Construct full path to root to do FSControl_StampImage
+
+        Push    "r1,r2"
+
+        MOV     r1, #FSControl_StampImage_NextUpdate
+        ADD     r2, r5, #DiscRecord_DiscName
+        BL      StampImage
+
+        Pull    "r1,r2"
+
+        ; Ignore any error at this point
+        CLRV
+
+        ; Drop through to startup disc
+
+60
+        ; Found, and have filled in a disc record for this disc
+        ;
+        ; Register at this moment are:
+        ; r1 = drive number
+        ; r2 = disc number
+        ; r4 ->drive record
+        ; r5 ->disc record
+        ; r6 = read sectors cache
+
+ [ DebugL
+
+        DLINE   "Starting up disc..."
+ ]
+
+        LDR     r0, [r5, #DiscRecord_DiscType]
+        LDR     lr, =FileType_FileCoreFloppyDisc
+        TEQ     r0, lr
+        LDRNE   lr, =FileType_FileCoreHardDisc
+        TEQNE   r0, lr
+        BNE     %FT70
+
+        ; It's a FileCore disc
+        BL      StartupFileCoreDisc
+        B       %FT80
+
+70
+        BL      StartupNonFileCoreDisc
+
+80
+        ; Disc started (maybe): if error then disc is just so much random data
+        ; An error shouldn't occur as the disc wouldn't have identified correctly
+ [ DebugL
+        BVC     %FT01
+        DREG    r0, "Mapping to FileType_Data due to error:"
+01
+ ]
+        LDRVS   r1, =FileType_Data
+        STRVS   r1, [r5, #DiscRecord_DiscType]
+        BVS     %FT90
+
+        ; Disc in drive is now certain
+        ; However, there is a possibility that PollChange calls during disc
+        ; startup may have delinked the disc and drive, so make sure it's still
+        ; valid before we mark the drive as certain
+        LDRB    r1, [r4, #DrvsDisc]
+        TST     r1, #Unknown :OR: Empty :OR: Full
+        BICEQ   r1, r1, #Uncertain
+        STREQB  r1, [r4, #DrvsDisc]
+
+        ; If disc remained unidentified then check read sectors cache for errors
+        ; If we find an error then use that
+        LDR     r1, [r5, #DiscRecord_DiscType]
+        LDR     lr, =FileType_Data
+        TEQ     lr, r1
+        BNE     %FT90
+        MOV     r1, r6
+        B       %FT87
+85
+        LDR     r0, [r1, #SectorCache_Error]
+        TEQ     r0, #0
+ [ DebugL
+        BEQ     %FT01
+        DREG    r0, "Error found is "
+01
+ ]
+        BLNE    SetV
+        BVS     %FT90
+        LDR     r1, [r1, #SectorCache_Next]
+87
+        TEQ     r1, #0
+        BNE     %BT85
+
+90
+        STRVS   r0, [sp]
+
+        ; Save V state over discard of readsectors cache (don't care if it fails)
+        SavePSR r7
+        BL      DoSwiDiscardReadSectorsCache
+        RestPSR r7,,f
+
+ [ DebugL
+        DREG    R5, "Disc rec ptr now: "
+ ]
+
+        Pull    "r0,r1,r3,r4,r7,r11,pc"
+
+        LTORG
+
+; ==========
+; StampImage
+; ==========
+
+; entry
+;  r1 = type of stamp image
+;  r2 = disc name of image
+
+; exit
+;  error possible
+StampImage ROUT
+        Push    "r0-r4,lr"
+
+        MOV     r4, r1
+
+        ; Construct full path to root to do FSControl_StampImage
+
+        LDR     r1, FS_Title
+        BL      strlen
+        ADD     r3, r3, #?DiscRecord_DiscName + 2 + 1 + 3  ; <FS>::<DiscName>
+        BIC     r3, r3, #3
+        SUB     sp, sp, r3
+
+        ; <FS>
+        MOV     r0, sp
+30
+        LDRB    lr, [r1], #1
+        STRB    lr, [r0], #1
+        TEQ     lr, #0
+        BNE     %BT30
+
+        ; ::
+        MOV     lr, #":"
+        STRB    lr, [r0, #-1]
+        STRB    lr, [r0], #1
+
+        ; <DiscName>
+        MOV     r1, #?DiscRecord_DiscName
+35
+        LDRB    lr, [r2], #1
+        CMP     lr, #" "
+        TEQHI   lr, #DeleteChar
+        MOVLS   lr, #0
+        MOVLS   r1, #1
+        STRB    lr, [r0], #1
+        SUBS    r1, r1, #1
+        BNE     %BT35
+
+        MOV     lr, #0
+        STRB    lr, [r0], #1
+
+        MOV     r0, #FSControl_StampImage
+        MOV     r1, sp
+        MOV     r2, r4
+ [ DebugLi
+
+        DSTRING r1, "FSControl_StampImage(",cc
+        DREG    r2, ",",cc
+        DLINE   ")"
+ ]
+        BL      DoXOS_FSControl
+
+        ADD     sp, sp, r3
+        STRVS   r0, [sp]
+        Pull    "r0-r4,pc"
+
+
+
+; ================
+; MountDiscOnDrive (r1,r4->V+r0,r1,r2,r4,r5,r6)
+; ================
+;
+; entry
+;   r1 = drive number
+;   r4 ->drive record
+;
+; exit
+;   V, r0=error is possible
+;   r1 = drive number
+;   r2 = disc number
+;   r4 ->drive record
+;   r5 ->disc record
+;   r6 = read sectors cache handle
+;
+; This routine mounts the disc in the given drive as a FileType_Data
+; disc which is DiscNotFileCore. The drive's contents are assumed to be
+; Uncertain. If the disc Mounts OK and a disc record is found for it,
+; then the record will be filled in and attached to the drive.
+;
+; Algorithm:
+; Get the old attached disc record's density
+; Mark the FSMap as empty (for old map disc handling)
+; Unlink the old disc from this drive
+; Unlink defect list from drive
+; Allocate a new disc record
+; Store the density in the new record
+; Set the drive to 'No defect list'
+; Mount the disc
+; Set the disc type to FileType_Data
+; Set the disc to DiscNotFileCore and set FloppyFlag if appropriate
+; Attach the record to the drive
+
+MountDiscOnDrive ROUT
+        Push    "r0,r3,r8,lr"
+
+ [ DebugL
+        DREG    r1, "Mounting ",cc
+        DREG    r4, " on record "
+ ]
+
+        ; Get density of disc currently (but not for much longer) attached to drive
+        LDRB    r8, [r4, #DrvsDisc]
+        BIC     r8, r8, #Uncertain
+        CMP     r8, #8
+        MOVHS   r8, #0                  ; Start at Density=0 if no valid disc previously attached
+        BHS     %FT10
+
+ [ DebugL
+        DREG    r8, "Old disc attached to drive:"
+ ]
+
+        ; Had a disc record attached
+        DiscRecPtr lr, r8
+        LDRB    r8, [lr, #DiscRecord_Density]      ; Density of disc last in this drive
+
+        ; Mark FsMap for old map disc as Empty
+        LDRB    r0, [lr, #DiscFlags]
+ [ DebugL
+        DREG    r0, "Old disc flags are "
+ ]
+        TST     r0, #DiscNotFileCore
+        LDREQB  r0, [lr, #DiscRecord_NZones]
+        TEQEQ   r0, #0
+ [ BigMaps
+        LDREQB  r0, [lr, #DiscRecord_BigMap_NZones2]
+        TEQEQ   r0, #0
+ ]
+ [ DynamicMaps
+        LDREQ   r0, [r4, #DrvsFsMapFlags]
+        ORREQ   r0, r0, #EmptyFs
+        STREQ   r0, [r4, #DrvsFsMapFlags]
+ |
+        LDREQ   r0, [r4, #DrvsFsMap]
+        ORREQ   r0, r0, #EmptyFs
+        STREQ   r0, [r4, #DrvsFsMap]
+ ]
+
+
+        ; Unlink the old disc from this drive
+        MOV     r0, r1
+        BL      UnlinkByDrive
+
+10
+ [ DebugL
+        DREG    r8, "Going to use initial density "
+ ]
+
+        ; Find a disc record
+        BL      FindDiscRec
+        BVS     %FT90
+        MOV     r5, r3
+
+ [ DebugL
+        DREG    r2, "Found disc record ",cc
+        DREG    r5, " at "
+ ]
+
+        ; Clear out fields which would cause problems if not cleared out:
+        ; IdLen, Log2bpmb, Skew, BootOpt, Zones, ZoneSpare, DiscId, DiscName
+        MOV     lr, #0
+        ASSERT  DiscRecord_IdLen :MOD: 4 = 0
+        ASSERT  DiscRecord_Log2bpmb = DiscRecord_IdLen + 1
+        ASSERT  DiscRecord_Skew = DiscRecord_Log2bpmb + 1
+        ASSERT  DiscRecord_BootOpt = DiscRecord_Skew + 1
+        STR     lr, [r5, #DiscRecord_IdLen]
+
+        STRB    lr, [r5, #DiscRecord_NZones]
+ [ BigMaps
+        STRB    lr, [r5, #DiscRecord_BigMap_NZones2]
+ ]
+        STRB    lr, [r5, #DiscRecord_ZoneSpare]
+        STRB    lr, [r5, #DiscRecord_ZoneSpare+1]
+
+        ASSERT  DiscRecord_DiscId :MOD: 4 = 0
+        ASSERT  DiscRecord_DiscName = DiscRecord_DiscId + 2
+        STR     lr, [r5, #DiscRecord_DiscId]
+ [ BigDisc
+        ; DiscSize2
+        STR     lr, [r5,#DiscRecord_BigMap_DiscSize2]
+ [ BigShare
+        ; ShareSize
+        STR     lr, [r5,#DiscRecord_BigMap_ShareSize]
+ ]
+ ]
+
+
+        ; Set up a sensible pre-guess at the RootDir
+ [ DebugL
+        DREG    r2, "Setting RootDir from "
+ ]
+        MOV     lr, r2, ASL #(32-3)
+        STR     lr, [r5, #DiscRecord_Root]
+
+        ; Fill in old density
+        STRB    r8, [r5, #DiscRecord_Density]
+
+        ; Mark drive as having no defect list
+        LDRB    r0, [r4, #DrvFlags]
+        BIC     r0, r0, #HasDefectList
+        STRB    r0, [r4, #DrvFlags]
+
+; as a hack to try to get floppies to mount - set DiscSize2 to 0
+
+        ; Mount the disc
+        Push    "r2,r4"
+        MOVS    r2, r1, ASL #(32-3)
+        EOR     r2, r2, #bit31          ; Convert to external drive numbering
+        MOV     r3, #BadPtr             ; Bad address just in case the driver gets frisky
+        MOV     r4, #0
+        LDRPL   r0, WinnieProcessBlk
+        MOVPL   r6, #WinnieLock
+        LDRMI   r0, FloppyProcessBlk
+        MOVMI   r6, #FloppyLock
+        BL      Mount
+        Pull    "r2,r4"
+        BVS     %FT90
+
+        ; Set disc record to data
+        ; And attach disc and drive together
+ [ DebugL
+        LDR     r0, [r5, #DiscRecord_Log2SectorSize]
+        DREG    r0, "Mounted OK - parameters from mount are:"
+ ]
+        MOV     r0, #DiscNotFileCore
+        TST     r1, #bit2
+        ORRNE   r0, r0, #FloppyFlag
+        ORR     r0, r0, #DiscNotIdentified
+ [ DebugL
+        DREG    r0, "DiscFlags set to "
+ ]
+        STRB    r0, [r5, #DiscFlags]
+        LDR     r0, =FileType_Data
+        STR     r0, [r5, #DiscRecord_DiscType]
+        MOV     r0, #0
+        STRB    r0, [r5, #Priority]
+        STRB    r0, [r5, #DiscUsage]
+        STRB    r1, [r5, #DiscsDrv]
+ [ DebugL
+        DREG    r1, "************************* DiscsDrv set to",cc
+        DLINE   " in MountDiscOnDrive *************************"
+        DREG    r2, "DrvsDisc set to "
+ ]
+        STRB    r2, [r4, #DrvsDisc]
+        ASSERT  DiscRecord_DiscName = DiscRecord_DiscId + 2
+        STR     r0, [r5, #DiscRecord_DiscId]
+        STR     r0, [r5, #DiscRecord_DiscName+2]
+        STR     r0, [r5, #DiscRecord_DiscName+6]
+
+ [ BigDir
+        LDR     lr, [r5, #DiscRecord_Root]
+        BIC     lr, lr, #DiscBits
+        ORR     lr, lr, r2, LSL #(32-3)
+        STR     lr, [r5, #DiscRecord_Root]
+ ]
+
+        ; Make sure this disc is thought to be used
+        MOV     r0, r2
+        BL      UpdatePriority
+
+90
+        STRVS   r0, [sp]
+        Pull    "r0,r3,r8,pc"
+
+; ===================
+; StartupFileCoreDisc
+; ===================
+
+; Entry
+;   r1 = drive number
+;   r2 = disc number
+;   r4 ->drive record
+;   r5 ->disc record
+;   r6 = read sectors cache
+;
+; Exit
+;   r6 = new read sectors cache
+;
+; This routine initialises the DriveRec given that the disc is a FileCore disc
+;
+
+StartupFileCoreDisc ROUT
+        Push    "r0-r5,r7-r11,lr"
+
+ [ DebugL
+
+        DLINE   "Starting up filecore disc"
+        DREG    r1, "Drive=", cc
+        DREG    r4, " at "
+        DREG    r2, "Disc=",cc
+        DREG    r5, " at "
+        DREG    r6, "Cache = "
+
+        LDRB    r11, [r5, #DiscFlags]
+        DREG    r11, "Disc flags are "
+ ]
+
+        BL      ReadDefectList
+ [ DebugL
+        LDRB    r11, [r5, #DiscFlags]
+        DREG    r11, "Disc flags are "
+ ]
+
+
+ [ :LNOT: ReadMapDuringIdentify
+        BLVC    AdjustFsSpace
+ [ DebugL
+        LDRB    r11, [r5, #DiscFlags]
+        DREG    r11, "Disc flags are "
+ ]
+ ]
+
+        BLVC    ReadFsMap
+        BVS     %FT90
+
+        ; Make sure disc is FileCore
+        LDRB    r11, [r5, #DiscFlags]
+        TST     r11, #DiscNotFileCore
+        BIC     r11, r11, #DiscNotFileCore
+        ORRNE   r11, r11, #NeedNewIdFlag        ; Set NeedNewId if it is a fresh FileCore disc
+ [ DebugL
+        DREG    r11, "DiscFlags set to "
+ ]
+        STRB    r11, [r5, #DiscFlags]
+
+90
+        STRVS   r0, [sp]
+ [ DebugL
+
+        DLINE   "Starting of FileCore disc done"
+        BVC     %FT01
+        DREG    r0, "Error produced:"
+01
+ ]
+        Pull    "r0-r5,r7-r11,pc"
+
+; ==============
+; ReadDefectList
+; ==============
+
+; Entry
+;   r1 = drive number
+;   r4 ->drive record
+;   r5 ->disc record
+;   r6 = read sectors cache
+;
+; Exit
+;   V, r0=error is possible
+;   r6 = new read sectors cache
+
+; Reads DefectList, sets HasDefectList
+; Copies Zones, ZoneSpare, BitSize to disc record
+
+ReadDefectList ROUT
+        Push    "r0-r4,r11,lr"
+
+        LDR     lr, =FileType_FileCoreHardDisc
+        LDR     r0, [r5, #DiscRecord_DiscType]
+        TEQ     r0, lr
+        BNE     %FT20
+
+ [ DebugL
+
+        DLINE   "It's a winnie...read defect list"
+ ]
+
+        ; It's a FileCore hard disc, read the bad block list
+        MOV     r4, #SzDefectList
+        LDR     r3, DefectSpace
+        ADD     r3, r3, SB
+        ASSERT  SzDefectList = (1 :SHL: 9)
+        ADD     r3, r3, r1, ASL #9
+      [ BigSectors
+        ; For 2k and 4k sector sizes the defect list isn't on a sector boundary
+        ; any more, so read via an intermediate buffer
+        LDRB    r2, [r5, #DiscRecord_Log2SectorSize]
+        ASSERT  (DefectListDiscAdd :MOD: 1024) = 0
+        CMP     r2, #10
+        ASSERT  ?ScratchSpace >= SzDefectList
+        MOVHI   r3, #ScratchSpace
+        ASSERT  SzDefectList <= 1:SHL:11
+        MOVHI   r4, #1
+        MOVHI   r4, r4, LSL r2
+      ]
+        MOV     r2, r1, ASL #(32-3)     ; Top 3 drive bits
+        MOV     r1, #DiscOp_CachedReadSecs
+ [ BigDisc
+        Push    "R10,R11"
+        LDRB    r11, [r5, #DiscRecord_Log2SectorSize]
+        MOV     r10,#DefectListDiscAdd
+        ORR     r2,r2,r10,LSR r11       ; Offset in sectors
+        Pull    "R10,R11"
+ |
+        ORR     r2, r2, #DefectListDiscAdd
+ ]
+        BL      RetryDriveOp
+        BVS     %FT90                   ; Bog it, defect list didn't read
+
+
+        ; Assume defect list is OK as it must have been checked in identifying the disc
+
+        ; Restore r1,r2 and r4 (and r3 too, but don't care about that)
+        LDMIB   sp, {r1-r4}
+
+        ; Flag against the drive that it has a bad block list
+        LDRB    r0, [r4, #DrvFlags]
+        ORR     r0, r0, #HasDefectList
+        STRB    r0, [r4, #DrvFlags]
+
+        ; Get address of disc record in bad block area
+        LDR     r3, DefectSpace
+        ADD     r3, r3, SB
+        ASSERT  SzDefectList = (1 :SHL: 9)
+        ADD     r3, r3, r1, ASL #9
+
+      [ BigSectors
+        LDRB    r0, [r5, #DiscRecord_Log2SectorSize]
+        CMP     r0, #10
+        BLS     %FT10                   ; Was directly loaded
+
+        MOV     r14, #DefectListDiscAdd
+        MOV     r1, r14, LSR r0
+        SUB     r0, r14, r1, LSL r0     ; R0 := defect list addr MOD sector size
+        ADD     r0, r0, #ScratchSpace   ; src
+        MOV     r1, r3                  ; dest
+        MOV     r2, #SzDefectList       ; len
+        ASSERT  (SzDefectList :MOD: 256) = 0
+        BL      Move256n                ; (R0-R2->R0-R2)
+10
+      ]
+        ADD     r3, r3, #DefectStruc
+
+        ; Copy zones to our disc record
+        LDRB    r0, [r3, #DiscRecord_NZones]
+        STRB    r0, [r5, #DiscRecord_NZones]
+ [ BigMaps
+        LDRB    r0, [r3, #DiscRecord_BigMap_NZones2]
+        STRB    r0, [r5, #DiscRecord_BigMap_NZones2]
+ ]
+
+        ; If zones <> 0, then copy ZoneSpare and Log2bpmb too for E format
+        TEQ     r0, #0
+        LDRNEB  r0, [r3, #DiscRecord_ZoneSpare]
+        STRNEB  r0, [r5, #DiscRecord_ZoneSpare]
+        LDRNEB  r0, [r3, #DiscRecord_ZoneSpare+1]
+        STRNEB  r0, [r5, #DiscRecord_ZoneSpare+1]
+        LDRNEB  r0, [r3, #DiscRecord_Log2bpmb]
+        STRNEB  r0, [r5, #DiscRecord_Log2bpmb]
+
+ [ DebugL
+
+        DLINE   "Defect list has read OK"
+ ]
+        B       %FT80
+
+20
+ [ DebugL
+
+        DLINE   "It's a floppy...no defect list to read"
+ ]
+
+        ; It's a FileCore floppy disc, read sector 0 byte 2 to test bit 7 of it
+        SUB     sp, sp, #4
+        MOV     r3, sp                  ; read to the stack
+        MOV     r4, #4                  ; 4 bytes to read
+        MOV     r2, r1, ASL #(32-3)
+        MOV     r1, #DiscOp_CachedReadSecs
+        BL      RetryDriveOp
+        LDRB    r0, [sp,#FreeLink + 1]
+        ADD     sp, sp, #4
+
+        ; Restore r1,r2 and r4 (and r3 too, but don't care about that)
+        LDMIB   sp, {r1-r4}
+
+        BVS     %FT30                   ; Byte 2 didn't read, but it is a floppy, assume it's an E floppy
+
+        TST     r0, #bit7               ; Check for FreeLink end bit
+        BNE     %FT30
+
+        ; It's a D or L format disc
+        MOV     r0, #0
+        STRB    r0, [r5, #DiscRecord_NZones]
+ [ BigMaps
+        STRB    r0, [r5, #DiscRecord_BigMap_NZones2]
+ ]
+        B       %FT40
+
+30
+        CLRV    ; To make sure V from RetryDriveOp above doesn't cause problems
+
+        ; It's an E format disc - frig up some values which work to read the map
+        MOV     r0, #1
+        STRB    r0, [r5, #DiscRecord_NZones]
+        MOV     r0, #0
+ [ BigMaps
+        STRB    r0, [r5, #DiscRecord_BigMap_NZones2]
+ ]
+        STRB    r0, [r5, #DiscRecord_ZoneSpare]
+        STRB    r0, [r5, #DiscRecord_ZoneSpare+1]
+        STRB    r0, [r5, #DiscRecord_Log2bpmb]
+
+40
+        ; It's a floppy - clear hasdefectlist and set need new id and floppy flag
+        LDRB    r0, [r4, #DrvFlags]
+        BIC     r0, r0, #HasDefectList
+        STRB    r0, [r4, #DrvFlags]
+
+80
+        ; DefectList read OK
+
+90
+        STRVS   r0, [sp]
+        Pull    "r0-r4,r11,pc"
+
+; =============
+; AdjustFsSpace
+; =============
+
+; Entry
+;   r1 = drive number
+;   r4 ->drive record
+;   r5 ->disc record
+;
+; Exit
+;   V, r0=error possible
+
+; For the given disc adjust the FsSpace to be enough for the FsMap of an
+; assumed FileCore disc.
+
+AdjustFsSpace ROUT
+        Push    "r0,r2,r3,r7-r10,lr"
+
+        ; Work out the map's size
+ [ BigMaps
+        LDRB    r9, [r5, #DiscRecord_NZones]
+        LDRB    r7, [r5, #DiscRecord_BigMap_NZones2]
+        ADD     r9, r9, r7, LSL #8
+ |
+        LDRB    r9, [r5, #DiscRecord_NZones]
+ ]
+        LDRB    r7, [r5, #DiscRecord_Log2SectorSize]
+        MOVS    r8, r9, LSL r7
+        MOVEQ   r8, #SzOldFs
+
+ [ DynamicMaps
+        LDR     lr, [r4, #DrvsFsMapSize]; get size of the free space map
+        TEQS    r8, lr                  ; is space allocated for map right size ?
+ |
+        ; Get the map space for this drive and test the required
+        ; map space against it
+        ASSERT  FloppySizes = WinnieSizes+4
+        sbaddr  r10, WinnieSizes
+        ADD     r10, r10, r1
+        LDRB    lr, [r10]
+
+        TEQS    r8, lr, LSL #8          ;is space claimed for map right size ?
+ ]
+
+ [ DebugL
+
+        BNE     %FT01
+        DLINE   "Stored map size and disc map size match"
+        B       %FT02
+01
+        DLINE   "Stored and disc map map sizes differ"
+        DREG    r8, "Disc:", cc
+        MOV     r2, lr
+        DREG    r2, " and map is:"
+02
+ ]
+        ; Pick up the old map block, and skip replacing it if it's the right size
+ [ DynamicMaps
+        LDR     r2, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r2, [r4, #DrvsFsMap]
+        BIC     r2, r2, #HiFsBits
+ ]
+        BEQ     %FT20
+
+        ; Must change stored map for something a different size
+
+ [ DynamicMaps
+
+        ; find the actual allocated size
+
+        Push    "R1, R3-r8"
+
+        MOV     R0, #2
+        LDR     R1, [R4, #DrvsFsMapArea]
+        BL      OnlyXOS_DynamicArea             ; get the dynamic area size in bytes
+
+
+        Pull    "R1, R3-R8"
+
+        LDRVS   lr, [r4, #DrvsFsMapFlags]       ; set the 'map memory error' bit
+        ORRVS   lr, lr, #MemErrorFs             ;
+        STRVSB  lr, [r4, #DrvsFsMapFlags]
+
+        BVS     %FT90
+        ; work out the size the area must grow or shrink by
+
+        ADD     r3, r8, r8, LSR #8              ; new size of wotsit
+
+        Push    "R1"
+
+        SUB     R1, R3, R2                      ; amount to change size by
+ [ DebugL
+        DREG    R1, "Area size to change by: "
+ ]
+        LDR     R0, [R4, #DrvsFsMapArea]        ; area number
+        BL      OnlyXOS_ChangeDynamicArea
+
+ [ DebugL
+        BVC     %FT01
+        DebugError      "AdjustFsSpace - OS_ChangeDynamicarea error "
+01
+ ]
+
+        LDR     lr, [r4, #DrvsFsMapFlags]       ; set/clear the 'map memory error' bit
+        ORRVS   lr, lr, #MemErrorFs             ;
+        BICVC   lr, lr, #MemErrorFs             ;
+        STR     lr, [r4, #DrvsFsMapFlags]       ;
+
+        Pull    "R1"
+
+        BVS     %FT90                           ; error!
+
+        ; here, new space allocation is correct, so we're cool
+
+        STR     r8, [R4, #DrvsFsMapSize]                ; store the new size
+
+20
+        TEQ     r9, #0
+        MOVEQ   lr, #EmptyFs
+        MOVNE   lr, #0
+        STR     lr, [r4, #DrvsFsMapFlags]               ; store new flags0
+
+ | ; ELSE              (NOT Dynamic maps!)
+
+        ; Cancel storage before freeing it - saves embarasment on Reset
+        MOV     lr, #0
+        STRB    lr, [r10]
+
+
+        ; Free the storage
+        MOV     r3, #0
+        STR     r3, [r4, #DrvsFsMap]    ; Clear out to stop attempt to Free if problems
+        TEQ     r2, #0
+        MOVNE   r0, #ModHandReason_Free
+        BLNE    OnlyXOS_Module  ;return old map buffer
+ [ DebugL
+
+        BVC     %FT01
+        DLINE   "Discard map free error"
+01
+ ]
+        ; 2 options here, soldier on using a broken heap, or:
+        BVS     %FT90
+
+        ; Claim enough for the zones, and one byte per zone
+        ; (This assumes sectors size >= 256 bytes)
+        ADD     r3, r8, r8, LSR #8      ;size needed
+        MOV     r0, #ModHandReason_Claim
+ [ DebugL
+        DREG    r3, "Claim ",cc
+        DREG    r8, " for map of size "
+ ]
+        BL      OnlyXOS_Module  ;claim workspace
+ [ DebugL
+
+        BVC     %FT01
+        DLINE   "Map claim failed"
+        B       %FT02
+01
+        DREG    r2, "Map claimed is at "
+02
+ ]
+        BVS     %FT90           ; Bog it, didn't get space for the map!
+
+20
+        ; Flag old map as EmptyFs and attach memory to drive record
+        TEQ     r9, #0
+        ORREQ   r2, r2, #EmptyFs
+        STR     r2, [r4, #DrvsFsMap]
+
+        ; Record the map size we've now got, do this late
+        ; as we wouldn't want to try using a duff map after Reset
+        MOV     lr, r8, LSR #8
+        STRB    lr, [r10]
+
+ ] ;ENDIF DynamicMaps
+
+90
+        STRVS   r0, [sp]
+        Pull    "r0,r2,r3,r7-r10,pc"
+
+; =========
+; ReadFsMap
+; =========
+
+; Entry
+;   r1 = drive number
+;   r2 = disc number
+;   r4 ->drive record
+;   r5 ->disc record
+;   r6 = read sectors cache
+;
+; Exit
+;   V, r0=error possible
+;   r6 = new read sectors cache
+
+; Read the right sort of FsMap for the disc. Assumes the FsMap is OK if it reads as
+; it has already been checked by the identification process. These fields are set if
+; necessary:IdLen, Log2bpmb, Skew, BootOpt, ZoneSpare, RootDir. These flags are adjusted:
+; OldDirFlag, OldMapFlag, AltMapFlag, EmptyFs.
+
+ReadFsMap ROUT
+        Push    "r0-r4,r7,r9,r11,lr"
+
+        ; Adjust DiscFlags in r11
+        LDRB    r11, [r5, #DiscFlags]
+ [ DebugL
+        DREG    r11, "DiscFlags in ReadFsMap are "
+ ]
+
+ [ BigMaps
+        LDRB    r7, [r5, #DiscRecord_BigMap_NZones2]
+        LDRB    r9, [r5, #DiscRecord_NZones]
+        ADD     r9, r9, r7, LSL #8
+ |
+        LDRB    r9, [r5, #DiscRecord_NZones]
+ ]
+        LDRB    r7, [r5, #DiscRecord_Log2SectorSize]
+
+        ; Determine old/new-ness of map by number of zones recorded
+        TEQ     r9, #0
+        BNE     %FT30
+
+        ; Old map
+ [ DebugL
+
+        DLINE   "old map"
+ ]
+
+        ; Ensure there's enough space to load an old map
+        BL      AdjustFsSpace           ; (R1,R4,R5->R0,V)
+ [ DynamicMaps
+        LDR     r3, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r3, [r4, #DrvsFsMap]
+        BIC     r3, r3, #HiFsBits
+ ]
+
+        ; Read map
+        MOV     r4, #SzOldFs
+        MOV     r2, r1, ASL #(32-3)
+        MOV     r1, #DiscOp_CachedReadSecs
+        BL      RetryDriveOp
+        BVS     %FT90                   ; Bog it, map didn't read
+
+        ; Restore r1,r2 and r4 (and r3 too, but don't care about that)
+        LDMIB   sp, {r1-r4}
+
+ [ DynamicMaps
+        ; Map is now in
+        LDR     r3, [r4, #DrvsFsMapFlags]
+        BIC     r3, r3, #NewHiFsBits
+        STR     r3, [r4, #DrvsFsMapFlags]
+        LDR     r3, [r4, #DrvsFsMapAddr]
+ |
+        ; Map is now in
+        LDR     r3, [r4, #DrvsFsMap]
+        BIC     r3, r3, #HiFsBits
+        STR     r3, [r4, #DrvsFsMap]
+ ]
+
+        ; Set OldMapFlag, OldDirFlag and AltMapFlag as appropriate:
+        ; OldMapFlag set
+        ; AltMapFlag clear
+        ; OldDirFlag set only if Floppy, 256 bytes sectors and 16 sectors per track
+        LDR     lr, [r5, #DiscRecord_DiscType]
+ [ BigDisc
+        LDR     r0, FileType_FileCoreFloppyDiscStore
+        B       %FT01
+FileType_FileCoreFloppyDiscStore
+        DCD     FileType_FileCoreFloppyDisc
+
+01
+ |
+        LDR     r0, =FileType_FileCoreFloppyDisc
+ ]
+        TEQ     lr, r0
+        TEQEQ   r7, #8          ; 256 byte sectors
+        LDREQB  lr, [r5, #DiscRecord_SecsPerTrk]
+        TEQEQ   lr, #16         ; 16 sectors per track
+ [ DebugL
+        DREG    r11, "Adjusting DiscFlags from "
+ ]
+        ORREQ   r11, r11, #OldDirFlag
+        BICNE   r11, r11, #OldDirFlag
+        ORR     r11, r11, #OldMapFlag
+        BIC     r11, r11, #AltMapFlag
+
+        ; Set RootDir:
+        ; Location &200 (L_Root) on old dir discs, &400 (D_Root) on new dir discs
+        MOVEQ   r0, #L_Root
+        MOVNE   r0, #D_Root
+        ORR     r0, r0, r2, ASL #(32-3)
+ [ DebugL
+        DREG    r0, "Setting RootDir to (FileCore20, 1394) "
+ ]
+        STR     r0, [r5, #DiscRecord_Root]
+
+        ; Zap these fields to 0:
+        ASSERT  DiscRecord_IdLen :MOD: 4 = 0
+        ASSERT  DiscRecord_Log2bpmb=DiscRecord_IdLen+1
+        ASSERT  DiscRecord_Skew=DiscRecord_Log2bpmb+1
+        ASSERT  DiscRecord_BootOpt=DiscRecord_Skew+1
+        ASSERT  DiscRecord_NZones=9
+        ASSERT  DiscRecord_ZoneSpare=10
+        ; IdLen is critical because it determins the buffer size used for open files
+        MOV     r0, #0
+        STR     r0, [r5, #DiscRecord_IdLen]
+        STRB    r0, [r5, #DiscRecord_ZoneSpare+0]
+        STRB    r0, [r5, #DiscRecord_ZoneSpare+2]
+
+        ; Set BootOpt from map
+ [ DynamicMaps
+        LDR     r0, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r0, [r4, #DrvsFsMap]
+        BIC     r0, r0, #HiFsBits
+ ]
+        LDRB    r0, [r0, #OldBoot]
+        STRB    r0, [r5, #DiscRecord_BootOpt]
+
+        B       %FT80
+
+30
+        ; New map
+ [ DebugL
+
+        DLINE   "new map"
+ ]
+
+ [ ReadMapDuringIdentify ; map is already in dynamic area in this case
+        ASSERT  BigDisc
+        ASSERT  DynamicMaps
+        
+        ; Read the flag that tells us which copy of the map was loaded
+        LDR     lr, [r4, #DrvsFsMapAddr]
+        ADD     lr, lr, r9, LSL r7      ; Zones<<Log2SectorSize
+        LDR     lr, [lr]
+        TEQ     lr, #0
+        BICEQ   r11, r11, #AltMapFlag
+        ORRNE   r11, r11, #AltMapFlag
+ 
+ |
+        ; Initialise the zone flags in the map to not valid
+        MOV     r0, #0
+        BL      SetAllZoneFlags
+
+        BL      MapDiscAdd
+        BIC     r2, r2, #DiscBits
+        ORR     r2, r2, r1, ASL #(32-3)
+        MOV     r1, #DiscOp_CachedReadSecs
+ [ DynamicMaps
+        LDR     r3, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r3, [r4, #DrvsFsMap]
+ ]
+        MOV     r4, r9, ASL r7          ; Zones<<Log2SectorSize
+        BL      RetryDriveOp
+
+        ; Restore r1,r2 and r4 (and r3 too, but don't care about that)
+        LDMIB   sp, {r1-r4}
+
+        BICVC   r11, r11, #AltMapFlag
+        BVC     %FT40                   ; 1st Map copy read OK
+
+        BL      MapDiscAdd
+ [ BigDisc
+        ADD     r2, r2, r9              ; MapDiscAdd + Zones<<DiscRecord_Log2SectorSize
+ |
+        ADD     r2, r2, r9, ASL r7      ; MapDiscAdd + Zones<<DiscRecord_Log2SectorSize
+ ]
+        BIC     r2, r2, #DiscBits
+        ORR     r2, r2, r1, ASL #(32-3)
+        MOV     r1, #DiscOp_CachedReadSecs
+ [ DynamicMaps
+        LDR     r3, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r3, [r4, #DrvsFsMap]
+ ]
+        MOV     r4, r9, ASL r7          ; Zones<<Log2SectorSize
+        BL      RetryDriveOp
+        BVS     %FT90                   ; 2nd map copy failed to read
+
+        ; Restore r1,r2 and r4 (and r3 too, but don't care about that)
+        LDMIB   sp, {r1-r4}
+
+        ORR     r11, r11, #AltMapFlag
+
+40
+ ] ; ReadMapDuringIdentify
+
+        ; Common DiscFlag settings on E disc
+        BIC     r11, r11, #OldMapFlag :OR: OldDirFlag
+
+        ; Validate the zones in memory
+        MOV     r0, #ZoneValid
+        BL      SetAllZoneFlags
+
+        ; Copy fields from the disc record in the map to the disc record that gets used:
+        ; SecsPerTrk (This overides copy-protection-scheme confused value).
+        ; IdLen, Log2bpmb, Skew, BootOpt, ZoneSpare, RootDir
+        ; and adjust RootDir to have the disc number in its disc bits
+ [ DynamicMaps
+        LDR     r0, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r0, [r4, #DrvsFsMap]
+ ]
+        ADD     r0, r0, #ZoneHead
+        LDRB    lr, [r0, #DiscRecord_SecsPerTrk]
+        STRB    lr, [r5, #DiscRecord_SecsPerTrk]
+        ASSERT  (DiscRecord_IdLen :MOD: 4) = 0
+        ASSERT  DiscRecord_Log2bpmb = DiscRecord_IdLen+1
+        ASSERT  DiscRecord_Skew = DiscRecord_Log2bpmb+1
+        ASSERT  DiscRecord_BootOpt = DiscRecord_Skew+1
+        LDR     lr, [r0, #DiscRecord_IdLen]
+        STR     lr, [r5, #DiscRecord_IdLen]
+        LDRB    lr, [r0, #DiscRecord_ZoneSpare]
+        STRB    lr, [r5, #DiscRecord_ZoneSpare]
+        LDRB    lr, [r0, #DiscRecord_ZoneSpare+1]
+        STRB    lr, [r5, #DiscRecord_ZoneSpare+1]
+        LDR     r0, [r0, #DiscRecord_Root]
+        BIC     r0, r0, #DiscBits
+        ORR     r0, r0, r2, ASL #(32-3)
+ [ DebugL
+        DREG    r0, "Setting RootDir to (FileCore20, 1509) "
+ ]
+        STR     r0, [r5, #DiscRecord_Root]
+
+80
+ [ DebugL
+        DREG    r11, "DiscFlags set to "
+ ]
+        STRB    r11, [r5, #DiscFlags]
+90
+        STRVS   r0, [sp]
+        Pull    "r0-r4,r7,r9,r11,pc"
+
+; ===============
+; SetAllZoneFlags
+; ===============
+
+; Entry
+;   r0 = Zone flags to set
+;   r4 ->drive record
+;   r7 = Log2SectorSize
+;   r9 = zones
+;
+; This sets all the zone flags for a given map to the given value
+
+SetAllZoneFlags ROUT
+        Push    "r1,lr"
+ [ DynamicMaps
+        LDR     r1, [r4, #DrvsFsMapAddr]
+ |
+        LDR     r1, [r4, #DrvsFsMap]
+ ]
+        ADD     r1, r1, r9, ASL r7
+        MOV     lr, r9
+10
+        SUBS    lr, lr, #1
+        STRPLB  r0, [r1], #1
+        BPL     %BT10
+
+        Pull    "r1,pc"
+
+; ======================
+; StartupNonFileCoreDisc
+; ======================
+
+; Entry
+;   r1 = drive number
+;   r2 = disc number
+;   r4 ->drive record
+;   r5 ->disc record
+;   r6 = read sectors cache
+;
+; Exit
+;   V possible with r0=error
+;   r6 = new read sectors cache
+;
+; This routine initialises the DiscRec given that the disc is not a FileCore disc
+;
+; Algorithm:
+;   Free any associated map block
+
+StartupNonFileCoreDisc ROUT
+        Push    "r0-r3,r8,lr"
+
+ [ DebugL
+
+        DLINE   "Starting up non-filecore disc"
+ ]
+
+ [ DynamicMaps
+
+        ; with the maps stored in a dynamic area, we don't delete the dynamic area,
+        ; but instead just pretend it's not there
+
+        MOV     R1, #0                  ; set the allocated size to zero,
+        STR     R1, [R4, #DrvsFsMapSize]        ; so that if we have problems, we assume no map allocated
+
+        LDR     R1, [R4, #DrvsFsMapArea]
+        MOV     R0, #2
+
+        Push    "R3-R8"
+
+        BL      OnlyXOS_DynamicArea     ; get the dynamic area's info (only needs r2, ie the size)
+
+        BVS     %FT80                   ; got the size
+
+        Pull    "R3-R8"
+
+        ; now shrink it back to zero
+
+        MOV     R0, R1                  ; dynamic area number in R0
+        RSB     R1, R2, #0              ; shrinking...
+
+        BL      OnlyXOS_ChangeDynamicArea       ; shrink it
+
+        BVS     %FT80                   ; shrink
+ |
+
+        ; Free any map area associated with this drive
+        ASSERT  FloppySizes = WinnieSizes+4
+        sbaddr  r8, WinnieSizes
+        ADD     r8, r8, r1
+        LDRB    lr, [r8]
+        TEQ     lr, #0
+        BEQ     %FT20
+
+        ; Cancel the storage size first (for Reset proofing)
+        MOV     lr, #0
+        STRB    lr, [r8]
+
+        ; Free the storage (clearing FsMap ptr before free to avoid retrying failed free)
+        LDR     r2, [r4, #DrvsFsMap]
+        MOV     r3, #0
+        STR     r3, [r4, #DrvsFsMap]
+        BICS    r2, r2, #HiFsBits
+        MOVNE   r0, #ModHandReason_Free
+        BLNE    OnlyXOS_Module
+
+ ]
+
+        BVS     %FT80
+
+20
+        ; Zero out:
+        ; IdLen, Log2bpmb, Skew, BootOpt, Zones, ZoneSpare
+        MOV     lr, #0
+        ASSERT  DiscRecord_IdLen :MOD: 4 = 0
+        ASSERT  DiscRecord_Log2bpmb = DiscRecord_IdLen + 1
+        ASSERT  DiscRecord_Skew = DiscRecord_Log2bpmb + 1
+        ASSERT  DiscRecord_BootOpt = DiscRecord_Skew + 1
+        STR     lr, [r5, #DiscRecord_IdLen]
+        STRB    lr, [r5, #DiscRecord_NZones]
+ [ BigMaps
+        STRB    lr, [r5, #DiscRecord_BigMap_NZones2]
+ ]
+        STRB    lr, [r5, #DiscRecord_ZoneSpare]
+        STRB    lr, [r5, #DiscRecord_ZoneSpare+1]
+
+        ; Set up RootDir to be start of disc
+        LDR     lr, [sp, #2*4]
+        MOV     lr, lr, ASL #(32-3)
+ [ DebugL
+        Push    "r5"
+        MOV     r5, lr
+        DREG    r5, "Setting RootDir to (FileCore20, 1653) "
+        Pull    "r5"
+ ]
+        STR     lr, [r5, #DiscRecord_Root]
+
+        ; NewDir to get LexEqv to work porperly (bit7 chars)
+        ; OldMap to get IndDiscOps to work
+        LDRB    lr, [r5, #DiscFlags]
+        BIC     lr, lr, #OldDirFlag
+        ORR     lr, lr, #OldMapFlag
+        STRB    lr, [r5, #DiscFlags]
+
+80
+        STRVS   r0, [sp]
+ [ DebugL
+
+        DLINE   "Finished starting up non-filecore disc"
+ ]
+        Pull    "r0-r3,r8,pc"
+
+
+; SBP:  for mount, disc address must be in byte form as we don't
+;       know the sector size of the disc.
+
+; =====
+; Mount
+; =====
+
+;entry
+; R0 -> controller process block
+; R1 drive (internal drive numbering)
+; R2 disc address (external drive numbering)
+; R3 RAM address
+; R4 length
+; R5 disc rec to fill in (floppy)
+; R6 controller lock bits
+
+;exit
+; ok    R0 corrupt
+; error R0,V
+
+Mount
+ [ DebugL
+
+        DREG    R0, "", cc
+        DREG    R1, " ",cc
+        DREG    R2, " ",cc
+        DREG    R3, " ",cc
+        DREG    R4, " ",cc
+        DREG    R5, " ",cc
+        DREG    R6, " ",cc
+        DLINE   ">Mount"
+ ]
+        Push    "R7,R8,LR"
+
+        ; If LastDiscOpWasFormat fill in the values stored from that in the disc record
+        DrvRecPtr r7, r1
+        LDRB    r8, [r7, #DrvFlags]
+        TST     r8, #LastDiscOpWasFormat
+        BEQ     %FT05
+
+        LDRB    r8, [r7, #PrevFormSectorSize]
+        STRB    r8, [r5, #DiscRecord_Log2SectorSize]
+        LDRB    r8, [r7, #PrevFormSecsPerTrk]
+        STRB    r8, [r5, #DiscRecord_SecsPerTrk]
+        LDRB    r8, [r7, #PrevFormHeads]
+        STRB    r8, [r5, #DiscRecord_Heads]
+        LDRB    r8, [r7, #PrevFormDensity]
+        STRB    r8, [r5, #DiscRecord_Density]
+        LDRB    r8, [r7, #PrevFormLowSector]
+        STRB    r8, [r5, #DiscRecord_LowSector]
+        LDR     r8, [r7, #PrevFormDiscSize]
+        STR     r8, [r5, #DiscRecord_DiscSize]
+ [ BigDisc
+        LDR     r8, [r7, #PrevFormDiscSize2]
+        STR     r8, [r5, #DiscRecord_BigMap_DiscSize2]
+ ]
+        Pull    "r7,r8,pc"
+
+05
+        BL      DriveWriteBehindWait            ;(R1)
+        LDR     R7, FS_Flags
+        ANDS    R7, R7, R6
+ [ DebugI
+        BEQ     %FT01
+
+        DLINE   " C2 ",cc
+01
+ ]
+        BLNE    ClaimFiq
+
+        LDRB    R8, Interlocks
+        ORR     LR, R8, R6
+        STRB    LR, Interlocks
+        BL      WaitForControllerFree           ;(R0)
+
+        ; For Pre-MultiFS filing systems assume LowSector is 0
+        MOV     r0, #0
+        STRB    r0, [r5, #DiscRecord_LowSector]
+
+        ; Mount non-mounting winnies by reading defect list to scratch space.
+        ; Need the defect list for heads/sectorsize/secspertrk/density/lowsector/DiscSize
+        ; from boot block.
+      [ {TRUE} ; Support floppies on filing systems that can only mount via boot block
+        LDR     lr, FS_Flags
+        TST     r1, #bit2
+        TSTEQ   lr, #CreateFlag_FixedDiscsMountLikeFloppy
+        BEQ     %FT09
+        TST     r1, #bit2
+        TSTNE   lr, #CreateFlag_FloppyDiscsMountLikeFixed
+        BEQ     %FT10
+09
+      |
+        TST     r1, #bit2
+        LDREQ   lr, FS_Flags
+        TSTEQ   lr, #CreateFlag_FixedDiscsMountLikeFloppy
+        BNE     %FT10
+      ]
+
+      [ BigSectors
+DefectListDiscAligned * (DefectListDiscAdd:SHR:12):SHL:12 ; Round DLDA down to nearest whole sector
+      |
+DefectListDiscAligned * (DefectListDiscAdd:SHR:10):SHL:10 ; Round DLDA down to nearest whole sector
+      ]
+        MOV     r2, #DefectListDiscAligned
+        ORR     r2, r2, r1, ASL #(32-3)
+        EOR     r2, r2, #bit31
+        MOV     r3, #ScratchSpace
+        LDR     r4, =DefectListDiscAdd - DefectListDiscAligned + SzDefectList
+10
+
+ [ DebugL
+
+        DLINE   ">MiscMount"
+ ]
+        MOV     R0, #MiscOp_Mount
+        BL      Parent_Misc
+ [ DebugL
+
+        DLINE   "<MiscMount"
+ ]
+
+        BVS     %FT20
+
+        ; For non-mounting winnies verify the defect list and copy/generate fields
+        ; as appropriate.
+      [ {TRUE} ; Support floppies on filing systems that can only mount via boot block
+        LDR     lr, FS_Flags
+        TST     r1, #bit2
+        TSTEQ   lr, #CreateFlag_FixedDiscsMountLikeFloppy
+        BEQ     %FT12
+        TST     r1, #bit2
+        TSTNE   lr, #CreateFlag_FloppyDiscsMountLikeFixed
+        BEQ     %FT20
+12
+      |
+        TST     r1, #bit2
+        LDREQ   lr, FS_Flags
+        TSTEQ   lr, #CreateFlag_FixedDiscsMountLikeFloppy
+        BNE     %FT20
+      ]
+
+        Push    "r0,r1"
+        MOV     r0, #ScratchSpace
+        ADD     r0, r0, #DefectListDiscAdd - DefectListDiscAligned
+        MOV     r1, #SzDefectList
+        BL      CheckSum
+        BVS     %FT15
+
+        ; Pick up heads/sectorsize/secspertrk/density/lowsector/DiscSize from read block
+        MOV     r4, #ScratchSpace
+        ADD     r4, r4, #DefectListDiscAdd - DefectListDiscAligned
+        ADD     r4, r4, #DefectStruc
+
+        ; Density <= DensityOctal
+        LDRB    lr, [r4, #DiscRecord_Density]
+        CMP     lr, #DensityOctal
+        BHI     %FT15
+        STRB    lr, [r5, #DiscRecord_Density]
+
+        ; Heads > 0
+        LDRB    lr, [r4, #DiscRecord_Heads]
+        TEQ     lr, #0
+        BEQ     %FT15
+        STRB    lr, [r5, #DiscRecord_Heads]
+
+        ; SecsPerTrk > 0
+        LDRB    lr, [r4, #DiscRecord_SecsPerTrk]
+        TEQ     lr, #0
+        BEQ     %FT15
+        STRB    lr, [r5, #DiscRecord_SecsPerTrk]
+
+        ; 256 <= SectorSize <= upper limit
+        LDRB    lr, [r4, #DiscRecord_Log2SectorSize]
+        CMP     lr, #8
+        BLO     %FT15
+      [ BigSectors
+        CMP     lr, #12         ; upper limit 4k
+      |
+        CMP     lr, #10         ; upper limit 1k
+      ]
+        BHI     %FT15
+        STRB    lr, [r5, #DiscRecord_Log2SectorSize]
+
+        LDRB    lr, [r4, #DiscRecord_LowSector]
+        STRB    lr, [r5, #DiscRecord_LowSector]
+        LDR     lr, [r4, #DiscRecord_DiscSize]
+        STR     lr, [r5, #DiscRecord_DiscSize]
+ [ BigDisc
+        LDR     lr, [r4, #DiscRecord_BigMap_DiscSize2]
+ [ DebugL
+        DREG    lr, "Miscmount discsize 2 "
+ ]
+        STR     lr, [r5, #DiscRecord_BigMap_DiscSize2]
+ ]
+        B       %FT19
+
+15
+        CLRV
+
+        ; Defect list bad - reject it and fill in some values that'll work
+ [ {TRUE}
+        MOV     lr, #&10000
+        ORR     lr, lr, #&100
+        ORR     lr, lr, #&09
+ |
+        LDR     lr, =&0001010a  ; density=0, heads=1, sides=1, sectorsize=1024
+ ]
+        STR     lr, [r5]
+        MOV     lr, #0
+        STRB    lr, [r5, #DiscRecord_LowSector]
+        MOV     lr, #640*1024   ; 640K disc
+        STR     lr, [r5, #DiscRecord_DiscSize]
+ [ BigDisc
+        MOV     lr, #0
+        STR     lr, [r5, #DiscRecord_BigMap_DiscSize2]
+ ]
+
+19
+        Pull    "r0,r1"
+
+20
+
+        STRB    R8, Interlocks
+        TEQS    R7, #0
+ [ DebugI
+
+        BEQ     %FT01
+        DLINE   " R2 ",cc
+01
+ ]
+        BLNE    ReleaseFiq
+ [ DebugL
+
+        BVS     %FT01
+        DLINE   "         ",cc
+        B       %FT02
+01
+        DREG    R0, "", cc
+02
+        DREG    R1, " ",cc
+        DREG    R2, " ",cc
+        DREG    R3, " ",cc
+        DREG    R4, " ",cc
+        DREG    R5, " ",cc
+        DREG    R6, " ",cc
+        DLINE   "<Mount"
+ ]
+        Pull    "R7,R8,PC"
+
+; ==========
+; PollChange
+; ==========
+
+; Examine and act on disc changed signal for floppy drive
+; CAN ONLY BE CALLED FROM FOREGROUND
+
+; entry R0 = drive
+; exit  LR = Drive's Disc
+
+PollChange ROUT
+        Push    "R0-R7,LR"
+        SavePSR R7
+ [ Debug4
+        DREG    R0, "Pollchange on "
+ ]
+        DrvRecPtr  R4,R0
+        LDRB    R1, LockedDrive ;MAKE CERTAIN NO MAP RELOADING WHILE ALTERING MAP
+        TEQS    R0, R1
+        BEQ     %FT90
+        MOV     R1, R0
+        BL      DriveWriteBehindWait            ;(R1)
+        LDRB    R6, Interlocks
+ [ {TRUE}
+        TST     R0, #bit2
+ ]
+        ORREQ   LR, R6, #WinnieLock
+        ORRNE   LR, R6, #FloppyLock
+        STRB    LR, Interlocks                  ;ensure controller claimed
+        LDREQ   R0, WinnieProcessBlk
+        LDRNE   R0, FloppyProcessBlk
+
+        LDRB    LR, [R0,#Process]
+        TSTS    LR, #Inactive           ;If background floppy op
+        LDREQB  LR, [R0, #ProcessDrive]
+        TEQEQS  LR, R1                  ;     on same disc then assume not changed
+        BEQ     %FT85
+        BL      WaitForControllerFree   ;(R0) else if on other disc let it finish
+
+        LDR     R2, [R4,#ChangedSeqNum]
+        BL      LowPollChange   ;(R1-R2->R1-R3)
+        MOV     R0, R1
+        LDRB    R1, [R4,#DrvsDisc]
+        TSTS    R3, #MiscOp_PollChanged_NotChanged_Flag
+        BNE     %FT10
+
+        ; If disc not same as last disc then clear LastDiscOpWasFormat
+        TST     R3, #MiscOp_PollChanged_Changed_Flag :OR: MiscOp_PollChanged_Empty_Flag
+        LDRNEB  LR, [R4, #DrvFlags]
+        BICNE   LR, LR, #LastDiscOpWasFormat
+        STRNEB  LR, [R4, #DrvFlags]
+
+ [ DebugL
+
+        BEQ     %FT01
+        DLINE   "LastDiscOpWasFormat clear (B)"
+01
+ ]
+
+        ; Don't mess with NeedNewIdFlag. WhatDisc will set it if needs, which is
+        ; when a new, not previously known disc gets inserted and started up. IE
+        ; if a disc which has already been seen is inserted then NeedNewId WILL NOT
+        ; be set. This is working upon the pricipal that the NewId mechanism is working OK.
+
+        ; If drive might have changed then disc is uncertain
+        TSTS    R3, #MiscOp_PollChanged_MaybeChanged_Flag
+        ORRNE   R1, R1, #Uncertain
+
+        ; If drive has changed or is empty then unlink the disc from the drive
+        TSTS    R3, #MiscOp_PollChanged_Changed_Flag :OR: MiscOp_PollChanged_Empty_Flag
+        BLNE    UnlinkByDrive    ;(R0)
+
+        ; If drive empty then return disc Empty
+        TSTS    R3, #MiscOp_PollChanged_Empty_Flag
+        MOVNE   R1, #Empty
+
+        ; If disc might have changed and drive has changed
+        TSTS    R3, #MiscOp_PollChanged_Changed_Flag
+        B       %FT20
+
+10
+        ; Processing for NotChanged discs:
+
+        ; If the drive's last DiscOp was format and the disc isn't locked
+        ; into the drive then the disc is uncertain
+        LDRB    LR, [R4, #DrvFlags]
+        TSTS    LR, #LastDiscOpWasFormat
+        BEQ     %FT15
+        LDRB    LR, [R4, #LockCount]
+        TEQ     LR, #0
+        ORREQ   R1, R1, #Uncertain
+
+15
+      [ {TRUE}
+        ; Rationale for this change:
+        ; * it's impossible to get here unless the FS reported Changed, so there's
+        ;   no point in testing for the NotChanged or MaybeChanged cases
+        ; * the Unknown flag implies the Uncertain flag, and FileCore already treats
+        ;   Unknown:OR:Uncertain drives identically to Full:OR:Uncertain ones
+        ; * for the existing drive state to be Empty implies that in an earlier poll
+        ;   the FS returned the Empty flag. No existing FS does this without the
+        ;   EmptyWorks flag as well, and EmptyWorks is a sticky flag, so it must
+        ;   still be set. Logically, this makes sense too. So removing this check
+        ;   removes the only place where FileCore examines the EmptyWorks flag,
+        ;   simplifying the API.
+        TSTS    R1, #Empty
+      |
+        ; If disc hasn't changed and the drive was unknown or empty and empty works on this drive
+        ; and one of notchanged, maybechanged and changed are set
+        TSTS    R1, #Unknown :OR: Empty
+        TSTNES  R3, #MiscOp_PollChanged_EmptyWorks_Flag
+        TSTNES  R3, #MiscOp_PollChanged_NotChanged_Flag :OR: MiscOp_PollChanged_MaybeChanged_Flag :OR: MiscOp_PollChanged_Changed_Flag
+      ]
+20
+        ; then mark the disc as full and uncertain
+        MOVNE   R1, #Full :OR: Uncertain
+        STRB    R1, [R4,#DrvsDisc]
+        STR     R2, [R4,#ChangedSeqNum]
+
+85
+        STRB    R6, Interlocks
+90
+        LDRB    LR, [R4,#DrvsDisc]
+        RestPSR R7,,f
+        Pull    "R0-R7,PC"
+
+; =============
+; LowPollChange
+; =============
+
+; entry: R1 = drive (internal numbering)
+;        R2 = sequence number
+
+; exit:  V, R0 = error possible
+;        R2 = new sequence number
+;        R3 = result flags
+
+LowPollChange ROUT
+        Push    "r0,lr"
+
+        ; Check the drive number
+        TST     r1, #bit2
+        LDRNEB  lr, Floppies
+        ADDNE   lr, lr, #4
+        LDREQB  lr, Winnies
+        CMP     r1, lr
+
+        ; If bad drive then fake up empty and changed working and the drive is empty
+        MOVHS   r3, #MiscOp_PollChanged_Empty_Flag :OR: MiscOp_PollChanged_EmptyWorks_Flag :OR: MiscOp_PollChanged_ChangedWorks_Flag
+        Pull    "r0,pc",HS
+
+        ; Check if the drive is locked - if it is then return Drv_NotChanged
+        DrvRecPtr R0, R1
+        LDRB    LR, [R0, #LockCount]
+        TEQ     LR, #0
+        MOVNE   R3, #MiscOp_PollChanged_NotChanged_Flag
+        Pull    "R0,PC", NE
+
+        MOV     r0, #MiscOp_PollChanged
+
+        ; If Winnie and it doesn't poll change then frig a suitable value
+        ; Else (floppy or winnie which poll changes) do poll change
+        TST     r1, #bit2
+        ASSERT  :INDEX: FS_Flags :MOD: 4 = 0
+        LDREQ   lr, FS_Flags
+        TSTEQ   lr, #CreateFlag_FixedDiscPollChangeSupport
+        MOVEQ   r3, #MiscOp_PollChanged_NotChanged_Flag :OR: MiscOp_PollChanged_EmptyWorks_Flag :OR: MiscOp_PollChanged_ChangedWorks_Flag
+        BLNE    Parent_Misc     ;(R0-R2->R1-R3)
+
+        STRVS   r0, [sp]
+        Pull    "r0,pc"
+
+; ===========
+; FindDiscRec
+; ===========
+
+; entry: R1 = Drive to find rec for
+; exit:
+; IF error V set, R0 result
+; ELSE
+;        R1 = drive
+;        R2 = free Disc Record number
+;        R3 = record ptr
+
+FindDiscRec ROUT
+        Push    "R1,R4-R8,LR"
+
+05
+
+ [ Debug4
+        DREG    R1, "Find disc rec for drive "
+ ]
+
+        ; Winnies are now treated like floppies which don't happen to get removed
+
+        ; Start at the first disc record
+        MOV     R4, #0
+        MOV     R6, #&100       ;lowest priority so far
+;search loop
+10
+        ; Get to this record
+        DiscRecPtr  R5,R4
+
+        ; If in use don't use it
+        LDRB    R7, [R5,#DiscUsage]
+        TEQS    R7, #0
+        BNE     %FT40                   ;dont forget discs in use
+
+        LDRB    lr, LockedDisc
+        TEQ     lr, r4
+        BEQ     %FT40                   ;dont forget the locked disc
+
+        ; Get the priority: priority += 8 if the disc is in a drive
+        LDRB    R7, [R5,#Priority]
+        CMPS    R7, #0                  ;0 <=> Unassigned
+        LDRNEB  R8, [R5,#DiscsDrv]
+        CMPNES  R8, #8
+        ADDLO   R7, R7, #8              ;Higher priority for discs in a drive
+
+      [ RO3Paths
+;Dont forget discs holding CritBufDir or BufDir
+        LDR     R0, CritBufDir
+        CMPS    R0, #-1
+        BEQ     %FT30
+        CMPS    R4, R0, LSR #(32-3)
+        BEQ     %FT40            ;holds an important dir
+30
+        LDR     R0, BufDir
+        CMPS    R0, #-1
+        BEQ     %FT30
+        CMPS    R4, R0, LSR #(32-3)
+        BEQ     %FT40            ;holds an important dir
+30
+      |
+;Dont forget discs holding UserRootDir, LibDir, CurDir, BackDir, or Bufdir
+        MOV     R8, #:INDEX:UserRootDir
+        ASSERT  LibDir=UserRootDir+4
+        ASSERT  CurDir=LibDir+4
+        ASSERT  BackDir=CurDir+4
+        ASSERT  CritBufDir=BackDir+4
+        ASSERT  BufDir=CritBufDir+4
+20
+        LDR     R0, [SB,R8]
+        CMPS    R0, #-1
+        BEQ     %FT30
+        CMPS    R4, R0, LSR #(32-3)
+        BEQ     %FT40            ;holds an important dir
+30
+        ADD     R8, R8, #4
+        CMPS    R8, #:INDEX:BufDir
+        BLS     %BT20
+      ]
+
+        ;dont forget floppies with open files
+        MOV     R0, R4
+        BL      HasDiscOpenFiles        ;(R0->Z)
+        BEQ     %FT40
+
+        ; If lowest priority so far, then note record number, record pointer and its priority
+        CMPS    R7, R6
+        MOVLS   R2, R4          ; note rec num
+        MOVLS   R3, R5          ; note rec ptr
+        MOVLS   R6, R7          ; adjust lowest priority
+40
+        ; Move to next record
+        ADD     R4, R4, #1
+        TEQS    R4, #8
+        BNE     %BT10
+
+; R6 = lowest priority found
+;       0 => empty disc rec
+; 1 to &F => reclaimable
+;    &100 => none available
+ [ Debug4
+        DREG    R6, "Lowest priority was = ",cc
+        DREG    r2, " disc number "
+ ]
+        MOVS    R6, R6, LSL #(32-8)
+        BCS     %FT70           ;all present disc records needed
+        BEQ     %FT50
+
+        ; Disc record not empty, so clear it out before using it.
+        MOV     R1, R2
+        BL      CloseAllByDisc  ;just to discard any FCBs for objects on this disc (closed, but hanging around)
+        MOV     R0, R2
+        BL      FreeDiscRec
+
+50
+        MOV     R0, #0          ;No error
+60
+        BL      SetVOnR0
+ [ Debug4
+
+        DLINE   "Result   Disc     Disc Rec - Leave FindDiscRec"
+        DREG    R0,,cc
+        DREG    R2," ",cc
+        DREG    R3," "
+ ]
+        Pull    "R1,R4-R8,PC"
+
+70
+ [ Debug4
+
+        DLINE   "All record used - attempt to close files"
+ ]
+        ; All disc records in use.
+        ; Try to close any partitions
+        MOV     r8, sp
+
+        ; Calculate length needed for a suitable stack frame and grab that
+        LDR     r1, FS_Title
+        BL      strlen
+        ADD     r3, r3, #2+NameLen+1+3  ; 2 for ::, NameLen for disc title, 1 for terminator, 3 for round-up
+        BIC     r3, r3, #3
+        SUB     sp, sp, r3
+
+        ; Copy FS_Title
+        MOV     r2, sp
+75
+        LDRB    lr, [r1], #1
+        CMP     lr, #" "
+        STRHIB  lr, [r2], #1
+        BHI     %BT75
+
+        ; Copy ::
+        MOV     lr, #":"
+        STRB    lr, [r2], #1
+        STRB    lr, [r2], #1
+
+        ; r3 = number of files closed in this pass
+        ; r4 = disc number
+        MOV     r3, #0
+        MOV     r4, #0
+
+77
+        DiscRecPtr r5, r4
+
+        MOV     r1, #NameLen
+        MOV     r0, r2
+        ADD     r5, r5, #DiscRecord_DiscName
+
+80
+        LDRB    lr, [r5], #1
+        CMP     lr, #" "                ; SMC: don't want trailing space on disc name
+        STRHIB  lr, [r0], #1
+        SUBHIS  r1, r1, #1
+        BHI     %BT80
+        MOV     lr, #0
+        STRB    lr, [r0]
+
+        MOV     r5, r2
+
+        ; Do the service call
+        MOV     r1, #Service_CloseFile
+        MOV     r2, sp
+ [ Debug4
+        DSTRING r2, "Attempt close "
+ ]
+        BL      DoXOS_ServiceCall
+        BVS     %FT90
+
+        MOV     r2, r5
+
+85
+        ; Advance to the next disc
+        ADD     r4, r4, #1
+        CMP     r4, #7
+        BLS     %BT77
+
+90
+        ; unwind the stack
+        MOV     sp, r8
+ [ Debug4
+        DREG    r3, "Files closed="
+ ]
+
+        ; If nothing was closed give up
+        CMP     r3, #0
+        MOVEQ   r0, #TooManyDiscsErr
+        BEQ     %BT60
+
+        ; If no problem go back for another go
+        LDRVC   r1, [sp]
+        BVC     %BT05
+
+        B       %BT60
+
+; ===========
+; FreeDiscRec
+; ===========
+
+; entry: R0 = disc rec num
+; exit:  R0 unchanged
+
+FreeDiscRec ROUT
+        Push    "R1,LR"
+
+ [ Debug4
+
+ DREG   r0, "FreeDiscRec(",cc
+ DLINE  ")"
+ ]
+
+      [ RO3Paths
+;Invalidate CritBufDir or BufDir if on this disc
+        LDR     LR, CritBufDir
+        CMPS    R0, LR, LSR #(32-3)
+        MOVEQ   LR, #-1
+        STREQ   LR, CritBufDir
+        
+        LDR     LR, BufDir
+        CMPS    R0, LR, LSR #(32-3)
+        MOVEQ   LR, #-1
+        STREQ   LR, BufDir
+      |
+;Invalidate UserRootDir,LibDir, CurDir, BackDir, or  Bufdir if on this disc
+        MOV     R1, #:INDEX:UserRootDir
+        ASSERT  LibDir=UserRootDir+4
+        ASSERT  CurDir=LibDir+4
+        ASSERT  BackDir=CurDir+4
+        ASSERT  BufDir=BackDir+8
+10
+        LDR     LR, [SB,R1]
+        CMPS    R0, LR, LSR #(32-3)
+        MOVEQ   LR, #-1
+        STREQ   LR, [SB,R1]
+        ADD     R1, R1, #4
+        CMPS    R1, #:INDEX:BufDir
+        BLS     %BT10
+      ]
+
+        BL      InvalidateFragCache
+        BL      UnCacheDisc
+        BL      UnlinkByDisc
+        BL      UpdatePriority  ;so that when set to 0 below highest is removed
+        DiscRecPtr  R1,R0
+        MOV     LR,#DefDiscRecEnd       ;unnassigned record defaults
+        ASSERT  SzDiscRec :MOD: 4 = 0
+        ASSERT  DiscFlags=SzDiscRec-4
+        ASSERT  Priority=SzDiscRec-3
+        ASSERT  DiscsDrv=SzDiscRec-2
+        ASSERT  DiscUsage=SzDiscRec-1
+        STR     LR, [R1,#SzDiscRec-4]
+
+        Pull    "R1,PC"
+
+; ==============
+; UpdatePriority
+; ==============
+
+;decrement priority of higher priority floppy discs by 1 and set priority of
+;this floppy disc to (# of other discs in use) + 1
+
+; entry: R0 = disc rec num
+
+UpdatePriority ROUT
+        Push    "R1-R5,LR"
+        ; Winnies get treated just like floppies - but they don't happen to ever be removed
+        MOV     R4, #0
+        DiscRecPtr  R1, R0
+        LDRB    R2, [R1,#Priority]
+        MOV     R3, #1                  ;discs in use ctr
+10
+        DiscRecPtr  R5,R4               ;Rec ptr
+        CMPS    R0, R4                  ;IF not same disc rec
+        LDRNEB  LR, [R5,#Priority]
+        CMPNES  LR, #0                  ; IF other disc rec in use
+        ADDNE   R3, R3, #1              ;  count a disc rec in use
+        TEQNES  R2, #0                  ;  IF this disc rec in use
+        CMPNES  LR, R2                  ;   IF other disc rec had higher priority
+        SUBHI   LR, LR, #1              ;    dec priority of other disc rec
+        STRHIB  LR, [R5,#Priority]
+        ADD     R4, R4, #1
+        CMPS    R4, #8              ; (V cleared)
+        BLO     %BT10               ;loop until all disc recs done
+        STRB    R3, [R1,#Priority]  ;set priority of this disc rec
+90
+        Pull    "R1-R5,PC"
+
+
+; =============
+; UnlinkByDrive
+; =============
+
+; breaks link between drive & disc
+
+; entry: R0 = drive
+
+UnlinkByDrive ROUT
+
+ [ Debug4
+
+        DREG    R0, "Unlink drive ",cc
+        DLINE   " from disc",cc
+ ]
+        Push    "R1-R2,LR"
+        DrvRecPtr  R1,R0
+        LDRB    R2, [R1,#DrvsDisc]
+        BIC     R2, R2,#Uncertain
+        DiscRecPtr  LR,R2
+
+; Entry: R2 Disc/Drive attached to Drive/Disc being unlinked
+;        R1-R2,LR pushed
+;        R1 DrvRecPtr
+;        LR DiscRecPtr
+UnlinkCommon
+ [ Debug4
+        DREG    R2
+ ]
+        CMPS    R2,#8
+        Pull    "R1-R2,PC",HS
+  [ Debug4
+        DREG    R1,"DrvRec:",cc
+        MOV     R2, LR
+        DREG    R2," DiscRec:"
+  ]
+        Push    "R0"
+
+        ; Unlink the disc
+        LDRB    R0, [R1, #DrvsDisc]     ;Pick up DrvsDisc to possibly dismount it later
+        BIC     R0, R0,#Uncertain       ; Disc may be uncertain
+        MOV     R2, #Uncertain :OR: Unknown
+        STRB    R2, [R1, #DrvsDisc]     ;drive contents unknown and uncertain
+        MOV     R2, #8
+        STRB    R2, [LR, #DiscsDrv]     ;disc in unknown drive
+
+ [ DebugL
+        DLINE   "************** Setting DiscsDrv to 8 in UnlinkCommon *************"
+ ]
+
+        ; If unlinked a Data disc, then dismount it (and ignore any error back)
+        LDR     R2, [LR, #DiscRecord_DiscType]
+        LDR     LR, =FileType_Data
+        TEQ     LR, R2
+        MOVEQ   R1, R0
+        BLEQ    DismountDisc
+
+        CLRV
+        Pull    "R0-R2,PC"
+
+
+; ============
+; UnlinkByDisc
+; ============
+
+; breaks link between drive & disc
+
+; entry: R0 = disc
+
+UnlinkByDisc
+ [ Debug4
+
+        DREG    R0, "Unlink disc ",cc
+        DLINE   " from drive",cc
+ ]
+        Push    "R1-R2,LR"
+        DiscRecPtr  LR,R0
+        LDRB    R2,[LR,#DiscsDrv]
+        DrvRecPtr  R1,R2
+        B       UnlinkCommon
+
+; =========
+; LockDrive
+; =========
+
+; entry: R1 = drive
+;
+; Exit: V, R0=error possible
+
+LockDrive ROUT
+        Push    "R0,LR"
+
+        ; Filter out non-poll-change winnies
+        TST     R1, #bit2
+        ASSERT  :INDEX: FS_Flags :MOD: 4 = 0
+        LDREQ   lr, FS_Flags
+        TSTEQ   lr, #CreateFlag_FixedDiscPollChangeSupport
+        BEQ     %F50
+
+        ; Count up the drive lock count
+        DrvRecPtr R0, R1
+        LDRB    LR, [R0, #LockCount]
+        TEQ     LR, #0
+        ADD     LR, LR, #1
+        STRB    LR, [R0, #LockCount]
+        BNE     %F50
+
+        MOV     R0, #MiscOp_LockDrive
+        BL      Parent_Misc
+
+50
+        STRVS   R0, [SP]
+        Pull    "R0,PC"
+
+; ===========
+; UnlockDrive
+; ===========
+
+; entry: R1 = drive
+;
+; Exit: V, R0=error possible
+
+UnlockDrive ROUT
+        Push    "R0,LR"
+
+        ; Filter out non-poll-change winnies
+        TST     R1, #bit2
+        ASSERT  :INDEX: FS_Flags :MOD: 4 = 0
+        LDREQ   lr, FS_Flags
+        TSTEQ   lr, #CreateFlag_FixedDiscPollChangeSupport
+        BEQ     %F50
+
+        ; Count down the drive lock count
+
+        DrvRecPtr R0, R1
+        LDRB    LR, [R0, #LockCount]
+        SUB     LR, LR, #1
+        TEQ     LR, #0
+        STRB    LR, [R0, #LockCount]
+        BNE     %F50
+
+        MOV     R0, #MiscOp_UnlockDrive
+        BL      Parent_Misc
+
+50
+        STRVS   R0, [SP]
+        Pull    "R0,PC"
+
+; ==================
+; DiscMustBeFileCore
+; ==================
+
+; entry: R3 = top 3 bits disc num
+
+; exit: VC or VS and R0=error
+
+DiscMustBeFileCore ROUT
+        Push    "lr"
+        BL      DiscAddToRec    ;(R3->LR)
+        LDRB    lr, [lr, #DiscFlags]
+        TST     lr, #DiscNotFileCore
+        MOVNE   r0, #DiscNotFileCoreErr
+        BLNE    SetV
+        BLEQ    ClearV
+        Pull    "pc"
+
+; ==========
+; CheckFsMap
+; ==========
+
+; Check consistency of free space map
+
+; entry: R3->disc rec, R4->drv rec
+; exit:  IF error V set, R0 result
+
+CheckFsMap ROUT
+
+ [ Debug5
+        mess    ,"Checking FS map ",NL
+ ]
+        Push    "R1-R3,R7-R11,LR"
+ [ DynamicMaps
+        LDR     R0, [R4,#DrvsFsMapAddr]
+ |
+        LDR     R0, [R4,#DrvsFsMap]
+        BIC     R0, R0, #HiFsBits
+ ]
+        MOV     R9, R0
+        MOV     R1, #SzOldFs / 2
+        BL      CheckSum        ;(R0,R1->R2,Z)
+        ADDEQ   R0, R0, R1
+        BLEQ    CheckSum
+        BNE     %FT95
+                        ;now check space entries are reasonable
+        MOV     R10, R9         ;R9-R11 as InitReadOldFs
+        LDRB    R11, [R9,#FreeEnd]
+
+        MOV     R3, #0          ;pretend disc 0 to get disc bits clear
+        MOV     R0, #0          ;init end of previous space
+10
+        BL      NextOldFs       ;(R3,R10,R11->R7,R8,R10,R11,Z)
+        BEQ     %FT95           ;all spaces checked
+        ORR     LR, R7, R8
+        CMPS    LR, #DiscBits   ;bad if these bits set
+        CMPLOS  R0, R8          ;or end of prev space >= start of this space
+        ADDLO   R0, R8, R7
+        BLO     %BT10
+        MOVS    SP, SP          ;set NE if bad
+95
+
+;Z=1 <=> good map
+ [ DynamicMaps
+        LDRNE   R2, [R4,#DrvsFsMapFlags]
+        ORRNE   R2, R2, #BadFs
+        STRNE   R2, [R4,#DrvsFsMapFlags]
+ |
+        LDRNE   R2, [R4,#DrvsFsMap]
+        ORRNE   R2, R2, #BadFs
+        STRNE   R2, [R4,#DrvsFsMap]
+ ]
+ [ Debug5
+        mess    NE,"BAD MAP",NL
+ ]
+
+        MOVEQ   R0, #0
+        MOVNE   R0, #BadFsMapErr
+        BL      SetVOnR0
+        Pull    "R1-R3,R7-R11,PC"
+
+
+; ========
+; CheckSum
+; ========
+
+; Check consistency of block under checksum, last byte of block is check byte
+
+; entry: R0=start, R1=block length
+; exit:  R0,R1 preserved, R2=checksum, V=0 <=> good
+
+CheckSum ROUT
+
+ [ Debug9
+        DLINE    ,"start    length - entering checksum";,NL
+        DREG   R0," ",cc
+        DREG   R1," ",cc
+ ]
+
+        Push    "R1,R3,LR"
+        ADDS    LR, R0, R1      ;->end+1      C=0
+        SUB     R1, LR, #1      ;->check byte
+        MOV     R2, #0
+        B        %FT20
+10
+        LDRB    R3, [R1,#-1] !  ;get next byte
+        ADC     R2, R2, R3      ;add into checksum
+        MOVS    R2, R2, LSL #24 ;bit 8 = carry
+        MOV     R2, R2, LSR #24
+20
+        TEQS    R0, R1
+        BNE     %BT10           ;loop until done
+        LDRB    R3, [LR,#-1]
+
+        CMPS    R2, R3          ;check sum = old check byte ?
+        BLNE    SetV
+ [ Debug9
+        DREG    R2,"Checksum="
+        BVC     %FT21
+        DLINE   "Bad sum"
+21
+ ]
+        Pull    "R1,R3,PC"
+
+        LTORG
+        END

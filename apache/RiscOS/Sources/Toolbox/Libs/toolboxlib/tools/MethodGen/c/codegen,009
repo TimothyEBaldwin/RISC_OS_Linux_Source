@@ -1,0 +1,1382 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Name  :  codegen.c
+ * Desc  :  handles code generation
+ * Author:  James Bye
+ * Date  :  23-Jun-1994
+ */
+ 
+/*-- from CLib --*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "kernel.h"
+
+/*-- from RISC_OSLib --*/
+
+#include "wimp.h"        /*  access to WIMP SWIs                      */
+#include "wimpt.h"       /*  wimp task facilities                     */
+#include "win.h"         /*  registering window handlers              */
+#include "event.h"       /*  poll loops, etc                          */
+#include "baricon.h"     /*  putting icon on icon bar                 */
+#include "sprite.h"      /*  sprite operations                        */
+#include "werr.h"        /*  error reporting                          */
+#include "res.h"         /*  access to resources                      */
+#include "resspr.h"      /*  sprite resources                         */
+#include "flex.h"        /*  dynamic mem alloc from WIMP              */
+#include "template.h"    /*  reading in template file                 */
+#include "bbc.h"         /*  olde-style graphics routines             */
+#include "colourtran.h"  /*  interface to colour translation module   */
+#include "os.h"          /*  low-level RISCOS access                  */
+#include "dbox.h"        /*  dialogue box handling                    */
+#include "saveas.h"      /*  data export from dbox by icon dragging   */
+#include "visdelay.h"    /*  show the hourglass for delay             */
+#include "print.h"       /*  printing bits                            */
+#include "fileicon.h"
+
+#define TRACE 0
+#include "trace.h"
+
+
+#ifndef BOOL
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+#endif
+
+/*-- from my headers --*/
+
+#include "newclass.h"
+#include "file.h"
+#include "datafile.h"
+#include "addmethod.h"
+
+
+/*****************************************************
+ * Icon definitions                                  *
+ *****************************************************/
+ 
+#define i_Prototype_Icon      1
+#define i_Prototype_Filename  4
+#define i_Prototype_Ok        0
+#define i_Prototype_Comments  3
+#define i_Prototype_CHeader   2
+
+#define i_Generate_Comment    0
+#define i_Generate_Slider     3
+
+#define i_Pause_Discard       1
+#define i_Pause_Continue      2
+
+
+#define WRITEB_SIZE 2048
+
+/*****************************************************
+ * Static variables                                  *
+ *****************************************************/
+
+static BOOL c_header_wrappings = FALSE;
+static BOOL partial_comments   = FALSE; 
+static char filename[255];
+static char writeb[WRITEB_SIZE];
+static wimp_w generate;
+static int slider_inc;
+static wimp_icon slider;
+static NewClassMethods *current_method;
+static int current_method_number = 0;
+static wimp_i current_slider;
+static BOOL done = FALSE;
+static BOOL codegen_open = FALSE;
+static BOOL pause = FALSE;
+static BOOL assembler_veneers = FALSE;
+
+
+static _kernel_oserror no_mem      = {0,"Not enough memory to load file"};
+
+ 
+/*****************************************************
+ * Static functions                                  *
+ *****************************************************/
+
+/*
+ * fills a buffer with specified characters
+ */
+ 
+static void my_memset ( char *p, char c, int n )
+{
+int x = 0;
+
+  while(x++ <= n)
+    *p++ = c;
+  *p = '\0';
+}
+
+
+
+/*
+ * writes a specified number of carriage returns
+ * to a file (max of ten)
+ */
+ 
+static _kernel_oserror *write_cr ( int fh, int n )
+{
+int x = 0;
+
+  while(x <= n)
+    writeb[x++] = '\n';
+    
+  return(file_writebytes(fh,writeb,0,x,-1));
+}
+
+
+
+/*
+ * loads a file and appends in to file 'fh'
+ */
+ 
+static _kernel_oserror *write_file_to_file ( int fh, char *filename )
+{
+_kernel_oserror *e = NULL;
+char *buffer = NULL;
+int bufflen;
+
+  /*-- find the size of the hdr file --*/
+  
+  if((e = file_readcat(filename,0,0,0,&bufflen,0)) != NULL)
+    goto finish;
+    
+  /*-- allocate space for file and load it --*/
+  
+  if((buffer = malloc(bufflen)) == NULL)
+  {
+    e = &no_mem;
+    goto finish;
+  }
+  
+  if((e = file_load(filename,(int)buffer)) != NULL)
+    goto finish;
+    
+  /*-- write the buffer to the file --*/
+  
+  if((e = file_writebytes(fh,buffer,0,bufflen,-1)) != NULL)
+    goto finish;
+
+
+finish:
+
+  if(buffer != NULL)
+    free(buffer);
+    
+  return(e);
+}
+
+
+/*
+ * writes header information
+ */
+ 
+static _kernel_oserror *write_header_info ( int fh, NewClassBlock *nclass )
+{
+  /*-- build the buffer to write --*/
+  
+  strcpy(writeb,"/*\n");
+  strcat(writeb," * Name        : ");
+  strcat(writeb,nclass->class_title);
+  strcat(writeb,".h\n");
+  strcat(writeb," * Description : C veneers to the Methods provided by the ");
+  strcat(writeb,nclass->class_title);
+  strcat(writeb," class\n");
+  strcat(writeb," */\n");
+  
+  /*-- and write buffer to file --*/
+  
+  return(file_writebytes(fh,writeb,0,strlen(writeb),-1));
+}
+
+
+
+/*
+ * writes the #ifdef bits for the header
+ */
+ 
+static _kernel_oserror *write_header_defs ( int fh, NewClassBlock *nclass )
+{
+  /*-- build buffer --*/
+  
+  sprintf(writeb,"#ifndef __%s_h\n#define __%s_h\n",nclass->class_title,
+              nclass->class_title);
+        
+  /*-- and write the buffer --*/
+        
+  return(file_writebytes(fh,writeb,0,strlen(writeb),-1));
+}
+
+
+/*
+ * write #include bits for the header
+ */
+ 
+static _kernel_oserror *write_header_includes ( int fh, NewClassBlock *nclass )
+{
+_kernel_oserror *e = NULL;
+char temp[20];
+int len,x,i;
+
+  /*-- write include for the kernel --*/
+  
+  sprintf(writeb,"#ifndef __kernel_h\n#include \"kernel.h\"\n#endif\n\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+
+  /*-- write include for the toolbox --*/
+  
+  sprintf(writeb,"#ifndef __toolbox_h\n#include \"toolbox.h\"\n#endif\n\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+  /*-- write other includes --*/
+  
+  len = strlen(nclass->needs);
+  x = 0;
+  
+  while(x <= len)
+  {
+    tracef2("x = %d len = %d\n",x,len);
+    i = 0;   
+    while(nclass->needs[x] != ',' && nclass->needs[x] != '\0')
+    {
+      temp[i++] = nclass->needs[x++];
+    }
+    temp[i] = '\0';
+    
+    tracef1("Found '%s'\n",temp);
+    
+    if(strcmp(temp,nclass->class_title) != 0)
+    {
+      tracef1("Writing '%s'\n",temp);
+      sprintf(writeb,"#ifndef __%s_h\n#include \"%s.h\"\n#endif\n\n",temp,temp);
+      if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+        goto finish;
+    }    
+    x++;
+  }
+    
+  
+finish:
+
+  return(e);
+}
+
+
+/*
+ * does the actual writing of the parameters
+ */
+ 
+static _kernel_oserror *do_write_parms ( int fh, int move, AddMethodRegister *r, BOOL comment, 
+                                         BOOL first )
+{
+_kernel_oserror *e = NULL;
+
+  if(!comment)
+  {
+    my_memset(writeb,' ',move);
+    strcat(writeb,r->var_type);
+    if(r->ptr)
+      strcat(writeb," *");
+    else
+      strcat(writeb," ");
+    strcat(writeb,r->var_name);
+    strcat(writeb,",\n");
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+  }
+  else
+  {
+    if(!first)
+      sprintf(writeb," *               %s ",r->var_type);
+    else
+      sprintf(writeb,"%s ",r->var_type);
+    if(r->ptr)
+      strcat(writeb,"*");
+    strcat(writeb,r->var_name);
+    strcat(writeb,"\n");
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+  }
+  
+finish:
+
+  return(e);
+}
+    
+  
+
+
+/*
+ * writes parameters for a prototype
+ */
+ 
+#define SetFirst if(!output) \
+                 { \
+                   first = FALSE; \
+                 } \
+                 else \
+                 { \
+                   if(count++ == 0) \
+                     first = TRUE; \
+                   else \
+                     first = FALSE; \
+                 }
+                                                         
+static _kernel_oserror *write_prototype_parms ( int fh, int move, AddMethodRegisterSet *reg, 
+                                                BOOL comment, BOOL output )
+{
+_kernel_oserror *e = NULL;
+int count = 0;
+BOOL first = TRUE;
+
+  /*-- write the registers depending on the register mask --*/
+  
+  if(reg->regs_set & RegisterSet_r0)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r0,comment,first)) != NULL)
+      goto finish;
+  }
+  
+  if(reg->regs_set & RegisterSet_r1)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r1,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r2)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r2,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r3)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r3,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r4)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r4,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r5)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r5,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r6)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r6,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r7)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r7,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r8)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r8,comment,first)) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r9)
+  {
+    SetFirst;
+    if((e = do_write_parms(fh,move,&reg->r9,comment,first)) != NULL)
+      goto finish;
+  }  
+
+  if(output && !count)
+  {
+    strcpy(writeb,"None\n");
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+  }
+
+finish:
+
+  return(e);
+}
+
+
+
+/*
+ * does the writing of a comment block for a function
+ */
+ 
+static _kernel_oserror *write_comment ( int fh, char *func_name, AddMethodBlock *method,
+                                         char *title )
+{
+_kernel_oserror *e = NULL;
+
+  /*-- write the comment start --*/
+  
+  sprintf(writeb,"/*\n * Name        : %s\n * Description : %s \n * In          : ",
+                      func_name,method->description);
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+  /*-- write the arguments for the comment --*/
+
+  sprintf(writeb,"unsigned int flags\n *               ObjectId %s\n",title);
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+  
+  if((e = write_prototype_parms(fh,0,&method->input,TRUE,FALSE)) != NULL)
+    goto finish;    
+    
+  sprintf(writeb," * Out         : ");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+  if((e = write_prototype_parms(fh,0,&method->output,TRUE,TRUE)) != NULL)
+    goto finish;
+    
+  /*-- and finish of the comment --*/
+
+  strcpy(writeb," * Returns     : pointer to error block\n */\n\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+
+
+finish:
+
+  return(e);
+}
+
+
+
+
+/*
+ * writes a prototype function
+ */
+ 
+static _kernel_oserror *write_prototype ( int fh, AddMethodBlock *method, BOOL proto, char *title, 
+                                             char *objname)
+{
+_kernel_oserror *e = NULL;
+int len;
+char func_name[100];
+int x = 0;
+int i = 0;
+int seqptr;
+BOOL found_underscore = FALSE;
+
+  /*-- build function name --*/
+  
+  len = strlen(method->method_name);  
+  while(x <= len)
+  {
+    if(method->method_name[x] == '_')
+      found_underscore = TRUE;
+      
+    if(found_underscore)
+    {
+      if(isupper(method->method_name[x]) && x > 0 && method->method_name[x-1] != '_')
+        func_name[i++] = '_';
+    }
+    func_name[i++] = tolower(method->method_name[x++]);
+  }  
+  func_name[i] = '\0';  
+  tracef1("Function name is '%s'\n",func_name);  
+  
+  /*-- write comment if that is set --*/
+  
+  if(partial_comments)
+  {
+    if((e = write_comment(fh,func_name,method,objname)) != NULL)
+      goto finish;
+  }
+  
+  /*-- build and write start of prototype --*/
+  
+  sprintf(writeb,"extern _kernel_oserror *%s ( ",func_name);
+  len = strlen(writeb);
+  if((e = file_writebytes(fh,writeb,0,len,-1)) != NULL)
+    goto finish;
+    
+  /*-- write the start of the prototype --*/
+  
+  sprintf(writeb,"unsigned int flags,\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+  len--;
+  my_memset(writeb,' ',len);
+  strcat(writeb,"ObjectId ");
+  strcat(writeb,objname);
+  strcat(writeb,",\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+  /*-- and write the functions parameters --*/
+  
+  if((e = write_prototype_parms(fh,len,&method->input,FALSE,FALSE)) != NULL)
+    goto finish;
+    
+  if((e = write_prototype_parms(fh,len,&method->output,FALSE,FALSE)) != NULL)
+    goto finish;
+    
+  /*-- frig sequential file pointer to take out last comma --*/
+  
+  file_read_seqptr(fh,&seqptr);
+  file_write_seqptr(fh,seqptr-2);
+  if((e = file_writeabyte(fh,'\n')) != NULL)
+    goto finish;
+    
+  /*-- and complete the function --*/
+ 
+  my_memset(writeb,' ',len-2);
+  if(proto)
+    strcat(writeb,");\n\n\n");
+  else
+    strcat(writeb,")\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+
+finish:
+
+  return(e);
+}
+
+
+
+/*
+ * does the saving of the prototypes
+ */
+ 
+static BOOL save_prototypes ( char *filename, void *handle )
+{
+NewClassBlock *nclass = (NewClassBlock *) handle;
+_kernel_oserror *e = NULL;
+int fh = 0;
+NewClassMethods *mblock = nclass->methods;
+
+  /*-- open the file --*/
+  
+  if((e = file_open(filename,&fh,OPEN_NEW_READ_WRITE)) != NULL)
+    goto finish;
+    
+  /*-- write header start if we need to --*/
+  
+  if(c_header_wrappings)
+  {  
+    /*-- write copyright sign --*/
+    
+    if((e = write_file_to_file(fh,"MethodGen:Resources.hdr")) != NULL)
+      goto finish;      
+    if((e = write_cr(fh,2)) != NULL)
+      goto finish;
+      
+    /*-- write header information --*/
+     
+    if((e = write_header_info(fh,nclass)) != NULL)
+      goto finish;      
+    if((e = write_cr(fh,2)) != NULL)
+      goto finish;      
+      
+   /*-- write #ifdef bits --*/
+   
+   if((e = write_header_defs(fh,nclass)) != NULL)
+     goto finish;
+   if((e = write_cr(fh,1)) != NULL)
+     goto finish;      
+     
+     
+   /*-- write #include bits --*/
+   
+   if((e = write_header_includes(fh,nclass)) != NULL)
+     goto finish;
+  }
+  
+  /*-- write functions starting banner --*/
+  
+  if((e = write_file_to_file(fh,"MethodGen:Resources.funcbanner")) != NULL)
+    goto finish;
+  
+  /*-- write c++ def bits --*/
+  
+  strcpy(writeb,"#ifdef __cplusplus\n  extern \"C\" {\n#endif\n\n\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+     
+  /*-- and write the prototypes --*/
+  
+  while(mblock != NULL)
+  {
+    if((e = write_prototype(fh,mblock->method,TRUE,nclass->class_title,
+                                                    nclass->object_name)) != NULL)
+      goto finish;
+    mblock = mblock->next;
+  }
+  
+  /*-- write final def bits --*/
+  
+  strcpy(writeb,"#ifdef __cplusplus\n  }\n#endif\n\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;  
+    
+  if(c_header_wrappings)
+  {
+    strcpy(writeb,"\n#endif\n");
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+  }
+   
+  /*-- and close the file --*/
+  
+  if((e = file_close(fh)) != NULL)
+    goto finish;
+    
+  if((e = file_writecat18(filename,0xFFF)) != NULL)
+    goto finish;
+
+finish:
+
+  if(e != NULL)
+  {
+    if(fh != 0)
+      file_close(fh);
+    werr(0,"Error: %s",e->errmess);
+    return(FALSE);
+  }
+  
+  return(TRUE);
+}
+  
+
+
+/*
+ * event handler for save proto dbox
+ */
+ 
+static BOOL save_proto_events ( dbox d, void *event, void *handle )
+{
+wimp_eventstr *e = (wimp_eventstr *) event;
+
+  switch(e->e)
+  {
+    case wimp_EBUT : 
+    
+      if(e->data.but.m.bbits == wimp_BDRAGLEFT)
+      {
+        dbox_getfield(d,i_Prototype_Filename,filename,255);
+        c_header_wrappings = dbox_getnumeric(d,i_Prototype_Comments);
+        partial_comments = dbox_getnumeric(d,i_Prototype_CHeader);
+        xfersend(0xFFF,filename,1024,save_prototypes,NULL,NULL,e,handle);
+        return(TRUE);
+      }
+  }
+  
+  return(FALSE);
+}
+
+
+/*
+ * sets the slider on the generate window
+ */
+ 
+static void set_slider ( void )
+{
+int add_to;
+wimp_icreate ic;
+
+  /*-- delete the slider icon --*/
+  
+  wimp_delete_icon(generate,current_slider);
+
+  /*-- calculate the increment on the icons bbox --*/
+  
+  add_to = slider_inc * current_method_number;
+  
+  /*-- create the icon --*/
+  
+  ic.w = generate;
+  ic.i = slider;
+  
+  /*-- alter icons bbox according to current method --*/
+  
+  ic.i.box.x1 = ic.i.box.x0 + add_to;
+  
+  /*-- and create the icon --*/
+  
+  wimpt_complain(wimp_create_icon(&ic,&current_slider));
+  wimp_set_icon_state(generate,current_slider,0,0);
+}
+
+
+
+/*
+ * creates a directory structure
+ * (all elements of path will form part of the directory)
+ */
+ 
+static _kernel_oserror *create_dir_struct ( char *path )
+{
+_kernel_oserror *e = NULL;
+char dir[255];
+int i,x;
+int len = strlen(path);
+
+  i = x = 0;
+  
+  /*-- loop, extracting path elements at a time and create dirs --*/
+  
+  while(x < 255 && i <= len)
+  {
+    while(path[i] != '.' && path[i] != '\0')
+      dir[x++] = path[i++];
+    dir[x] = '\0';
+    tracef1("Creating dir '%s'\n",dir);
+    
+    /*-- create the directory --*/
+    
+    if((e = file_createdir(dir,0)) != NULL)
+      goto finish;
+    i++;
+    dir[x++] = '.';
+  }      
+  
+  /*-- write the 'source' directory --*/
+  
+  if(!assembler_veneers)
+    dir[x++] = 'c';
+  else
+    dir[x++] = 's';
+  dir[x] = '\0';
+  tracef1("Writing dir '%s'\n",dir);
+  
+  if((e = file_createdir(dir,0)) != NULL)
+    goto finish;
+    
+  /*-- write the 'o' directory --*/
+  
+  dir[strlen(dir)-1] = 'o';
+  tracef1("Writing dir '%s'\n",dir);
+  
+  if((e = file_createdir(dir,0)) != NULL)
+    goto finish;
+    
+
+finish:
+
+  return(e);
+}
+
+
+/*
+ * writes a title for a source file
+ */
+ 
+static _kernel_oserror *write_source_title ( int fh, AddMethodBlock *method )
+{
+_kernel_oserror *e = NULL;
+
+  if(!assembler_veneers)
+    sprintf(writeb,"/*\n * Name        : %s.c\n * Purpose     : Veneer for method %s\n * Description : %s\n */\n\n\n",method->source_file,method->method_name,method->description);
+  else
+    sprintf(writeb,";\n; Name        : %s.c\n; Purpose     : Veneer for method %s\n; Description : %s\n;\n\n\n",method->source_file,method->method_name,method->description);
+  
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+
+
+finish:
+
+  return(e);
+}
+
+
+
+/*
+ * write #include bits for the source
+ */
+ 
+static _kernel_oserror *write_source_includes ( int fh, NewClassBlock *nclass )
+{
+_kernel_oserror *e = NULL;
+char temp[20];
+int len,x,i;
+
+  /*-- write include for the kernel --*/
+  
+  sprintf(writeb,"#include \"kernel.h\"\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+
+  /*-- write include for the toolbox --*/
+  
+  sprintf(writeb,"#include \"toolbox.h\"\n");
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+    
+  /*-- write other includes --*/
+  
+  len = strlen(nclass->needs);
+  x = 0;
+  
+  while(x <= len)
+  {
+    tracef2("x = %d len = %d\n",x,len);
+    i = 0;   
+    while(nclass->needs[x] != ',' && nclass->needs[x] != '\0')
+    {
+      temp[i++] = nclass->needs[x++];
+    }
+    temp[i] = '\0';
+    
+    tracef1("Found '%s'\n",temp);
+    
+    tracef1("Writing '%s'\n",temp);
+    sprintf(writeb,"#include \"%s.h\"\n",temp);
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+    x++;
+  }
+    
+  
+finish:
+
+  return(e);
+}
+
+
+
+/*
+ * does the writing of a register assignment
+ */
+ 
+static _kernel_oserror *do_write_reg ( int fh, AddMethodRegister *reg, BOOL output, char r )
+{
+  /*-- build string depending on output flag --*/
+  
+  if(!output)
+    sprintf(writeb,"  r.r[%c] = (int) %s;\n",r,reg->var_name);
+  else
+    sprintf(writeb,"    if(%s != NULL) *%s = (%s) r.r[%c];\n",reg->var_name,reg->var_name,
+                          reg->var_type,r);
+    
+  return(file_writebytes(fh,writeb,0,strlen(writeb),-1));
+}
+    
+
+
+
+/*
+ * writes input register assignments
+ */
+ 
+static _kernel_oserror *write_source_registers ( int fh, AddMethodRegisterSet *reg, BOOL output )
+{
+_kernel_oserror *e = NULL;
+
+  /*-- write the registers depending on the register mask --*/
+  
+  if(reg->regs_set & RegisterSet_r0)
+  {
+    if((e = do_write_reg(fh,&reg->r0,output,'0')) != NULL)
+      goto finish;
+  }
+  
+  if(reg->regs_set & RegisterSet_r1)
+  {
+    if((e = do_write_reg(fh,&reg->r1,output,'1')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r2)
+  {
+    if((e = do_write_reg(fh,&reg->r2,output,'2')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r3)
+  {
+    if((e = do_write_reg(fh,&reg->r3,output,'3')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r4)
+  {
+    if((e = do_write_reg(fh,&reg->r4,output,'4')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r5)
+  {
+    if((e = do_write_reg(fh,&reg->r5,output,'5')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r6)
+  {
+    if((e = do_write_reg(fh,&reg->r6,output,'6')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r7)
+  {
+    if((e = do_write_reg(fh,&reg->r7,output,'7')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r8)
+  {
+    if((e = do_write_reg(fh,&reg->r8,output,'8')) != NULL)
+      goto finish;
+  }
+
+  if(reg->regs_set & RegisterSet_r9)
+  {
+    if((e = do_write_reg(fh,&reg->r9,output,'9')) != NULL)
+      goto finish;
+  }  
+
+
+finish:
+
+  return(e);
+}
+
+
+
+
+/*
+ * does the generation of a source file
+ */
+
+static _kernel_oserror *do_source_generation ( NewClassBlock *nclass )
+{
+_kernel_oserror *e = NULL;
+AddMethodBlock *method = current_method->method;
+int fh = 0;
+char path[255];
+
+  /*-- build the source path --*/
+  
+  if(!assembler_veneers)
+    sprintf(path,"%s.c.%s",nclass->source_path,method->source_file);
+  else
+    sprintf(path,"%s.s.%s",nclass->source_path,method->source_file);
+  tracef1("Source path is '%s'\n",path);
+  
+  /*-- create directory structure --*/
+  
+  if((e = create_dir_struct(nclass->source_path)) != NULL)
+    goto finish;
+    
+  /*-- open source file --*/
+  
+  if((e = file_open(path,&fh,OPEN_NEW_READ_WRITE)) != NULL)
+    goto finish;
+    
+  /*-- write the source file header --*/
+  
+  if(!assembler_veneers)
+  {
+    if((e = write_file_to_file(fh,"MethodGen:Resources.srchdr")) != NULL)
+      goto finish;
+  }
+  else
+  {
+    if((e = write_file_to_file(fh,"MethodGen:Resources.asmhdr")) != NULL)
+      goto finish;
+  } 
+    
+  /*-- write the source files title --*/
+  
+  if((e = write_source_title(fh,method)) != NULL)
+    goto finish;
+    
+  if(!assembler_veneers)
+  {
+    /*-- write source includes --*/
+  
+    if((e = write_source_includes(fh,nclass)) != NULL)
+      goto finish;
+    if((e = write_cr(fh,3)) != NULL)
+      goto finish;
+    
+    /*-- and write the function itself --*/
+  
+    if((e = write_prototype(fh,method,FALSE,nclass->class_title,nclass->object_name)) != NULL)
+      goto finish;
+    
+    strcpy(writeb,"{\n_kernel_swi_regs r;\n");
+    if(method->output.regs_set != 0)
+      strcat(writeb,"_kernel_oserror *e;\n\n");
+    else
+      strcat(writeb,"\n");
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+        
+    /*-- write the input registers --*/
+  
+    sprintf(writeb,"  r.r[0] = flags;\n  r.r[1] = (int) %s;\n  r.r[2] = %s;\n",
+                nclass->object_name,method->method_name);
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;  
+  
+    if((e = write_source_registers(fh,&method->input,FALSE)) != NULL)
+      goto finish;
+    
+    /*-- write function call and output registers --*/
+   
+    if(method->output.regs_set == 0)
+    {
+      strcpy(writeb,"  return(_kernel_swi(Toolbox_ObjectMiscOp,&r,&r));\n}\n\n");
+      if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+        goto finish;
+    }
+    else
+    {
+      strcpy(writeb,"  if((e = _kernel_swi(Toolbox_ObjectMiscOp,&r,&r)) == NULL)\n  {\n");
+      if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+        goto finish;
+      if((e = write_source_registers(fh,&method->output,TRUE)) != NULL)
+        goto finish;      
+      strcpy(writeb,"  }\n\n  return(e);\n}\n\n");
+      if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+        goto finish;
+    }
+  }
+  else
+  {
+#if (0)
+  int len;
+  char func_name[100];
+  int x = 0;
+  int i = 0;
+
+    /*-- build routine name --*/
+  
+    len = strlen(method->method_name);  
+    while(x <= len)
+    {
+      if(isupper(method->method_name[x]) && x > 0 && method->method_name[x-1] != '_')
+        func_name[i++] = '_';
+      func_name[i++] = tolower(method->method_name[x++]);
+    }  
+    func_name[i] = '\0';  
+    tracef1("Function name is '%s'\n",func_name);
+    
+    /*-- write exporty bits --*/
+    
+    sprintf(writeb,"\n\tEXPORT\t%s\n\n\tAREA |Method$$Code|,CODE,READONLY\n\n%s\n\n",
+             func_name,func_name);
+    if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+      goto finish;
+          
+    if((e = write_stack_push_or_pull(fh,method,TRUE)) != NULL)
+      goto finish;
+#endif
+  }
+  
+    
+finish:
+
+  if(fh != 0)
+  {
+    file_close(fh);
+    file_writecat18(path,0xFFF);
+  }
+
+  return(e);
+}  
+  
+  
+  
+/*
+ * process a null event for the generate window
+ */
+ 
+static void process_null_event ( NewClassBlock *nclass )
+{
+_kernel_oserror *e;
+char itext[100];
+
+  current_method_number++;
+
+  /*-- see if we have finished --*/
+  
+  if(current_method_number > nclass->no_methods || current_method == NULL)
+  {
+    done = TRUE;
+  }
+  else
+  {
+    /*-- set the display icon field --*/
+    
+    sprintf(itext,"Writing '%s'",current_method->method->method_name);
+    set_icon_text(generate,i_Generate_Comment,itext);
+    wimp_set_icon_state(generate,i_Generate_Comment,0,0);
+    
+    /*-- generates the current source file --*/
+    
+    if((e = do_source_generation(nclass)) != NULL)
+    {
+      werr(0,"Error: %s",e->errmess);
+      done = TRUE;
+    }
+    else
+    {    
+      /*-- increment the slider --*/
+    
+      set_slider();
+    
+      /*-- increment current method pointer --*/
+    
+      current_method = current_method->next;
+    }
+  }
+}
+
+
+/*
+ * handles the pausing of codegenerating (returns TRUE if stop)
+ */
+
+static BOOL handle_pause ( void )
+{
+dbox d = dbox_new("genpause");
+int i;
+
+  dbox_show(d);
+  i = dbox_fillin(d);
+  dbox_dispose(&d);
+  
+  if(i == i_Pause_Discard)
+    return(TRUE);
+    
+  return(FALSE);
+}
+  
+
+  
+
+
+/*
+ * event handler for the generate window
+ */
+ 
+static void generate_events ( wimp_eventstr *e, void *handle )
+{
+NewClassBlock *nclass = (NewClassBlock *) handle;
+
+  switch(e->e)
+  {
+    case wimp_ENULL  : if(done)
+                       {
+                         /*-- tidy up because we have finished --*/
+                         
+                         win_claim_idle_events((wimp_w)-1);
+                         wimpt_complain(wimp_close_wind(generate));
+                         wimpt_complain(wimp_delete_wind(generate));                         
+                         codegen_open = FALSE;
+                       }
+                       else
+                       {
+                         if(!pause)
+                           process_null_event(nclass);
+                       }
+                       break;
+    case wimp_EOPEN  : wimp_open_wind(&e->data.o);
+                       break;
+    case wimp_ECLOSE : pause = TRUE;
+                       if(handle_pause())
+                         done = TRUE;
+                       else
+                         pause = FALSE;
+                       break;
+  }
+}
+
+
+
+/*****************************************************
+ * External Functions                                *
+ *****************************************************/
+ 
+/*
+ * Name   : codegen_generate_source
+ * Desc   : generates source for a class
+ * Parms  : NewClassBlock *nclass - pointer to class
+ * Returns: True or False on result
+ */
+ 
+extern BOOL codegen_generate_source ( NewClassBlock *nclass )
+{
+template *t;
+wimp_wstate state;
+int width;
+char title[100];
+
+  if(assembler_veneers)
+  {
+    werr(0,"Assembler veneer generation is not currently supported");
+    return(FALSE);
+  }
+
+  if(!codegen_open)
+  {
+    /*-- init static variables --*/
+  
+    slider_inc = 0;
+    current_method = NULL;
+    current_method_number = 0;
+    done = FALSE;
+    partial_comments = TRUE;
+
+    /*-- create window and attach event handler --*/
+  
+    t = template_find("generate");
+    wimpt_complain(wimp_create_wind(&t->window,&generate));
+    wimpt_complain(wimp_get_wind_state(generate,&state));
+    wimpt_complain(wimp_open_wind(&state.o));
+    codegen_open = TRUE;
+    sprintf(title,"Generating source [%s]",nclass->class_title);
+    win_settitle(generate,title);
+    win_register_event_handler(generate,generate_events,nclass);
+  
+    /*-- calculate slider increase --*/
+  
+    wimpt_complain(wimp_get_icon_info(generate,i_Generate_Slider,&slider));
+    current_slider = i_Generate_Slider;
+    width = slider.box.x1 - slider.box.x0;
+    slider_inc = width / nclass->no_methods;
+    tracef1("Slider inc = %d\n",slider_inc);
+  
+    /*-- setup our current method --*/
+  
+    current_method = nclass->methods;
+    done = FALSE;
+    pause = FALSE;
+  
+    /*-- cause NULL events to be delivered to our window --*/
+  
+    win_claim_idle_events(generate);
+  
+    /*-- setup slider for current method --*/
+  
+    set_slider();
+  }
+  else
+    werr(0,"Already generating");
+  
+  return(TRUE);
+}
+
+
+  
+ 
+/*
+ * Name   : codegen_generate_prototypes
+ * Desc   : generates prototypes for a class
+ * Parms  : NewClassBlock  *nclass
+ * Returns: True or False on result
+ */
+
+extern BOOL codegen_generate_prototypes ( NewClassBlock *nclass )
+{
+dbox d;
+int i;
+BOOL dot;
+
+  if((d = dbox_new("saveproto")) == NULL)
+  {
+    werr(0,"Not enough memory for dbox");
+    return(FALSE);
+  }
+  
+  dbox_show(d);
+  xfersend_close_on_xfer(TRUE,dbox_syshandle(d));
+  fileicon((wimp_w) dbox_syshandle(d),i_Prototype_Icon,0xFFF);
+  
+  dbox_raw_eventhandler(d,save_proto_events,nclass);
+  strcpy(filename,nclass->class_title);
+  dbox_setfield(d,i_Prototype_Filename,filename);
+  
+  while(dbox_fillin(d) == i_Prototype_Ok)
+  {
+    dbox_getfield(d,i_Prototype_Filename,filename,255);
+    c_header_wrappings = dbox_getnumeric(d,i_Prototype_Comments);
+    partial_comments = dbox_getnumeric(d,i_Prototype_CHeader);    
+    i = 0;
+    dot = FALSE;
+    
+    while((!dot) && filename[i] != '\0')
+      dot = filename[i++] == '.';
+      
+    if(!dot)
+    {
+      werr(0,"To save, drag the icon to a directory display");
+    }
+    else
+    {
+      xfersend_set_fileissafe(TRUE);
+      if(save_prototypes(filename,nclass) == TRUE && !dbox_persist())
+        break;
+    }
+  }
+  
+  xfersend_close_on_xfer(FALSE,0);
+  xfersend_clear_unknowns();
+  dbox_hide(d);
+  dbox_dispose(&d);
+  
+  return(TRUE);
+}
+
+
+/*
+ * Name    : codegen_set_veneer_type
+ * Desc    : sets the type of veneers that codegen generates
+ * Parms   : BOOL asm
+ * Returns : none
+ */
+ 
+extern void codegen_set_veneer_type ( BOOL asm )
+{
+  assembler_veneers = asm;
+}
+    
+
+/*-- end --*/
+

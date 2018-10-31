@@ -1,0 +1,1693 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > $.Source.PMF.Key
+
+; ARTHUR keyboard code
+
+; Authors       Tim Dobson, Jon Thackray
+; Started       13-Oct-86
+
+; ************************************************************
+; ***    C h a n g e   L i s t  (better late than never!)  ***
+; ************************************************************
+
+; Date      Who Description
+; ----      --- -----------
+; 17-Feb-88     Added Sam's code to call the callback vector in RDCH/INKEY
+;                idle loop
+; 02-Mar-88     Initialise KeyVec to NewKeyStruct before the keyboard has told
+;                us its ID, so Sam can call INKEY(-ve) with no keyboard
+; 13-Apr-88     Fixed RDCH from RS423 if treating as keyboard, getting NUL+char
+;                (didn't try to reenable RTS on 2nd char)
+; 11-Jun-88     Put input redirection where it was needed really. SKS
+; 12-Aug-88     Read mouse position from buffer forces inside bounding box
+; 02-Sep-88     Buffered mouse coords stored in absolute terms, not relative to
+;                origin at time of click. Made relative after reading out and
+;                clipping to bounding box. Mouse event coords are still relative
+;                to origin at time of click.
+; 06-Feb-91     LastLED added to stop unnecessary LED transmissions
+;
+; 24-Feb-93 SMC Split off Archimedes keyboard driver into file KbdDrA1.
+;               Split off mouse stuff into file mouse.
+;               Added new interfaces for generic keyboard driver.
+; 23-Aug-93 SMC GotKbId now sets KbId but remembers the last in LastKbId.
+; 24-Aug-93 SMC Key handler can now get keyboard stuff going.
+; 18-Nov-93 SMC Fixed bug in key handler stuff (no handler => KeyVec=-1).
+; 25-Nov-93 SMC Key handler and keyboard driver now trigger each other correctly.
+; 25-Apr-94 RCM ReadCh modified for Stork's power saving scheme.
+;
+; 28-Apr-04 JWB Added magic switch to turn off kernel kbd debounce
+;               r2 on KEYV vector 0 = 'NoKd' to disable debounce
+
+
+; *****************************************************************************
+;
+;       Entry point for keyboard code - Initialisation
+;
+
+KeyInit ROUT
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        Push    R14
+
+        WritePSRc I_bit :OR: SVC_mode, R14
+
+        MOV     R0, #-1                 ; no default key handler
+        STR     R0, KeyVec
+
+        MOV     R0, #&FF                ; indicate no previous keyboard id
+        STRB    R0, LastKbId
+        STRB    R0, KbId
+
+        BL      ClearKbd
+
+        Pull    PC                      ; go back to user
+
+; *****************************************************************************
+;
+;       KeyPostInit - Called after modules have initialised
+;
+
+KeyPostInit ROUT
+        Push    R14
+        BYTEWS  WsPtr
+
+        MOV     R0, #TerritoryNum_UK    ; indicate keyboard UK
+        MOV     R1, #ISOAlphabet_Latin1 ; indicate alphabet Latin1
+        STRB    R0, Keyboard
+        STRB    R1, Alphabet
+        STRB    R1, KeyAlphabet         ; alphabet corresponding to keyboard
+
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        PHPSEI                          ; disable interrupts round this bit
+        Push    R14                     ; save I_bit indication
+        LDRB    R1, LastKbId
+        TEQ     R1, #KeyboardID_None    ; if no keyboard initialised yet then
+        LDREQB  R1, KbId                ;   try now
+        BLEQ    GotKbId
+        Pull    R14                     ; restore I_bit indication
+        PLP                             ; set I_bit from this
+
+        MOV     R0, #OsByte_Country
+        LDROSB  R1, Country
+        SWI     XOS_Byte
+        Pull    PC
+
+; *****************************************************************************
+
+ClearKbd ROUT
+        Entry   "R1-R2"
+
+        MOV     R0, #&FF
+        STR     R0, CurrKey             ; no current key
+        STR     R0, OldKey
+        STRB    R0, LastLED
+
+; Set up keyboard table
+
+        MOV     R0, #0                  ; All keys up
+        MOV     R1, #?KeysDown
+        ADR     R2, KeysDown
+10
+        SUBS    R1, R1, #4
+        STR     R0, [R2], #4
+        BNE     %BT10
+
+        EXIT
+
+; *****************************************************************************
+;
+;       UpdateLEDs - Update the LED(s) from the keyboard status byte
+;
+; in:   R11 -> keyboard workspace
+;
+; out:  R0, R1 corrupted
+;
+
+UpdateLEDs ROUT
+        LDRB    r0, KbId                ; get keyboard id
+        TEQ     r0, #&FF                ; if not found yet
+        MOVEQ   pc, lr                  ; then exit
+
+        LDROSB  r0, KeyBdStatus         ; Build current LED state byte.
+        TST     r0, #KBStat_NoCapsLock
+        MOVEQ   r1, #1
+        MOVNE   r1, #0
+        TST     r0, #KBStat_NoNumLock
+        ORREQ   r1, r1, #2
+        TST     r0, #KBStat_ScrollLock
+        ORRNE   r1, r1, #4
+
+        ; fall through
+        ASSERT  . = SetLEDs
+
+; *****************************************************************************
+;
+;       SetLEDs - Set the LED(s) to a specific value
+;
+; in:   R1 = desired LED state (bit 0 = caps lock, 1 = num lock, 2 = scroll lock)
+;       R11 -> keyboard workspace
+;
+; out:  R0, R1 corrupted
+;
+
+SetLEDs
+        LDRB    r0, LastLED             ; Only update if different.
+        TEQ     r0, r1
+        MOVEQ   pc,lr
+
+        STRB    r1, LastLED
+
+        MOV     r0, #3
+        Push    "r10-r12,lr"
+        MRS     r11, CPSR               ; Save current PSR.
+        ORR     r10, r11, #SVC_mode + I32_bit
+        MSR     CPSR_c, r10             ; Call KEYV in SVC mode, no IRQs.
+        MOV     r10, #KEYV
+        Push    "lr"                    ; Save SVC lr.
+        BL      CallVector
+        Pull    "lr"                    ; Restore SVC lr.
+        MSR     CPSR_cf, r11            ; Go back to old mode.
+        NOP
+        Pull    "r10-r12,pc"
+
+; *****************************************************************************
+;
+;       LEDsOn - Turn on all the LEDs
+;
+; out:  all registers preserved
+;
+
+LEDsOn  Push    "r0,r1,r11,lr"
+        MOV     r1, #7
+        LDR     r11, =ZeroPage+KeyWorkSpace
+        BL      SetLEDs
+        Pull    "r0,r1,r11,pc"
+
+; *****************************************************************************
+;
+;       LEDsOff - Restore the LEDs to keyboard status
+;
+; out:  all registers preserved
+;
+
+LEDsOff Push    "r0,r1,r11,lr"
+        LDR     r11, =ZeroPage+KeyWorkSpace
+        BL      UpdateLEDs
+        Pull    "r0,r1,r11,pc"
+
+; *****************************************************************************
+;
+;       Handle new keyboard id.
+;       In:     r1 = keyboard id
+;               r2 = magic 'NoKd' to disable kernel debouncing
+;               r11 = KeyWorkSpace
+;       Out:    preserve flags
+;
+GotKbId
+        EntryS
+
+        STRB    r1, KbId                ; Store the new keyboard id.
+
+        LDR     r0, KeyVec
+        Push    r0                      ; Save old key handler so we know if it's changed.
+
+        LDR     lr, NoKbMagic
+        TEQ     r2, lr
+        MOVNE   lr, #0
+        STRB    lr, NoDebounce          ; remember kernel debounce switch
+
+        LDRB    r8, LastKbId
+        TEQ     r8, r1                  ; If we have a different keyboard id then
+
+        BLNE    IssueKeyboardService    ;   issue service.
+
+        LDR     lr, KeyVec              ; Get possibly new key handler.
+        Pull    r0                      ; And old handler.
+        TEQ     r0, lr                  ; If key handler has not changed then
+        BLEQ    KeyboardEnable          ;   handler has not initialised with OS_InstallKeyHandler so we try.
+
+        EXITS
+
+
+NoKbMagic DCD   &4e6f4b64               ; Magic of NoKd to signal no kernel
+                                        ;   debounce
+
+
+; *****************************************************************************
+; Initialise keyboard handler and enable keyboard driver.
+;
+; In:   r1 = keyboard id
+;
+KeyboardEnable
+        Push    lr
+
+        BL      ClearKbd
+
+        LDR     r0, KeyVec
+        CMP     r0, #-1                 ; If no key handler
+        LDRNEB  r1, KbId                ;     or no keyboard yet then
+        TEQNE   r1, #&FF
+        Pull    pc, EQ                  ;   can't initialise.
+
+        STRB    r1, LastKbId            ; Remember last keyboard id that initialised.
+
+        LDR     r8, [r0, #KeyHandler_Init] ; Initialise key handler.
+        ADD     r8, r8, r0
+        BL      CallUserKeyCode
+
+        MOV     r0, #4                  ; Initialise keyboard driver.
+        MOV     r10, #KEYV
+        BL      CallVector
+        Pull    pc
+
+; *****************************************************************************
+;
+;       Default KEYV handler (deal with keyboard id, keys up/down).
+;
+;       In:     r0 = reason code 0
+;               r1 = keyboard id
+;               r2 = magic 'NoKd' if kernel debouncing to be disabled
+;       or
+;               r0 = reason code 1 or 2
+;               r1 = key code
+;
+KeyVector ROUT
+        CMP     r0, #3                  ; If not id/key up/key down then
+        Pull    pc, CS                  ;  just claim call.
+
+        Push    "r0-r12"
+
+        LDR     r11, =ZeroPage+KeyWorkSpace
+
+        TEQ     r0, #0                  ; If keyboard id then
+        BLEQ    GotKbId                 ;   handle it
+        Pull    "r0-r12,pc",EQ          ;   and claim call.
+
+        MOV     r2, r1
+        SUB     r1, r0, #1
+
+        CMP     R2, #?KeysDown*8
+        BCS     %FT05
+        ADR     R0, KeysDown
+        MOV     lr, R2, LSR #5
+        LDR     lr, [R0, lr, LSL #2]!   ; load appropriate word
+        MOV     R3, #&80000000          ; index 0 is in top bit
+        TEQ     r1, #0
+        BNE     %FT03
+
+        TST     lr, R3, ROR R2          ; if going up and key already up (keyboard reinitialised) then
+        BEQ     %FT50                   ;   nothing to do
+        B       %FT04                   ; else clear flag, generate event etc.
+03
+        TST     lr, R3, ROR R2          ; if going down and key already down (weird) then
+        BNE     %FT50                   ;   nothing to do else...
+04
+        EOR     lr, lr, R3, ROR R2      ; switch state of flag
+        STR     lr, [R0]                ; store back
+05
+        BL      KeyboardEvent           ; generate key up/down event
+
+        BL      CheckForShiftingKey
+        BCC     %FT10                   ; [not shifting key]
+
+        BL      CallSpecialReturnNChars
+        B       %FT50
+
+10
+        TEQ     r1, #0                  ; if key up then
+        BEQ     %FT30                   ;   go and deal with it
+
+        LDR     R0, CurrKey
+        TEQ     R0, #&FF                ; have we got a current key ?
+        BEQ     %FT20
+
+        LDR     R1, OldKey
+        TEQ     R1, #&FF                ; have we got an old key ?
+        BNE     %FT50                   ; ignore new - we've got 2 down already
+
+        STR     R0, OldKey              ; make current key old
+20
+        STR     R2, CurrKey             ; update current
+        LDRB    r1, NoDebounce          ; check debouncing?
+        TEQ     r1, #0
+        MOVEQ   R0, #2                  ; Eq.. normal kernel debounce
+        MOVNE   R0, #0                  ; NE.. no kernel debounce
+        STRB    R0, Debouncing
+        LDROSB  R0, KeyRepDelay, NE     ; and load delay
+        STRB    R0, AutoRepeatCount     ; generate char after 2 100Hz ticks
+
+        MOVNE   r1,#2                   ; mark as first key
+        BLNE    GenerateChar            ; R2 = key number
+
+        B       %FT50
+
+30
+        LDR     R0, OldKey
+        TEQ     R0, R2                  ; is it old key going up ?
+        BNE     %FT40
+
+; Old key going up
+
+        LDR     R0, CurrKey             ; current key is one to ignore in scan
+        BL      ScanKeys
+
+        STRPL   R0, OldKey              ; found key, so current -> old
+        BPL     %BT20                   ; and R2 -> current
+
+        MOV     R0, #&FF                ; else mark old key invalid
+        STR     R0, OldKey
+        B       %FT50                   ; and return
+
+40
+        LDR     R1, CurrKey
+        TEQ     R1, R2                  ; is it current key going up ?
+        BNE     %FT50                   ; not interested if not
+
+        BL      ScanKeys                ; R0 was OldKey
+        BPL     %BT20                   ; was a key so make that current
+
+        MOV     R2, #&FF
+        STR     R2, CurrKey             ; mark current key up
+
+50
+        Pull    "r0-r12,pc"
+
+; *****************************************************************************
+;
+;       KeyboardEvent - Generate key up/down event
+;
+; in:   R1 = 0 for up, 1 for down
+;       R2 = key index
+;
+
+KeyboardEvent ROUT
+        LDRB    R3, KbId                ; tell event user the keyboard id
+        MOV     R0, #Event_Keyboard
+        B       OSEVEN
+
+; *****************************************************************************
+;
+;       Scan keyboard for keys down, ignoring key number R0 and shifting keys
+;
+; in:   R0 = key number to ignore
+;
+; out:  N=0 => R2 = key number found
+;       N=1 => no key found; R2 = -1
+;       R0 preserved
+;
+
+ScanKeys ROUT
+        Push    "R0, R14"
+        ADR     R1, KeysDown
+        MOV     R2, #(?KeysDown/4)-1
+10
+        TEQ     R2, #&200/32
+        MOVEQ   R2, #4                  ; skip extension key range &100
+        LDR     R3, [R1, R2, LSL #2]    ; get the word
+        TEQ     R3, #0                  ; if any keys in this down, skip
+        BNE     %FT20
+15
+        SUBS    R2, R2, #1              ; N=1 last time round
+        BPL     %BT10
+        Pull    "R0, PC"
+
+20
+        MOV     R2, R2, LSL #5          ; multiply by 32
+        ADD     R2, R2, #32             ; and add 32
+30
+        TEQ     R3, #0                  ; no more bits ?
+        MOVEQ   R2, R2, LSR #5          ; then reset R2 to word offset
+        BEQ     %BT15                   ; and continue word loop
+        SUB     R2, R2, #1              ; decrement key number
+        MOVS    R3, R3, LSR #1          ; shift out bit
+        BCC     %BT30
+
+        CMP     R2, R0                  ; is it old key (C=1 if it is)
+        BLNE    CheckForShiftingKeyR0R3 ; check that it's not shifting key
+        BCS     %BT30                   ; C=1 => invalid, so loop
+
+        TEQ     R2, #0                  ; N := 0
+        Pull    "R0, PC"
+
+; *****************************************************************************
+;
+;       CheckForShiftingKey - either going down or going up
+;
+; in:   R2 = key number
+;
+; out:  C=1 <=> is shifting key, so don't set current key etc
+;       R0 -> key structure
+;       R4 = shifting key index, or 0 if not shifting key
+;       R3,R5 undefined
+;       R1,R2,R6-R12 preserved
+;
+
+CheckForShiftingKeyR0R3 ROUT              ; version that saves R0, for ScanKeys
+        Push    "R0,R3,R14"
+        BL      CheckForShiftingKey
+        Pull    "R0,R3,PC"
+
+CheckForShiftingKey ROUT
+        LDR     R0, KeyVec
+        CMP     R0, #-1
+        MOVEQ   PC, R14
+        LDR     R3, [R0, #KeyHandler_KeyTranSize] ; maximum internal key number +1
+        TST     R3, #KeyHandler_HasFlags
+        BIC     R3, R3, #KeyHandler_HasFlags
+        LDRNE   R5, [R0, #KeyHandler_Flags]
+        TSTNE   R5, #KeyHandler_Flag_Wide
+        BNE     %FT20                   ; Use wide version of routine
+
+        CMP     R2, R3                  ; is it outside table ?
+        LDRCC   R3, [R0, #KeyHandler_KeyTran] ; no, R3 := offset to keytran
+        ADDCC   R3, R3, R0              ; R3 -> keytran
+        LDRCC   R3, [R3, R2, LSL #2]    ; R3 = table word for this key
+        CMNCC   R3, #1                  ; C=1 <=> outside table or is special
+        MOVCC   PC, R14                 ; can't be shifting key
+
+        LDR     R3, [R0, #KeyHandler_ShiftingList] ; R3 = offset to shifting key list
+        LDRB    R4, [R3, R0]!           ; R4 = length of shifting key list
+        TEQ     R4, #0
+10
+        LDRNEB  R5, [R3, R4]
+        TEQNE   R5, R2
+        SUBNES  R4, R4, #1
+        BNE     %BT10
+
+        CMP     R4, #1                  ; C=1 <=> shifting key
+        MOV     PC, R14                 ; not one of the shifting keys
+
+20
+        CMP     R2, R3                  ; is it outside table ?
+        LDRCC   R3, [R0, #KeyHandler_KeyTran] ; no, R3 := offset to keytran
+        ADDCC   R3, R3, R0              ; R3 -> keytran
+        LDRCC   R4, =&FF00FF00
+        ADDCC   R3, R3, R2, LSL #3      ; R3 = table address for this key
+        LDMCCIA R3, {R3, R5}            ; R3, R5 = table entry for this key
+        EORCC   R3, R3, R4
+        EORCC   R5, R5, R4
+        ANDCC   R3, R3, R5
+        CMNCC   R3, #1                  ; C=1 <=> outside table or is special
+        MOVCC   PC, R14                 ; can't be shifting key
+
+        LDR     R3, [R0, #KeyHandler_ShiftingList] ; R3 = offset to shifting key list
+      [ NoARMv4
+        LDRB    R4, [R3, R0]!
+        LDRB    R5, [R3, #1]
+        ORRS    R4, R4, R5, LSL #8      ; R4 = length of shifting key list
+      |
+        LDRH    R4, [R3, R0]!
+        TEQ     R4, #0                  ; R4 = length of shifting key list
+      ]
+30
+      [ NoARMv4
+        ASSERT  :LNOT: NoUnaligned
+        LDRNE   R5, [R3, R4, LSL #1]
+        MOVNE   R5, R5, LSL #16
+        TEQNE   R5, R2, LSL #16
+      |
+        ADDNE   R5, R3, R4, LSL #1
+        LDRNEH  R5, [R5]
+        TEQNE   R5, R2
+      ]
+        SUBNES  R4, R4, #1
+        BNE     %BT30
+
+        CMP     R4, #1                  ; C=1 <=> shifting key
+        MOV     PC, R14                 ; not one of the shifting keys
+
+; *****************************************************************************
+;
+;       CallSpecialCode - Call code for a special key
+;
+; in:   R0 -> Key structure
+;       R1 = 0 for up, 1 for down (shifting keys); 2 for first, 3 for repeat
+;       R2 = key number
+;
+
+CallSpecialCode ROUT
+        LDR     R3, [R0, #KeyHandler_KeyTranSize]
+        ADR     R6, NullCharList
+        TST     R3, #KeyHandler_HasFlags
+        LDRNE   R3, [R0, #KeyHandler_Flags]
+        TSTNE   R3, #KeyHandler_Flag_Wide
+        LDR     R3, [R0, #KeyHandler_SpecialList] ; R3 = offset to special list
+        BNE     CallSpecialCodeWide
+        LDRB    R4, [R3, R0]!           ; R4 = length of special list
+        TEQ     R4, #0
+        MOVEQ   PC, R14                 ; no special keys, so can't be one
+10
+        LDRB    R5, [R3, R4]
+        TEQ     R5, R2
+        BEQ     %FT20
+        SUBS    R4, R4, #1
+        BNE     %BT10
+        MOV     PC, R14
+
+CallSpecialCodeWide
+      [ NoARMv4
+        LDRB    R4, [R3, R0]!
+        LDRB    R5, [R3], #1
+        ORR     R4, R4, R5, LSL #8      ; R4 = length of special list
+      |
+        LDRH    R4, [R3, R0]!           ; R4 = length of special list
+      ]
+        TEQ     R4, #0
+        MOVEQ   PC, R14                 ; no special keys, so can't be one
+15
+        LDHA    R5, R3, R4, R8
+        TEQ     R5, R2
+        BEQ     %FT20
+        SUBS    R4, R4, #1
+        BNE     %BT15
+        MOV     PC, R14
+
+20
+        LDR     R3, [R0, #KeyHandler_SpecialCodeTable] ; R3 = offset to special table
+        ADD     R3, R3, R0              ; R3 -> special code table
+        SUB     R5, R3, #4              ; 0th entry is for 1st special
+
+        LDR     R8, [R5, R4, LSL #2]    ; R8 = offset to code for this special
+        ADD     R8, R8, R3              ; R8 = address of code for this special
+        ADR     R3, ReturnVector
+
+; and drop thru to ...
+
+CallUserKeyCode ROUT
+        Push    R14
+        LDROSB  R5, KeyBdStatus
+        LDRB    R7, PendingAltType
+        Push    R5
+        BL      %FT10
+        Pull    R12
+        STRB    R7, PendingAltType
+        TEQ     R5, R12
+        BLNE    OfferKeyStatusUpCall
+        STROSB  R5, KeyBdStatus, R12
+        Pull    R14
+        B       UpdateLEDs
+
+10
+        ADRL    R12, UserKeyWorkSpace
+        MOV     PC, R8
+
+NullCharList
+        =       0
+        ALIGN
+
+ReturnVector
+        B       MouseButtonChange
+        B       DoBreakKey
+
+; On entry: R5 = new status, R12 = old
+; On exit:  R5 = new new status, R12 corrupt, all other registers preserved
+OfferKeyStatusUpCall
+        Entry   "R0-R3,R10,R11"
+        MRS     R11, CPSR
+        ORR     R10, R11, #SVC_mode + I32_bit
+        MSR     CPSR_c, R10
+        Push    "R14"
+        MOV     R10, #UpCallV
+        MOV     R3, R5                        ; new value
+        MOV     R2, R12                       ; old value
+        MOV     R1, #0                        ; pre-change
+        MOV     R0, #UpCall_KeyboardStatus
+        BL      CallVector
+        MOV     R5, R3                        ; R5 = value, after interference
+10      TEQ     R5, R2
+        MOVNE   R10, #UpCallV
+        MOVNE   R1, #1                        ; post-change
+        MOVNE   R0, #UpCall_KeyboardStatus
+        BLNE    CallVector
+        Pull    "R14"
+        MSR     CPSR_cf, R11
+        NOP
+        EXIT
+
+OfferPostKeyStatusUpCall
+        ALTENTRY
+        MRS     R11, CPSR
+        ORR     R10, R11, #SVC_mode + I32_bit
+        MSR     CPSR_c, R10
+        Push    "R14"
+        MOV     R3, R5
+        MOV     R2, R12
+        B       %BT10
+
+
+; *****************************************************************************
+;
+;       Centisecond tick routine
+;
+
+CentiSecondTick ROUT
+        Push    "R11, R14"
+        LDR     R11, =ZeroPage+KeyWorkSpace
+
+        LDR     R0, InkeyCounter
+        SUBS    R0, R0, #1              ; decrement
+        STRCS   R0, InkeyCounter        ; store back unless was frozen at 0
+
+        LDR     R2, CurrKey
+        TEQ     R2, #&FF
+        Pull    "R11,PC", EQ            ; no current key, so no auto-repeat
+
+        BL      UpdateLEDs              ; update LEDs from keyboard status
+
+        LDRB    R0, AutoRepeatCount
+        SUBS    R0, R0, #1              ; decrement count (if frozen then C:=0)
+        STRHIB  R0, AutoRepeatCount ; store back if now non-zero and not frozen
+        Pull    "R11,PC", NE            ; return if non-zero or was frozen
+
+        LDRB    R1, Debouncing          ; get debounce flag
+        TEQ     R1, #0
+
+        STRNEB  R0, Debouncing          ; if not zero, zero it
+        LDROSB  R0, KeyRepDelay, NE     ; and load delay
+        MOVNE   R1, #2                  ; indicate first time
+
+        LDROSB  R0, KeyRepRate, EQ      ; if zero, then load repeat
+        MOVEQ   R1, #3                  ; indicate subsequent time
+
+        STRB    R0, AutoRepeatCount     ; in any case, store back
+
+        Push    "R4-R10"                ; save registers
+        BL      GenerateChar            ; R2 = key number
+        Pull    "R4-R11,PC"
+
+; *****************************************************************************
+;
+;       DoBreakKey - Called by key handler when break key up or down
+;
+; in:   R0 -> key structure
+;       R1 = 0 for up, 1 for down (shouldn't be 2 or 3)
+;       R2 = ARM internal key number
+;       R3 = address of ReturnVector
+;       R4 = special number 1..n
+;       R5 = keyboard status
+;
+; out:  R6 -> list of chars to return
+;
+
+DoBreakKey ROUT
+        TST     R5, #KBStat_ShiftEngaged        ; shift down ?
+        MOVEQ   R3, #31
+        MOVNE   R3, #29
+
+        TST     R5, #KBStat_CtrlEngaged         ; ctrl down ?
+        BICNE   R3, R3, #4
+
+        LDROSB  R2, BREAKvector
+        MOVS    R2, R2, LSL R3                  ; put relevant bits in C,N
+
+        MOVCS   PC, R14                         ; 2 or 3 => ignore
+        BPL     %FT10                           ; 0 => do a reset
+
+        TEQ     R1, #1                          ; is it key down ?
+        ADREQ   R6, EscList                     ; yes, return ESCAPE
+        MOV     PC, R14                         ; else just return
+
+10
+        TEQ     R1, #0                          ; is it key up ?
+        MOVNE   PC, R14                         ; no, then return
+
+; This entry point is used by new SWI OS_Reset (TMD 06-Jan-94)
+; If it's break on the keyboard R0 <> the magic 'power off' word,when '&OFF' is
+; passed in R0 the power will be turned off assuming the hardware supports it
+
+PerformReset
+
+        Push    R0
+        WritePSRc F_bit+I_bit+SVC_mode, R14
+
+        BL      IICAbort                        ; Ensure any CMOS operation aborted
+        MOV     R1, #Service_PreReset           ; offer the pre-reset service
+        BL      Issue_Service
+
+        WritePSRc F_bit+I_bit+SVC_mode, R14     ; just in case!
+        Pull    R0
+
+        LDR     R1, PowerDownMagic
+        TEQ     R0, R1
+        BNE     %FT15
+        AddressHAL
+        MOV     a1, #0
+        LDR     a2, =L1PT
+        CallHAL HAL_Reset
+15
+        B       CONT_Break                      ; If we can't turn the power off,we may end up back here anyway
+
+EscList
+        =       1, &1B
+        ALIGN
+PowerDownMagic
+        DCD     &46464F26
+
+; *****************************************************************************
+;
+;       Generate a character in keyboard buffer, if necessary
+;
+; in:   R1 = 2 if first press; 3 if repetition
+;       R2 = key number
+;
+
+GenerateChar ROUT
+        Push    R14
+        LDR     R0, KeyVec
+        CMP     R0, #-1
+        Pull    PC,EQ
+        LDR     R5, [R0, #KeyHandler_KeyTranSize] ; get size
+        BIC     R3, R5, #KeyHandler_HasFlags
+        CMP     R2, R3                          ; if outside table
+        BCS     %FT04                           ; then assume special
+
+        LDR     R3, [R0, #KeyHandler_KeyTran]   ; R3 = offset to KeyTran
+        ADD     R3, R3, R0                      ; R3 -> KeyTran
+
+        TST     R5, #KeyHandler_HasFlags
+        LDRNE   R6, [R0, #KeyHandler_Flags]
+        TSTNE   R6, #KeyHandler_Flag_Wide
+        MOVEQ   R6, #1
+        MOVNE   R6, #2
+        ADDNE   R3, R3, R2, LSL #2
+
+; now modify for CTRL and SHIFT
+
+        LDROSB  R5, KeyBdStatus
+
+        TST     R5, #KBStat_CtrlEngaged
+        ADDNE   R3, R3, R6, LSL #1
+
+        TST     R5, #KBStat_ShiftEngaged
+        ADDNE   R3, R3, R6
+
+        TEQ     R6, #1
+      [ NoARMv4
+        ASSERT  :LNOT: NoUnaligned
+        LDR     R3, [R3, R2, LSL #2]            ; get real code
+        MOVNE   R3, R3, LSL #16
+        ANDEQ   R3, R3, #255
+        MOVNE   R3, R3, LSR #16
+      |
+        ADD     R3, R3, R2, LSL #2
+        LDREQB  R3, [R3]
+        LDRNEH  R3, [R3]
+      ]
+
+; apply CAPS lock modifying
+
+        BIC     R6, R3, #&20                    ; get upper-case code
+        CMP     R6, #"A"
+        RSBCSS  R6, R6, #"Z"                    ; is it alphabetic ?
+        BCC     %FT20
+
+        TST     R5, #KBStat_ShiftEnable         ; if SHCAPS
+        EORNE   R3, R3, #&20                    ; then swap case
+
+        TSTEQ   R5, #KBStat_NoCapsLock          ; else if CAPS
+        BICEQ   R3, R3, #&20                    ; force upper case
+20
+        TEQ     R3, #&FF                        ; is it a special ?
+        BEQ     %FT04                           ; [yes, so skip]
+
+        LDROSB  R6, ESCch                       ; if ESCAPE character
+        TEQ     R3, R6
+        LDROSB  R6, ESCaction, EQ               ; and normal ESCAPE action
+        TEQEQ   R6, #0
+        LDROSB  R6, ESCBREAK, EQ                ; and ESCAPE not disabled
+        TSTEQ   R6, #1
+        BNE     %FT21
+
+        TST     R5, #KBStat_PendingAlt
+        BEQ     %FT21
+        MOV     R5, R12
+        BIC     R5, R5, #KBStat_PendingAlt      ; then cancel pending alt
+        BL      OfferPostKeyStatusUpCall        ; don't let them interfere
+        STROSB  R5, KeyBdStatus, R6             ; and store back
+
+21      TST     R5, #KBStat_PendingAlt          ; is there a pending Alt ?
+        BNE     ProcessPendingAlt
+
+        TEQ     R3, #0                          ; is it NUL ?
+        BNE     %FT10                           ; no, so skip
+
+        ADR     R6, NULNULList                  ; then insert NUL NUL
+        B       ReturnNChars
+
+CallSpecialReturnNChars
+        Push    R14
+        CMP     R0, #-1
+        Pull    PC,EQ
+04
+        BL      CallSpecialCode
+
+ReturnNChars
+        LDRB    R3, [R6], #1                    ; R1 = count of characters
+
+; TMD 25-Sep-89: Fix bug which resulted in Break key (acting as Escape) not
+; working if buffer was full - only count spaces if more than 1 character going
+; into buffer
+
+ [ {TRUE}
+        CMP     R3, #1
+        Pull    PC, CC                          ; no chars, so exit now
+        BEQ     %FT05                           ; only 1 char, don't count
+ |
+        TEQ     R3, #0                          ; no chars?
+        Pull    PC, EQ                          ; then exit now
+ ]
+
+        MOV     R1, #Buff_Key
+        CMP     PC, #0                          ; C=1, V=0 so count spaces
+        BL      CnpEntry
+        ORR     R1, R1, R2, LSL #8              ; R1 = number of spaces
+        CMP     R3, R1                          ; are there enough ?
+        Pull    PC, HI                          ; no, then forget them
+
+05
+        LDRB    R2, [R6], #1                    ; send chars
+        BL      InsertKeyZCOE                   ; one at a time
+        SUBS    R3, R3, #1
+        BNE     %BT05
+        Pull    PC
+
+10
+        Pull    R14                             ; restore stacked R14
+        MOV     R2, R3
+
+; and drop thru to ...
+
+; *****************************************************************************
+;
+;       InsertKeyZCOE - Insert key zeroing count on escape
+;
+; in:   R2 = character
+;
+
+InsertKeyZCOE
+        LDROSB  R0, KeyBdDisable                ; disable insertion of codes ?
+        TEQ     R0, #0
+        MOVNE   PC, R14                         ; [disabled]
+        LDROSB  R0, ESCch                       ; escape character
+        TEQ     R0, R2                          ; if is esc char
+        LDROSB  R0, ESCaction, EQ
+        TEQEQ   R0, #0                          ; and FX229,0
+
+        STREQB  R0, AutoRepeatCount             ; then zero repeat counter
+
+; and drop thru to ...
+
+; *****************************************************************************
+;
+;       RDCHS - Insert character into keyboard buffer
+;
+; in:   R2 = character
+;
+
+RDCHS   ROUT
+        MOV     R1, #Buff_Key                   ; keyboard buffer id
+
+; Insert character R2 into buffer R1, checking for escape character
+
+        B       DoInsertESC
+
+; *****************************************************************************
+
+NULNULList                                      ; list for returning NUL NUL
+        =       2, 0, 0
+        ALIGN
+
+; *****************************************************************************
+
+ProcessPendingAlt
+        ADR     R6, NullCharList
+        LDR     R8, [R0, #KeyHandler_PendingAltCode]
+        ADD     R8, R8, R0
+        BL      CallUserKeyCode
+        B       ReturnNChars
+
+; *****************************************************************************
+;
+;       Read character entry point
+;
+; in:   -
+; out:  R0 = character
+;       C=1 => ESCAPE
+;       R1-R13 preserved
+;
+
+NewRdch
+        Push    "R1-R4,R11"
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        MOV     R4, #1                  ; indicate RDCH not INKEY
+        BL      RdchInkey
+        Pull    "R1-R4,R11,PC"
+
+; *****************************************************************************
+;
+;       RDCH/INKEY
+;
+; in:   R4 = 0  => INKEY
+;       R4 <> 0 => RDCH                 ; *** TMD This changed 25-Apr-91 ***
+;
+; out:  V=1 => error (and possibly R0 -> error block if you're lucky!)
+;
+
+RdchInkey Entry
+
+; Enable interrupts so that keyboard can work properly
+
+        WritePSRc SVC_mode, r1
+
+        LDR     r1, =ZeroPage
+        LDRB    r1, [r1, #RedirectInHandle]
+        TEQ     r1, #0
+        BEQ     %FT10
+
+; Tutu doesn't believe that an escape condition should break redirection
+; - similar to exec if you turn off escape ack side-effects
+
+        SWI     XOS_BGet                ; get byte from redirection handle
+        BVS     RedirectBadExit
+        BCC     ReturnChar              ; (C=0)
+
+; EOF, so close redirect file and read from exec file or keyboard
+
+; stop redirecting, BEFORE closing file, in case the CLOSE gets an error
+
+        LDR     r0, =ZeroPage
+        ASSERT  (ZeroPage :AND: 255) = 0
+        STRB    r0, [r0, #RedirectInHandle] ; Convenient, huh ?
+        SWI     XOS_Find                ; close file (R0=0, R1=handle)
+        EXIT    VS
+
+10
+
+; First check for EXEC file
+
+        LDROSB  R1, ExecFileH           ; read EXEC handle
+        TEQ     R1, #0
+        BEQ     %FT20                   ; no exec file
+
+        SWI     XOS_BGet                ; get byte from exec handle
+        BVS     ExecBadExit
+        BCC     ReturnChar              ; (C=0)
+
+; EOF, so close exec file and read from keyboard
+
+; stop EXECing, BEFORE closing file, in case the CLOSE gets an error
+
+        ASSERT (ZeroPage :AND: 255) = 0
+        STROSB  R0, ExecFileH, R0       ; (STROSB sets temp reg to 0)
+      [ ZeroPage <> 0
+        MOV     R0, #0
+      ]
+        SWI     XOS_Find                ; close file (R0=0, R1=handle)
+        EXIT    VS
+20
+        Push    "R5,R6"
+        LDR     R5, =ZeroPage
+        LDRB    R5, [R5, #PortableFlags] ; 0 if not a portable, else Portable_Features result
+
+RdchLoop
+        LDR     R0, =ZeroPage
+        LDRB    R0, [R0, #ESC_Status]
+        MOVS    R0, R0, LSL #(32-6)     ; shift relevant bit into carry
+        MOVCS   R0, #27                 ; escape detected
+        BCS     ReturnChar2
+
+        LDROSB  R1, InputStream         ; 0 => keyboard, 1 => RS423
+        BL      RDCHG
+        BCC     ReturnChar2
+
+; Sam's hack to call the callback vector if appropriate
+
+        LDR     R0, =ZeroPage
+        LDRB    R14, [R0, #CallBack_Flag]
+        TST     R14, #CBack_VectorReq
+        BLNE    process_callback_chain
+
+; here endeth the hack
+
+        TEQ     R4, #0                  ; EQ => inkey, NE => rdch
+        LDREQ   R0, InkeyCounter        ; if inkey
+        TEQEQ   R0, #0                  ; and count expired
+        BEQ     InkeyTimeout
+
+        TST     R5, #PortableFeature_Idle
+        SWINE   XPortable_Idle
+        TST     R5, #PowerSave
+        BNE     RdchLoop                ; if we've gone slow already, then loop
+        TST     R5, #PortableFeature_Speed
+        BEQ     RdchLoop                ; if speed change doesn't work, then loop
+        MOV     R0, #1                  ; go slow
+        MOV     R1, #0
+        SWI     XPortable_Speed         ; out: R0 = old speed, R1 = new speed
+        ORRVC   R5, R5, #PowerSave      ; if OK, indicate power save mode
+        MOVVC   R6, R0                  ; and remember old speed
+        LDRVS   R5, =ZeroPage           ; if got error, then indicate we don't want to try again
+        ASSERT  (ZeroPage :AND: 255) = 0
+        STRVSB  R5, [R5, #PortableFlags] ; and store this back for future RDCHs
+        B       RdchLoop
+
+InkeyTimeout
+        MOV     R0, #&FF                ; indicate timeout
+        SEC                             ; and set carry
+ReturnChar2
+        ASSERT  PowerSave < 256
+        TST     R5, #PowerSave          ; NB preserves carry
+        BLNE    RestoreSpeed
+        Pull    "R5,R6"
+ReturnChar
+        CLRPSR  V_bit, R14
+        EXIT
+
+RestoreSpeed EntryS "R0"
+        MOV     R0, R6                  ; restore old speed
+        MOV     R1, #0                  ; AND mask of 0
+        SWI     XPortable_Speed
+        EXITS                           ; restore R0 and carry
+
+ExecBadExit                             ; got an error from BGET
+        Push    R0                      ; save error pointer
+        ASSERT (ZeroPage :AND: 255) = 0
+        STROSB  R0, ExecFileH, R0       ; (STROSB sets temp reg to 0)
+      [ ZeroPage <> 0
+        MOV     R0, #0
+      ]
+        SWI     XOS_Find                ; close file (R0=0, R1=handle)
+        Pull    "R1, R14"               ; pull registers
+        MOVVC   R0, R1                  ; if closed OK, then restore old error
+        SETV                            ; still indicate error
+        MOV     PC, R14
+
+RedirectBadExit                         ; got an error from BGET
+        BL      RemoveOscliCharJobs     ; preserves r0
+        SETV                            ; still indicate error
+        Pull    "PC"                    ; pull register
+
+; *****************************************************************************
+;
+;       RDCHG - Fetch character from input buffer
+;       Expand soft keys as necessary
+;       Pass cursor control keys to VDU driver
+;       Return carry set if character not available
+;
+; in:   R1 = input buffer id (0 => keyboard, 1 => RS423)
+
+RDCHG   ROUT
+        Push    R14
+
+; insert check here for ECONET interception of RDCH
+
+RDCHNM
+        LDROSB  R0, SoftKeyLen          ; are we expanding a soft key
+        TEQ     R0, #0
+        BEQ     RDCHG1                  ; not expanding
+
+        LDROSB  R2, RS423mode
+        TST     R1, R2                  ; if RS423 and 8 bit data
+        BNE     RDCHG1                  ; ignore soft keys
+
+        LDR     R2, SoftKeyPtr
+        LDRB    R2, [R2, -R0]           ; get character out of buffer
+
+        SUB     R0, R0, #1              ; decrement character count
+        STROSB  R0, SoftKeyLen, R3      ; store back
+
+        MOV     R0, R2                  ; put character in R0
+        CLC                             ; and exit with carry clear
+        Pull    PC
+
+RDCHG1
+        BL      KeyREMOVECheckRS423     ; remove character, if none, exit CS
+
+        LDROSB  R2, RS423mode           ; 0 => treat RS423 as keyboard
+        TST     R1, R2                  ; NZ => let RS423 deliver 8-bit codes
+        BNE     RDCHGCLC
+
+        TEQ     R0, #0                  ; is it NUL ?
+        BNE     %FT10
+
+        BL      KeyREMOVECheckRS423     ; get another char, if none then
+                                        ; spurious, so ignore
+
+        TEQ     R0, #0                  ; is it NUL NUL ?
+        BNE     RDCHGCLC                ; no, then return this character
+
+      [ ZeroPage <> 0
+        LDR     R0, =ZeroPage
+      ]
+        LDRB    R2, [R0, #OsbyteVars + :INDEX: IPbufferCh]!
+                                        ; R0 was 0, so now -> 1st of 8 keybases
+        ADD     R3, R0, #8
+05
+        TEQ     R2, #2                  ; is this key base = 2 ?
+        MOVEQ   R0, #0                  ; if so then return NUL NUL
+        BEQ     ReturnNULR0
+        LDRB    R2, [R0, #1]!           ; load next key base
+        TEQ     R0, R3                  ; if not tried all of them
+        BNE     %BT05                   ; then loop
+        MOV     R0, #0                  ; no special key bases,
+                                        ; so just return NUL
+10
+        TST     R0, #&80
+        BEQ     RDCHGCLC
+
+; now check for cursor key movement
+
+        AND     R3, R0, #&0F            ; save bottom nybble
+        CMP     R3, #&0B                ; is it a cursor key ?
+        BCC     NotCursorKey
+
+        TST     R0, #&40                ; don't let Cx-Fx be cursor keys
+        BNE     NotCursorKey
+
+        LDROSB  R2, CurEdit             ; FX 4 state
+        CMP     R2, #1
+        ADDLS   R0, R3, #&87-&0B        ; 0 or 1 => force in range &87-&8B
+        BCC     ItsCursorEdit           ; 0 => cursor edit
+        BEQ     RDCHGCLC                ; 1 => return these codes
+
+NotCursorKey
+        MOV     R0, R0, LSR #4
+        EOR     R0, R0, #&0C            ; 4..7, 0..3
+      [ ZeroPage = 0
+        LDRB    R2, [R0, #OsbyteVars+IPbufferCh-OSBYTEFirstVar]
+      |
+        LDR     R2, =ZeroPage+OsbyteVars+IPbufferCh-OSBYTEFirstVar
+        LDRB    R2, [R0, R2]
+      ]
+                                        ; get key variable
+        CMP     R2, #1                  ; is it 0 (ignore) or 1 (softkey)
+        BCC     RDCHG1                  ; get another char if 0
+
+        BEQ     ExpandSoftKey           ; expand soft key if 1
+
+        TEQ     R2, #2                  ; is it special Compact option ?
+        EOREQ   R0, R0, #&0C            ; undo that mangling !
+        ORREQ   R0, R3, R0, LSL #4      ; if so, then return NUL <code>
+        BEQ     ReturnNULR0
+
+        ADD     R0, R2, R3              ; add offset to base
+        AND     R0, R0, #&FF            ; make it wrap
+
+RDCHGCLC
+        CLC
+        Pull    PC
+
+
+ItsCursorEdit
+        LDROSB  R2, WrchDest
+        TST     R2, #2                  ; if wrch not to VDU
+        BNE     RDCHG1                  ; then ignore character
+
+        Push    "R1,R4-R12"
+        VDWS    WsPtr
+        BL      DoCursorEdit
+        Pull    "R1,R4-R12"
+
+        BCS     RDCHG1                  ; no character yet, so loop
+        Pull    PC                      ; NB carry clear - no ESCAPE !
+
+; *****************************************************************************
+;
+;       ReturnNULR0 - Return NUL followed by R0 from RDCH
+;
+
+ReturnNULR0 ROUT
+        ADR     R2, SoftKeyExpand       ; store code in SoftKeyExpand +0
+        STRB    R0, [R2], #1            ; and set ptr to SoftKeyExpand +1
+        STR     R2, SoftKeyPtr
+        MOV     R2, #1                  ; set key length to 1
+        STROSB  R2, SoftKeyLen, R0      ; (sets R0 to 0!)
+      [ ZeroPage <> 0
+        MOV     R0, #0
+      ]
+        B       RDCHGCLC                ; return NUL as first character
+
+; *****************************************************************************
+
+KeyREMOVECheckRS423 ROUT
+        Push    R14
+        BL      KeyREMOVE
+        ADDCS   R13, R13, #4            ; pull stacked R14 if CS
+        Pull    PC
+
+; *****************************************************************************
+
+KeyREMOVE
+        Push    "R10,R12,R14"
+        CLRV                                    ; do remove not examine
+        MOV     R10, #REMV
+        B       GoVec
+
+
+; expand a soft key as a variable (R3 = key number)
+
+ExpandSoftKey ROUT
+        Push    "R1,R4"
+        BL      SetupKeyName
+        ADR     R1, SoftKeyExpand
+        MOV     R2, #255                        ; max length of string
+        MOV     R3, #0                          ; no name pointer
+        MOV     R4, #VarType_Expanded
+        SWI     XOS_ReadVarVal
+
+        Pull    "R1,R4", VS
+        BVS     RDCHG1                          ; no string or bad
+
+        STROSB  R2, SoftKeyLen, R0              ; store length (may be zero)
+        ADD     R1, R1, R2                      ; R1 -> last char+1
+        STR     R1, SoftKeyPtr
+        Pull    "R1,R4"
+        B       RDCHNM                          ; try to expand it
+
+KeyName
+        =       keyprefix,0
+        ALIGN
+
+; *****************************************************************************
+;
+;       SetupKeyName - Set up the name <keyprefix><n><0> in SoftKeyName
+;
+; in:   R11 -> KeyWS
+;       R3 = key number
+;
+; out:  R0 -> SoftKeyName, which contains <keyprefix><n><0>
+;       R2-R4 corrupted
+;
+
+SetupKeyName ROUT
+        ADR     R2, KeyName
+        ADR     R0, SoftKeyName
+10
+        LDRB    R4, [R2], #1                    ; copy keyprefix in
+        TEQ     R4, #0
+        STRNEB  R4, [R0], #1
+        BNE     %BT10                           ; now put digits at R0
+
+        ORR     R3, R3, #"0"
+        CMP     R3, #"9"+1
+
+        MOVCS   R2, #"1"                        ; if >=10 then put in "1"
+        STRCSB  R2, [R0], #1
+        SUBCS   R3, R3, #10                     ; and subtract 10
+
+        STRB    R3, [R0], #1
+        STRB    R4, [R0]                        ; (R4=0) terminate
+
+        ADR     R0, SoftKeyName
+        MOV     PC, R14
+
+; *****************************************************************************
+;
+;       DoInkeyOp - Perform INKEY
+
+DoInkeyOp
+        TST     R2, #&80                ; INKEY(+ve) ?
+        BNE     NewInkeyNeg
+
+NewInkeyPos
+        Push    R4
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        AND     R1, R1, #&FF            ; no funny business
+        AND     R2, R2, #&FF            ; ditto
+        ORR     R1, R1, R2, LSL #8      ; get combined count
+        STR     R1, InkeyCounter
+
+        MOV     R4, #0                  ; indicate inkey not rdch
+        BL      RdchInkey
+
+        MOV     R1, R0                  ; make X the character
+        MOVCC   R2, #0                  ; Y := 0 if normal exit
+        MOVCS   R2, R0                  ; Y := &1B or &FF for ESC or timeout
+
+        Pull    "R4,PC"                 ; return preserving V and R0
+
+NewInkeyNeg
+        EOR     R1, R1, #&7F            ; invert bits for scan call
+        EOR     R2, R2, #&7F
+        BL      BBCScanKeys
+        Pull    PC
+
+; *****************************************************************************
+;
+;       BBCScanKeys - Test individual key or scan for key depression
+;
+; in:   R1 = 0..&7F => scan keyboard from BBC internal key R1+(R2<<8)
+; out:  C=0 => R1 = BBC internal key found
+;       C=1 => R1 = &FF (no key found)
+;
+; in:   R1 = &80..&FF => test if BBC internal key ((R1+(R2<<8)) EOR &80) is down
+; out:  C=0, R1=R2=&00 => key is up
+;       C=1, R1=R2=&FF => key is down
+;
+
+BBCScanKeys ROUT
+        Push    "R10, R11, LR"
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        AND     R1, R1, #&FF            ; trap wallies
+
+        AND     R10, R2, #&7F
+
+        LDR     R2, KeyVec
+
+        TST     R1, #&80                ; >=&80 => test single key
+                                        ; < &80 => scan for key
+        BEQ     DoBBCScan               ; [is scanning not testing]
+
+        ADD     R0, R2, #1
+        CMP     R0, #1                  ; if no key handler then
+        MOVCC   R1, #0                  ;   return key up (C=0)
+        BCC     ExitBBCTest
+
+        TEQ     R1, #&80+13             ; extension range?
+        TEQNE   R1, #&80+15             
+        BEQ     DoBBCTestExtension
+
+        LDR     R0, [R2, #KeyHandler_InkeyTran]
+        ADD     R0, R2, R0              ; R0 -> InkeyTran or InkeyTran2
+
+        ADD     R0, R0, #4 * &FF        ; R0 -> InkeyTran+4*&FF
+        LDR     R0, [R0, -R1, LSL #2]   ; get word of indexes into KeysDown
+
+        LDR     R10, [R2, #KeyHandler_KeyTranSize]
+        TST     R10, #KeyHandler_HasFlags
+        LDRNE   R10, [R2, #KeyHandler_Flags]
+        TSTNE   R10, #KeyHandler_Flag_Wide
+        MOVNE   R2, #&FF0000
+        BNE     DoBBCTestWide
+
+        MOV     R2, #&FF000000
+02
+        CMP     R0, #-1                 ; is it all FF's
+        MOVEQ   R1, #0                  ; if so then none of keys down
+        BEQ     %FT04
+
+        AND     R1, R0, #&FF            ; just get bottom byte
+        ADR     R3, KeysDown            ; look up in KeysDown
+        MOV     R1, R1, LSR #5
+        LDR     R3, [R3, R1, LSL #2]    ; get word of 32 bits
+        AND     R1, R0, #31
+        MOV     R3, R3, LSL R1          ; put relevant bit into top bit
+        MOVS    R1, R3, LSR #31         ; R1 = 0 if up, 1 if down
+        ORREQ   R0, R2, R0, LSR #8      ; shift down, putting FF in top byte
+        BEQ     %BT02
+
+04
+        CMP     R1, #1                  ; C=1 <=> at least one of keys down
+        MOVCC   R1, #0
+        MOVCS   R1, #&FF
+        MOV     R2, R1
+ExitBBCTest
+        Pull    "R10, R11, PC"
+
+DoBBCTestWide
+        MOV     R1, R0, LSL #16         ; get bottom entry
+        CMP     R1, #&FF0000            ; is it FF?
+        MOVEQ   R1, #0                  ; if so then none of keys down
+        BEQ     %BT04
+
+        ADR     R3, KeysDown            ; look up in KeysDown
+        MOV     R1, R1, LSR #5+16
+        LDR     R3, [R3, R1, LSL #2]    ; get word of 32 bits
+        AND     R1, R0, #31
+        MOV     R3, R3, LSL R1          ; put relevant bit into top bit
+        MOVS    R1, R3, LSR #31         ; R1 = 0 if up, 1 if down
+        ORREQ   R0, R2, R0, LSR #16     ; shift down, putting FF in top entry
+        BEQ     DoBBCTestWide
+        B       %BT04
+
+DoBBCTestExtension
+        TST     R1, #2
+        ADDEQ   R10, R10, #&100 ; EQ -> (R1 AND &7F) = 13
+        ADDNE   R10, R10, #&200 ; NE -> (R1 AND &7F) = 15
+        ADR     R3, KeysDown
+        MOV     R1, R10, LSR #5
+        LDR     R3, [R3, R1, LSL #2]
+        AND     R1, R10, #31
+        MOV     R3, R3, LSL R1
+        MOV     R1, R3, LSR #31
+        B       %BT04
+
+DoBBCScan       ROUT
+        CMP     R2, #-1                 ; if no key handler then
+        MOVEQ   r1, #&FF                ;   return all keys up (C=1)
+        BEQ     ExitBBCTest
+        Push    "R4, R5"
+
+        ; Check for extension key range and include R10 if necessary
+        TEQ     R1, #13
+        TEQNE   R1, #15
+        ORREQ   R1, R1, R10, LSL #8
+
+        LDR     R0, [R2, #KeyHandler_InkeyTran]
+        ADD     R0, R2, R0              ; R0 -> InkeyTran or InkeyTran2
+
+        ADD     R0, R0, #4 * &7F        ; R0 -> InkeyTran+4*&7F
+
+        LDR     R4, [R2, #KeyHandler_KeyTranSize]
+        TST     R4, #KeyHandler_HasFlags
+        LDRNE   R4, [R2, #KeyHandler_Flags]
+        TSTNE   R4, #KeyHandler_Flag_Wide
+        MOVNE   R4, #&FF0000
+        BNE     DoBBCScanWide
+
+        MOV     R4, #&FF000000
+10
+        AND     R3, R1, #&7F-2
+        TEQ     R3, #13                 ; 13 or 15?
+        BLEQ    DoBBCScanExtension      ; handle extension range scan
+        LDR     R3, [R0, -R1, LSL #2]   ; get word of indexes into KeysDown
+15
+        CMP     R3, #-1                 ; all FFs ?
+        BEQ     %FT18                   ; then not one of these keys
+
+        AND     R5, R3, #&FF
+        ADR     R2, KeysDown
+        MOV     R5, R5, LSR #5
+        LDR     R2, [R2, R5, LSL #2]    ; get word of bits
+        AND     R5, R3, #31
+        MOV     R2, R2, LSL R5          ; put relevant bit into top bit
+        MOVS    R5, R2, LSR #31         ; R5 = 0 for up, 1 for down
+        BNE     ExitBBCScan             ; [down, so stop]
+        ORR     R3, R4, R3, LSR #8      ; up -> shift down putting FF in top
+        B       %BT15
+18
+        ADD     R1, R1, #1              ; go to next key
+        TEQ     R1, #&80                ; if not run out of keys
+        BNE     %BT10                   ; then loop
+        MOV     R1, #&FF                ; indicate no key
+ExitBBCScan
+        MOV     R2, #0
+        TEQ     R1, #&FF
+        MOVEQ   R2, #C_bit
+        MSR     CPSR_f, R2              ; C=0 <=> found key
+        Pull    "R4,R5,R10,R11,PC"
+
+DoBBCScanWide   ROUT
+        AND     R3, R1, #&7F-2
+        TEQ     R3, #13                 ; 13 or 15?
+        BLEQ    DoBBCScanExtension      ; handle extension range scan
+        LDR     R3, [R0, -R1, LSL #2]   ; get word of indexes into KeysDown
+15
+        MOV     R5, R3, LSL #16         ; get bottom entry
+        CMP     R5, #&FF0000            ; is it FF?
+        BEQ     %FT18                   ; then not one of these keys
+
+        ADR     R2, KeysDown
+        MOV     R5, R5, LSR #5+16
+        LDR     R2, [R2, R5, LSL #2]    ; get word of bits
+        AND     R5, R3, #31
+        MOV     R2, R2, LSL R5          ; put relevant bit into top bit
+        MOVS    R5, R2, LSR #31         ; R5 = 0 for up, 1 for down
+        BNE     ExitBBCScan             ; [down, so stop]
+        ORR     R3, R4, R3, LSR #16     ; up -> shift down putting FF in top
+        B       %BT15
+18
+        ADD     R1, R1, #1              ; go to next key
+        TEQ     R1, #&80                ; if not run out of keys
+        BNE     DoBBCScanWide           ; then loop
+        MOV     R1, #&FF                ; indicate no key
+        B       ExitBBCScan
+
+DoBBCScanExtension ROUT
+        ; R2, R3, R5, R10 corruptible
+        ; Return to LR if no key found
+        MOV     R10, R1, LSR #8
+        TST     R1, #2
+        ADDEQ   R10, R10, #&100 ; EQ -> (R1 AND &7F) = 13
+        ADDNE   R10, R10, #&200 ; NE -> (R1 AND &7F) = 15
+        ADR     R2, KeysDown
+10
+        MOV     R3, R10, LSR #5
+        LDR     R3, [R2, R3, LSL #2]
+        AND     R5, R10, #31
+        MOVS    R3, R3, LSL R5
+        BNE     %FT20                   ; found one
+
+        BIC     R10, R10, #31           ; skip to next word
+        ADD     R10, R10, #32
+        TEQ     R10, #&300
+        BNE     %BT10
+        ; Ran out of extension keys
+        MOV     R1, #16
+        MOV     PC, LR
+
+20
+      [ NoARMv5
+        CMP     R3, #1<<16
+        ADDLO   R10, R10, #16
+        MOVLO   R3, R3, LSL #16
+        CMP     R3, #1<<24
+        ADDLO   R10, R10, #8
+        MOVLO   R3, R3, LSL #8
+        CMP     R3, #1<<28
+        ADDLO   R10, R10, #4
+        MOVLO   R3, R3, LSL #4
+        CMP     R3, #1<<30
+        ADDLO   R10, R10, #2
+        MOVLO   R3, R3, LSL #2
+        TST     R3, #1<<31
+        ADDEQ   R10, R10, #1
+      |
+        CLZ     R3, R3
+        ADD     R10, R10, R3
+      ]
+        ; Convert back to inkey key
+        TST     R10, #&100
+        MOVNE   R1, #13
+        MOVEQ   R1, #15
+        ORR     R1, R1, R10, LSL #8
+        BIC     R1, R1, #&FF0000
+        B       ExitBBCScan
+        
+
+; *****************************************************************************
+;
+;       Write keys down information
+;
+; in:   R1 = Current key (in BBC internal key format)
+;       R2 = Old key     (------------""------------)
+;
+; out:  R1, R2 preserved
+;       R3 corrupt
+;
+; Note: Doesn't deal with extended key numbers
+;
+
+WriteKeysDown ROUT
+        Push    R14
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        AND     R0, R1, #&FF            ; mask off any extension bits
+        BL      ConvertInternalKey
+        STR     R0, CurrKey
+        AND     R0, R2, #&FF
+        BL      ConvertInternalKey
+        STR     R0, OldKey
+        Pull    PC
+
+; in:   R0 = INKEY code EOR &FF
+; out:  R0 = internal low level key number
+;       R3 corrupt
+ConvertInternalKey ROUT
+        TST     R0, #&80                ; if not in range &80..&FF
+        MOVEQ   R0, #&FF                ; return value &FF (key not valid)
+        MOVEQ   PC, R14
+
+        EOR     R0, R0, #&7F            ; else convert to inkey value
+        
+        LDR     R3, KeyVec
+        CMP     R3, #-1                 ; if no key handler then
+        MOVEQ   R0, #&FF                ;   return no key
+        MOVEQ   PC, R14
+
+        Push    R4
+        LDR     R4, [R3, #KeyHandler_KeyTranSize]
+        TST     R4, #KeyHandler_HasFlags
+        LDRNE   R4, [R3, #KeyHandler_Flags]
+        TSTNE   R4, #KeyHandler_Flag_Wide
+
+        LDR     R4, [R3, #KeyHandler_InkeyTran]
+        ADD     R3, R3, R0, LSL #2
+
+        SUB     R3, R3, #&80*4          ; R3 -> InkeyTran-4*&80
+
+      [ NoARMv4
+        LDRB    R0, [R3, R4]!           ; convert to ARM internal key
+                                        ; (just get 1st key for this key)
+        LDRNEB  R4, [R3, #1]
+        ORRNE   R0, R0, R4, LSL #8
+      |
+        LDREQB  R0, [R3, R4]
+        LDRNEH  R0, [R3, R4]
+      ]
+        Pull    R4
+        MOV     PC, R14
+
+
+; *****************************************************************************
+;
+;       InstallKeyHandler - Install user key handler
+;
+; in:   R0 = new key handler
+;        0 => just read old key handler
+;        1 => just read keyboard id
+;
+; out:  R0 = old key handler, or
+;       R0 = keyboard id if R0 was 1 on entry (&FF => no keyboard id yet)
+;
+
+InstallKeyHandler ROUT
+        MRS     R11, CPSR
+        ORR     R11, R11, #I32_bit
+        MSR     CPSR_c, R11             ; disable IRQs
+
+        LDR     R11, =ZeroPage+KeyWorkSpace
+        TEQ     R0, #1                  ; asking for keyboard id ?
+        LDREQB  R0, KbId                ; then load it
+        ExitSWIHandler EQ               ; and exit
+
+        LDR     R10, KeyVec             ; R10 -> old key handler
+        TEQ     R0, #0                  ; if not just reading it
+        STRNE   R0, KeyVec              ; then store new one
+        MOV     R0, R10                 ; R0 -> old key handler
+        ExitSWIHandler EQ               ; exit if just reading
+
+        Push    "R0-R12,LR"
+        BL      KeyboardEnable
+        Pull    "R0-R12,LR"
+        ExitSWIHandler
+
+; *****************************************************************************
+;
+;       IssueKeyboardService - Issue keyboard handler service
+;
+; in:   R11 -> KeyWorkSpace
+;
+; out:  R0 preserved
+;
+
+IssueKeyboardService
+        Push    "R0,R14"
+        MOV     R1, #Service_KeyHandler
+        LDRB    R2, KbId
+        BL      Issue_Service
+        Pull    "R0,PC"
+
+        LTORG
+
+        END

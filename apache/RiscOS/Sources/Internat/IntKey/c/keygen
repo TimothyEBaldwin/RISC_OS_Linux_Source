@@ -1,0 +1,1133 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+#include "Global/Keyboard.h"
+
+#include "Unicode/iso10646.h"
+
+#include "unicdata.h"
+#include "structures.h"
+#include "throwback.h"
+
+#define MAX_FILE_DEPTH 16
+static FILE *sourcefile[MAX_FILE_DEPTH];
+static char *sourcefilename[MAX_FILE_DEPTH];
+static int sourceline[MAX_FILE_DEPTH];
+static int filedepth;
+
+static const char *ExtraKeys, *FNKey;
+
+static LLK keypad_codes[]={
+                   KeyNo_NumPadSlash, KeyNo_NumPadStar, KeyNo_NumPadHash,
+    KeyNo_NumPad7, KeyNo_NumPad8,     KeyNo_NumPad9,    KeyNo_NumPadMinus,
+    KeyNo_NumPad4, KeyNo_NumPad5,     KeyNo_NumPad6,    KeyNo_NumPadPlus,
+    KeyNo_NumPad1, KeyNo_NumPad2,     KeyNo_NumPad3,
+    KeyNo_NumPad0,                    KeyNo_NumPadDot,  KeyNo_NumPadEnter,
+    0
+};
+
+typedef struct charinfo
+{
+    UCS4 code;
+    char *name;
+} charinfo;
+
+/* Must be sorted */
+static charinfo funclist[] =
+{
+    0xC0, "ACORN",
+    0xC8, "ALL CANDIDATES",
+    0x08, "BACKSPACE",
+    0x8A, "BREAK",
+    0xC6, "CONVERT",
+    0x8B, "COPY",
+    0x7F, "DELETE",
+    0x8E, "DOWN",
+    0xC4, "EISUU",
+    0x8B, "END",
+    0x0D, "ENTER",
+    0x1B, "ESCAPE",
+    0x81, "F1",
+    0xCA, "F10",
+    0xCB, "F11",
+    0xCC, "F12",
+    0x82, "F2",
+    0x83, "F3",
+    0x84, "F4",
+    0x85, "F5",
+    0x86, "F6",
+    0x87, "F7",
+    0x88, "F8",
+    0x89, "F9",
+    0x1E, "HOME",
+    0xCD, "INSERT",
+    0xC7, "KANA",
+    0xC3, "KANJI",
+    0xC9, "KANJI NUMBER",
+    0x8C, "LEFT",
+    0xC1, "MENU",
+    0xC5, "NO CONVERSION",
+    0x9E, "PAGE DOWN",
+    0x9F, "PAGE UP",
+    0x80, "PRINT",
+    0x8D, "RIGHT",
+    0x8F, "UP",
+    0xC2, "WIDTH",
+};
+
+#define FUNCTIONS (sizeof funclist / sizeof funclist[0])
+
+static charinfo speclist[] =
+{
+    0x03, "CAPS LOCK",
+    0x07, "CONFIGURED KEYBOARD",
+    0x06, "DEFAULT KEYBOARD",
+    0x09, "DELETE",
+    0x08, "DIAL KEYBOARD",
+    0x04, "KANA LOCK",
+    0x01, "NUM LOCK",
+    0x00, "SCROLL LOCK",
+    0x05, "SHIFT-CAPS LOCK",
+    0x02, "TAB",
+};
+
+#define SPECIALS (sizeof speclist / sizeof speclist[0])
+
+static charinfo deadlist[] =
+{
+     2, "ACUTE ACCENT",
+     6, "BREVE",
+    11, "CARON",
+    13, "CEDILLA",
+     3, "CIRCUMFLEX ACCENT",
+     8, "DIAERESIS",
+     7, "DOT ABOVE",
+    10, "DOUBLE ACUTE ACCENT",
+     1, "GRAVE ACCENT",
+     8, "GREEK DIALYTIKA",
+    15, "GREEK DIALYTIKA TONOS",
+    12, "GREEK TONOS",
+     5, "MACRON",
+    14, "OGONEK",
+     9, "RING ABOVE",
+    16, "STROKE",
+     4, "TILDE",
+    12, "VERTICAL LINE ABOVE",
+};
+
+#define DEADS (sizeof deadlist / sizeof deadlist[0])
+
+static const char *current_output_file;
+static FILE *current_output_handle;
+static int throwback, depend;
+
+void error(const char *p);
+
+void error(const char *p)
+{
+    fprintf(stderr, "%s, line %d: %s\n", sourcefilename[filedepth],  sourceline[filedepth], p);
+    if (throwback)
+        throwback_send(1, sourceline[filedepth], p, sourcefilename[0], sourcefilename[filedepth]);
+    fclose(current_output_handle);
+    remove(current_output_file);
+    exit(1);
+}
+
+
+static int cmp_name2(const void *p1, const void *p2)
+{
+    char *n = (char *) p1;
+    charinfo *c2 = (charinfo *) p2;
+
+    return strcmp(n, c2->name);
+}
+
+static UCS4 function_key_code(const char *p)
+{
+    UCS4 c, c2;
+    int ctrl=0, shift=0;
+    charinfo *ci;
+
+    /* Check for raw &8A */
+    if (*p == '&' && *(p+1) != '\0')
+    {
+        char *end;
+        c = (UCS4) strtol(p+1, &end, 16);
+        if (*end != '\0' || c < 0x80 || c >= 0xFF)
+            error("Bad hex");
+        return 0x80000000 + c;
+    }
+
+    /* Check for CTRL-B etc */
+    if (strncmp(p, "CTRL-", 5) == 0)
+    {
+        c = p[5];
+        c2 = p[6];
+        if (c >= '@' && c <= '_' && c2 == '\0')
+            return c-'@';
+        if (c == '?' && c2 == '\0')
+            return 127;
+    }
+
+    /* CTRL and SHIFT modifiers for other keys */
+
+    if (strncmp(p, "CTRL-", 5) == 0)
+    {
+        ctrl = 0x20;
+        p+=5;
+    }
+
+    if (strncmp(p, "SHIFT-", 6) == 0)
+    {
+        shift = 0x10;
+        p+=6;
+    }
+
+    ci = (charinfo *) bsearch(p, funclist, FUNCTIONS, sizeof funclist[0], cmp_name2);
+    if (ci == NULL)
+    {
+        error("Unknown function key");
+        return NULL_UCS4;
+    }
+
+    if (ci->code < 0x80)
+    {
+        /* no shift/ctrl variants of these codes, and bit 31 needn't be set */
+        return ci->code;
+    }
+
+    return (0x80000000 + ci->code) ^ ctrl ^ shift;
+}
+
+static UCS4 special_key_code(const char *p)
+{
+    charinfo *ci;
+
+    ci = (charinfo *) bsearch(p, speclist, SPECIALS, sizeof speclist[0], cmp_name2);
+    if (ci == NULL)
+    {
+        error("Unknown special key");
+        return NULL_UCS4;
+    }
+
+    return 0x80010000 + ci->code;
+}
+
+static UCS4 dead_key_code(const char *p)
+{
+    charinfo *ci;
+
+    ci = (charinfo *) bsearch(p, deadlist, DEADS, sizeof deadlist[0], cmp_name2);
+    if (ci == NULL)
+    {
+        error("Unknown dead key");
+        return NULL_UCS4;
+    }
+
+    return 0x80020000 + ci->code;
+}
+
+static UCS4 keycode_from_name(const char *name)
+{
+    if (name[0]=='-' && name[1]=='\0')
+        return NULL_UCS4;
+
+    if (strncmp(name, "FUNCTION KEY ", 13)==0)
+        return function_key_code(name+13);
+
+    if (strncmp(name, "SPECIAL KEY ", 12)==0)
+        return special_key_code(name+12);
+
+    if (strncmp(name, "DEAD KEY ", 9)==0)
+        return dead_key_code(name+9);
+
+    return UCS_from_name(name);
+}
+
+static char *getline(char *p, size_t plen)
+{
+    char *ret;
+    int l;
+
+  start_again:
+
+    do
+    {
+        sourceline[filedepth]++;
+        ret = fgets(p, plen, sourcefile[filedepth]);
+        if (!ret)
+        {
+            /* EOF - either return from the current include file, or give up */
+            if (filedepth)
+            {
+                free(sourcefilename[filedepth]);
+                fclose(sourcefile[filedepth]);
+                sourcefile[filedepth--] = NULL;
+                l = 0;
+                continue;
+            }
+            else
+                return NULL;
+        }
+
+        l = strlen(p);
+        if (p[l-1] == '\n')
+            p[--l] = '\0';
+
+        while (l && p[l-1] == ' ')
+            p[--l] = '\0';
+
+    } while (l == 0 || p[0] == '#');
+
+    if (p[0] == '%' && memcmp(p, "%Include ", 9) == 0)
+    {
+        if (filedepth == MAX_FILE_DEPTH-1)
+            error("%Include depth too great");
+        else
+        {
+            const char *newinclude;
+            if (strcmp(p+9, "@ExtraKeys@") == 0)
+            {
+                if (ExtraKeys)
+                    newinclude = ExtraKeys;
+                else
+                    goto start_again;
+            }
+            else if (strcmp(p+9, "@FNKey@") == 0)
+            {
+                if (FNKey)
+                    newinclude = FNKey;
+                else
+                    goto start_again;
+            }
+            else
+                newinclude = p+9;
+
+            /* Mustn't increment filedepth until all errors cleared */
+            if ((sourcefilename[filedepth+1]=malloc(strlen(newinclude)+1)) == NULL)
+                error("Out of memory");
+            strcpy(sourcefilename[filedepth+1], newinclude);
+#ifdef UNIX
+            { char *dot = sourcefilename[filedepth+1]; while ((dot = strchr(dot, '.')) != NULL) *dot++ = '/'; }
+#endif
+            if ((sourcefile[filedepth+1] = fopen(sourcefilename[filedepth+1], "r")) == NULL)
+                error("Unable to open %Include file");
+            sourceline[++filedepth]=0;
+
+            if (depend)
+                add_dependency(current_output_file, sourcefilename[filedepth]);
+
+            goto start_again;
+        }
+    }
+
+    return p;
+}
+
+static bool is_modifier_key(LLK key)
+{
+    return key == KeyNo_Break || key == KeyNo_CtrlLeft || key == KeyNo_ShiftLeft ||
+           key == KeyNo_ShiftRight || key == KeyNo_AltLeft || key == KeyNo_AltRight ||
+           key == KeyNo_CtrlRight || key == KeyNo_FN ||
+           key == KeyNo_LeftMouse || key == KeyNo_CentreMouse || key == KeyNo_RightMouse;
+}
+
+static bool is_keypad_key(LLK key)
+{
+    if(key == 0)
+        return false;
+    for(int i=0;i<sizeof(keypad_codes)/sizeof(keypad_codes[0]);i++)
+        if(keypad_codes[i] == key)
+            return true;
+    return false;
+}
+
+static bool is_special_key(int key)
+{
+    return key == KeyNo_ScrollLock || key == KeyNo_NumLock || key == KeyNo_Tab ||
+           key == KeyNo_CapsLock || is_modifier_key(key);
+}
+
+static void read_keypad(Keyboard *kb)
+{
+    int i=0;
+    char buffer[256];
+    char *second, *p;
+    UCS4 k, k2;
+
+    while (getline(buffer, 256))
+    {
+        if (buffer[0] == '$')
+        {
+            if (strcmp(buffer, "$EndKeypad")==0)
+            {
+                if (i < 17)
+                    error("Too few keypad keys");
+                return;
+            }
+            else
+                error("Unexpected directive");
+        }
+
+        if (i >= 17)
+            error("Too many keypad keys");
+
+        second = strchr(buffer, ';');
+        if (second)
+        {
+            *second='\0';
+            p = (second++)-1;
+            while (p>=buffer && *p==' ')
+                *p--='\0';
+            while (*second==' ')
+                second++;
+        }
+
+        k = keycode_from_name(buffer);
+        if (second)
+            k2 = keycode_from_name(second);
+        else
+            k2 = k;
+
+        if ((k >= 0x80 && k < 0x80000080) || (k >= 0x800000FF && k < 0xFFFFFFFF) ||
+            (k2 >= 0x80 && k2 < 0x80000080) || (k2 >= 0x800000FF && k2 < 0xFFFFFFFF))
+            error("I'm afraid you can't put that character on the keypad");
+
+        kb->keypad[0][i]=(unsigned char)k;
+        kb->keypad[1][i++]=(unsigned char)k2;
+    }
+
+    error("Unexpected end of file");
+}
+
+static void read_fnkey(Keyboard *kb)
+{
+    int i=0;
+    char buffer[256];
+    char *p;
+    unsigned long k, k2;
+
+    for (i=0; i<kb->maxkeys; i++)
+        kb->key[i].fn = -1;
+
+    kb->fnused = false;
+    i = 0;
+
+    while (getline(buffer, 256))
+    {
+        if (buffer[0] == '$')
+        {
+            if (strcmp(buffer, "$EndFNKey")==0)
+            {
+                return;
+            }
+            else
+                error("Unexpected directive");
+        }
+
+        k = strtoul(buffer, &p, 16);
+        if (k >= kb->maxkeys)
+            error("Expected key number");
+
+        k2 = strtoul(p, NULL, 16);
+        if (k2 >= kb->maxkeys || k == k2)
+            error("Expected key number");
+
+        /* Can only map non-modifier keys to other non-modifier keys */
+        if (is_modifier_key((LLK) k) && !kb->key[k].defined ||
+            is_modifier_key((LLK) k2) && !kb->key[k2].defined)
+            error("I'm sorry, I'm afraid I can't do that");
+
+        kb->key[k].defined = true;
+        kb->key[k2].defined = true;
+
+        kb->key[k].fn = (LLK) k2;
+        kb->fnused = true;
+        if (++i > 0xFF)
+            error("Too many FN mappings");
+    }
+
+    error("Unexpected end of file");
+}
+
+static void read_layer(Keyboard *kb, int layerno)
+{
+    char buffer[256];
+    char scaps[8], caps[8];
+    int key, i, replace=0;
+    char *p;
+
+    while (getline(buffer, 256))
+    {
+        char uc[8];
+
+        if (buffer[0] == '$')
+        {
+            if (strcmp(buffer, "$EndLayer")==0)
+                return;
+        }
+
+        key = (int) strtol(buffer, &p, 16);
+        if (p == buffer || key < 0 || key >= kb->maxkeys)
+            error("Expected key number");
+
+        while (*p <= ' ' && *p != '\0')
+            p++;
+
+        if (*p != '\0')
+        {
+            if (strcmp(p, "replace") == 0)
+                replace = 1;
+            else
+                error("Unexpected trailing garbage after key number");
+        }
+
+        if (!replace && kb->key[key].definedinlayer[layerno])
+            error("Key already defined");
+
+        if (is_modifier_key(key))
+            kb->needshiftinglist = true;
+
+        if (is_keypad_key(key))
+            error("Use $Keypad to alter keypad keys");
+
+        if (is_special_key(key))
+            kb->needcodetable = true;
+
+        kb->key[key].defined = true;
+        kb->key[key].definedinlayer[layerno] = true;
+
+        if (key >= kb->numkeys)
+        {
+            kb->numkeys = key + 1;
+        }
+
+        for (i=0; i<8; i++)
+        {
+            char *p=buffer, *q;
+            static const char brack[] = "-[]-{}-()-<>";
+
+            if (getline(buffer, 256) == NULL)
+                error("Error reading key");
+
+            q = *p != '-' ? strchr(brack, *p) : NULL;
+            if (q)
+            {
+                uc[i] = q-brack+1;
+                p++;
+            }
+            else
+                uc[i] = 0;
+
+            kb->key[key].character[layerno][i] = keycode_from_name(p);
+        }
+
+        /* Now we need to figure out the Caps Lock and Shift-Caps lock mappings.
+         * The logic here is that two parts of a key may be an upper/lower pair,
+         * marked with [ ] or { }. When Caps Lock is in force, you should always
+         * get the upper case form of anything you press. When Shift-Caps is in
+         * force, you should get the opposite case of anything you press.
+         */
+        kb->key[key].caps[layerno] = 0;
+        for (i=0; i<8; i++)
+        {
+            int j;
+            caps[i]=scaps[i]=i;
+            for (j=0; j<8; j++)
+            {
+                if (uc[j] == uc[i] + 1)
+                {
+                    caps[i] = j;
+                    scaps[i] = j;
+                }
+                else if (uc[j] == uc[i] - 1)
+                    scaps[i] = j;
+            }
+            if (caps[i] == scaps[i])
+            {
+                kb->key[key].caps[layerno] |= caps[i] << i*4;
+            }
+            else
+            {
+                if (caps[i] == i)
+                    kb->key[key].caps[layerno] |= (scaps[i]|8) << i*4;
+                else
+                    error("Inconsistent Caps Lock pairs");
+            }
+        }
+
+        /* Now we work out if this is an "easy" key, ie one that the
+         * kernel can handle itself.
+         */
+        kb->key[key].easylayer[layerno] = 0;
+        for (i=0; i<8; i++)
+        {
+            UCS4 c = kb->key[key].character[layerno][i];
+            kb->key[key].easych[layerno][i]=false;
+            if ((i < 4 && (c <= 0x7F || c >= 0x80000080 && c <= 0x800000FE)) || c == 0xFFFFFFFF)
+            {
+                UCS4 kc, ksc;
+                /* Okay, it's one of the kernel's 00-FF codes. What will the kernel
+                 * do with Caps-Lock? */
+                if ((c &~ 0x20) >= 'A' && (c &~ 0x20) <= 'Z')
+                {
+                    ksc = c ^ 0x20;
+                    kc = c &~ 0x20;
+                }
+                else
+                    kc = ksc = c;
+
+                /* Does it match what we want? */
+                if (ksc == kb->key[key].character[layerno][scaps[i]] &&
+                    kc == kb->key[key].character[layerno][caps[i]])
+                {
+                    kb->key[key].easylayer[layerno]++;
+                    kb->key[key].easych[layerno][i]=true;
+                }
+            }
+        }
+        if (kb->key[key].easylayer[layerno] < 8) kb->key[key].easylayer[layerno] = 0;
+    }
+    error("Unexpected end of file");
+}
+
+static void *xmalloc(size_t s)
+{
+    void *ret = malloc(s);
+    if (!ret) error("Out of memory");
+    return ret;
+}
+
+static void read_layout_file(Keyboard *kb)
+{
+    char buffer[256];
+    int layer = -1;
+
+    while (getline(buffer, 256))
+    {
+        if (buffer[0] == '$')
+        {
+            if (memcmp(buffer, "$Country ", 9)==0)
+                kb->country = atoi(buffer + 9);
+            else if (strcmp(buffer, "$LeftAltLayerSwitch")==0)
+            {
+                kb->leftaltlayerswitch = true;
+                kb->needcodetable = true;
+            }
+            else if (memcmp(buffer, "$Layer ", 7)==0)
+            {
+                layer = atoi(buffer + 7);
+                if (layer < 0 || layer >= MAXLAYERS)
+                    error("Bad layer number");
+
+                if (layer < kb->layers)
+                    error("Layer already defined");
+
+                read_layer(kb, layer);
+
+                kb->layers++;
+            }
+            else if (strcmp(buffer, "$Keypad")==0)
+            {
+                if (kb->custompad)
+                    error("Keypad already defined");
+                kb->custompad=true;
+                read_keypad(kb);
+            }
+            else if (strcmp(buffer, "$FNKey")==0)
+                read_fnkey(kb);
+            else if (memcmp(buffer, "$Type ", 6)==0)
+            {
+                strcpy(kb->type, buffer + 6);
+            }
+            else if (strcmp(buffer, "$Wide")==0)
+            {
+                kb->flags |= KeyHandler_Flag_Wide;
+                kb->maxkeys = MAXKEYS;
+            }
+            else
+                error("Unknown directive");
+        }
+        else
+            error("Expecting a $ directive");
+    }
+
+}
+
+static void output_layer(FILE *out, Keyboard *kb, int layerno)
+{
+    int i;
+
+    fprintf(out, "\nUCSTable%s_%d\n", kb->id, layerno);
+
+    for (i=0; i < kb->maxkeys; i++)
+    {
+        if (kb->key[i].defined && !kb->key[i].easy)
+            fprintf(out, "        &       &%08X,&%08X,&%08X,&%08X ; &%02X\n"
+                         "        &       &%08X,&%08X,&%08X,&%08X, &%08X\n",
+                         kb->key[i].character[layerno][0],
+                         kb->key[i].character[layerno][1],
+                         kb->key[i].character[layerno][2],
+                         kb->key[i].character[layerno][3],
+                         i,
+                         kb->key[i].character[layerno][4],
+                         kb->key[i].character[layerno][5],
+                         kb->key[i].character[layerno][6],
+                         kb->key[i].character[layerno][7],
+                         kb->key[i].caps[layerno]);
+    }
+}
+
+static void output_simples(FILE *out, Keyboard *kb)
+{
+    int i,j,c, best;
+    int t;
+
+    if (kb->fnused)
+    {
+        /* Sorry lads, if FN's in use we can't have any simple keys */
+        for (i=0; i<kb->maxkeys; i++)
+            kb->key[i].easy = false;
+        best = 0;
+    }
+    else
+    {
+        int bestmem;
+        int specials;
+
+        for (i=0; i<kb->maxkeys; i++)
+        {
+            kb->key[i].easy = true;
+            for (j=0; j<kb->layers; j++)
+            {
+                if (!kb->key[i].easylayer[j])
+                {
+                    kb->key[i].easy = false;
+                    break;
+                }
+                for (c=0; c<8; c++)
+                    if (kb->key[i].character[j][c] != kb->key[i].character[0][c])
+                    {
+                        kb->key[i].easy = false;
+                        break;
+                    }
+            }
+        }
+
+        /* How many should we put in the "easy" array? Want to
+         * minimise memory usage. The memory usage is basically
+         *      4 * (highest easy key+1) * width     for the KeyTran table
+         *    + 36 * special keys * layers + special keys * width.    for SpecialList + UCSList
+         *
+         * Start off supposing every defined key is special,
+         * then try effect of gradually extending the simple table.
+         */
+
+        for (i=0, specials=0; i < kb->maxkeys; i++)
+            if (kb->key[i].defined)
+                specials++;
+
+        int width = (kb->flags & KeyHandler_Flag_Wide)?2:1;
+
+        bestmem = 36*specials*kb->layers + specials*width;
+        best = 0;
+
+        for (i=0; i < kb->maxkeys; i++)
+        {
+            int mem;
+            if (kb->key[i].easy && kb->key[i].defined) // we've saved one special code!!
+                specials--;
+            mem = (i+1)*4*width + 36*specials*kb->layers + specials*width;
+            /*printf("%d simple, %d special, mem = %d\n", i, specials, mem);*/
+            if (mem<bestmem)
+            {
+                best = i+1;
+                bestmem = mem;
+            }
+        }
+
+        for (i=best; i < kb->maxkeys; i++)
+            kb->key[i].easy=false;
+    }
+
+    fprintf(out, "KeyTran%s\n", kb->id);
+    for (i=0; i < best; i++)
+        if (kb->key[i].easy)
+            fprintf(out, "        $LLK    &%02X, &%02X, &%02X, &%02X\n",
+                         kb->key[i].easych[0][0] ? kb->key[i].character[0][0]&0xFF : 0xFF,
+                         kb->key[i].easych[0][1] ? kb->key[i].character[0][1]&0xFF : 0xFF,
+                         kb->key[i].easych[0][2] ? kb->key[i].character[0][2]&0xFF : 0xFF,
+                         kb->key[i].easych[0][3] ? kb->key[i].character[0][3]&0xFF : 0xFF);
+        else
+            fprintf(out, "        $LLK    &FF, &FF, &FF, &FF\n");
+
+    fprintf(out, "KeyTran%sEnd\n\n", kb->id);
+
+    fprintf(out, "\nSpecialList%s\n"
+                 "        $LLK    ((SpecialList%sEnd - SpecialList%s) :SHR: LLKS) - 1\n",
+                 kb->id, kb->id, kb->id);
+
+    t=1;
+
+    if (!kb->key[KeyNo_ShiftLeft].defined)     { fprintf(out, "        $LLK    KeyNo_ShiftLeft\n");   t++; }
+    if (!kb->key[KeyNo_ShiftRight].defined)     { fprintf(out, "        $LLK    KeyNo_ShiftRight\n");  t++; }
+    if (!kb->key[KeyNo_CtrlLeft].defined)      { fprintf(out, "        $LLK    KeyNo_CtrlLeft\n");    t++; }
+    if (!kb->key[KeyNo_CtrlRight].defined)      { fprintf(out, "        $LLK    KeyNo_CtrlRight\n");   t++; }
+    if (!kb->key[KeyNo_AltLeft].defined)       { fprintf(out, "        $LLK    KeyNo_AltLeft\n");     t++; }
+    if (!kb->key[KeyNo_AltRight].defined)       { fprintf(out, "        $LLK    KeyNo_AltRight\n");    t++; }
+    if (!kb->key[KeyNo_FN].defined)         { fprintf(out, "        $LLK    KeyNo_FN\n");          t++; }
+    if (!kb->key[KeyNo_LeftMouse].defined)    { fprintf(out, "        $LLK    KeyNo_LeftMouse\n");   t++; }
+    if (!kb->key[KeyNo_CentreMouse].defined)      { fprintf(out, "        $LLK    KeyNo_CentreMouse\n"); t++; }
+    if (!kb->key[KeyNo_RightMouse].defined)    { fprintf(out, "        $LLK    KeyNo_RightMouse\n");  t++; }
+    if (!kb->key[KeyNo_Break].defined)      { fprintf(out, "        $LLK    KeyNo_Break\n");       kb->key[KeyNo_Break].tablenum=t++; }
+
+    fprintf(out, "SpecialList%sPad\n"
+                 "        $LLK    KeyNo_NumPadSlash, KeyNo_NumPadStar, KeyNo_NumPadHash\n"
+                 "        $LLK    KeyNo_NumPad7, KeyNo_NumPad8, KeyNo_NumPad9, KeyNo_NumPadMinus\n"
+                 "        $LLK    KeyNo_NumPad4, KeyNo_NumPad5, KeyNo_NumPad6, KeyNo_NumPadPlus\n"
+                 "        $LLK    KeyNo_NumPad1, KeyNo_NumPad2, KeyNo_NumPad3\n"
+                 "        $LLK    KeyNo_NumPad0, KeyNo_NumPadDot, KeyNo_NumPadEnter\n",
+                 kb->id);
+
+    kb->key[KeyNo_NumPadSlash].tablenum=t++;
+    kb->key[KeyNo_NumPadStar].tablenum=t++;
+    kb->key[KeyNo_NumPadHash].tablenum=t++;
+    kb->key[KeyNo_NumPad7].tablenum=t++;
+    kb->key[KeyNo_NumPad8].tablenum=t++;
+    kb->key[KeyNo_NumPad9].tablenum=t++;
+    kb->key[KeyNo_NumPadMinus].tablenum=t++;
+    kb->key[KeyNo_NumPad4].tablenum=t++;
+    kb->key[KeyNo_NumPad5].tablenum=t++;
+    kb->key[KeyNo_NumPad6].tablenum=t++;
+    kb->key[KeyNo_NumPadPlus].tablenum=t++;
+    kb->key[KeyNo_NumPad1].tablenum=t++;
+    kb->key[KeyNo_NumPad2].tablenum=t++;
+    kb->key[KeyNo_NumPad3].tablenum=t++;
+    kb->key[KeyNo_NumPad0].tablenum=t++;
+    kb->key[KeyNo_NumPadDot].tablenum=t++;
+    kb->key[KeyNo_NumPadEnter].tablenum=t++;
+
+    if (!kb->key[KeyNo_ScrollLock].defined) { fprintf(out, "        $LLK    KeyNo_ScrollLock\n");  kb->key[KeyNo_ScrollLock].tablenum=t++; }
+    if (!kb->key[KeyNo_NumLock].defined)    { fprintf(out, "        $LLK    KeyNo_NumLock\n");     kb->key[KeyNo_NumLock].tablenum=t++; }
+    if (!kb->key[KeyNo_Tab].defined)        { fprintf(out, "        $LLK    KeyNo_Tab\n");         kb->key[KeyNo_Tab].tablenum=t++; }
+    if (!kb->key[KeyNo_CapsLock].defined)   { fprintf(out, "        $LLK    KeyNo_CapsLock\n");    kb->key[KeyNo_CapsLock].tablenum=t++; }
+
+    fprintf(out, "SpecialList%sUCS", kb->id);
+
+    for (j=0, i=0; i<kb->maxkeys; i++)
+        if (kb->key[i].defined && !kb->key[i].easy)
+        {
+            fprintf(out, "%s&%02X", j==0 ? "\n        $LLK    " : ", ", i);
+            j = (j+1)%8;
+            kb->key[i].tablenum = t++;
+        }
+
+    fprintf(out, "\nSpecialList%sEnd\n"
+                 "        ALIGN\n",
+                 kb->id);
+}
+
+static void process_keyboard(FILE *in, FILE *out)
+{
+    int i, k, c;
+    Keyboard *kb = xmalloc(sizeof *kb);
+    strcpy(kb->type,"PC");
+    kb->country = -1;
+    kb->layers = 0;
+    kb->numkeys = 0;
+    kb->maxkeys = 0x100;
+    kb->fnused = false;
+    kb->needcodetable = false;
+    kb->needshiftinglist = false;
+    kb->custompad = false;
+    kb->leftaltlayerswitch = false;
+    kb->flags = 0;
+
+    sourcefile[0] = in;
+
+    for (k=0; k<MAXKEYS; k++)
+    {
+        kb->key[k].defined = false;
+        kb->key[k].tablenum = 0;
+        kb->key[k].easy = true;
+        for (i=0; i<MAXLAYERS; i++)
+        {
+            for (c=0; c<8; c++)
+            {
+                kb->key[k].character[i][c] = NULL_UCS4;
+                kb->key[k].easych[i][c]=true;
+            }
+            kb->key[k].caps[i]=(0<<0)|(1<<4)|(2<<8)|(3<<12)|(4<<16)|(5<<20)|(6<<24)|(7<<28);
+            kb->key[k].definedinlayer[i]=false;
+            kb->key[k].easylayer[i]=1;
+        }
+    }
+
+    read_layout_file(kb);
+
+    sprintf(kb->id,"%s%d",kb->type,kb->country);
+
+    /* Key handler structure */
+
+    fprintf(out, "LLKS    SETA    %d\n"
+                 "LLK     SETS    %s\n",
+                 ((kb->flags&KeyHandler_Flag_Wide)?1:0),
+                 ((kb->flags&KeyHandler_Flag_Wide)?"\"DCW\"":"\"DCB\""));
+                 
+
+    fprintf(out, "KeyStruct%s\n"
+                 "        &       KeyTran%s-KeyStruct%s\n"
+                 "        &       ((KeyTran%sEnd-KeyTran%s) :SHR: (LLKS+2))%s\n"
+                 "        &       InkeyTran%s%s-KeyStruct%s\n",
+                 kb->id,
+                 kb->id, kb->id,
+                 kb->id, kb->id, (kb->flags?"+ KeyHandler_HasFlags":""),
+                 kb->type, ((kb->flags&KeyHandler_Flag_Wide)?"W":""), kb->id);
+
+    if (kb->needshiftinglist)
+        fprintf(out, "        &       ShiftingKeyList%s-KeyStruct%s\n", kb->id, kb->id);
+    else
+        fprintf(out, "        &       ShiftingKeyList%s-KeyStruct%s\n", ((kb->flags&KeyHandler_Flag_Wide)?"W":""), kb->id);
+
+    fprintf(out, "        &       SpecialList%s-KeyStruct%s\n",
+                 kb->id, kb->id);
+
+    if (kb->needcodetable)
+        fprintf(out, "        &       SpecialCodeTable%s-KeyStruct%s\n", kb->id, kb->id);
+    else
+        fprintf(out, "        &       SpecialCodeTable-KeyStruct%s\n", kb->id);
+
+    fprintf(out, "        &       KeyStructInit-KeyStruct%s\n"
+                 "        &       PendingAltCode-KeyStruct%s\n",
+                 kb->id, kb->id);
+    fprintf(out, "        &       &%08x\n",kb->flags);
+
+    /* Extra data required by intkey */
+
+    if (kb->custompad)
+        fprintf(out,
+               "        &       PadK%sNumTran-KeyStruct%s-((SpecialList%sPad-SpecialList%s):SHR:LLKS)\n"
+               "        &       PadK%sCurTran-KeyStruct%s-((SpecialList%sPad-SpecialList%s):SHR:LLKS)\n",
+               kb->id, kb->id, kb->id, kb->id,
+               kb->id, kb->id, kb->id, kb->id);
+    else
+        fprintf(out,
+               "        &       PadKNumTran-KeyStruct%s-((SpecialList%sPad-SpecialList%s):SHR:LLKS)\n"
+               "        &       PadKCurTran-KeyStruct%s-((SpecialList%sPad-SpecialList%s):SHR:LLKS)\n",
+               kb->id, kb->id, kb->id,
+               kb->id, kb->id, kb->id);
+
+    if (kb->fnused)
+        fprintf(out, "        &       FNTable%s-KeyStruct%s\n", kb->id, kb->id);
+    else
+        fprintf(out, "        &       0\n");
+
+    for (i=0; i < MAXLAYERS; i++)
+    {
+        int j = i < kb->layers ? i : 0;
+        fprintf(out, "        &       UCSTable%s_%d-KeyStruct%s-((SpecialList%sUCS-SpecialList%s):SHR:LLKS)*36\n", kb->id, j, kb->id, kb->id, kb->id);
+    }
+
+    fprintf(out, "\n");
+
+    output_simples(out, kb);
+
+    if (kb->needcodetable)
+    {
+        fprintf(out, "\nSpecialCodeTable%s\n", kb->id);
+
+        if (!kb->key[KeyNo_ShiftLeft].defined)
+            fprintf(out, "        &       ProcessKShift - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_ShiftRight].defined)
+            fprintf(out, "        &       ProcessKShift - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_CtrlLeft].defined)
+            fprintf(out, "        &       ProcessKCtrl - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_CtrlRight].defined)
+            fprintf(out, "        &       ProcessKCtrl - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_AltLeft].defined)
+        {
+            if (kb->leftaltlayerswitch)
+                fprintf(out, "        &       ProcessKAltLeft - SpecialCodeTable%s\n", kb->id);
+            else
+                fprintf(out, "        &       ProcessKAlt - SpecialCodeTable%s\n", kb->id);
+        }
+        if (!kb->key[KeyNo_AltRight].defined)
+            fprintf(out, "        &       ProcessKAlt - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_FN].defined)
+            fprintf(out, "        &       ProcessKFN - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_LeftMouse].defined)
+            fprintf(out, "        &       ProcessKLeft - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_CentreMouse].defined)
+            fprintf(out, "        &       ProcessKCentre - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_RightMouse].defined)
+            fprintf(out, "        &       ProcessKRight - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_Break].defined)
+            fprintf(out, "        &       ProcessKBreak - SpecialCodeTable%s\n", kb->id);
+        for (i=0; i<17; i++)
+            fprintf(out, "        &       ProcessK1Pad - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_ScrollLock].defined)
+            fprintf(out, "        &       ProcessKScroll - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_NumLock].defined)
+            fprintf(out, "        &       ProcessKNum - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_Tab].defined)
+            fprintf(out, "        &       ProcessKTab - SpecialCodeTable%s\n", kb->id);
+        if (!kb->key[KeyNo_CapsLock].defined)
+            fprintf(out, "        &       ProcessKCaps - SpecialCodeTable%s\n", kb->id);
+        for (i=0; i<kb->maxkeys; i++)
+            if (kb->key[i].defined && !kb->key[i].easy)
+                fprintf(out, "        &       ProcessUCS - SpecialCodeTable%s\n", kb->id);
+    }
+    else
+    {
+        /* Check the builtin special code table is large enough */
+        fprintf(out,"        ASSERT ((SpecialList%sEnd-SpecialList%s):SHR:LLKS)-1 <= (SpecialCodeTableEnd-SpecialCodeTable):SHR:2\n",kb->id,kb->id);
+    }
+
+    if (kb->needshiftinglist)
+    {
+        fprintf(out, "\nShiftingKeyList%s\n"
+                     "        $LLK    ((ShiftingKeyList%sEnd - ShiftingKeyList%s) :SHR: LLKS) - 1\n",
+                     kb->id, kb->id, kb->id);
+
+        if (!kb->key[KeyNo_ShiftLeft].defined)  fprintf(out, "        $LLKS    KeyNo_ShiftLeft\n");
+        if (!kb->key[KeyNo_ShiftRight].defined)  fprintf(out, "        $LLKS    KeyNo_ShiftRight\n");
+        if (!kb->key[KeyNo_CtrlLeft].defined)   fprintf(out, "        $LLKS    KeyNo_CtrlLeft\n");
+        if (!kb->key[KeyNo_CtrlRight].defined)   fprintf(out, "        $LLKS    KeyNo_CtrlRight\n");
+        if (!kb->key[KeyNo_AltLeft].defined)    fprintf(out, "        $LLKS    KeyNo_AltLeft\n");
+        if (!kb->key[KeyNo_AltRight].defined)    fprintf(out, "        $LLKS    KeyNo_AltRight\n");
+        if (!kb->key[KeyNo_FN].defined)      fprintf(out, "        $LLKS    KeyNo_FN\n");
+        if (!kb->key[KeyNo_RightMouse].defined) fprintf(out, "        $LLKS    KeyNo_RightMouse\n");
+        if (!kb->key[KeyNo_CentreMouse].defined)   fprintf(out, "        $LLKS    KeyNo_CentreMouse\n");
+        if (!kb->key[KeyNo_LeftMouse].defined) fprintf(out, "        $LLKS    KeyNo_LeftMouse\n");
+        if (!kb->key[KeyNo_Break].defined)   fprintf(out, "        $LLKS    KeyNo_Break\n");
+
+        fprintf(out, "ShiftingKeyList%sEnd\n"
+                     "        ALIGN\n",
+                     kb->id);
+    }
+
+    for (i=0; i<kb->layers; i++)
+        output_layer(out, kb, i);
+
+    if (kb->fnused)
+    {
+        fprintf(out, "\nFNTable%s\n"
+                     "        $LLK    (FNTable%sEnd - FNTable%s - 1) :SHR: (LLKS+1)\n",
+                     kb->id, kb->id, kb->id);
+        for (i=0; i<kb->maxkeys; i++)
+            if (kb->key[i].fn != -1)
+            {
+                if (!kb->key[i].tablenum || !kb->key[kb->key[i].fn].tablenum)
+                {
+                    char buffer[128];
+                    sprintf(buffer, "Consistency failure in FN map (%02X->%02X)", i, kb->key[i].fn);
+                    error(buffer);
+                }
+                fprintf(out, "        $LLK    &%02X, &%02X\n", kb->key[i].tablenum,
+                                                               kb->key[kb->key[i].fn].tablenum);
+            }
+        fprintf(out, "FNTable%sEnd\n", kb->id);
+    }
+
+    if (kb->custompad)
+    {
+        int j, n;
+        for (n=0; n<=1; n++)
+        {
+            fprintf(out, n ? "\nPadK%sCurTran" : "\nPadK%sNumTran", kb->id);
+            for (j=0, i=0; i<17; i++)
+            {
+                fprintf(out, "%s&%02X", j==0 ? "\n        =       " : ", ", kb->keypad[n][i]);
+                j = (j+1)%8;
+            }
+        }
+        putc('\n', out);
+    }
+
+    fprintf(out, "\n        ALIGN\n");
+    fprintf(out, "\n        END\n");
+    free(kb);
+}
+
+int main(int argc, char **argv)
+{
+    FILE *in, *out;
+
+    if (argc >= 3 && strcmp(argv[1], "-depend")==0)
+    {
+        depend = 1;
+        dependfilename = argv[2];
+        argv+=2;
+        argc-=2;
+    }
+
+    if (argc >= 2 && strcmp(argv[1], "-throwback")==0)
+    {
+        throwback = 1;
+        argv++;
+        argc--;
+    }
+
+    if (argc >= 3 && strcmp(argv[1], "-extra")==0)
+    {
+        ExtraKeys = argv[2];
+        argv+=2;
+        argc-=2;
+    }
+
+    if (argc >= 3 && strcmp(argv[1], "-fn")==0)
+    {
+        FNKey = argv[2];
+        argv+=2;
+        argc-=2;
+    }
+
+    if (argc != 3)
+    {
+        fprintf(stderr, "Usage: keygen [-depend filename] [-throwback] [-extra filename] [-fn filename]\n"
+                        "              layout-file output-file\n");
+        exit(1);
+    }
+
+    in = fopen(argv[1], "r");
+    if (!in)
+    {
+        perror(argv[1]);
+        exit(1);
+    }
+
+    out = fopen(argv[2], "w");
+    if (!out)
+    {
+        perror(argv[2]);
+        exit(1);
+    }
+
+    sourcefilename[0] = argv[1];
+    current_output_handle = out;
+    current_output_file = argv[2];
+    if (depend)
+        add_dependency(current_output_file, sourcefilename[0]);
+
+    load_unidata("UniData");
+
+    process_keyboard(in, out);
+
+    return 0;
+}

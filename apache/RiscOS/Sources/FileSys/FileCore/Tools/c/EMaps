@@ -1,0 +1,914 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+        C routines to understand ADFS E format maps
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "kernel.h"
+#include "swis.h"
+#include "typedefs.h"
+#include "EMaps.h"
+#include "DiscOps.h"
+#include "EObjects.h"
+#include "Dirs.h"
+#include "StatEMap.h"
+#include "Displays.h"
+
+#define zone0bits (60*bits_per_byte)
+#define zone_header_bits (sizeof( zone_header )*bits_per_byte)
+#define cross_check_valid_value 0xff
+
+void initialise_zone_walk
+(
+        unsigned int * const next_free,
+        unsigned int * const bit_offset,
+        unsigned int * const zone_end,
+        disc_record const * const discrec,
+        void const * const map,
+        unsigned int const zone
+);
+
+unsigned int read_bits
+(
+        void const * const start,
+        unsigned int const bit_offset,
+        unsigned int const bit_size
+)
+{
+        unsigned int low = ((unsigned int *)start)[ bit_offset/bits_per_word ];
+        unsigned int high = ((unsigned int *)start)[ bit_offset/bits_per_word + 1 ];
+        unsigned int mod_offset = bit_offset % bits_per_word;
+
+        return ((low>>mod_offset) | (high<<(bits_per_word-mod_offset))) & ((1<<bit_size)-1);
+}
+
+unsigned int read_len
+(
+        void const * const start,
+        unsigned int const bit_offset,
+        unsigned int const bit_size
+)
+{
+        unsigned int const * const word_base = start;
+        unsigned int word_offset = (bit_offset+bit_size)/bits_per_word;
+        unsigned int mod_offset = (bit_offset+bit_size) % bits_per_word;
+        unsigned int word = (word_base[ word_offset ] >> mod_offset) << mod_offset;
+        unsigned int len_so_far = bit_size - mod_offset;
+
+        while ( !word )
+        {
+                len_so_far += bits_per_word;
+                word = word_base[ ++word_offset ];
+        }
+
+        /*
+                Found a non-zero word, so binary chop to find the length
+        */
+        if ( !(word<<16) )
+        {
+                word = word>>16;
+                len_so_far+=16;
+        }
+        if ( !(word<<24) )
+        {
+                word = word>>8;
+                len_so_far+=8;
+        }
+        if ( !(word<<28) )
+        {
+                word = word>>4;
+                len_so_far+=4;
+        }
+        if ( !(word<<30) )
+        {
+                word = word>>2;
+                len_so_far+=2;
+        }
+        if ( word<<31 )
+                return len_so_far+1;
+        else
+                return len_so_far+2;
+}
+
+void WrLinkBits
+(
+        disc_record const * const discrec,
+        void const * const map,
+        unsigned int bit_offset,
+        unsigned int link
+)
+{
+        unsigned int fill_mask = (1<<discrec->fragment_id_length) - 1;
+        unsigned int *word_to_fill = (unsigned int *)map + (bit_offset / 32);
+        unsigned int rot_value = bit_offset % 32;
+
+        *word_to_fill = (*word_to_fill & ~(fill_mask << rot_value)) | ((link & fill_mask) << rot_value);
+        word_to_fill++;
+        *word_to_fill = (*word_to_fill & ~(fill_mask >> (32-rot_value))) | ((link & fill_mask) >> (32-rot_value));
+}
+
+void WrLenBits
+(
+        disc_record const * const discrec,
+        void const * const map,
+        unsigned int bit_offset,
+        unsigned int len
+)
+{
+        unsigned int *map_base = (unsigned int *)map;
+        unsigned int i;
+
+        for ( i = discrec->fragment_id_length; i < len-1; i++ )
+        {
+                map_base[(i+bit_offset)/32] &= ~( 1 << ((i+bit_offset)%32) );
+        }
+
+        map_base[(i+bit_offset)/32] |= 1 << ((i+bit_offset)%32);
+}
+
+direct_disc_address map_bit_offset_to_disc_address
+(
+        disc_record const * const discrec,
+        unsigned int const bit_offset
+)
+{
+        direct_disc_address retval;
+        unsigned int zone = (bit_offset/bits_per_byte)>>discrec->log2_sector_size;
+
+        retval.disc_number = discrec->root_directory.direct.disc_number;
+
+        retval.byte_offset =
+                (bit_offset - zone_header_bits - zone0bits - zone*discrec->zone_spare) <<
+                                discrec->log2_bytes_per_map_bit;
+
+        return retval;
+}
+
+unsigned int map_size
+(
+        disc_record const * const discrec
+)
+{
+        return discrec->zones_in_map << discrec->log2_sector_size;
+}
+
+direct_disc_address map_start
+(
+        disc_record const * const discrec
+)
+{
+        unsigned int bit_offset;
+        unsigned int start_zone = discrec->zones_in_map/2;
+
+        /*
+                First allocation bit in the general zone
+        */
+        bit_offset = ((start_zone*bits_per_byte)<<discrec->log2_sector_size) + zone_header_bits;
+
+        /*
+                First usable bit in zone 0
+        */
+        if ( start_zone == 0 )
+                bit_offset += zone0bits;
+
+        return map_bit_offset_to_disc_address( discrec, bit_offset );
+}
+
+/*
+        Maximum number of fragments which could be squeezed into a zone
+*/
+unsigned int fragment_ids_per_zone
+(
+        disc_record const * const discrec
+)
+{
+        return ((bits_per_byte<<discrec->log2_sector_size) - discrec->zone_spare)/(discrec->fragment_id_length+1);
+}
+
+unsigned int indirect_disc_address_to_zone
+(
+        disc_record const * const discrec,
+        indirect_disc_address const address
+)
+{
+        return address.fragment_id==2 ? discrec->zones_in_map/2 : address.fragment_id/fragment_ids_per_zone( discrec );
+}
+
+unsigned char map_zone_valid_byte
+(
+        void const * const map,
+        disc_record const * const discrec,
+        unsigned int zone
+)
+{
+        unsigned char const * const map_base = map;
+        unsigned int sum_vector0;
+        unsigned int sum_vector1;
+        unsigned int sum_vector2;
+        unsigned int sum_vector3;
+        unsigned int zone_start;
+        unsigned int rover;
+
+        sum_vector0 = 0;
+        sum_vector1 = 0;
+        sum_vector2 = 0;
+        sum_vector3 = 0;
+
+        zone_start = zone<<discrec->log2_sector_size;
+        for ( rover = ((zone+1)<<discrec->log2_sector_size)-4; rover > zone_start; rover-=4 )
+        {
+                sum_vector0 += map_base[rover+0] + (sum_vector3>>8);
+                sum_vector3 &= 0xff;
+                sum_vector1 += map_base[rover+1] + (sum_vector0>>8);
+                sum_vector0 &= 0xff;
+                sum_vector2 += map_base[rover+2] + (sum_vector1>>8);
+                sum_vector1 &= 0xff;
+                sum_vector3 += map_base[rover+3] + (sum_vector2>>8);
+                sum_vector2 &= 0xff;
+        }
+
+        /*
+                Don't add the check byte when calculating its value
+        */
+        sum_vector0 +=                     (sum_vector3>>8);
+        sum_vector1 += map_base[rover+1] + (sum_vector0>>8);
+        sum_vector2 += map_base[rover+2] + (sum_vector1>>8);
+        sum_vector3 += map_base[rover+3] + (sum_vector2>>8);
+
+        return (unsigned char)((sum_vector0^sum_vector1^sum_vector2^sum_vector3) & 0xff);
+}
+
+YesNoAnswer zone_is_valid
+(
+        void const * const map,
+        disc_record const * const discrec,
+        unsigned int zone,
+        YesNoAnswer report_the_results
+)
+{
+        int result = Yes;
+        unsigned int next_free;
+        unsigned int bit_offset;
+        unsigned int zone_end;
+        unsigned int fragment_id;
+        unsigned int fragment_length;
+        YesNoAnswer free_list_terminated;
+        YesNoAnswer last_fragment_was_free;
+
+        /*
+                Get values for walking through a zone
+        */
+        initialise_zone_walk( &next_free, &bit_offset, &zone_end, discrec, map, zone );
+        free_list_terminated = No;
+        last_fragment_was_free = No;
+
+        if ( next_free < bit_offset )
+        {
+                free_list_terminated = Yes;
+                if ( next_free != (zone << (discrec->log2_sector_size + 3)) + 8 )
+                {
+                        if ( report_the_results )
+                                printf( "Zone %d initial free link links to before the alloc bits\n", zone );
+
+                        result = No;
+                }
+        }
+
+        /*
+                While we haven't reached the end of the zone
+        */
+        while ( bit_offset < zone_end )
+        {
+                /*
+                        Extract the fragment id and length (in map bits)
+                */
+                fragment_id = read_bits( map, bit_offset, discrec->fragment_id_length );
+                fragment_length = read_len( map, bit_offset, discrec->fragment_id_length );
+
+                /*
+                        Advance the next free block if this one's a free block
+                */
+                if ( bit_offset == next_free )
+                {
+                        if ( last_fragment_was_free )
+                        {
+                                if ( report_the_results )
+                                        printf( "Zone %d has two adjacent free fragments\n", zone );
+                                result = No;
+                        }
+
+                        if ( fragment_id == 0 )
+                                free_list_terminated = Yes;
+                        else
+                                next_free += fragment_id;
+
+                        last_fragment_was_free = Yes;
+                }
+                else
+                {
+                        last_fragment_was_free = No;
+                }
+
+                /*
+                        Advance to the next fragment
+                */
+                bit_offset += fragment_length;
+
+                if ( !free_list_terminated &&
+                        next_free < bit_offset )
+                {
+                        if ( report_the_results )
+                                printf( "Free list in zone %d links to non-fragment boundary\n", zone );
+                        free_list_terminated = Yes;
+                        result = No;
+                }
+        }
+
+        /*
+                If fragment overhangs and it isn't the bad fragment at the end of the last
+                zone
+        */
+        if ( bit_offset != zone_end &&
+                !( !last_fragment_was_free &&
+                   fragment_id == 1 &&
+                   zone == discrec->zones_in_map-1 ) )
+        {
+                if ( report_the_results )
+                        printf( "Zone %d fragments don't end cleanly at the end of the allocation bits\n", zone );
+                result = No;
+        }
+
+        if ( next_free >= zone_end )
+        {
+                if ( report_the_results )
+                       printf( "Zone %d free list links off the end of the allocation bits\n", zone );
+                result = No;
+        }
+
+        if ( map_zone_valid_byte( map, discrec, zone ) != ((unsigned char *)map)[zone<<discrec->log2_sector_size] )
+        {
+                if ( report_the_results )
+                        printf( "Zone %d checkbyte bad\n", zone );
+                result = No;
+        }
+
+        return result;
+}
+
+void fix_zone
+(
+        void * const map,
+        disc_record const * const discrec,
+        unsigned int zone
+)
+{
+        unsigned int one_before_last_free;
+        unsigned int last_free;
+        unsigned int next_free;
+        unsigned int one_before_last_bit_offset;
+        unsigned int last_bit_offset;
+        unsigned int bit_offset;
+        unsigned int zone_end;
+        unsigned int fragment_id;
+        unsigned int fragment_length;
+        YesNoAnswer free_list_terminated;
+        YesNoAnswer last_fragment_was_free;
+        zone_header *zone_contents = (zone_header *)((char *)map + (zone << discrec->log2_sector_size));
+
+        /*
+                Get values for walking through a zone
+        */
+        initialise_zone_walk( &next_free, &bit_offset, &zone_end, discrec, map, zone );
+        last_free = (zone << (discrec->log2_sector_size + 3)) + 8;
+        free_list_terminated = No;
+        last_fragment_was_free = No;
+
+        if ( next_free < bit_offset )
+        {
+                free_list_terminated = Yes;
+                if ( next_free != (zone << (discrec->log2_sector_size + 3)) + 8 )
+                {
+                        printf( "Zone %d initial free link links to before the alloc bits\n", zone );
+                        if ( query( "Do you want the free list cleanly truncated" ))
+                        {
+                                zone_contents->free_link = 0;
+                        }
+                }
+        }
+
+        /*
+                While we haven't reached the end of the zone
+        */
+        while ( bit_offset < zone_end )
+        {
+                /*
+                        Extract the fragment id and length (in map bits)
+                */
+                fragment_id = read_bits( map, bit_offset, discrec->fragment_id_length );
+                fragment_length = read_len( map, bit_offset, discrec->fragment_id_length );
+
+                /*
+                        Advance the next free block if this one's a free block
+                */
+                if ( bit_offset == next_free )
+                {
+                        if ( last_fragment_was_free )
+                        {
+                                printf( "Zone %d has two adjacent free fragments\n", zone );
+
+                                if ( query( "Do you want these merged" ))
+                                {
+                                        if ( fragment_id == 0 )
+                                                WrLinkBits( discrec, map, last_free, 0 );
+                                        else
+                                                WrLinkBits( discrec, map, last_free, next_free + fragment_id - last_free );
+
+                                        WrLenBits( discrec, map, last_free, bit_offset + fragment_length - last_free );
+                                }
+                        }
+
+                        one_before_last_free = last_free;
+                        last_free = next_free;
+
+                        if ( fragment_id == 0 )
+                                free_list_terminated = Yes;
+                        else
+                                next_free += fragment_id;
+
+                        last_fragment_was_free = Yes;
+                }
+                else
+                {
+                        last_fragment_was_free = No;
+                }
+
+                /*
+                        Advance to the next fragment
+                */
+                one_before_last_bit_offset = last_bit_offset;
+                last_bit_offset = bit_offset;
+                bit_offset += fragment_length;
+
+                if ( !free_list_terminated &&
+                        next_free < bit_offset )
+                {
+                        printf( "Free list in zone %d links to non-fragment boundary\n", zone );
+                        free_list_terminated = Yes;
+
+                        if ( query( "Do you want the free list terminated cleanly" ))
+                        {
+                                WrLinkBits( discrec, map, last_free, 0 );
+                        }
+                }
+        }
+
+        /*
+                If fragment overhangs and it isn't the bad fragment at the end of the last
+                zone
+        */
+        if ( bit_offset != zone_end &&
+                !( !last_fragment_was_free &&
+                   fragment_id == 1 &&
+                   zone == discrec->zones_in_map-1 ) )
+        {
+                printf( "Zone %d fragments don't end cleanly at the end of the allocation bits\n", zone );
+
+                if ( zone_end - last_bit_offset > discrec->fragment_id_length )
+                {
+                        /*
+                                Enough room to truncate the duff fragment
+                        */
+                        if ( query( "Do you want this fragment truncated to fit" ))
+                        {
+                                WrLenBits( discrec, map, last_bit_offset, zone_end - last_bit_offset );
+                        }
+                }
+                else
+                {
+                        /*
+                                Not enough room to truncate the duff fragment -
+                                will have to merge it into the previous fragment
+                        */
+                        printf( "There isn't enough room to truncate the fragment\n" );
+
+                        if ( query( "Do you want this fragment discarded and the remains merged into the previous fragment" ))
+                        {
+                                WrLenBits( discrec, map, one_before_last_bit_offset, zone_end - one_before_last_bit_offset );
+
+                                /*
+                                        Check if vaped the free list's end
+                                */
+                                if ( last_free == last_bit_offset )
+                                {
+                                        WrLinkBits( discrec, map, one_before_last_free, 0 );
+                                        next_free = last_free = one_before_last_free;
+                                }
+                        }
+                }
+        }
+
+        if ( next_free >= zone_end )
+        {
+                printf( "Zone %d free list links off the end of the allocation bits\n", zone );
+
+                if ( query( "Do you want the list terminated before the end" ))
+                {
+                        WrLinkBits( discrec, map, last_free, 0 );
+                }
+        }
+}
+
+int map_crosscheck_is_valid
+(
+        void const * const map,
+        disc_record const * const discrec
+)
+{
+        unsigned char const * const map_base = map;
+        unsigned char check_so_far = 0;
+        unsigned int zone;
+
+        for ( zone = 0; zone < discrec->zones_in_map; zone++ )
+        {
+                check_so_far ^= ((zone_header *)&map_base[zone<<discrec->log2_sector_size])->cross_check;
+        }
+
+        if ( check_so_far==cross_check_valid_value )
+        {
+                return Yes;
+        }
+        else
+        {
+                printf( "Map cross check bytes bad\n" );
+                return No;
+        }
+}
+
+void zone_limits
+(
+        int *low,
+        int *high,
+        disc_record const * const discrec,
+        int zone
+)
+{
+        *low = zone << (discrec->log2_sector_size + 3);
+        *high = (zone+1) << (discrec->log2_sector_size + 3);
+        *low += sizeof( zone_header ) * bits_per_byte;
+        *high += sizeof( zone_header ) * bits_per_byte - discrec->zone_spare;
+        if ( zone == 0 )
+                *low += zone0bits;
+}
+
+int whole_map_is_valid
+(
+        void const * const map,
+        disc_record const * const discrec,
+        YesNoAnswer report_result
+)
+{
+        int result = Yes;
+        unsigned int zone;
+
+        for ( zone = 0; zone < discrec->zones_in_map; zone++ )
+        {
+                if ( !zone_is_valid( map, discrec, zone, report_result ) )
+                {
+                        result = No;
+                }
+        }
+
+        if ( !map_crosscheck_is_valid( map, discrec ) )
+        {
+                result = No;
+        }
+
+        return result;
+}
+
+void fix_map
+(
+        void * const map,
+        disc_record const * const discrec
+)
+{
+        unsigned int zone;
+
+        for ( zone = 0; zone < discrec->zones_in_map; zone++ )
+        {
+                if ( !zone_is_valid( map, discrec, zone, No ) )
+                {
+                        fix_zone( map, discrec, zone );
+                }
+        }
+
+        printf( "The map zone check bytes and cross check bytes will be fixed automatically\n" );
+}
+
+_kernel_oserror *write_map
+(
+        void * const map,
+        disc_record const * const discrec
+)
+{
+        _kernel_oserror *err;
+        unsigned char * const map_base = map;
+        unsigned char check_so_far = 0;
+        unsigned int zone;
+        direct_disc_address map_address;
+        unsigned int this_map_size;
+        void *dummy;
+
+        /*
+                Fix the check bytes
+        */
+        for ( zone = 0; zone < discrec->zones_in_map; zone++ )
+        {
+                if ( zone < discrec->zones_in_map-1 )
+                        check_so_far ^= ((zone_header *)&map_base[zone<<discrec->log2_sector_size])->cross_check;
+                else
+                        ((zone_header *)&map_base[zone<<discrec->log2_sector_size])->cross_check = check_so_far ^ cross_check_valid_value;
+
+                map_base[ zone<<discrec->log2_sector_size] = map_zone_valid_byte( map, discrec, zone );
+        }
+
+        this_map_size = map_size( discrec );
+        map_address = map_start( discrec );
+        map_address.disc_number = discrec->root_directory.direct.disc_number;
+        dummy = map;
+
+        err = adfs_discop_write( &dummy, discrec, &map_address, &this_map_size );
+        if ( err )
+                return err;
+
+        this_map_size = map_size( discrec );
+        map_address = map_start( discrec );
+        map_address.disc_number = discrec->root_directory.direct.disc_number;
+        map_address.byte_offset += this_map_size;
+        dummy = map;
+
+        err = adfs_discop_write( &dummy, discrec, &map_address, &this_map_size );
+
+        if ( !err )
+        {
+                printf( "Map written out\n" );
+        }
+
+        return err;
+}
+
+_kernel_oserror *read_map
+(
+        void ** const map,
+        disc_record const * const discrec
+)
+{
+        direct_disc_address map_address;
+        void *dummy;
+        unsigned int this_map_size = map_size( discrec );
+        _kernel_oserror *err;
+
+        dummy = *map = malloc( this_map_size );
+
+        map_address = map_start( discrec );
+        map_address.disc_number = discrec->root_directory.direct.disc_number;
+
+        err = adfs_discop_read( &dummy, discrec, &map_address, &this_map_size );
+
+        if ( err )
+        {
+                printf( "First map copy failed to read due to error &%X:%s\n", err->errnum, err->errmess );
+
+                dummy = *map;
+                this_map_size = map_size( discrec );
+                map_address = map_start( discrec );
+                map_address.disc_number = discrec->root_directory.direct.disc_number;
+                map_address.byte_offset += this_map_size;
+
+                err = adfs_discop_read( &dummy, discrec, &map_address, &this_map_size );
+                if ( err )
+                {
+                        printf( "Second map copy failed to read due to error &%X:%s\n", err->errnum, err->errmess );
+
+                        printf( "Disc very hard to recover - this proggy bails out at this point\n" );
+
+                        return err;
+                }
+
+                if ( !whole_map_is_valid( *map, discrec, Yes ))
+                {
+                        printf( "Second copy of read, but is invalid\n" );
+
+                        if ( query( "Do you want the map fixed from the 2nd copy\n" ))
+                        {
+                                fix_map( *map, discrec );
+                                return write_map( *map, discrec );
+                        }
+
+                        return NULL;
+                }
+
+                printf( "2nd map read OK and is good\n" );
+
+                if ( query( "Do you want the 1st copy overwritten by this" ))
+                {
+                        return write_map( *map, discrec );
+                }
+
+                return NULL;
+        }
+        else if ( !whole_map_is_valid( *map, discrec, Yes ))
+        {
+                printf( "First copy of map bad\n" );
+
+                dummy = *map;
+                this_map_size = map_size( discrec );
+                map_address = map_start( discrec );
+                map_address.disc_number = discrec->root_directory.direct.disc_number;
+                map_address.byte_offset += this_map_size;
+
+                err = adfs_discop_read( &dummy, discrec, &map_address, &this_map_size );
+                if ( err )
+                {
+                        printf( "Second copy of map failed to read due to error &%X:%s\n", err->errnum, err->errmess );
+
+                        if ( query( "Fix the first map copy" ))
+                        {
+                                map_address = map_start( discrec );
+                                map_address.disc_number = discrec->root_directory.direct.disc_number;
+
+                                err = adfs_discop_read( &dummy, discrec, &map_address, &this_map_size );
+
+                                if ( err )
+                                {
+                                        printf( "Re-reading the 1st copy failed due to error &%X:%s\n", err->errnum, err->errmess );
+                                        printf( "Disc not fixable by this proggy\n" );
+
+                                        return err;
+                                }
+
+                                fix_map( *map, discrec );
+                                return write_map( *map, discrec );
+                        }
+
+                        return NULL;
+                }
+
+                if ( !whole_map_is_valid( *map, discrec, Yes ))
+                {
+                        printf( "Second copy of map bad too\n" );
+
+                        if ( query( "Fix second copy and write it out" ))
+                        {
+                                fix_map( *map, discrec );
+                                return write_map( *map, discrec );
+                        }
+
+                        return NULL;
+                }
+
+                printf( "Second copy of map good\n" );
+
+                if ( query( "Do you want the 1st copy overwritten by this" ))
+                {
+                        return write_map( *map, discrec );
+                }
+        }
+        else
+        {
+                /*
+                        1st map read and was valid - no problem!
+                */
+        }
+
+        return NULL;
+}
+
+void initialise_zone_walk
+(
+        unsigned int * const next_free,
+        unsigned int * const bit_offset,
+        unsigned int * const zone_end,
+        disc_record const * const discrec,
+        void const * const map,
+        unsigned int const zone
+)
+{
+        *next_free = ((zone*bits_per_byte)<<discrec->log2_sector_size) + 8; /* 8 = bits to next free in zone_header */
+        *next_free += read_bits( map, *next_free, discrec->fragment_id_length );
+
+        *bit_offset = ((zone*bits_per_byte)<<discrec->log2_sector_size) + zone_header_bits;
+
+        if ( zone == 0 )
+                *bit_offset += zone0bits;
+
+        *zone_end = (((zone+1)*bits_per_byte)<<discrec->log2_sector_size) + zone_header_bits - discrec->zone_spare;
+}
+
+/*
+        Cycle through zones at start_zone, enumerating fragments
+*/
+void do_zone_walk
+(
+        unsigned int const start_zone,
+        pre_zone_function pre_zone_func,        void *pre_zone_func_param,
+        unused_function unused_func,            void *unused_func_param,
+        alloced_function alloced_func,          void *alloced_func_param,
+        post_zone_function post_zone_func,      void *post_zone_func_param,
+        all_done_function all_done_func,        void *all_done_func_param,
+        disc_record const * const discrec,
+        void const * const map
+)
+{
+        unsigned int zone;
+        unsigned int zones_left;
+        unsigned int next_free;
+        unsigned int bit_offset;
+        unsigned int zone_end;
+        unsigned int fragment_id;
+        unsigned int fragment_length;
+
+        zone = start_zone;
+
+        for ( zones_left = discrec->zones_in_map; zones_left; zones_left-- )
+        {
+                /*
+                        Process the stuff at the beginning of the zone
+                */
+                if ( pre_zone_func )
+                        pre_zone_func( pre_zone_func_param, discrec, zone );
+
+                /*
+                        Get values for walking through a zone
+                */
+                initialise_zone_walk( &next_free, &bit_offset, &zone_end, discrec, map, zone );
+
+                /*
+                        While we haven't reached the end of the zone
+                */
+                while ( bit_offset < zone_end )
+                {
+                        /*
+                                Extract the fragment id and length (in map bits)
+                        */
+                        fragment_id = read_bits( map, bit_offset, discrec->fragment_id_length );
+                        fragment_length = read_len( map, bit_offset, discrec->fragment_id_length );
+
+                        /*
+                                Advance the next free block if this one's a free block
+                        */
+                        if ( bit_offset == next_free )
+                        {
+                                next_free += fragment_id;
+
+                                /*
+                                        Process the unused fragment
+                                */
+                                if ( unused_func && unused_func( unused_func_param, discrec, bit_offset, fragment_length ))
+                                        return;
+                        }
+                        else
+                        {
+                                /*
+                                        Process the allocated fragment
+                                */
+                                if ( alloced_func && alloced_func( alloced_func_param, discrec, zone, fragment_id, bit_offset, fragment_length ))
+                                        return;
+                        }
+
+                        /*
+                                Advance to the next fragment
+                        */
+                        bit_offset += fragment_length;
+                }
+
+                /*
+                        Process the stuff at the end of the zone
+                */
+                if ( post_zone_func )
+                        post_zone_func( post_zone_func_param, discrec, zone, bit_offset );
+
+                /*
+                        Move to next zone cycling round
+                */
+                if ( ++zone >= discrec->zones_in_map )
+                        zone = 0;
+        }
+
+        if ( all_done_func )
+                all_done_func( all_done_func_param, discrec, map );
+}

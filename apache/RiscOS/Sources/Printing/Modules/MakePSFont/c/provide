@@ -1,0 +1,1133 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ * provide_font
+ *
+ * Make sure that a given font is available for use.
+ * 
+ * Inputs:
+ *  font name
+ *  output stream
+ * Outputs:
+ *  name to reference the font by (malloc space)
+ *  PostScript on the output stream to make the font available
+ *  declarations to PDriver_MiscOp.
+ *
+ * Actions:
+ *  Determine alphabet, encoding name, encoding file and base encoding file.
+ *  The last will only be applicable for a new style font.
+ *
+ *  Search font list for an identical font.  If found, return its name.
+ * 
+ *  Search font list for a similar font (no matrix, any encoding).  If found,
+ *  construct the desired font from this.
+ *
+ *  If the outlines are derived, follow the derivation and call
+ *  provide_font on the derived-from font.  Then make the required
+ *  changes to the derived-from font to obtain the desired font.
+ *  (using the recursive method this will only be a rename and
+ *  possible reencoding, I think)
+ * 
+ *  Else, download the font.  If there was a matrix, send the base
+ *  version first, then the matrix one.
+ *
+ *  Return name.
+ */
+
+#include "Interface/HighFSI.h"
+
+#include "module.h"
+#include "registry.h"
+#include "misc.h"
+#include "use.h"
+
+#define NAMELEN 64
+#define FILENAMELEN 256
+
+typedef struct
+{
+    int mat[6];
+    Bool used;
+} MatrixRec, *MatrixPtr;
+
+typedef struct
+{
+    char fontname[NAMELEN];
+    char encname[NAMELEN];
+    char encfile[FILENAMELEN];
+    char basefile[FILENAMELEN];
+    char outlines[FILENAMELEN];
+    char metrics[FILENAMELEN];
+    char local[NAMELEN];
+    char foreign[NAMELEN];
+    MatrixRec matrix;
+} FontRec, *FontPtr;
+
+
+/*
+ * Operations on FontRecs
+ */
+
+static FontPtr new_font (void)
+{
+    return (FontPtr) calloc(1, sizeof(FontRec));
+}
+
+static void free_font (FontPtr font)
+{
+    (void) free((char *) font);
+}
+
+static void zero_font (FontPtr font)
+{
+    memset((void *) font, 0, sizeof(FontRec));
+}
+
+
+/*
+ * Useful utilities
+ */
+
+static char *setstring (char *dest, char *source, int size)
+{
+    *(dest + size - 1) = 0;
+    strncpy(dest, source, size - 1);
+    return dest;
+}
+
+
+/*
+ * Compare ignoring case.  Return zero for the same, else non-zero
+ * XXXX Should use territory manager..
+ */
+
+int compare (char *one, char *two)
+{
+    unsigned char a, b;
+    for (; (a = *(unsigned char *)one) && (b = *(unsigned char *)two); one++, two++)
+    {
+        if (islower(a)) a = toupper(a);
+        if (islower(b)) b = toupper(b);
+        if (a != b) return 1;
+    }
+    return *one || *two;
+}
+
+/*
+ * Output structured comments to bracket fonts
+ */
+
+static void beginfont (FILE *f, char *n)
+{
+    fprintf(f, "\n%%%%BeginFont: %s\n", n);
+}
+
+static void endfont (FILE *f)
+{
+    fprintf(f, "%%%%EndFont\n\n");
+}
+
+
+/*
+ * Add a string at an address, and return the address of
+ * the terminating zero.
+ */
+
+static char *add (char *buf, char *what)
+{
+    while (*what) *buf++ = *what++;
+    *buf = 0;
+    return buf;
+}
+
+
+/*
+ * As above but for a matrix
+ */
+
+static char *addmat (char *buf, MatrixPtr mat, char sep)
+{
+    sprintf(buf, "%d%c%d%c%d%c%d%c%d%c%d", mat->mat[0], sep, mat->mat[1], sep,
+            mat->mat[2], sep, mat->mat[3], sep, mat->mat[4], sep, mat->mat[5]);
+    return buf + strlen(buf);
+}
+
+
+/*
+ * Construct a local font name, sticking it in the 'local' field of 'font'.
+ * XXXX check for overflow!
+ */
+
+static void make_local_name (FontPtr font)
+{
+    char *buf = font->local;
+    buf = add(buf, "\\F");
+    buf = add(buf, font->fontname);
+    if (*(font->encname))
+    {
+        buf = add(buf, "\\E");
+        buf = add(buf, font->encname);
+    }
+    if (font->matrix.used)
+    {
+        buf = add(buf, "\\M");
+        buf = addmat(buf, &font->matrix, ' ');
+    }
+}
+
+
+/*
+ * As above for foreign name.
+ * XXXX check for overflow!
+ */
+
+static void make_foreign_name (FontPtr font)
+{
+    char *buf = font->foreign;
+    buf = add(buf, permanent ? FONTTAG_DOWNLOAD : FONTTAG_NORMAL);
+    buf = add(buf, font->fontname);
+    if (!permanent && *(font->encname))
+    {
+        buf = add(buf, "_E");
+        buf = add(buf, font->encname);
+    }
+    if (font->matrix.used)
+    {
+        buf = add(buf, "_M");
+        buf = addmat(buf, &font->matrix, '.');
+    }
+}
+
+
+/*
+ * Split encoding and matrix information out of the
+ * given font name string.  If there's no \E field,
+ * leave encname NULL.  If there's no matrix, leave matrix.used
+ * FALSE, otherwise fill the matrix in.  Modify the font
+ * string in-place to get the encoding and fontname parts.
+ * If there's no \F, then assume the fontname starts
+ * at the beginning.
+ */
+
+static void process_fontname (FontPtr font, char *fontstring)
+{
+    char *p = fontstring, *q;
+    int left;
+    if (!fontstring)
+        return;
+    zero_font (font);
+    setstring(font->local, fontstring, sizeof(font->local));
+
+    q = font->fontname;         /* defaults to start if no \F */
+    left = sizeof(font->fontname);
+
+    while (*p)
+    {
+        if (*p == '\\')
+        {
+            if (q) *q = 0;              /* terminate whatever string we were on */
+            q = 0; p++;
+            switch (*p++)
+            {
+            case   0: return;
+            case 'F': q = font->fontname; left = sizeof(font->fontname); break;
+            case 'E': q = font->encname; left = sizeof(font->encname); break;
+            case 'M':
+                if (sscanf (p, "%d %d %d %d %d %d",
+                            font->matrix.mat + 0, font->matrix.mat + 1, font->matrix.mat + 2,
+                            font->matrix.mat + 3, font->matrix.mat + 4, font->matrix.mat + 5)
+                    == 6)
+                    font->matrix.used = TRUE;
+                /*FALLTHROUGH*/
+            default:
+                while (*p && *p != '\\')
+                    p++;
+            }
+        }                              /* if '\\' */
+        else
+        {
+            if (q && left > 1) { *q++ = *p; left--; }
+            p++;
+        }
+    }                                  /* while *p */
+}
+
+
+static Bool mats_match (FontPtr one, FontPtr two)
+{
+    int i;
+    if (!(one->matrix.used && two->matrix.used))
+        return !(one->matrix.used || two->matrix.used);
+    for (i = 0; i < 6; i++)
+        if (one->matrix.mat[i] != two->matrix.mat[i])
+            return FALSE;
+    return TRUE;
+}
+
+
+#define SAME_ENC_SAME_MAT 4
+#define SAME_ENC_NO_MAT   3
+#define ANY_ENC_SAME_MAT  2
+#define ANY_ENC_NO_MAT    1
+
+static int rank_match (FontPtr wanted, FontPtr current)
+{
+    if (compare (wanted->fontname, current->fontname) == 0)
+    {
+        if (compare (wanted->encname, current->encname) == 0)
+        {
+            if (mats_match(wanted, current))
+                return SAME_ENC_SAME_MAT;
+            else if (current->matrix.used == FALSE)
+                return SAME_ENC_NO_MAT;
+        } else
+        {
+            if (mats_match(wanted, current))
+                return ANY_ENC_SAME_MAT;
+            else if (current->matrix.used == FALSE)
+                return ANY_ENC_NO_MAT;
+        }
+    }
+    return 0;
+}
+
+
+/* Go through the printer fonts looking for the best match with
+ * the given font.  In order of preference:
+ *  same font name, same enc name, same matrix  (4)  MOST PREFERABLE
+ *  same font name, same enc name, no matrix    (3)
+ *  same font name, any enc name, same matrix   (2)
+ *  same font name, any enc name, no matrix     (1)
+ *
+ * Return non-zero rank if a match was found, else zero.
+ */
+
+static int closest_font (FontPtr wanted, FontPtr closest)
+{
+    int handle = 0;
+    int rank = 0;
+    char *bestlocal = NULL, *bestforeign = NULL;
+    do
+    {
+        char *local, *foreign;
+        if (getnext(&handle, &local, &foreign, FONT_REGISTRY))
+        {
+            int thisrank;
+dstring(local);
+            process_fontname (closest, local);
+            thisrank = rank_match (wanted, closest);
+            if (thisrank > rank)
+            {
+                bestlocal = local;
+                bestforeign = foreign;
+                if ((rank = thisrank) == SAME_ENC_SAME_MAT)
+                    goto finished;              /* look no further */
+            }
+        }
+    } while (handle != 0);
+finished:
+    if (bestlocal)
+    {
+        setstring(closest->local, bestlocal, sizeof(closest->local));
+        setstring(closest->foreign, bestforeign, sizeof(closest->foreign));
+    }
+
+    return rank;
+}
+
+
+
+static void lose_font (int handle)
+{
+    _swix(Font_LoseFont, _IN(0), handle);
+}
+
+
+static void read_encoding_file (FontPtr font,
+                                int *alpha /* alphabet number (of base if present) */
+                               )
+{
+    FILE *f = fopen(font->encfile, "r");
+    char buf[64];
+    *(font->basefile) = 0;
+    *alpha = -1;
+    if (!f) return;
+    
+    while (fgets(buf, sizeof(buf), f) != NULL)
+        if (*buf != ' ' && *buf != '\n' && *buf != '%')
+            goto ret;
+        else if (strncmp(buf, ROALPHABET, sizeof(ROALPHABET) - 1) == 0 && *alpha == -1)
+            sscanf(buf + sizeof(ROALPHABET) - 1, "%d", alpha);
+        else if (strncmp(buf, ROBASEDON, sizeof(ROBASEDON) -1) == 0)
+        {
+            sscanf(buf + sizeof(ROBASEDON) - 1, "%d", alpha);
+/* XXX should check length */
+            sprintf(font->basefile, "%s%s%d", PUBLICENCDIR, BASEBASE, *alpha);
+            goto ret;
+        }
+ ret:
+    fclose(f);
+    return;
+}
+
+
+/* Append alphabet part to font name.  There should be space! */
+
+static void fontfilename(char *outbuff,       /* already filled in */
+                         char *leafname,      /* eg Outlines */
+                         int alphabet)
+{
+    char numbuff[8];
+    int excess;
+    outbuff += strlen(outbuff);
+
+    if (alphabet < 0)
+    {
+        (void) add(outbuff, leafname);
+    } else
+    {
+        sprintf(numbuff, "%d", alphabet);
+        excess = strlen(leafname) + strlen(numbuff) - 10;
+        if (excess < 0)
+            excess = 0;
+        outbuff = add(outbuff, leafname) - excess;
+        (void) add(outbuff, numbuff);
+    }
+}
+
+
+/* XXX Should check for overflow */
+
+static void make_fontfile_name(char *dest,     /* FILENAMELEN bytes */
+                               char *prefix,   /* NULL means it's there already */
+                               char *leafname, /* Outlines or IntMetrics */
+                               int alpha)      /* -1 for none */
+{
+    char *destp = dest;
+    *destp = 0;
+
+    if (prefix)
+        destp = add(destp, prefix);
+    if (destp > dest && *(destp - 1) != '.')
+        destp = add(destp, ".");
+    fontfilename(destp, leafname, alpha);
+}
+
+
+/* Report file size, or -1 if file does not exist */
+
+int filesize (char *name)
+{
+    int type, size;
+    if (_swix (OS_File, _INR(0,1) | _OUT(0) | _OUT(4),
+               OSFile_ReadNoPath, name, &type, &size)
+        || type == object_nothing)
+        return -1;
+    return size;
+}
+
+
+/*
+ * If the outlines file is derived, then get the font name it contains.
+ * Return the font's RISCOS font name, which should be freed.
+ */
+
+static char *follow_derivation (char *outlines)
+{
+    char *file, *p;
+    int size;
+    if ((size = filesize(outlines)) <= 0 || size > FOLLOW_MAX_SIZE)
+        return NULL;
+    if ((file = read_whole_file(outlines, NULL)) == NULL)
+        return NULL;
+    if (file[0] == 'F' && file[1] == 'O' && file[2] == 'N' && file[3] == 'T')
+    {
+        free(file);
+        return NULL;
+    }
+    /* The file contents are the derived-from font name.  Ensure that
+     * the thing is sensibly terminated, though.
+     */
+    for (p = file; *p >= 32; p++) ;
+    *p = 0;
+    return file;
+}
+
+
+
+/*
+ * Find information about a font.
+ * The string in font->local is used for the call to FindFont.
+ * This should be set up by process_fontname() so that font->fontname, etc,
+ * are also set up.
+ *
+ * The following will be set (to the empty string, if appropriate):
+ *   font->encfile
+ *   font->basefile
+ *   font->outlines
+ *   font->metrics
+ *
+ * Kerning information is returned via the var parameter kernret if the
+ * flag kern was set.  The data should be freed by the caller.  If for
+ * any reason kern info could not be obtained, then NULL will be returned
+ * in *kernret.
+ */
+
+static os_error *find_font (FontPtr font,
+                            int *alpha,          /* alphabet (-1 for none) */
+                            Bool kern,           /* return kern info... */
+                            int **kernret        /* ...as malloc data */
+                           )
+{
+    int handle;
+    os_error *err;
+    char prefix [FILENAMELEN];  /* XXXX put this on the heap!! */
+
+    *(font->outlines) = *(font->metrics) = *(font->basefile) = *(font->encfile) = 0;
+    *alpha = -1;
+
+    if (!*(font->local))
+        make_local_name(font);
+
+    err = _swix (Font_FindFont, _INR(1,5) | _OUT(0),
+                 font->local, 16, 16, 0, 0,     /* 1 point for kerning purposes */
+                 &handle);
+    if (err) return err;
+
+    if (_swix (Font_ReadFontPrefix, _INR(0,2), handle, prefix, sizeof(prefix)))
+    {
+        lose_font(handle);
+        return make_error(EPREFIX);
+    }
+
+    if (_swix (Font_ReadEncodingFilename, _INR(0,2), handle, font->encfile,
+               sizeof(font->encfile)))
+    {
+        lose_font(handle);
+        return make_error(EBADENCODING);
+    }
+
+    if (kern)
+    {
+        char *kdata;
+        int size;
+        if (_swix (Font_ReadFontMetrics, _INR(0,7) | _OUT(5),
+                   handle, 0, 0, 0, 0, 0, 0, 0, &size))
+            kdata = NULL;
+        else
+            kdata = malloc(size);
+        if (kdata)
+        {
+            if (_swix (Font_ReadFontMetrics, _INR(0,7),
+                       handle, 0, 0, 0, 0, kdata, 0, 0))
+            {
+                free(kdata); kdata = NULL;
+            }
+        }
+        *kernret = (int *) kdata;
+    }
+
+    lose_font(handle);
+
+    /* Now we have the prefix, the encoding filename, the user matrix */
+
+    if (*(font->encfile) && filesize(font->encfile) != -1)
+    {
+        char *dot = strrchr(font->encfile, '.');
+        if (dot && compare(dot, ".Encoding") == 0)
+            *alpha = -1;
+        else
+            read_encoding_file(font, alpha);    /* May set basefile too */
+    } else
+    {
+        /* No encoding filename.  Use IntMetrics and Outlines.  Try to
+         * find an appropriate encoding for the font.  This is sought by
+         * looking up the first portion of the fontname in a private
+         * encoding file inside !Printers.  Note that any private encoding
+         * within the font directory will be used (above) in preference
+         * to this.
+         */
+        char *p = add(font->encfile, PRIVATEENCDIR);
+        char *q = font->fontname;
+        while (*q && *q != '.')
+            *p++ = *q++;
+        *p = 0;
+        if (filesize(font->encfile) == -1)
+            *(font->encfile) = 0;               /* Could not find an encoding file */
+        *alpha = -1;
+    }
+
+    /* Now the Outlines and Metrics filenames */
+
+    make_fontfile_name(font->outlines, prefix, "Outlines", *alpha);
+    make_fontfile_name(font->metrics,  prefix, "IntMetrics", *alpha);
+    return NULL;
+}
+
+
+/* Scan list of registered encodings for one which matches
+ * encname, ignoring case.  If the font is found, then
+ * return a pointer to the correct name to use for referencing
+ * this encoding (a block in the RMA not owned by me).  If the
+ * encoding was not found, download it now and add it to
+ * the list of known encodings.
+ *
+ * Pass output==NULL for no output.
+ */
+
+static char *ensure_encoding (FILE *output, char *encname, char *encfile)
+{
+    if (!encname || !do_declarations)
+        return NULL;
+    else
+    {
+        int handle = 0, c;
+        FILE *f;
+        char *local, *alien, realname[64], ver[64], rev[64];
+        *ver = *rev = 0;
+
+        do
+        {
+            if (getnext(&handle, &local, &alien, ENCODING_REGISTRY))
+                if (compare(local, encname) == 0 || compare(alien, encname) == 0)
+                    return alien;
+        } while (handle != 0);
+
+        if (!encfile || (f = fopen(encfile, "r")) == NULL)
+            return NULL;
+
+        if (fscanf(f, "%% %s %[0123456789.] %[0123456789]%*[^\n]\n", realname, ver, rev) != 3
+            || !*realname || !*ver || !*rev)
+        {
+            rewind(f);
+            sprintf(realname, "Acorn_%sEncoding", encname);
+            strcpy(ver, "1.00");
+            strcpy(rev, "0");
+        }
+
+        if (output)
+        {
+            fprintf(output, "\n\n%%%%BeginProcSet: %s %s %s\n", realname, ver, rev);
+            fprintf(output, "/%s [\n", realname);
+            while ((c = getc(f)) != EOF)
+                putc(c, output);
+            fprintf(output, "] def\n\n");
+            fprintf(output, "%%%%EndProcSet\n");
+        }
+        fclose(f);
+        return addrecord(encname, realname, ENCODING_REGISTRY, FALSE);
+    }
+} 
+    
+
+static void showFP (FILE *out, int fp)
+{
+    if (fp < 0)
+    {
+        fp = -fp;
+        putc ('-', out);
+    }
+    fprintf (out, "%d.%03d ", fp >> 16, ((fp & 0xFFFF) * 1000) / 65536);
+}
+
+
+static void printmat (FILE *output, MatrixPtr mat)
+{
+    if (!mat->used)
+        return;
+    fputs("[ ", output);
+    showFP(output, mat->mat[0]);
+    showFP(output, mat->mat[1]);
+    showFP(output, mat->mat[2]);
+    showFP(output, mat->mat[3]);
+    fprintf(output, "%d %d ]", mat->mat[4], mat->mat[5]);
+}
+
+static void declare_font (char *local, char *alien)
+{
+    if (do_declarations)
+    {
+        dstringc("Declare local *"); dstringc(local);
+        dstringc("* as *"); dstringc(alien); dstring("*");
+        (void) addrecord(local, alien, FONT_REGISTRY, TRUE);
+#if DEBUG
+        seethem(FONT_REGISTRY);
+#endif
+    }
+}
+
+static void declare_extra_font (char *alien, int flags, Bool overwrite)
+{
+    if (do_extra_declarations)
+        (void) addrecord(alien, "X", flags, overwrite);
+}
+
+
+/* XXX This should also reset the following stuff:
+ *     FontBBox, Underline{Position,Thickness}, ItalicAngle, FullName,
+ *     FamilyName, Weight, and the WIDTH info for the glyphs.
+ * This means serious delving in the metrics file as well as
+ * making a real copy of the FontInfo dict.
+ */
+
+static void modify_font(FILE *output, char *from, char *to,
+                        char *encname, MatrixPtr matrix)
+{
+    if (procremap)
+    {
+        fprintf(output, "/%s ", to);
+        if (encname)
+            fprintf(output, "%s ", encname);
+
+        if (matrix->used)
+            printmat(output, matrix);
+        else
+            fprintf(output, "false");
+
+        fprintf(output, " /%s %s\n", from, encname ? "RFE" : "RF");
+    } else
+    {
+        /* Can't expect to find RF and RFE in this case! */
+        fprintf(output, "\n%% Modify font %s to get font %s\n", from, to);
+        fprintf(output, "/%s findfont  dup length dict  begin\n", from);
+        fprintf(output, "  {1 index /FID ne {def} {pop pop} ifelse} forall\n");
+        if (encname)
+            fprintf(output, "  /Encoding %s def\n", encname);
+        if (matrix->used)
+        {
+            fprintf(output, "  /FontMatrix FontMatrix ");
+            printmat(output, matrix);
+            fprintf(output, " 6 array concatmatrix def\n");
+        }
+        fprintf(output, "currentdict end\n");
+        fprintf(output, "/%s exch definefont pop\n\n", to);
+    }
+
+    declare_extra_font(from, DF_REGISTRY, FALSE);       /* Declare the font we used */
+    declare_extra_font(to, DSF_REGISTRY, TRUE);         /* And the one we've supplied */
+}
+
+
+static void copyresult (char *dest, int *len, char *source)
+{
+    int srclen = strlen(source) + 1;
+    if (*len >= srclen)
+    {
+        strcpy(dest, source);
+        *len = 0;
+    }
+    else
+        *len = srclen;
+}
+
+/* Rotate right by 4 bits in lowest 8 bits */
+
+#define ROTATE(n) ( (((n) >> 4) | ((n) << 4)) & 0xFF )
+
+static void kerntable (FILE *output, int *kerndata)
+{
+    unsigned int flags = (unsigned int) kerndata[257];
+    Bool x_present  = !(flags & (1 << 1));
+    Bool y_present  = !(flags & (1 << 2));
+    Bool compressed = (flags & 0x80000000);
+    int entrysize = (!compressed) + x_present + y_present;    /* entry size in words */
+    int npairs = ((kerndata[256] >> 2) - 258) / entrysize;
+    int bucket;
+
+    if (!(x_present || y_present))
+        return;
+
+    fprintf(output, "/KernData %d dict dup begin\n", npairs);
+    for (bucket = 0; bucket < 256; bucket++)
+    {
+        int *first = kerndata + kerndata[bucket] / 4;
+        int *last  = kerndata + kerndata[bucket + 1] / 4;
+        int *pair;
+        for (pair = first; pair < last; )
+        {
+            int charA, charB, xoff = 0, yoff = 0;
+            if (compressed)
+            {
+                charA = *pair++;
+                if (x_present)
+                {
+                    xoff = charA >> 8;
+                    if (y_present) yoff = *pair++;
+                } else if (y_present)
+                    yoff = charA >> 8;
+            } else
+            {
+                charA = *pair++;
+                if (x_present) xoff = *pair++;
+                if (y_present) yoff = *pair++;
+            }
+            charA &= 0xFF;
+            charB = ROTATE(charA ^ bucket);
+            if (x_present && !y_present)
+                fprintf(output, "%d %d def\n", (charA << 8) | charB, xoff);
+            else
+                fprintf(output, "%d [%d %d] def\n", (charA << 8) | charB, xoff, yoff);
+        }
+    }
+    fprintf(output, "end def\n");
+}
+
+
+/* Pass NULL as output if you don't want any output */
+
+os_error *ensure_font (char *name, FILE *output, char *nameret, int *namelen, Bool kern)
+{
+    os_error *err = NULL;
+    char *regencname, *der_name;
+    int alpha, rank;
+
+    FontPtr font = NULL, closest = NULL, final = NULL;
+
+    int *kerndata = NULL;
+
+    if (permanent) kern = FALSE;
+
+dstringc("Inside ensure "); dstring(name);
+    font = new_font();
+    if (!font)
+    {
+        err = make_error(EWORKSPACE);
+        goto finished;
+    }
+
+    process_fontname(font, name);
+dstring("processed");
+    err = find_font(font, &alpha, kern, &kerndata);
+dstring("found");
+    if (err)
+    {
+        dstring(err->errmess);
+        goto finished;
+    }
+dstring("didn't error");
+    /* Be explicit about the encoding name if it defaulted - the user might
+     * change territory later.
+     * For permanent download jobs we guarantee that the
+     * font name will be DL_<riscos font name>.  When the
+     * printer driver tries to use the font we make the
+     * encoding-specific version.  This is done for regular
+     * fonts as well as alphabet ones, as we can't tell which
+     * encodings are present in a remote printer.
+     */
+
+    if (!*(font->encname))
+    {
+        if (*(font->encfile) && alpha != -1)
+        {
+            /* Public encoding */
+            char *dot = strrchr(font->encfile, '.');
+            if (dot)
+                setstring(font->encname, dot + 1, sizeof(font->encname));
+        } else if (*(font->encfile) && alpha == -1)
+        {
+            /* Private encoding; name the encoding as the font name */
+            /* XXXX shouldn't this be first component only? */
+            setstring(font->encname, font->fontname, sizeof(font->encname));
+        } else
+        {
+            /* Last ditch; use OldLatin1 */
+            setstring(font->encfile, OLDLATIN1, sizeof(font->encfile));
+            setstring(font->encname, "OldLatin1", sizeof(font->encname));
+        }
+    }
+
+
+    /* Permanent downloads go without an encoding and without a _E
+     * suffix; this is so that remapping works from a client machine.
+     */
+dstring("checking perm flag");
+    if (permanent)
+    {
+        dstring("permanent - no encoding information");
+        setstring(font->encname, "Base", sizeof(font->encname));
+        regencname = "StandardEncoding";
+    }
+    else
+    {
+dstring("non-perm... ensuring enc");
+        regencname = ensure_encoding(output, font->encname, font->encfile);
+        /* NULL if the encoding is not now available by name.
+         * Also NULL if do_declarations is FALSE, in which case we
+         * don't even reference regencname.
+         */
+        if (alpha == -1) *(font->encname) = 0;
+    }
+
+#if 0
+    if (permanent && alpha != -1)
+    {
+        dstring("Permanent alpha - no encoding");
+        setstring(font->encname, "Base", sizeof(font->encname));
+        regencname = " [] ";
+    } else
+    {
+        regencname = ensure_encoding(output, font->encname, font->encfile);
+        /* NULL if the encoding is not now available by name.
+         * Also NULL if do_declarations is FALSE, in which case we
+         * don't even reference regencname.
+         */
+        if (alpha == -1) *(font->encname) = 0;
+    }
+#endif
+
+
+    /* Look for the exact font */
+
+    closest = new_font();
+    if (!closest)
+    {
+        err = make_error(EWORKSPACE);
+        goto finished;
+    }
+
+dstringc("Seeking closest... ");
+    rank = closest_font(font, closest);
+dint("Closest rank ", rank);
+
+    if (rank == SAME_ENC_SAME_MAT)
+    {
+        final = closest;
+        dstring("Exact match");
+        goto finished;
+    } else if (rank != 0)
+    {
+        /* Either both encs are NULL or neither are */
+        dstring("Modifying");
+        make_local_name(font);     /* ensures regularity of the local font name */
+        make_foreign_name(font);
+        if (output)
+        {
+            beginfont(output, font->foreign);
+            modify_font(output, closest->foreign, font->foreign,
+                        regencname, &(font->matrix));
+            endfont(output);
+        }
+        declare_font(font->local, font->foreign);
+        final = font;
+        goto finished;
+    }
+
+
+    /* Can't get away with a simple remap, so we must try harder.
+     * First see if the font is derived.  If so, recursively provide
+     * its derived-from font.  Leave the foreign name in closest.foreign.
+     */
+
+    der_name = follow_derivation(font->outlines);
+    if (der_name)
+    {
+        int len = sizeof(closest->foreign);
+        err = ensure_font(der_name, output, closest->foreign, &len, FALSE);     /* no kerns */
+        free(der_name);
+        if (err) goto finished;
+        /*
+         * Now just map onto closest->foreign
+         */
+        make_local_name(font);     /* ensures regularity of the local font name */
+        make_foreign_name(font);
+        if (output)
+        {
+            beginfont(output, font->foreign);
+            modify_font(output, closest->foreign, font->foreign,
+                        regencname, &(font->matrix));
+            endfont(output);
+        }
+        declare_font(font->local, font->foreign);
+        final = font;
+        goto finished;
+    }
+
+    /* Finally...
+     * Font not present yet and not derived.
+     * - If we've been asked not to do full downloads, then use the default
+     * - If we have a Type1 file available, then
+     *     send it down, using private name and no encoding
+     *     if there's an encoding or matrix, then remap
+     * - If we have no Outlines for the font, then use the default.
+     * - Else convert & download the base version (desired encoding and no matrix)
+     *     and remap with a matrix if needed.
+     */
+
+    setstring(closest->fontname, font->fontname, sizeof(closest->fontname));
+    setstring(closest->encname, font->encname, sizeof(closest->encname));
+    closest->matrix.used = FALSE;
+
+    make_local_name(closest); make_foreign_name(closest);
+
+    /* only happens in permanent downloads, when kerning isn't happening */
+    if (permanent && dont_allow_downloads)
+    {
+        /* Replace the foreign name with a default font, which we hope
+         * will be present in the printer.  Currently this default is compiled
+         * in.  Perhaps the actual value should come from somewhere else?
+         */
+        dstring("Not allowing download!");
+        setstring(closest->foreign, DEFAULTFONT, sizeof(closest->foreign));
+        declare_font(closest->local, closest->foreign);
+    }
+    else
+    {
+        char *t1file;
+
+#if DEBUG
+        if (output)
+        {
+            dstring("actually downloading");
+            dstring(closest->foreign);
+            dstring(regencname);
+            dint("", alpha);
+            dstring(alpha != -1 ? font->basefile : font->encfile);
+            dstring(font->outlines);
+            dstring(font->metrics);
+        }
+#endif
+        
+        /* Try to send existing Type1 file.  Always use the font's inbuilt encoding for this
+         * step, and send a remap afterwards if not permanent.  The sendtype1file routine
+         * does not declare the font.
+         */
+
+        if (t1file = type1filename(font->outlines))   /* malloc */
+        {
+            /* Download it with no particular encoding and no matrix */
+
+            setstring(closest->encname, "Base", sizeof(closest->encname));
+            make_local_name(closest); make_foreign_name(closest);
+            if (output)
+            {
+                beginfont(output, closest->foreign);
+                sendtype1file(output, closest->foreign, t1file);
+                endfont(output);
+                declare_extra_font(closest->foreign, DSF_REGISTRY, TRUE);
+            }
+            free(t1file);
+            declare_font(closest->local, closest->foreign);
+
+
+            /* Do at most one remap.  This can have a new encoding, a new matrix or both.
+             * Note that if it's both, we don't send the version with encoding but
+             * no matrix (unlike in the T3 case below).  This doesn't matter; if we
+             * are ever asked for that version we'll generate it from the Base version.
+             */
+
+            if (!permanent || font->matrix.used)
+            {
+                make_local_name(font); make_foreign_name(font);
+                if (output)
+                {
+                    beginfont(output, font->foreign);
+                    modify_font(output, closest->foreign, font->foreign, permanent ? NULL : regencname, &(font->matrix));
+                    endfont(output);
+                }
+                declare_font(font->local, font->foreign);
+                final = font;
+            }
+            else
+                final = closest;
+        }
+
+        else
+        {
+            /* Final solution: convert outlines into type 3 and download */
+
+            char *encbodge = NULL;
+
+            if (filesize(font->outlines) == -1)
+            {
+                /* Replace the foreign name with a default font, which we hope
+                 * will be present in the printer.  Currently this default is compiled
+                 * in.  Perhaps the actual value should come from somewhere else?
+                 */
+                dstring("No outlines, using default font");
+                setstring(closest->foreign, DEFAULTFONT, sizeof(closest->foreign));
+                encbodge = regencname;
+            }
+            else if (output)
+            {
+                beginfont(output, closest->foreign);
+                make_t3(output, closest->foreign, font->outlines, font->metrics,
+                        regencname,
+                        alpha != -1 ? font->basefile : font->encfile);
+                endfont(output);
+                declare_extra_font(closest->foreign, DSF_REGISTRY, TRUE);
+            }
+            declare_font(closest->local, closest->foreign);
+
+            if (font->matrix.used || encbodge)
+            {
+                make_local_name(font); make_foreign_name(font);
+                if (output)
+                {
+                    beginfont(output, font->foreign);
+                    modify_font(output, closest->foreign, font->foreign, encbodge, &(font->matrix));
+                    endfont(output);
+                }
+                declare_font(font->local, font->foreign);
+                final = font;
+            }
+            else
+                final = closest;
+        }
+    }
+    
+finished:
+    if (err)
+    {
+        dstringc("Error: "); dstring(err->errmess);
+    } else if (final)
+    {
+        if (kerndata && strncmp(final->foreign, FONTTAG_KERNED, sizeof(FONTTAG_KERNED) - 1) != 0)
+        {
+            char *newname = malloc(strlen(final->foreign) + sizeof(FONTTAG_KERNED) - 1);
+            if (!newname)
+            {
+                err = make_error(EWORKSPACE);
+                goto finished;
+            }
+            if (strncmp(final->foreign, FONTTAG_NORMAL, sizeof(FONTTAG_NORMAL) -1) == 0 ||
+                strncmp(final->foreign, FONTTAG_DOWNLOAD, sizeof(FONTTAG_DOWNLOAD) -1) == 0)
+                sprintf(newname, "%s%s", FONTTAG_KERNED, final->foreign + sizeof(FONTTAG_NORMAL) - 1);
+            else
+                sprintf(newname, "%s%s", FONTTAG_KERNED, final->foreign);
+            if (output)
+            {
+                beginfont(output, newname);
+                fprintf(output, "/%s findfont  dup length 1 add dict  begin\n", final->foreign);
+                fprintf(output, "{1 index /FID ne {def} {pop pop} ifelse} forall\n");
+                kerntable (output, kerndata);
+                fprintf(output, "currentdict end  /%s exch definefont pop\n", newname);
+                endfont(output);
+            }
+            declare_font(final->local, newname);                        /* override old one */
+            declare_extra_font(final->foreign, DF_REGISTRY, FALSE);     /* Declare the font we used */
+            declare_extra_font(newname, DSF_REGISTRY, TRUE);            /* And the one we've supplied */
+            free(newname);
+        }
+        if (nameret)
+            copyresult(nameret, namelen, final->foreign);
+    }
+            
+    free((char *)kerndata);
+    free_font(font);
+    free_font(closest);
+    return err;
+}
+
+

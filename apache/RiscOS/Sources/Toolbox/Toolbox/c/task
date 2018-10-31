@@ -1,0 +1,1127 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:    task.c
+ * Purpose: tasks running under the Toolbox
+ * Author:  Ian Johnson
+ * History: 9-Sep-93:  IDJ:   created
+ *          15-Jun-94: IDJ:   fixed confusion over null msg list, and msg list with just 0 in it
+ *                            (now reflects wimp behaviour)
+ *          21-Jun-94: IDJ:   deliver Quit message even if not asked for.
+ *          29-Jul-94: IDJ:   make sure error is reported if occurs while loading a res file.
+ *                            (used to just say Could not load resource file).
+ *          21-Nov-94: IDJ:   bug-fix AQU-00071 (task_exit).
+ *          23-nov-94: IDJ:   bug fix AQU-00591: check for invalid reason code
+ *          22-Dec-94: IDJ:   use string_length on dir name not strlen.
+ *
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+#include "Global/FSNumbers.h"
+#include "Global/Services.h"
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "string32.h"
+#include "messages.h"
+
+#include "globals.h"
+#include "callback.h"
+#include "task.h"
+
+
+#define SPRITES11
+
+
+static TaskDescriptor *task__list;    /* the list of all tasks */
+
+static char           *prefilter_name = "tbox_pre";      /* names of the filters.  These are globals */
+static char           *postfilter_name = "tbox_post";    /* so that the same register contents are   */
+                                                         /* passed to the registration and           */
+                                                         /* deregistration filter SWIs.  Not that    */
+                                                         /* code area string constants are not good  */
+                                                         /* enough! */
+
+
+/**************************************** linked list of tasks handling *****************************/
+
+static void task__add_to_list (TaskDescriptor *t)
+{
+    /*
+     * Function to add an element to the list of tasks
+     * (add to head of list)
+     */
+
+    t->next = task__list;
+    t->prev = NULL;
+    if (task__list != NULL)
+        task__list->prev = t;
+    task__list = t;
+}
+
+
+static void task__remove_from_list (TaskDescriptor *t)
+{
+    /*
+     * Function to remove a given task descriptor from the active list
+     */
+
+    DEBUG mem_chk(t, CHECK_HEAP | CHECK_NONZERO);
+
+    if (t == task__list)
+        task__list = t->next;
+    else
+        t->prev->next = t->next;
+
+    if (t->next != NULL)
+        t->next->prev = t->prev;
+
+}
+
+
+static void task__delete (TaskDescriptor *t)
+{
+    /*
+     * Function to delete a task descriptor (inc remove it from the list)
+     * All store associated with this task is freed.
+     */
+
+    _kernel_swi_regs regs;
+
+    DEBUG mem_chk(t, CHECK_HEAP | CHECK_NONZERO);
+
+    /*
+     * first free up store used to hold task info which task.c knows about
+     */
+
+    if (t->info.name != NULL)
+        mem_free (t->info.name, "removing task name");
+
+    if (t->info.dir_name != NULL)
+        mem_free (t->info.dir_name, "removing dir name");
+
+    if (t->info.sprite_area != NULL && t->info.sprite_area != (void *)1 &&
+        !t->info.sprite_area_in_resourcefs)
+        mem_free (t->info.sprite_area, "removing sprite area");
+
+    if (t->toolbox_event_list != NULL)
+        mem_free (t->toolbox_event_list, "removing toolbox event list");
+
+    if (t->wimp_msg_list != NULL)
+        mem_free (t->wimp_msg_list, "removing wimp msg list");
+
+    object_remove_list ();
+
+    resf_remove_list ();
+
+    filters_remove_list ();
+
+
+    /*
+     * remove main pre and postfilters for this task
+     */
+
+    regs.r[0] = (int)prefilter_name;
+    regs.r[1] = (int)&prefilter_veneer;
+    regs.r[2] = (int)t;
+    regs.r[3] = t->info.wimp_handle;
+    _kernel_swi (Filter_DeRegisterPreFilter, &regs, &regs);
+
+    regs.r[0] = (int)postfilter_name;
+    regs.r[1] = (int)&postfilter_veneer;
+    regs.r[2] = (int)t;
+    regs.r[3] = t->info.wimp_handle;
+    regs.r[4] = 0;
+    _kernel_swi (Filter_DeRegisterPostFilter, &regs, &regs);
+
+
+    /*
+     * close the task's messages file for it
+     */
+
+    _swix (MessageTrans_CloseFile, _IN(0), &t->info.messages_fd);
+    if (t->info.messages_name != NULL)
+        mem_free (t->info.messages_name, "removing messages name");
+
+    /*
+     * ... and finally remove the task descriptor
+     */
+
+    task__remove_from_list (t);
+
+    mem_free (t, "removing task descriptor");
+
+    mem_print_list();
+}
+
+
+/********************************************** client SWIs *****************************************/
+
+extern _kernel_oserror *task_get_sys_info (_kernel_swi_regs *r)
+{
+
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *
+     *         R0 Value       Meaning
+     *         --------       -------
+     *             0          return task name
+     *             1          return 4-word messages file descriptor
+     *             2          return name of directory passed to
+     *                        Toolbox_Initialise
+     *             3          return task's Wimp task handle
+     *             4          return pointer to sprite area used.
+     *
+     *         R1, R2 depends on entry value of R0 (see below)
+     *
+     *   Exit:
+     *         R0 on entry      On exit
+     *         -----------      -------
+     *              0           if R1 was 0
+     *                              R2 holds size of buffer required
+     *                          else
+     *                              buffer pointed at by R1 holds task
+     *                              name.
+     *              1           buffer pointed at by R1 contains a
+     *                          4-word messages file descriptor.
+     *              2           if R1 was 0
+     *                              R2 holds size of buffer required
+     *                          else
+     *                              buffer pointed at by R1 holds
+     *                              directory name passed to
+     *                              Toolbox_Initialise.
+     *              3           R0 contains task handle.
+     *              4           R0 contains sprite area pointer.
+     *
+     */
+
+    DEBUG mem_chk(r, CHECK_NONZERO);
+
+    switch (r->r[0])
+    {
+        case Toolbox_GetSysInfo_TaskName:
+            string_to_buffer ((char *)r->r[1], task->info.name, &r->r[2]);
+            break;
+
+        case Toolbox_GetSysInfo_DirName:
+            {
+                int reqd;
+
+                reqd = string_length (task->info.dir_name) + 1 /* terminator */;
+                if (task->info.dir_name_was_dir) reqd--; /* un pathify */
+                if (r->r[1] == 0)
+                {
+                    r->r[2] = reqd; /* override string_to_buffer's view of length */
+                    return NULL;
+                }
+                r->r[2] = MIN (reqd, r->r[2]);
+                string_to_buffer ((char *)r->r[1], task->info.dir_name, &r->r[2]);
+            }
+            break;
+
+        case Toolbox_GetSysInfo_MessagesFD:
+            if (r->r[1] != 0)
+            {
+                /*
+                 * return message file descriptor block in buffer pointed at by R1
+                 */
+
+                memcpy ((void *)r->r[1], (void *)task->info.messages_fd, 4*sizeof(int));
+            }
+            break;
+
+        case Toolbox_GetSysInfo_TaskHandle:
+            r->r[0] = task->info.wimp_handle;
+            break;
+
+        case Toolbox_GetSysInfo_SpriteArea:
+            r->r[0] = (int)task->info.sprite_area;
+
+            DEBUG debug_output ("sprite", "T:Returning sprite area %p\n", task->info.sprite_area);
+            break;
+
+        default:
+            /* bug fix AQU-00591: IDJ: 23-Nov-94: check for invalid reason code */
+            return make_error (Toolbox_BadGetSysInfoReason, 0);
+    }
+
+    return NULL;
+}
+
+static _kernel_oserror *task__load_messages_file (TaskDescriptor *t, _kernel_swi_regs *r)
+{
+
+    /*
+     * Function to load a sibling Messages file.  Tries <app$dir>.Message<territorynumber>
+     * first, then <app$dir>.Messages
+     */
+
+    char             filename[MAXFILENAME];
+    _kernel_oserror *e = NULL;
+    int              territory = 0;
+    int              pass;
+
+    for (pass = 0; pass < 2; pass++)
+    {
+        switch (pass)
+        {
+            /*
+             * First pass - read territory number and try Message<n>
+             */
+          case 0:
+            if (_swix(Territory_Number, _OUT(0), &territory) != NULL)
+                continue;
+            sprintf(filename, "%sMessage%d", t->info.dir_name, territory);
+            break;
+            /*
+             * Second pass - try Messages
+             */
+          case 1:
+            sprintf(filename, "%sMessages", t->info.dir_name);
+            break;
+        }
+
+        /*
+         * Need to keep filename in RMA so MessageTrans can refer to it later
+         */
+        t->info.messages_name = mem_allocate(string_length(filename)+1, "messages name");
+        if (t->info.messages_name == NULL)
+            return make_error(Toolbox_NoMem, 0);
+        string_copy(t->info.messages_name, filename);
+
+        DEBUG debug_output ("start", "T:Trying messages file %s\n", t->info.messages_name);
+
+        e = _swix(MessageTrans_OpenFile, _INR(0,2), t->info.messages_fd, t->info.messages_name, 0);
+        if (e) {
+            DEBUG debug_output("start", "T:error -> %s\n", e->errmess);
+            mem_free(t->info.messages_name, "removing messages name");
+            t->info.messages_name = NULL;
+        }
+        else {
+            break;
+        }
+    }
+
+    if (e)
+        return e;
+
+    /* return messages file descriptor to caller */
+    if (r->r[5] != 0)
+        memcpy ((void *)r->r[5], t->info.messages_fd, sizeof(t->info.messages_fd));
+
+    DEBUG debug_output ("start", " writing messages fd @%p \n", (void *)r->r[5]);
+
+    return NULL;
+}
+
+
+static _kernel_oserror *task__start_wimp_task (TaskDescriptor *t, _kernel_swi_regs *r, int*wimp_version)
+{
+
+    /*
+     * Function to start up as a Wimp task.  The wimp version number is returned
+     * and the task's wimp task handle is stored in the task descriptor
+     */
+
+    char            *appname;
+    _kernel_swi_regs regs;
+    _kernel_oserror *e;
+    int              events[2];
+
+    /* look up task name */
+    regs.r[0] = (int)t->info.messages_fd;
+    regs.r[1] = (int)"_TaskName";
+    regs.r[2] = 0;                  /* use looked up message in-place */
+    regs.r[3] = 0;
+    regs.r[4] = 0;
+    regs.r[5] = 0;
+    regs.r[6] = 0;
+    regs.r[7] = 0;
+    if ((e = _kernel_swi (MessageTrans_Lookup, &regs, &regs)) != NULL)
+    {
+        return e;
+    }
+    appname = (char *)regs.r[2];
+
+    if ((t->info.name = (char *)mem_allocate (string_length(appname)+1, "task name")) == NULL)
+        return make_error (Toolbox_NoMem, 0);
+
+    string_copy (t->info.name, appname);
+
+    DEBUG debug_output ("start", "T:Start Wimp task %s", appname);
+
+    /* initialise as Wimp task */
+    regs.r[0] = r->r[1];
+    regs.r[1] = 0x4b534154;    /*'TASK'*/
+    regs.r[2] = (int)appname;
+    regs.r[3] = r->r[2];
+    if ((e = _kernel_swi (Wimp_Initialise, &regs, &regs)) != NULL)
+        return e;
+
+    t->info.wimp_handle = regs.r[1];
+    *wimp_version       = regs.r[0];
+
+
+    /*
+     * a client must always get wimp_MTOOLBOX_EVENT, so that Toolbox_RaiseToolboxEvent works
+     */
+
+    if (!(t->wimp_msg_list != NULL && t->wimp_msg_list[0] == 0))
+    {
+        events[0] = wimp_MTOOLBOX_EVENT;
+        events[1] = 0;
+        regs.r[0] = (int)events;
+        if ((e = _kernel_swi (Wimp_AddMessages, &regs, &regs)) != NULL)
+            return e;
+    }
+
+    return NULL;
+}
+
+
+static _kernel_oserror *task__try_sprite_load (TaskDescriptor *t, char *filename, BOOL *report_error)
+{
+    /*
+     * Function to try to load a given sprites file.  This function
+     * allocates a block of memory big enough and init's it as a sprite
+     * area
+     */
+
+    _kernel_oserror *e = NULL;
+    int              area_len;
+    int             *sprite_area;
+    int              file_handle;
+    int              object_type;
+    int              file_length;
+    int              internal_handle;
+    int              filing_system;
+
+    *report_error = FALSE;
+
+    DEBUG debug_output ("start", "T:Try sprite load %s\n", filename);
+
+    /* read catalogue info for the file */
+    if ((e = _swix (OS_File, _INR(0,1)|_OUT(0)|_OUT(4), 17, filename, &object_type, &file_length)) != NULL)
+    {
+        *report_error = TRUE;
+        return e;
+    }
+
+    DEBUG debug_output ("start", "T:Read catalogue info\n");
+
+    if (object_type != 1)    /* file not found */
+    {
+        *report_error = FALSE;
+        return make_error (Toolbox_NoMem, 0);
+    }
+
+    /* Check to see if it's in ResourceFS */
+    if ((e = _swix (OS_Find, _INR(0,1)|_OUT(0), 0x4F, filename, &file_handle)) != NULL)
+    {
+        *report_error = TRUE;
+        return e;
+    }
+
+    e = _swix (OS_FSControl, _INR(0,1)|_OUTR(1,2), 21, file_handle, &internal_handle, &filing_system);
+
+    _swix (OS_Find, _INR(0,1), 0, file_handle); /* close the file */
+
+    if (e)
+    {
+        *report_error = TRUE;
+        return e;
+    }
+
+    if ((filing_system & 0xFF) == fsnumber_resourcefs)
+    {
+        sprite_area = (int *)internal_handle - 1; /* take a direct pointer */
+        t->info.sprite_area_in_resourcefs = 1;
+    }
+    else
+    {
+        area_len = file_length + sizeof(int);   /* area is file contents plus length word */
+
+        if ((sprite_area = (int *)mem_allocate (area_len, "sprite area")) == NULL)
+        {
+            *report_error = TRUE;
+            return make_error (Toolbox_NoMem, 0);
+        }
+
+        /* initialise the sprite area */
+        sprite_area[0] = area_len;
+        sprite_area[1] = 0;
+        sprite_area[2] = 16;
+        sprite_area[3] = 16;
+
+        /* load the sprites file */
+        if ((e = _swix(OS_SpriteOp, _INR(0,2), 10 + 256, sprite_area, filename)) != NULL)
+        {
+            *report_error = TRUE;
+            return e;
+        }
+        t->info.sprite_area_in_resourcefs = 0;
+    }
+
+    /* record the sprite area pointer */
+    t->info.sprite_area = (void *)sprite_area;
+
+    return NULL;
+}
+
+
+static _kernel_oserror *task__load_sprites_file (TaskDescriptor *t)
+{
+
+    /*
+     * Function to load a sibling sprites file.  First tries
+     * <app$dir>.Sprites<mode> then <app$dir>.Sprites
+     */
+
+    char             filename[MAXFILENAME];
+    const char      *suffix = "";
+    int              modeflags = 0;
+    _kernel_oserror *e;
+    BOOL             report_error = FALSE;
+
+#ifdef SPRITES11
+    
+    int              bufferspace = 0;
+    
+    /* Read the mode flags - we're interested in bit 8 */
+    _swix (OS_ReadModeVariable, _INR(0,1)|_OUT(2), -1, 0, &modeflags);
+    
+    /* First time, check if the Wimp supports Wimp_Extend 13 */
+    if (modeflags & 0x100)
+    {
+        sprintf (filename, "%sTvSprs", t->info.dir_name);
+    }
+    else
+    {
+        sprintf (filename, "%s<Wimp$IconTheme>Sprites", t->info.dir_name);
+    }
+    
+    e = _swix (Wimp_Extend, _INR(0,3)|_OUT(3), 13, filename, filename, MAXFILENAME, &bufferspace);
+    
+    if (bufferspace != MAXFILENAME) /* Wimp_Extend 13 is supported */
+    {
+        if (e && (modeflags & 0x100))
+        {
+            sprintf (filename, "%s<Wimp$IconTheme>Sprites", t->info.dir_name);
+            
+            e = _swix (Wimp_Extend, _INR(0,3), 13, filename, filename, MAXFILENAME);
+        }
+        
+        if (e)
+        {
+            sprintf (filename, "%sSprites", t->info.dir_name);
+            
+            e = _swix (Wimp_Extend, _INR(0,3), 13, filename, filename, MAXFILENAME);
+        }
+        
+        if (!e)
+        {
+            e = task__try_sprite_load (t, filename, &report_error);
+            
+            if (!e || report_error == TRUE)
+                return e;
+        }
+    }
+    
+    else /* Wimp_Extend 13 is not supported, fall back to old code */
+    {
+#endif
+
+    /*
+     * try: 1) TVSprs<suffix>   (only if mode flag 8 (interlaced) is set)
+     *      2) Sprites<suffix>
+     *      3) TVSprs           (only if mode flag 8 is set)
+     *      4) Sprites
+     */
+
+    /* read mode-dependent suffix string */
+    _swix (Wimp_ReadSysInfo, _IN(0)|_OUT(0), 2, &suffix);
+
+#ifndef SPRITES11
+    /* read the mode flags - we're interested in bit 8 */
+    _swix (OS_ReadModeVariable, _INR(0,1)|_OUT(2), -1, 0, &modeflags);
+#endif
+
+    if (suffix[0])
+    {
+        if (modeflags & 0x100)
+        {
+            sprintf (filename, "%sTVSprs%s", t->info.dir_name, suffix);
+
+            e = task__try_sprite_load (t, filename, &report_error);
+
+            if (!e || report_error == TRUE)
+                return e;
+        }
+
+        sprintf (filename, "%sSprites%s", t->info.dir_name, suffix);
+
+        e = task__try_sprite_load (t, filename, &report_error);
+
+        if (!e || report_error == TRUE)
+            return e;
+    }
+
+    if (modeflags & 0x100)
+    {
+        sprintf (filename, "%sTVSprs", t->info.dir_name);
+
+        e = task__try_sprite_load (t, filename, &report_error);
+
+        if (!e || report_error == TRUE)
+            return e;
+    }
+
+    sprintf (filename, "%sSprites", t->info.dir_name);
+
+    e = task__try_sprite_load (t, filename, &report_error);
+
+    if (!e || report_error == TRUE)
+        return e;
+
+#ifdef SPRITES11
+    }
+#endif
+
+    return NULL;
+}
+
+
+static _kernel_oserror *task__load_resource_file (TaskDescriptor *t)
+{
+
+    /*
+     * Function to load sibling resources file. No errors if the Res file is missing.
+     */
+
+    char             filename[MAXFILENAME];
+    _kernel_swi_regs regs;
+    int              pass, territory = 0, modeflags = 0;
+
+    _swix(Territory_Number, _OUT(0), &territory);
+    _swix(OS_ReadModeVariable, _INR(0,1)|_OUT(2), -1, 0, &modeflags);
+
+    for (pass = 0; pass < 4; pass++)
+    {
+        switch (pass)
+        {
+            /*
+             * First pass - read territory number and try TVRes<n> (if interlaced)
+             */
+          case 0:
+            if (!(modeflags & 0x100)) continue;
+            if (!territory) continue;
+            sprintf(filename, "%sTVRes%d", t->info.dir_name, territory);
+            break;
+
+            /*
+             * Second pass - read territory number and try Res<n>
+             */
+          case 1:
+            if (!territory) continue;
+            sprintf(filename, "%sRes%d", t->info.dir_name, territory);
+            break;
+
+            /*
+             * Third pass - try TVRes (if interlaced)
+             */
+          case 2:
+            if (!(modeflags & 0x100)) continue;
+            sprintf(filename, "%sTVRes", t->info.dir_name);
+            break;
+
+            /*
+             * Fourth pass - try Res
+             */
+          case 3:
+            sprintf(filename, "%sRes", t->info.dir_name);
+            break;
+        }
+
+        /*
+         * first need to see if file exists (so we know whether to return file load
+         * errors.
+         */
+
+        regs.r[0] = 17;   /* no path */
+        regs.r[1] = (int)filename;
+        _kernel_swi (OS_File, &regs, &regs);
+        if (regs.r[0] == 1)
+        {
+            /*
+             * now try to load res file
+             */
+
+            regs.r[0] = 0;
+            regs.r[1] = (int)filename;
+            return resf_load_resource_file (&regs);
+        }
+    }
+
+    return NULL;
+}
+
+
+static _kernel_oserror *task__register_filters (TaskDescriptor *t)
+{
+
+    /*
+     * Function to add pre- and postfilters for the current task.  This task's
+     * descriptor will be passed to the filter veneers in R12.  The veneers will
+     * use this value to set up static data relocations.
+     */
+
+    _kernel_swi_regs regs;
+    _kernel_oserror *e = NULL;
+
+
+    /*
+     * add another pre-filter to the chain (nb this is not the list maintained
+     * by filters.c, which refers to filters registered using
+     * Toolbox_RegisterPreFilter)
+     */
+
+    regs.r[0] = (int)prefilter_name;
+    regs.r[1] = (int)&prefilter_veneer;
+    regs.r[2] = (int)t;
+    regs.r[3] = t->info.wimp_handle;
+    e = _kernel_swi (Filter_RegisterPreFilter, &regs, &regs);
+
+
+    /*
+     * add another post-filter to the chain (nb this is not the list maintained
+     * by filters.c, which refers to filters registered using
+     * Toolbox_RegisterPostFilter)
+     */
+
+    regs.r[0] = (int)postfilter_name;
+    regs.r[1] = (int)&postfilter_veneer;
+    regs.r[2] = (int)t;
+    regs.r[3] = t->info.wimp_handle;
+    regs.r[4] = 0;                     /* get all events which the task gets */
+    e = _kernel_swi (Filter_RegisterPostFilter, &regs, &regs);
+
+    return e;
+}
+
+
+extern _kernel_oserror *task_filtermgr_restarting (void)
+{
+    TaskDescriptor  *t = task__list;
+    _kernel_oserror *e;
+
+    /*
+     * filter mgr is re-starting, so we must re-register all of our pre-
+     * and post-filters
+     */
+
+    while (t != NULL)
+    {
+        if ((e = task__register_filters (t)) != NULL)
+            return e;
+
+        t = t->next;
+    }
+
+    return NULL;
+}
+
+
+
+extern _kernel_oserror *task_initialise (_kernel_swi_regs *r)
+{
+
+    /*
+     *   Entry:
+     *         R0  =  flags
+     *         R1  =  last Wimp version number known to task * 100
+     *                (must be >= 310)
+     *         R2  -> list of Wimp message numbers which the client wishes
+     *                to receive, terminated by a 0 word.
+     *                If R2 = 0, then all messages are delivered.
+     *                If R2 points to just a 0 word, then no messages are
+     *                delivered (apart from the Quit message).
+     *         R3  -> list of Toolbox Event codes which the client wishes
+     *                to receive, terminated by a 0 word.
+     *                If R3 = 0, then all Toolbox Events are delivered.
+     *                If R3 points to just a 0 word, then no Toolbox Events
+     *                are delivered.
+     *         R4  -> Directory name or path with which we find our resources.
+     *         R5  -> 4-word buffer to receive messages file descriptor.
+     *         R6  -> buffer to hold Object ids on return from Wimp_Poll.
+     *
+     *   Exit:
+     *         R0 = current Wimp version number * 100
+     *         R1 = Wimp task handle for this client
+     *         R2 = Pointer to Sprite area used.
+     *         Buffer pointed to by R5 is filled in with a MessageTrans
+     *         file descriptor for the messages file to be used.
+     *
+     */
+
+    _kernel_oserror        *e;
+    TaskDescriptor         *new_task = NULL;
+    int                     wimp_version;
+    int                    *p, *q;
+    int                     len;
+    _kernel_swi_regs        regs;
+
+    DEBUG debug_output ("start", "T:New task starting! (0x%x 0x%x 0x%x)\n", r->r[0], r->r[2], r->r[3]);
+
+    /*
+     * check parameters
+     */
+
+    if (r->r[4] == 0)
+        return make_error (Toolbox_NoDirName, 0);
+
+    if (r->r[5] == 0)
+        return make_error (Toolbox_NoMsgsFD, 0);
+
+    if (r->r[6] == 0)
+        return make_error (Toolbox_NoIDBlock, 0);
+
+    /*
+     * create a new Task descriptor, add it to the list of tasks, and make it the current task
+     */
+
+    if ((new_task = mem_allocate (sizeof(TaskDescriptor), "task descriptor")) == NULL)
+        return make_error (Toolbox_NoMem, 0);
+
+    len = string_length((char *)r->r[4]);
+    if ((new_task->info.dir_name = mem_allocate (len+2, "dir name")) == NULL)
+        return make_error (Toolbox_NoMem, 0);
+    string_copy (new_task->info.dir_name, (char *)r->r[4]);
+    new_task->info.dir_name_was_dir = FALSE;
+    if (new_task->info.dir_name[len-1] != ':')
+    {
+        /* the caller has given a directory (rather than a path), append a dot
+         * so all the subsequent uses can treat everything as though a path
+         */
+        strcat (new_task->info.dir_name, ".");
+        new_task->info.dir_name_was_dir = TRUE;
+    }
+
+    new_task->id_block = (IDBlock *)r->r[6];    /* id block filled in on Wimp_Poll */
+
+    new_task->pw = private_word;                /* remember Toolbox's private word in task descriptor */
+
+    new_task->info.sprite_area = (void *)1;     /* default to wimp sprite area */
+
+    task__add_to_list (new_task);
+
+    task = new_task;                            /* this is now the current task */
+
+
+    /*
+     * remember the lists of wimp messages, and toolbox events which the client wishes to receive
+     */
+
+    p = (int *)r->r[2];   /* list of wimp message numbers */
+
+    if (p != NULL)
+    {
+        while (*p++ != 0)
+            ;
+
+        if ((task->wimp_msg_list = mem_allocate (sizeof(int)*(p-(int *)r->r[2]), "wimp msg list")) == NULL)
+        {
+            e = make_error (Toolbox_NoMem, 0);
+            goto error;
+        }
+
+        p = (int *)r->r[2];
+        q = task->wimp_msg_list;
+
+        while ((*q++ = *p++) != 0)
+            ;
+    }
+    else
+        task->wimp_msg_list = NULL;
+
+    DEBUG { q = task->wimp_msg_list;
+            do
+            {
+                debug_output ("start", "T:msg 0x%x\n", *q);
+            } while (*q++ != 0);
+            debug_output ("start", "T:\n");
+          }
+
+
+    p = (int *)r->r[3];   /* list of toolbox events */
+
+    if (p != NULL)
+    {
+        while (*p++ != 0)
+            ;
+
+        if ((task->toolbox_event_list = mem_allocate (sizeof(int)*(p-(int *)r->r[3]), "toolbox event list")) == NULL)
+        {
+            e = make_error (Toolbox_NoMem, 0);
+            goto error;
+        }
+
+        p = (int *)r->r[3];
+        q = task->toolbox_event_list;
+
+        while ((*q++ = *p++) != 0)
+            ;
+    }
+    else
+        task->toolbox_event_list = NULL;
+
+    DEBUG { q = task->toolbox_event_list;
+            do
+            {
+                debug_output ("start", "T:event 0x%x\n", *q);
+            } while (*q++ != 0);
+            debug_output ("start", "T:\n");
+          }
+
+    /*
+     * load and register messages file with MessageTrans and store descriptor
+     * first try <app$dir>.Messages, then Message<CountryNumber>
+     * Messages file is loaded into RMA by the MessageTrans module
+     */
+
+    if ((e = task__load_messages_file (new_task, r)) != NULL)
+        goto error;
+
+
+    /*
+     * start up as a Wimp task, and store the task handle.
+     */
+
+    if ((e = task__start_wimp_task (new_task, r, &wimp_version)) != NULL)
+        goto error;
+
+
+    /*
+     * issue service call to inform Object modules that a new client has started up
+     */
+
+    regs.r[0] = new_task->info.wimp_handle;
+    regs.r[1] = Service_ToolboxTaskBorn;
+    regs.r[2] = (int) new_task;
+    _kernel_swi (OS_ServiceCall, &regs, &regs);
+
+
+    /*
+     * if a sprites file is there, then load it and store the area pointer
+     */
+
+    if ((e = task__load_sprites_file (new_task)) != NULL)
+        goto error2;
+
+
+    /*
+     * try to load the resources file.  Try "res", then try "res<countrynumber>"
+     */
+
+    if ((e = task__load_resource_file (new_task)) != NULL)
+        goto error2;
+
+
+    /*
+     * register pre- and post-filters for this task
+     */
+
+    if ((e = task__register_filters (new_task)) != NULL)
+        goto error2;
+
+
+    /*
+     * set up return registers
+     */
+
+    r->r[0] = wimp_version;
+    r->r[1] = new_task->info.wimp_handle;
+    r->r[2] = (int)new_task->info.sprite_area;
+
+    mem_print_list();
+
+    return NULL;
+
+
+error2:
+    regs.r[0] = new_task->info.wimp_handle;
+    regs.r[1] = Service_ToolboxTaskDied;
+    _kernel_swi (OS_ServiceCall, &regs, &regs);
+error:
+    task__delete(new_task);
+    return e;
+}
+
+
+
+/************************************** task manipulation functions ********************************/
+
+
+extern BOOL task_any_active (void)
+{
+    return task__list != NULL;
+}
+
+extern BOOL task_expected_wimp_message (int action)
+{
+    int *p = task->wimp_msg_list;
+
+    if (action == 0)
+        return TRUE;
+
+    if (p == NULL)
+        return FALSE;
+
+    if (*p == 0)
+        return TRUE;    /* null list means all msgs delivered */
+
+    while (*p != 0)
+    {
+        if (*p == action)
+            return TRUE;
+        p++;
+    }
+
+    return FALSE;
+}
+
+
+extern BOOL task_expected_toolbox_event (int event_code)
+{
+    int *p = task->toolbox_event_list;
+
+    if (p == NULL)
+        return FALSE;
+
+    if (*p == 0)
+        return TRUE;    /* null list means all events delivered */
+
+    while (*p != 0)
+    {
+        if (*p == event_code)
+            return TRUE;
+        p++;
+
+    }
+
+    return FALSE;
+}
+
+
+extern TaskDescriptor *task_find (int task_handle)
+{
+
+    /*
+     * Function to return a TaskDescriptor corresponding to
+     * a task with a given Wimp handle
+     */
+
+    TaskDescriptor *t;
+
+    t = task__list;
+
+    while (t != NULL)
+    {
+        if (t->info.wimp_handle == task_handle)
+            break;
+
+        t = t->next;
+    }
+
+    return t;
+}
+
+
+extern void task_exit (TaskDescriptor *t)
+{
+    /*
+     * Delete task descriptor.
+     */
+
+    DEBUG debug_output ("exit", "Task died %p (0x%x)\n", (void *)t, t->info.wimp_handle);
+
+    task__delete (t);
+
+    if (t == task)
+        task = NULL;  /* IDJ: 21-Nov-94: bug-fix AQU-00071: reset task swapped in */
+}
+
+
+/* This function fixed in Toolbox 1.38 to issue N service calls, one per task, instead of N
+ * service calls all for the same task.
+ *
+ * 'task' must be set to the handle of the task being announced because the Object modules
+ * will set pre-filters/post-filters etc. and we need to ensure that task is correct for
+ * those to succeed.
+ */
+extern void task_inform_object_modules (void)
+{
+    DEBUG debug_output ("inform", "Informing object modules\n");
+
+    if (task__list != NULL) {
+        (void) _swix(OS_AddCallBack, _INR(0,1), task_inform_callback_handler, private_word);
+    }
+}
+
+
+extern void task_inform_object_modules_callback (void);
+extern void task_inform_object_modules_callback (void)
+{
+    TaskDescriptor  *t = task__list, *const current_task = task;
+
+    DEBUG debug_output ("inform", "Informing object modules: callback executing\n");
+
+    while (t != NULL)
+    {
+        task = t;
+        DEBUG debug_output ("inform", "Informing object modules: task %08x\n", (int) t);
+        (void) _swix(OS_ServiceCall, _INR(0,2), t->info.wimp_handle, Service_ToolboxTaskBorn, t);
+        t = t->next;
+    }
+
+    /* Restore current setting of task after issuing the service calls */
+    task = current_task;
+}
+
+#if debugging
+extern _kernel_oserror *task_list(void)
+{
+    	TaskDescriptor  *t = task__list;
+
+    	for (; t; t = t->next) {
+            	object_t *o;
+        	printf("Task `%s'\n", t->info.name);
+		for (o = t->object_list; o; o = o->next) {
+		        static char buf[256];
+		        int len;
+		        _swix(OS_SWINumberToString, _INR(0,2)|_OUT(0), o->header.class_id, buf, sizeof(buf), &len);
+		        printf("  %#08x %02x %06x (%.*s)\n", o->header.class_id,
+		        	o->reference_count >> 24, o->reference_count & ~0xFF000000,
+		        	len, buf);
+		}
+        }
+
+    	return NULL;
+}
+#endif

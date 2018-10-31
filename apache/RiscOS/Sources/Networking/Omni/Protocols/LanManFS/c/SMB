@@ -1,0 +1,3271 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*
+*  SMB.C  -- SMB Server routines
+*
+*  14-02-94 INH  Original
+*                No WriteRaw
+*  17-08-94      No 'drv' numbers passed
+*  12-09-94      New NetBIOS interface
+*  22-09-95      Tracks Uids & session keys. Uses "DOS LM1.2X002"
+*                  protocol to keep Lan Manager happy.
+*  26-03-97      SMB_GetAttribs call replaced for NT 4.0 bug workround
+*  21-04-97      SMB_SetAttribs sets time/date using Open/Close on Windows95
+*
+*  04-12-98      sbrodie: started adding long filename support - controlled
+*                  by LONGNAMES macro.
+*  08-12-98      sbrodie: Added SMB_Transact2 with full support for setup
+*                  words and the like (present only for LONGNAMES build)
+*                  Several new functions added to support long filename
+*                  compatible versions of some calls,  These functions have
+*                  the same name as the function they upgrade with an X2 suffix
+*                  added.
+*/
+
+/* A word about 'drive letters':
+
+   Each connection from us to a shared directory or printer on a server
+   is given a drive letter (starting at 'A' and working up). This is
+   essentially a handle to a (server_name, share_name) pair, but it
+   is made a character to allow it to be passed as the first character
+   in filename strings to the SMB_xxx functions.
+
+   LanManFS itself will allow disk-type network connections to be
+   given 'mount names' so RISCOS file names take the form
+     LanMan::MountName.$.<filespec>
+
+   We never see these mount names; they are handled in c.Omni. When
+   a RISCOS filename is passed to Xlt_ConvertPath, it uses
+   Omni_GetDrvLetter() to convert the mount name to an SMB drive letter.
+
+   We could allow SMB to deal directly in mount names, but (i) we'd
+   have to create nonconflicting names for all the anonymous mounts
+   like printers and RPC connections, (ii) the Omni module has to
+   deal with mount names anyway, & has a perfectly good set of list-
+   management routines there already; we'd only have to duplicate
+   them & write an interface (iii) legal characters & case
+   sensitivity for mount names may be different to DOS filenames,
+   making a composite name a pain in the bum to validate.
+
+   SMB treats drives, printers and the IPC$ share used for remote
+   procedure call as alike; a different set of operations
+   is allowed on each one, but they are all connected with
+   SMB_CreateShare() & SMB_DeleteShare(), and they all have a
+   'drive letter'. Hence you will find references to
+   drive letters in the printer and RPC code - panic not, they
+   are just connection identifiers.
+*/
+
+
+/* Standard includes */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include "kernel.h"
+#include "swis.h"
+
+/* Our includes */
+
+#include "stdtypes.h"
+#include "LanMan.h"
+#include "BufLib.h"
+#include "NetBIOS.h"
+#include "SMB.h"
+#include "Transact.h"
+#ifdef LONGNAMES
+#include "NameCache.h" /* for the directory entry cache */
+#endif
+#include "LMVars.h"
+#include "Attr.h"   /* For InvalidateDrive */
+#include "Xlate.h"  /* For string functions */
+#include "Auth.h"
+
+/* Definitions ===================================================== */
+
+/* Our definitions */
+
+#define MAX_SERVERS  (MAX_DRIVES + 4)
+#define MAX_SHARES   (MAX_DRIVES + 4)
+
+/* Tuning parameters */
+
+#define MAX_RX_BLOCK_SIZE (3*1452)  /* Windows clients' default, see [MS-CIFS].pdf note 91 (p709) */
+#define MAX_CORE_TX_BLOCK_SIZE 1024 /* Core dialect doesn't send MaxBufferSize value */
+#define RDRAW_BLOCK_SIZE  32768
+#define WRRAW_BLOCK_SIZE  16384
+#define PRN_BLOCK_SIZE    1024
+
+/* This structure relies on Norcroft C packing the bytes & words
+   properly!
+ */
+typedef struct
+{
+  BYTE id[4];
+  BYTE command;
+  BYTE errclass;
+  BYTE reh;
+  BYTE errlo;
+  BYTE errhi;
+  BYTE flg;
+  WORD flg2;
+  WORD rsvd[6];
+
+  WORD tid;
+  WORD pid;
+  WORD uid;
+  WORD mid;
+  BYTE wct;  /* Word count */
+
+} SMBHDR;
+
+/* Size of above structure - sizeof() may round to word boundary! */
+#define SMBHDR_SIZE 33
+
+/* Maximum number of word params - 14 is used by Transact */
+#ifdef LONGNAMES
+/* Transact2 (LONGNAMES build only) requires extra setup words.
+ * The NT LM 0.12 negprot response requires 17.
+ */
+#define MAX_WCT (17+(MAX_SETUPWORDS)+1)
+#else
+#define MAX_WCT 17
+#endif
+
+/* Max number of significant characters in a shared drive
+   or printer name */
+#define SHARENAME_LEN 16
+
+#define DATA_BLOCK      1
+#define DATA_DIALECT    2
+#define DATA_PATHNAME   3
+#define DATA_ASCII      4
+#define DATA_VARBLK     5
+
+#define ECLASS_DOS      1
+#define ECLASS_SRV      2
+#define ECLASS_HARD     3
+
+
+#define SMBmkdir      0x00   /* create directory */
+#define SMBrmdir      0x01   /* delete directory */
+#define SMBopen       0x02   /* open file */
+#define SMBcreate     0x03   /* create file */
+#define SMBclose      0x04   /* close file */
+#define SMBflush      0x05   /* flush file */
+#define SMBunlink     0x06   /* delete file */
+#define SMBmv         0x07   /* rename file */
+#define SMBgetatr     0x08   /* get file attributes */
+#define SMBsetatr     0x09   /* set file attributes */
+#define SMBread       0x0A   /* read from file */
+#define SMBwrite      0x0B   /* write to file */
+#define SMBlock       0x0C   /* lock byte range */
+#define SMBunlock     0x0D   /* unlock byte range */
+#define SMBctemp      0x0E   /* create temporary file */
+#define SMBmknew      0x0F   /* make new file */
+#define SMBchkpth     0x10   /* check directory path */
+#define SMBexit       0x11   /* process exit */
+#define SMBlseek      0x12   /* seek */
+#define SMBreadBraw   0x1A   /* Read block raw */
+#define SMBwriteBraw  0x1D   /* Write block raw */
+#define SMBtransact   0x25   /* RPC transaction */
+#define SMBtcon       0x70   /* tree connect */
+#define SMBtdis       0x71   /* tree disconnect */
+#define SMBnegprot    0x72   /* negotiate protocol */
+#define SMBsesssetup  0x73   /* Session setup and X */
+#define SMBdskattr    0x80   /* get disk attributes */
+#define SMBsearch     0x81   /* search directory */
+#define SMBsplopen    0xC0   /* open print spool file */
+#define SMBsplwr      0xC1   /* write to print spool file */
+#define SMBsplclose   0xC2   /* close print spool file */
+#define SMBsplretq    0xC3   /* return print queue */
+#define SMBsends      0xD0   /* send single block message */
+#define SMBsendb      0xD1   /* send broadcast message */
+#define SMBfwdname    0xD2   /* forward user name */
+#define SMBcancelf    0xD3   /* cancel forward */
+#define SMBgetmac     0xD4   /* get machine name */
+#define SMBsendstrt   0xD5   /* send start of multi-block message */
+#define SMBsendend    0xD6   /* send end of multi-block message */
+#define SMBsendtxt    0xD7   /* send text of multi-block message */
+
+#ifdef LONGNAMES
+/* The following are only available with LANMAN 2.0 Extended File Sharing
+ * Protocol as defined in "SMB F. S. P. Extensions Version 3.0", document
+ * version 1.11, June 19, 1990.
+ */
+#define SMBtrans2     0x32   /* transaction2 */
+#define SMBtranss2    0x33   /* transaction2 (secondary request/response) */
+#define SMBfindclose2 0x34   /* terminates a TRANSACT2_FIND_FIRST/NEXT */
+#define SMBecho       0x2B
+
+/* And now the sub-commands for SMBtrans2 */
+#define TRANSACT2_FINDFIRST   0x01
+#define TRANSACT2_FINDNEXT    0x02
+#define TRANSACT2_QUERYFSINFORMATION 0x03
+#define TRANSACT2_QUERYPATHINFORMATION 0x05
+#endif
+
+#define SUCCESS   0
+#define ERRDOS 0x01
+#define ERRSRV 0x02
+#define ERRHRD 0x03
+#define ERRCMD 0xFF
+
+
+#define SEARCH_TOT_SIZE 43
+#define SEARCH_COUNT 10
+
+#define PROT_USERLOGON   1
+#define PROT_ENCRYPT     2
+#define PROT_READRAW     4
+#define PROT_WRITERAW    8
+#define PROT_RWMULTI     16
+#define PROT_SETDATETIME 32
+#define PROT_HAVE_GUID   64
+
+#define SMB_CASELESS   8
+
+#ifdef LONGNAMES
+#define SMB_KNOWS_LONG_NAMES	(1)
+#define SMB_IS_LONG_NAME	(0x40)
+#define SMB_UNICODE		(0x8000)
+
+#define T2FLAGS_LONGNAMES	(1)
+#define T2FLAGS_SWAPDATETIME	(2)
+#define T2FLAGS_TESTEDSWAP	(4)
+
+#define CAP_EXTENDED_SECURITY	(0x80000000)
+#endif
+
+/* Private structures */
+
+#define FREE         0   /* 'flags' values: */
+#define ALLOCATED    1   /* True whenever this slot is allocated */
+#define CONNECTED    2   /* True if share is connected, to the best of
+                             our knowledge */
+
+/* Password fields are strewn around here as mild hacker discouragement */
+
+struct ActiveServer
+{
+  int      flags;
+  time_t   last_xact;
+
+  hSESSION hSession;    /* Only valid if status is IN_USE */
+  char     password[NAME_LIMIT];
+
+  int      Uid;        /* User identifier */
+  int      Sesskey;    /* Session key */
+  int      ProtFlags;  /* USERLOGON/ENCRYPT etc */
+  int      SMB_flg;    /* Flags to pass in SMB_flg field */
+#ifdef LONGNAMES
+  int      SMB_flg2;   /* Flags to pass in SMB_flg2 field */
+  int      t2flags;
+#endif
+  int      prot;       /* which protocol was nogitated */
+  char     guid[16];   /* GUID returned from NT negprot commands */
+  int      bloblen;
+  BYTE     *blob;
+  char     servname[NAME_LIMIT]; /* upper case */
+  char     username[NAME_LIMIT]; /* case preserved */
+  unsigned int maxTxBufferSize; /* maximum SMB message size the server can receive */
+};
+
+typedef struct ActiveServer *hSERVER;
+
+struct ActiveShare
+{
+  int     flags;
+
+  char    password[NAME_LIMIT];
+  hSERVER hServer;  /* Only valid if status is IN_USE */
+  int     sharetype;
+
+  int     Tid;          /* Tree ID */
+  int     Uid;          /* User ID */
+  int     Datasize;
+  int     FH_base;    /* Base number for file handles */
+  char    drvletter;  /* Letter for identifying 'drive' */
+  char    sharename[SHARENAME_LEN];  /* upper case */
+};
+
+
+#define GetFid(FH) ((FH) & 0xFFFF)
+#define MakeFH(pS,FID) ((pS)->FH_base | (FID & 0xFFFF) )
+
+#ifdef LONGNAMES
+static err_t SMB_Transact2 ( hSHARE hS, struct TransactParms *pT );
+#endif
+
+/* SMB globals ======================================================== */
+
+static SMBHDR SMB_TxHdr;
+static WORD   SMB_TxWords [MAX_WCT+1];
+
+static SMBHDR SMB_RxHdr;
+static WORD   SMB_RxWords [MAX_WCT];
+static WORD   SMB_RxByteCount;
+static int    SMB_RxWordCount;
+
+static struct ActiveServer SMB_Servers[MAX_SERVERS];
+static struct ActiveShare  SMB_Shares[MAX_SHARES];
+
+BYTE          SMB_WorkBuf[SMBWORKBUF_SIZE];
+
+/* SMB routines ======================================================== */
+
+static int DOS_Errs[] =
+{
+  18, ENOMOREFILES,
+  2,  EFILENOTFOUND,
+  12, ENOTPRESENT,  /* Returned by OS2-Connect from SetAttrib */
+  50, ENOTPRESENT,  /* Returned by W4WG from SetAttrib call */
+  110, EFILENOTFOUND, /* Returned by OS2 servers for hidden files */
+  3,  EPATHNOTFOUND,
+  1,  EBADPARAM,
+  5,  ENOACCESS,
+  16, ESHARING,     /* Attempt to remove current dir on server */
+  80, EFILEEXISTS,
+  32, ESHARING,     /* Normal sharing violation */
+  67, ENOSUCHSHARE, /* Returned by NT3.5 for bad share names */
+  112, EDISCFULL,   /* Returned by NT3.5 when disk full */
+  65, ENOACCESS,    /* Returned by W4WG on set-attribs on CDROM */
+  145, EDIRNOTEMPTY, /* Attempt to remove non-empty directory */
+  -1, EDOSERROR
+};
+
+/* --------------------------- */
+
+static int SMB_Errs[] =
+{
+  2,  EBADPASSWD,
+  4,  ENOACCESS,
+  6,  ENOSUCHSHARE,
+  5,  ENOACCESS,     /* Returned by W4WG when password changed */
+  2239, EACCDISABLED,
+  -1, ESERVERROR
+};
+
+/* --------------------------- */
+
+static err_t Err_Translate ( int class, int code )
+{
+  int *p1;
+
+  debug2(" SMB-Err class %d number %d\n", class, code );
+
+  if ( class == 0 )
+    return OK;
+  else if ( class == ECLASS_DOS )
+    p1 = DOS_Errs;
+  else if ( class == ECLASS_SRV )
+    p1 = SMB_Errs;
+  else if ( class == ECLASS_HARD )
+    return EHARDERROR;
+  else
+    return EPROTOCOLERR;
+
+  while ( *p1 >= 0 && *p1 != code )
+    p1 += 2;
+
+  debug1(" Unknown err code %d\n", code );
+  return p1[1];
+}
+
+
+/* --------------------- */
+
+static BUFCHAIN MkDataBlock ( BUFCHAIN pB, int type,
+                                    BYTE *ptr, int len, bool indirect )
+{
+  BYTE   hdrblk[4];
+
+  if ( len > 0 )
+  {
+    if ( indirect )
+      pB = AddChainIndirect ( pB, ptr, len );
+    else
+      pB = AddChain ( pB, ptr, len );
+
+    if ( pB == NULL ) return NULL;
+  }
+
+  hdrblk[0] = type;
+  hdrblk[1] = len & 0xFF;
+  hdrblk[2] = len >> 8;
+
+  return AddChain ( pB, hdrblk, 3 );
+}
+
+/* --------------------- */
+
+/* This routine takes an ASCII string and encodes it into Unicode by
+ * inserting extra zero bytes between each character and at the end
+ * It adds the resulting string to the given BUFCHAIN.  It optimises
+ * for strings up to AUSTC_SKIP chars long.
+ */
+#if 0
+static BUFCHAIN AddUnicodeStringToChain ( BUFCHAIN pB, char *str )
+{
+#define AUSTC_SKIP 18
+        int len = strlen(str)+1, skiplen, cp;
+        char ucbuf[AUSTC_SKIP*2];
+
+	skiplen = len % AUSTC_SKIP;
+	len -= skiplen;
+
+        do {
+                for (cp = skiplen - 1; cp>=0; --cp) {
+                        ucbuf[cp*2] = str[len + cp];
+                        ucbuf[cp*2+1] = '\0';
+                }
+                pB = AddChain(pB, ucbuf, skiplen * 2);
+                skiplen = AUSTC_SKIP;
+                len -= skiplen;
+        } while (pB && len >= 0);
+
+        return pB;
+}
+#endif
+
+/* --------------------- */
+
+static BUFCHAIN MkDataString ( BUFCHAIN pB, int type, const char *ptr )
+{
+  BYTE   hdrblk[4];
+
+  pB = AddChain ( pB, (void *)ptr, strlen(ptr)+1 );
+
+  if ( pB == NULL ) return NULL;
+
+  hdrblk[0] = type;
+
+  return AddChain ( pB, hdrblk, 1 );
+}
+
+
+/* --------------------------- */
+
+#define DumpBuffer(ptr, len) ddumpbuf("smb_1", ptr, len, 0)
+
+#ifdef DEBUG
+static BUFCHAIN DumpChain(BUFCHAIN pB)
+{
+        static char membuf[32768];
+        int len = ChainLen(pB);
+
+        GetData ( pB, membuf, len);
+        FreeChain(pB);
+        pB = AddChain ( NULL, membuf, len);
+        if (pB == NULL)
+                return NULL;
+        DumpBuffer(membuf, len);
+        return pB;
+}
+#else
+#define DumpChain(pB) (pB)
+#endif
+
+#ifdef DEBUG
+typedef struct {
+        const char *name;
+        int size;
+} DumpVarStr;
+#define DVS_MK(name,type) {name, sizeof(type)}
+#define DVS_END {0,0}
+
+DumpVarStr dvs_NTnegprot[] = {
+	DVS_MK("dialect", WORD),
+	DVS_MK("securitymode", BYTE),
+	DVS_MK("maxmpx", WORD),
+	DVS_MK("maxvcs", WORD),
+	DVS_MK("maxbuffersize", DWORD),
+	DVS_MK("maxrawsize", DWORD),
+	DVS_MK("sessionkey", DWORD),
+	DVS_MK("capabilities", DWORD),
+	DVS_MK("systimelo", DWORD),
+	DVS_MK("systimehi", DWORD),
+	DVS_MK("servertimezone", WORD),
+	DVS_MK("securitybloblen", BYTE),
+	DVS_END
+};
+
+DumpVarStr dvs_negprot[] = {
+	DVS_MK("dialect", WORD),
+	DVS_MK("securitymode", WORD),
+	DVS_MK("maxbuffersize", DWORD),
+	DVS_MK("maxmpx", WORD),
+	DVS_MK("maxvcs", WORD),
+	DVS_MK("rawmode", WORD),
+	DVS_MK("sessionkey", DWORD),
+	DVS_MK("systime", WORD),
+	DVS_MK("sysdate", WORD),
+	DVS_MK("challengelen", WORD),
+	DVS_MK("reserved (MBZ)", WORD),
+	DVS_END
+};
+
+static void *DumpVar(void *ptr, const char *name, unsigned long sz)
+{
+        static const char *sizestr[] = { "<NULL>", "UCHAR", "USHORT", "????", "ULONG" };
+	BYTE *bptr = ptr;
+	unsigned long value = 0;
+	unsigned long s;
+
+	for (s=0; s<sz; ++s) {
+	        value |= ((unsigned long)(*bptr++) << (s<<3UL));
+	}
+	dprintf(("%6s %s: %#lx (%ld)\n", sizestr[sz], name, value, value));
+	return bptr;
+
+}
+
+static void DumpStruct(void *ptr, const DumpVarStr *dvs)
+{
+        while (dvs->size) {
+                ptr = DumpVar(ptr, dvs->name, dvs->size);
+                ++dvs;
+        }
+}
+#else
+#define DumpVar(ptr, name, sz) ((void *)(((char *)ptr)+sz))
+#define DumpStruct(ptr, str) ((void)0)
+#endif
+
+/* Does one SMB command (send & reply).
+
+   hS is the connection handle to do it on (MUST BE VALIDATED!)
+   cmd is the command byte value
+   wct_in is the number of Tx Words to be sent
+   pB_in is any Tx Bytes to be sent afterwards, or NULL
+   ppB_out is the address of a variable in which to store a pointer
+        to any received bytes. If this is NULL, any received bytes
+        will be discarded. If it isn't, either a pointer will be
+        stored here (which MUST be freed after use), or NULL will
+        be stored if there is any error.
+
+   It will leave results in SMB_RxWords, SMB_RxWordCount and
+    SMB_RxByteCount.
+*/
+
+/* sbrodie (15 Jan 1999)
+ *
+ * This function has been split into two parts so that SMB_Transact2 can share the
+ * packet response code (now in Do_SMBResponse) with that used by Do_SMB.  SMB_Transact2
+ * can have multiple response packets if the data is very large.
+ */
+static err_t Do_SMBResponse(hSHARE hS, int cmd, BUFCHAIN *ppB_out )
+{
+  int wct_rx;
+  err_t res;
+  BUFCHAIN pB_rx;
+
+  if (cmd == SMBchkpth) {
+    /* This was just the keep-alive message */
+    debug0("Not waiting for response to SMBchkpth request\n");
+    return OK;
+  }
+
+  /* Get reply */
+  res = NB_GetData ( hS->hServer->hSession, &pB_rx, REPLY_TIMEOUT );
+  if ( res != OK )
+    return res;
+
+  /* Extract received data */
+  dprintf(("smb_2", "Do_SMB (cmd=0x%x) - NB_GetData => %d bytes\n", cmd, ChainLen(pB_rx)));
+
+  SMB_RxHdr.wct = 0;
+  SMB_RxByteCount = 0;
+  SMB_RxWordCount = 0;
+
+  pB_rx = GetData ( pB_rx, &SMB_RxHdr, SMBHDR_SIZE );
+  wct_rx = SMB_RxHdr.wct;
+
+/* sbrodie: moved this from just above "OK - all was well" comment */
+  /* Process errors back from server */
+  if ( SMB_RxHdr.errclass != 0 )
+  {
+    dprintf(("", "Do_SMB: errclass was %d\n", SMB_RxHdr.errclass));
+    FreeChain(pB_rx);
+    return Err_Translate ( SMB_RxHdr.errclass,
+        SMB_RxHdr.errlo + (SMB_RxHdr.errhi << 8) );
+  }
+
+  if ( wct_rx > MAX_WCT )  /* Dispose of extra word results */
+  {
+    pB_rx = GetData ( pB_rx, SMB_RxWords, MAX_WCT*2 );
+    pB_rx = GetData ( pB_rx, NULL, (wct_rx-MAX_WCT)*2 );
+  }
+  else if ( wct_rx > 0 )
+  {
+    pB_rx = GetData ( pB_rx, SMB_RxWords, wct_rx*2 );
+  }
+
+  pB_rx = GetData(pB_rx, &SMB_RxByteCount, 2); /* Get byte count */
+
+  if ( pB_rx == NULL ) /* It's all gone horribly wrong! */
+    return EDATALEN;
+
+  /* OK - all was well */
+#ifdef DEBUG
+  if (cmd == SMBnegprot) debug2("Protocol negotiation returned %d words and %d bytes\n",
+          wct_rx, SMB_RxByteCount);
+#endif
+
+  if (SMB_RxHdr.command == SMBchkpth) {
+    /* Discard the 'ping' response */
+    dprintf(("smb_1", "This response was actually to the previous chkpth call\n"));
+    ppB_out = NULL;
+  }
+
+  SMB_RxWordCount = wct_rx;
+
+  if ( ppB_out != NULL )
+    *ppB_out = pB_rx;     /* Hand over ownership */
+  else
+    FreeChain(pB_rx);
+  return OK;
+}
+
+static err_t Do_SMB_threadsafe ( hSHARE hS, int cmd, int wct_in, BUFCHAIN pB_in,
+                      BUFCHAIN *ppB_out )
+{
+  err_t res;
+  hSESSION hSess;
+
+  (void) time(&hS->hServer->last_xact);
+
+  if ( ppB_out != NULL ) /* If early exit, leave NULL in result */
+    *ppB_out = NULL;
+
+  hSess = hS->hServer->hSession;
+
+  /* Fill in parameters for this connection */
+
+  SMB_TxHdr.tid = hS->Tid;
+  SMB_TxHdr.uid = hS->hServer->Uid;
+  SMB_TxHdr.flg = hS->hServer->SMB_flg;
+#ifdef LONGNAMES
+  SMB_TxHdr.flg2 = hS->hServer->SMB_flg2;
+#endif
+
+  /* Add byte count */
+
+  SMB_TxWords[wct_in] = ChainLen(pB_in);
+
+  /* Add parameter words */
+
+  pB_in = AddChain ( pB_in, SMB_TxWords, (wct_in*2) + 2 );
+  if ( pB_in == NULL )
+    return EOUTOFMEM;
+
+  /* Prepare & add header */
+
+  SMB_TxHdr.command = cmd;
+  SMB_TxHdr.wct     = wct_in;
+
+  pB_in = AddChain ( pB_in, &SMB_TxHdr, SMBHDR_SIZE );
+  if ( pB_in == NULL )
+    return EOUTOFMEM;
+
+  /* Send data */
+
+  res = NB_ClearRxQueue ( hSess );
+  if (res != OK) {
+    debug0("****************** NB_ClearRxQueue says there was stuff pending!!!!!!!!\n");
+  }
+
+  res = NB_SendData ( hSess, pB_in );
+  if ( res != OK )
+    return res;
+
+  do {
+    /* MUST avoid recursive calls to Do_SMBResponse */
+    res = Do_SMBResponse(hS, cmd, ppB_out);
+  } while (res == OK && SMB_RxHdr.command == SMBchkpth);
+
+  return res;
+}
+
+static err_t Do_SMB ( hSHARE hS, int cmd, int wct_in, BUFCHAIN pB_in,
+                      BUFCHAIN *ppB_out )
+{
+  static volatile int threaded = 0;
+
+  if (threaded) {
+    return ELANMANFSINUSE;
+  }
+  else {
+    err_t res;
+    ++threaded;
+    res = Do_SMB_threadsafe(hS, cmd, wct_in, pB_in, ppB_out);
+    --threaded;
+    return res;
+  }
+}
+
+
+/* ---------------------------- */
+
+/* This attempts to do a ReadRaw on a given file. If there are any errors,
+   or we're at end of file, it returns 0. Assume 'hS' etc. has been
+   validated.
+*/
+
+
+static uint SMB_ReadRaw ( hSHARE hS,
+                     int fid, uint offset, uint len, BYTE *where )
+{
+  err_t res;
+  BUFCHAIN pB;
+  hSESSION hSess = hS->hServer->hSession;;
+
+  if (len>RDRAW_BLOCK_SIZE) len=RDRAW_BLOCK_SIZE;
+
+  SMB_TxWords[0] = fid;
+  SMB_TxWords[1] = (offset & 0xFFFF);
+  SMB_TxWords[2] = (offset >> 16 );
+  SMB_TxWords[3] = len;
+  SMB_TxWords[4] = 0; /* Minimum returned byte count */
+
+  SMB_TxWords[5] = 0xFFFF; /* Timeout */
+  SMB_TxWords[6] = 0xFFFF;
+
+  SMB_TxWords[7] = 0; /* Reserved */
+  SMB_TxWords[8] = 0; /* Following byte count */
+
+  pB = AddChain( NULL, SMB_TxWords, 18 );
+  if ( pB == NULL )
+    return 0;
+
+  SMB_TxHdr.tid = hS->Tid;
+  SMB_TxHdr.uid = hS->hServer->Uid;
+
+  SMB_TxHdr.command = SMBreadBraw;
+  SMB_TxHdr.wct     = 8; /* Word count */
+
+  pB = AddChain ( pB, &SMB_TxHdr, SMBHDR_SIZE );
+  if ( pB == NULL )
+    return 0;
+
+  /* Send data */
+
+  NB_ClearRxQueue ( hSess ); /* Ensure reply is correct */
+
+  res = NB_SendData ( hSess, pB );
+  if ( res != OK )
+  {
+    debug1("Send data failed, %d\n", res);
+    return 0;
+  }
+
+  /* Get reply (raw data block) */
+
+  res = NB_GetBlockData ( hSess, where, &len, REPLY_TIMEOUT );
+  if ( res != OK )
+    return 0;
+
+  return len;
+}
+
+/* ---------------------------- */
+
+static err_t SMB_WriteRaw ( hSHARE hS, int fid, uint offset,
+                    uint len, BYTE *where )
+{
+  err_t res;
+
+  SMB_TxWords[0] = fid;
+  SMB_TxWords[1] = len;
+  SMB_TxWords[2] = 0;
+  SMB_TxWords[3] = (offset & 0xFFFF);
+  SMB_TxWords[4] = (offset >> 16 );
+  SMB_TxWords[5] = 0xFFFF; /* Timeout */
+  SMB_TxWords[6] = 0xFFFF;
+
+  SMB_TxWords[7] = 0; /* Write mode: write-through */
+  SMB_TxWords[8] = 0; /* Reserved */
+  SMB_TxWords[9] = 0; /* Reserved */
+  SMB_TxWords[10] = 0; /* # of data bytes immediately following */
+  SMB_TxWords[11] = 0; /* Offset to immediate data bytes */
+
+  res = Do_SMB ( hS, SMBwriteBraw, 12, NULL, NULL );
+  if ( res != OK )
+    return res;
+
+  /* If no error, just send the data in a large block. Any errors
+     will be picked up on the next write or close operation. If
+     we get to this stage, we can assume 'drv' is validated. */
+
+  return NB_SendBlockData ( hS->hServer->hSession, where, len );
+
+}
+
+/* sbrodie: Abstract the dialect strings here - means debug version can
+ * call this function to find out which protocol was accepted.  The
+ * offsets within the array of each string are vital to SMB_Negotiate.
+ */
+static const char *dialects[] = {
+                "PC NETWORK PROGRAM 1.0",
+                "DOS LM1.2X002",
+                "LM1.2X002",
+                "NT LM 0.12"
+};
+#define MAX_DIALECT ((sizeof(dialects)/sizeof(*dialects))-1)
+#define DIALECT_BASIC 0
+#define DIALECT_LM12X002 1
+#define DIALECT_NT 3
+static const char *SMB_Dialect(unsigned int num)
+{
+        if (num <= MAX_DIALECT) return dialects[num];
+        return "";
+}
+
+/* ---------------------------- */
+
+static err_t SMB_Negotiate( hSHARE hS )
+{
+  err_t res;
+  unsigned int dcount;
+  BUFCHAIN pB;
+
+  pB = NULL;
+
+  /* Must be entered in reverse order */
+  for (dcount = MAX_DIALECT; ; --dcount) {
+    pB = MkDataString( pB, DATA_DIALECT, SMB_Dialect(dcount));
+    if (pB == NULL || dcount == 0) break;
+  }
+
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  res = Do_SMB ( hS, SMBnegprot, 0, pB, &pB );
+  if ( res != OK )
+    return res;
+
+
+  debug1("Negotiated protocol `%s'\n", SMB_Dialect(SMB_RxWords[0]));
+  hS->hServer->prot = SMB_RxWords[0];
+  if ( SMB_RxWords[0] >= DIALECT_LM12X002 )
+  {
+    if (SMB_RxWords[0] >= DIALECT_NT) {
+      /* grr - different response format */
+      hS->hServer->maxTxBufferSize = (SMB_RxWords[3] >> 8) | (SMB_RxWords[4] << 8) | (SMB_RxWords[5] << 24);
+      hS->hServer->ProtFlags = PROT_RWMULTI + PROT_SETDATETIME +
+         (SMB_RxWords[9] & 0x100 ? PROT_READRAW+PROT_WRITERAW : 0 ) +
+         (SMB_RxWords[1] & 1 ? PROT_USERLOGON : 0 ) +
+         (SMB_RxWords[1] & 2 ? PROT_ENCRYPT : 0 );
+      if (SMB_RxWords[11] & 0x80) {
+        /* CAP_EXTENDED_SECURITY */
+        hS->hServer->ProtFlags |= PROT_HAVE_GUID;
+        GetData(pB, hS->hServer->guid, 16);
+        debug0("Found a GUID block in the data section\n");
+      }
+      else {
+        /* No bit */
+        debug0("No extended security - no GUID in the data block\n");
+      }
+      hS->hServer->bloblen = SMB_RxWords[16] >> 8;
+      hS->hServer->Sesskey = (SMB_RxWords[7] >> 8) | (SMB_RxWords[8] << 8) | (SMB_RxWords[9] << 24);
+    }
+    else {
+      hS->hServer->maxTxBufferSize = SMB_RxWords[2];
+      hS->hServer->ProtFlags = PROT_RWMULTI + PROT_SETDATETIME +
+         (SMB_RxWords[1] & 1 ? PROT_USERLOGON : 0 ) +
+         (SMB_RxWords[1] & 2 ? PROT_ENCRYPT : 0 ) +
+         (SMB_RxWords[5] & 1 ? PROT_READRAW : 0 ) +
+         (SMB_RxWords[5] & 2 ? PROT_WRITERAW : 0 );
+      hS->hServer->bloblen = SMB_RxWords[11];
+      hS->hServer->Sesskey = SMB_RxWords[6] | (SMB_RxWords[7] << 16);
+    }
+    hS->hServer->SMB_flg = SMB_CASELESS;
+#ifdef LONGNAMES
+    debug0("Enabling long filenames on this share\n");
+    hS->hServer->SMB_flg2 = SMB_KNOWS_LONG_NAMES; /* | SMB_IS_LONG_NAME;*/
+    hS->hServer->t2flags = T2FLAGS_LONGNAMES;
+#endif
+    if (hS->hServer->bloblen > 0) {
+      free(hS->hServer->blob);
+      hS->hServer->blob = malloc(hS->hServer->bloblen);
+      if (hS->hServer->blob != NULL) {
+        GetData(pB, hS->hServer->blob, hS->hServer->bloblen);
+      }
+    }
+    else {
+      hS->hServer->blob = 0;
+    }
+  }
+  else
+  {
+    hS->hServer->maxTxBufferSize = MAX_CORE_TX_BLOCK_SIZE;
+    hS->hServer->ProtFlags = PROT_SETDATETIME;
+    hS->hServer->SMB_flg = 0;
+#ifdef LONGNAMES
+    hS->hServer->t2flags = 0;
+    hS->hServer->SMB_flg2 = 0;
+#endif
+  }
+  FreeChain(pB);
+  debug1("%s-level security\n", hS->hServer->ProtFlags & PROT_USERLOGON ? "User" : "Share");
+  return OK;
+}
+
+/* ------------------------------- */
+
+/* Session setup logs the user on with a given name and password */
+
+static err_t SMB_SessSetup ( hSHARE hS, char *userid, char *passwd )
+{
+  BUFCHAIN pB;
+  err_t res;
+
+  SMB_TxWords[0] = 0x00FF; /* No additional command */
+  SMB_TxWords[1] = 0;      /* Offset to next cmd */
+  SMB_TxWords[2] = MAX_RX_BLOCK_SIZE; /* Maximum SMB message size we can receive */
+  SMB_TxWords[3] = 1;      /* Max pending requests */
+  SMB_TxWords[4] = 0;      /* First & only VC */
+  SMB_TxWords[5] = hS->hServer->Sesskey & 0xFFFF;
+  SMB_TxWords[6] = hS->hServer->Sesskey >> 16;
+
+  if (hS->hServer->prot < DIALECT_NT) {
+    pB = AddChain ( NULL, userid, strlen(userid)+1 );
+    if ( pB != NULL ) pB = AddChain ( pB, passwd, strlen(passwd)+1 );
+    if ( pB == NULL )
+      return EOUTOFMEM;
+
+    SMB_TxWords[7] = strlen ( passwd ) + 1;
+    SMB_TxWords[8] = 0;
+    SMB_TxWords[9] = 0;
+
+    res = Do_SMB ( hS, SMBsesssetup, 10, pB, NULL );
+  }
+  else if (hS->hServer->ProtFlags & PROT_HAVE_GUID) {
+    /* CAP_EXTENDED_SECURITY is supported by the server - setup session accordingly */
+    SMB_TxWords[7] = hS->hServer->bloblen;
+    SMB_TxWords[8] = SMB_TxWords[9] = 0; /* reserved */
+    SMB_TxWords[10] = SMB_TxWords[11] = 0; /* client capabilities */
+    pB = AddChain (NULL, "CIFS", sizeof("CIFS"));
+    if (pB) pB = AddChain ( pB, "RISCOS", sizeof("RISCOS"));
+    if (pB) pB = AddChain ( pB, hS->hServer->blob, hS->hServer->bloblen );
+    if (pB == NULL )
+      return EOUTOFMEM;
+    res = Do_SMB ( hS, SMBsesssetup, 12, pB, NULL );
+  }
+  else {
+    /* Server does not support extended security */
+    if (hS->hServer->ProtFlags & PROT_ENCRYPT)
+    {
+      unsigned char lmowfv2digest[16];
+      unsigned char challengeResponse[24];
+
+      if (strlen( passwd ) != 0)
+      {
+        Auth_LMOWFv2( (const char *)passwd, strlen( passwd ),
+                      (const char *)userid, strlen( userid ),
+                      (const char *)userid, 0, /* no domain */
+                      lmowfv2digest );
+        Auth_LMv2ChallengeResponse( lmowfv2digest, (void *)hS->hServer->blob, challengeResponse );
+        SMB_TxWords[7] = sizeof(challengeResponse);
+      }
+      else
+      {
+        SMB_TxWords[7] = 0;
+      }
+      SMB_TxWords[8] = 0;
+      SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
+      SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
+      pB = AddChain( NULL, "CIFS", sizeof("CIFS") );
+      if (pB) pB = AddChain( pB, "\0RISCOS", sizeof("\0RISCOS") );
+      if (pB) pB = AddChain( pB, userid, strlen(userid) + 1 );
+      if (pB && (SMB_TxWords[7] != 0)) pB = AddChain( pB, challengeResponse, sizeof(challengeResponse) );
+      if (pB) pB = DumpChain( pB );
+      if (pB == NULL)
+        return EOUTOFMEM;
+    }
+    else
+    {
+      SMB_TxWords[7] = strlen ( passwd );
+      SMB_TxWords[8] = 0;
+      SMB_TxWords[9] = SMB_TxWords[10] = 0; /* Reserved */
+      SMB_TxWords[11] = SMB_TxWords[12] = 0; /* client capabilities */
+      pB = AddChain( NULL, "CIFS", sizeof("CIFS") );
+      if (pB) pB = AddChain( pB, "\0RISCOS", sizeof("\0RISCOS") );
+      if (pB) pB = AddChain( pB, userid, strlen(userid) + 1 );
+      if (pB) pB = AddChain( pB, passwd, strlen(passwd) );
+      if (pB) pB = DumpChain( pB );
+      if (pB == NULL)
+        return EOUTOFMEM;
+    }
+    res = Do_SMB ( hS, SMBsesssetup, 13, pB, NULL );
+  }
+  if ( res != OK )
+    return res;
+
+  hS->hServer->Uid = SMB_RxHdr.uid;
+
+  return OK;
+}
+
+/* ---------------------------- */
+
+/* Keep in step with #defines in H.SMB ! */
+
+static char *sharetype_str[4] =
+{
+  "A:", "LPT1:", "COMM", "IPC"
+};
+
+/* ConnectShare connects to a given share, with share name & type &
+   password as given in the hSHARE structure. hS->hServer is
+   assumed to be valid & connected
+*/
+
+static err_t ConnectShare ( hSHARE hS )
+{
+  BUFCHAIN pB;
+  err_t res;
+
+  /* Mild sanity check */
+
+  if ( hS==NULL || hS->hServer==NULL ||
+       hS->sharetype < 0 || hS->sharetype > 3 )
+    return EBADPARAM;
+
+  debug3("Connect share %c to \\\\%s\\%s\n", hS->drvletter,
+            hS->hServer->servname, hS->sharename );
+
+  pB = MkDataString( NULL, DATA_ASCII, sharetype_str[hS->sharetype] );
+
+  if ( pB == NULL ) return EOUTOFMEM;
+
+  /* For user-based logon schemes, there is not a password for
+      tree connect */
+
+  if ( hS->hServer->ProtFlags & PROT_USERLOGON )
+    pB = MkDataString ( pB, DATA_ASCII, "" );
+  else
+  {
+    Xlt_Unjumble ( hS->password );
+    pB = MkDataString ( pB, DATA_ASCII, hS->password );
+    Xlt_Jumble ( hS->password );
+  }
+
+  if ( pB == NULL ) return EOUTOFMEM;
+
+  /* Path name is of the form \\SERVER\SHARENAME */
+
+  sprintf( (char*)SMB_WorkBuf, "\\\\%s\\%s", hS->hServer->servname,
+                                             hS->sharename );
+  pB = MkDataString ( pB, DATA_ASCII, (char *)SMB_WorkBuf );
+
+  if ( pB == NULL ) return EOUTOFMEM;
+
+  /* Do connection */
+
+  res = Do_SMB ( hS, SMBtcon, 0, pB, NULL );
+
+  if ( res == OK )
+  {
+    hS->Tid      = SMB_RxWords[1];
+    hS->Datasize = SMB_RxWords[0];
+    hS->flags   |= CONNECTED;     /* Clear CONN_LOST flag */
+  }
+
+  return res;
+}
+
+
+
+/* ----------------------------- */
+
+static err_t DisconnectShare ( hSHARE hS )
+{
+  if ( hS==NULL )       /* Shouldn't happen, but make sure */
+    return EBADPARAM;
+
+  debug3("Disconnect share %c from \\\\%s\\%s\n", hS->drvletter,
+            hS->hServer->servname, hS->sharename );
+
+  /* Say connection has been broken; if the operation fails it's
+     probably been broken already */
+
+  hS->flags &= ~CONNECTED;
+
+  /* Do SMB Tree disconnect operation */
+  return Do_SMB ( hS, SMBtdis, 0, NULL, NULL );
+}
+
+/* ------------------------------ */
+
+/* ConnectServer attempts to connect to a given server. It is actually
+   passed an hSHARE handle for internal reasons. It it assumed that
+   hS->hServer has been set up to point to a valid server, and that
+   the server name, user name & password are set up correctly.
+*/
+
+static err_t ConnectServer ( hSHARE hS )
+{
+  NETNAME nnserver;
+  hSERVER hSrv;
+  err_t res;
+
+  if ( hS == NULL || (hSrv=hS->hServer, hSrv == NULL) )
+    return EBADPARAM;
+
+  debug1("Connect server %s\n", hSrv->servname);
+
+  /* Set initial values */
+
+  hSrv->ProtFlags = 0;
+  hSrv->SMB_flg = 0;
+  hSrv->Uid = 0;
+  hSrv->Sesskey = 0;
+  hSrv->hSession = NULL;
+
+  /* Try to contact server */
+
+  debug0("NB_FormatName..\n");
+  res = NB_FormatName ( ntSERVER, hSrv->servname, &nnserver );
+  if ( res != OK )
+    return res;
+
+  /* Try to contact server */
+
+  debug0("NB_OpenSession..\n");
+  res = NB_OpenSession( NB_MachineName, &nnserver, &(hSrv->hSession) );
+  if ( res != OK )
+    return res;
+
+  /* Establish protocol */
+
+  debug0("SMB_Negotiate..\n");
+  res = SMB_Negotiate ( hS );
+  if ( res != OK )
+    goto abort_server;
+
+  /* Logon user, if it's that sort of server */
+
+  if (hSrv->ProtFlags & PROT_USERLOGON)
+  {
+    Xlt_Unjumble(hSrv->password);
+  debug0("SMB_SessSetup..\n");
+    res = SMB_SessSetup ( hS, hSrv->username, hSrv->password );
+    Xlt_Jumble(hSrv->password);
+
+    if ( res != OK ) goto abort_server;
+  }
+
+  debug0("ConnectServer succeeds\n");
+
+  return OK;
+
+abort_server:
+  NB_CloseSession(hSrv->hSession);
+  hSrv->hSession = NULL;
+  return res;
+}
+
+/* ------------------------------ */
+
+static err_t DisconnectServer ( hSERVER hSrv )
+{
+  int i;
+  hSHARE hS;
+
+  if ( hSrv == NULL )
+    return EBADPARAM;
+
+  debug1("Disconnect server %s\n", hSrv->servname);
+
+  /* Disconnect Server implicity closes all shares using it;
+     fortunately, the server will do all this if we drop the
+     link. All we have to do is mark the relevant shares as being
+     disconnected.
+  */
+
+  hS = SMB_Shares;
+  for ( i=0; i < MAX_SHARES; i++ )
+  {
+    if ( (hS->flags & ALLOCATED) &&
+         (hS->hServer == hSrv )     )
+      hS->flags &= ~CONNECTED;
+
+    hS++;
+  }
+
+  /* Close NetBIOS session */
+  if ( hSrv->hSession != NULL )
+  {
+    NB_CloseSession(hSrv->hSession);
+    hSrv->hSession = NULL;
+  }
+  return OK;
+}
+
+/* As a general rule, the routines above don't perform
+   any allocation/deallocation functions, only the network
+   transactions themselves. These are dealt with in the following
+   bits.
+*/
+
+/* ==========================================  */
+
+static hSERVER AllocServer ( void )
+{
+  hSERVER hS;
+  int i;
+
+  for ( hS = SMB_Servers, i=0; i < MAX_SERVERS; hS++, i++ )
+    if ( (hS->flags & ALLOCATED)==0 )
+    {
+      hS->flags = ALLOCATED;
+      hS->hSession = 0;
+      hS->blob = 0;
+#ifdef LONGNAMES
+      hS->t2flags = 0;
+#endif
+      return hS;
+    }
+
+  return NULL;
+}
+
+/* ----------------------------------- */
+
+static hSHARE AllocShare ( void )
+{
+  hSHARE hS;
+  int i;
+
+  for ( hS = SMB_Shares, i=0; i < MAX_SHARES; hS++, i++ )
+    if ( (hS->flags & ALLOCATED)== 0 )
+    {
+      hS->flags = ALLOCATED;
+      hS->hServer = NULL;
+      hS->Tid=0;
+      hS->Datasize=0;
+      return hS;
+    }
+
+  return NULL;
+}
+
+/* ----------------------------------- */
+
+static bool ServerInUse ( hSERVER hServ )
+{
+  int i;
+  hSHARE hS;
+
+  for ( hS=SMB_Shares, i=0; i<MAX_SHARES; hS++, i++ )
+  {
+    if ( hS->hServer == hServ && (hS->flags & ALLOCATED)  )
+      return true;
+  }
+
+  return false;
+}
+
+/* ----------------------------------- */
+
+static hSERVER FindServer ( char *serv_name )
+{
+  hSERVER hS;
+  int i;
+
+  for ( hS = SMB_Servers, i=0; i < MAX_SERVERS; hS++, i++ )
+  {
+    if ( (hS->flags & ALLOCATED) &&
+         stricmp ( hS->servname, serv_name ) == 0
+       )
+      return hS;
+  }
+
+  return NULL;
+}
+
+/* ----------------------------------- */
+
+static hSHARE FindShare ( hSERVER hServ, char *share_name )
+{
+  hSHARE hS;
+  int i;
+
+  for ( hS = SMB_Shares, i=0; i < MAX_SHARES; hS++, i++ )
+  {
+    if ( hS->hServer == hServ && (hS->flags & ALLOCATED) &&
+         stricmp ( hS->sharename, share_name ) == 0
+       )
+      return hS;
+  }
+
+  return NULL;
+}
+
+
+/* ----------------------------------- */
+
+static void FreeServer ( hSERVER hS )
+{
+  if (hS->flags != FREE) {
+    free(hS->blob);
+    hS->blob = NULL;
+  }
+  hS->flags = FREE;
+}
+
+/* ----------------------------------- */
+
+static void FreeShare ( hSHARE hS )
+{
+  hS->flags = FREE;
+}
+
+/* =======================================  */
+
+/* Validates a share, given a filename (the first character being the
+   drive letter). If the link to the server has failed, it will
+   attempt to reconnect it before returning.
+
+   Unlike most routines, it returns an hSHARE as a result and an error
+   via a pointer. The hSHARE will be non-Null if & only if the result is
+   OK; it is acceptable to test either.
+*/
+
+static hSHARE GetShare ( const char *filename, err_t *pRes )
+{
+  uint tmp;
+  hSHARE hS;
+  err_t res;
+
+  /* Is drive letter in range & in use? */
+
+  tmp = filename[0] - 'A';
+  if ( tmp >= MAX_SHARES ||
+        (hS=&SMB_Shares[tmp], (hS->flags & ALLOCATED)==0) )
+  {
+    *pRes = EBADDRV;
+    return NULL;
+  }
+
+  /* Can we still talk to the server */
+
+  if ( !NB_LinkOK ( hS->hServer->hSession ) )
+  {
+    DisconnectServer(hS->hServer);      /* Drop links, deallocate stuff */
+
+    res = ConnectServer(hS);   /* Try to reconnect to server */
+    if ( res != OK )
+    {
+      *pRes = res;
+      return NULL;
+    }
+  }
+
+  /* Server works, now see if we need reconnecting */
+
+  if ( (hS->flags & CONNECTED) == 0 )
+  {
+    res = ConnectShare(hS);
+    if ( res != OK )
+    {
+      *pRes = res;
+      return NULL;
+    }
+  }
+
+  *pRes = OK;
+  return hS;
+}
+
+
+/* ---------------------------- */
+
+/* GetShareNoConn() is used to validate a drive letter when
+    we aren't bothered if the connection is lost (e.g. for
+    the GetConnInfo or DisconnectShare calls)
+*/
+static hSHARE GetShareNoConn ( uint letter )
+{
+  letter -= 'A';
+  if ( (letter < MAX_SHARES) &&
+       (SMB_Shares[letter].flags & ALLOCATED) )
+    return &SMB_Shares[letter];
+
+  return NULL;
+}
+
+
+/* ---------------------------- */
+
+#ifdef LONGNAMES
+/* SMB_IsLongNameFS() returns true if the path refers to a share which is
+ * using long filenames.  Xlate.c needs to know this in order to determine
+ * which set of file mappings is to be used.
+ */
+bool SMB_IsLongNameFS( const char * path)
+{
+  hSHARE hS;
+
+  hS = GetShareNoConn(*path);
+  if (hS != NULL && (hS->hServer->t2flags & T2FLAGS_LONGNAMES)) return true;
+  return false;
+}
+#endif  
+
+/* --------------------- */
+
+/* When trying to get a share ID from a file handle, there's
+   no point reconnecting, because the handle wouldn't be valid
+   anyway.
+*/
+
+static hSHARE GetShareFromFH ( uint FH, err_t *pRes )
+{
+  FH = (FH >> 16);  /* Get share identifier from file handle */
+  if ( FH < MAX_SHARES )
+  {
+    hSHARE hS=&SMB_Shares[FH];
+
+    if ( (hS->flags & (ALLOCATED|CONNECTED))  == (ALLOCATED|CONNECTED) )
+      return hS;
+  }
+
+  *pRes = EFILEHANDLE;
+  return NULL;
+}
+
+/* ----------------------------- */
+
+static err_t SMB_SingleOp ( int op, char *path )
+{
+  BUFCHAIN pB;
+  hSHARE hS;
+  err_t res;
+
+  hS = GetShare (path, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString( NULL, DATA_ASCII, path+2 );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  return Do_SMB ( hS, op, 0, pB, NULL );
+}
+
+/* Public Connect/disconnect operations ====================== */
+
+/* CreateShare can do about five different things, depending on
+    the current state of the system. See SMB.H for full
+    description of the parameters. Scenarios include
+    - connection to a new share on a new server
+    - if we're already connected to the given server and the
+        given user name is blank or the same, connect to a new
+        share on the same server.
+    - if we're already connected to the given server and the
+        given user name is different, reconnect to the server;
+        the share name may be the same as an existing name (in
+        which case we're just changing user ID) or it may be
+        a new one (in which case it needs adding)
+    - if all of (server name, user name, share name) are the
+        same, return the drive letter corresponding to this
+        connection.
+
+    This is all a bit of a logical nightmare, especially as we
+    have to back out gracefully if any bit fails, so I've written
+    it out using flags which get set as each thing needs to be
+    done.
+
+*/
+
+static bool IsBlank ( char *str )
+{
+  while ( isspace(*str) ) str++;  /* Skip leading spaces */
+
+  if ( iscntrl(*str) )            /* If it's the end, it's blank */
+    return true;
+
+  return false;
+}
+
+#define ALLOC_SERVER   1
+#define ALLOC_SHARE    2
+#define DISCONN_SERVER 4
+#define CONN_SERVER    8
+
+err_t SMB_CreateShare (  int sharetype_in,
+                         int style,
+                         char *servname_in, char *sharename_in,
+                         char *username_in, char *password_in,
+                         char *drv_letter_out )
+{
+  hSHARE hShare;
+  hSERVER hServ;
+  char uc_sharename[SHARENAME_LEN];
+  char uc_servname [NAME_LIMIT];
+  char plain_password[NAME_LIMIT];
+  int to_do, done;
+  err_t res;
+
+  /* Validate & format parameters */
+#ifdef TRACE
+  debug2("Server name %p; share name %p\n", servname_in, sharename_in);
+  debug2("Server name `%s'; share name `%s'\n", servname_in, sharename_in);
+#endif
+
+  if ( servname_in == NULL || sharename_in==NULL )
+    return EBADPARAM;
+
+  strcpyn_upper ( uc_sharename, sharename_in, SHARENAME_LEN);
+  strcpyn_upper ( uc_servname,  servname_in, NAME_LIMIT);
+
+  if ( username_in == NULL ) username_in = "";
+  if ( password_in == NULL ) password_in = "";
+
+  /* Work out a list of what we have to do ------------ */
+
+  to_do = 0;
+
+  hServ = FindServer ( uc_servname );
+
+  if ( hServ == NULL )  /* New server */
+  {
+    hShare = NULL;
+    to_do |= (ALLOC_SERVER | ALLOC_SHARE | CONN_SERVER);
+
+    /* If both names are blank, use logon names */
+    if ( IsBlank(username_in) && IsBlank(password_in) )
+    {
+      username_in = LM_Vars.username;
+      Xlt_Unjumble ( LM_Vars.password_ptr );
+      strcpyn ( plain_password, LM_Vars.password_ptr, NAME_LIMIT );
+      Xlt_Jumble ( LM_Vars.password_ptr );
+      password_in = plain_password;
+    }
+  }
+  else
+  {
+    /* Already have connection to server */
+    hShare = FindShare(hServ, uc_sharename);
+
+    if ( hShare == NULL ) /* New share on existing server */
+      to_do |= (ALLOC_SHARE);
+
+    /* Check if user name is being given. If not,
+       disconnect and reconnect to force name change */
+
+    if ( (style & CREATE_NEW_USER) && !IsBlank (username_in)  )
+      to_do |= (DISCONN_SERVER | CONN_SERVER);
+  }
+
+  /* Check that's OK with the given style ----- */
+
+  if ( (style & CREATE_NEW_SHARE) && !(to_do & ALLOC_SHARE) )
+  {
+    /* If the share already exists, and the 'insist it's something
+       new' bit is set,  we fail the call and say  which drive letter
+       it is. Otherwise, we drop through the rest of the code - the
+       only thing that might happen is a disconnect/reconnect to
+       change user ID */
+    *drv_letter_out = hShare->drvletter;
+    return ECONNEXISTS;
+  }
+
+  /* Now do each bit ----------------------- */
+
+  done = 0;
+
+  /* Ensure hServ is allocated */
+  if ( to_do & ALLOC_SERVER )
+  {
+    hServ = AllocServer();
+    if ( hServ == NULL )
+    {
+      res = ECONNLIMIT;
+      goto fail;
+    }
+    strcpy  ( hServ->servname, uc_servname );
+    done |= ALLOC_SERVER;
+  }
+
+  /* Ensure hShare is allocated & set up */
+  if ( to_do & ALLOC_SHARE )
+  {
+    hShare = AllocShare();
+    if ( hShare == NULL )
+    {
+      res = ECONNLIMIT;
+      goto fail;
+    }
+
+    /* Assume flags don't have CONNECTED set */
+    hShare->hServer = hServ;
+    hShare->sharetype = sharetype_in;
+    strcpy  ( hShare->sharename, uc_sharename );
+    strcpyn ( hShare->password, password_in, NAME_LIMIT );
+    Xlt_Jumble(hShare->password);
+    done |= ALLOC_SHARE;
+  }
+
+  /* Clear attribute-file cache for the drive */
+
+  Attr_InvalidateDrive ( hShare->drvletter );
+
+  /* Disconnect server if new user */
+
+  if ( to_do & DISCONN_SERVER )
+  {
+    /* For a change of user, disconnect the server. It will mark
+       all attached shares as being disconnected */
+    DisconnectServer ( hServ );
+    done |= DISCONN_SERVER;
+  }
+
+  /* (re)connect to server */
+
+  if ( to_do & CONN_SERVER )
+  {
+    /* Set up new server details */
+    strcpyn_upper ( hServ->username, username_in, NAME_LIMIT );
+    strncpy ( hServ->password, password_in, NAME_LIMIT );
+    Xlt_Jumble(hServ->password);
+
+    res = ConnectServer ( hShare );
+    if ( res != OK )
+      goto fail;
+
+    done |= CONN_SERVER;
+  }
+
+  /* Connect to share ------------------- */
+
+  /* Reconnect share, & reconnect link if it's down */
+  if ( GetShare ( &(hShare->drvletter), &res ) == NULL )
+    goto fail;
+
+  *drv_letter_out = hShare->drvletter;
+  return OK;
+
+  /* Back out if something goes wrong */
+
+fail:
+  if ( done & ALLOC_SHARE )   /* If it was a new share */
+    FreeShare(hShare);        /*   free it */
+
+  if ( done & ALLOC_SERVER )  /* If it was a new server... */
+  {
+    if ( done & CONN_SERVER )  /* Disconnect it if it was */
+      DisconnectServer(hServ); /* connected */
+
+    FreeServer(hServ);
+  }
+
+  return res;
+}
+
+/* --------------------------- */
+
+err_t SMB_DeleteShare ( char drvlettr )
+{
+  hSHARE  hS;
+  hSERVER hSrv;
+
+  hS = GetShareNoConn(drvlettr);
+  if ( hS == NULL )
+    return EBADDRV;
+
+  hSrv = hS->hServer;
+
+  /* Do Tree disconnect */
+
+  DisconnectShare(hS);
+  FreeShare(hS);
+
+  /* If there are no shares left on this server, drop link */
+
+  if ( !ServerInUse(hSrv) )
+  {
+    DisconnectServer(hSrv);
+    FreeServer(hSrv);
+  }
+
+  return OK;
+}
+
+/* Public file/directory routines ================================ */
+
+static err_t SMB_ChkPath ( char *path )
+{
+  return SMB_SingleOp( SMBchkpth, path );
+}
+
+/* ----------------------------- */
+
+err_t SMB_MkDir ( char *path )
+{
+  return SMB_SingleOp( SMBmkdir, path );
+}
+
+/* ----------------------------- */
+
+err_t SMB_RmDir ( char *path )
+{
+  return SMB_SingleOp( SMBrmdir, path );
+}
+
+/* ----------------------------- */
+
+err_t SMB_Delete ( char *path )
+{
+  BUFCHAIN pB;
+  hSHARE hS;
+  err_t res;
+
+  hS = GetShare (path, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString( NULL, DATA_ASCII, path+2 );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = ATTR_NORM;
+
+  return Do_SMB ( hS, SMBunlink, 1, pB, NULL );
+}
+
+
+/* ----------------------------- */
+
+err_t SMB_Rename ( char *oldpath, char *newpath )
+{
+  BUFCHAIN pB;
+  hSHARE hS;
+  err_t res;
+
+  if ( oldpath[0] != newpath[0] )  /* Different drives! */
+    return EBADRENAME;
+
+  debug2("SMB_Rename: %s %s\n", oldpath+1, newpath+1);
+  if (strcmp(oldpath+1, newpath+1) == 0)
+    return OK;
+
+  hS = GetShare (oldpath, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString( NULL, DATA_ASCII, newpath+2 );
+  if ( pB != NULL ) pB = MkDataString ( pB, DATA_ASCII, oldpath+2 );
+
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = ATTR_NORM | ATTR_DIR; /* Permit both file and dir renaming */
+
+  return Do_SMB ( hS, SMBmv, 1, pB, NULL );
+}
+
+/* --------------------------- */
+
+#ifdef LONGNAMES
+
+/* Some Microsoft servers not sending them in the documented order */
+static void swap_time_date(BYTE *p)
+{
+        BYTE swp;
+
+        swp = p[0];
+        p[0] = p[2];
+        p[2] = swp;
+
+        swp = p[1];
+        p[1] = p[3];
+        p[3] = swp;
+}
+
+static err_t SMB_GetAttribsX2 (hSHARE hS, char *filename, DOS_ATTRIBS *pAttr )
+{
+  err_t res;
+  BYTE *resb;
+  static struct TransactParms tp;
+
+  debug1("SMB_GetAttribs: %s\n", filename);
+  resb = NameCache_Locate(filename);
+  if (resb != NULL) {
+    Transact_init(&tp, 1 * 2);           /* need to initialise tp.data_out_buf!! */
+    memcpy( tp.data_out_buf, resb, 23);
+    strcpy( (char *) tp.data_out_buf + 23, (char *) resb + 23);
+    return Xlt_ExpandSearchEntryX2 ( tp.data_out_buf, NULL, NULL, pAttr, NULL);
+  }
+
+  if (!(hS->hServer->t2flags & T2FLAGS_TESTEDSWAP))
+  {
+    /* Need to test whether we have to swap the date/time fields */
+    char        fnbuffer[8];
+    DOS_ATTRIBS aattrbuf;
+    DOS_ATTRIBS sattrbuf;
+
+    hS->hServer->t2flags |= T2FLAGS_TESTEDSWAP;
+    fnbuffer[0] = *filename;
+    fnbuffer[1] = ':';
+    fnbuffer[2] = '\\';
+    fnbuffer[3] = '\0';
+    debug1("Looking up `%s' to test buffer format\n", fnbuffer);
+    if (SMB_GetAttribsX2 ( hS, fnbuffer, &aattrbuf ) == OK)
+    {
+      fnbuffer[3] = '\0';
+      Transact_init(&tp, 6 * 2);           /* will accept 6 WORD return params */
+      Transact_addsetupword(&tp, TRANSACT2_FINDFIRST);
+      if (LM_Vars.namemode & NM_INTERNAL)
+      {                                    /* findfirst_Attribute */
+        Transact_addword(&tp, ATTR_DIR | ATTR_SYS | ATTR_HID);
+      }
+      else
+      {
+        Transact_addword(&tp, ATTR_DIR);     
+      }
+      Transact_addword(&tp, 1);            /* findfirst_SearchCount = 1 please */
+      Transact_addword(&tp, 1);            /* findfirst_Flags = auto close after this query */
+      Transact_addword(&tp, 1);            /* Search level = standard level  */
+      Transact_addlong(&tp, 0L);           /* reserved, MBZ */
+      Transact_addstring(&tp, fnbuffer+2); /* findfirst_FileName[] */
+      debug1("Looking for `%s'\n", fnbuffer+2);
+      res = SMB_Transact2(hS, &tp);
+      if (res == OK)
+      {
+        debug0("SMB_Transact2 worked\n");
+        SMB_TxWords[0] = Transact_getword(tp.parms_out_buf);
+        if (Transact_getword(tp.parms_out_buf + 2) == 1)
+        {
+          debug1("Filename was `%s'\n", tp.data_out_buf + 23);
+          res = Xlt_ExpandSearchEntryX2 ( tp.data_out_buf, NULL, NULL, &sattrbuf, NULL);
+          if (res == OK)
+          {
+            if (sattrbuf.utime != aattrbuf.utime)
+            {
+               debug0("Might need to swap date/time\n");
+               swap_time_date(tp.data_out_buf+0);
+               swap_time_date(tp.data_out_buf+4);
+               swap_time_date(tp.data_out_buf+8);
+               Xlt_ExpandSearchEntryX2 ( tp.data_out_buf, NULL, NULL, &sattrbuf, NULL);
+               if (sattrbuf.utime != aattrbuf.utime)
+               {
+                 debug0("Even after swapping they don't match\n");
+               }
+               else
+               {
+                 hS->hServer->t2flags |= T2FLAGS_SWAPDATETIME;
+                 debug0("Tested and verified!\n");
+               }
+            }
+            else
+            {
+               debug0("Don't need to swap date/time!\n");
+            }
+          }
+        }
+      }
+      else
+      {
+        debug0("SMB_Transact2 failed\n");
+      }
+    }
+  }
+
+  Transact_init(&tp, 1 * 2);
+  Transact_addsetupword(&tp, TRANSACT2_QUERYPATHINFORMATION);
+  Transact_addword(&tp, 1);  /* information level */
+  Transact_addlong(&tp, 0L); /* Reserved */
+  Transact_addstring(&tp, filename+2);
+  res = SMB_Transact2(hS, &tp);
+  if (res != OK)
+    return res;
+  /*
+   * OK.  Who decided that this call should return data in a different
+   * format than the FindFirst/FindNext calls.  Need to reverse the times
+   * and dates of the file before calling Xlt to expand them ... but only
+   * if the remote server has this bug.
+   */
+  if (hS->hServer->t2flags & T2FLAGS_SWAPDATETIME)
+  {
+    swap_time_date(tp.data_out_buf);
+    swap_time_date(tp.data_out_buf+4);
+    swap_time_date(tp.data_out_buf+8);
+  }
+  /* end workaround */
+  strcpy((char *)tp.data_out_buf+23, filename); /* Xlt_ExpandSearchEntryX2 relies on this */
+  return Xlt_ExpandSearchEntryX2 ( tp.data_out_buf, NULL, NULL, pAttr, NULL);
+}
+#endif /* LONGNAMES */
+
+/* --------------------------- */
+
+#if 0
+err_t SMB_GetAttribs ( char *filename, DOS_ATTRIBS *pAttr )
+{
+  err_t res;
+  BUFCHAIN pB;
+  hSHARE hS;
+
+  hS = GetShare (filename, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString ( NULL, DATA_ASCII, filename+2 );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  res = Do_SMB ( hS, SMBgetatr, 0, pB, NULL );
+
+  if ( res == OK )
+  {
+    pAttr->attr  = SMB_RxWords[0];
+    pAttr->utime = SMB_RxWords[1] + (SMB_RxWords[2] << 16);
+    pAttr->length = SMB_RxWords[3] + (SMB_RxWords[4] << 16);
+  }
+
+  return res;
+}
+#else
+/* THIS IS A BODGE!!
+   The SMB_GetAtr command in NT4.0 returns rubbish the file time;
+     it renders this command basically unusable. We have to get the
+     same information out via a directory search command instead.
+*/
+
+err_t SMB_GetAttribs ( char *filename, DOS_ATTRIBS *pAttr )
+{
+  err_t res;
+  BUFCHAIN pB, pBres;
+  hSHARE hS;
+
+  hS = GetShare (filename, &res);
+  if ( hS == NULL )
+    return res;
+
+#ifdef LONGNAMES
+  if (hS->hServer->t2flags & T2FLAGS_LONGNAMES)
+    return SMB_GetAttribsX2 (hS, filename, pAttr );
+#endif
+
+  pB = MkDataBlock ( NULL, DATA_VARBLK, NULL, 0, false );
+  if ( pB != NULL )
+    pB = MkDataString ( pB, DATA_ASCII, filename+2 );
+
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = 1; /* Count of entries to return */
+  SMB_TxWords[1] = ATTR_DIR; /* Return files & directories info */
+
+  res = Do_SMB ( hS, SMBsearch, 2, pB, &pBres );
+
+  if ( res == ENOMOREFILES )
+    return EFILENOTFOUND;
+
+  if ( res != OK )
+    return res;
+
+  /* Extract all data  */
+
+  FreeChain( GetData ( pBres, SMB_WorkBuf, SMB_RxByteCount ) );
+
+  if ( SMB_RxWords[0] < 1 ) /* No files read */
+    return EFILENOTFOUND;
+
+  return Xlt_ExpandSearchEntry ( SMB_WorkBuf+3+SEARCH_ST_SIZE,
+               NULL, NULL, pAttr, NULL );
+
+}
+#endif
+
+/* --------------------------- */
+
+static err_t SMB_SetDateTimeAttr ( char *filename, DOS_ATTRIBS *pAttr,
+                                         int flags )
+{
+  BUFCHAIN pB;
+  hSHARE hS;
+  err_t res;
+
+  hS = GetShare (filename, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString ( NULL, DATA_ASCII, "" );
+  if ( pB != NULL )
+    pB = MkDataString ( pB, DATA_ASCII, filename+2 );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = pAttr->attr;
+  if ( flags & PROT_SETDATETIME )
+  {
+    SMB_TxWords[1] = pAttr->utime & 0xFFFF;
+    SMB_TxWords[2] = pAttr->utime >> 16;
+  }
+  else
+  {
+    SMB_TxWords[1] = 0;
+    SMB_TxWords[2] = 0;
+  }
+  SMB_TxWords[3] = 0;
+  SMB_TxWords[4] = 0;
+  SMB_TxWords[5] = 0;
+  SMB_TxWords[6] = 0;
+  SMB_TxWords[7] = 0;
+
+  return Do_SMB ( hS, SMBsetatr, 8, pB, NULL );
+}
+
+/* ------------------------------------------ */
+
+err_t SMB_SetAttribs ( char *filename, DOS_ATTRIBS *pAttr )
+{
+  err_t res;
+
+  /* W4WG / Windows 95 barfs if we try to set a file time with this call */
+  /* but they can set other attributes, so we have to retry */
+
+  res = SMB_SetDateTimeAttr ( filename, pAttr, PROT_SETDATETIME );
+  if ( res != ENOTPRESENT )
+    return res;
+
+  /* 1997.04.21 - try really hard to set file attributes first, then
+                  date & time by opening and closing the file */
+
+  res = SMB_SetDateTimeAttr ( filename, pAttr, 0 );
+  if ( res != OK )
+    return res;
+
+  if ( pAttr->utime != 0 && (pAttr->attr & ATTR_DIR) == 0 )
+  {
+    int FH, tmp;
+    DOS_ATTRIBS da;
+
+    res = SMB_Open ( MODE_RD, filename, &da, &FH, &tmp );
+    if ( res == OK )
+    {
+      da.utime = pAttr->utime;
+      SMB_Close( FH, &da );
+    }
+    /* Swallow errors, as this is a bit of a bodge! */
+  }
+
+  return OK;
+}
+
+/* --------------------------- */
+
+#ifdef LONGNAMES
+static err_t SMB_GetFreeSpaceX2 ( hSHARE hS, struct disk_size_response *pDSR  )
+{
+  err_t res;
+  static struct TransactParms tp;
+  BYTE *p;
+  DWORD sectors_per_alloc, total_allocs, total_avail_allocs;
+  WORD bytes_per_sector;
+
+  Transact_init(&tp, 1 * 2);
+  Transact_addsetupword(&tp, TRANSACT2_QUERYFSINFORMATION);
+  Transact_addword(&tp, 1);  /* information level */
+  res = SMB_Transact2(hS, &tp);
+  if (res != OK)
+    return res;
+  p = tp.data_out_buf + 4;
+  sectors_per_alloc = Transact_getlong(p), p += 4;
+  total_allocs = Transact_getlong(p), p += 4;
+  total_avail_allocs = Transact_getlong(p), p += 4;
+  bytes_per_sector = Transact_getword(p);
+
+  pDSR->blksize = bytes_per_sector * sectors_per_alloc;
+  pDSR->freeblks =  total_avail_allocs;
+  pDSR->totalblks = total_allocs;
+
+  return OK;
+}
+#endif
+
+err_t SMB_GetFreeSpace ( char lettr, struct disk_size_response *pDSR  )
+{
+  err_t res;
+  hSHARE hS;
+
+  hS = GetShare (&lettr, &res);
+  if ( hS == NULL )
+    return res;
+
+#ifdef LONGNAMES
+  if (hS->hServer->t2flags & T2FLAGS_LONGNAMES)
+  {
+    return SMB_GetFreeSpaceX2(hS, pDSR);
+  }
+#endif
+
+  res = Do_SMB ( hS, SMBdskattr, 0, NULL, NULL );
+
+  if ( res == OK )
+  {
+    pDSR->blksize = SMB_RxWords[1] * SMB_RxWords[2];
+    pDSR->freeblks = SMB_RxWords[3];
+    pDSR->totalblks = SMB_RxWords[0];
+  }
+
+  return res;
+}
+
+
+/* ------------------------------- */
+
+#ifdef LONGNAMES
+enum {
+  ffirst_FORCE_CLOSE = 1,
+  ffirst_CLOSE_IF_DONE = 2, /* Note close_if_done doesn't seem to work (at least on NT 4.0 SP3) */
+  ffirst_RETURN_KEYS = 4,
+  fnext_CONTINUE = 8, /* This bit allows continuation without the need to use resume keys */
+  ffirst_BACKUP_INTENT = 16
+};
+
+static err_t SMB_AbandonFind2( hSHARE hS, WORD dir_handle )
+{
+  debug1("Terminating search op (dir_handle = %x)\n", dir_handle);
+  SMB_TxWords[0] = dir_handle;
+  return Do_SMB(hS, SMBfindclose2, 1, NULL, NULL);
+}
+
+/* Implement directory searching via TRANSACT2/FINDFIRST/FINDNEXT */
+static err_t SMB_ReadDirEntriesX2 ( hSHARE hS, char *path, int count,
+                                    ENUM_DIR_FN dirfn, void *private,
+                                    Transact_SearchContext *con )
+{
+  err_t res;
+  BYTE *p;
+  int n_read = 0;
+  int eos;
+  int i;
+  DWORD actual_resume_key;
+  const int first_flags = ffirst_RETURN_KEYS;
+  const int stuck_flags = ffirst_RETURN_KEYS | fnext_CONTINUE;
+  const int next_flags  = ffirst_RETURN_KEYS;
+  bool path_changed = false;
+  bool taken;
+  
+  /* Despite having a resume key it may be necessary to restart */
+  if ( (path != NULL) && (strcmp( path, con->dir_path ) != 0) )
+    path_changed = true;
+
+  if ( path_changed || (con->resume_key == 0) ) {
+    /* Path changed due to recursion or new search */
+    if (con->dir_handle_valid) {
+      debug1("SMB_ReadDirEntriesX2 -> abandon old search of dir handle %x\n", con->dir_handle);
+      (void) SMB_AbandonFind2( hS, con->dir_handle );
+      con->dir_handle_valid = false;
+    }
+    strcpy( con->dir_path, path );
+    con->resume_key_encountered = (con->resume_key == 0) ? true : false;
+
+    /* For a new search, ensure the request allows for "." and ".." which are
+     * always given and would therefore end up oscillating with 0 useful files
+     * found and a resume key of 0 again
+     */
+    count = max( count, 3 );
+
+    /* Initial search - note we accept SIX return parameters - contrary to
+     * Microsoft's own document - because it doesn't work if you only pass 5. Grr.
+     */
+    Transact_init(&con->tp, 6 * 2);                /* will accept 6 WORD return params */
+    Transact_addsetupword(&con->tp, TRANSACT2_FINDFIRST);
+    if (LM_Vars.namemode & NM_INTERNAL) {          /* findfirst_Attribute */
+      Transact_addword(&con->tp, ATTR_DIR | ATTR_SYS | ATTR_HID);
+    }
+    else {
+      Transact_addword(&con->tp, ATTR_DIR);        
+    }
+    Transact_addword(&con->tp, count);             /* findfirst_SearchCount */
+    Transact_addword(&con->tp, first_flags);       /* findfirst_flags */
+    Transact_addword(&con->tp, 1);                 /* Search level  */
+    Transact_addlong(&con->tp, 0L);                /* reserved, MBZ */
+    Transact_addstring(&con->tp, path+2);          /* findfirst_FileName[] */
+    res = SMB_Transact2(hS, &con->tp);
+    if (res != OK)
+      return res;
+    p = con->tp.parms_out_buf;
+    con->dir_handle = Transact_getword(p); p += 2;
+    con->dir_handle_valid = true;
+    con->resume_fake = 0;
+    con->resume_key_stuck = false;
+    con->resume_file_name[0] = 0;
+    debug1("SMB_ReadDirEntriesX2 -> new dir handle %x\n", con->dir_handle);
+  }
+  else {
+    /* Continuation */
+    Transact_init(&con->tp, 4 * 2);                /* will accept 4 WORD return params */
+    Transact_addsetupword(&con->tp, TRANSACT2_FINDNEXT);
+    Transact_addword(&con->tp, con->dir_handle);   /* findnext_DirHandle */
+    Transact_addword(&con->tp, count);             /* findnext_SearchCount */
+    Transact_addword(&con->tp, 1);                 /* Search level  */
+    Transact_addlong(&con->tp, con->actual_resume_key);   /* Resume key from previous */
+    Transact_addword(&con->tp, next_flags);               /* Jump to place using the resume key */
+    Transact_addstring(&con->tp, con->resume_file_name);
+    debug1("SMB_ReadDirEntriesX2 -> continue with key %08x\n", con->resume_key);
+    res = SMB_Transact2(hS, &con->tp);
+    if (res != OK)
+      return res;
+    p = con->tp.parms_out_buf;
+  }
+  /* Remainder of response handling is common to both sub-commands */
+  n_read = Transact_getword(p); p += 2;
+  eos = Transact_getword(p); p += 2;
+  if (eos)
+    debug0(">> Server said it was the end of the search operation\n");
+  p = con->tp.data_out_buf;
+  if (n_read == 0)
+    return ENOMOREFILES;
+
+  /* At this point, p is pointing to the start of the returned data
+   * buffer, n_read contains the number of files known to be in the
+   * return buffer, eos is non-zero if the search is completed.
+   */
+  for (i = 1; i <= n_read; i++) {
+    int length;
+    DWORD next_resume_key;
+
+    /* Get next resume key */
+    next_resume_key = Transact_getlong(p); p += 4;
+    length = p[22];
+    con->resume_fake++;
+
+    /* Special case . and .. so the duff resume key detection doesn't see them */
+    if ( ((p[22] == 1) && (p[23] == '.') && (p[24] == 0)) ||
+         ((p[22] == 2) && (p[24] == '.') && (p[25] == 0) && (p[23] == '.')) ) {
+      p += 23 + length + 1;
+      continue;
+    }
+
+    actual_resume_key = next_resume_key;
+
+    /* Workaround for NTFS always returning zero */
+    con->resume_key_stuck = (next_resume_key == 0) ? true : false;
+    if (con->resume_key_stuck) next_resume_key = con->resume_fake; 
+
+    /* Either consume the name or keep waiting for sync */
+    if ( con->resume_key_encountered ) {
+      debug1("SMB_ReadDirEntriesX2 -> call back with key %08x\n", next_resume_key);
+      res = dirfn(p, 1, &taken, private);
+
+      if (taken) {
+        con->resume_key = next_resume_key;
+        con->actual_resume_key = actual_resume_key;
+        memcpy(con->resume_file_name, p + 23, length + 1);
+      }
+      else {
+        con->resume_fake--;
+      }
+
+      if (res != OK) {
+        /* Entry expander must have run out of space! */
+        debug0("SMB_ReadDirEntriesX2 -> caller ran out of space (or could be name xlate code)\n");
+        return EOUTOFMEM;
+      }
+    }
+    else {
+      debug2("SMB_ReadDirEntriesX2 -> awaiting key %08x (got %08x)\n", con->resume_key, next_resume_key);
+      con->actual_resume_key = actual_resume_key;
+      memcpy(con->resume_file_name, p + 23, length + 1);
+      if ( next_resume_key == con->resume_key )
+        con->resume_key_encountered = true;
+    }
+    p += 23 + length + 1;
+  }
+
+  if (eos)
+    debug0(">> Server said it was the end of the search operation\n");
+
+  return eos ? ENOMOREFILES : OK;
+}
+#endif
+
+err_t SMB_ReadDirEntries ( char *path, int count,
+                           ENUM_DIR_FN dirfn, void *private, void *context )
+{
+  err_t res;
+  int i, n_read, eos;
+  BYTE *p;
+  BUFCHAIN pB, pBres;
+  Transact_SearchContext *con;
+  bool path_changed = false;
+  bool taken;
+
+  /* Don't be silly */
+  if (count < 0) return ENOMOREFILES;
+
+  con = (Transact_SearchContext *)context;
+  if (con->resume_key == 0) {
+    /* Start search */
+    con->search_drive = GetShare(path, &res);
+    if ( con->search_drive == NULL )
+      return res;
+  }
+  else {
+    /* Continue search */
+    if ( con->search_drive == NULL )
+      return ENOMOREFILES;
+  }
+
+#ifdef LONGNAMES
+  if ( con->search_drive->hServer->t2flags & T2FLAGS_LONGNAMES ) {
+    /* Long names enabled */
+    return SMB_ReadDirEntriesX2(con->search_drive, path, count, dirfn, private, con);
+  }
+#endif
+
+  /* Despite having a resume key it may be necessary to restart */
+  if ( (path != NULL) && (strcmp( path, con->dir_path ) != 0) )
+    path_changed = true;
+
+  if (con->resume_key == 0) {
+    /* New search */
+    strcpy( con->dir_path, path );
+    con->resume_key_encountered = true;
+    con->dir_handle_valid = false;
+
+    /* For a new search, ensure the request allows for "." and ".." which are
+     * always given and would therefore end up oscillating with 0 useful files
+     * found and a resume key of 0 again
+     */
+    count = max( count, 3 );
+  
+    /* Initial search */
+    pB = MkDataBlock ( NULL, DATA_VARBLK, NULL, 0, false );
+    if ( pB != NULL )
+      pB = MkDataString( pB, DATA_ASCII, path+2 );
+    debug1("SMB_ReadDirEntries -> new search of %s\n", path);
+  }
+  else {
+    /* Continuation */
+    debug1("SMB_ReadDirEntries -> continue with key %08x\n", con->resume_key);
+
+    if (!path_changed && con->dir_handle_valid &&
+       ((WORD)con->resume_key == con->dir_handle)) {
+      /* Path is the same, search key non zero, state valid */
+      debug0("SMB_ReadDirEntries -> hyperspace\n");
+      con->resume_key_encountered = true;
+      pB = MkDataBlock (NULL, DATA_VARBLK, con->resume_state,
+                        SEARCH_ST_SIZE, false);
+      if ( pB != NULL)
+        pB = MkDataString( pB, DATA_ASCII, "" );
+    }
+    else {
+      /* Emulate the state resumption, slow but infrequent */
+      debug0("SMB_ReadDirEntries -> emulation\n");
+
+      con->resume_key_encountered = false;
+      pB = MkDataBlock ( NULL, DATA_VARBLK, NULL, 0, false );
+      if ( pB != NULL )
+        pB = MkDataString( pB, DATA_ASCII, path+2 );
+
+      while (!con->resume_key_encountered) {
+        /* Do search */
+        if ( pB == NULL )
+          return EOUTOFMEM;
+        SMB_TxWords[0] = max( count, SEARCH_COUNT );
+        SMB_TxWords[1] = ATTR_DIR /* | ATTR_SYS | ATTR_HID */;
+        res = Do_SMB( con->search_drive, SMBsearch, 2, pB, &pBres );
+        if ( res != OK )
+          return res;
+        FreeChain( GetData( pBres, SMB_WorkBuf, SMB_RxByteCount ) );
+        
+        /* Scan for a match */
+        n_read = SMB_RxWords[0];
+        eos = (n_read < count);
+        if (eos)
+          debug0(">> Server said it was the end of the search operation\n");
+        
+        p = SMB_WorkBuf+3;
+        /* At this point, p is pointing to the start of the returned data
+         * buffer, n_read contains the number of files known to be in the
+         * return buffer, eos is non-zero if the search is completed.
+         */
+        if (n_read == 0)
+          return ENOMOREFILES;
+        
+        for (i = 1; i <= n_read; i++) {
+          DWORD next_resume_key;
+
+          /* Prep resumption */
+          memcpy( con->resume_state, p, SEARCH_ST_SIZE );
+
+          /* Get next resume key */
+          _swix(OS_CRC, _INR(0,3)|_OUT(0), 0, p+30, p+SEARCH_TOT_SIZE, 1, &next_resume_key);
+          if (next_resume_key == con->resume_key) {
+            strcpy( con->dir_path, path );
+            con->resume_key_encountered = true;
+            break;
+          }
+
+          p += SEARCH_TOT_SIZE;
+        }
+
+        /* Again again... */
+        pB = MkDataBlock (NULL, DATA_VARBLK, con->resume_state,
+                          SEARCH_ST_SIZE, false);
+        if ( pB != NULL)
+          pB = MkDataString( pB, DATA_ASCII, "" );
+      }
+    }
+  }
+
+  /* Do search */
+  if ( pB == NULL )
+    return EOUTOFMEM;
+  count = min( count, SEARCH_COUNT ); 
+  SMB_TxWords[0] = count;
+  SMB_TxWords[1] = ATTR_DIR /* | ATTR_SYS | ATTR_HID */;
+  res = Do_SMB( con->search_drive, SMBsearch, 2, pB, &pBres );
+  if ( res != OK )
+    return res;
+  FreeChain( GetData( pBres, SMB_WorkBuf, SMB_RxByteCount ) );
+
+  /* Remainder of response handling is common to both sub-commands */
+  n_read = SMB_RxWords[0];
+  eos = (n_read < count);
+  if (eos)
+    debug0(">> Server said it was the end of the search operation\n");
+
+  p = SMB_WorkBuf+3;
+  /* At this point, p is pointing to the start of the returned data
+   * buffer, n_read contains the number of files known to be in the
+   * return buffer, eos is non-zero if the search is completed.
+   */
+  if (n_read == 0)
+    return ENOMOREFILES;
+  
+  for (i = 1; i <= n_read; i++) {
+    DWORD next_resume_key;
+
+    /* Get next resume key */
+    _swix(OS_CRC, _INR(0,3)|_OUT(0), 0, p+30, p+SEARCH_TOT_SIZE, 1, &next_resume_key);
+    p[SEARCH_TOT_SIZE - 1] = 0;
+
+    debug1("SMB_ReadDirEntries -> call back with key %08x\n", next_resume_key);
+    res = dirfn(p+SEARCH_ST_SIZE, 0, &taken, private);
+    if (taken) {
+      con->resume_key = next_resume_key;
+      memcpy( con->resume_state, p, SEARCH_ST_SIZE );
+      con->dir_handle = (WORD)next_resume_key;
+      con->dir_handle_valid = true;
+    }
+    if (res != OK) {
+      /* Entry expander must have run out of space! */
+      debug0("SMB_ReadDirEntries -> caller ran out of space (or could be name xlate code)\n");
+      return EOUTOFMEM;
+    }
+
+    p += SEARCH_TOT_SIZE;
+  }
+
+  if (eos)
+    debug0(">> Server said it was the end of the search operation\n");
+
+  return eos ? ENOMOREFILES : OK;
+}
+
+/* Public file read/write operations ============================= */
+
+
+err_t SMB_Create ( char *filename, DOS_ATTRIBS *pInAttr,
+                   int *pOutFH )
+{
+  err_t res;
+  BUFCHAIN pB;
+  hSHARE hS;
+
+  hS = GetShare(filename, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString ( NULL, DATA_ASCII, filename+2 );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = (pInAttr->attr) & (ATTR_RO|ATTR_SYS|ATTR_HID);
+  SMB_TxWords[1] = (pInAttr->utime) & 0xFFFF;
+  SMB_TxWords[2] = (pInAttr->utime) >> 16;
+
+  res = Do_SMB ( hS, SMBcreate, 3, pB, NULL );
+  if ( res == OK )
+    *pOutFH = MakeFH(hS, SMB_RxWords[0]);
+
+  return res;
+}
+
+/* ---------------- */
+
+static int ModeXlate[4] = { MODE_RD, MODE_WR, MODE_RDWR, 0 };
+
+err_t SMB_Open ( int mode, char *filename,
+      DOS_ATTRIBS *pOutAttr, int *pOutFH, int *pOutModes )
+{
+  err_t res;
+  BUFCHAIN pB;
+  hSHARE hS;
+
+  hS = GetShare(filename, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString ( NULL, DATA_ASCII, filename+2 );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = mode;  /* Exclusive access */
+  SMB_TxWords[1] = ATTR_RO | ATTR_HID | ATTR_SYS; /* Attribute */
+
+  res = Do_SMB ( hS, SMBopen, 2, pB, NULL );
+  if ( res == OK )
+  {
+    *pOutFH = MakeFH(hS, SMB_RxWords[0]);
+
+    if ( pOutAttr != NULL )
+    {
+      pOutAttr->attr    = SMB_RxWords[1];
+      pOutAttr->utime   = SMB_RxWords[2] + (SMB_RxWords[3] << 16);
+      pOutAttr->length  = SMB_RxWords[4] + (SMB_RxWords[5] << 16);
+    }
+
+    if ( pOutModes != NULL )
+      *pOutModes = ModeXlate[SMB_RxWords[6] & 3];
+  }
+  return res;
+}
+
+/* ---------------- */
+
+err_t SMB_GetLength ( int FH, uint *pOutLen )
+{
+  err_t res;
+  hSHARE hS = GetShareFromFH(FH, &res);
+  if ( hS == NULL )
+    return res;
+
+  SMB_TxWords[0] = GetFid(FH);
+  SMB_TxWords[1] = 2;  /* SEEK from end */
+  SMB_TxWords[2] = 0;  /* Offset 0: Relative to end */
+  SMB_TxWords[3] = 0;
+
+  res = Do_SMB ( hS, SMBlseek, 4, NULL, NULL );
+  if ( res == OK )
+  {
+    *pOutLen = SMB_RxWords[0] + (SMB_RxWords[1] << 16);
+  }
+
+  return res;
+}
+
+/* ---------------- */
+
+
+err_t SMB_Read ( int FH, uint offset, uint len, BYTE *where,
+    uint *pOutLen )
+{
+  uint len_left, n_read;
+  int  fid;
+  hSHARE hS;
+  BUFCHAIN pB_res;
+  err_t res = OK;
+
+  len_left = len;
+  hS = GetShareFromFH(FH, &res);
+  if ( hS == NULL )
+    return res;
+
+  fid = GetFid(FH);
+
+  /* Can a raw block read help us ? */
+
+  if ( hS->hServer->ProtFlags & PROT_READRAW )
+  {
+    while ( len_left > MAX_RX_BLOCK_SIZE )
+    {
+      n_read = SMB_ReadRaw ( hS, fid, offset, len_left, where );
+      if ( n_read == 0 )  /* Didn't work? Find out why */
+        break;
+
+      len_left -= n_read;
+      where    += n_read;
+      offset   += n_read;
+    }
+  }
+
+  /* Conventional read command */
+
+  while ( len_left > 0 )
+  {
+    SMB_TxWords[0] = fid;
+    SMB_TxWords[1] = min(len_left, MAX_RX_BLOCK_SIZE);
+    SMB_TxWords[2] = offset & 0xFFFF;
+    SMB_TxWords[3] = (offset >> 16 );
+    SMB_TxWords[4] = (len_left);
+
+    res = Do_SMB ( hS, SMBread, 5, NULL, &pB_res );
+    if ( res != OK )
+      break;
+
+    n_read = SMB_RxWords[0];
+
+    if ( n_read > 0 )
+    {
+      pB_res = GetData(pB_res, NULL, 3 ); /* Data header */
+      pB_res = GetData(pB_res, where, n_read );
+
+      if ( pB_res == NULL )  /* Read failed */
+      {
+        res = EDATALEN;
+        break;
+      }
+
+      len_left -= n_read;
+      where    += n_read;
+      offset   += n_read;
+    }
+
+    FreeChain(pB_res);
+
+    if ( n_read < MAX_RX_BLOCK_SIZE )  /* Reached end of file */
+      break;
+  }
+
+  if ( pOutLen != NULL ) *pOutLen = len-len_left;
+  return res;
+}
+
+/* ---------------- */
+
+err_t SMB_Truncate ( int FH, uint length )
+{
+  BUFCHAIN pB;
+  err_t res;
+  hSHARE hS;
+
+  hS = GetShareFromFH(FH, &res);
+  if ( hS == NULL )
+    return res;
+
+  /* Do a truncate with a write of length zero */
+  SMB_TxWords[0] = GetFid(FH);
+  SMB_TxWords[1] = 0 /* Byte count to write */;
+  SMB_TxWords[2] = length & 0xFFFF;
+  SMB_TxWords[3] = (length >> 16 );
+  SMB_TxWords[4] = 0;
+
+  pB = MkDataBlock ( NULL, DATA_BLOCK, NULL, 0, false );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  return Do_SMB ( hS, SMBwrite, 5, pB, NULL );
+}
+
+/* ---------------- */
+
+err_t SMB_Write ( int FH, uint offset, uint len, BYTE *where,
+    uint *pOutLen )
+{
+  BUFCHAIN pB;
+  uint len_left, n_written, n_count;
+  int  fid;
+  hSHARE hS;
+
+  err_t res=OK;
+
+  hS = GetShareFromFH(FH, &res);
+  if ( hS == NULL )
+    return res;
+
+  fid = GetFid(FH);
+  len_left = len;
+
+  /* Can we do it with raw writes? */
+
+  if ( hS->hServer->ProtFlags & PROT_WRITERAW )
+  {
+    while ( len_left >= WRRAW_BLOCK_SIZE )
+    {
+      n_written = WRRAW_BLOCK_SIZE;
+      res = SMB_WriteRaw ( hS, fid, offset, n_written, where );
+      if ( res != OK )
+        goto finish;
+
+      len_left -= n_written;
+      where    += n_written;
+      offset   += n_written;
+    }
+  }
+
+  while ( len_left > 0 )
+  {
+    n_count = min(0xFFFF, min(len_left, hS->hServer->maxTxBufferSize));
+    SMB_TxWords[0] = fid;
+    SMB_TxWords[1] = n_count;
+    SMB_TxWords[2] = (WORD)offset;
+    SMB_TxWords[3] = (WORD)(offset >> 16);
+    SMB_TxWords[4] = min(0xFFFF, len_left); /* Estimate of remainder */
+
+    pB = MkDataBlock ( NULL, DATA_BLOCK, where, n_count, true );
+    if ( pB == NULL )
+    {
+      res = EOUTOFMEM;
+      break;
+    }
+
+    res = Do_SMB ( hS, SMBwrite, 5, pB, NULL );
+    if ( res != OK )
+      break;
+
+    n_written = SMB_RxWords[0];
+    len_left -= n_written;
+    where    += n_written;
+    offset   += n_written;
+
+    if ( n_written < n_count )  /* Server has insufficient resources */
+      break;
+  }
+
+finish:
+  if ( pOutLen != NULL ) *pOutLen = len-len_left;
+  return res;
+
+}
+
+/* ---------------- */
+
+err_t SMB_Flush ( int FH )
+{
+  err_t res;
+  hSHARE hS;
+
+  hS = GetShareFromFH(FH, &res);
+  if ( hS == NULL )
+    return res;
+
+  SMB_TxWords[0] = GetFid(FH);
+  return Do_SMB ( hS, SMBflush, 1, NULL, NULL );
+}
+
+/* ---------------- */
+
+err_t SMB_Close ( int FH, DOS_ATTRIBS *pAttr )
+{
+  err_t res;
+  hSHARE hS;
+
+  hS = GetShareFromFH(FH, &res);
+  if ( hS == NULL )
+    return res;
+
+  SMB_TxWords[0] = GetFid(FH);
+  SMB_TxWords[1] = pAttr->utime & 0xFFFF;
+  SMB_TxWords[2] = pAttr->utime >> 16;
+
+  return Do_SMB ( hS, SMBclose, 3, NULL, NULL );
+}
+
+
+/* Printing routines ================================== */
+
+err_t SMB_OpenPrinter ( char drvlettr, char *idstring, int *ph_out )
+{
+  err_t res;
+  BUFCHAIN pB;
+  hSHARE hS;
+
+  hS = GetShare(&drvlettr, &res);
+  if ( hS == NULL )
+    return res;
+
+  pB = MkDataString ( NULL, DATA_ASCII, idstring );
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  SMB_TxWords[0] = 0;  /* Length of printer setup data */
+  SMB_TxWords[1] = 1;  /* Graphics mode */
+
+  res = Do_SMB ( hS, SMBsplopen, 2, pB, NULL );
+
+  if ( res == OK )
+    *ph_out = MakeFH(hS, SMB_RxWords[0]);
+
+  return res;
+}
+
+/* -------------- */
+
+err_t SMB_WritePrinter ( int PH, BYTE *data, int datalen )
+{
+  BUFCHAIN pB;
+  hSHARE hS;
+  int len;
+  err_t res=OK;
+
+  hS = GetShareFromFH(PH, &res);
+  if ( hS == NULL )
+    return res;
+
+  while ( datalen > 0 )
+  {
+    len = ( datalen > PRN_BLOCK_SIZE ) ? PRN_BLOCK_SIZE : datalen;
+    SMB_TxWords[0] = GetFid(PH);
+
+    pB = MkDataBlock ( NULL, DATA_BLOCK, data, len, true );
+    if ( pB == NULL )
+    {
+      res = EOUTOFMEM;
+      break;
+    }
+
+    res = Do_SMB ( hS, SMBsplwr, 1, pB, NULL );
+    if ( res != OK )
+      break;
+
+    datalen -= len;
+    data += len;
+  }
+
+  return res;
+}
+
+/* ---------------- */
+
+err_t SMB_ClosePrinter ( int PH )
+{
+  err_t res;
+  hSHARE hS;
+
+  hS = GetShareFromFH(PH, &res);
+  if ( hS == NULL )
+    return res;
+
+  SMB_TxWords[0] = GetFid(PH);
+  return Do_SMB ( hS, SMBsplclose, 1, NULL, NULL );
+}
+
+/* "Transact" (Remote-procedure-call) operations =========== */
+
+/* For the time being, we limit each transmission to one
+   packet's worth (1500 bytes). This might cause Tx failures
+   if we exceed it.
+
+   Also, we don't allow any 'setup words' (cos I've never seen them
+   used & don't know what they do!).
+
+*/
+
+err_t SMB_Transact ( char drvlettr, char *name, struct TransactParms *pT )
+{
+  BUFCHAIN pB, pBres;
+  err_t res;
+  int   a, padbytes;    /* Temp variable */
+  hSHARE hS;
+
+  hS = GetShare(&drvlettr, &res);
+  if ( hS == NULL )
+    return res;
+
+  a = SMBHDR_SIZE + (14*2) + 2 + strlen(name) + 1;
+      /* Size of SMB header, 14 word params, 2 byte data length,
+            plus the transaction name inc. zero terminator */
+
+  SMB_TxWords[0]  = pT->parms_in_len; /* Total length */
+  SMB_TxWords[1]  = pT->data_in_len; /* Total length */
+  SMB_TxWords[2]  = pT->parms_out_maxlen;
+  SMB_TxWords[3]  = pT->data_out_maxlen;
+  SMB_TxWords[4]  = 0; /* Setup words to return */
+  SMB_TxWords[5]  = 0; /* Flags - normal */
+  SMB_TxWords[6]  = TRANSACT_TIMEOUT; /* Timeout LSW */
+  SMB_TxWords[7]  = 0; /* Timeout MSW */
+  SMB_TxWords[8]  = 0; /* Reserved */
+  SMB_TxWords[9]  = pT->parms_in_len; /* Length this buffer */
+  SMB_TxWords[10] = a;  /* Offset from SMB header to parm bytes */
+  SMB_TxWords[11] = pT->data_in_len; /* Length this buffer */
+  SMB_TxWords[12] = a + pT->parms_in_len;  /* Offset to data bytes */
+  SMB_TxWords[13] = 0; /* Setup words being sent */
+
+  pB = NULL;
+
+  /* Make up data chain */
+
+  if ( pT->data_in_len != 0 )
+  {
+    pB = AddChain ( pB, pT->data_in, pT->data_in_len );
+    if ( pB == NULL )
+      return EOUTOFMEM;
+  }
+
+  if ( pT->parms_in_len != 0 )
+  {
+    pB = AddChain ( pB, pT->parms_in, pT->parms_in_len );
+    if ( pB == NULL )
+      return EOUTOFMEM;
+  }
+
+  pB = AddChain ( pB, name, strlen(name)+1 );
+
+  res = Do_SMB ( hS, SMBtransact, 14, pB, &pBres );
+
+  if ( res != OK )
+    return res;
+
+  /* Now extract results */
+
+  if ( SMB_RxWordCount < 10 )
+  {
+    FreeChain(pBres);
+    return EDATALEN;
+  }
+
+  a = SMBHDR_SIZE + (SMB_RxWordCount)*2 + 2;
+  /* Size of SMBHDR plus returned rx words plus byte count
+     = offset of data in pBres from start of header */
+
+  pT->parms_out_len = min(SMB_RxWords[3], pT->parms_out_maxlen);
+                          /* Parm bytes being returned */
+  pT->data_out_len  = min(SMB_RxWords[6], pT->data_out_maxlen);
+                          /* Data bytes being returned */
+
+  if ( pT->parms_out_len > 0 )         /* Get parms_out */
+  {
+    padbytes = SMB_RxWords[4] - a;     /* RxWords[4] is offset;
+                                          Get number of pad bytes */
+
+    if ( padbytes > 0 )
+      pBres = GetData(pBres, NULL, padbytes);
+    pBres = GetData(pBres, pT->parms_out_buf, pT->parms_out_len);
+    a += padbytes + pT->parms_out_len; /* New offset value */
+  }
+
+  if ( pT->data_out_len > 0 )        /* Get parms_out */
+  {
+    padbytes = SMB_RxWords[7] - a;     /* Number of pad bytes */
+
+    if ( padbytes > 0 )
+      pBres = GetData(pBres, NULL, padbytes);
+    pBres = GetData(pBres, pT->data_out_buf, pT->data_out_len);
+  }
+
+  if ( pBres == NULL )  /* Oh no! Techo fear! */
+    return EDATALEN;
+
+  FreeChain(pBres);
+  return OK;
+}
+
+#ifdef LONGNAMES
+/* 14 is the number of words common to all Transact2 commands.  The
+ * number of setup words is then added to that value.  The 14 passed
+ * to Do_SMB has the number of setup words added to it as this doubles
+ * as the header length limiter and the pointer to where to write the
+ * total data+param size field (what the Microsoft docs call smb_bcc).
+ * This is why you cannot just AddChain the setup word blocks like the
+ * data and parameters are handled.
+ */
+static err_t SMB_Transact2 ( hSHARE hS, struct TransactParms *pT )
+{
+  BUFCHAIN pB, pBres;
+  err_t res;
+  int iter = 0; /* Response iteration number */
+  int a = SMBHDR_SIZE + ((14 + pT->setup_in_len)*2) + 2;
+  int pda = ((a + 3) & ~3);
+      /* SMB header size, 14 params + setup words + 2 byte data length
+       */
+  int   padbytes;    /* Temp variable */
+  int   sc;
+  int   retry = 3;
+  int   tot_data_rcvd = 0, tot_param_rcvd = 0;
+
+retry_transact2:
+  debug2("SMB_Transact2: processing (Tid = %#04x, sub-cmd=%#04x)...\n", hS->Tid,
+    pT->setup_in[0]);
+
+  SMB_TxWords[0]  = pT->parms_in_len; /* Total length */
+  SMB_TxWords[1]  = pT->data_in_len; /* Total length */
+  SMB_TxWords[2]  = pT->parms_out_maxlen;
+  SMB_TxWords[3]  = pT->data_out_maxlen;
+  SMB_TxWords[4]  = 0; /* Setup words to return */
+  SMB_TxWords[5]  = 0; /* Flags - normal */
+  SMB_TxWords[6]  = TRANSACT2_TIMEOUT; /* Timeout LSW */
+  SMB_TxWords[7]  = 0; /* Timeout MSW */
+  SMB_TxWords[8]  = 0; /* Reserved */
+  SMB_TxWords[9]  = pT->parms_in_len; /* Length this buffer */
+  SMB_TxWords[10] = pda;  /* Offset from SMB header to parm bytes */
+  SMB_TxWords[11] = pT->data_in_len; /* Length this buffer */
+  SMB_TxWords[12] = pda + pT->parms_in_len;  /* Offset to data bytes */
+  SMB_TxWords[13] = pT->setup_in_len; /* Setup words being sent */
+
+  debug2("%d bytes of parameters at offset %#x\n", pT->parms_in_len, pda);
+  debug2("%d bytes of data at offset %#x\n", pT->data_in_len, SMB_TxWords[12]);
+
+  for (sc = 0; sc < pT->setup_in_len; ++sc)
+    SMB_TxWords[14 + sc] = pT->setup_in[sc];
+
+  pB = NULL;
+
+  /* Make up data chain */
+
+  if ( pT->data_in_len != 0 )
+  {
+    pB = AddChain ( pB, pT->data_in, pT->data_in_len );
+    if ( pB == NULL )
+      return EOUTOFMEM;
+  }
+
+  if ( pT->parms_in_len != 0 )
+  {
+    pB = AddChain ( pB, pT->parms_in, pT->parms_in_len );
+    if ( pB == NULL )
+      return EOUTOFMEM;
+  }
+
+  /* Add the null string - pda-a must be 1 or 3.  "D " added because
+   * that's what SAMBA does (because that's what OS/2 does) */
+  pB = AddChain ( pB, "\0D ", pda - a );
+  if (pB == NULL )
+    return EOUTOFMEM;
+
+  res = Do_SMB ( hS, SMBtrans2, 14 + pT->setup_in_len, pB, &pBres );
+
+  if ( res != OK ) {
+    if (SMB_RxHdr.errclass == ERRSRV && SMB_RxHdr.errlo == 1 && SMB_RxHdr.errhi == 0 && retry)
+    {
+       --retry;
+       debug0("SMB_Transact2: retrying request\n");
+       goto retry_transact2;
+    }
+    debug0("SMB_Transact2: Do_SMB failed\n");
+    DumpBuffer(&SMB_RxHdr, SMBHDR_SIZE);
+    return res;
+  }
+
+  /* Now extract results - note that there may be 1 of these.  OTOH, there may be several
+   * if the data didn't fit into the negotiated buffer sizes ... */
+  for (iter = 0; ; ++iter) {
+
+    if ( SMB_RxWordCount < 10 )
+    {
+      FreeChain(pBres);
+      return EDATALEN;
+    }
+
+    a = SMBHDR_SIZE + (SMB_RxWordCount)*2 + 2;
+    /* Size of SMBHDR plus returned rx words plus byte count
+       = offset of data in pBres from start of header */
+
+    if (iter == 0) {
+      /* First response will tell us how much is coming */
+      pT->parms_out_len = min(SMB_RxWords[0], pT->parms_out_maxlen);
+                              /* Parm bytes being returned */
+      pT->data_out_len  = min(SMB_RxWords[1], pT->data_out_maxlen);
+                              /* Data bytes being returned */
+      pT->setup_out_len = min(SMB_RxWords[9] & 0xFF, pT->setup_out_maxlen);
+
+      /* setup words must come in the first packet */
+      if (pT->setup_out_len > 0 )          /* Get setup_out */
+      {
+        memcpy(pT->setup_out, &SMB_RxWords[14], 2 * pT->setup_out_len);
+      }
+    }
+
+    if ( pT->parms_out_len > 0 && SMB_RxWords[3])         /* Get parms_out */
+    {
+      padbytes = SMB_RxWords[4] - a;     /* RxWords[4] is offset;
+                                            Get number of pad bytes */
+
+      if ( padbytes > 0 )
+        pBres = GetData(pBres, NULL, padbytes);
+      pBres = GetData(pBres, pT->parms_out_buf + SMB_RxWords[5], SMB_RxWords[3]);
+      a += padbytes + pT->parms_out_len; /* New offset value */
+      tot_param_rcvd += SMB_RxWords[3];
+    }
+
+    if ( pT->data_out_len > 0 && SMB_RxWords[6] > 0)        /* Get data_out */
+    {
+      padbytes = SMB_RxWords[7] - a;     /* Number of pad bytes */
+      if ( padbytes > 0 )
+        pBres = GetData(pBres, NULL, padbytes);
+      pBres = GetData(pBres, pT->data_out_buf + SMB_RxWords[8], SMB_RxWords[6]);
+      tot_data_rcvd += SMB_RxWords[6];
+      if (pT->setup_in[0] == TRANSACT2_QUERYPATHINFORMATION)
+        DumpBuffer(pT->data_out_buf, pT->data_out_len);
+    }
+
+    if ( pBres == NULL ) {  /* Oh no! Techo fear! */
+      debug0("SMB_Transact2: pBres was NULL\n");
+      return EDATALEN;
+    }
+
+    FreeChain(pBres);
+
+    if (tot_data_rcvd < pT->data_out_len || tot_param_rcvd < pT->parms_out_len) {
+
+      do {
+        /* MUST avoid recursive calls to Do_SMBResponse */
+        res = Do_SMBResponse(hS, SMBtrans2, &pBres);
+      } while (res == OK && SMB_RxHdr.command == SMBchkpth);
+
+      if (res != OK)
+        return res;
+      /* Extract received data */
+      debug1("Transact2 (2ndary response) - returned %d bytes\n", ChainLen(pBres));
+    }
+    else break;
+  }
+
+  return OK;
+}
+#endif
+
+/* Utility routines ============================================ */
+
+const char *SMB_GetConnInfo ( char drvletter, int infotype )
+{
+  static char nouser[10];
+  static char sharetype[20];
+  char   token[8];
+  hSHARE hS = GetShareNoConn(drvletter);
+
+  if ( hS == NULL )
+    return NULL;
+
+  switch ( infotype )
+  {
+    case GCI_SERVER:
+      return hS->hServer->servname;
+
+    case GCI_USER:
+      if ( hS->hServer->ProtFlags & PROT_USERLOGON )
+      {
+        return hS->hServer->username;
+      }
+      else
+      {
+        strncpy(nouser, MsgLookup("NoUser"), sizeof(nouser));
+        return nouser;
+      }
+
+    case GCI_SHARE:
+      return hS->sharename;
+
+    case GCI_LOGONTYPE:
+      if ( hS->hServer->ProtFlags & PROT_USERLOGON )
+        return "U"; /* User level authentication */
+      else
+        return "S"; /* Share level authentication */
+
+    case GCI_SHARETYPE:
+      sprintf(token, "Type%u", hS->sharetype);
+      strncpy(sharetype, MsgLookup(token), sizeof(sharetype));
+      return sharetype;
+
+    case GCI_SERVERINFO:
+      return NB_DescribeLink( hS->hServer->hSession );
+  }
+
+  return "";
+}
+
+/* Init routines ================================================ */
+
+bool SMB_Init( void )
+{
+  int i;
+
+  for ( i=0; i<MAX_SHARES; i++ )
+  {
+    SMB_Servers[i].flags = FREE;
+  }
+
+  for ( i=0; i<MAX_SHARES; i++ )
+  {
+    SMB_Shares[i].flags = FREE;
+    SMB_Shares[i].drvletter = 'A' + i;
+    SMB_Shares[i].FH_base = (i << 16);
+  }
+
+  SMB_TxHdr.id[0] = 0xFF;
+  SMB_TxHdr.id[1] = 'S';
+  SMB_TxHdr.id[2] = 'M';
+  SMB_TxHdr.id[3] = 'B';
+
+  SMB_TxHdr.mid = 0;  /* Multiplex ID: not used */
+  SMB_TxHdr.pid = 1;  /* Process ID: dummy value */
+  SMB_TxHdr.tid = 0;  /* Tree ID: set later */
+#ifdef LONGNAMES
+  SMB_TxHdr.flg2 = SMB_KNOWS_LONG_NAMES; /*| SMB_IS_LONG_NAME;*/
+#else
+  SMB_TxHdr.flg2 = 0;
+#endif
+#ifdef LONGNAMES
+  NameCache_Init();
+#endif
+  return true;
+}
+
+
+/* ----------------------------------------- */
+
+/* Shutdown will disconnect all logged-on drives */
+
+err_t SMB_Shutdown ( void )
+{
+  int i;
+  for ( i=0; i < MAX_SHARES; i++ )
+    SMB_DeleteShare ( 'A'+i );
+
+  return OK;
+}
+
+/* ---------------------------- */
+
+/* SMB_AntiIdle() is used to stop idle-outs on shares.
+ * Each call, it moves onto the next share in order to
+ * "ping" the server to keep it awake.
+ */
+void SMB_AntiIdle ( void )
+{
+  static uint letter = -1;
+  hSHARE hS;
+
+  ++letter;
+  if (letter >= MAX_SHARES) letter = 0;
+  hS = GetShareNoConn('A' + letter);
+  if (hS == NULL) {
+    return;
+  }
+  else {
+    time_t t;
+    (void) time(&t);
+    if (t > (hS->hServer->last_xact + 60 * 10)) {
+      char echodat[sizeof("A:\\")];
+      (void) sprintf(echodat, "%c:\\", 'A' + letter);
+      dprintf(("idle_1", "Anti idle-out measure: %s\n", echodat));
+      if (ELANMANFSINUSE == SMB_ChkPath(echodat)) {
+        dprintf(("idle_1", "Re-entrancy due to idle-out check prevented\n"));
+      }
+    }
+  }
+}

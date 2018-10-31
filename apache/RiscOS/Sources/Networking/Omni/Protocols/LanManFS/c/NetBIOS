@@ -1,0 +1,1380 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*
+*  NETBIOS.C  -- NetBIOS name-service functions
+*
+*  14-02-94 INH  Original
+*                AcksNeeded altered
+*
+*
+*/
+
+/* Standard includes */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "kernel.h"
+
+/* Our includes */
+
+#ifndef NO_NETBEUI
+
+#include "stdtypes.h"
+#include "LanMan.h"
+#include "BufLib.h"
+#include "Stats.h"
+#include "LLC.h"
+#include "NetBIOS.h"
+#include "LMVars.h"
+
+#define EXPORT static
+
+/* Timeouts ************ */
+
+#define ADD_NAME_TIME     50
+#define ADD_NAME_TRIES     3
+#define FIND_NAME_TIME    50
+#define FIND_NAME_TRIES    5
+#define OPEN_SESS_TIME  1000
+#define ACK_SEND_TIME     50   /* Timeout before sending ACK */
+#define ACK_WAIT_TIME   1000   /* Time to wait for ACK before failing */
+
+
+/* Frame types ***************** */
+
+#define ADD_GROUP_NAME_QUERY 0x00
+#define ADD_NAME_QUERY       0x01
+#define NAME_IN_CONFLICT     0x02
+#define STATUS_QUERY         0x03
+#define DATAGRAM             0x08
+#define DATAGRAM_BROADCAST   0x09
+#define NAME_QUERY           0x0A
+#define ADD_NAME_RESPONSE    0x0D
+#define NAME_RECOGNISED      0x0E
+#define STATUS_RESPONSE      0x0F
+#define DATA_ACK             0x14
+#define DATA_FIRST_MIDDLE    0x15
+#define DATA_ONLY_LAST       0x16
+#define SESSION_CONFIRM      0x17
+#define SESSION_END          0x18
+#define SESSION_INITIALISE   0x19
+#define NO_RECEIVE           0x1A
+#define RECEIVE_OUTSTANDING  0x1B
+#define RECEIVE_CONTINUE     0x1C
+#define SESSION_ALIVE        0x1F
+
+#define NETBIOS_SAP 0xF0
+
+/* Private structures / definitions ************ */
+
+/* ---------------- */
+
+struct status_resp  /* Structure used to process STATUS_RESPONSE */
+{
+  int    nt_search;           /* Name-type to respond to */
+  struct FindName_res *pRes;  /* Pointer to result buf */
+  int    spaces_left;         /* Space left in result buf */
+};
+
+
+/* Entries in name table: datagram-type packets come from and and
+   directed at these names */
+
+/* Status values */
+
+#define NS_FREE      0
+#define NS_AWAIT_ADD 1
+#define NS_NAME_OK   2
+#define NS_ADD_FAIL  4
+#define NS_RECEIVING 8   /* Able to receive datagrams */
+
+struct _NBsession; /* ... is coming up soon */
+
+typedef struct
+{
+  int       Status;
+  NETNAME   Name;
+
+  struct _NBsession  *pS_call;   /* For when we're calling & awaiting
+                                   reply from far end */
+  struct _NBsession  *pS_listen; /* For when we're waiting for a call
+             	    		   from someone else */
+
+  struct status_resp *pStatResp;  /* Status-response state */
+
+  BUFQUEUE  DatagramQ;            /* Queue for incoming datagrams */
+}
+  NAME_ENTRY;
+
+/* Entry in session table: there is one session for each connection
+   between us and another end */
+
+#define SS_FREE         0
+#define SS_CALLING      1  /* Calling far end */
+#define SS_CALL_WAIT    2  /* Done NAME_RESPONSE, await LLC connect */
+#define SS_LISTENING    4  /* Waiting for call from far end */
+#define SS_LISTEN_RDY   8  /* Done NAME_QUERY, ready for LLC connect */
+#define SS_CONNECTED    16 /* Connected */
+
+
+typedef struct _NBsession
+{
+  /* General session state */
+  int         Status;
+
+  NAME_ENTRY *LclName;       /* Local name at this end */
+  int         LclLSN;
+
+  NETADDR     RmtAddr;       /* Address of far end */
+  NETNAME     RmtName;       /* Name at far end */
+  int         RmtLSN;
+
+  HCONN       hconn;          /* LLC connection handle */
+
+  /* Connection/sequencing status */
+  int         xmitsize;       /* Max transmit size in one pkt */
+  BUFCHAIN    PartialRcv;     /* Used for assembling larger pkts */
+  BUFQUEUE    RcvQ;           /* Complete receive messages */
+  int         next_resp;      /* Next 'response' value to use */
+  int         next_xmit;      /* Next 'xmit' value to send */
+  bool        ack_pending;    /* True if we need to send data ack */
+  struct Timer AckTimer;      /* Timer for sending DATA_ACK */
+  bool        ack_required;   /* True if we should wait for DATA_ACK
+                                   before sending any more data */
+} NBSESSION;
+
+
+/* ------------------------------------ */
+
+/* Note: These structures are sailing reasonably close to the
+   wind by assuming that the compiler will pack the BYTEs and
+   WORDs properly. All groups of bytes, 16-bit words and
+   network names do start on longword boundaries, so it isn't
+   technically incorrect.
+*/
+typedef struct
+{
+  WORD len;
+  WORD delim;
+
+  BYTE cmd;
+  BYTE opt1;
+  BYTE opt2lo;
+  BYTE opt2hi;
+
+  WORD resp;
+  WORD xmit;
+
+  BYTE dst_sn;       /* Remote session number */
+  BYTE src_sn;       /* Local session  number */
+}
+  NB_SHORTHDR;
+
+typedef struct
+{
+  WORD len;
+  WORD delim;
+
+  BYTE cmd;
+  BYTE opt1;
+  BYTE opt2lo;
+  BYTE opt2hi;
+
+  WORD resp;
+  WORD xmit;
+
+  NETNAME dst_name;       /* Remote session number */
+  NETNAME src_name;       /* Local session  number */
+}
+  NB_LONGHDR;
+
+/* Globals =========================================== */
+
+static NETADDR Multi_Addr = { 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 };
+
+#define MAX_NAMES 16
+static NAME_ENTRY NB_NameTable[MAX_NAMES];
+
+#define MAX_SESSIONS 16
+static NBSESSION NB_SessionTbl[MAX_SESSIONS];
+
+static NB_SHORTHDR SHdr;
+static NB_LONGHDR  LHdr;
+static int NB_MaxSize;
+
+/* Support functions ======================================== */
+
+#ifdef DEBUG
+static void debug_name ( NETNAME *nn )
+{
+  char lclbuf[17];
+  memcpy (lclbuf, nn, 16);
+  lclbuf[16] = 0;
+  debug1("<%s>", lclbuf);
+}
+#else
+#define debug_name(a)
+#endif
+
+/* ----------------- */
+
+static NBSESSION *LSNtoSession (int LSN)
+{
+  if ( LSN <= 0 || LSN > MAX_SESSIONS ) return NULL;
+
+  return &NB_SessionTbl [LSN-1];
+}
+
+/* ----------------- */
+
+static NAME_ENTRY *ValidatehName( hNAME hName )
+{
+  NAME_ENTRY *pN = (NAME_ENTRY *)hName;
+  if ( pN != NULL && pN->Status == NS_NAME_OK )
+    return pN;
+
+  return NULL;
+}
+/* ----------------- */
+
+static NBSESSION *ValidatehSession( hSESSION hSess )
+{
+  NBSESSION *pN = (NBSESSION *)hSess;
+  if ( pN != NULL && pN->Status == SS_CONNECTED )
+    return pN;
+
+  return NULL;
+}
+
+/* Exported procedures ------------------------------------ */
+
+EXPORT bool _NB_LinkOK ( hSESSION hS )
+{
+  NBSESSION *pN = (NBSESSION *)hS;
+  return (bool) ( pN != NULL && pN->Status == SS_CONNECTED &&
+             LLC_LinkOK (pN->hconn) );
+}
+
+/* -------------------- */
+
+EXPORT bool _NB_MatchName ( NETNAME *nn1, NETNAME *nn2 )
+{
+  return (bool) ( nn1->c4[0] == nn2->c4[0] &&
+           nn1->c4[1] == nn2->c4[1] &&
+           nn1->c4[2] == nn2->c4[2] &&
+           nn1->c4[3] == nn2->c4[3] );
+}
+
+/* -------------------- */
+
+static NAME_ENTRY *FindName ( NETNAME *nn, int flags )
+{
+  int i;
+
+  if ( flags == NS_FREE )
+  {
+    for ( i=0; i < MAX_NAMES; i++ )
+      if ( NB_NameTable[i].Status == NS_FREE )
+        return &NB_NameTable[i];
+  }
+  else
+  {
+    for ( i=0; i < MAX_NAMES; i++ )
+      if ( (NB_NameTable[i].Status & flags) != 0    &&
+           _NB_MatchName ( nn, &NB_NameTable[i].Name ) )
+        return &NB_NameTable[i];
+  }
+
+  return NULL;
+}
+
+/* --------------------- */
+
+EXPORT err_t _NB_FormatName ( nametype_t nt, char *name, NETNAME *res )
+{
+  int i;
+
+  for ( i=0; i<15; i++)
+  {
+    if ( name[i] < 0x20 ) break;
+    if (name[i] == '\xA0') res->b[i] = ' ';
+    else res->b[i] = toupper(name[i]);
+  }
+
+  while (i<15)
+    res->b[i++] = 0x20;
+
+  res->b[15] = nt;
+  return OK;
+}
+
+/* --------------------- */
+
+EXPORT nametype_t _NB_DecodeName ( NETNAME *pnn, char *buf )
+{
+  BYTE *p = pnn->b;
+  char *last_nonsp = buf;
+  int i;
+
+  for (i=0; i<15 && *p >= 0x20; ++i)
+    *buf++ = *p++;
+
+  *buf = 0;
+
+  while (--buf > last_nonsp) {
+    if (*buf == ' ') *buf = 0;
+  }
+
+  return (nametype_t) (pnn->b[15]);
+}
+
+/* ----------------------- */
+
+static void SendDatagram (int Cmd, NETADDR *pnaDest,
+        NETNAME *pnnDest, NETNAME *pnnSource, int Opt1, int Opt2,
+        int Resp )
+{
+  BUFCHAIN pB;
+
+  debug1("SendDatagram called: command %x\n",Cmd);
+
+  LHdr.len   = 0x002C;
+  LHdr.delim = 0xEFFF;
+  LHdr.cmd   = Cmd;
+  LHdr.opt1  = Opt1;
+  LHdr.opt2lo= Opt2 & 0xFF;
+  LHdr.opt2hi= Opt2 >> 8;
+  LHdr.resp  = Resp;
+  LHdr.xmit  = 0;
+  if ( pnnSource != NULL )
+    LHdr.src_name  = *pnnSource;
+  if ( pnnDest != NULL )
+    LHdr.dst_name  = *pnnDest;
+
+  pB = AddChain ( NULL, &LHdr, 0x2C );
+  if ( pB != NULL )
+    UI_SendData ( pnaDest, NETBIOS_SAP, pB );
+}
+
+/* ----------------------- */
+
+static void ProcessStatusResp ( struct status_resp *pSR,
+   int nnames, BUFCHAIN pData )
+{
+  BYTE buf[18];
+
+  /* Strip off header */
+  pData = GetData ( pData, NULL, 0x3C );
+
+  while ( pSR->spaces_left > 0 &&
+          nnames -- > 0 )
+  {
+    pData = GetData ( pData, buf, 0x12 );
+    if ( pData == NULL ) break;
+
+    if ( pSR->nt_search == ANY_NAME_TYPE ||
+         pSR->nt_search == buf[15] )
+    {
+      memcpy ( &(pSR->pRes->name), buf, 16 );
+      pSR->pRes->type = (nametype_t) buf[15];
+      pSR->pRes->flags = buf[17];
+      pSR->spaces_left--;
+      pSR->pRes++;
+    }
+  }
+
+  FreeChain(pData);
+}
+
+/* NetBIOS name management functions ============================== */
+
+static void NB_ReceiveDatagram ( NETADDR *src, BUFCHAIN Data, void *pw )
+{
+  NAME_ENTRY *pDN;
+  static NB_LONGHDR  RLHdr;
+
+  (void) pw;
+
+  /* Read in header & check format */
+
+  Data = GetData ( Data, &RLHdr, 0x2C );
+  if ( Data == NULL )
+    return;
+
+  if ( RLHdr.len != 0x2C || RLHdr.delim != 0xEFFF )
+    goto DumpIt;
+
+  /* Deal with command */
+
+  switch ( RLHdr.cmd )
+  {
+    case DATAGRAM:
+    case DATAGRAM_BROADCAST:
+      pDN = FindName ( &RLHdr.dst_name, NS_NAME_OK );
+      if ( pDN != NULL && (pDN->Status & NS_RECEIVING) )
+      {
+        /* This facility is currently unused by the rest of
+           LanManFS. In fact just sticking 'Data' in a queue
+           is a pretty poor way of doing it, because we don't
+           carry the name of the sender of the data along with
+           us. */
+        QueueAdd( &(pDN->DatagramQ), Data );
+        return;  /* Don't need to free chain! */
+      }
+
+      break;
+
+    case NAME_QUERY:  /* Trying to call us */
+      pDN = FindName ( &RLHdr.dst_name, NS_NAME_OK );
+      if ( pDN != NULL && pDN->pS_listen != NULL )
+      {
+        NBSESSION *pS = pDN->pS_listen;
+
+        if ( pS->Status & SS_LISTENING )
+        {
+          pS->RmtAddr = *src;
+          pS->RmtName = RLHdr.src_name;
+          pS->RmtLSN  = RLHdr.opt2lo;
+
+          SendDatagram ( NAME_RECOGNISED, src, &RLHdr.src_name,
+                 &(pDN->Name), 0, pS->LclLSN, RLHdr.xmit );
+
+          pS->Status = SS_LISTEN_RDY;
+        } /* We don't do any more of this at present; need to
+             add code to LLC to accept incoming calls */
+      }
+      break;
+
+    case NAME_RECOGNISED:  /* Response to a name query */
+      pDN = FindName ( &RLHdr.dst_name, NS_NAME_OK );
+      if ( pDN != NULL && pDN->pS_call != NULL )
+      {
+        NBSESSION *pS = pDN->pS_call;
+
+        if ( !_NB_MatchName ( &RLHdr.src_name, &pS->RmtName ) )
+          break;  /* Crank call? */
+
+        if ( pS->Status & SS_CALLING )
+        {
+          pS->RmtAddr= *src;
+          pS->RmtLSN = RLHdr.opt2lo;  /* Copy session number */
+          pS->Status = SS_CALL_WAIT;
+        }
+      }
+      break;
+
+    case ADD_GROUP_NAME_QUERY:  /* Does any other machine have this name? */
+    case ADD_NAME_QUERY:
+      pDN = FindName (&RLHdr.src_name, NS_NAME_OK | NS_AWAIT_ADD);
+      if ( pDN != NULL )
+        SendDatagram( ADD_NAME_RESPONSE, src, &RLHdr.src_name,
+             &RLHdr.src_name, 0, 0, RLHdr.xmit ) ;
+      break;
+
+    case NAME_IN_CONFLICT:    /* Reply to ADD_NAME_QUERY: we can't use */
+    case ADD_NAME_RESPONSE:   /* this name */
+      pDN = FindName (&RLHdr.dst_name, NS_AWAIT_ADD);
+      if ( pDN != NULL )
+        pDN->Status = NS_ADD_FAIL;
+      break;
+
+    case STATUS_RESPONSE:
+      pDN = FindName ( &RLHdr.dst_name, NS_NAME_OK );
+      if ( pDN != NULL && pDN->pStatResp != NULL )
+      {
+        ProcessStatusResp ( pDN->pStatResp, RLHdr.opt1, Data );
+        return;
+      }
+      break;
+
+    case STATUS_QUERY:
+      debug0("Status query");
+      break;
+
+    default:
+      break;
+  }
+
+DumpIt:
+  FreeChain ( Data );
+
+}
+
+/* ---------------------- */
+
+static bool CheckNameUnique ( NAME_ENTRY *pN )
+{
+  int Timer;
+
+  pN->Status = NS_AWAIT_ADD;
+  SendDatagram ( ADD_NAME_QUERY, &Multi_Addr, NULL, &pN->Name, 0, 0, 0 );
+
+  Timer = LLC_TickerTime;
+
+  /* Wait 1 second for reply */
+
+  do
+  {
+    LLC_BackgroundProcess();
+    if ( pN->Status == NS_ADD_FAIL )
+    {
+      pN->Status = NS_FREE;
+      return false;
+    }
+  }
+  while ((LLC_TickerTime-Timer) < ADD_NAME_TIME);
+
+  return true;
+}
+
+/* NB_AddLocalName() --------------------------------------------
+
+   Adds a local name, and checks with the network that it is unique.
+*/
+
+EXPORT err_t _NB_AddLocalName ( nametype_t nt, char *name, hNAME *phName )
+{
+  NAME_ENTRY *pN;
+  NETNAME  myname;
+  int i;
+
+  _NB_FormatName (  nt, name, &myname ); /* Convert to 16-byte format */
+
+  pN = FindName ( &myname, NS_NAME_OK );
+  if ( pN != NULL )
+    return ENAMEEXISTS;
+
+  pN = FindName ( NULL, NS_FREE );
+  if ( pN == NULL )
+    return ENOHANDLES;
+
+  pN->Name = myname;
+
+  for (i=0; i<3; i++)
+  {
+    if ( !CheckNameUnique(pN) )
+    {
+      debug0("  Name already exists\n");
+      return ENAMEEXISTS;
+    }
+  }
+
+  pN->Status  = NS_NAME_OK;
+  pN->pS_call    = NULL;
+  pN->pS_listen  = NULL;
+  pN->pStatResp  = NULL;
+  pN->DatagramQ.Head = NULL;
+  pN->DatagramQ.Last = NULL;
+  *phName = (hNAME) pN;
+
+  return OK;
+}
+
+/* NB_RemoveLocalName() --------------------------------------------
+
+   Removes a local name from the table.
+   Any connections to this name get vaped!
+*/
+EXPORT err_t _NB_CloseSession ( hSESSION hSession ); /* Forward reference */
+
+EXPORT err_t _NB_RemoveLocalName ( hNAME hName )
+{
+  int i;
+  NBSESSION *pS;
+  NAME_ENTRY *pN = ValidatehName(hName);
+
+  if ( pN == NULL )
+    return EBADPARAM;
+
+  for ( i=1; i<=MAX_SESSIONS; i++ )
+  {
+    pS = LSNtoSession(i);
+    if ( (pS->Status == SS_CONNECTED)  &&
+         (pS->LclName == pN)
+       )
+    {
+      _NB_CloseSession(pS);
+    }
+  }
+
+  QueueFlush(&(pN->DatagramQ));
+
+  pN->Status = NS_FREE;
+  return OK;
+}
+
+
+/* NB_FindNames () ----------------------------------------- */
+
+EXPORT int _NB_FindNames (   NETNAME *pnnFind,
+                     nametype_t ntFind,
+                     struct FindName_res *pResults,
+                     int results_max,
+                     int timeout )
+{
+  struct status_resp SR;
+  int    Timer;
+  NAME_ENTRY *pN = ValidatehName ( NB_MachineName );
+
+  if ( pN == NULL )
+    return 0;
+
+  SR.nt_search   = ntFind;
+  SR.pRes        = pResults;
+  SR.spaces_left = results_max;
+
+  pN->pStatResp = &SR;
+  SendDatagram ( STATUS_QUERY, &Multi_Addr, pnnFind, &pN->Name,
+     0x1, 0x15C, 0 );
+
+  Timer = LLC_TickerTime;
+
+  do
+  {
+    LLC_BackgroundProcess();
+  }
+    while ( (SR.spaces_left > 0)  &&
+            ((LLC_TickerTime - Timer) < timeout ) );
+
+  pN->pStatResp = NULL;
+  return results_max - SR.spaces_left;
+}
+
+/* Connection-oriented functions =================================== */
+
+static void ClearUp ( NBSESSION *pS )
+{
+  QueueFlush ( &pS->RcvQ );
+  TimerClear ( &pS->AckTimer );
+  if ( pS->PartialRcv != NULL )
+    FreeChain(pS->PartialRcv);
+  pS->PartialRcv = NULL;
+}
+
+/* ----------------- */
+
+static void SendAlive ( NBSESSION *pS )
+{
+  BUFCHAIN pB;
+
+  SHdr.len   = 0x0E;
+  SHdr.delim = 0xEFFF;
+  SHdr.cmd   = SESSION_ALIVE;
+  SHdr.opt1  = 0;
+  SHdr.opt2lo= 0;
+  SHdr.opt2hi= 0;
+  SHdr.resp  = 0;
+  SHdr.xmit  = 0;
+  SHdr.dst_sn = pS->RmtLSN;
+  SHdr.src_sn  = pS->LclLSN;
+
+  pB = AddChain ( NULL, &SHdr, 0x0E );
+
+  if ( pB != NULL )
+    LLC_SendData ( pS->hconn, pB );
+}
+
+/* ----------------------- */
+
+static bool EnsureAcks ( NBSESSION *pS )
+{
+  BUFCHAIN pB;
+
+  if ( !pS->ack_pending )
+    return true;
+
+  /* Send ACK to far end */
+
+  SHdr.len   = 0x0E;
+  SHdr.delim = 0xEFFF;
+  SHdr.cmd   = DATA_ACK;
+  SHdr.opt1  = 0;
+  SHdr.opt2lo= 0;
+  SHdr.opt2hi= 0;
+  SHdr.resp  = pS->next_resp;
+  SHdr.xmit  = 0;
+  SHdr.dst_sn = pS->RmtLSN;
+  SHdr.src_sn = pS->LclLSN;
+
+  pB = AddChain ( NULL, &SHdr, 0x0E );
+
+  if ( pB != NULL &&
+       LLC_SendData( pS->hconn, pB ) == OK )
+  {
+    pS->ack_pending = false;
+    pS->next_resp = 0;
+    return true;
+  }
+
+  debug0 (" Couldn't send ack! ");
+  return false;
+}
+
+/* --------------------- */
+
+/* This is called when a data ack timer expires */
+
+static void AckTimerCallback ( void *data )
+{
+  NBSESSION *pS = (NBSESSION *)data;
+
+  /* This will retry indefinitely if EnsureAcks fails */
+
+  if ( pS->Status == SS_CONNECTED )
+  {
+    if ( !EnsureAcks(pS) )
+      TimerStart ( &pS->AckTimer, ACK_SEND_TIME );
+  }
+}
+
+/* --------------------- */
+
+/* This waits for an ACK from the other end, if it is needed */
+
+static bool WaitForAck ( NBSESSION *pS )
+{
+  int t = LLC_TickerTime;
+
+  while ( pS->ack_required )
+  {
+    LLC_BackgroundProcess();
+
+    if ( LLC_TickerTime - t > ACK_WAIT_TIME )
+      return false;
+  }
+
+  return true;
+}
+
+/* ----------------------------------------- */
+
+/* LinkRxFn processes incoming data on a link. */
+
+static void NB_LinkRxFn ( HCONN hc, BUFCHAIN Data, void *private )
+{
+  static NB_SHORTHDR RSHdr;
+  NBSESSION *pS;
+  (void) hc;
+  (void) private;
+
+  Data = GetData ( Data, &RSHdr, 0x0E );
+  if ( Data == NULL )  /* Barf! */
+    return;
+
+  if ( RSHdr.delim != 0xEFFF )
+    goto DumpIt;
+
+  pS = LSNtoSession(RSHdr.dst_sn);
+  if ( pS == NULL ||
+       (pS->Status & (SS_CONNECTED | SS_CALL_WAIT)) == 0 )
+    goto DumpIt;
+
+  debug1(" Rx-NB-%X", RSHdr.cmd );
+
+  switch ( RSHdr.cmd )
+  {
+    case SESSION_CONFIRM:
+      pS->RmtLSN = RSHdr.src_sn; /* Should be already! */
+      pS->xmitsize = RSHdr.opt2lo + (RSHdr.opt2hi << 8);
+      if ( pS->xmitsize == 0 || pS->xmitsize > NB_MaxSize )
+        pS->xmitsize = NB_MaxSize;
+
+      pS->Status = SS_CONNECTED;
+      break;
+
+    case DATA_FIRST_MIDDLE:
+      pS->PartialRcv = ConcatChain ( pS->PartialRcv, Data );
+      return; /* Don't deallocate */
+
+    case DATA_ONLY_LAST:
+      pS->next_resp = RSHdr.xmit;
+      pS->ack_pending = true;
+      pS->ack_required = false;
+      TimerStart ( &pS->AckTimer, ACK_SEND_TIME );
+      QueueAdd ( &pS->RcvQ, ConcatChain( pS->PartialRcv, Data ) );
+      pS->PartialRcv = NULL;
+
+      return; /* Don't deallocate buffers */
+
+    case SESSION_ALIVE:
+      SendAlive(pS);
+      break;
+
+    case DATA_ACK:
+      pS->ack_required = false;
+      break;
+
+    default:
+      break;
+  }
+
+DumpIt:
+  FreeChain ( Data );
+}
+/* -------------------------------- */
+
+/* FindRemoteName does a network name query for a given name;
+   this will find its network address, and also exchange
+   Local Session Numbers prior to making a connection.
+*/
+
+static err_t FindRemoteName ( NBSESSION *pS )
+{
+  int i, Timer;
+
+  pS->Status = SS_CALLING;
+
+  for ( i=0; i< FIND_NAME_TRIES; i++ )
+  {
+    Timer = LLC_TickerTime;
+    SendDatagram ( NAME_QUERY, &Multi_Addr, &(pS->RmtName),
+                     &(pS->LclName->Name), 0, pS->LclLSN, 0 );
+
+    do
+    {
+      LLC_BackgroundProcess();
+      /* Wait for return datagram to fill in address & RmtLSN */
+      if ( pS->Status == SS_CALL_WAIT )
+        return OK;
+    }
+      while ( (LLC_TickerTime - Timer) < FIND_NAME_TIME );
+  }
+
+  /* Failed to find name */
+  return ECANTFINDNAME;
+}
+
+/* ------------------------------------ */
+
+EXPORT err_t _NB_OpenSession ( hNAME hThisEnd, NETNAME *pnnFarEnd,
+                             hSESSION *phSession )
+{
+  err_t   res;
+  HCONN   hc;
+  int     i, timer;
+
+  BUFCHAIN pB;
+  NBSESSION *pS;
+  NAME_ENTRY *pnLcl = ValidatehName(hThisEnd);
+
+  if ( pnLcl == NULL || pnnFarEnd == NULL )
+    return EBADPARAM;
+
+  /* (ii) Find a suitable session number */
+
+  for ( i=1; i <= MAX_SESSIONS; i++ )
+  {
+    pS = LSNtoSession(i);
+    if ( pS->Status == SS_FREE )
+      goto GotSession;
+  }
+  return ENOHANDLES;
+
+GotSession:
+  /* (iii) Do a network find-name query */
+
+  NB_MaxSize = LLC_GetMTU() - 14;
+
+  debug0("Call: "); debug_name(&(pnLcl->Name));
+  debug0("--> "); debug_name(pnnFarEnd);
+
+  pS->RmtName = *pnnFarEnd;
+  pS->LclName = pnLcl;
+  pnLcl->pS_call = pS;
+
+  res = FindRemoteName ( pS );
+  pnLcl->pS_call = NULL;
+
+  if ( res != OK )
+    goto abort_find;
+
+  /* (iv) Try to open an LLC connection */
+
+  res = LLC_OpenLink ( &pS->RmtAddr, NETBIOS_SAP, NB_LinkRxFn,
+              NULL, &hc );
+
+  if ( res != OK )
+    goto abort_find;
+
+  /* Initialise fields */
+
+  pS->hconn = hc;
+  pS->next_xmit = 1;
+  pS->next_resp = 0;
+  pS->ack_pending = false;
+  pS->ack_required = false;
+  ClearUp ( pS );  /* Clear queues, etc, just in case */
+
+  /* Send SESSION_INIT to other end */
+
+  SHdr.len   = 0x0E;
+  SHdr.delim = 0xEFFF;
+  SHdr.cmd   = SESSION_INITIALISE;
+  SHdr.opt1  = 0x8F;         /* Various flags - ?? */
+  SHdr.opt2lo= NB_MaxSize & 0xFF;
+  SHdr.opt2hi= NB_MaxSize >> 8;
+  SHdr.resp  = 0;
+  SHdr.xmit  = 0;
+  SHdr.dst_sn = pS->RmtLSN;
+  SHdr.src_sn  = pS->LclLSN;
+
+  pB = AddChain ( NULL, &SHdr, 0x0E );
+  if ( pB == NULL )
+  {
+    res = EOUTOFMEM;
+    goto abort_conn;
+  }
+
+  res = LLC_SendData ( hc, pB );
+  if ( res != OK )
+    goto abort_conn;
+
+  /* Wait for SESSION_CONFIRM */
+
+  timer = LLC_TickerTime;
+
+  while ( pS->Status != SS_CONNECTED )
+  {
+    LLC_BackgroundProcess();
+    if ( !LLC_LinkOK(hc) )
+    {
+      res = ELINKFAILED;
+      goto abort_conn;
+    }
+
+    if ( (LLC_TickerTime-timer) > OPEN_SESS_TIME )
+    {
+      res = ETIMEOUT;
+      goto abort_conn;
+    }
+  }
+
+  /* We win! */
+  *phSession = (hSESSION) pS;
+  return OK;
+
+abort_conn:
+   LLC_CloseLink(hc);
+abort_find:
+   pS->Status = SS_FREE;
+   return res;
+}
+
+/* ----------------------- */
+
+EXPORT err_t _NB_SendData ( hSESSION hSession, BUFCHAIN pB )
+{
+  NBSESSION *pS = ValidatehSession(hSession);
+  err_t res;
+
+  if ( pS == NULL )
+  {
+    FreeChain(pB);
+    return ENOCONN;
+  }
+
+  if ( !WaitForAck(pS) )
+  {
+    FreeChain(pB);
+    return ETIMEOUT;
+  }
+
+  /* Send DATA_ONLY_LAST data to far end */
+
+  SHdr.len   = 0x0E;
+  SHdr.delim = 0xEFFF;
+  SHdr.cmd   = DATA_ONLY_LAST;
+  SHdr.opt1  = pS->ack_pending ? 0x0C : 0x04;
+  SHdr.opt2lo= 0;
+  SHdr.opt2hi= 0;
+  SHdr.resp  = pS->next_resp;
+  SHdr.xmit  = pS->next_xmit;
+  SHdr.dst_sn = pS->RmtLSN;
+  SHdr.src_sn = pS->LclLSN;
+
+  pB = AddChain ( pB, &SHdr, 0x0E );
+
+  if ( pB == NULL )
+    return EOUTOFMEM;
+
+  /* Send packet */
+
+  res = LLC_SendData( pS->hconn, pB );
+  if ( res == OK )
+  {
+    pS->ack_pending = false;
+    pS->next_resp = 0;
+    pS->next_xmit++;
+    pS->ack_required = true;
+  }
+  return res;
+}
+
+/* ----------------------- */
+
+EXPORT err_t _NB_SendBlockData ( hSESSION hSession, BYTE *data, uint datalen )
+{
+  BUFCHAIN pB;
+  err_t res;
+  int n;
+  NBSESSION *pS = ValidatehSession(hSession);
+
+  if ( pS == NULL )
+    return ENOCONN;
+
+  if ( !WaitForAck(pS) )
+    return ETIMEOUT;
+
+  while ( datalen > 0 )
+  {
+    if ( datalen > pS->xmitsize )
+    {
+      n = pS->xmitsize;
+      SHdr.cmd   = DATA_FIRST_MIDDLE;
+    }
+    else
+    {
+      n = datalen;
+      SHdr.cmd   = DATA_ONLY_LAST;
+    }
+
+    SHdr.len   = 0x0E;
+    SHdr.delim = 0xEFFF;
+    SHdr.opt1  = pS->ack_pending ? 0x0C : 0x04;
+    SHdr.opt2lo= 0;
+    SHdr.opt2hi= 0;
+    SHdr.resp  = pS->next_resp;
+    SHdr.xmit  = pS->next_xmit;
+    SHdr.dst_sn = pS->RmtLSN;
+    SHdr.src_sn = pS->LclLSN;
+
+    pB = AddChainIndirect ( NULL, data, n );
+    if ( pB != NULL ) pB = AddChain ( pB, &SHdr, 0x0E );
+    if ( pB == NULL )
+      return EOUTOFMEM;
+
+    /* Send packet */
+
+    pS->ack_pending = false;
+    pS->next_resp = 0;
+
+    if ( (res=LLC_SendData( pS->hconn, pB )), res != OK )
+      return res;
+
+    datalen -= n;
+    data += n;
+
+  }
+
+  pS->next_xmit++;
+  pS->ack_required = true;
+
+  return OK;
+}
+
+/* ----------------------- */
+
+EXPORT err_t _NB_ClearRxQueue ( hSESSION hSession )
+{
+  NBSESSION *pS = ValidatehSession(hSession);
+
+  if ( pS == NULL )
+    return ENOCONN;
+
+  QueueFlush ( &pS->RcvQ );
+  FreeChain(pS->PartialRcv);
+  pS->PartialRcv = NULL;
+  return OK;
+}
+
+
+/* ----------------------- */
+
+EXPORT err_t _NB_GetData ( hSESSION hSession, BUFCHAIN *pOutData, int timeout )
+{
+  int timer;
+  BUFCHAIN pB;
+  NBSESSION *pS = ValidatehSession(hSession);
+
+  if ( pS == NULL )
+    return ENOCONN;
+
+
+  timer = LLC_TickerTime;
+  do
+  {
+    pB = QueueGet(&pS->RcvQ);
+
+    if ( pB != NULL )
+    {
+      *pOutData = pB;
+      return OK;
+    }
+
+    LLC_BackgroundProcess();
+
+    if ( !LLC_LinkOK(pS->hconn) )
+      return ELINKFAILED;
+  }
+    while ( (LLC_TickerTime - timer) < timeout );
+
+  return ETIMEOUT;
+}
+
+/* ----------------------- */
+
+/* This is used chiefly by SMB_ReadRaw. The len_in_out parameter passes
+   an advisory maximum block length in, and receives the received
+   data count out. It is only set if OK is returned, and is unchanged
+   otherwise!
+   This routine was added because other transports (e.g. TCP/IP) may
+   optimise a large data read differently. Indeed, keen people may want
+   to try to optimise this further.
+*/
+
+EXPORT err_t _NB_GetBlockData ( hSESSION hSession, BYTE *where, uint *len_in_out,
+                             int timeout )
+{
+  int timer;
+  BUFCHAIN pB;
+  NBSESSION *pS = ValidatehSession(hSession);
+
+  if ( pS == NULL )
+    return ENOCONN;
+
+  timer = LLC_TickerTime;
+  do
+  {
+    pB = QueueGet(&pS->RcvQ);
+
+    if ( pB != NULL )
+    {
+      *len_in_out = GetAllData(pB, where);
+      FreeChain(pB);
+      return OK;
+    }
+
+    LLC_BackgroundProcess();
+
+    if ( !LLC_LinkOK(pS->hconn) )
+      return ELINKFAILED;
+  }
+    while ( (LLC_TickerTime - timer) < timeout );
+
+  return ETIMEOUT;
+}
+
+/* -------------------------------- */
+
+EXPORT err_t _NB_CloseSession ( hSESSION hSession )
+{
+  BUFCHAIN pB;
+  NBSESSION *pS = ValidatehSession(hSession);
+
+  if ( pS == NULL )
+    return ENOCONN;
+
+  EnsureAcks ( pS );
+
+  /* Send SESSION_END to far end */
+
+  SHdr.len   = 0x0E;
+  SHdr.delim = 0xEFFF;
+  SHdr.cmd   = SESSION_END;
+  SHdr.opt1  = 0;
+  SHdr.opt2lo= 0;
+  SHdr.opt2hi= 0;
+  SHdr.resp  = 0;
+  SHdr.xmit  = 0;
+  SHdr.dst_sn = pS->RmtLSN;
+  SHdr.src_sn = pS->LclLSN;
+
+  pB = AddChain ( NULL, &SHdr, 0x0E );
+
+  /* Send command */
+
+  if ( pB != NULL )
+    LLC_SendData ( pS->hconn, pB );
+
+  /* Finish up on link */
+
+  LLC_CloseLink(pS->hconn);
+
+  /* Clean up */
+
+  ClearUp ( pS );
+  pS->Status = SS_FREE;
+  return OK;
+
+}
+
+/* ----------------------- */
+
+EXPORT char *_NB_DescribeLink ( hSESSION hS )
+{
+  static char namebuf[40];
+  NBSESSION *pS = ValidatehSession(hS);
+
+  if ( pS == NULL )
+    return NULL;
+
+  sprintf( namebuf, "%02X:%02X:%02X:%02X:%02X:%02X",
+       pS->RmtAddr.b[0], pS->RmtAddr.b[1],
+       pS->RmtAddr.b[2], pS->RmtAddr.b[3],
+       pS->RmtAddr.b[4], pS->RmtAddr.b[5] );
+
+  return namebuf;
+}
+
+/* ----------------------- */
+
+EXPORT err_t _NB_Startup(void)
+{
+  int i;
+  err_t res;
+  NBSESSION *pS;
+  NAME_ENTRY *pN;
+
+  debug0("Initialising NetBEUI transport\n");
+
+  /* First, clear out all our session & name tables */
+
+  for ( i=1; i <= MAX_SESSIONS; i++ )
+  {
+    pS = LSNtoSession(i);
+    pS->Status  = SS_FREE;
+    pS->LclLSN  = i;
+    pS->RcvQ.Head  = NULL;
+    pS->RcvQ.Last  = NULL;
+    pS->PartialRcv = NULL;
+    TimerInit ( &pS->AckTimer, AckTimerCallback, pS );
+  }
+
+  for ( i=0; i < MAX_NAMES; i++ )
+  {
+    pN = &NB_NameTable[i];
+    pN->Status = NS_FREE;
+  }
+
+  Stat_ClassMask |= SCLASS_NETBEUI;
+
+  /* Initialise LLC layer */
+
+  if ( !LLC_Init() )
+    return EINITFAILED;
+
+  /* Now find network driver */
+
+  debug1("Looking for driver '%s'\n", LM_Vars.drivername);
+
+  res = LLC_AttachDriver(LM_Vars.drivername, &Multi_Addr);
+  if ( res != OK )
+  {
+    LLC_Shutdown();
+    return res;
+  }
+
+  /* Now set our machine name */
+
+  UI_SetReceiver( NETBIOS_SAP, NB_ReceiveDatagram, NULL);
+
+  if ( LM_Vars.machinename[0] == 0 )
+  {
+    BYTE *p = LLC_MachineAddress.b;
+    sprintf( LM_Vars.machinename, "ARM%02X%02X%02X%02X%02X%02X",
+       p[0], p[1], p[2], p[3], p[4], p[5] );
+  }
+
+  debug1( "Setting machine name to '%s'\n", LM_Vars.machinename );
+
+  res = _NB_AddLocalName( ntMACHINE, LM_Vars.machinename, &NB_MachineName );
+  if (res != OK)
+  {
+    LLC_Shutdown();
+  }
+
+  return res;
+}
+
+/* ----------------------- */
+
+EXPORT void _NB_Shutdown(void)
+{
+  int i;
+
+  /* Clear up all active sessions */
+
+  for ( i=1; i <= MAX_SESSIONS; i++ )
+    ClearUp(LSNtoSession(i));
+
+  for ( i=0; i < MAX_NAMES; i++ )
+    if ( NB_NameTable[i].Status != NS_FREE )
+    {
+      QueueFlush(&(NB_NameTable[i].DatagramQ));
+      NB_NameTable[i].Status = NS_FREE;
+    }
+
+  LLC_Shutdown(); /* Detach driver & turn off timers, etc */
+}
+
+/* NB_InternetGone() --------------------------- */
+
+static void _NB_InternetGone(void)
+{
+  /* We don't care - we're the protocol module? */
+}
+
+
+/* NB_InternetGone() --------------------------- */
+
+static void _NB_InternetInit(void)
+{
+  /* We don't care - we're the protocol module? */
+}
+
+
+/* Setup routine ------------------------------- */
+
+static struct NETBIOS_TRANSPORT NetBEUI_Transport;
+
+void NB_NetBEUI_Setup ( void )
+{
+  struct NETBIOS_TRANSPORT *p;
+  NB_ActiveTransport = p = &NetBEUI_Transport;
+
+  p->pfnStartup	 = _NB_Startup;
+  p->pfnShutdown = _NB_Shutdown;
+  p->pfnFormatName = _NB_FormatName;
+  p->pfnDecodeName = _NB_DecodeName;
+  p->pfnMatchName = _NB_MatchName;
+  p->pfnAddLocalName = _NB_AddLocalName;
+  p->pfnRemoveLocalName = _NB_RemoveLocalName;
+  p->pfnOpenSession = _NB_OpenSession;
+  p->pfnSendData = _NB_SendData;
+  p->pfnSendBlockData = _NB_SendBlockData;
+  p->pfnClearRxQueue = _NB_ClearRxQueue;
+  p->pfnGetData = _NB_GetData;
+  p->pfnGetBlockData = _NB_GetBlockData;
+  p->pfnLinkOK = _NB_LinkOK;
+  p->pfnCloseSession = _NB_CloseSession;
+  p->pfnFindNames = _NB_FindNames;
+  p->pfnDescribeLink = _NB_DescribeLink;
+  p->pfnInternetGone = _NB_InternetGone;
+  p->pfnInternetInit = _NB_InternetInit;
+}
+#endif

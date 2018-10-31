@@ -1,0 +1,1089 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > Sources.Font_Arith
+
+;-----------------------------------------------------------------------------
+; New routines which cope with matrix transformation from outlines to pixels
+;
+; Transformatiom from design units to pixels << 9 is performed by the
+; 'rendermatrix', held in each font header and in each transform block.
+; This is computed as:
+;       derived matrix * font matrix * paint matrix * resolution matrix
+;
+;   derived matrix = optional transformation of original outlines
+;   font matrix = transformation supplied to Font_FindFont
+;   paint matrix = transformation supplied to Font_Paint
+;   resolution matrix = matrix derived from dpi << 9 / 72000
+;
+;   metrics matrix = font matrix * paint matrix
+;   render matrix = 1000/designsize * derived * point size * metrics * resolution
+;
+; All intermediate matrix calculations are performed in floating point.
+; The final matrix is in 16-bit fixed point, to speed up transformpt.
+;
+;-----------------------------------------------------------------------------
+
+FACC    RN      R0
+FACCX   RN      R1
+FGRD    RN      R2
+FSIGN   RN      R3
+FWACC   RN      R4
+FWACCX  RN      R5
+FWGRD   RN      R6
+FWSIGN  RN      R7
+
+; Calculate resolution matrix from xres,yres (dots per inch)
+; In    [R6,#hdr_x/yres] = dots per inch
+; Out   [R6,#hdr_resXX/YY] = dots per inch << 9 / 72000 (fixed point at bit 16)
+
+getresmatrix Entry "R0-R7"
+
+        LDR     FACC,[R6,#hdr_xres]
+        BL      div72000
+        ADD     R14,R6,#hdr_resXX
+        STMIA   R14,{FACC,FACCX}
+
+        LDRVC   FACC,[R6,#hdr_yres]
+        BLVC    div72000
+        ADDVC   R14,R6,#hdr_resYY
+        STMVCIA R14,{FACC,FACCX}
+
+        STRVS   R0,[sp]
+        EXIT
+
+;..................................................................................
+
+; In    FACC = dividend
+; Out   FACC,FACCX,FSIGN = float(FACC) << 9 / 72000
+;       FGRD,FWACC,FWACCX,FWSIGN corrupted
+;       R6 (FWGRD) preserved
+
+div72000 Entry "R6"
+
+        BL      IFLT                    ; FACC,FACCX,FSIGN := float(FACC)
+        MOVS    FWACC,FACC
+        ADDNE   FWACCX,FACCX,#9
+        MOVNE   FWSIGN,FSIGN            ; FWACC := FACC << 9
+        LDRNE   FACC,=72000
+        BLNE    IFLT
+        BLNE    FXDIV                   ; FACC := FWACC / FACC
+
+        EXIT
+        LTORG
+
+;...............................................................................
+
+; Calculate matrix for transforming outlines to bitmaps
+; This is stashed in the font header for future use
+; The chained transformed chunks each have their own version
+;
+; Each matrix to be calculated has a marker word set initially to indicate
+; that it has not yet been calculated.  Once it has been, the marker becomes
+; unset, so any given matrix is only calculated once.
+;
+;       scaled fontmatrix = point size * fontmatrix
+;       metrics matrix = fontmatrix * paint matrix
+;       scaled derived matrix = 1000/designsize * derived matrix
+;       render matrix = scaled derived matrix * point size * metrics matrix * resolution matrix
+;
+; The first 3 are optional - if present, they are in floating point format.
+; The rendermatrix is mandatory, and is always in fixed point format.
+;
+
+MAT_MARKER      *       &C0000000
+mat_marker      *       mat_Y                   ; offset inside matrix block
+
+;...............................................................................
+
+; Called from ScanFontDir and GetTransform
+;
+; In    R6 -> font header
+;       [transformptr] -> transform block, or 0 => no transform
+;       [paintmatrix] -> paint matrix, if [transformptr] <> 0
+; Out   [rendermatrix] -> [R6,#hdr_rendermatrix..] = render matrix
+;       [[R6,#hdr_FontMatrix],#mtb_metricsmatrix..] = metrics matrix
+;       [paintmatrix] = 0, if [transformptr] = 0
+;       [x/yscale] = appropriate values (also put into font header / transform block)
+;
+; NB: THIS ROUTINE MUST NOT MOVE THE CACHE
+
+getnewrendermatrix Entry "R1-R3,R7"
+
+        LDRB    R0,[R6,#hdr_masterfont]
+        BL      getfontheaderptr                ; R7 -> master font header
+        EXIT    VS
+
+        LDRB    R14,[R7,#hdr1_leafname]
+        CMP     R14,#leaf_scanfontdir
+        BLLE    GetOutlinesHeader               ; gets 1-bpp data for font header R7
+        EXIT    VS
+
+        LDR     R3,transformptr
+        TEQ     R3,#0
+        BNE     %FT01
+
+        STR     R3,paintmatrix                  ; no paintmatrix if no transform block
+
+        LDR     R14,[R6,#hdr_xscale]
+        STR     R14,xscale                      ; x/yscale = defaults (used if no transformation)
+        LDR     R14,[R6,#hdr_yscale]
+        STR     R14,yscale
+
+        LDR     R1,[R6,#hdr_FontMatrix]
+        TEQ     R1,#0                           ; don't copy metrics matrix if no font matrix
+        ADDNE   R1,R1,#mtb_metricsmatrix        ; (just use x/ysize/16 directly later on)
+
+        ADD     R2,R6,#hdr_rendermatrix
+        BL      getrendermatrix
+
+        MOVVS   R14,#MAT_MARKER
+        STRVS   R14,[R6,#hdr_rendermatrix + mat_marker]
+
+        LDRVC   R14,xscale                      ; x/yscale recomputed if there was a FontMatrix
+        STRVC   R14,[R6,#hdr_xscale]
+        LDRVC   R14,yscale
+        STRVC   R14,[R6,#hdr_yscale]
+
+        LDRVCB  R14,swapxyposnsflag             ; bit 0 set => swap over x/y subpixel posns
+        STRVCB  R14,[R6,#hdr_flags]
+
+        EXIT
+
+; (re)do transform block rendermatrix
+; assume that paintmatrix -> paint matrix, and this has already been copied into the transform block
+
+01      LDR     R14,[R6,#hdr_xscale]            ; use these as defaults
+        STR     R14,xscale
+        LDR     R14,[R6,#hdr_yscale]
+        STR     R14,yscale
+
+        ADD     R1,R3,#trn_metricsmatrix        ; R1 -> dest for metrics matrix
+        ADD     R2,R3,#trn_rendermatrix         ; R2 -> dest for render matrix
+        BL      getrendermatrix                 ; cache must not move in here (R3 unrelocated)
+
+        LDRVC   R14,xscale                      ; set up x/y scale for this transform
+        STRVC   R14,[R3,#trn_xscale]
+        LDRVC   R14,yscale
+        STRVC   R14,[R3,#trn_yscale]
+
+        LDRVCB  R14,swapxyposnsflag             ; bit 0 set => swap over x/y subpixel posns
+        STRVCB  R14,[R3,#trn_flags]
+
+        ADDVC   R14,R3,#trn_rendermatrix        ; [rendermatrix] -> render matrix in block
+        STRVC   R14,rendermatrix                ; bbox matrix follows
+
+        ADDVC   R14,R3,#trn_metricsmatrix
+        STRVC   R14,metricsmatrix
+
+        EXIT
+
+;...............................................................................
+
+; In    R7 -> master font header
+; Out   GetPixels1Header called for master font
+
+GetOutlinesHeader Entry "R6"
+
+        MOV     R6,R7                           ; R6 -> master font header
+        BL      GetPixels1Header
+
+        EXIT
+
+;...............................................................................
+
+; In    R1 -> buffer to contain metrics matrix (0 => don't bother)
+;       R2 -> buffer to contain render matrix
+;       R6 -> font header
+;       R7 -> master font header
+;       [R7,#hdr_designsize] = design size
+;       [R6,#hdr_x/ysize] = point size * 16
+;       [R6,#hdr_FontMatrix] = Font_FindFont matrix block
+;       [paintmatrix] = current paint matrix
+;       [R6,#hdr_resXX/YY] = resolution matrix (x/yres << 9 / 72000 with fixed point at bit 16)
+; Out   [metricsmatrix] -> [R1..] = metrics matrix (in fontmatrix block or transform block)
+;       [rendermatrix] -> [R2..] = rendering matrix (in font header or transform block)
+;       [R2,#mat_end..] = bbox matrix (ie. just after rendermatrix)
+
+; NB: THIS ROUTINE MUST NOT MOVE THE CACHE
+
+getrendermatrix Entry "R1,R2"
+
+        ADR     R14,tempmatrix_start-fmat_end   ; start again each time
+        STR     R14,tempmatrixrover
+
+; step 1: calculate metrics matrix (= font matrix * paint matrix)
+
+        LDR     R1,[R6,#hdr_FontMatrix]
+        BL      getfpfontmatrix                 ; R1 -> fp font matrix (0 if none)
+
+        BL      getfppaintmatrix                ; R2 -> fp paint matrix, or 0
+        TEQ     R2,#0
+        BLNE    matrix_multiply                 ; R1 := R1 * R2 (= metrics matrix)
+        EXIT    VS
+
+        DebugMF matrix,"metrics matrix =",R1
+
+        LDR     R2,[sp,#0*4]                    ; copy matrix to required destination
+        TEQ     R2,#0                           ; R2=0 => R11=0 and R2<>0 => R11<>0
+        BLNE    matrix_fix                      ; [R2..] = fix ( [R1..] ) (metrics matrix)
+        EXIT    VS
+
+; step 1a: multiply point size by metrics matrix
+
+        MOVS    R2,R1
+        BL      getxysizeover16                 ; R1 -> fp matrix equivalent to xysize/16
+        BLNE    matrix_multiply                 ; R1 := R1 * R2
+        EXIT    VS
+
+; step 2: calculate bbox matrix = scaled derived matrix * scaled metrics matrix (R1)
+
+        MOV     R2,R1                           ; R2 -> fp metrics matrix
+
+        LDR     R1,[R7,#hdr_FontMatrix]
+        BL      getfpfontmatrix                 ; R1 -> derived font matrix, or 0
+        TEQ     R1,#0
+        MOVEQ   R1,R2
+        BLNE    matrix_multiply                 ; R1 -> derived font matrix * metrics matrix
+        EXIT    VS
+
+        LDR     R14,[R7,#hdr_designsize]
+        TEQ     R14,#500
+        BLEQ    matrix_double                   ; R1 -> 2*[R1]
+        TEQNE   R14,#1000
+        MOVNE   R2,R1                           ; R2 -> derived * metrics
+        BLNE    getdesignmatrix                 ; R1 -> matrix (1000/designsize)
+        BLNE    matrix_multiply                 ; R1 -> 1000/design * derived * metrics
+
+        ASSERT  hdr_bboxmatrix = hdr_rendermatrix+mat_end
+        LDRVC   R2,[sp,#1*4]                    ; store bbox matrix just after render matrix
+        ADDVC   R2,R2,#mat_end
+        BLVC    matrix_fix
+
+; step 3: calculate render matrix = bbox matrix * resolution matrix
+
+        BLVC    getresolutionmatrix             ; R2 -> resolution matrix (fp)
+        BLVC    matrix_multiply                 ; R1 -> derived font matrix * metrics matrix * resolution matrix
+        EXIT    VS
+
+        LDR     R2,[sp,#1*4]
+        BLVC    matrix_fix
+        STR     R2,rendermatrix                 ; [rendermatrix] -> fixed-point matrix
+
+; step 4: recalculate x/yscale based on transformed width / height
+
+        MOV     R14,#0                          ; default = don't swap x/y subpixel posns
+        STRB    R14,swapxyposnsflag
+
+        LDR     R14,[R6,#hdr_FontMatrix]        ; leave x/yscale alone if no transformation
+        TEQ     R14,#0
+        LDREQ   R14,paintmatrix
+        TEQEQ   R14,#0
+        BLNE    transformxyscale
+
+        EXIT
+
+;..................................................................................
+
+; In    R7 -> master font header (for designsize)
+;       [rendermatrix] -> render matrix
+; Out   [x/yscale] = nominal width,height of font for threshold comparisons (pixels * 16 * 72)
+;       [swapxyposnsflag] = 1 => swap x/y posns (ie. font is more vertical than horizontal)
+
+transformxyscale Entry "R0-R11"
+
+        Debug   trn,"Munging x/yscale: originals are",#xscale,#yscale
+
+        LDR     R2,rendermatrix
+        DebugM  trn,"rendermatrix =",R2
+
+        LDR     R3,[R2,#mat_coordshift]
+        LDR     R0,[R7,#hdr_designsize]
+        MOV     R3,R0,LSL R3                    ; R3 = designsize << coordshift
+
+; units are 1/16th pixel in the following stuff: itsabiggie <=> size > 2047
+
+        LDR     R1,[R2,#mat_XX]
+        BL      getpixsize                      ; R4 = ABS(XX)
+        MOV     R8,R4
+        MOVLE   R5,R0                           ; R5 = XX
+        MULLE   R7,R5,R0                        ; R7 = XX^2
+
+        LDRLE   R1,[R2,#mat_YX]
+        BLLE    getpixsize
+        BGT     itsabiggie
+
+        CMP     R8,R4                           ; if axes swapped, swap over x/y subpixel scaling
+        MOVGE   R14,#0
+        MOVLT   R14,#trnf_swapxyposns
+        STRB    R14,swapxyposnsflag
+
+        MOV     R6,R0                           ; R6 = YX
+        MLA     R0,R6,R0,R7                     ; R0 = XX^2 + YX^2
+
+        BL      squareroot                      ; R0 = sqrt(R0)
+
+        MOVS    R9,R0                           ; R9 = length of 1-ems worth of baseline
+        BEQ     itsabiggie
+
+        LDR     R1,[R2,#mat_XY]
+        BL      getpixsize
+        MOVLE   R7,R0
+
+        LDRLE   R1,[R2,#mat_YY]
+        BLLE    getpixsize
+        BGT     itsabiggie
+        MOV     R8,R0                           ; R5,R6,R7,R8 = XX,YX,XY,YY
+
+        Debug   trn,"Pixel*16 XX,YX,XY,YY =",R5,R6,R7,R8
+
+; work out size of new bounding box, to avoid problems with massive sprites
+; 4 points of parallelogram are (0,0) (XX,YX) (XY,YY) (XX+XY,YX+YY)
+
+        ADD     R10,R5,R7                       ; R10 = XX+XY
+        ADD     R11,R6,R8                       ; R11 = YX+YY
+
+        MOV     R1,#0
+        MOV     R2,#0
+        MOV     R3,#0
+        MOV     R4,#0
+
+        CMP     R1,R5
+        MOVGT   R1,R5
+        CMP     R1,R7
+        MOVGT   R1,R7
+        CMP     R1,R10
+        MOVGT   R1,R10
+
+        CMP     R2,R6
+        MOVGT   R2,R6
+        CMP     R2,R8
+        MOVGT   R2,R8
+        CMP     R2,R11
+        MOVGT   R2,R11
+
+        CMP     R3,R5
+        MOVLT   R3,R5
+        CMP     R3,R7
+        MOVLT   R3,R7
+        CMP     R3,R10
+        MOVLT   R3,R10
+
+        CMP     R4,R6
+        MOVLT   R4,R6
+        CMP     R4,R8
+        MOVLT   R4,R8
+        CMP     R4,R11
+        MOVLT   R4,R11
+
+        Debug   trn,"New bbox x0,y0,x1,y1 (pixels*16) =",R1,R2,R3,R4
+
+        SUB     R3,R3,R1
+        SUB     R4,R4,R2
+
+; don't cache the object if its bitmap would be way too big
+
+        CMP     R3,#364*16                      ; 364 = 256 * sqrt(2) approx
+        CMPLE   R4,#364*16                      ; max fontmax3 = 255, so rotations won't bring this into effect
+        BGT     itsabiggie
+
+; if that was OK, pretend that the width is the new baseline length, and the height is measured perpendicularly
+
+        MUL     R1,R5,R8                        ; R1 = YY * XX
+        MUL     R2,R6,R7                        ; R2 = XY * YX
+
+        SUBS    R1,R1,R2
+        RSBLT   R1,R1,#0                        ; R1 = ABS(YY*XX-XY*YX)
+        DivRem  R0,R1,R9,R14,norem
+
+        Debuga  trn,"New pixel w,h =",R9,R0
+        Debuga  trn," - "
+
+        CMP     R0,#&1C00000                    ; rounding errors may have allowed this to overflow
+        BGT     itsabiggie
+
+        MOV     R1,#72                          ; units are already in pixels * 16
+
+        MUL     R2,R9,R1                        ; R2 = width (pixels * 72 * 16)
+        STR     R2,xscale
+
+        MUL     R2,R0,R1                        ; R2 = height (pixels * 72 * 16)
+        STR     R2,yscale
+
+        Debug   trn,"New x/yscale =",#xscale,#yscale
+
+        CLRV
+        EXIT
+
+itsabiggie
+        MOV     R14,#bignum
+        STR     R14,xscale
+        STR     R14,yscale
+
+        Debug   trn,"Too big: new x/yscale =",#xscale,#yscale
+
+        CLRV
+        EXIT
+
+;..................................................................................
+
+; In    R0 = unsigned integer
+; Out   R0 = square root of input R0
+
+squareroot Entry "R1-R6"
+
+        TEQ     R0,#0
+        EXIT    EQ
+
+        Debuga  trn,"Square root of",R0
+
+        MOV     R1,#0
+        MOVS    R2,R0
+01      ADDNE   R1,R1,#1                ; R1 = number of significant bits in R0
+        MOVNES  R2,R2,LSR #1
+        BNE     %BT01
+
+        SUB     R1,R1,#1
+        MOV     R1,R1,ASR #1            ; R1 = (R1-1)/2
+
+        MOV     R2,#1
+        MOV     R2,R2,LSL R1            ; R2 = 1 << R1
+        MOV     R5,R2
+
+        MOV     R3,R2,LSL R1            ; R3 = 1 << (R1*2)
+        MOV     R4,R3
+
+02      CMP     R3,R0
+        BHS     %FT03
+
+        ADD     R6,R3,R2,LSL R1         ; R6 = R3 + (R2 << R1)
+
+        MOV     R4,R4,LSR #2            ; R4 = 1 << (R1*2)
+        MOV     R5,R5,LSR #1            ; R5 = 1 << R1
+
+        ADD     R6,R6,R4
+
+        CMP     R6,R0
+        MOVLS   R3,R6
+        ADDLS   R2,R2,R5
+
+        SUBS    R1,R1,#1
+        BHI     %BT02
+
+03      MOV     R0,R2
+
+        Debug   trn," is",R0
+
+        EXIT
+
+;..................................................................................
+
+; In    R3 = design size << coordshift
+;       R1 = 16-bit signed value from matrix
+; Out   R0 = (R3 * R1 >> 16) >> (9-4) = 1 em in 1/16th pixel
+;       R4 = ABS(R0)
+;       GT <=> R4 is too big to be multiplied up
+
+getpixsize Entry ""
+
+        Debuga  trn,"getpixsize: in",R3
+
+ [ NoARMM
+        MOV     R0,R3
+        BL      mul_R0_R1
+        MOV     R0,R0,ASR #9-4            ; convert to pixels * 16
+ |
+        SMULL   R0,LR,R1,R3
+        MOV     R0,R0,LSR #16+9-4
+        ORR     R0,R0,LR,LSL #16-9+4
+ ]
+        MOVS    R4,R0
+        RSBMI   R4,R4,#0
+        CMP     R4,#&8000
+
+        Debug   trn," out, abs(out)",R0,R4
+
+        EXIT
+
+;..................................................................................
+
+; In    R1 -> fp matrix block
+; Out   [R1..] = [R1..] * 2 (achieved by adding 1 to the exponents)
+
+matrix_double EntryS "R2"
+
+        MOV     R2,#fmat_YY+4                   ; don't do the offsets (we're pre-multiplying)
+
+01      LDR     R14,[R1,R2]                     ; adding 1 to exponent doubles number
+        ADD     R14,R14,#1                      ; double 0 is still 0!
+        STR     R14,[R1,R2]
+
+        SUBS    R2,R2,#8
+        BGE     %BT01
+
+        EXITS
+
+;..................................................................................
+
+; In    R1 -> font matrix block, or 0
+; Out   R1 -> fp font matrix, or 0 if none
+
+getfpfontmatrix Entry "R2"
+
+        CMP     R1,#0
+        EXIT    EQ
+
+        ADD     R1,R1,#mtb_matrix
+        ADD     R2,R1,#mtb_scaledmatrix - mtb_matrix
+        LDR     R14,[R2,#mat_marker]
+        TEQ     R14,#MAT_MARKER
+        BLEQ    matrix_float
+
+        MOV     R1,R2                           ; R1 -> fp font matrix
+
+        DebugMF matrix,"fp font matrix =",R1
+
+        CLRV
+        EXIT
+
+;..................................................................................
+
+; In    [paintmatrix] -> paint matrix block, or 0
+; Out   R2 -> fp paint matrix, or 0 if none
+
+getfppaintmatrix Entry "R1"
+
+        LDR     R1,paintmatrix
+        MOVS    R2,R1
+        EXIT    EQ
+
+        ADR     R2,fppaintmatrixbuffer          ; always the same one
+        LDR     R14,[R2,#mat_marker]
+        TEQ     R14,#MAT_MARKER
+        BLEQ    matrix_float
+
+        DebugMF matrix,"fp paint matrix =",R2
+
+        CLRV
+        EXIT
+
+;.............................................................................
+
+; In    R1 -> source matrix (fixed point)
+;       R2 -> destination matrix (floating point)
+; Out   [R2..] = floating point version of [R1..]
+
+matrix_float Entry "R0-R10"
+
+        DebugM  matrix,"matrix_float: in  ",R1
+
+        MOV     R8,#mat_enduser/4
+        MOV     R9,R1
+        MOV     R10,R2
+
+01      LDR     FACC,[R9],#4
+        BL      IFLT
+        CMP     R8,#2                           ; first 4 are 16-bit fixed point, last 2 are 0-bit fixed point
+        SUBHI   FACCX,FACCX,#16
+        TEQ     FACCX,#0
+        MOVMI   FACCX,#0                        ; (avoid underflow)
+        ORR     FACCX,FACCX,FSIGN
+        STMIA   R10!,{FACC,FACCX}
+
+        SUBS    R8,R8,#1
+        BNE     %BT01
+
+      [ debugmatrix
+        LDR     R2,[sp,#2*4]
+        DebugMF matrix,"matrix_float: out ",R2
+      ]
+
+        EXIT
+
+;.............................................................................
+
+; In    R1 -> source matrix (floating point) or 0
+;       R2 -> destination matrix (fixed point), with space for mat_coordshift
+; Out   [R2..] = fixed point version of [R1..]
+
+matrix_fix Entry "R0-R11"
+
+        DebugMF matrix,"matrix_fix: in  ",R1
+
+        MOV     R9,R1                           ; R9 -> input matrix
+        MOV     R10,R2                          ; R10 -> output matrix
+
+        MOV     R8,#fmat_X/8                    ; reduce first 4 so they fit in 32 bits
+        MOV     R11,#0                          ; R11 = minimum coordshift required (0)
+
+11      LDMIA   R9!,{FACC,FACCX}
+        AND     FACCX,FACCX,#255                ; FACCX = exponent (ie. number of bits used at top of word)
+        SUBS    FACCX,FACCX,#&80+15
+        CMP     FACCX,R11
+        MOVGT   R11,FACCX                       ; R11 = maximum coordshift required
+
+        SUBS    R8,R8,#1
+        BNE     %BT11
+
+        STR     R11,[R10,#mat_coordshift]       ; used by transformpt
+
+        SUB     R9,R9,#fmat_X                   ; R9 -> input matrix again
+        MOV     R8,#fmat_end/8
+
+01      LDMIA   R9!,{FACC,FACCX}
+        AND     FSIGN,FACCX,#&80000000
+        AND     FACCX,FACCX,#255
+        CMP     R8,#2                           ; first 4 are 16-bit fixed point, last 2 are 0-bit fixed point
+        ADDHI   FACCX,FACCX,#16
+        SUBHI   FACCX,FACCX,R11                 ; shift down to avoid overflow
+        BL      INTRND                          ; rounds to nearest
+        BVS     %FT90
+        STR     FACC,[R10],#4
+
+        SUBS    R8,R8,#1
+        BNE     %BT01
+
+      [ debugmatrix
+        LDR     R2,[sp,#2*4]
+        DebugM  matrix,"matrix_fix: out ",R2
+        Debug   matrix,"coordshift =",R11
+      ]
+
+        EXIT
+
+90      STR     R0,[sp]
+        EXIT
+
+;..................................................................................
+
+; In    R6 -> font header
+;       [R6,#hdr_xysize] = point size of font * 16
+; Out   R1 -> floating point matrix equivalent of xysize/16
+
+getxysizeover16 EntryS "R0,R2-R7"
+
+        LDR     FACC,[R6,#hdr_xsize]
+        BL      IFLT                            ; FACC,FACCX,FSIGN = float(FACC)
+        SUB     FACCX,FACCX,#4                  ; divide by 16
+
+        MOV     FWACC,FACC
+        MOV     FWACCX,FACCX
+        ASSERT  FWACCX < R6
+
+        LDR     FACC,[R6,#hdr_ysize]
+        BL      IFLT                            ; FACC,FACCX,FSIGN = float(FACC)
+        SUB     FACCX,FACCX,#4                  ; divide by 16
+
+        BL      makematrix                      ; R1 -> matrix [ x 0 0 y 0 0 ]
+
+        DebugMF matrix,"xysizeover16 =",R1
+
+        EXITS                                   ; must preserve flags
+
+;..................................................................................
+
+; In    R6 -> font header
+;       [R6,#hdr_resXX/YY] = resolution matrix values
+; Out   R2 -> floating point matrix equivalent of [ resXX 0 0 resYY 0 0 ]
+
+getresolutionmatrix Entry "R0-R1,R3-R7"
+
+        ADD     R14,R6,#hdr_resXX
+        LDMIA   R14,{FWACC,FWACCX}
+
+        ADD     R14,R6,#hdr_resYY
+        LDMIA   R14,{FACC,FACCX}
+
+        BL      makematrix
+        MOV     R2,R1                           ; R2 -> output matrix
+
+        DebugMF matrix,"resolution matrix =",R2
+
+        CLRV
+        EXIT
+
+;..................................................................................
+
+; In    R7 -> master font header
+;       [R7,#hdr_designsize] = design size
+; Out   R1 -> floating point matrix equivalent of [ 1000/designsize 0 0 1000/designsize 0 0 ]
+
+getdesignmatrix EntryS "R0,R2-R7"
+
+        LDR     FACC,[R7,#hdr_designsize]
+      [ debugbrk
+        CMP     FACC,#1000
+        BreakPt "Invalid designsize",HI
+      ]
+        BL      IFLT                            ; FACC,FACCX,FSIGN = float(FACC)
+
+        LDR     FWACC,=1000 :SHL: 22
+        MOV     FWACCX,#&80+32-22
+        MOV     FWSIGN,#0
+        BL      FXDIV                           ; FACC = FWACC/FACC
+
+        MOV     FWACC,FACC
+        MOV     FWACCX,FACCX
+
+        BL      makematrix                      ; R1 -> matrix [ x 0 0 y 0 0 ]
+
+        DebugMF matrix,"design matrix =",R1
+
+        EXITS
+
+;..................................................................................
+
+; In    FWACC,FWACCX = fmat_XX value
+;       FACC,FACCX = fmat_YY value
+; Out   R1 -> matrix [ XX 0 0 YY 0 0 ]
+
+makematrix Entry "R8,R9"
+
+        BL      getnewmatrix                    ; R8 -> spare matrix block
+
+        ASSERT  fmat_XX = 0
+        STMIA   R8!,{FWACC,FWACCX}
+
+        MOV     FWACC,#0
+        MOV     FWACCX,#0
+        MOV     R9,#0
+        MOV     R14,#0
+
+        ASSERT  fmat_YX = fmat_XX + 8
+        ASSERT  fmat_XY = fmat_YX + 8
+        STMIA   R8!,{FWACC,FWACCX,R9,R14}
+
+        ASSERT  fmat_YY = fmat_XY + 8
+        STMIA   R8!,{FACC,FACCX}
+
+        ASSERT  fmat_X = fmat_YY + 8
+        ASSERT  fmat_Y = fmat_X + 8
+        STMIA   R8,{FWACC,FWACCX,R9,R14}
+
+        SUB     R1,R8,#fmat_X
+
+        DebugMF matrix,"makematrix: out",R1
+
+        EXIT
+
+;.............................................................................
+
+; In    R1 -> source matrix #1 (fp)
+;       R2 -> source matrix #2 (fp)
+; Out   R1 -> temp buffer containing matrix(R1) * matrix(R2)
+;       VS => R0 -> error block (overflow)
+
+matrix_multiply Entry "R0,R2-R11"
+
+        DebugMF matrix,"matrix_mul: in1",R1
+        DebugMF matrix,"matrix_mul: in2",R2
+
+        CMP     R1,#0                   ; watch for either matrix being null
+        MOVEQ   R1,R2
+        CMPNE   R2,#0
+        EXIT    EQ                      ; R1 -> matrix result, or = 0
+
+        BL      getnewmatrix            ; R8 -> spare matrix block
+
+        MOV     R11,R2
+
+        ADD     R10,R1,#fmat_XX
+        BL      rowtimescol_0_twice     ; generates XX, YX
+
+        ADDVC   R10,R10,#fmat_XY - fmat_XX
+        BLVC    rowtimescol_0_twice     ; generates XY, YY
+
+        ADDVC   R10,R10,#fmat_X - fmat_XY
+        BLVC    rowtimescol_1_twice     ; generates X, Y
+
+        SUBVC   R1,R8,#fmat_end         ; R1 -> output matrix
+
+        DebugMF matrix,"matrix_mul: out",R1
+
+        EXIT
+
+;.............................................................................
+
+; In    R10 -> row of first matrix, with implicit 0 at end
+;       R11 -> second matrix
+;       R8 -> where to put the results
+; Out   [R8..]! = row(R10)*colX(R11), row(R10)*colY(R11)
+;       R0-R7 corrupt
+
+rowtimescol_0_twice Entry "R11"
+
+        BL      rowtimescol_0
+        ORRVC   FACCX,FACCX,FSIGN               ; compress result into 2 words
+        STMVCIA R8!,{FACC,FACCX}
+
+        ADDVC   R11,R11,#fmat_YX
+        BLVC    rowtimescol_0
+        ORRVC   FACCX,FACCX,FSIGN               ; compress result into 2 words
+        STMVCIA R8!,{FACC,FACCX}
+
+        EXIT
+
+;.............................................................................
+
+; In    R10 -> row of first matrix, with implicit 1 at end
+;       R11 -> second matrix
+;       R8 -> where to put the results
+; Out   [R8..]! = row(R10)*colX(R11), row(R10)*colY(R11)
+;       R0-R7 corrupt
+
+rowtimescol_1_twice Entry "R11"
+
+        BL      rowtimescol_1
+        ORRVC   FACCX,FACCX,FSIGN               ; compress result into 2 words
+        STMVCIA R8!,{FACC,FACCX}
+
+        ADDVC   R11,R11,#fmat_YX
+        BLVC    rowtimescol_1
+        ORRVC   FACCX,FACCX,FSIGN               ; compress result into 2 words
+        STMVCIA R8!,{FACC,FACCX}
+
+        EXIT
+
+;.............................................................................
+
+; In    R10 -> row of first matrix
+;       R11 -> column of second matrix
+; Out   FACC,FACCX,FSIGN = result of multiplying one row by one column
+;       R4-R7 corrupt
+
+rowtimescol_1 Entry ""
+
+        BL      rowtimescol_0           ; FACC,FACCX,FSIGN = Xr * cX + Yr * cY
+
+        ADDVC   R14,R11,#fmat_X - fmat_XX
+        LDMVCIA R14,{FWACC,FWACCX}
+        ANDVC   FWSIGN,FWACCX,#&80000000
+        ANDVC   FWACCX,FWACCX,#255
+        BLVC    FADDW                   ; FACC += FWACC
+
+        EXIT
+
+;.............................................................................
+
+; In    R10 -> row of first matrix
+;       R11 -> column of second matrix
+; Out   FACC,FACCX,FSIGN = result of multiplying one row by one column
+;       R4-R7 corrupt
+
+rowtimescol_0 Entry "R10,R11"
+
+        Debug   matrix,"row*col: in",R10,R11
+
+        LDMIA   R10!,{FACC,FACCX}               ; move across a column
+        AND     FSIGN,FACCX,#&80000000
+        AND     FACCX,FACCX,#255
+        TEQ     FACC,#0
+        LDMNEIA R11,{FWACC,FWACCX}
+        ANDNE   FWSIGN,FWACCX,#&80000000
+        ANDNE   FWACCX,FWACCX,#255
+        BLNE    FMUL
+        EXIT    VS
+
+        Push    "FACC,FACCX,FSIGN"
+
+        LDMIA   R10!,{FACC,FACCX}               ; move across a column
+        AND     FSIGN,FACCX,#&80000000
+        AND     FACCX,FACCX,#255
+        TEQ     FACC,#0
+        ADDNE   R11,R11,#fmat_XY - fmat_XX      ; move down a row
+        LDMNEIA R11,{FWACC,FWACCX}
+        ANDNE   FWSIGN,FWACCX,#&80000000
+        ANDNE   FWACCX,FWACCX,#255
+        BLNE    FMUL
+
+        Pull    "FWACC,FWACCX,FWSIGN"
+        BLVC    FADDW
+
+        Debug   matrix,"row*col: out",FACC,FACCX,FSIGN
+
+        EXIT
+
+;.............................................................................
+
+; Out   R8 -> temporary matrix block, allocated from a cyclic buffer
+
+getnewmatrix Entry ""
+
+        LDR     R8,tempmatrixrover
+        ADD     R8,R8,#fmat_end
+        ADR     R14,tempmatrix_end
+        CMP     R8,R14
+        SUBHS   R8,R8,#tempmatrix_end-tempmatrix_start
+        STR     R8,tempmatrixrover
+
+        Debug   matrix,"getnewmatrix:",R8
+
+        EXIT
+
+;-----------------------------------------------------------------------------
+
+; In    R1 -> transformation matrix (fixed point, with coordshift following)
+;       R2,R3 = coords (design units)
+; Out   R2,R3 = x,y coords (pixels << 9)
+
+transformpt PEntryS TransformPt, "R0-R1,R4-R9"
+
+      [ NoARMM
+        LDR     R14,[R1,#mat_coordshift]
+
+        Debuga  matrix,"transformpt: matrix, x,y,coorshift =",R1,R2,R3,R14
+
+        MOV     R2,R2,LSL R14
+        MOV     R3,R3,LSL R14
+
+        BL      scalexcoord             ; R4 = new x-coord
+        BL      scaleycoord             ; R5 = new y-coord
+        Debug   matrix,", out x,y",R4,R5
+
+        MOV     R2,R4
+        MOV     R3,R5
+      |
+        LDMIA   R1,{R4-R9,R14}
+
+        Debuga  matrix,"transformpt: matrix, x,y,coorshift =",R1,R2,R3,R14
+
+        MOV     R2,R2,LSL R14
+        SMULL   R0,R1,R2,R4             ; R0,R1 = oldX * mXX
+        MOV     R3,R3,LSL R14
+        SMLAL   R0,R1,R3,R6             ; R0,R1 += oldY * mXY
+        SMULL   R4,R6,R2,R5             ; R4,R6 = oldX * mYX
+        ADD     R2,R8,R0,LSR #16        ; R0,R1 + mX
+        SMLAL   R4,R6,R3,R7             ; R4,R6 += oldY * mYY
+        ADD     R2,R2,R1,LSL #16        ; R0,R1 + mX
+        ADD     R3,R9,R4,LSR #16        ; R4,R6 + mY
+        ADD     R3,R3,R6,LSL #16        ; R4,R6 + mY
+      ]
+        PExitS                          ; doesn't return errors
+
+;.............................................................................
+
+ [ NoARMM ; Inline versions of these routines are used if long multiplies are available
+
+; In    R1 -> matrix
+;       R2,R3 = old x, y coordinates (already shifted by coordshift)
+; Out   R4 = new x-coordinate
+;       R0,R5-R9 corrupted
+
+scalexcoord Entry "R1"
+
+        LDMIA   R1,{R5-R9}              ; R5,R7,R9 are the relevant numbers
+
+        Debug   matrix2,"scalexcoord: XX, XY, X =",R5,R7,R9
+      [ NoARMM
+        MOVS    R1,R5
+        MOVEQ   R4,#0
+        MOVNE   R0,R2
+        BLNE    mul_R0_R1
+        MOVNE   R4,R0                   ; R4 = oldX * mXX
+
+        MOVS    R1,R7
+        MOVNE   R0,R3
+        BLNE    mul_R0_R1
+        ADDNE   R4,R4,R0                ; R4 += oldY * mXY
+        
+        ADD     R4,R4,R9
+      |
+        SMULL   R0,R1,R2,R5             ; R0,R1 = oldX * mXX
+        SMLAL   R0,R1,R3,R7             ; R0,R1 += oldY * mXY
+        ADD     R4,R9,R0,LSR #16        ; + mX
+        ADD     R4,R4,R1,LSL #16
+      ]
+
+        EXIT
+
+;.............................................................................
+
+; In    R1 -> matrix
+;       R2,R3 = old x, y coordinates (already shifted by coordshift)
+; Out   R5 = new y-coordinate
+;       R0-R1,R6-R9 corrupted
+
+scaleycoord Entry "R4"
+
+        LDMIB   R1,{R4,R6-R9}           ; R4,R7,R9 are the relevant numbers
+
+        Debug   matrix2,"scaleycoord: YX, YY, Y =",R4,R7,R9
+      [ NoARMM
+        MOVS    R1,R4
+        MOVEQ   R5,#0
+        MOVNE   R0,R2
+        BLNE    mul_R0_R1
+        MOVNE   R5,R0                   ; R5 = oldX * mYX
+
+        MOVS    R1,R7
+        MOVNE   R0,R3
+        BLNE    mul_R0_R1
+        ADDNE   R5,R5,R0                ; R5 += oldY * mYY
+
+        ADD     R5,R5,R9
+      |
+        SMULL   R0,R1,R2,R4             ; R0,R1 = oldX * mYX
+        SMLAL   R0,R1,R3,R7             ; R0,R1 += oldY * mYY
+        ADD     R5,R9,R0,LSR #16        ; + mY
+        ADD     R5,R5,R1,LSL #16
+      ]
+
+        EXIT
+
+;.............................................................................
+
+; In    R0 = number to multiply up
+;       R1 = fixed point matrix value to multiply by
+; Out   R0 = result (signed, 32-bit), ie. R0*R1 >> 16
+
+mul_R0_R1
+ [ NoARMM
+        EntryS "R1-R3"
+ |
+        EntryS
+ ]
+
+        TEQ     R0,#0
+        TEQNE   R1,#0
+        MOVEQ   R0,#0
+        EXITS   EQ
+
+        Debuga  scf2,"mul_R0_R1: in",R0,R1
+
+ [ NoARMM
+        MOV     R2, R1, ASR #16         ; R2 = scale_hi
+        BIC     R1, R1, R2, LSL #16     ; R1 = scale_lo
+        MOV     R3, R0, ASR #16         ; R3 = input_hi
+        BIC     R0, R0, R3, LSL #16     ; R0 = input_lo
+
+        MUL     LR, R0, R2              ; LR = input_lo * scale_hi
+        MLA     LR, R3, R1, LR          ; LR = input_hi * scale_lo + LR
+        MUL     R1, R0, R1              ; R1 = input_lo * scale_lo
+        MUL     R0, R3, R2              ; R1 = input_hi * scale_hi
+
+        ADD     R1, LR, R1, LSR #16
+        ADD     R0, R1, R0, LSL #16     ; R0 = answer!
+ |
+        SMULL   R0, LR, R1, R0
+        MOV     R0, R0, LSR #16
+        ORR     R0, R0, LR, LSL #16
+ ]
+        Debug   scf2,", out",R0
+
+        EXITS                           ; must preserve flags
+ ] ; NoARMM
+
+        GET     Font_BasFP.s
+
+        END
