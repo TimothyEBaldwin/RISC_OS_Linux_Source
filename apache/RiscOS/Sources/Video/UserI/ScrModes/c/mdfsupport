@@ -1,0 +1,912 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* mdfsupport.c */
+
+/*
+ * Monitor definition file support.
+ */
+
+#include <stdio.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <stdbool.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/Services.h"
+#include "Interface/HighFSI.h"
+
+#include "errors.h"
+#include "modex.h"
+#include "monitors.h"
+#include "mdfsupport.h"
+
+/* Tweak to force the keyword table to be stored in the code area, by
+ * making it all into a single char array including embedded NULs to
+ * terminate individual entries.  We trust the compiler to spot the
+ * multiple (2) source instances of this string constant and arrange to
+ * use a single copy of it.
+ */
+#define keywordset     \
+    "x_res\0         " \
+    "y_res\0         " \
+    "h_timings\0     " \
+    "v_timings\0     " \
+    "pixel_rate\0    " \
+    "sync_pol\0      " \
+    "external_clock\0" \
+    "mode_name\0     " \
+    "file_format\0   " \
+    "monitor_title\0 " \
+    "dpms_state\0    " \
+    "lcd_support\0   " \
+    "interlaced\0    " \
+    "output_format\0 " \
+    "startmode\0     " \
+    "endmode"
+#define MAXKEYWORDLEN 14
+#define keyword(n) (keywordset + ((n) * (MAXKEYWORDLEN+1)))
+
+/* Must keep this consistent with keywordset above: order has to match
+ * exactly.
+ */
+enum keycode
+{
+    /* First in the set are those keywords which may be encountered
+     * when reading an individual mode definition (i.e. between
+     * "startmode", and "endmode").  These values are kept together in
+     * the enumeration to make it easier to form a bitmap of seen
+     * keywords in parse_mode() below.  At the moment, every keyword
+     * must be seen exactly once in each definition.
+     */
+    k_x_res = 0,
+    k_y_res,
+    k_h_timings,
+    k_v_timings,
+    k_pixel_rate,
+    k_sync_pol,
+    k_external_clock,
+    k_mode_name,
+#define last_mode_key k_mode_name  /* last in *enumeration* - order in file not fixed! */
+
+    k_file_format,
+    k_monitor_title,
+    k_dpms_state,
+    k_lcd_support,
+    k_interlaced,
+    k_output_format,
+    k_startmode,
+    k_endmode,
+
+    /* Now specials which do not correspond to actual file keywords */
+    k_nokey,                       /* identifer not recog. as keyword */
+    k_eof                          /* end of file */
+};
+
+static FILE *thefile;              /* only valid during processing */
+static const char *thefilename;    /* only valid during processing */
+static int lineno;
+
+static int nextc(void)
+{
+    int c;
+    c = getc(thefile);
+    if (c == '\n')
+    {
+        ++lineno;
+    }
+    return c;
+}
+
+static void pushback(int c)
+{
+    if (c != EOF)
+    {
+        ungetc(c, thefile);
+        if (c == '\n')
+        {
+            --lineno;
+        }
+    }
+}
+
+static void close_modefile(void)
+{
+    fclose(thefile);
+}
+
+static _kernel_oserror *synerr0(int code)
+{
+    char linebuff[10+1];
+    sprintf(linebuff, "%u", lineno);
+    return error(code, thefilename, linebuff, 0);
+}
+
+static _kernel_oserror *synerrC(int errcode, int thechar)
+{
+    char linebuff[10+1], charbuff[1+1];
+    sprintf(linebuff, "%u", lineno);
+    charbuff[0] = thechar; charbuff[1] = '\0';
+    return error(errcode, thefilename, linebuff, charbuff);
+}
+
+static _kernel_oserror *synerrK(int errcode, enum keycode keycode)
+{
+    char linebuff[10+1];
+    sprintf(linebuff, "%u", lineno);
+    return error(errcode, thefilename, linebuff, keyword(keycode));
+}
+
+/* Semantic errors are not directly associated with a single line, so
+ * no line number is shown.  The distinction between syntatic errors
+ * and semantic ones is a little fine at times...
+ */
+static _kernel_oserror *semerr0(int code)
+{
+    return error(code, thefilename, 0, 0);
+}
+
+static _kernel_oserror *semerrS(int code, char *thestring)
+{
+    return error(code, thefilename, thestring, 0);
+}
+
+static int skip_space(void)
+{
+    int c;
+    while ((c = nextc()) != '\n' && isspace(c))
+        ;
+    return c;
+}
+
+static int matchtext(char *text, const char *ref)
+{
+    while (tolower(*text) == *ref)
+    {
+        if (*text == '\0')
+        {
+            return 1;
+        }
+        ++text; ++ref;
+    }
+    return 0;
+}
+
+static int skip_comment_or_blank(void)
+{
+    int c;
+    while ((c = skip_space()) == '\n' || c == '#')
+    {
+        if (c == '#')
+        {
+            /* Comment - extends to end of line */
+            /* TMD 25-Nov-93 - Fix bug MED-01177
+               Wasn't checking for EOF here, so if comment line
+               ended in EOF, it looped indefinitely
+             */
+            do
+                c = nextc();
+            while (c != '\n' && c != EOF);
+        }
+    }
+    return c;
+}
+
+static enum keycode read_keyword(void)
+{
+    char buff[MAXKEYWORDLEN+1+1];
+    int i, c;
+    enum keycode k;
+
+    c = skip_comment_or_blank();
+    i = 0;
+    if (c == EOF)
+    {
+        return k_eof;
+    }
+    while (isalpha(c) || c == '_')
+    {
+        if (i < MAXKEYWORDLEN+1)
+        {
+            /* allow one extra char, to catch junk at end */
+            buff[i++] = c;
+        }
+        c = nextc();
+    }
+    pushback(c);                       /* backstep over terminating char */
+    buff[i] = '\0';                     /* terminate it */
+    k = (enum keycode) 0;
+    while (k < k_nokey && !matchtext(buff, keyword(k)))
+        k = (enum keycode) (k + 1);
+    return k;
+}
+
+static _kernel_oserror *skip_char(int ch)
+{
+    int c;
+    while ((c = nextc()) != '\n' && isspace(c))
+        ;
+    if (c == ch)
+    {
+        return NULL;
+    }
+    if (c == EOF)
+    {
+        return synerr0(ERR_EOF);
+    }
+    pushback(c);                       /* in case of '\n', to get lineno right */
+    return synerrC(ERR_EXPCHAR, ch);
+}
+
+static _kernel_oserror *check_eol(int eofok)
+{
+    int c = skip_space();
+    if (c == '\n' || (eofok && c == EOF))
+    {
+        return NULL;
+    }
+    if (c == EOF)
+    {
+        return synerr0(ERR_EOF);
+    }
+    return synerr0(ERR_EXTRAINPUT);
+}
+
+/* Read text (starting with the next non-space character) up to the
+ * end of the current line. EOF is not acceptable to terminate it.
+ * Trailing spaces are removed.  Text longer than the available buffer
+ * size is (for now) just truncated.
+ *
+ * TMD 13-Dec-93: Allow zero length lines if blankerror=-1,
+ * because blank mode names are now OK.
+ */
+static _kernel_oserror *read_text(char *buff, int size, int blankerror)
+{
+    int c, i, excess;
+    i = 0;  excess = 0;
+    /* Skip leading white-space */
+    c = skip_space();
+    if (c == '\n' && blankerror != -1)
+    {
+        /* blank field - complain if necessary */
+        pushback(c);                   /* to get line number correct! */
+        return synerr0(blankerror);
+    }
+    while (c != EOF && c != '\n')
+    {
+        if (i < size-1)
+        {
+            buff[i++] = c;
+        }
+        else
+        {
+            /* Should we complain, or issue a warning? Do nowt for now. */
+            if (!isspace(c))
+            {
+                ++excess;
+#if DODEBUG
+                    if (excess == 1)
+                    {
+                        printf("excess chars ignored on text at line %d\n", lineno);
+                    }
+#endif                    
+            }
+        }
+        c = nextc();
+    }
+    if (c == EOF)
+    {
+        return synerr0(ERR_EOF);       /* EOF not allowed */
+    }
+    /* Remove trailing white-space */
+    while (i > 0 && isspace(buff[i-1]))
+        --i;
+    /* Terminate the string */
+    buff[i] = '\0';
+    return NULL;
+}
+
+static _kernel_oserror *read_u32(uint32_t *var)
+{
+    int c;
+    uint32_t acc;
+    c = skip_space();
+    if (!isdigit(c))
+    {
+        return synerr0(ERR_EXPNUM);
+    }
+    acc = c - '0';
+    while (isdigit(c = nextc()))
+    {
+        int digit = c - '0';
+        if (acc > UINT32_MAX/10 ||
+            (acc == UINT32_MAX/10 && digit > UINT32_MAX%10)) {
+            return synerr0(ERR_VALUEOVF);
+        }
+        acc = acc * 10 + digit;
+    }
+    pushback(c);                       /* leave terminating char waiting to be read */
+    *var = acc;
+    return NULL;
+}
+
+static _kernel_oserror *read_one_u32(uint32_t *var, uint32_t fault_zero)
+{
+    _kernel_oserror *res = read_u32(var);
+    if (res)
+    {
+        return res;
+    }
+    if (fault_zero && *var == 0)
+    {
+        return synerr0(ERR_INVALIDPAR);
+    }
+    return check_eol(0);
+}
+
+static _kernel_oserror *check_keyword(enum keycode code, int colon)
+{
+    enum keycode kc;
+    kc = read_keyword();
+    if (kc == k_eof)
+    {
+        /* we never explicitly look for k_eof */
+        return synerr0(ERR_EOF);
+    }
+    if (kc != code)
+    {
+        return synerrK(ERR_EXPKEY, code);
+    }
+    if (colon)
+    {
+        return skip_char(':');
+    }
+    else
+    {
+        return NULL;
+    }
+}
+
+static _kernel_oserror *parse_mode(ModeDefinition *definition)
+{
+    uint32_t keyseen;
+    ModeDef *mode = &definition->timings;
+
+    keyseen = 0;
+    mode->interlaced = 0; /* Assume mode is not interlaced, unless we see the keyword */
+    mode->external_clock = -1;
+    for (;;)
+    {
+        enum keycode kc = read_keyword();
+        uint32_t param, missed, ok_to_miss;
+        _kernel_oserror *res;
+        if (kc <= last_mode_key)
+        {
+            if (keyseen & (1 << kc))
+            {
+                return synerrK(ERR_REPKEY, kc);
+            }
+            res = skip_char(':');
+            if (res)
+            {
+                return res;
+            }
+            keyseen |= 1 << kc;
+        }
+        switch (kc)
+        {
+            case k_eof:
+                return synerr0(ERR_EOF);
+            
+            case k_endmode:
+                /* Work out which, if any, of the entries have not been supplied */
+                assert(last_mode_key <= 31);
+                missed = ((1u << (last_mode_key + 1)) - 1) & ~keyseen;
+            
+                /* In format 1, we normally insist that x_res = hdisp and
+                 * y_res = vdisp so x_res and y_res are in fact optional.
+                 * However if the mode is interlaced, then x_res and y_res are compulsory.
+                 * We insist that all other keywords do occur.
+                 */
+                ok_to_miss = mode->interlaced ? 0 : (1 << k_x_res) | (1 << k_y_res);
+                ok_to_miss |= (1 << k_interlaced) | (1 << k_external_clock);
+                if (missed & ~ok_to_miss)
+                {
+                    /* If some other keyword(s) not seen, complain.  If
+                     * mode_name is one of them, must identify by line
+                     * number so treat it as a syntactic error, else as
+                     * semantic, providing debugging info in terms of the
+                     * mode name.
+                     */
+                    if (missed & (1 << k_mode_name))
+                    {
+                        return synerr0(ERR_NOMODENAME);
+                    }
+                    else
+                    {
+                        return semerrS(ERR_INCOMPLETE, definition->name);
+                    }
+                }
+                /* If xres and/or yres missing, use the xdisp and/or ydisp values */
+                if (!(keyseen & (1 << k_x_res)))
+                {
+                  mode->xres = mode->hpar[FR_DISP];
+                }
+                if (!(keyseen & (1 << k_y_res)))
+                {
+                  mode->yres = mode->vpar[FR_DISP];
+                }
+            
+                /* xres must equal xdisp, and yres must equal ydisp (or ydisp*2 for interlaced modes) */
+                if (mode->xres != mode->hpar[FR_DISP] ||
+                    mode->yres != mode->vpar[FR_DISP] * (mode->interlaced+1))
+                {
+                    return semerrS(ERR_INCONSISTENT, definition->name);
+                }
+                return check_eol(1);
+            
+            case k_nokey:
+                return synerr0(ERR_UNKNOWNPAR);
+            
+            default:
+                /* Known keyword but out of place */
+                return synerrK(ERR_WRONGCONTEXT, kc);
+            
+            case k_x_res:
+                res = read_one_u32(&mode->xres, 1);
+                if (res)
+                {
+                    return res;
+                }
+                break;
+            
+            case k_y_res:
+                res = read_one_u32(&mode->yres, 1);
+                if (res)
+                {
+                    return res;
+                }
+                break;
+            
+            case k_pixel_rate:
+                res = read_one_u32(&mode->pixel_khz, 1);
+                if (res)
+                {
+                    return res;
+                }
+                break;
+            
+            case k_sync_pol:
+                res = read_one_u32(&param, 0);
+                if (res)
+                {
+                    return res;
+                }
+                if (param > 3)
+                {   /* must fit in (currently) 2 bits */
+                    return synerr0(ERR_VALUEOVF);
+                }
+                mode->syncpol = param;
+                break;
+            
+            case k_interlaced:
+                mode->interlaced = 1; /* It is an interlaced mode */
+                res = check_eol(0);
+                if (res)
+                {
+                    return res;
+                }
+                break;
+            
+            case k_external_clock:
+                res = read_one_u32(&mode->external_clock, 0);
+                if (res)
+                {
+                    return res;
+                }
+                break;
+            
+            case k_mode_name:
+                /* TMD 13-Dec-93: We must allow blank mode names now -
+                 * they mean a mode is not shown in DisplayManager menu.
+                 * Passing in -1 as the error number for read_text means don't
+                 * fault blank lines.
+                 */
+                res = read_text(definition->name, sizeof(definition->name), -1);
+                if (res)
+                {
+                    return res;
+                }
+                break;
+            
+            case k_h_timings:
+            case k_v_timings:
+            {
+                int pn;
+                uint16_t *par = kc == k_h_timings ? mode->hpar : mode->vpar;
+                for (pn = 0; pn < FR__COUNT; ++pn)
+                {
+                    uint32_t param;
+                    res = read_u32(&param);
+                    if (res)
+                    {
+                        return res;
+                    }
+                    if (param >= 0x10000)
+                    {   /* must fit in 16 bits (unsigned) */
+                        return synerr0(ERR_VALUEOVF);
+                    }
+                    par[pn] = param;
+                    /* Check for following comma or end of line */
+                    if (pn < FR__COUNT-1)
+                    {
+                        res = skip_char(',');
+                    }
+                }
+                if (par[FR_DISP] == 0)
+                {
+                    return synerr0(ERR_INVALIDPAR);
+                }
+            
+                res = check_eol(0);
+                if (res)
+                {
+                    return res;
+                }
+            }
+            break;
+        }
+    }
+}
+
+static _kernel_oserror *parse_modelist(MonitorDescriptionRef monitor, enum keycode kc)
+{
+    for (;;)
+    {
+        if (kc == k_startmode)
+        {
+            ModeDescriptionRef mp;
+#if 0
+            ModeDescriptionRef rp;
+#endif
+            _kernel_oserror *res;
+            res = check_eol(0);
+            if (res)
+            {
+                return res;
+            }
+            mp = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+            if (mp == NULL)
+            {
+                return error(ERR_NOSPACE, 0, 0, 0);
+            }
+            /* Chain the new (as yet un-filled-in) mode on as the head
+             * of the existing list, so the space will get released
+             * properly on error.
+             */
+            mp->next = monitor->modelist;
+            monitor->modelist = mp;
+            /* Go parse the definition, filling in the record fields */
+            res = parse_mode(&mp->definition);
+            if (res)
+            {
+                return res;                     /* failed */
+            }
+            /* fill in defaults */
+            if (mp->definition.timings.external_clock == -1)
+            {
+                mp->definition.timings.external_clock = monitor->external_clock;
+            }
+            /* derive frame and line rates */
+            compute_modedescription(mp);
+#if 0
+            /* Check for uniqueness of mode name */
+            rp = mp->next;
+            while (rp)
+            {
+                if (strcmp(rp->definition.name, mp->definition.name) == 0)
+                {
+                    return semerrS(ERR_DUPMODENAME, mp->definition.name);
+                }
+                rp = rp->next;
+            }
+#endif
+        }
+        else if (kc == k_eof)
+        {
+            /* OK provided there is at least one mode! */
+            if (monitor->modelist != NULL)
+            {
+                return NULL;            /* ALL DONE */
+            }
+            return semerr0(ERR_NOMODES);
+        }
+        else
+        {
+            return synerrK(ERR_EXPKEY, k_startmode);
+        }
+        kc = read_keyword();               /* read next startmode, hopefully */
+    }
+}
+
+#if DODEBUG
+static void show_monitor(MonitorDescriptionRef monitor)
+{
+    ModeDescriptionRef mode;
+    printf("Monitor title: \"%s\"\n", monitor->name);
+    for (mode = monitor->modelist; mode; mode = mode->next)
+    {
+        ModeDef *dp = &mode->definition.timings;
+        uint32_t pixrate = dp->pixel_khz;
+        uint32_t pixels = dp->xres * dp->yres;
+        int log2bpp;
+        printf("  Mode name \"%s\"\n", mode->definition.name);
+        printf("  Resolution %u x %u\n", dp->xres, dp->yres);
+        printf("  Line rate %u.%03u kHz, Frame rate %d.%03d Hz\n",
+               mode->line_hz / 1000, mode->line_hz % 1000,
+               mode->frame_mhz / 1000, mode->frame_mhz % 1000);
+        printf("  Pixel rate %u kHz, Sync type %u\n", dp->pixel_khz, dp->syncpol);
+        printf("  Line timings\n"
+               "    sync %u b-porch %u l-border %u display %u r-border %u f-porch %u\n",
+               dp->hpar[FR_SYNC], dp->hpar[FR_BPCH], dp->hpar[FR_BDR1],
+               dp->hpar[FR_DISP], dp->hpar[FR_BDR2], dp->hpar[FR_FPCH]);
+        printf("  Frame timings\n"
+               "    sync %u b-porch %u t-border %u display %u b-border %u f-porch %u\n",
+               dp->vpar[FR_SYNC], dp->vpar[FR_BPCH], dp->vpar[FR_BDR1],
+               dp->vpar[FR_DISP], dp->vpar[FR_BDR2], dp->vpar[FR_FPCH]);
+        if (dp->interlaced)
+        {
+            printf("  Interlaced\n");
+        }
+        for (log2bpp = 0; log2bpp <= 5; ++log2bpp) {
+            uint32_t bits = 1 << log2bpp;
+            uint32_t drate, dsize;
+            if (bits < 8)
+            {
+                uint8_t shift = 3 - log2bpp;
+                uint32_t round = (1 << shift) - 1;
+                drate = (pixrate + round) >> shift;
+                dsize = (pixels + round) >> shift;
+            }
+            else
+            {
+                uint8_t shift = log2bpp - 3;
+                drate = pixrate << shift;
+                dsize = pixels << shift;
+            }
+            printf("  %2u bpp: bandwidth %6u000 bytes/sec, data size %7u bytes\n", bits, drate, dsize);
+        }
+        printf("\n");
+    }
+}
+#endif
+
+static _kernel_oserror *parse_modefile(MonitorDescriptionRef *description)
+{
+    uint32_t ffmt;
+    _kernel_oserror *res;
+    MonitorDescriptionRef md;
+    enum keycode kc = k_nokey;
+
+    res = check_keyword(k_file_format, 1);
+    if (res)
+    {
+        return res;
+    }
+    res = read_one_u32(&ffmt, 0);
+    if (res)
+    {
+        return res;
+    }
+    if (ffmt != 1)
+    {
+        return synerr0(ERR_UNKNOWNFMT);
+    }
+
+    res = check_keyword(k_monitor_title, 1);
+    if (res == NULL)
+    {
+        /* OK, commit to reading a monitor description - go allocate space */
+        res = new_monitordescription(&md);
+    }
+
+    if (res != NULL)
+    {
+        /* Fatal */
+        return res;
+    }
+
+    if (res == NULL)
+    {
+        res = read_text(md->name, sizeof(md->name), ERR_BLANKMONTITLE);
+    }
+
+    /* Now check for optional DPMS_state keyword */
+    if (res == NULL)
+    {
+        md->dpms_state = -1;                                   /* indicates field not present */
+        kc = read_keyword();
+        if (kc == k_dpms_state)
+        {
+            res = skip_char(':');
+            if (res == NULL)
+            {
+                res = read_one_u32(&md->dpms_state, 0);       /* read DPMS_state value */
+            }
+            if (res == NULL)
+            {
+                kc = read_keyword();                          /* then read next keyword */
+            }
+        }
+    }
+
+    /* Now check for optional LCD_support keyword */
+    if (res == NULL)
+    {
+        md->lcd_support = 0;                                   /* Indicates CRT as default */
+        if (kc == k_lcd_support)
+        {
+            IFDEBUG printf("Got the lcdsupport keyword\n");
+            res = skip_char(':');
+            if (res == NULL)
+            {
+                res = read_one_u32(&md->lcd_support, 0);      /* read LCD_support value */
+                if (md->lcd_support != 0)
+                {
+                  md->dpms_state = -1;                         /* LCD and DPMS are mutually exclusive */
+                }
+                IFDEBUG printf("Read the value as %d\n",md->lcd_support);
+            }
+            if (res == NULL)
+            {
+              kc = read_keyword();                            /* then read next keyword */
+            }
+        }
+    }
+
+    /* Now check for optional output_format keyword */
+    if (res == NULL)
+    {
+        md->output_format = -1;                                /* indicates field not present */
+        if (kc == k_output_format)
+        {
+            res = skip_char(':');
+            if (res == NULL)
+            {
+                res = read_one_u32(&md->output_format, 0);    /* read output_format value */
+            }
+            if (res == NULL)
+            {
+                kc = read_keyword();                          /* then read next keyword */
+            }
+        }
+    }
+
+    /* Now check for optional external_clock keyword */
+    if (res == NULL)
+    {
+        md->external_clock = -1;                               /* indicates field not present */
+        if (kc == k_external_clock)
+        {
+            res = skip_char(':');
+            if (res == NULL)
+            {
+                res = read_one_u32(&md->external_clock, 0);   /* read external_clock value */
+            }
+            if (res == NULL)
+            {
+                kc = read_keyword();                          /* then read next keyword */
+            }
+        }
+    }
+
+    if (res == NULL)
+    {
+        IFDEBUG printf("Going to read the modes now...\n");
+        res = parse_modelist(md, kc);                         /* pass in read keyword token */
+    }
+
+    if (res)
+    {
+        free_monitordescription(md);
+        md = NULL;
+    }
+    *description = md;
+    return res;
+}
+
+_kernel_oserror *loadtextMDF(const char *file, FILE *handle)
+{
+    _kernel_oserror *res;
+    MonitorDescriptionRef new_monitor;
+
+    thefile = handle;
+    thefilename = file;
+    lineno = 1;
+
+    IFDEBUG printf("file opened OK\n");
+    res = parse_modefile(&new_monitor);
+    IFDEBUG printf("closing file\n");
+    close_modefile();
+    if (res != NULL)
+    {
+        IFDEBUG printf("failed to parse mode file\n");
+    }
+    else
+    {
+        IFDEBUG printf("monitor description parsed OK\n");
+        sort_modelist(&new_monitor->modelist);
+#if DODEBUG
+        show_monitor(new_monitor);
+#endif
+        /* If we haven't got a file loaded at present, then
+         * read current monitortype, to restore on module shutdown
+         */
+        if (old_monitortype == -1)
+        {
+            old_monitortype = read_monitortype();
+        }
+
+        /* Now tell kernel to use monitor type 7 (File) */
+        res = set_monitortype(MONITOR_FILE);
+        if (res != NULL)
+        {
+            _kernel_oserror *res2;
+            IFDEBUG printf("setting of monitor type to type `FILE' failed\n");
+            res2 = restore_monitortype(); /* restore old value */
+#if DODEBUG
+            if (res2 != NULL)
+            {
+                printf("couldn't reset monitor type to CMOS default!\n");
+            }
+#endif                
+        }
+        else
+        {
+            char *path, *dot;
+
+            path = malloc(strlen(file) + 32);
+            if (path != NULL)
+            {
+                /* Allow the MDF to come with an accompanying sprite */
+                strcpy(path,"IconSprites ");
+                dot = strrchr(file, '.');
+                if (dot != NULL)
+                {
+                    strcat(path, file);    /* Grab the path */
+                    dot = 1 + strrchr(path, '.');
+                    *dot = '\0';           /* Slice off the leafname */
+                }
+                strcat(path, "!Sprites");
+                _kernel_oscli(path);
+                free(path);
+            }
+
+            release_currentmonitor();
+            current_monitor = new_monitor;
+            /* Forget any old preferred mode */
+            preferred_mode->bit0 = 0;
+
+            /* Newly defined monitor, announce it */
+            _swix(OS_ServiceCall, _IN(1), Service_ModeFileChanged);
+        }
+    }
+    return res;
+}
+
+/* EOF mdfsupport.c */

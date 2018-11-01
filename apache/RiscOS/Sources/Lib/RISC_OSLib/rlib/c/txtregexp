@@ -1,0 +1,980 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:    txtregexp.c
+ * Purpose: Regular Expression pattern matching by NFA.
+ *
+ * History:
+ *      LDS, 22-Jan-89  created
+ *      IDJ, 24-Jan-90  made re_match return end of match through 'end'
+ *      IDJ, 24-Jan-90  added case-insensitivity to re_match (I hope)
+ *      IDJ, 29-Jan-90  horrible hack to re_match/char/charset to get twin-like MOST working,
+ *                      it goes like this:
+ *                          ....%a....  ==> ....^a~a....
+ *                      when ~a is found, backtrack posn in text (and pop head of dequeue)
+ *      IDJ, 6-Feb-90   further hack to deal with %x when reaching end of buffer!!
+ *      IDJ, 8-Feb-90   added field# code. Put & 255 on end of access fns (fed up with
+ *                      bugs associated with this!)
+ *                      Ambiguous fields work like this:
+ *                         As we traverse the NFA nodes, we need to know whether an
+ *                         ambiguous node (or nodes) is being processed, and also need
+ *                         to know when such processing is finished (to be able to store
+ *                         its start and end in the text).
+ *                         Some magic patterns are trivial:
+ *                              ~x
+ *                              .
+ *                              @
+ *                              #
+ *                              [...]
+ *                         These are all represented by a SINGLE node in the NFA.
+ *                         The following are more difficult:
+ *                              %x
+ *                              ^x
+ *                              *x
+ *                         Note that these have the following NFA nodes created for them:
+ *                         %x:
+ *                                       --------------------
+ *                                      |                    |
+ *                                      |             next -->
+ *                                      x -------> OR
+ *                                                    alt_next ------> ~x(MOSTNODE) ----....
+ *
+ *
+ *
+ *                         ^x and %xy:
+ *                                       --------------------
+ *                                      |                    |
+ *                                      |             next -->
+ *                                      x -------> OR
+ *                                                    alt_next ------> ....
+ *
+ *
+ *                                       --------------------
+ *                         *x:          |                    |
+ *                                         next -------> x -->
+ *                                      OR
+ *                                         alt_next --------------> ......
+ *
+ *
+ *
+ *                         During NFA traversal, we check to see if any of these patterns
+ *                         are found; if so we remember where the "exit" node from such an
+ *                         ambiguous node is (so we know when to mark the end of this match
+ *                         in the text).
+ *      IDJ, 5-Apr-90 : check to see if ambiguous patterns are necessary before keeping
+ *                      track of ambiguous starts/ends.  txtedit indicates no special
+ *                      ? strings used in replacement by ambiguous == 0
+ *      IDJ,19-Jul-90 : fixed some real tricky bugs in end-conditions for ambiguous pats.
+ *
+ *      IDJ, 31-Aug-90: guarded against stack/heap/wimpslot extension when getting
+ *                      pointer into flex block (previously char *buffer was passed
+ *                      to re_match, which may be invalid pointer after flex__budge
+ *                      called from C library memory allocator
+ *      IDJ, 22-Aug-91: removed last string literals into messages lookup
+ *
+ * Copyright (C) Acorn Computers Ltd., 1989
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "EditIntern/txtregexp.h"
+#include "VerIntern/messages.h"
+#include "msgs.h"
+#include "txt.h"
+#include "werr.h"
+#define FALSE 0
+#define TRUE  1
+
+#ifndef NULL
+#  define NULL 0
+#endif
+
+#define  NULL_NODE          0
+#define  CHAR_NODE          1
+#define  NOT                2
+#define  NOT_CHAR_NODE      (NOT + CHAR_NODE)
+#define  SPECIAL_NODE       4
+#define  NOT_SPECIAL        (NOT + SPECIAL_NODE)
+#define  CHAR_SET           8
+#define  OR_NODE           16
+#define  END_NODE          32
+#define  SIGN_BIT          0x80000000
+#define  TOP_CHAR_BIT      0x8000
+#define  VISITED_NODE      64
+#define  MOST_NODE         128 /* IDJ 29-Jan-90 special node inserted due to MOST */
+#define  ON_PATH           0x80000000  /* to mark node as on goal path */
+
+
+/*
+ * An NFA is represented in store as this header, followed by a (possibly
+ * empty) array of CharSets (each 32 bytes long) followed by an array of
+ * 4-byte NFA nodes. In fact, the matching algorithm doesn't need to know
+ * the number of nodes - only the number of arcs in the NFA and the index
+ * of the entry node - so we don't retain n_nodes.
+ */
+struct re_nfa {
+    int n_arcs;             /* no of arcs in the NFA - i.e. deque size */
+    int n_charsets;         /* no of charsets in the NFA... */
+    int entry;              /* Node offset to entry node... */
+};
+
+/*
+ * Next and alt_next values - like the entry field of an re_nfa - are
+ * indexes into the array of nodes. All nodes have exactly one successor,
+ * except for OR ndes which have two and the END node which has none.
+ */
+typedef struct node {
+    char type;              /* the node's type */
+    char val;               /* ch val, charset idx */
+    unsigned char next;     /* pointer to next node in NFA */
+    unsigned char alt_next; /* if type == OR_NODE */
+} Node;
+
+/*
+ * Nodes are also treated as unsigned ints with the following access fns
+ */
+#define  type_(n)           ((n) & 255)
+#define  val_(n)            (((n) >> 8) & 255)
+#define  next_(n)           (((n) >> 16) & 255)
+#define  alt_next_(n)       (((n) >> 24) & 255)
+
+
+struct re_handle {          /* Used while building an NFA */
+    int n_nodes;            /* no of nodes in the NFA */
+    int n_ors;              /* of which this many OR nodes */
+    int n_charsets;         /* and this many CharSets... */
+    NFA *nfa;               /* during pass-2, if pass-1 is OK, else NULL */
+    Node *space;            /* during pass-2, points to nfa's node array */
+    Node *free;             /* during pass-2, points to next free node */
+    Node *orend;            /* end of last OR-branch */
+    unsigned begin;         /* offset of start of current sub-R.E. */
+    unsigned bra;           /* offset of last sub-R.E. opening bracket */
+    unsigned last;          /* ... start of last R.E. (for modification...) */
+    unsigned pass;          /* pass-1 or pass-2... */
+    unsigned modifier;      /* index of node after last modifier node... */
+};
+
+static Node *start_or;
+
+extern void re_begin1(REHandle *hh)
+{
+/*
+ * Initialise the REHandle for the information gathering pass.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  h->n_nodes = 1;                 /* 1 for the END node */
+  h->n_ors = 0;
+  h->n_charsets = 0;
+  h->nfa = NULL;
+  h->pass = 1;
+  h->modifier = 0;
+}
+
+extern void re_begin2(REHandle *hh)
+{
+/*
+ * Initialise the REHandle for the construction phase, allocating store
+ * to hold the NFA's compact representation.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  NFA *nfa;
+  int sz;
+/*
+ * If n_arcs > 254 there is a constraint violation, so we just
+ * repeat pass-1 and return NULL via re_end().
+ */
+  if ((h->n_nodes + h->n_ors) <= 254)
+  {
+    sz = sizeof(NFA) + sizeof(CharSet)*h->n_charsets + sizeof(Node)*h->n_nodes;
+    nfa = (NFA *) malloc(sz);
+    memset(nfa, 0, sz);
+    nfa->n_arcs = h->n_nodes + h->n_ors;
+    nfa->n_charsets = 0;
+    h->nfa = nfa;
+    h->space = h->free = (Node *)((char *)nfa + sizeof(NFA) +
+                                                sizeof(CharSet)*h->n_charsets);
+    h->orend = NULL;
+    h->begin = 0;
+    h->bra   = 255;    /* cunning choice... +1 == 0 mod 256... */
+    h->pass  = 2;
+    h->modifier = -1;  /* an impossible value... */
+  }
+}
+
+static void re_close_or(struct re_handle *h)
+{
+/*
+ * Close the currently open OR structure - if there is one.
+ * This requires back-patching the node.next values of the nodes at the ends
+ * of each arm of the OR structure so they point just past the entire OR.
+ * These nodes are chained together via their next fields, with the head of
+ * the chain - the end of the penultimate branch of the OR - identified by
+ * h->orend.
+ */
+  Node *n = h->orend;
+  if (n != NULL)
+  {
+    h->begin = (n - h->space) + 1;
+    while (n != NULL)
+    { int prev = n->next;
+      n->next = h->free - h->space;        /* just past the whole OR... */
+      n = (prev ? h->space + prev : NULL);
+    }
+    h->orend = NULL;
+  }
+}
+
+static int follow_possible_loop(char *base, unsigned char n, int next_link)
+{
+  Node *node = (Node *) (base) + n;
+  int found = 0;
+  if (node == start_or) {                 /* found a loop */
+    start_or->type = NULL_NODE;
+    return 2;                             /* signal loop found to parent proc */
+  } else if (node->type & VISITED_NODE) { /* been here before */
+    return 0;                             /* no loop, will be one later */
+  } else if (node->type == NULL_NODE) {   /* keep going */
+    node->type |= VISITED_NODE;
+    found = follow_possible_loop(base, node->next, next_link);
+    node->type &= ~VISITED_NODE;
+    return found;
+  } else if (node->type == OR_NODE) {     /* try each branch for a loop */
+    node->type |= VISITED_NODE;
+    found = follow_possible_loop(base, node->next, next_link);
+    if (found) {
+      node->type &= ~VISITED_NODE;
+      if (found > 1) {                    /* first OR in loop before start_or */
+        if (next_link)                    /* start_or->next is loop path */
+          node->next = start_or->alt_next;
+        else                              /* start_or->alt_next is loop path */
+          node->next = start_or->next;
+      }
+      return 1;
+    }
+    found = follow_possible_loop(base, node->alt_next, next_link);
+    node->type &= ~VISITED_NODE;
+    if (found) {
+      if (found > 1) {                    /* first OR in loop before start_or */
+        if (next_link)                    /* start_or->next is loop path */
+          node->alt_next = start_or->alt_next;
+        else                              /* start_or->alt_next is loop path */
+          node->alt_next = start_or->next;
+      }
+      return 1;
+    }
+  }
+  return 0;                               /* no loop */
+}
+
+static void remove_or_loops(NFA *nfa)
+{
+  int found_loop;
+  int posn;
+  char *base = (char *) nfa + (sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets);
+  do {
+    posn = 0; found_loop = 0;
+    for (;;)
+    { Node *n = (Node *)(base) + posn;
+      if (n->type == END_NODE) break;
+      if (n->type == OR_NODE) {
+        start_or = n;
+        n->type |= VISITED_NODE;
+        found_loop = follow_possible_loop(base, n->next, 1);
+        if (found_loop) break;
+        found_loop = follow_possible_loop(base, n->alt_next, 0);
+        if (found_loop) {
+          /* n is now a NULL_NODE so the link should be via next not alt_next */
+          n->next = n->alt_next;
+          break;
+        }
+        n->type &= ~VISITED_NODE;
+      }
+      ++posn;
+    }
+    /*
+     * Every time a loop is found, the nfa should be re-traversed from the start
+     * in case the structure has changed for something that was ok earlier.
+     */
+  } while (found_loop);
+}
+
+extern NFA *re_end(REHandle *hh)
+{
+  struct re_handle *h = (struct re_handle *) hh;
+  Node *n;
+  NFA *nfa;
+
+  re_close_or(h);                          /* just in case... */
+  n = h->free;                             /* add the END node... */
+  n->type = END_NODE;
+  nfa = h->nfa;                            /* pick up the NFA header... */
+  if (nfa) {                               /* and enter at the start of */
+    nfa->entry = h->begin;                 /* the first sub-R.E... */
+#ifdef LIB_DEBUGGING
+  {
+    werr(FALSE, "NFA before any looping NULLS/ORS removed\n");
+    print_nfa(nfa);
+  }
+#endif
+    remove_or_loops(nfa);                  /* remove looping ors/nulls */
+  }
+  return nfa;
+}
+
+
+extern void re_modify(REHandle *hh, int modifier)
+{
+/*
+ * This procedure is best understood in pictures (so go draw some).
+ * In the cases of closure (*) and optionality (?), pre-modification
+ * is used. That is, an OR mode is made to precede the sub-R.E. being
+ * modified. This can always be done because the sub-R.E. is either the
+ * preceding simple node (which is swapped with the following free node)
+ * or is a bracketed expression (the NULL node of which is swapped with
+ * the following free node). In both cases, the alt_next field of the OR
+ * becomes the next free node after that. In the case of closure, the next
+ * field of the end of the sub-R.E. (prior to this call, the node immediately
+ * before h->free) is made to point back to the OR node.
+ * In the case of 1-closure, the OR node simply follows the sub-R.E. being
+ * modified and its next filed points to the beginning of that sub-R.E.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->modifier = (h->n_nodes += 1);   /* modification costs an OR node... */
+    h->n_ors += 1;                     /* and a NULL node if followed by OR */
+  }
+  else
+  {
+    Node *l = h->space + h->last;
+    Node *n = h->free++;
+    if (modifier != '+')
+    {
+      *n = *l;
+      n = l;
+      l = h->free - 1;
+      l->next = ((modifier == '?') ? h->free : n) - h->space;
+    }
+    else
+    {
+      n->next = h->last;
+    }
+    n->type = OR_NODE;
+    n->alt_next = h->modifier = h->free - h->space;
+  }
+}
+
+extern void re_char(REHandle *hh, int ch, int most)
+{
+/*
+ * Add a node capable of matching a character or one of the 'special',
+ * builtin character classes.
+ * 30-Jan-90 IDJ most == '%' means that this is a ~-node, created as a result of %a
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->n_nodes += 1;
+  }
+  else
+  { Node *n = h->free++;
+    h->last = n - h->space;
+    n->next = h->free - h->space;
+    if (ch > (255+RE_NOT))
+    {
+      n->type = (most == '%')?SPECIAL_NODE+MOST_NODE:SPECIAL_NODE;
+      /* ANY, Start Of Buffer and End Of Buffer can't be negated... */
+      if (ch == RE_ANY || ch == RE_SOB || ch == RE_EOB) ch &= ~RE_NOT;
+      ch &= (255+RE_NOT);
+    }
+    else
+    {
+      n->type = (most == '%')?CHAR_NODE+MOST_NODE:CHAR_NODE;
+    }
+    if (ch & RE_NOT) n->type += NOT;
+    n->val = ch;
+  }
+}
+
+extern void re_charset(REHandle *hh, CharSet *charset, int most)
+{
+/*
+ * Add a node capable of matching a custom-built class of characters.
+ */
+  struct re_handle *h = (struct re_handle *) hh;
+  if (h->pass == 1)
+  {
+    h->n_nodes += 1;
+    h->n_charsets += 1;
+  }
+  else
+  { Node  *n = h->free++;
+    NFA *nfa = h->nfa;
+    char *cs = (char *)nfa + sizeof (NFA) + sizeof(CharSet)*nfa->n_charsets;
+    h->last = n - h->space;
+    n->type = (most == '%')?CHAR_SET+MOST_NODE:CHAR_SET;
+    n->val  = nfa->n_charsets++;
+    n->next = h->free - h->space;
+    memcpy(cs, charset, sizeof(CharSet));
+  }
+}
+
+extern void re_head(NFA *nfa, char *buf, int buflen)
+{
+  Node *nodes, *n;
+  nodes = (Node *)((char *)nfa +
+                   sizeof(NFA) + sizeof(CharSet)*nfa->n_charsets);
+  n = nodes + nfa->entry;
+  while ((n->type == CHAR_NODE) && (buflen > 1))
+  {
+    *buf++ = n->val;
+    n = nodes + n->next;
+    --buflen;
+  }
+  *buf = 0;
+}
+
+
+/* ------------------------------------ code to deal with ambiguous patterns ------------- */
+/* yuk */
+
+extern int re_make_subpattern_table(NFA *nfa, SubPattern *sub_patterns)
+{
+   int np = 0;
+   unsigned int n;
+   Node *nodes;
+   int s = 0;
+
+   nodes = (Node *)((char *)nfa +
+                    sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets);
+   n = *((unsigned *)(nodes + np));
+
+   for (n = *((unsigned *)(nodes + np)); !(type_(n) & END_NODE); n = *((unsigned *)(nodes + np)))
+   {
+      /* check for *x */
+      if (type_(n) == OR_NODE)
+      {
+#ifdef LIB_DEBUGGING
+         werr(FALSE, "*x node subpattern %d", s);
+#endif
+         /* set up table entry */
+         sub_patterns[s].start_node = np;
+         sub_patterns[s].flags |= F_AMBIGUOUS|F_0ORMORE;
+         s++;
+
+         np = alt_next_(n);
+         continue;
+      }
+
+      /* check for %x or ^x */
+      if (type_(*((unsigned *)(nodes + next_(n)))) == OR_NODE)
+      {
+         unsigned int ornode = *((unsigned *)(nodes + next_(n)));
+
+         /* check further... */
+         if (next_(ornode) == np)  /* certain it is %x or ^x */
+         {
+#ifdef LIB_DEBUGGING
+               werr(FALSE, "%%x or ^x subpattern %d", s);
+#endif
+
+            /* set up table entry */
+            sub_patterns[s].start_node = np;
+            sub_patterns[s].flags |= F_AMBIGUOUS;
+            s++;
+
+            if (type_(*((unsigned *)(nodes + alt_next_(ornode)))) & MOST_NODE)  /* %x */
+            {
+               unsigned int mostnode = *((unsigned *)(nodes + alt_next_(ornode)));
+
+               sub_patterns[s-1].flags |= F_MOST;
+               np = next_(mostnode);
+            }
+            else  /* ^x */
+            {
+               sub_patterns[s-1].flags |= F_1ORMORE;
+               np = alt_next_(ornode);
+            }
+            continue;
+         }
+      }
+
+      /* check for other special node */
+      if (!(type_(n) & MOST_NODE) &&
+
+         (((type_(n) & SPECIAL_NODE) && (val_(n) == RE_ANY-512 ||
+                                         val_(n) == RE_DIGIT-512))
+         ||
+           (type_(n) & CHAR_SET)
+         ||
+           ((type_(n) & CHAR_NODE) && (type_(n) & NOT))))
+      {
+
+#ifdef LIB_DEBUGGING
+               werr(FALSE, "special subpattern %d", s);
+#endif
+         /* set up table entry */
+         sub_patterns[s].start_node = np;
+         sub_patterns[s].flags |= F_AMBIGUOUS;
+         s++;
+
+         np = next_(n);
+         continue;
+      }
+
+      /* we only get here if it's not a 'special' node */
+      sub_patterns[s].start_node = np;
+      s++;
+
+      np = next_(n);
+   }
+
+#ifdef LIB_DEBUGGING
+   { int ss=0;
+     while(sub_patterns[ss].start_node != 0xffffffff)
+     {
+        werr(FALSE, "sub[%d] start_node %d flags %d", ss, sub_patterns[ss].start_node, sub_patterns[ss].flags );
+        ss++;
+     }
+     werr(FALSE, "num subs %d", s);
+   }
+#endif
+
+   return s;
+}
+
+
+static void re__setup_ambiguous_table(Ambiguous_entry *ambiguous, SubPattern *sub_patterns, int end)
+{
+   int s = 0, a = 0;
+
+   while (s < 128 && a < MAX_AMBIGUOUS && sub_patterns[s].start_node != 0xffffffff)
+   {
+      if (sub_patterns[s].flags & F_AMBIGUOUS)
+      {
+         ambiguous[a].start = sub_patterns[s].start_pos;
+         ambiguous[a].end = (sub_patterns[s+1].start_node != 0xffffffff)?sub_patterns[s+1].start_pos:end;
+         a++;
+      }
+      s++;
+   }
+#ifdef LIB_DEBUGGING
+   for (a = 0; a < MAX_AMBIGUOUS; a++)
+       werr(FALSE, "amb[%d] start %d end %d", a, ambiguous[a].start, ambiguous[a].end);
+#endif
+}
+
+
+/*
+ * To Understand the following, read the relevant chapter of
+ * Robert Sedgewick's masterpiece entitled "Algorithms".
+ * (But beware: if you read the first edition, the code he gives
+ *  is wrong! This is corrected in the second edition. Because
+ *  there are 2 editions I don't quote page or chapter numbers.)
+ */
+
+typedef struct
+{
+   unsigned int node_number;
+   int pusher;
+} deque_entry;
+
+typedef struct
+{
+   unsigned int node_number;
+   int pusher;
+   int p;      /* pos. in text buffer relative to start of search */
+} path_entry;
+
+
+#define  DQ_SIZE        256
+#define  SCAN           255    /* advance one character in this state */
+/* now define the deque operations */
+#define  rm_hd_()       (head = (head + 1) & (DQ_SIZE-1))
+
+#ifdef FIELDNUM
+#define  add_hd_(x)     (head = (head - 1) & (DQ_SIZE-1), dq[head].node_number = (x), dq[head].pusher = pusher)
+#define  add_tl_(x)     (tail = (tail + 1) & (DQ_SIZE-1), dq[tail].node_number = (x), dq[tail].pusher = pusher)
+#else
+#define  add_hd_(x)     (head = (head - 1) & (DQ_SIZE-1), dq[head].node_number = (x))
+#define  add_tl_(x)     (tail = (tail + 1) & (DQ_SIZE-1), dq[tail].node_number = (x))
+#endif
+
+#ifdef FIELDNUM
+static BOOL re__is_start_sub_pattern(SubPattern *sub_patterns, unsigned int node, int *s)
+{
+   *s = 0;
+
+   while (sub_patterns[*s].start_node != 0xffffffff)
+   {
+      if (sub_patterns[*s].start_node == node) return TRUE;
+      (*s)++;
+   }
+
+   return FALSE;
+}
+
+static void re__trace_back(path_entry *path, int goal_node, Ambiguous_entry *ambiguous, SubPattern *sub_patterns, int end)
+{
+   int p = goal_node;
+   int i, sub;
+
+   /* --- trace goal path back through array (marking members) --- */
+   while (p != -1)
+   {
+      path[p].node_number |= ON_PATH;   /* mark node as on goal path */
+      p = path[p].pusher;
+   }
+
+   /* --- ... now process array forwards setting start points for sub-patterns --- */
+   for (i = 0; i<=goal_node; i++)
+   {
+      if (path[i].node_number & ON_PATH)
+      {
+         if (re__is_start_sub_pattern(sub_patterns, path[i].node_number & ~ON_PATH, &sub))
+         {
+             if (sub_patterns[sub].start_pos == -1) sub_patterns[sub].start_pos = path[i].p;
+          }
+      }
+   }
+
+   /* --- ... and construct ambiguous table from sub-pattern table --- */
+   re__setup_ambiguous_table(ambiguous, sub_patterns, end);
+}
+#endif
+
+extern int re_match(txt t, txt_index at, NFA *nfa, int scanning, int *end, int nocase
+#ifdef FIELDNUM
+, Ambiguous_entry *ambiguous
+, SubPattern *sub_patterns
+, BOOL rescanning
+#endif
+)
+{
+  int j, p;
+  unsigned head, tail, dqh;
+  Node *nodes;
+  deque_entry dq[DQ_SIZE];
+  char *buf;
+  int len;
+#ifdef FIELDNUM
+  path_entry *path = 0;
+  int path_size = 0;
+  int pusher = -1;
+  int i;
+  BOOL met_most_node = FALSE;
+#endif
+
+  nodes = (Node *)((char *)nfa +
+                   sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets);
+
+  j = 0;
+
+
+  /* get pointer into flex block */
+  txt_arrayseg(t, at, &buf, &len);
+
+#ifdef FIELDNUM
+  if (rescanning)
+  {
+     if ((path=malloc(DQ_SIZE * sizeof(path_entry))) == 0)
+     {
+        werr(FALSE, msgs_lookup(MSGS_txtfind3));
+        path_size = DQ_SIZE;
+        return -1;
+     }
+  }
+#endif
+
+  do
+  {
+#ifdef FIELDNUM
+    if (ambiguous)
+    {
+       for (i = 0; i < 128; i++) sub_patterns[i].start_pos = -1;
+       for (i = 0; i < MAX_AMBIGUOUS; i++) ambiguous[i].start = ambiguous[i].end = -1;
+    }
+    pusher = -1;
+    dq[0].pusher = -1;
+    dq[1].pusher = 0;
+#endif
+
+    head = 0;  tail = 1;  dq[0].node_number = nfa->entry;  dq[1].node_number = SCAN;
+    met_most_node = FALSE;
+
+    p = j;
+
+    do
+    {
+      dqh = dq[head].node_number;
+#ifdef FIELDNUM
+      if (rescanning)
+      {
+         if (pusher+1 >= path_size)
+         {
+            path_entry *old_path = path;
+
+            path_size += DQ_SIZE;
+            if ((path = realloc(path, path_size * sizeof(path_entry))) == 0)
+            {
+               werr(FALSE, msgs_lookup(MSGS_txtfind3));
+               free(old_path);
+               return -1;
+            }
+         }
+         path[++pusher].node_number = dqh;
+         path[pusher].pusher = dq[head].pusher;
+         path[pusher].p = p;
+      }
+#endif
+
+      /* get pointer into flex block (do it again cos it may have moved due to slot extension) */
+      if (rescanning) txt_arrayseg(t, at, &buf, &len);
+
+      rm_hd_();
+
+#ifdef LIB_DEBUGGING
+      werr(FALSE, "processing node %d, buf %x", dqh, buf);
+#endif
+      if (dqh == SCAN)
+      {
+        ++p;  add_tl_(SCAN);  j &= ~SIGN_BIT;  /* turn off exact match */
+      }
+      else
+      { unsigned int n = *((unsigned *)(nodes + dqh));
+
+        if (type_(n) & (CHAR_NODE + SPECIAL_NODE + CHAR_SET))
+        { int ch;
+          /* another IDJ hack 6-Feb-90 */
+          /* if we just had a most node and reached EOB, and no more nodes in pattern */
+          /* this is a match!!! */
+          if (p >= len)
+          {
+             if ((type_(n) & MOST_NODE) && type_(*((unsigned *)(nodes + next_(n)))) == END_NODE)
+             {
+                *end = p;
+#ifdef FIELDNUM
+                if (rescanning)
+                {
+                   if (pusher+1 >= path_size)
+                   {
+                      path_size += DQ_SIZE;
+                      if (realloc(path, path_size) == 0)
+                      {
+                         werr(FALSE, msgs_lookup(MSGS_txtfind3));
+                         free(path);
+                         return -1;
+                      }
+                   }
+                   path[++pusher].node_number = next_(n);
+                   path[pusher].pusher = pusher-1;
+                   path[pusher].p = p;
+
+                   re__trace_back(path, pusher, ambiguous, sub_patterns, p);
+                   free(path);
+                }
+#endif
+                return j;
+             }
+             else
+                continue;
+          }
+          /* before IDJ hack:  if (p >= len) continue;*/
+          /* we can safely access array, cos no extension can have happened, since
+             we called txt_arrayseg */
+
+          ch = buf[p];
+
+          if (type_(n) & CHAR_NODE)
+          {
+            int lch = (nocase)?tolower(ch):ch;
+            unsigned int lvaln = (nocase)?tolower(val_(n)):val_(n);
+            if (((lch == lvaln) && (type_(n) & NOT) != 0) ||
+                (lch != lvaln && (type_(n) & NOT) == 0)) continue;
+          }
+          else if (type_(n) & SPECIAL_NODE)
+          { int match;
+            switch (val_(n))
+            {
+case  RE_ANY-512:      match = 1;            break;
+case  RE_SOB-512:      if (p == 0) {match = 1;  --p;} else match = 0;
+                                             break;
+case  RE_EOB-512:      match = (p == (len-1));   break;
+case  RE_ALPHA-512:    match = isalpha(ch);  break;
+case  RE_ALPHANUM-512: match = isalnum(ch);  break;
+case  RE_DIGIT-512:    match = isdigit(ch);  break;
+case  RE_XDIGIT-512:   match = isxdigit(ch); break;
+case  RE_UPPER-512:    match = isupper(ch);  break;
+case  RE_LOWER-512:    match = islower(ch);  break;
+case  RE_SPACE-512:    match = isspace(ch);  break;
+case  RE_CNTRL-512:    match = iscntrl(ch);  break;
+case  RE_GRAPHIC-512:  match = isgraph(ch);  break;
+case  RE_PRINT-512:    match = isprint(ch);  break;
+case  RE_PUNCT-512:    match = ispunct(ch);  break;
+default:               match = 0;
+            }
+            if (type_(n) & NOT) match = !match;
+            if (!match) continue;
+          }
+          else /* CHAR_SET */
+          { CharSet *s = (CharSet *)((char *) nfa +
+                         sizeof(NFA)) + val_(n);
+            if (((*s)[ch >> 5] & (1L << (int)(ch & 31))) == 0) continue;
+          }
+          /* matched a character... */
+          /* 29-Jan-90 IDJ hack for MOST -- rematch same char!!!!! */
+#ifdef LIB_DEBUGGING
+          werr(FALSE, "matched a char");
+#endif
+          if (type_(n) & MOST_NODE)
+          {
+              /* yuk!!!! can I do better?*/
+              met_most_node = TRUE;
+#if FALSE
+              p--;        /* backtrack one char in the text */
+              if (((head+1)&(DQ_SIZE-1)) <= tail) rm_hd_();   /* ignore next state (it will cause infinite loop!) unless queue has only one node */
+#endif
+          }
+
+          add_tl_(next_(n));
+        }
+        else if (type_(n) == NULL_NODE)
+        {
+          add_hd_(next_(n));
+        }
+        else if (type_(n) == OR_NODE)
+        {
+          if ((type_(next_(n)) == OR_NODE) || (type_(next_(n)) == NULL_NODE)) {
+            add_hd_(next_(n));
+            add_hd_(alt_next_(n));
+          } else {
+            add_hd_(alt_next_(n));
+            add_hd_(next_(n));
+          }
+        }
+        else if (type_(n) == END_NODE)
+        {
+           if (scanning)
+           {
+               *end = (met_most_node)?(p-1):p;
+#ifdef FIELDNUM
+               if (rescanning)
+               {
+                  re__trace_back(path, pusher, ambiguous, sub_patterns, (met_most_node)?(p-1):p);
+                  free(path);
+               }
+#endif
+               return j;
+           }
+           j |= SIGN_BIT;            /* try for exact match... */
+        }
+      }
+    } while (head != tail);
+
+    if (!scanning)
+    {
+      /* LH.
+       * p is incremented if a complete match was made but:
+       * I think j & SIGN_BIT means 'the nfa ran out of state (ENDNODE reached)
+       * and so a match was found'. It seems that it does not matter that the
+       * end of the input string was not also reached. So I have added the
+       * extra test that the end of input string was reached as well. It seems
+       * to work, but I don't understand all that is happening. Not enough time.
+       */
+#ifdef LIB_DEBUGGING
+  {
+    if (j & SIGN_BIT) {
+      if (p == len) werr(FALSE, "'%s' matches the nfa completely\n", buf);
+      else werr(FALSE, "end of nfa reached at character %d in '%s'\n", p+1, buf);
+    } else
+      werr(FALSE, "end of nfa not reached, mismatch at character %d in '%s'\n", p+1, buf);
+  }
+#endif
+      if ((j & SIGN_BIT) && (p == len)) ++p;
+#ifdef FIELDNUM
+      if (ambiguous) re__trace_back(path, pusher, ambiguous, sub_patterns, p);
+#endif
+      return p;
+    }
+
+    ++j;
+  } while (j < len);
+#ifdef LIB_DEBUGGING
+  werr(FALSE, "re_match returning -1");
+#endif
+  return -1;
+}
+
+#ifdef LIB_DEBUGGING
+
+extern void print_nfa(NFA *nfa)
+{
+  int posn;
+  char *base;
+  {
+    posn = sizeof(NFA) + sizeof(CharSet) * nfa->n_charsets;
+    werr(FALSE, "n_arcs = %d, entry = %d, NFA at %d\n",
+           nfa->n_arcs, nfa->entry, posn);
+    base = (char *) nfa + posn;
+    posn = 0;
+    for (;;)
+    { Node *n = (Node *)(base) + posn;
+      werr(FALSE, "%d: ", posn);
+      if (n->type & MOST_NODE) werr(FALSE, "Most node");
+      switch (n->type & ~MOST_NODE)
+      {
+case NULL_NODE:
+        werr(FALSE, "NULL");
+        break;
+case CHAR_NODE:
+        werr(FALSE, "CHAR '%c'", n->val);
+        break;
+case NOT_CHAR_NODE:
+        werr(FALSE, "NOT CHAR '%c'", n->val);
+        break;
+case CHAR_SET:
+        werr(FALSE, "CHARSET[%u]", n->val);
+        break;
+case SPECIAL_NODE:
+        werr(FALSE, "SPECIAL[%u]", n->val);
+        break;
+case NOT_SPECIAL:
+        werr(FALSE, "NOT SPECIAL[%u]", n->val);
+        break;
+case OR_NODE:
+        werr(FALSE, "OR, alt_next = %u", n->alt_next);
+        break;
+case END_NODE:
+        werr(FALSE, "END\n");
+        return;
+        break;
+default:
+        werr(FALSE, "Unrecognised node\n");
+      }
+      werr(FALSE, ", next = %u\n", n->next);
+      if (n->type == CHAR_SET)
+      { CharSet *cs = (CharSet *) ((char *)nfa + sizeof(NFA)) + n->val;
+        int j;
+        for (j = 0;  j < 8;  ++j) werr(FALSE, "|%.8lx", (*cs)[j]);
+        werr(FALSE, "|\n");
+      }
+      ++posn;
+    }
+  }
+}
+
+
+#endif

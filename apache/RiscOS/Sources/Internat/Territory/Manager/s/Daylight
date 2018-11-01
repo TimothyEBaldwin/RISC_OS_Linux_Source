@@ -1,0 +1,285 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > s.Daylight
+
+;-----------------------------------------------------------------------------
+; Read/modify/write the two CMOS bits
+; In: R0=AND mask R1=EOR mask, does new := (old AND R0) EOR R1
+; The two bits are actually in two different CMOS bytes
+; Out: R0=old value
+;
+
+daylight_modify_cmos ROUT
+        Push    "r1-r5, lr"
+
+        MOV     r3, r0
+        MOV     r4, r1
+
+        MOV     r0, #OsByte_ReadCMOS
+        MOV     r1, #DBTBCMOS
+        SWI     XOS_Byte
+        MOVVC   r5, r2
+        BVS     %FT90
+
+        TST     r3, #AutoDSTCMOSBit
+        BICEQ   r2, r2,#AutoDSTCMOSBit
+        TST     r4, #AutoDSTCMOSBit
+        EORNE   r2, r2,#AutoDSTCMOSBit
+        TEQ     r2, r5
+        MOVNE   r0, #OsByte_WriteCMOS
+        SWINE   XOS_Byte
+
+        MOV     r0, #OsByte_ReadCMOS
+        MOV     r1, #AlarmAndTimeCMOS
+        SWI     XOS_Byte
+        ORRVC   r5, r5, r2, LSL #24
+        BVS     %FT90
+
+        TST     r3, #DSTCMOSBit
+        BICEQ   r2, r2,#DSTCMOSBit
+        TST     r4, #DSTCMOSBit
+        EORNE   r2, r2,#DSTCMOSBit
+        TEQ     r2, r5, LSR #24
+        MOVNE   r0, #OsByte_WriteCMOS
+        SWINE   XOS_Byte
+
+        ASSERT  DSTCMOSBit != AutoDSTCMOSBit
+        AND     r5, r5, #(DSTCMOSBit:SHL:24):OR:AutoDSTCMOSBit
+        ORR     r5, r5, r5, LSR #24
+        AND     r0, r5, #&FF
+90
+        MOVVS   r0, #0                  ; As blank CMOS
+        Pull    "r1-r5, pc"
+
+;-----------------------------------------------------------------------------
+; Called when * callback expires
+;             * the territory is set
+;             * the timezone or DST CMOS is set
+;             * the soft RTC is resynchronised with hard RTC
+; Note that using OS_Word 15 behind our back is not trapped, you must
+; set the time with SWI Territory_SetTime when using auto switch over.
+; In: Nothing
+; Out: R0=error and V set if applicable
+;
+
+daylight_switch_check ROUT
+        Push    "r1-r8, lr"
+        ADRL    r0, daylight_switchover
+        MOV     r1, r12
+        SWI     XOS_RemoveTickerEvent   ; Might fail if unset
+
+        ; Read current configuration
+        BL      which_timezone
+        STR     r0, tzone_index
+        STR     r1, tzone_centis
+
+        MOV     r0, #DSTCMOSBit:OR:AutoDSTCMOSBit
+        MOV     r1, #0
+        BL      daylight_modify_cmos
+        MOV     r4, r0
+
+        ; Don't book a callback unless automatic and in a recognised zone
+        TST     r4, #AutoDSTCMOSBit
+        MOV     r6, #0
+        BEQ     %FT90
+
+        Debug   ad, "Contemplating AutoDST"
+
+        ; Find out which year it is (needed in both code paths)
+        SUB     sp, sp, #36 + 8
+
+        MOV     r0, #3
+        ADD     r1, sp, #36
+        STRB    r0, [r1]
+        MOV     r0, #OsWord_ReadRealTimeClock
+        SWI     XOS_Word
+
+        MOVVC   r2, sp
+        LDRVC   r3, =(TimeFormats_UTC5Byte:SHL:TimeFormats_InFormatShift) :OR: \
+                     (TimeFormats_UTCOrdinals:SHL:TimeFormats_OutFormatShift) :OR: \
+                     TimeFormats_Flag_NoDST
+        SWIVC   XTerritory_ConvertTimeFormats
+        LDRVC   r8, [sp, #24]           ; Year now from the ordinals
+        ADD     sp, sp, #36
+        BVS     %FT80
+
+        ; Unknown timezone can't deduce DST rules        
+        LDR     r14, tzone_index
+        CMP     r14, #-1
+        BEQ     %FT60
+
+        Debug   ad, "Get rules for year", r8
+
+        ; Read rules for this year and book a callback if they exist
+        MOV     r0, #-1
+        MOV     r1, #DaylightSaving_GetBounds
+        LDR     r2, tzone_index
+        MOV     r3, r8
+        ADR     r4, dst_start
+        ADR     r5, dst_stop
+        SWI     XTerritory_DaylightSaving
+        BVS     %FT60
+
+nowhi   RN 7
+nowlo   RN 6
+stophi  RN 5
+stoplo  RN 4
+starthi RN 3
+startlo RN 2
+
+        ; Locate the time now on a timeline
+        ;
+        ; | Jan01-----Start+++++Stop-----Dec31 |
+        ; |           <-- DST on -->           |
+        ;
+        LDR     nowlo, [sp, #0] 
+        LDRB    nowhi, [sp, #4]
+        LDR     startlo, dst_start + 0
+        LDRB    starthi, dst_start + 4
+        LDR     stoplo, dst_stop + 0
+        LDRB    stophi, dst_stop + 4
+        SUBS    lr, stoplo, startlo
+        SBCS    lr, stophi, starthi
+
+        DebugIf PL, ad, "Northern hemisphere"
+        DebugIf MI, ad, "Southern hemisphere"
+        
+        MOVPL   r1, #DSTCMOSBit         ; If stop > start -> northern hemisphere
+        MOVMI   r1, #0                  ; If start > stop -> southern hemisphere
+        LDRMI   startlo, dst_stop + 0   ; Sort ascending
+        LDRMIB  starthi, dst_stop + 4
+        LDRMI   stoplo, dst_start + 0
+        LDRMIB  stophi, dst_start + 4
+
+        SUBS    lr, stoplo, nowlo
+        SBCS    lr, stophi, nowhi
+        BMI     %FT20
+
+        SUBS    lr, startlo, nowlo
+        SBCS    lr, starthi, nowhi
+        BMI     %FT10
+
+        ; In the region between 'Jan01' and 'Start'
+        MOV     r0, #AutoDSTCMOSBit
+        EOR     r1, r1, #DSTCMOSBit
+        BL      daylight_modify_cmos
+        ASSERT  ticksperyear <= &FFFFFFFF
+        SUB     r0, startlo, nowlo      ; Time until 'Start'
+        B       %FT75
+10
+        ; In the region between 'Start' and 'Stop'
+        MOV     r0, #AutoDSTCMOSBit
+        BL      daylight_modify_cmos
+        ASSERT  ticksperyear <= &FFFFFFFF
+        SUB     r0, stoplo, nowlo       ; Time until 'Stop'
+        B       %FT75
+20
+        ; In the region between 'Stop' and 'Dec31' 
+        EOR     r1, r1, #DSTCMOSBit
+        B       %FT70
+60
+        Debug   ad, "No rule, forcing standard time"
+
+        MOV     r0, #-1                 ; Mark as known invalid
+        STR     r0, dst_start
+        STR     r0, dst_stop
+
+        MOV     r1, #0                  ; Clear DST bit
+70
+        MOV     r0, #AutoDSTCMOSBit     ; Change DST bit, keep auto bit
+        BL      daylight_modify_cmos
+
+        Debug   ad, "Recheck rule on new year's day"
+
+        ; Plan to check again at the start of next year
+        SUB     sp, sp, #28 + 8
+        MOV     r0, #0
+        STR     r0, [sp, #0]
+        STR     r0, [sp, #4]
+        STR     r0, [sp, #8]
+        STR     r0, [sp, #12]
+        MOV     r0, #1
+        STR     r0, [sp, #16]
+        STR     r0, [sp, #20]
+        ADD     r8, r8, #1
+        STR     r8, [sp, #24]           ; 00:00:00.00 on 01 Jan YYYY+1
+
+        MOV     r1, sp
+        ADD     r2, sp, #28
+        LDR     r3, =(TimeFormats_UTCOrdinals:SHL:TimeFormats_InFormatShift) :OR: \
+                     (TimeFormats_UTC5Byte:SHL:TimeFormats_OutFormatShift) :OR: \
+                     TimeFormats_Flag_NoDST
+        SWI     XTerritory_ConvertTimeFormats
+        
+        LDRVC   r1, [sp, #28]           ; Low word of new year's day
+        ADD     sp, sp, #28 + 8
+        BVS     %FT80
+        
+        ASSERT  ticksperyear <= &FFFFFFFF
+        SUB     r0, r1, nowlo           ; Time until new year
+75
+        Debug   ad, "Scheduling switch in +", r0
+        ADR     r1, daylight_switchover
+        MOV     r2, r12
+        SWI     XOS_CallAfter
+80
+        ADD     sp, sp, #8              ; Junk the time now block
+        MOVVC   r6, #0
+        MOVVS   r6, r0                  ; Propagate any errors
+90
+        ; Did any net change occur?
+        MOV     r0, #DSTCMOSBit:OR:AutoDSTCMOSBit
+        MOV     r1, #0
+        BL      daylight_modify_cmos
+        LDRB    r2, last_dst_bits
+        STRB    r0, last_dst_bits
+
+        LDR     r3, tzone_centis
+        LDR     r1, last_tzone_centis
+        STR     r3, last_tzone_centis
+
+        CMP     r3, r1                  ; Offset changed?
+        CMPEQ   r0, r2                  ; DST flags changed?
+        BEQ     %FT95
+
+        ; Tell other interested souls
+        Debug   ad, "Timezone changed to", r3
+        Debug   ad, "DST CMOS bits changed to", r0
+        MOV     r2, #0
+        TST     r0, #DSTCMOSBit
+        ORRNE   r2, r2, #DaylightSaving_DSTBit
+        TST     r0, #AutoDSTCMOSBit
+        ORRNE   r2, r2, #DaylightSaving_AutoDSTBit
+        LDR     r1, =Service_TimeZoneChanged
+        SWI     XOS_ServiceCall         
+95
+        CLRV
+        MOVS    r0, r6
+        SETV    NE
+        Pull    "r1-r8, pc"
+
+;-----------------------------------------------------------------------------
+; Callback when it's time to switch DST on or off
+; In: Nothing
+; Out: Nothing
+;
+
+daylight_switchover ROUT
+        Push    "r0, lr"
+        BL      daylight_switch_check   ; Reassess next move
+        CLRV
+        Pull    "r0, pc"
+
+        LNK     SWIs.s

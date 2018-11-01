@@ -1,0 +1,236 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; > s.main 
+
+;;; Initialisation
+;
+AMBControl_Init
+        Push    "R0-R4,R12,LR"
+
+;claim main workspace
+        LDR     R3,=AMBmaxwork
+        BL      ClaimSysHeapNode
+;;;     BVS     err_cantclaim - this should not happen
+
+;don't store ws pointer till end of initialise - service routines must
+;know when initialise is not yet complete
+;
+        MOV     R12,R2      
+
+;zero-init workspace
+        MOV     R1,#0
+        LDR     R3,=AMBmaxwork
+        ADD     R3,R3,R2
+00
+        STR     R1,[R2],#4
+        CMP     R2,R3
+        BLO     %BT00        
+
+;claim block for handle array
+        MOV     R3,#(AMBInitialMaxNodes:SHL:2)
+        BL      ClaimSysHeapNode
+;;;     BVS     err_cantclaim
+        STR     R2,AMBNodeHandles
+
+;put all handles on free list (entry 0 is used as hdr of free list)
+        MOV     R0,#1
+        MOV     R1,#AMBInitialMaxNodes
+        STR     R1,AMBNhandles
+01
+        STR     R0,[R2],#4
+        ADD     R0,R0,#1
+        CMP     R0,R1
+        BNE     %BT01
+        MOV     R0,#0       ; = end of list
+        STR     R0,[R2]
+
+;init any other workspace that shouldn't init as 0
+        ADR     R1,AMBAnchorNode
+        STR     R1,[R1,#AMBNode_prev]  ;anchor prev initially -> anchor (empty list)
+        STR     R1,[R1,#AMBNode_next]  ;anchor next initially -> anchor (empty list)
+  [ AMB_LazyMapIn
+        LDR     R0,=ZeroPage
+        LDR     R0,[R0,#ProcessorFlags]
+        TST     R0,#CPUFlag_BaseRestored
+        MOVEQ   R1,#AMBFlag_LazyMapIn_disable  ;laziness not supported if we can't trivially restart after abort (because we're lazy!)
+        MOVNE   R1,#0                          ;yipee, laziness enabled (and not suspended)
+        TST     R0,#CPUFlag_AbortRestartBroken ;but wait! can't use for bugged chips (eg. pre rev T StrongARM)
+        MOVNE   R1,#AMBFlag_LazyMapIn_disable
+        STR     R1,AMBFlags
+
+; Calculate default page flags
+        MOV     R0, #0
+        MOV     R1, #0
+        GetPTE  R0, 4K, R0, R1
+        STR     R0,AMBPageFlags
+  |
+        MOV     R1,#AMBFlag_LazyMapIn_disable
+        STR     R1,AMBFlags
+  ]
+        LDR     R0,=ZeroPage+AMBControl_ws
+        STR     R12,[R0]               ;now initialisation is complete
+
+        Pull    "R0-R4,R12,PC"
+
+
+; OS_AMBControl SWI handler
+; entry:
+;   R0 = reason code (bits 0..7) and flags (bits 8..31), flags depend on reason
+;   other regs. depend on reason code
+; exit:
+;   R0 preserved
+;   other regs. depend on reason code
+
+AMBControlSWI
+        LDR     R12,=ZeroPage+AMBControl_ws
+        LDR     R12,[R12]
+ 
+        AND     R11,R0,#&FF
+        CMP     R11,#(reasons0-reasons1)/4
+        ADDCC   PC,PC,R11,LSL #2        ;Despatch if within a suitable range
+        B       reasons1
+reasons0
+        B       allocate     ;0
+        B       deallocate   ;1
+        B       growshrink   ;2
+        B       mapslot      ;3
+        B       readinfo     ;4
+  [ AMB_LazyMapIn
+        B       laziness     ;5
+  |
+        B       reserved     ;5
+  ]
+        B       reserved     ;6
+        B       reserved     ;7
+        B       mjs_info     ;8 - system reason code, dumps info to buffer
+reasons1
+        ADR     R0,err_badreason
+        B       SLVK_SetV
+
+
+  [ AMB_LazyMapIn
+;
+;entry: R0=5 (reason),R1=1 for lazy on, 0 for lazy off, -1 to read lazy only
+;exit: R1=new lazy value, after any restrictions of platform applied
+;
+;action: if reading only, if lazy disabled, or if new state = current, do nothing
+;        if state is changing, map out any current node, change state, map in any current node
+;
+laziness ROUT
+       Push    "R2-R3,LR"
+       CMP     R1,#-1
+       BEQ     %FT20
+       LDR     R2,AMBFlags                      ;R2 := current flags
+       TST     R2,#AMBFlag_LazyMapIn_disable    ;disable is permanent
+       BNE     %FT20
+       CMP     R1,#0
+       MOV     R1,R2
+       ORREQ   R1,R1,#AMBFlag_LazyMapIn_suspend
+       BICNE   R1,R1,#AMBFlag_LazyMapIn_suspend ;R1 := new flags
+       EOR     R3,R1,R2
+       TST     R3,#AMBFlag_LazyMapIn_suspend    ;is suspend status changing?
+       BEQ     %FT20
+       LDR     R3,AMBMappedInNode
+       CMP     R3,#0
+       BEQ     %FT10
+       Push    "R0-R3"
+       MOV     R0,#3
+       MOV     R1,#-1
+       LDR     R2,[R3,#AMBNode_handle]
+       SWI     XOS_AMBControl                   ;map out current node
+       Pull    "R0-R3"
+10
+       STR     R1,AMBFlags
+       CMP     R3,#0
+       BEQ     %FT20
+       Push    "R0-R3"
+       MOV     R0,#3
+       MOV     R1,#0
+       LDR     R2,[R3,#AMBNode_handle]
+       SWI     XOS_AMBControl                   ;map in current node
+       Pull    "R0-R3"
+20
+       LDR     R1,AMBFlags
+       TST     R1,#AMBFlag_LazyMapIn_disable :OR: AMBFlag_LazyMapIn_suspend
+       MOVEQ   R1,#1
+       MOVNE   R1,#0
+       Pull    "R2-R3,LR"
+       B       SLVK
+;
+  ] ;AMB_LazyMapIn
+
+
+;entry: R0=8 (reason),R1 -> buffer (say 4k for up to 255 tasks)
+;exit: buffer filled:
+;       0   Ntasks
+;       4   Handle of mapped in task (or 0)
+;       8   Handle 1
+;      12   Npages 1
+;      16   Logical address 1
+;      20   PPL 1
+;      24   Handle 2
+;      28   Npages 2
+;      32   Logical address 2
+;      36   PPL 2
+;      ...
+mjs_info
+       Push    "R1-R7,LR"
+       LDR     R2,AMBNtasks
+       STR     R2,[R1],#4
+       LDR     R2,AMBMappedInNode
+       CMP     R2,#0
+       LDRNE   R2,[R2,#AMBNode_handle]
+       STR     R2,[R1],#4
+       ADR     R2,AMBAnchorNode
+       MOV     R7,R2
+       LDR     LR,=DynAreaFlags_AccessMask
+01
+       LDR     R2,[R2,#AMBNode_next]
+       CMP     R2,R7
+       BEQ     %FT02
+       LDR     R3,[R2,#AMBNode_handle]
+       LDR     R4,[R2,#AMBNode_DANode+DANode_PMPSize]
+       LDR     R5,[R2,#AMBNode_DANode+DANode_Base]
+       LDR     R6,[R2,#AMBNode_DANode+DANode_Flags]
+       AND     R6,R6,LR
+       STMIA   R1!,{R3-R6}
+       B       %BT01
+02
+       Pull    "R1-R7,LR"
+       B       SLVK
+
+reserved
+       ADR     R0,err_reserved
+       B       SLVK_SetV
+
+;;; errors (sod internationalisation)
+
+err_badreason
+        DCD     0
+        DCB     "bad AMBControl reason code",0
+        ALIGN
+
+err_reserved
+        DCD     0
+        DCB     "reserved AMBControl reason code",0
+        ALIGN
+
+err_nomorehandles
+        DCD     0
+        DCB     "AMBControl handles exhausted",0
+        ALIGN
+
+   END

@@ -1,0 +1,443 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* Title:   tbevent.c
+ * Purpose: dispatching toolbox events.
+ * Author:  IDJ
+ * History: 19-Jun-94: IDJ: created
+ *          24-Mar-95: IDJ: deregister event handler now works!
+ *          19-Dec-96: ADH: ...it didn't if a handler deregistered itself; this is now fixed
+ *          01-Apr-97: KJB/ADH: added call to deregister all handlers for a given object ID
+ *          18-Feb-02: BJGA: added finalisation
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+
+#include "event.h"
+
+#include "debug.h"
+#include "types.h"
+#include "tbevent.h"
+
+static ToolboxEventHandlerItem * _next_handler;
+
+static _kernel_oserror err = {0, "Error in event handling"};
+
+static _kernel_oserror *make_error (void)
+{
+    return &err;
+}
+
+#ifdef MIKEDEBUG
+static void report (char *message)
+{
+   _kernel_swi_regs r;
+   _kernel_oserror e;
+
+   e.errnum = 0;
+   strcpy(e.errmess, message);
+
+   r.r[0] = (int)&e;
+   r.r[1] = 1;
+   r.r[2] = (int)"Mike's app";
+   _kernel_swi(Wimp_ReportError, &r, &r);
+}
+#endif
+
+#define HashTableSize 256
+
+static int hash (int word)
+{
+    /* hashing algorithm: add ascending bytes, with carry, and use lower byte as result */
+    /* - NB, if changing this, don't forget to amend HashTableSize above as needed.     */
+
+    int temp =  (word&0xff) +
+                ((word>>8)&0xff) +
+                ((word>>16)&0xff) +
+                ((word>>24)&0xff);
+
+    return ((temp&0xff) + ((temp>>8)&0xff)) & 0xff;
+}
+
+static ToolboxEventHandlerItem *tbevent__handlers[HashTableSize];
+
+static ToolboxEventHandlerItem *tbevent__all_handlers = 0;
+
+#define handler_matches(h, object_id, event_code, handler, handle)   h->object_id == (object_id)\
+                                                                 && h->event_code == (event_code)\
+                                                                 && h->handler == (handler)\
+                                                                 && h->handle == (handle)
+
+
+/* ------------------------------------ dispatching toolbox events -------------------------------- */
+
+static int toolbox_event_matches (int event_code, ToolboxEventHandlerItem *h, IdBlock *id_block)
+{
+    /*
+     * first look to see if interested in all objects of all classes,
+     * then interest in this object.
+     */
+
+    if (h->event_code != event_code && h->event_code != -1)
+        return 0;
+
+    if (h->object_id == -1)      /* all objects */
+        return 1;
+    else if (h->object_id == id_block->self_id)    /* this object */
+        return 1;
+
+    return 0;
+}
+
+
+static _kernel_oserror *call_toolbox_handlers (ToolboxEventHandlerItem *h, WimpPollBlock *poll_block, IdBlock *id_block, int *claimed)
+{
+    ToolboxEvent *toolbox_event = (ToolboxEvent *)&poll_block->words;
+
+
+    while (h != NULL)
+    {
+        if (toolbox_event_matches (toolbox_event->hdr.event_code, h, id_block) && h->handler != NULL)
+        {
+#ifdef MIKEDEBUG
+                report ("handler matches");
+#endif
+            /* remember the next handler before calling this one,
+             * as if the handler deregisters itself the h block
+             * will be freed and h->next becomes invalid
+             */
+
+            _next_handler = h->next;
+
+            /* call the handler */
+            if (h->handler (toolbox_event->hdr.event_code, toolbox_event, id_block, h->handle))
+            {
+#ifdef MIKEDEBUG
+                report ("handler claimed event");
+#endif
+                *claimed = 1;
+                return NULL;
+            }
+
+            h = _next_handler;
+        }
+        else
+            h = h->next; /* For efficiency, only use the global _next_handler if the handler is to be called */
+    }
+
+    *claimed = 0;
+    return NULL;
+}
+
+
+extern _kernel_oserror *tbevent_dispatch (WimpPollBlock *poll_block, IdBlock *id_block)
+{
+    ToolboxEventHandlerItem *h;
+    int                  elem;
+    int                  claimed = 0;
+    ToolboxEvent         *toolbox_event = (ToolboxEvent *)&poll_block->words;
+
+    DEBUG debug_output ("tbevent_dispatch", "Dispatching tbevent %x\n", toolbox_event->hdr.event_code);
+
+    elem = hash(toolbox_event->hdr.event_code);
+
+    h = tbevent__handlers[elem];
+
+#ifdef MIKEDEBUG
+                report ("calling specific handlers");
+#endif
+
+    call_toolbox_handlers (h, poll_block, id_block, &claimed);
+
+    if (claimed)
+        return NULL;
+
+#ifdef MIKEDEBUG
+                report ("calling all handlers");
+#endif
+    h = tbevent__all_handlers;
+
+    call_toolbox_handlers (h, poll_block, id_block, &claimed);
+
+    return NULL;
+}
+
+
+
+/* -------------------------- registering handlers for toolbox events ------------------------------ */
+
+_kernel_oserror *tbevent_register_toolbox_handler (int object_id, int event_code, ToolboxEventHandler *handler, void *handle)
+{
+    ToolboxEventHandlerItem *h, *new_h;
+    int elem;
+
+    /*
+     * see if there's a handler there already.
+     */
+
+    DEBUG debug_output ("tbevent_register", "Registering toolbox event handler\n");
+
+
+    /*
+     * start looking down the linked list which hangs off the array element for this toolbox event
+     */
+
+    elem = hash(event_code);
+
+    DEBUG debug_output ("tbevent_register", "Event %x @ element %d\n", event_code, elem);
+
+    if (event_code == -1)
+        h =  tbevent__all_handlers;
+    else
+        h = tbevent__handlers[elem];
+
+    while (h != NULL)
+    {
+        /*
+         * if there's already a handler, just return.
+         */
+
+        if (handler_matches (h, object_id, event_code, handler, handle))
+            return NULL;
+
+        h = h->next;
+    }
+
+
+    DEBUG debug_output ("tbevent_register", "Adding new handler\n");
+
+
+    /*
+     * make a new entry in the list for this event
+     */
+
+    if ((new_h = malloc (sizeof(ToolboxEventHandlerItem))) == NULL)
+        return make_error ();
+
+    new_h->object_id  = object_id;
+    new_h->event_code = event_code;
+    new_h->handler    = handler;
+    new_h->handle     = handle;
+
+    if (event_code == -1)
+    {
+        new_h->next           = tbevent__all_handlers;
+        tbevent__all_handlers = new_h;
+    }
+    else
+    {
+        new_h->next             = tbevent__handlers[elem];
+        tbevent__handlers[elem] = new_h;
+    }
+
+    return NULL;
+}
+
+
+
+/* --------------------------- deregistering toolbox event handlers --------------------------------- */
+
+_kernel_oserror *tbevent_deregister_toolbox_handler (int object_id, int event_code, ToolboxEventHandler *handler, void *handle)
+{
+    ToolboxEventHandlerItem *h, *prev_h;
+    ToolboxEventHandlerItem **listhead;
+    int                      elem;
+
+    /*
+     * see if handler registered, and if so delete it.
+     */
+
+    /*
+     * start looking down the linked list which hangs off the array element for this event
+     */
+
+    elem = hash(event_code);
+
+    /* IDJ: bug-fix after product release
+       was looking in wrong list, so couldn't ever delete a handler!
+     */
+
+    if (event_code == -1)
+    {
+        h = prev_h = tbevent__all_handlers;
+        listhead   = &tbevent__all_handlers;
+    }
+    else
+    {
+        h = prev_h = tbevent__handlers[elem];
+        listhead   = &tbevent__handlers[elem];
+    }
+
+    while (h != NULL)
+    {
+        /*
+         * see if there's a handler, which matches.
+         */
+
+        if (handler_matches (h, object_id, event_code, handler, handle))
+            break;
+
+        prev_h = h;
+        h = h->next;
+    }
+
+
+    /*
+     * delete the handler from the list
+     */
+
+    if (h != NULL)
+    {
+#ifdef MIKEDEBUG
+                report ("found handler");
+#endif
+        if (h == *listhead)
+        {
+#ifdef MIKEDEBUG
+                report ("head of list");
+#endif
+            *listhead = h->next;
+        }
+        else
+        {
+#ifdef MIKEDEBUG
+                report ("not head of list");
+#endif
+            prev_h->next = h->next;
+        }
+
+        /* If we've deleted the item that was pointed to by _next_handler,
+         * need to repoint _next_handler to the next one along again.
+         */
+
+        if (h == _next_handler) _next_handler = h->next;
+
+        free (h);
+    }
+
+    return NULL;
+}
+
+
+_kernel_oserror *tbevent_deregister_toolbox_handlers_for_object (int object_id)
+{
+    ToolboxEventHandlerItem *h, *prev_h, *next_h;
+    ToolboxEventHandlerItem **listhead;
+    int                      elem;
+
+    for (elem = 0; elem <= HashTableSize; elem++)
+    {
+        if (elem == HashTableSize)
+        {
+            /* Handlers that cope with all events (event code of -1 given */
+            /* when registering the handler).                             */
+
+            h = prev_h = tbevent__all_handlers;
+            listhead = &tbevent__all_handlers;
+        }
+        else
+        {
+            /* Handlers that cope with specific events (the event code is */
+            /* specified when registering the handler).                   */
+
+            h = prev_h = tbevent__handlers[elem];
+            listhead = &tbevent__handlers[elem];
+        }
+
+        while (h != NULL)
+        {
+            /* See if there's a handler which matches. */
+
+            if (h->object_id == object_id)
+            {
+                /* Delete the handler from the list. */
+
+                next_h = h->next;
+
+                if (h == *listhead) *listhead    = next_h;
+                else                prev_h->next = next_h;
+
+                /* If we've deleted the item that was pointed to by _next_handler, */
+                /* need to repoint _next_handler to the next one along again.      */
+
+                if (h == _next_handler) _next_handler = next_h;
+
+                free(h);
+
+                h = next_h;
+            }
+            else
+            {
+                 /* Handler didn't match; move on to the next one */
+
+                 prev_h = h;
+                 h = h->next;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+
+/* --------------------------------------------- finalisation -------------------------------------- */
+
+_kernel_oserror *tbevent_finalise (void)
+{
+    ToolboxEventHandlerItem *h, *next_h;
+    ToolboxEventHandlerItem **listhead;
+    int                      elem;
+
+    for (elem = 0; elem <= HashTableSize; elem++)
+    {
+        if (elem == HashTableSize)
+        {
+            /* Handlers that cope with all events (event code of -1 given */
+            /* when registering the handler).                             */
+
+            h = tbevent__all_handlers;
+            listhead = &tbevent__all_handlers;
+        }
+        else
+        {
+            /* Handlers that cope with specific events (the event code is */
+            /* specified when registering the handler).                   */
+
+            h = tbevent__handlers[elem];
+            listhead = &tbevent__handlers[elem];
+        }
+
+        while (h != NULL)
+        {
+            /* Delete the handler from the list. */
+
+            next_h = h->next;
+            
+            *listhead = next_h;
+
+            free(h);
+
+            h = next_h;
+        }
+    }
+
+    _next_handler = NULL;
+
+    return NULL;
+}

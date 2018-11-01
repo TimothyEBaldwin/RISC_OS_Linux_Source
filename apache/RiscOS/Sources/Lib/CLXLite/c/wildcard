@@ -1,0 +1,305 @@
+/* Copyright 1999 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * WildCarding for RISC OS / Arthur / Springboard.
+ *
+ * Status:       C Library Extension
+ * Copyright:    (C) 1988, Acorn Computers Ltd., Cambridge, England.
+ * $Revision: 1.2 $  LH  2-Mar-89
+ * Copyright (C) Acorn Computers Ltd., 1989.
+ */
+
+#ifdef __STDC__
+#  include <string.h>
+#  include <stdlib.h>
+#else
+#  include <strings.h>
+   extern void free();
+#endif
+
+#include <stdio.h>
+#include <ctype.h>
+#include kernelheader
+#include "wildcard.h"
+#include "err.h"
+#include "re.h"
+#include "dir.h"
+
+#define  FNAMELEN           256
+#define  WILDCARD_CHARS     "(){}[],#*"
+#define  HOST_DIR_SEP_CH    '.'
+
+#ifdef LIB_DEBUGGING
+static int debugging = 0;
+#endif
+
+static int dir_sep_ch = HOST_DIR_SEP_CH;
+
+extern void wild_give_help(void)
+{
+  fprintf(stderr, "\n\
+File patterns:-\n\
+#   matches any file name character except '%c'\n\
+*   matches 0 or more file name characters other than '%c'\n\
+    all other characters except '{', ',' and '}' match as is\n\
+... is equivalent to %c(*%c) ie look in all sub-directories\n\
+A,B matches any file name matched by A or B\n\
+{A} matches any file name matched by A, but limits the scope of a ','\n\
+(A) matches any file name matched by 0 or more A's\n",
+    dir_sep_ch, dir_sep_ch, dir_sep_ch, dir_sep_ch);
+}
+
+static void expand_file_variables(char *buf)
+{
+  char *right_pos;
+  char *left_pos = strchr(buf, '<');
+  while ((left_pos != NULL) && ((right_pos = strchr(buf, '>')) > left_pos)) {
+    char file_var[FNAMELEN]; char temp[FNAMELEN]; char *expansion;
+    int i;
+#ifdef LIB_DEBUGGING
+    if (debugging) fprintf(stderr, "filename expansion of '%s' [%d to %d]", buf,
+                   left_pos - buf, right_pos - buf);
+#endif
+    *left_pos++ = 0; strcpy(temp, buf);
+    for (i = 0; left_pos < right_pos; i++) file_var[i] = *left_pos++;
+    file_var[i] = 0;
+    if ((expansion = getenv(file_var)) != NULL) strcat(temp, expansion);
+#ifdef LIB_DEBUGGING
+    if (debugging) {
+      if (expansion) fprintf(stderr, ", '%s -> '%s'", file_var, expansion);
+      else fprintf(stderr, ", '%s -> ''", file_var);
+    }
+#endif
+    strcat(temp, ++right_pos); strcpy(buf, temp);
+#ifdef LIB_DEBUGGING
+    if (debugging) fprintf(stderr, " --> '%s'\n", buf);
+#endif
+    left_pos = strchr(buf, '<');
+  }
+}
+
+extern int wild_carded(char *s)
+{
+  int ch;
+  char *p;
+  char buf[FNAMELEN];
+
+  strcpy(buf, s);
+  expand_file_variables(buf);
+  s = strchr(buf, ':');
+  if (s == NULL) s = buf;
+  else ++s;
+
+  for (;;)
+  { ch = *s++;
+    if (ch == 0) return 0;
+    p = WILDCARD_CHARS;
+    while (*p) {if (ch == *p) return 1; ++p;}
+  }
+}
+
+static void lc_copy(char *to, char *fm, int len)
+{
+  int j, ch;
+  for (j = 0;  j < len;  ++j)
+  {
+    ch = fm[j];  to[j] = isupper(ch) ? tolower(ch) : ch;
+  }
+}
+
+static int parse_fname_pattern(REHandle *h, char *pattern, int ket)
+{
+  int ch, n, bra, l;
+
+  n = 0; ch = 0;
+  for (;;)
+  { int last_ch = ch;
+    ch = pattern[n++];
+    switch (ch)
+    {
+case 0:
+case '}':
+case ')':   if (ch != ket) return 0;
+            return n-1;
+            break;
+case '{':
+case '(':   re_bra(h);
+            bra = ch;
+            l = parse_fname_pattern(h, pattern + n, bra == '(' ? ')' : '}');
+            if (l == 0) return 0;
+            n += l;
+            ch = pattern[n++];
+            re_ket(h);
+            if (ch == '}')
+            {
+              if (bra != '{') return 0;
+            }
+            else if (ch == ')')
+            {
+              if (bra != '(') return 0;
+              re_modify(h, '*');
+            }
+            else return 0;
+            break;
+case '#':
+case '*':   if (!((ch == '*') && (last_ch == '*'))) {
+              re_char(h, RE_NOT + dir_sep_ch);
+              if (ch == '*') re_modify(h, '*');
+            }
+            break;
+case ',':   re_or(h);
+            break;
+case '.':   if ((pattern[n] == '.') && (pattern[n+1] == '.')) { /* got ... */
+              /* turn into .(*.) */
+              n += 2;
+              re_char(h, dir_sep_ch);
+              re_bra(h);
+              re_char(h, RE_NOT + dir_sep_ch); re_modify(h, '*');
+              re_char(h, dir_sep_ch);
+              re_ket(h);
+              re_modify(h, '*');
+              break;
+            }
+default:    re_char(h, ch);
+            break;
+    }
+  }
+}
+
+static int scan(char *buf, int match_start, NFA *fname_nfa,
+                wild_apply_fn *fn, VoidStar c, int match_action)
+{
+  dir_handle dh;
+  dir_entry e;
+  char *tail;
+  int len, rc;
+  char nocase_buf[FNAMELEN];
+
+  dh = dir_open(buf, NULL);
+  if (dh == NULL)
+  {/*  err_lib_error("couldn't open directory '%s'", dir); */
+    return 1;
+  }
+  tail = buf + strlen(buf);
+  if (tail != buf)
+  {
+    *tail++ = dir_sep_ch;  *tail = 0;
+  }
+  while (dir_next(dh, &e))
+  { char *s = dir_entryname(e);
+    int type = dir_entrytype(e);
+    int match;
+    if (_kernel_escape_seen()) return 1;
+    strcpy(tail, s);
+    len = (tail - buf) + strlen(s);
+    lc_copy(nocase_buf, buf, len+1);
+    len -= match_start;
+    match = re_match(nocase_buf+match_start, len, fname_nfa, 0);
+#ifdef LIB_DEBUGGING
+    if (debugging) fprintf(stderr, "match '%s' -> %u\n", buf, match);
+#endif
+    if (match >= len)
+    {
+      if (type == DIR_FILE && match > len)
+      {
+        if ((rc = fn(buf, c, e)) != 0) return rc;
+      }
+      else if (type == DIR_DIR)
+      { int len_dot = len;
+        int match_dot;
+        (nocase_buf+match_start)[len_dot++] = dir_sep_ch;
+        (nocase_buf+match_start)[len_dot] = 0;
+        match_dot = re_match(nocase_buf+match_start, len_dot, fname_nfa, 0);
+#ifdef LIB_DEBUGGING
+    if (debugging) fprintf(stderr, "try dir match '%s' -> %u\n", nocase_buf, match_dot);
+#endif
+        if (match > len /* got match */ &&
+            match_action == WILD_ALL_MATCHES)
+        { if ((rc = fn(buf, c, e)) != 0) return rc;
+        }
+        if (match_dot >= len_dot)
+        { if ((rc = scan(buf, match_start, fname_nfa, fn, c, match_action))
+              != 0) return rc;
+        }
+      }
+    }
+  }
+  dir_close(dh);
+  return 0;
+}
+
+int wild_enumerate(char *name, wild_apply_fn fn, VoidStar c, int match_action)
+{
+  REHandle h;
+  NFA *fname_nfa = NULL;
+  int n, rc;
+  char nocase_buf[FNAMELEN];
+  char buffer[FNAMELEN];
+  char *buf, *path_head;
+
+  (void) dir_init();
+
+  strcpy(buffer, name);
+  expand_file_variables(buffer);
+  buf = strchr(buffer, ':');
+  if (buf == NULL)
+    buf = buffer;
+  else
+  { if (buf != buffer) ++buf;
+    if (*buf == ':')
+    {   do ++buf; while (*buf != dir_sep_ch && *buf != 0);
+    }
+  }
+
+  n = strlen(buf) + 1;
+  lc_copy(nocase_buf, buf, n);
+  re_begin1(&h);
+  if (parse_fname_pattern(&h, nocase_buf, 0))
+  {
+    re_begin2(&h);
+    if (parse_fname_pattern(&h, nocase_buf, 0)) fname_nfa = re_end(&h);
+  }
+  if (fname_nfa == NULL)
+  { err_lib_error("bad wildcard pattern '%s'", buf);
+    return 1;
+  }
+#ifdef LIB_DEBUGGING
+  print_nfa(fname_nfa);
+#endif
+  re_head(fname_nfa, buf, n);  /* MUST fit, as head <= all of it! */
+  path_head = buf;
+  n = strlen(path_head);
+#ifdef LIB_DEBUGGING
+  if (debugging) fprintf(stderr, "original path_head = '%s'\n", path_head);
+#endif
+  while (n > 0)
+  { n--;
+    if (path_head[n] == dir_sep_ch) break;
+  }
+  path_head[n] = 0;
+#ifdef LIB_DEBUGGING
+  if (debugging) fprintf(stderr, "path_head = '%s'\n", path_head);
+#endif
+  rc = scan(buffer, path_head - buffer, fname_nfa, fn, c, match_action);
+  free(fname_nfa);
+  return rc;
+}
+
+#ifdef LIB_DEBUGGING
+extern void wild_debug(int level)
+{
+  debugging = level;
+}
+#endif

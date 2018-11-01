@@ -43,9 +43,9 @@ ifeq ($(TARGET), Linux)
 all check: RISC_OS
 endif
 
-build_binds = $(foreach dir,bsd castle cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
+build_binds = $(foreach dir,apache bsd cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
-Build/src-stamp: $(shell find bsd castle cddl gpl mixed)
+Build/src-stamp: $(shell find apache bsd cddl gpl mixed)
 	ln -sfn . lock_source_1510718522
 	mkdir -p Build
 	touch Build/src-stamp
@@ -68,8 +68,8 @@ endif
 	  # Find directories and files
 	  shopt -s globstar
 	  shopt -s extglob
-	  dirs=({bsd,castle,cddl,gpl,mixed}/**/)
-	  files=({bsd,castle,cddl,gpl,mixed}/**)
+	  dirs=({apache,bsd,cddl,gpl,mixed}/**/)
+	  files=({apache,bsd,cddl,gpl,mixed}/**)
 	  #
 	  cd Build/$*
 	  #
@@ -100,8 +100,8 @@ endif
 	    echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
 	    cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
 	  fi
-	  cp -ru --preserve=mode,timestamps ../../castle/RiscOS/Export .
-	  ln -sf mixed/RiscOS/{Library,Modules} castle/RiscOS/{Env,BuildSys} .
+	  cp -ru --preserve=mode,timestamps ../../apache/RiscOS/Export .
+	  ln -sf mixed/RiscOS/{Library,Modules} apache/RiscOS/{Env,BuildSys} .
 	  cd Apps
 	  ln -sf ../../../lock_source_1510718522/Build/$*/*/RiscOS/Apps/\!* .
 	}

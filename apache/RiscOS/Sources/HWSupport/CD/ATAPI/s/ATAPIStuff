@@ -1,0 +1,1984 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;******************************************************************************
+;
+; ATAPIStuff.s
+;
+; Author:               Mark Watson (EESOX)
+; Largely rewritten by: Christopher Partington (Cambridge Systems Design)
+;
+; Description
+; ===========
+; This issues the low-level IDE ATAPI commands
+;
+; Change record
+; =============
+; 09-Mar-95  16:15  cpartington (Cambridge Systems Design)
+; * Start of work on ATAPI_Op to fix data corruption and "Compact disc is
+;   faulty" errors - rewrite all IDE access code to nearer specification.
+;   Add special action after IRQ to handle strange behaviour by Panasonic
+;   CR571B.
+; * Tidy up and commenting of existing code.
+;
+; 14-Mar-95  10:30  cpartington (Cambridge Systems Design)
+; * Rewrite of IRQ and DRQ polling following receipt of latest ATAPI
+;   specfication. MEW assumed Panasonic drive was just buggy and my first
+;   rewrite followed that assumption code. In fact, Panasonic and Sony
+;   drives are of different CMD DRQ types (Panasonic is "interrupt DRQ",
+;   Sony is "accelerated DRQ". The important difference is that "interrupt
+;   DRQ" provides an IRQ for the DRQ for the CDB. No wonder MEW found he
+;   needed massive delays to drive the Panasonic without error. Added
+;   routine WaitForIRQ.
+; * Change error handling code in ATAPI_Op to treat drive not ready as disc
+;   changed. If this isn't done, CDFS does not notice when the drive door is
+;   open but displays very very slow (and often corrupt) directory viewers.
+; * More tidying up following comparison with 1.06 (I was probably given the
+;   wrong sources to work from - 1.13). Fixed DoMicroDelay to preserve flags
+;   (as the original, copied from ADFS, did).
+;
+; 16-Mar-95  14:03  cpartington (Cambridge Systems Design)
+; * Rewrite of main data transfer loop so that it copies more data via
+;   optimised code - MEW's version always copied last 32 bytes a byte at
+;   a time.
+; * Rewrite of ATAPI_Control to call routines rather than branch to them.
+;   Those routines now simply return VS/VC and ATAPI_Control unlocks the
+;   IDE registers and returns to its caller.
+; * Rewrite ATAPI_Reset so it can be called when a drive locks up. This is
+;   to cope with the Panasonic which, occasionally, fails to deassert BSY
+;   when a disc is ejected during a command
+; * Removed code corrupting caller's R1 - looks as if it was only ever there
+;   as debug and all registers are meant to be preserved.
+;
+; 23-Mar-95  14:51  cpartington (Cambridge Systems Design)
+; * Changed ATAPI_LockUnlockIDE to return error returned by lock SWI if
+;   unable to get lock before timeout.
+; * Removed old, pre-1.06 code in ATAPI_LockUnlockIDE. Resisted temptation
+;   to rewrite current code.
+;
+; 30-Mar-95  12:20  cpartington (Cambridge Systems Design)
+; * Add extra read of alternate status (conditional on fix_cr571b10e_maybe)
+;   after reading byte count registers as badly-translated fax from
+;   Panasonic suggests this may work around their cache problem.
+; * Add check for IDENTIFY before retrying failed op (conditional on
+;   fix_slow_when_no_drives).
+; * Add 1us delay to WaitForIRQ (conditional on extra_delay_after_irq)
+;   before returning when BSY is clear after the IRQ has been received (it
+;   should always be clear after IRQ but some drives misbehave and driver
+;   has to wait for !BSY). This is not in response to a fault but for
+;   future-proofing.
+; * Spotted a few mini-optimisations but resisted temptation to make them!
+;   NOTE: some reads of regs are byte, others word - this should be sorted
+;   out.
+;
+; 06-Apr-95  17:45  cpartington (Cambridge Systems Design)
+; * Added debugging code so caller can detect how many bytes were not
+;   transferred.
+;
+; 12-Jun-95  11:33  cpartington (Cambridge Systems Design)
+; * Added conditional code to use TIMEOUT__COMMAND_COMPLETE instead of
+;   literal when calling WaitForIRQ to wait for command completion. Should
+;   always have used constant rather than literal but this change forced by
+;   trying to adjust timeout values to try to cope with slow Sony CDU50E.
+;
+; 13-Jun-95  16:09  cpartington (Cambridge Systems Design)
+; * Conditionally disable poll for !BSY before selecting drive to try to
+;   cope with Sony master drive with no slave connected.
+;
+; 19-Jun-95  16:36  cpartington (Cambridge Systems Design)
+; * Change ATAPI_Reset to use constant for timeout rather than literal.
+;
+; 06-Jul-95  10:37  cpartington (Cambridge Systems Design)
+; * Added code conditional on bodge_50e_sole_drive and full_drive_detection
+;   including new routine ATAPI_CheckForDrive and mechanism to call it via
+;   ATAPI_Control) to try to address SONY CDU50E sole drive problem.
+;
+;*end of change record*
+
+
+; ============= HAL case ======================================================
+ [ HAL
+
+;------------------------------------------------------------------------------
+; ATAPI_Control
+;
+; on entry:
+;          r0 - r6 may be used depending on reason code in r8
+;          r7 -> CDFS control block
+;          r8 =  reason code (ATAPICONTROL__ ... )
+;         r12 -> workspace
+;         r13 -> FD stack
+;
+; on exit:
+;          r8 = corrupted (probably not - cpartington)
+;
+;          if OK then
+;                        all regs preserved
+;          if ERROR then
+;                        r0 =  error number
+;                        or r0 -> error block if r0 >= &1000
+;
+;------------------------------------------------------------------------------
+
+ATAPI_Control   ROUT
+
+        CMP     r8,#(ATAPIC_EndOfJumpTable - ATAPIC_StartOfJumpTable) / 4
+        BHS     ATAPIC_UnknownReason
+
+        ADD     pc,pc,r8,LSL #2         ; call routine
+
+        NOP
+ATAPIC_StartOfJumpTable
+        B       ATAPI_Op
+        B       ATAPI_Reset
+        MOV     pc, r14                 ; obsolete reason code
+        B       ATAPI_RawOp
+ATAPIC_EndOfJumpTable
+
+ATAPIC_UnknownReason
+;
+; Bad reason code
+
+        MOV     r0,#DRIVERERROR__UNKNOWN_REASON
+        MOV     r1,#0
+        SETV
+        MOV     pc,r14
+
+;------------------------------------------------------------------------------
+; ATAPI_Op - ATAPICONTROL__SEND_COMMAND reason code
+;
+; Only functionality required for HAL version is to send command packet with retries
+;
+; on entry:
+;          r0 = b24 to b25 00 no data, 01 = read, 10=write, 11=reserved
+;               other bits reserved
+;          r1 =  length of control block
+;          r2 -> control block
+;          r3 -> start of transfer
+;          r4 =  length of transfer (in bytes)
+;          r7 -> CDFS control block
+;
+; on exit:
+;          if OK then
+;             all regs preserved
+;          if ERROR then
+;             r0 =  internal error number (DRIVERERROR or TARGETERROR ranges)
+;             or r0 -> error block if r0 >= &1000
+;
+;
+; COMMENT:
+;         This will do up to 3 retries as well as setting the disc changed flags.
+;
+;------------------------------------------------------------------------------
+
+ATAPI_Op        ROUT
+        Push    "r0-r5,r14"
+
+        MOV     r5,#0
+        BL      ATAPI_RawOp
+        ADDVC   sp,sp,#4*3
+        Pull    "r3-r5,pc",VC         ; no-error case
+        TEQ     r0,#DRIVERERROR__SELECTION_TIMEOUT
+        TEQNE   r0,#DRIVERERROR__OTHER_TIMEOUT
+        BEQ     %FT90           ; serious problems, try resetting before retrying
+        TEQ     r0,#DRIVERERROR__UK_SCSI_ERROR
+        BEQ     %FT95           ; might be UNIT ATTENTION or NOT READY, so retry
+
+        ; Convert SCSI sense errors to internal TARGETERROR errors before proceeding
+        CMP     r0,#&1000
+        BCC     %FT10           ; not an error pointer
+        LDR     r14,[r0]
+        SUB     r14,r14,#SCSISenseNumber:AND:&FF000
+        SUB     r14,r14,#SCSISenseNumber:AND:&00FF0
+        CMP     r14,#&40
+        BCS     %FT10           ; not a SCSI sense error block
+        AND     r1,r1,#3:SHL:5  ; extract EOM and ILI bits
+        MOV     r14,r14,LSL #ZERRORFLAGS__SENSEKEY_SHIFT
+        ORR     r0,r14,r1,LSR #5
+
+        TEQ     r14,#TARGETERROR__UNIT_ATTENTION
+        TEQNE   r14,#TARGETERROR__NOT_READY
+        BEQ     %FT95           ; retry if we got one of those two
+
+10      ; Return any remaining errors
+        ADD     sp,sp,#4
+        SETV
+        Pull    "r1-r5,pc"
+
+90      ; Reset drive before retrying command
+        Push    "r0"
+        BL      ATAPI_Reset
+        Pull    "r0"
+
+95      ; Retry command unless number of retries has been reached
+        ADDS    r14,SWIN,#1:SHL:30
+        BCS     %BT10
+
+        MOV     SWIN,r14
+        BL      Extras_ConvertControlBlockToDrive
+
+        ; Set the disc changed flag
+        BL      Extras_SetDiscChanged
+        ; The drawer must be unlocked (why?)
+        MOV     r1,#0
+        BL      Extras_SetDrawerStatus
+
+        Pull    "r0-r5,r14"
+        B       ATAPI_Op
+
+;------------------------------------------------------------------------------
+; ATAPI_Reset - ATAPICONTROL__SOFT_RESET reason code
+;
+; on entry:
+;          r7 -> CDFS control block
+;
+; on exit:
+;         all registers preserved except r0, error may be returned if drive not known
+;
+;------------------------------------------------------------------------------
+
+ATAPI_Reset     ROUT
+        Push    "r5,r14"
+
+        BL      Extras_ConvertControlBlockToDrive ; sets up r0
+        Pull    "r5,pc", VS                       ; return error if bad drive
+
+        ADR     r5,DriveCtlPrtDev
+        LDR     r0,[r5,r0,LSL#2]
+        ORR     r0,r0,#ADFSATAPIOp_Reset :OR: ADFSATAPIOp_TransNone
+        MOV     r5,#10*100            ; 10 second timeout
+        SWI     XADFS_ATAPIOp
+        BVS     %FT90
+        TEQ     r0,#0                 ; not a disc error?
+        Pull    "r5,pc"               ; exit with V clear
+        ; Any disc error at this point is bound to be a timeout
+        MOV     r0,#DRIVERERROR__OTHER_TIMEOUT
+        SETV
+        Pull    "r5,pc"
+
+90      ; Error pointer returned from SWI - is it "Bad drive"?
+        LDR     r14,[r0]
+        LDR     r5,=ADFSBadDrive
+        TEQ     r14,r5
+        MOVEQ   r0,#DRIVERERROR__INVALID_PARAMETER
+        ; Otherwise (eg "Driver in use") pass error pointer back
+        Pull    "r5,pc"
+
+;------------------------------------------------------------------------------
+; ATAPI_RawOp - ATAPICONTROL__RAW_OP reason code
+;
+; on entry:
+;          r0 = b24 to b25 00 no data, 01 = read, 10=write, 11=reserved
+;               other bits reserved
+;          r1 =  length of control block
+;          r2 -> control block
+;          r3 -> start of transfer
+;          r4 =  length of transfer (in bytes)
+;          r5 =  timeout in cs (0 = default)
+;          r7 -> CDFS control block
+;
+; on exit:
+;          if OK then
+;             r3,r4 updated
+;             all other regs preserved
+;          if ERROR then
+;             r0 =  internal error number (DRIVERERROR range only)
+;             or r0 -> error block if r0 >= &1000
+;             r1,r2 may contain relevant information if SCSI error, else corrupted
+;
+; COMMENT:
+;         Doesn't do retries, it relies on ATAPI_Op or CDFSDriver to do them instead.
+;
+;------------------------------------------------------------------------------
+
+ATAPI_RawOp     ROUT
+        Push    "r0-r2,r14"
+ [ cdebug
+        Push    "r0-r4"
+        CDebug_WriteS   "ATAPI cmd:",cc
+00
+        LDRB    r4,[r2],#1
+        CDebug_StrReg2  " ",r4,cc
+        SUBS    r1,r1,#1
+        BNE     %B00
+        CDebug_NewLine
+        Pull    "r0-r4"
+ 
+ ]
+
+        MOV     r0,#0
+        MOV     r14,#0
+        Push    "r0,r14"
+        Push    "r0,r14"              ; create zeroed 16-byte block on stack
+
+        ADD     r14,r2,r1
+        ADD     r2,sp,r1
+01      LDRB    r0,[r14,#-1]!
+        STRB    r0,[r2,#-1]!          ; copy control block to stack
+        CMP     r2,sp
+        BHI     %BT01
+
+        BL      Extras_ConvertControlBlockToDrive  ; sets up r0
+        MOVVS   r0,#DRIVERERROR__SELECTION_TIMEOUT ; different error required
+        ADDVS   sp,sp,#16+12
+        Pull    "pc",VS
+
+        Push    "r0"                  ; save drive number for "Driver in use" retries
+        SWI     XOS_ReadMonotonicTime
+        TEQ     r5,#0
+        ADDNE   r0,r0,r5
+        ADDEQ   r0,r0,#1000
+        Push    "r0"                  ; save timeout for "Driver in use" retries
+        LDR     r0,[sp,#4]            ; get drive number back in r0
+
+        ADR     r14,DriveRecognisedStatus
+        LDRB    r14,[r14,r0]          ; get packet size for device
+        CMP     r1,r14
+        MOVLO   r1,r14                ; ensure we transfer at least that much
+
+10      ADR     r14,DriveCtlPrtDev
+        LDR     r0,[r14,r0,LSL#2]
+        LDR     r14,[sp,#8+16+0]
+        ORR     r0,r14,r0
+        SWI     XADFS_ATAPIOp
+        BVS     %FT90
+        ADD     sp,sp,#8+16
+        TEQ     r0,#0                 ; not a disc error?
+        Pull    "r0-r2,pc", EQ        ; exit with V clear
+
+        ; A disc error occurred - convert into appropriate internal error number
+        ; or SCSI error register set
+        ADD     sp,sp,#12
+        SETV
+        TEQ     r0,#WinIDEErrCmdBusy
+        TEQNE   r0,#WinIDEErrCmdNotRdy
+        MOVEQ   r0,#DRIVERERROR__SELECTION_TIMEOUT
+        Pull    "pc",EQ
+        TEQ     r0,#WinIDEErrWFT
+        TEQNE   r0,#WinIDEErrABRT
+        TEQNE   r0,#WinIDEErrPacket
+        MOVNE   r0,#DRIVERERROR__OTHER_TIMEOUT ; the only disc errors I expect here
+        Pull    "pc",NE                        ; are &22 or &23, but treat all
+                                               ; unexpected ones the same
+        ; Do a REQUEST SENSE command
+        Push    "r3-r6"
+        ADRAL   r6,%FT50              ; r6 = where to go if command fails
+        TEQ     r0,#WinIDEErrABRT
+        ADREQ   r6,%FT60
+        TEQ     r0,#WinIDEErrPacket
+        ADREQ   r6,%FT70
+        BL      Extras_ConvertControlBlockToDrive ; can't return error this time
+        ADR     r5,DriveCtlPrtDev
+        LDR     r0,[r5,r0,LSL#2]
+        ORR     r0,r0,#ADFSATAPIOp_TransRead
+        MOV     r14,#0                ; padding bytes must be 0
+        MOV     r5,#0
+        MOV     r4,#8:SHL:16          ; alloc length = 8, reserved = Flag = Link = 0
+        MOV     r3,#3:SHL:16          ; operation = REQUEST SENSE, LUN = reserved = 0
+        MOV     r2,#0
+        MOV     r1,#0
+        Push    "r1-r5,r14"           ; command block at sp+10,
+                                      ; result block at sp+1
+        MOV     r1,#12                ; actually a 6-byte comand, but padded
+        ADD     r2,sp,#10
+        ADD     r3,sp,#1
+        MOV     r4,#8+10                 ; result is 8 bytes long
+        MOV     r5,#0
+        SWI     XADFS_ATAPIOp
+
+        TEQ     r0,#0
+        SETV    NE                    ; if this call failed we have to fake up
+        MOVVS   pc,r6                 ; an appropriate error for the first call
+
+ [ cdebug
+        CDebug_WriteS   "AutoSense:",cc
+        MOV     r3,#8+10
+        ADD     r1, sp,#1
+00
+        LDRB    r4,[r1],#1
+        CDebug_StrReg2  " ",r4,cc
+        SUBS    r3,r3,#1
+        BNE     %B00
+        CDebug_NewLine
+ 
+ ]
+
+        MOV     r3,#0                 ; build 'segment number' here
+        MOV     r4,#0                 ; build filemark/EOM/ILI/sense key here
+
+        LDRB    r1,[sp,#1+0]          ; first stab at valid bit & error class/code
+        AND     r0,r1,#&7F            ; error class and code
+        TEQ     r0,#&70
+        TEQNE   r0,#&71
+        BICNE   r1,r1,#&80            ; these are only cases when r2 will be valid
+        CMP     r0,#&70
+        RSBCSS  r14,r0,#&73
+        MOVCC   r0,#16                ; can't find sense key - return "unknown"
+        BCC     %FT30
+        CMP     r0,#&72
+        LDRCCB  r4,[sp,#1+2]          ; fixed sense data format has sense key at +2
+        LDRCCB  r3,[sp,#1+1]          ; and segment number at +1
+        LDRCSB  r4,[sp,#1+1]          ; descriptor sense data just has sense key
+        AND     r0,r4,#15             ; extract sense key
+        MOVCS   r4,r0                 ; descriptor sense data has no filemark/EOM/ILI
+        CMP     r0,#0
+        MOVEQ   pc,r6                 ; if "no sense" we may want to fake again
+
+20      LDR     r2,[sp,#1+3]          ; r2 = information bytes (big-endian)
+        EOR     r14,r2,r2,ROR #16
+        BIC     r14,r14,#&FF0000
+        MOV     r2,r2,ROR #8
+        EOR     r2,r2,r14,LSR #8      ; now little-endian
+
+30      ; r0 = sense key (0-16)
+        ; r1 = valid bit & error class/code
+        ; r2 = information bytes
+        ; r3 = segment number
+        ; r4 = filemark/ROM/ILI/reserved/sense key
+        ORR     r1,r1,r0,LSL #8
+        ORR     r1,r3,r1,LSL #8
+        ORR     r1,r4,r1,LSL #8
+        ORR     r1,r1,#NoSense :SHL: 24 ; r1 is now as for SCSI_Op
+        ASSERT  sense_error_spacing = 12
+        ADD     r0,r0,r0,LSL #1
+        ADRL    r14,scsi_sense_0_error
+        ADD     r0,r14,r0,LSL #2      ; r0 -> error block, not yet looked up
+
+40      ADD     sp,sp,#24
+        SETV
+        Pull    "r3-r6,pc"
+
+50      ; REQUEST SENSE failed, or "no sense" returned, after WinIDEErrWFT
+        MOVVS   r4,#0                 ; can't suppose any filemark/EOM/ILI bits
+        ; else r4 already contains filemark/EOM/ILI (if applicable) and no sense bits
+        MOV     r0,#4                 ; sense key := hardware error
+        MOV     r1,#&70
+        MOV     r2,#0
+        MOV     r3,#0
+        ORR     r4,r4,r0
+        B       %BT30
+
+60      ; REQUEST SENSE failed, or "no sense" returned, after WinIDEErrABRT
+        MOVVS   r4,#0                 ; can't suppose any filemark/EOM/ILI bits
+        ; else r4 already contains filemark/EOM/ILI (if applicable) and no sense bits
+        MOV     r0,#11                ; sense key := aborted command
+        MOV     r1,#&70
+        MOV     r2,#0
+        MOV     r3,#0
+        ORR     r4,r4,r0
+        B       %BT30
+
+70      ; REQUEST SENSE failed, or "no sense" returned, after WinIDEErrPacket
+                                      ; here because of a "no sense"?
+        BVC     %BT20                 ; it's okay to report it in this case
+        MOV     r0,#DRIVERERROR__UK_SCSI_ERROR
+                                      ; this converts to "Compact disc is faulty"
+                                      ; or "Target status - Check condition"
+        B       %BT40
+
+90      ; Error pointer returned from first SWI
+        ; Is it "Bad drive" or "Driver in use"?
+        ; These are selection timeouts (we need to timeout the latter)
+        Push    "r5"
+        LDR     r14,[r0]
+        LDR     r5,=ADFSBadDrive
+        TEQ     r14,r5
+        MOVEQ   r0,#DRIVERERROR__SELECTION_TIMEOUT
+        BEQ     %FT95
+        ADD     r5,r5,#ADFSDriverInUse-ADFSBadDrive
+        TEQ     r14,r5
+        ; For other errors (eg "Bad address") pass error pointer back
+        BNE     %FT95
+        ; Check whether we've waited long enough to give up on "Driver in use"
+        MOV     r5,r0
+        SWI     XOS_ReadMonotonicTime
+        LDR     r14,[sp,#4+0]
+        CMP     r14,r0
+        Pull    "r5", PL              ; PL condition for clock arithmetic
+        LDRPL   r0,[sp,#4]
+        BPL     %BT10
+        MOV     r0,r5                 ; get back "Driver in use" error pointer
+        SETV
+95
+        Pull    "r5"
+        ADD     sp,sp,#8+16+4
+        Pull    "r1-r2,pc"
+
+; ============= Non-HAL case ==================================================
+ |
+
+; Routines in thisfile
+;           ATAPI_Control
+;           ATAPI_Op
+;           WaitForIRQ
+;           ATAPI_Reset
+;           ATAPI_CheckForDrive
+;           DoMicroDelay
+;           ATAPI_LockUnlockIDE
+;
+; ONLY EVER USE THE ATAPI_Control function with reason codes.
+; NEVER call the functions directly
+
+
+;------------------------------------------------------------------------------
+; ATAPI_Control
+;
+; on entry:
+;          r0 - r6 may be used depending on reason code in r8
+;          r7 -> CDFS control block
+;          r8 =  reason code (ATAPICONTROL__ ... )
+;         r12 -> workspace
+;         r13 -> FD stack
+;
+; on exit:
+;          r8 = corrupted (probably not - cpartington)
+;
+;          if OK then
+;                        all regs preserved
+;          if ERROR then
+;                        r0 =  error number
+;
+;------------------------------------------------------------------------------
+
+ATAPI_Control   ROUT
+
+        CMP     r8,#(ATAPIC_EndOfJumpTable - ATAPIC_StartOfJumpTable) / 4
+        BHS     ATAPIC_UnknownReason
+
+; reason code is valid so try to lock IDE registers
+
+        Push    "r0,r14"
+
+        MOV     r0,#1                   ; lock, not unlock
+        BL      ATAPI_LockUnlockIDE
+        ADDVS   sp,sp,#4                ; if error, discard stacked r0...
+        Pull    "pc",VS                 ; and return error
+
+; managed to lock IDE registers
+
+        Pull    "r0"                    ; get original r0
+        MOV     r14,pc                  ; set return address
+        ADD     pc,pc,r8,LSL #2         ; call routine
+
+; valid ops return here
+
+        B       %F90
+ATAPIC_StartOfJumpTable
+        B       ATAPI_Op
+        B       ATAPI_Reset
+ [ full_drive_detection
+        B       ATAPI_CheckForDrive
+ ]
+ATAPIC_EndOfJumpTable
+
+ATAPIC_UnknownReason
+;
+; Bad reason code
+
+        MOV     r0,#DRIVERERROR__UNKNOWN_REASON
+        MOV     r1,#0
+        SETV
+        MOV     pc,r14
+
+;;;;;;;;;;;;;;;;;
+
+90
+; return from ATAPI_Op or ATAPI_Reset
+; unlock IDE registers
+; original r14 on stack
+
+        BVS     %FT91
+        Push    "r0"                    ; save return code
+        MOV     r0,#0                   ; unlock, not lock
+        BL      ATAPI_LockUnlockIDE
+        CLRV
+        Pull    "r0,pc"                 ; return
+91
+        Push    "r0"                    ; save return code
+        MOV     r0,#0                   ; unlock, not lock
+        BL      ATAPI_LockUnlockIDE
+        SETV
+        Pull    "r0,pc"                 ; return
+
+;------------------------------------------------------------------------------
+; ATAPI_Op
+;
+; on entry:
+;          r0 = b0  to b7  reserved
+;               b24 to b25 00 no data, 01 = read, 10=write, 11=reserved
+;               b26        =0 if Command packet, =1 if identify command
+;               b27        =0 then use r7 pointer and convert to an IDE
+;                             drive number
+;               b28        =0 then retry, else don't retry
+;               b29 to 31  =0 reserved
+;          r1 =  length of control block (must be even value)
+;          r2 -> control block
+;          r3 -> start of transfer
+;          r4 =  length of transfer (in bytes)
+;          r7 -> CDFS control block
+;         r12 -> workspace
+;         r13 -> FD stack
+;
+; on exit:
+;          if OK then
+;             all other regs preserved
+;          if ERROR then
+;             r0 =  internal error number (sense key + flags)
+;
+;
+; COMMENT:
+;         If TargetError-Unit Attention or MediaChanged flag is set then this
+;         will do up to 3 retries as well as setting the disc changed flags.
+;
+;------------------------------------------------------------------------------
+
+ATAPI_Op        ROUT
+
+        Push    "r0-r10,r14"
+
+ [ cdebug
+        CDebug_Time
+        CDebug_StrReg8  ": Op ",r0,cc
+;;;;        CDebug_StrReg8  ", addr ",r3,cc
+        CDebug_StrReg8  ", len ",r4,cc
+        MOV     r1,#12
+00
+        LDRB    r0,[r2],#1
+        CDebug_StrReg2  " ",r0,cc
+        SUBS    r1,r1,#1
+        BNE     %B00
+        CDebug_NewLine
+        LDMIA   sp,{r0-r2}
+ ]
+
+        MOV        r6,r0
+
+; work out which drive (0/1) and OR the bit into r6 for reference
+
+        TST     r6,#ATAPIOP__DONT_USE_R7
+        BNE     AO_GotDrive
+
+        BL      Extras_ConvertControlBlockToDrive
+        MOVVS   r0,#DRIVERERROR__SELECTION_TIMEOUT
+        BVS     ACOD_ExitError
+
+        ORR     r6,r6,r0
+
+AO_GotDrive
+
+; Permanent register assignments:
+; r6 =  r0 on entry + bit 0 = drive 0 or 1
+; r7 =  length of control block
+; r8 -> CDB
+; r9 -> start of transfer
+; r10 = length of transfer
+
+        MOV     r7,r1
+        MOV     r8,r2
+        MOV     r9,r3
+        MOV     r10,r4
+
+; poll for !BSY and cause timeout error if it doesn't appear
+
+        SWI     XOS_ReadMonotonicTime
+        ADD     r5,r0,#TIMEOUT__SELECTION_PHASE         ; r5 = time to give up
+        LDR     r1,TBA                                  ; r1 -> IDE
+
+ [ :LNOT: bodge_sony_selection
+01
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r0,#STATUSFLAGS__BSY
+        BEQ     %F02                                    ; branch if !BSY
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                                   ; time to stop?
+        BLO     %B01                                    ; branch if not
+        B       %F04                                    ; give up
+
+;;;;;;;;;;;;;;;;;
+ ]
+
+02
+; drive is no longer busy - select it and check status again
+; r5 = time to abandon selection
+
+        TSTS    r6,#1                                   ; drive?
+        MOVEQ   r2,#DRIVESELECT__ALWAYS + DRIVESELECTBITS__DEVICE0
+        MOVNE   r2,#DRIVESELECT__ALWAYS + DRIVESELECTBITS__DEVICE1
+03
+        STRB    r2,[r1,#TASKFILE__W_DRIVE_SELECT]
+
+; wait for other status bits to become valid - 400ns
+
+        MOV     r0,#1*2                                 ; 1/2 us units
+        BL      DoMicroDelay
+
+; now check status
+
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+
+; don't check for DRDY (Panasonic CR571B and Sony CDU50E don't seem to set it)
+
+        TSTS    r0,#STATUSFLAGS__BSY :OR: STATUSFLAGS__DRQ
+        BEQ     %F05
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                                   ; time to stop?
+        BLO     %B03                                    ; branch if not
+04
+; timeout - drive is busy
+
+ [ cdebug
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        CDebug_StrReg2  " Drive not ready - status ",r0
+ ]
+ [ reset_on_drive_error
+        MOV     r0,#DRIVERERROR__SELECTION_TIMEOUT
+        B       drive_error
+ |
+        LDR     r0,[sp]                                 ; get back R0
+        TSTS    r0,#ATAPIOP__DONT_RETRY
+        MOV     r0,#DRIVERERROR__SELECTION_TIMEOUT
+        BNE     ACOD_DiscNotChanged
+        B       ACOD_ExitError
+ ]
+
+;;;;;;;;;;;;;;;;;
+
+05
+; drive is ready
+; r1 -> registers
+
+ [ bodge_50e_sole_drive
+
+; Enable IRQ in digital output (device control) register so can poll for it
+; in IOC - this is OK as the IRQ is not enabled. Ideally, would
+; enable/disable it around each access but this will now upset ADFS which
+; assumes it is always enabled
+
+        MOV     r0,#2_1000                              ; -SRST IEN
+        STRB    r0,[r1,#TASKFILE__W_DIGITAL_OUTPUT]
+ ]
+
+; send command to drive via task file registers
+
+        MOV     r0,#FEATUREBITS__PIO
+        STRB    r0,[r1,#TASKFILE__W_FEATURES]
+
+; Work out how much data to read/write
+
+        MOV     r0,#LARGEST_DATA_CHUNK_PLUS_ONE
+        SUB     r0,r0,#2
+        CMP     r10,r0
+        MOVLT   r0,r10
+
+; write this to byte count registers
+
+        STRB    r0,[r1,#TASKFILE__W_BYTE_COUNT_LOW]
+        MOV     r0,r0,LSR #8
+        STRB    r0,[r1,#TASKFILE__W_BYTE_COUNT_HIGH]
+
+; do a quick read of status register to clear any pending IRQ
+; shouldn't be necessary but may get us out of trouble later
+
+        LDRB    r0,[r1,#TASKFILE__R_STATUS]
+
+        TSTS    r6,#ATAPIOP__IDENTIFY_DEVICE
+        MOVEQ   r0,#IDE__ATAPI_PACKET_COMMAND
+        MOVNE   r0,#IDE__ATAPI_IDENTIFY_DEVICE
+        STRB    r0,[r1,# TASKFILE__W_COMMAND]
+
+  [ cdebug2
+        CDebug_StrReg2  " IDE command ",r0,cc
+        LDRB            r0,[r8]
+        CDebug_StrReg2  ", PCmd=",r0
+  ]
+
+; wait 400ns for BSY to become set
+
+        MOV     r0,#1*2                         ; 1/2 us units
+        BL      DoMicroDelay
+
+ [ faster_startup
+
+; if IDENTIFY device, skip wait for !BSY and DRQ and go straight to command
+; complete. Normal code should do this, not just faster_startup but only
+; faster_startup code shows problem because its timeouts are shorter
+
+        TSTS    r6,#ATAPIOP__IDENTIFY_DEVICE
+        BNE     ACOD_WaitForCommandComplete     ; branch if IDENTIFY
+
+ ]
+; need to send CDB to drive so wait for it to be not busy
+
+        SWI     XOS_ReadMonotonicTime
+        ADD     r5,r0,#TIMEOUT__OTHER                   ; r5 = time to give up
+11
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r0,#STATUSFLAGS__BSY
+        BEQ     %F12
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                                   ; time to stop?
+        BLO     %B11                                    ; branch if not
+
+ [ cdebug
+        CDebug_StrReg8  "drive BSY after command, r6=",r6,cc
+        LDRB            r0,[r8]
+        CDebug_StrReg2  ", PCmd=",r0
+ ]
+        B       %F14
+
+;;;;;;;;;;;;;;;;;
+
+12
+; drive no longer busy - wait 400ns and then look for DRQ (if required)
+
+        MOV     r0,#1*2                                 ; 1/2 us units
+        BL      DoMicroDelay
+
+ [ :LNOT: faster_startup
+
+; if IDENTIFY, move straight onto waiting for command complete (no CDB)
+; See comments above to see why this code is not necessary if faster_startup
+; is enabled
+
+        TSTS    r6,#ATAPIOP__IDENTIFY_DEVICE    ; identify?
+        BNE     ACOD_WaitForCommandComplete     ; branch if IDENTIFY
+ ]
+
+13
+; check if drive is "Interrupt DRQ" type and wait for IRQ if so
+; "Accelerated DRQ" drives do not provide an IRQ at this point
+
+        AND     r0,r6,#1                ; get drive number
+        ADR     r14,DriveFlags
+        LDRB    r0,[r14,r0]             ; get flags for this drive
+        TSTS    r0,#DriveFlag_InterruptDRQ
+        BLNE    WaitForIRQ              ; (r1,r5->r0,r2,r3,Z)
+        BNE     %F14                    ; branch if error
+16
+; now ready to look for DRQ for CDB
+
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r0,#STATUSFLAGS__DRQ
+        BNE     %F15                                    ; branch if got DRQ
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5
+        BLO     %B16
+
+ [ cdebug
+        CDebug_StrReg8  "No DRQ (CDB), r6=",r6,cc
+        LDRB            r0,[r8]
+        CDebug_StrReg2  ", PCmd=",r0
+ ]
+
+14
+; drive was busy or failed to assert DRQ
+
+ [ cdebug
+        CDebug_StrReg8  "BSY or no DRQ (CDB) or no IRQ, r6=",r6,cc
+        LDRB            r0,[r8]
+        CDebug_StrReg2  ", PCmd=",r0
+ ]
+        MOV     r0,#DRIVERERROR__OTHER_TIMEOUT
+ [ reset_on_drive_error
+        B       drive_error
+ |
+        B       ACOD_ExitError
+ ]
+
+;;;;;;;;;;;;;;;;;
+
+15
+; got DRQ - send command block via data register
+
+        MOV     r5,r7           ; r5 = length of CDB
+        LDR     r1,TBA          ; r1 -> task file registers
+        ASSERT  TASKFILE__W_DATA = 0
+        MOV     r2,r8           ; r2 -> CDB
+
+ [ cdebug
+        TEQS    r5,#12
+        BEQ     %F01
+        CDebug_StrReg8     "CDB wrong size, ",r5
+01
+ ]
+
+ACOD_SendLoop
+        LDRB    r3,[r2],#1
+        LDRB    r4,[r2],#1
+
+; RISC PC doesn't like it if you put debugging here - MEW
+
+        ORR     r3,r3,r4,LSL #8
+        ORR     r3,r3,r3,LSL #16        ; RISC PC uses top, A5000 uses bottom
+        STR     r3,[r1]
+
+        SUBS    r5,r5,#2
+        BGT     ACOD_SendLoop
+
+; wait 5us (same time as ATA spec says for first sector of a write command)
+; to allow BSY to become set.
+
+        MOV     r0,#5*2                         ; 1/2 us units
+        BL      DoMicroDelay
+
+ACOD_WaitForCommandComplete
+
+        SWI     XOS_ReadMonotonicTime
+ [ long_command_timeout
+        ADD     r5,r0,#TIMEOUT__COMMAND_COMPLETE
+ |
+        ADD     r5,r0,#512                      ; MEW says NEC needs this long
+ ]
+        LDR     r1,TBA
+        BL      WaitForIRQ              ; (r1,r5->r0,r2,r3,Z)
+ [ cdebug
+        BEQ     %F01
+        CDebug_StrReg8  "No IRQ for cmd ",r6,cc
+        LDRB            r0,[r8]
+        CDebug_StrReg2  ", PCmd=",r0
+01
+ ]
+        MOVNE   r0,#DRIVERERROR__OTHER_TIMEOUT  ; NE => error
+ [ reset_on_drive_error
+        BNE     drive_error
+ |
+        BNE     ACOD_ExitError
+ ]
+
+; IRQ appeared and was cleared
+
+        LDR     r2,[r1,#TASKFILE__R_ALTERNATE_STATUS]   ; get updated status
+
+; data transfer requested?
+
+        TSTS    r6,#2_11:SHL:24
+        BEQ     ACOD_ExitOK             ; branch if no data transfer requested
+
+; check that BSY is clear
+
+        TSTS    r2,#STATUSFLAGS__BSY
+        BEQ     %F64
+
+; drive was busy following the IRQ - it should not be
+; It *can't* be safe just to look for (and clear) another IRQ as MEW did
+
+ [ cdebug
+        CDebug_StrReg2  "BSYIRQ ",r2
+ ]
+        MOV     r0,#DRIVERERROR__OTHER_TIMEOUT
+ [ reset_on_drive_error
+        B       drive_error
+ |
+        B       ACOD_ExitError
+ ]
+64
+; BSY is clear - check for error
+; r2 = status
+
+        TSTS    r2,#STATUSFLAGS__CHECK          ; error?
+        LDRNEB  r0,[r1,#TASKFILE__R_ERROR]      ; yes get error bits
+        BNE     ACOD_ExitError
+
+; any data to be read out of/copied into drive?
+
+        TSTS    r2,#STATUSFLAGS__DRQ
+        BEQ     ACOD_ExitOK             ; branch if no data
+
+; set r5 = how much data drive wants to send/receive
+
+        LDR     r1,TBA
+        LDRB    r14,[r1,#TASKFILE__R_BYTE_COUNT_LOW]
+        LDRB    r3,[r1,#TASKFILE__R_BYTE_COUNT_HIGH]
+        ORRS    r5,r14,r3,LSL #8
+
+ [ cdebug2
+        CDebug_StrReg4  "bytes in drive=",r5
+ ]
+        BEQ     ACOD_ExitOK             ; branch if no data in drive
+
+ [ fix_cr571b10e_maybe
+
+; read the alternate status register to try to work around the
+; bug in the Panasonic CR571B 1.0e
+
+        LDRB    r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+ ]
+
+; read the data in
+
+        LDR     r1,TBA
+        ASSERT  TASKFILE__R_DATA = 0
+
+; r0 =  temp
+; r1 -> task file data register
+; r2 =
+; r5 =  bytes remaining from drive/expected by drive
+; r6+   used
+
+        MOV     r4,r5
+
+; write data out ?
+
+        AND     r14,r6,#2_11:SHL:24
+        TEQS    r14,#writedata
+        BEQ     AR_WriteDataToDrive
+
+; Make sure that it's not returning more data than we want
+; r10 = length of transfer
+
+        CMPS    r5,r10
+        MOVGT   r5,r10
+ [ cdebug
+        CDebug_StrReg4   "copy ",r5
+ ]
+ [ cdebug
+        LDR     r0,inbytes
+        ADD     r0,r0,r5
+        STR     r0,inbytes
+ ]
+
+; fall through
+
+        ROUT
+
+; Improved data copy routine - MEWs did not copy last 32 bytes in optimised
+; loop and this happens on every transfer.
+; r1 -> data register
+; r4 = bytes in drive
+; r5 = bytes to copy into buffer
+; r9 -> buffer
+; r10 = bytes requested
+
+; if fewer than 32 bytes to copy, do it slowly -  the '+2' is in case we
+; have to word align the transfer before starting
+
+        CMPS    r5,#(8*4) + 2
+        BLT     %F20            ; slow copy
+
+; check for odd alignment - fast code can't currently handle this
+
+        TSTS    r9,#1
+        BNE     %F20            ; slow copy
+
+; word align if necessary for faster copy
+
+        TSTS    r9,#2           ; half-word aligned
+        LDRNE   r0,[r1]         ; align it if so
+        STRNEB  r0,[r9],#1
+        MOVNE   r0,r0,LSR #8
+        STRNEB  r0,[r9],#1
+        SUBNE   r5,r5,#2
+
+; The main loop does 8*4 bytes per iteration.
+; We know, by here, that the destination address is word-aligned.
+; r1 -> data register
+; r4 = bytes in drive
+; r5 = bytes to copy into buffer
+; r9 -> buffer
+; r10 = bytes requested
+;
+; The following registers are destroyed by this copy
+; r0, r14, r2, r3, r4, r6, r7, r8, r10
+;
+; save registers we must not destroy before starting
+
+        Push    "r2,r4,r6,r7,r8,r10"
+
+        SUB     r5,r5,#8*4              ; number of bytes per loop
+10
+        LDR     r0,[r1,#2]              ; data in b16..31
+        LDR     r14,[r1]                ; data in b0..15
+        MOV     r14,r14,LSL #16         ; move to b16..31 clearing b0..15
+        ORR     r0,r14,r0,LSR #16       ; bring in first 16 bits as b0..15
+
+        LDR     r2,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r2,r14,r2,LSR #16
+
+        LDR     r3,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r3,r14,r3,LSR #16
+
+        LDR     r4,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r4,r14,r4,LSR #16
+
+        LDR     r6,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r6,r14,r6,LSR #16
+
+        LDR     r7,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r7,r14,r7,LSR #16
+
+        LDR     r8,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r8,r14,r8,LSR #16
+
+        LDR     r10,[r1,#2]
+        LDR     r14,[r1]
+        MOV     r14,r14,LSL #16
+        ORR     r10,r14,r10,LSR #16
+
+        STMIA   r9!,{r0,r2,r3,r4,r6,r7,r8,r10}
+
+        SUBS    r5,r5,#8*4              ; number of bytes per loop
+        BGE     %B10
+
+        Pull    "r2,r4,r6,r7,r8,r10"
+
+; r5 now contains 0 (copy was multiple of 32 bytes) or <0 (copy was NOT
+; multiple of 32 bytes) and flags will reflect this. If <0, need to copy
+; remainder
+
+        ADDLT   r5,r5,#8*4
+
+; copied as much as we can in large chunks
+
+20
+; copy remaining data a byte at a time
+
+        SUBS    r5,r5,#1
+        LDRGE   r0,[r1]
+        STRGEB  r0,[r9],#1
+        SUBGES  r5,r5,#1
+        MOVGE   r0,r0,LSR #8
+        STRGEB  r0,[r9],#1
+        BGT     %B20
+
+ACOD_AnyMoreData
+
+; discard any unwanted data sitting in the drive
+; r4 = bytes drive wanted to send
+; r10 = desired transfer
+
+        SUBS    r5,r4,r10
+
+; r5 = bytes in drive - buffer size = bytes to discard
+
+ [ cdebug
+        BLE     %F00
+        CDebug_StrReg8  "Discard ",r5
+00
+ ]
+
+40
+; be careful only to read drive if necessary; in particular watch out for
+; odd transfer lengths e.g. drive wants 512 bytes read, caller only wants
+; 511 bytes transferred => no more data to read
+
+        SUBGTS  r5,r5,#2
+        LDRGE   r0,[r1]
+        BGT     %B40
+
+        SUBS    r10,r10,r4      ; r10 = buf size - bytes in drive
+        MOVLT   r10,#0
+
+; if IDENTIFY, there is no final interrupt without data transfer
+; so don't go looking for it
+
+        TSTS    r6,#ATAPIOP__IDENTIFY_DEVICE
+        BEQ     ACOD_WaitForCommandComplete     ; branch if not IDENTIFY
+
+ACOD_ExitOK
+
+; Get the status and sensekey bytes
+
+        CLRV
+        LDR     r1,TBA
+        LDRB    r3,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r3,#STATUSFLAGS__CHECK
+        Pull    "r0-r10,pc",EQ          ; exit VC if no error
+
+; error
+
+        LDRB    r0,[r1,#TASKFILE__R_ERROR]      ; get error status
+ [ cdebug2
+        CDebug_StrReg8  "#EReg ",r0
+ ]
+
+;----------------------------------------------------------------
+ACOD_ExitError
+;----------------------------------------------------------------
+
+; r0 = Internal error number
+
+ [ cdebug
+        CDebug_Time
+        CDebug_StrReg8  ": #err ",r0,cc
+        LDR     r14,[sp]                ; get original r0
+        CDebug_StrReg8  ", op=",r14,cc
+        LDR     r2,[sp,#2*4]            ; get original r2
+        MOV     r1,#12
+00
+        LDRB    r14,[r2],#1
+        CDebug_StrReg2  " ",r14,cc
+        SUBS    r1,r1,#1
+        BNE     %B00
+        CDebug_NewLine
+ ]
+
+; Does the error signal a disc change ?
+
+        BIC     r14,r0,#(1:SHL:ZERRORFLAGS__SENSEKEY_SHIFT) - 1
+        TEQ     r14,#TARGETERROR__UNIT_ATTENTION
+
+; with door open, drive keeps returning NOT_READY
+; if this is not treated as disc change, CDFS doesn't
+; seem to notice - cpartington
+
+        TEQNE   r14,#TARGETERROR__NOT_READY
+        EORNE   r14,r0,#ZERRORFLAGS__MCR
+        TSTNE   r14,#ZERRORFLAGS__MCR
+        BNE     ACOD_DiscNotChanged              ; branch if not disc changed
+
+; disc has changed (well, unit attention or not ready)
+
+change_of_disc
+
+; r0 = internal error number
+; r6 = r0 on entry + bit 0 = drive 0 or 1
+
+ [ cdebug
+        CDebug_StrReg8  "change of disc? ",r0,cc
+        LDR     r14,[sp]                ; get original r0
+        CDebug_StrReg8  ", op=",r14,cc
+        LDR     r2,[sp,#2*4]            ; get original r2
+        MOV     r1,#12
+00
+        LDRB    r14,[r2],#1
+        CDebug_StrReg2  " ",r14,cc
+        SUBS    r1,r1,#1
+        BNE     %B00
+        CDebug_NewLine
+ ]
+ [ fix_slow_when_no_drives
+
+; if IDENTIFY, don't retry as drive probably not there
+
+        TSTS    r6,#ATAPIOP__IDENTIFY_DEVICE
+        BNE     ACOD_DiscNotChanged             ; branch if it is IDENTIFY
+ ]
+
+ [ cdebug
+        CDebug_WriteS   "disc changed...",cc
+ ]
+
+; Check the number of retries currently performed
+
+        MOV     r14,SWIN,LSR #30
+        ADD     r14,r14,#1
+        CMP     r14,#3
+ [ cdebug
+        BLE     %F01
+        CDebug_WriteS   "fail"
+01
+ ]
+        BGT     ACOD_DiscNotChanged
+
+        ADD     SWIN,SWIN,#1:SHL:30
+
+; set the disc changed flag
+
+        AND     r0,r6,#MAX_NUMBER_OF_ATAPI_DRIVES - 1
+        BL      Extras_SetDiscChanged
+
+; The drawer must be unlocked
+
+        MOV     r1,#0
+        BL      Extras_SetDrawerStatus
+
+ [ cdebug
+        CDebug_WriteS   "retry"
+ ]
+        Pull    "r0-r10,r14"            ; yes
+        B       ATAPI_Op
+
+;;;;;;;;;;;;;;;;;
+
+ACOD_DiscNotChanged
+
+        SETV
+        ADD     r13, r13, #4
+        Pull    "r1-r10,pc"
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+drive_error     ROUT
+;
+; Drive failed to respond in way defined by specification
+; Reset it and return disc changed
+; Original entry registers to ATAPI_Op are on stack
+; r0 = error
+
+        Push    "r0"
+        LDR     r0,[sp,#4+0*4]          ; get stacked r0
+        LDR     r7,[sp,#4+7*4]          ; get stacked r7
+        BL      ATAPI_Reset
+        Pull    "r0"
+        B       change_of_disc
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+AR_WriteDataToDrive     ROUT
+;
+; Send data to the drive.  Only used by ModeSelect so it doesn't
+; have to be particularly quick.  This assumes that an even
+; amount of data will be written out, which is fair enough.
+; r1 -> 16 bit IDE data register
+; r4  = amount to send to the drive (must keep)
+; r5  = amount to send to the drive (can corrupt)
+; r9 -> start of transfer
+
+ [ cdebug
+        CDebug_WriteS "data out",cc
+ ]
+
+10
+        LDRB    r0,[r9],#1
+        LDRB    r2,[r9],#1
+        ORR     r0,r0,r2,LSL #8
+        ORR     r0,r0,r0,LSL #16
+        STR     r0,[r1]
+ [ cdebug
+        CDebug_StrReg4  " ",r0,cc
+ ]
+        SUBS    r5,r5,#2
+        BGT     %B10
+
+ [ cdebug
+        CDebug_NewLine
+ ]
+
+; now go and wait for the interrupt for this command
+
+        B       ACOD_WaitForCommandComplete
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+WaitForIRQ      ROUT
+;
+; Wait for IRQ and clear it before returning
+;
+; Entry:
+;    r1 -> task file registers
+;    r5 = time to abort
+;
+; Exit:
+;    NE => no IRQ, or wouldn't clear, or error
+;    EQ => IRQ appeared and was cleared OK
+;       r0 undefined
+;       r2 undefined
+;       r3 undefined
+
+        STMFD   sp!,{r14}
+
+        LDR     r1,TBA
+        LDR     r3,=IRQB__INTERRUPT_STATUS
+        LDR     r2,IrqFlag
+20
+        LDRB    r0,[r3]
+        TSTS    r0,r2                   ; IRQ?
+        BNE     %F22                    ; branch if yes
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                   ; time to quit?
+        BLO     %B20                    ; branch if no
+
+ [ cdebug
+        CDebug_Time
+        CDebug_WriteS   ": No IRQ"
+ ]
+
+; no IRQ before timeout
+
+        CMP     pc, #0
+        LDMFD   sp!,{pc}                ; return NE
+
+;;;;;;;;;;;;;;;;;
+22
+; got an IRQ - clear it and wait for it to clear
+; r1 -> task file registers
+; r2 = bit to test in IRQ flag
+; r3 -> IRQ flag
+; r5 = time to give up
+
+        LDRB    r0,[r1,#TASKFILE__R_STATUS]     ; clears IRQ
+ [ cdebug2
+        CDebug_StrReg2   "IRQ ",r0
+ ]
+
+; wait for IRQ to disappear
+26
+        LDRB    r0,[r3]
+        TSTS    r0,r2                   ; IRQ?
+        BEQ     %F27                    ; branch if no
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                   ; time to quit?
+        BLO     %B26                    ; branch if no
+
+ [ cdebug
+        CDebug_WriteS   "IRQ would not clear"
+ ]
+; drive did not deassert IRQ before timeout
+
+        CMP     pc, #0
+        LDMFD   sp!,{pc}                ; return NE
+;;;;;;;;;;;;;;;;;
+27
+; IRQ cleared - wait for !BSY
+
+        LDRB    r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r0,#STATUSFLAGS__BSY
+        BNE     %FT28
+ [ extra_delay_after_irq
+        MOV     r0,#1*2                 ; if !BSY, wait > 400ns for other...
+        BL      DoMicroDelay            ; ...status bits to become valid...
+ ]
+        CMP     r0, r0
+        LDMFD   sp!,{pc}                ; ...and return EQ
+28      SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                   ; time to quit?
+        BLO     %B27                    ; branch if no
+
+ [ cdebug
+        CDebug_WriteS   "drive BSY after IRQ"
+ ]
+; drive did not clear BSY after IRQ
+
+        CMP     pc, #0
+        LDMFD   sp!,{pc}                ; return NE
+
+;------------------------------------------------------------------------------
+
+        LTORG
+
+;------------------------------------------------------------------------------
+; ATAPI_Reset
+;
+; on entry:
+;          r0 =  flags
+;               b0         = drive number bit or use r7 if b27 is clear
+;               b27        =0 then use r7 pointer and convert to an IDE drive number
+;          r7 -> CDFS control block
+;         r12 -> workspace
+;         r13 -> FD stack
+;
+; on exit:
+;         all registers preserved except r0, error may be returned if drive not known
+;
+;------------------------------------------------------------------------------
+
+ATAPI_Reset     ROUT
+
+ [ cdebug
+        CDebug_Time
+        CDebug_WriteS   ": Reset.."
+ ]
+        Push    "r0-r2,r14"
+
+; work out which drive to use
+
+        TSTS    r0,#ATAPIOP__DONT_USE_R7
+        BNE     %F10
+
+        BL      Extras_ConvertControlBlockToDrive
+        Pull    "r0-r2,pc",VS                   ; return error if bad drive
+10
+; drive bit in r0
+; select drive, ignoring BSY status
+
+        LDR     r1,TBA                  ; r1 -> task file
+
+        TSTS    r0,#1
+        MOVEQ   r0,#DRIVESELECT__ALWAYS + DRIVESELECTBITS__DEVICE0
+        MOVNE   r0,#DRIVESELECT__ALWAYS + DRIVESELECTBITS__DEVICE1
+        STRB    r0,[r1,#TASKFILE__W_DRIVE_SELECT]
+
+; ATAPI soft reset
+
+        MOV     r0,#IDE__ATAPI_SOFT_RESET
+        STRB    r0,[r1,#TASKFILE__W_COMMAND]
+
+; wait for up to 10 seconds for drive to be not BSY
+
+        SWI     XOS_ReadMonotonicTime
+        ADD     r2,r0,#TIMEOUT__RESET_RECOVERY  ; r2 = finish time
+
+20
+        LDRB    r0,[r1,#TASKFILE__R_STATUS]     ; get status
+        TSTS    r0,#STATUSFLAGS__BSY            ; busy?
+        BEQ     %F30                            ; branch if not
+
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r2                           ; time to give up?
+        BLO     %B20                            ; branch if not
+30
+; either: drive is not busy or we've waited too long
+; return OK
+
+        CLRV
+        Pull    "r0-r2,pc"
+
+;------------------------------------------------------------------------------
+
+ [ full_drive_detection
+
+; ATAPI_CheckForDrive
+;
+; This routine checks to see if a particular drive is an ATAPI drive by
+; looking for the special signature in the cylinder/byte_count registers.
+; NOTE: this also enables the IRQ output from the drive.
+;
+; Entry:
+;       r0 = b0 = ATA drive number
+;       r12 -> workspace
+;       r13 -> stack
+;
+; Exit:
+;       VC => this drive is an ATAPI drive
+;       VS => this drive is NOT an ATAPI drive or we couldn't do the stuff
+;             necessary to determine it
+;       Would like to have used Z flag but calling sequence only passes V
+;       back to caller
+;       Other flags undefined
+;       All registers preserved
+;
+;------------------------------------------------------------------------------
+
+ATAPI_CheckForDrive     ROUT
+
+ [ cdebug2
+        CDebug_StrReg2  "CheckForDrive ",r0
+ ]
+        Push    "r0-r2,r5,r14"
+
+        LDR     r1,TBA                          ; r1 -> IDE registers
+        MOV     r2,r0,LSL #4                    ; put drive bit in place
+        ORR     r2,r2,#DRIVESELECT__ALWAYS      ; mandatory bits
+        SWI     XOS_ReadMonotonicTime
+        ADD     r5,r0,#TIMEOUT__SELECTION_PHASE ; r5 = time to give up
+
+; r1 -> IDE registers
+; r2 = drive selection value
+; r5 = time to abandon selection
+
+ [ :LNOT: bodge_sony_selection
+
+; poll for !BSY before selecting drive - ATA requirement
+
+05
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r0,#STATUSFLAGS__BSY
+        BEQ     %F08                            ; branch if not busy
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                           ; time to stop?
+        BLO     %B05
+
+; drive stayed busy so give up
+
+ [ cdebug
+        CDebug_WriteS   "Drive busy (1)"
+ ]
+        SETV
+        Pull    "r0-r2,r5,pc"
+
+;;;;;;;;;;;;;;;;;
+08
+ ]
+
+10
+; select drive
+; r2 = drive selection value
+
+        STRB    r2,[r1,#TASKFILE__W_DRIVE_SELECT]
+
+; wait for other status bits (and regs?) to become valid - 400ns
+
+        MOV     r0,#1*2                         ; 1/2 us units
+        BL      DoMicroDelay
+
+; have tried to select drive - check status
+
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+
+; want BSY=0 - ignore DRDY
+
+        TSTS    r0,#STATUSFLAGS__BSY
+        BEQ     %F30
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                           ; time to stop?
+        BLO     %B10                            ; branch if not
+
+; timeout - drive is busy
+
+ [ cdebug
+        CDebug_WriteS   "Drive busy (2)"
+ ]
+        SETV
+        Pull    "r0-r2,r5,pc"
+
+;;;;;;;;;;;;;;;;;
+
+30
+; drive is not busy
+; if DRDY=0, check signature in cylinder selection registers
+; Spec seems to suggest that even if DRDY=1 we should check signature but
+; this could lead to false detection with a hard disc whose last access left
+; the cylinder registers containing the signature. Anyway, issuing the
+; IDENTIFY should sort things out.
+
+ [ cdebug
+        CDebug_StrReg2  "Status after drive select = ",r0
+ ]
+        TSTS    r0,#STATUSFLAGS__DRDY           ; if DRDY=1
+ [ cdebug
+        BEQ     %F00
+        CDebug_WriteS   "DRDY=1 so skipping to IDENTIFY"
+00
+ ]
+        BNE     %F35                            ; ...skip to IDENTIFY
+        LDRB    r0,[r1,#TASKFILE__W_BYTE_COUNT_LOW]
+        CMPS    r0,#ATAPI_Signature :AND: &FF
+        LDREQB  r14,[r1,#TASKFILE__W_BYTE_COUNT_HIGH]
+        TEQEQS  r14,#ATAPI_Signature >> 8
+ [ cdebug
+        BNE     %F00
+        CDebug_WriteS   "Signature found (1)"
+00
+ ]
+        Pull    "r0-r2,r5,pc",EQ                ; if signature found, return VC
+
+ [ cdebug
+        CDebug_StrReg2  "Signature not found (1): ",r14,cc
+        CDebug_StrReg2  " ",r0
+ ]
+
+35
+; either DRDY=1 or signature is not present so issue an ATA IDENTIFY to
+; cause drive to reset its registers and try again
+
+ [ cdebug
+        CDebug_WriteS   "ATA IDENTIFY"
+ ]
+        MOV     r0,#FEATUREBITS__PIO
+        STRB    r0,[r1,#TASKFILE__W_FEATURES]
+
+; do a quick read of status register to clear any pending IRQ
+; shouldn't be necessary but may get us out of trouble later
+
+        LDRB    r0,[r1,#TASKFILE__R_STATUS]
+
+; now send the command to the drive
+
+        MOV     r0,#IDE__IDENTIFY
+        STRB    r0,[r1,#TASKFILE__W_COMMAND]
+
+; wait 400ns for BSY to be asserted
+
+        MOV     r0,#1*2                         ; 1/2 us units
+        BL      DoMicroDelay
+
+; wait for BSY to be deasserted
+
+        SWI     XOS_ReadMonotonicTime
+        ADD     r5,r0,#TIMEOUT__COMMAND_COMPLETE        ; r5 = time to give up
+40
+        LDR     r0,[r1,#TASKFILE__R_ALTERNATE_STATUS]
+        TSTS    r0,#STATUSFLAGS__BSY
+        BEQ     %F50
+        SWI     XOS_ReadMonotonicTime
+        CMPS    r0,r5                           ; time to stop?
+        BLO     %B40                            ; branch if not
+
+; drive did not deassert BSY
+
+ [ cdebug
+        CDebug_WriteS   "Drive busy (3)"
+ ]
+        SETV
+        Pull    "r0-r2,r5,pc"                   ; return VS
+
+;;;;;;;;;;;;;;;;;
+50
+; drive no longer busy - wait 400ns and then check status
+
+        MOV     r0,#1*2                         ; 1/2 us units
+        BL      DoMicroDelay
+
+        LDR     r0,[r1,#TASKFILE__R_STATUS]     ; also clears IRQ
+ [ cdebug
+        CDebug_StrReg2  "ATA IDENTIFY status ",r0
+ ]
+        TSTS    r0,#STATUSFLAGS__CHECK          ; error?
+        BNE     %F70                            ; branch if so
+
+; no error - ATAPI devices should cause an error but we don't really care;
+; the catch is that we now have to read any data that the drive has returned
+
+        TSTS    r0,#STATUSFLAGS__DRQ            ; data waiting?
+        BNE     %F70                            ; branch if not
+
+; OK: read 512 bytes and then move on
+
+        MOV     r0,#512
+60
+        LDR     r14,[r1,#TASKFILE__R_DATA]      ; get 16 bits
+        SUBS    r0,r0,#2
+        BNE     %B60
+70
+; IDENTIFY caused error or there was no data or we've read the data
+; Now look for the ATAPI signature again
+
+        LDRB    r0,[r1,#TASKFILE__W_BYTE_COUNT_LOW]
+        CMPS    r0,#ATAPI_Signature :AND: &FF
+        LDREQB  r14,[r1,#TASKFILE__W_BYTE_COUNT_HIGH]
+        TEQEQS  r14,#ATAPI_Signature >> 8
+ [ cdebug
+        BNE     %F00
+        CDebug_WriteS   "Signature found (2)"
+        B       %F01
+00
+        CDebug_StrReg2  "Signature not found (2): ",r14,cc
+        CDebug_StrReg2  " ",r0
+01
+ ]
+        SETV    NE ; otherwise V is left clear
+        Pull    "r0-r2,r5,pc"
+ ]
+
+;------------------------------------------------------------------------------
+;
+; DoMicroDelay
+;
+; Delay a specified number of 1/2 microsecond units.
+; Code courtesy of Tim Dobson.
+;
+; Entry:
+;   r0 = number of 1/2 microsecond units to wait
+;   MODE: SVC or IRQ
+;   IRQ state: undefined
+;
+; Exit:
+;   r0 undefined
+;   All other registers preserved
+;
+;------------------------------------------------------------------------------
+
+DoMicroDelay  ROUT
+
+        Push    "r1,r2,r14"
+
+        MOV     r2,#IOC                 ; R2 -> IOC
+        STRB    r0,[r2,#Timer0LR]       ; copies counter to output latch
+        LDRB    r1,[r2,#Timer0CL]       ; R1 = low output latch
+
+; loop waiting for counter to change (decremented at 2MHz)
+10
+        STRB    r0,[r2,#Timer0LR]       ; copies counter to output latch
+        LDRB    r14,[r2,#Timer0CL]      ; LR = low output latch
+        TEQS    r1,r14                  ; has counter changed?
+        BEQ     %BT10                   ; else wait for it to change
+
+; counter has changed, decrement our count of ticks
+
+        MOV     r1,r14                  ; update copy of counter
+        SUBS    r0,r0,#1                ; decrement ticks
+        BNE     %BT10                   ; ...and continue if not done
+
+; delay has expired
+
+        Pull    "r1,r2,pc"
+
+;------------------------------------------------------------------------------
+; ATAPI_LockUnlockIDE
+;
+; on entry:
+;          r0 = 0 to unlock, 1 to lock
+;         r12 -> workspace
+;         r13 -> FD stack
+;
+; on exit:
+;         all regs preserved
+;
+;         if OK then
+;            VC and all other regs preserved
+;         if ERROR then
+;            VS and r0 -> error block
+;
+;
+; COMMENT:
+;         IDE registers must be locked to avoid our corrupting ADFS commands
+;         in progress and vice versa.
+;------------------------------------------------------------------------------
+
+
+ATAPI_LockUnlockIDE
+
+        Push       "r0-r6, r14"
+
+        MySTRIM    "e"
+        DisplayNewLine
+
+        MOV        r6, r0
+
+; ADFS_LockIDE not supported
+        LDRB       r14, UseLockSWI
+        TEQ        r14, # TRUE
+        BNE        ALU_HackLockFlag                  ; not supported
+
+
+        SWI        XOS_ReadMonotonicTime
+        MOV        r2, r0
+
+; r6 = reason code 0 or 1
+; r2 = start time
+
+ALU_Loop
+        AND        r0, r6, # 2_01               ; only want bit 0
+        SWI        XADFS_LockIDE
+
+        BVC        ALU_ExitOK
+
+; Error occured
+        LDR        r14, [ r0, # 0 ]
+        SUB        r14, r14, #&008a0           ; &108a0
+        SUBS       r14, r14, #&10000           ; Driver in use error, so try again
+        BNE        ALU_Error
+
+        MOV     r5,r0           ; save error pointer
+
+; Timeout ?
+        SWI        XOS_ReadMonotonicTime
+        SUB        r0, r0, r2
+        CMP        r0, # 1*100
+        BLT        ALU_Loop
+
+; Timeout error
+        MOV     r0,r5           ; restore error pointer
+
+ALU_Error
+        SETV
+        STR        r0, [ r13 ]
+        Pull       "r0-r6, pc"
+
+ALU_ExitOK
+        CLRV
+        Pull       "r0-r6, pc"
+
+
+
+;----------------------------------------------------------------
+; Lock the IDE registers by writing directly into ADFS workspace
+;----------------------------------------------------------------
+
+ALU_HackLockFlag
+
+
+; Get the address of ADFS workspace
+        MOV        r0, #ModHandReason_LookupName
+        ADR        r1, ALU_ADFS
+        SWI        XOS_Module
+
+; If the error is 258, 'Module not found' then hooray there's no ADFS to worry about
+        LDRVS      r0, [ r0 ]
+        TEQVC      r0, r0
+
+        MOVVS      r14, # &100         ; r14 = error number
+        ADDVS      r14, r14, # &002
+        TEQVS      r0, r14
+
+; Problem calling XOS_Module, so exit with error
+        BNE        ALU_Error
+
+; Couldn't find ADFS module, so exit OK
+        BVS        ALU_ExitOK
+
+; Make sure workspace pointer is reasonable
+        TEQ        r4, # 0
+        BEQ        ALU_ExitOK
+
+; Hack hack hack
+        SWI        XOS_ReadMonotonicTime
+        MOV        r2, r0
+
+        LDR        r14, =&197
+        ADD        r4, r4, r14
+
+; r2 = start time
+; r4 -> ADFS lock flag BYTE
+; r5 = temp
+; r6 = reason code 0 or 1
+
+; Disable interrupts
+        WritePSRc  I_bit + SVC_mode, r0
+
+; Unlock the registers
+        TST        r6, # 1
+        MOVEQ      r14, # 0
+        STREQB     r14, [ r4 ]
+
+; Reenable interrupts
+        WritePSRc  SVC_mode, r0
+
+        TST        r6, # 1
+        BEQ        ALU_ExitOK
+
+
+ALU_HackLoop
+
+; Disable interrupts
+        WritePSRc  I_bit + SVC_mode, r0
+
+; Lock the registers
+
+        MOV        r5, # 0
+
+        LDRB       r0, [ r4 ]
+        TEQ        r0, # 0
+        MOVEQ      r5, # 1
+        STREQB     r5, [ r4 ]
+
+; Reenable interrupts
+        WritePSRc  SVC_mode, r0
+
+        TEQ        r5, # 1
+        BEQ        ALU_ExitOK
+
+; Timeout ?
+        SWI        XOS_ReadMonotonicTime
+        SUB        r0, r0, r2
+        CMP        r0, # 1*100
+        BLT        ALU_HackLoop
+
+; Timeout error
+        MOV        r0, # DRIVERERROR__OTHER_TIMEOUT
+        B          ALU_Error
+;;;;;;;;;;;;;;;;;;;;
+
+; ADFS module name, used to find workspace pointer
+ALU_ADFS
+        DCB        "ADFS", 0
+        ALIGN
+
+;------------------------------------------------------------------------------
+
+ ] ; end big HAL switch
+
+ END

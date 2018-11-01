@@ -1,0 +1,895 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+;
+; MT, May/June 1994.
+;
+; Code fragments used to convert from 1/2/4/8 channels of
+; 8-bit mu-law sound in the "logical" buffer, to 2 channels of
+; either 16-bit linear sound or 8-bit mu-law sound in the same
+; buffer, now treated as a "physical" buffer to be output by DMA.
+; Note the complexities caused because the logical buffer may
+; be smaller than, the same size as, or bigger than the physical
+; buffer, depending on the input and output sample-group sizes.
+; There are always the same number of sample-groups in the physical
+; buffer as in the logical buffer, and the sample rate is unaltered
+; also.
+;
+; These fragments are compiled dynamically after any sound system
+; reconfiguration or stereo position change, to cause the correct
+; translation of data after the next sound DMA interrupt.  The compiled
+; code lives in module workspace, whereas the conversion table stays
+; here in module code space (though it might usefully be copied into
+; RAM to maximise access speed if this code is running from ROM).
+;
+; On call to composite routine
+;
+;   r12 = start of logical/physical buffer
+;   r11 = end of physical buffer (1,2 channels) or
+;         start of physical buffer (4,8 channels)
+;   r10 = end of logical buffer
+;   r9  = base of 256-entry, 512-byte table converting mu-law bytes
+;         (treated as 0..255, i.e. unsigned) to 16-bit signed
+;         values in the range -3952..+3952.  See below
+;         for more details on the format of entries.
+;   r8  = 0xFF - mask for extraction of individual mu-law bytes
+;   r5  = 0x7FFF - constant used for limit operation if soundgain > 0
+;
+; during call:
+;   r7  = 32-bit accumulator for right channel linear data
+;   r6  = 32-bit accumulator for left channel linear data
+;   r0, r1, r3 - miscellaneous intermediate values
+;   r2, r4, r5 - unused
+
+; Conversion table (placed here to avoid addressing problems for the
+; compiler).  Compute linear values from mu-law at assembly time.  For
+; reference, the direct linear equivalents of mu-law values are:
+;
+; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+; 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46
+; 48 52 56 60 64 68 72 76 80 84 88 92 96 100 104 108
+; 112 120 128 136 144 152 160 168 176 184 192 200 208 216 224 232
+; 240 256 272 288 304 320 336 352 368 384 400 416 432 448 464 480
+; 496 528 560 592 624 656 688 720 752 784 816 848 880 912 944 976
+; 1008 1072 1136 1200 1264 1328 1392 1456 1520 1584 1648 1712 1776 1840 1904 1968
+; 2032 2160 2288 2416 2544 2672 2800 2928 3056 3184 3312 3440 3568 3696 3824 3952
+;
+
+;
+; JL, Jan 2010
+;
+; Now updated to allow use of LDRSH instead of unaligned LDR's. This required the following changes:
+; * Swapping the two halfwords of each convtable entry (although I doubt many people would notice if the waveform was inverted!)
+; * Using different shift offsets in stereo_code
+;   - In some cases this also resulted in shorter instruction sequences
+; * Using different shift offsets in byte_ext_TAB, due to LDRSH not supporting a shift of Rm
+;   - r8 was also changed to 0x1fe
+; * data_load_TAB was also tweaked to avoid an unaligned LDR for the 2-byte case
+;
+
+                  GBLA StereoShiftOffset
+ [ UseLDRSH
+StereoShiftOffset SETA 0
+ |
+StereoShiftOffset SETA 16
+ ]
+
+
+; Helper macros to perform MOV and ADD, shifted by the stereo shift offset
+; Apart from helping to keep the code readable, they also avoid making objasm cry like a baby when told to ASR #0 :(
+        MACRO
+        MOVASR  $rd, $rm, $shift
+ [ ("$shift" = "0") :LAND: UseLDRSH
+        MOV  $rd, $rm
+ |
+        MOV  $rd, $rm, ASR #$shift+StereoShiftOffset
+ ]
+        MEND
+        MACRO
+        ADDASR  $rd, $rn, $rm, $shift
+ [ ("$shift" = "0") :LAND: UseLDRSH
+        ADD  $rd, $rn, $rm
+ |
+        ADD  $rd, $rn, $rm, ASR #$shift+StereoShiftOffset
+ ]
+        MEND
+
+convtable
+        GBLA    chord
+        GBLA    point
+        GBLA    step
+        GBLA    value
+value   SETA    0
+chord   SETA    0
+        WHILE   chord < 8
+step      SETA  1 :SHL: chord
+point     SETA  0
+          WHILE point < 16
+ [ UseLDRSH
+            DCD         ((value :SHL: 2) :AND: &FFFF) :OR: (((-value) :SHL: 2) :SHL: 16)
+ |
+            DCD         (((-value) :SHL: 2) :AND: &FFFF) :OR: ((value :SHL: 2) :SHL: 16)
+ ]
+value       SETA        value + step
+point       SETA        point + 1
+          WEND
+chord     SETA  chord + 1
+        WEND
+
+; When size (logical buffer) >= size (physical buffer) we must proceed
+; forward, loading via r12 which is stepped forwards until it equals
+; r10.  Note that in this case r11 starts off = r12.  When the size of
+; the logical buffer < size of physical buffer, must move backwards -
+; r11 is initialised to end of physical buffer; hence r10 moves
+; backwards and r12 stays constant as end-stop for logical buffer.
+; End-condition is still r10 = r12.
+
+; Instruction sequence (1): loop begin (same for all configurations)
+loop_head
+        CMP     R10, R12                ; check for having finished
+        Pull    PC, EQ                  ; return if so
+
+; Instruction sequence (2): load up a sample-time's worth of data (1..8 bytes), and
+; check whether it is all zero. One instruction for each part, two instructions
+; per sequence.  Indexed by log2nchan.
+data_load_TAB
+        LDRB    r1, [r10, #-1]!         ; instruction for loading 1 byte (backwards)
+        MOVS    r1, r1, LSL #24         ; get 1 byte in top byte of r1, zero in rest
+
+ [ UseLDRSH
+        LDRH    r1, [r10, #-2]!         ; instruction for loading 2 bytes (backwards)
+ |
+        LDR     r1, [r10, #-2]!         ; instruction for loading 2 bytes (backwards)
+ ]
+        MOVS    r1, r1, LSL #16         ; get 2 bytes in top half of r1, zero low bytes
+
+        LDR     r1, [r12], #4           ; instruction for loading 4 bytes (forwards)
+        MOVS    r1, r1                  ; check it for all 4 bytes being 0
+
+        LDMIA   r12!, {r0,r1}           ; instruction for loading 8 bytes (forwards)
+        ORRS    r3, r0, r1              ; result -> temp, to avoid corruption of r0/r1
+
+; Instruction sequence (3): conditionally store a zero output value,
+; for when input data is all 0.   Indexed by log2nchan>>1.
+zero_store_TAB
+; for log2nchan>>1 = 0 (i.e. 1, 2 channels)
+        STREQ   r1, [r11, #-4]!         ; if 0, store out a zero and
+; for log2nchan>>1 = 1 (i.e. 4, 8 channels)
+        STREQ   r1, [r11], #4           ; if 0, store out a zero and
+
+; Instruction sequence (4): conditionally branch back to
+; start of loop if input data was all 0 for this sample.
+zero_branch
+        BEQ     .-(5*4)                 ; branch back to loop_head
+
+; Instruction sequence (5): extract one byte out of 0 through 7 of the 1..8
+; bytes picked up by instruction sequence (2), and put it into r3, testing
+; for 0 as this is done.  One instruction word for each case.  Entries in
+; this table are used starting from the (8-nchan)'th one, up to the required
+; number of channels, hence the apparent oddity of the zero-data test
+; instructions for 1,2 channels.  Note that the 1-channel case is slightly
+; inefficient since we have already checked for all 1 byte being zero - if we
+; hadn't done a LSL 24 in the process, we could dispense with this
+; instruction, but that would be less regular so we just take the minor hit.
+byte_ext_TAB
+ [ UseLDRSH ; LDRSH lacks support for shifting Rm, so we must preshift here.
+        ANDS    r3, r8, r0, LSL #1      ; byte 0
+        ANDS    r3, r8, r0, LSR #7      ; byte 1
+        ANDS    r3, r8, r0, LSR #15     ; byte 2
+        ANDS    r3, r8, r0, LSR #23     ; byte 3
+        ANDS    r3, r8, r1, LSL #1      ; byte 4
+        ANDS    r3, r8, r1, LSR #7      ; byte 5
+        ANDS    r3, r8, r1, LSR #15     ; byte 6
+        ANDS    r3, r8, r1, LSR #23     ; byte 7
+ |
+        ANDS    r3, r8, r0              ; byte 0
+        ANDS    r3, r8, r0, LSR #8      ; byte 1
+        ANDS    r3, r8, r0, LSR #16     ; byte 2
+        ANDS    r3, r8, r0, LSR #24     ; byte 3 (could just be MOVS)
+        ANDS    r3, r8, r1              ; byte 4
+        ANDS    r3, r8, r1, LSR #8      ; byte 5
+        ANDS    r3, r8, r1, LSR #16     ; byte 6
+        ANDS    r3, r8, r1, LSR #24     ; byte 7 (could just be MOVS)
+ ]
+
+; Instruction sequence (6): load up linear value for mu-law byte, from
+; table.  This always follows the extraction instruction (above) and is
+; conditionalised on Z flag from ANDS, to allow faster execution on zero
+; byte value (i.e. no load is actually done and r3 stays 0).  N.B.  As
+; should be apparent from its definition, The table holds 16-bit values,
+; arranged as +ve/-ve pairs, in words.  The access is indexed with LSL #1
+; (i.e. 2-byte entries) but is performed as an LDR, so we get both -ve and
+; +ve values, with the required one in the top half of r3, because of ARM's
+; data rotation on non-word aligned LDRs.  The subsequent stereo position
+; code extracts this value using ASR #n where n varies according to the
+; required multiplicative factor for the particular stereo position.
+; Within the table entries, each value is the basic 12-bit linear value,
+; shifted left by 2, and sign-extended to 16-bits.  This leaves the bottom
+; two bits 0, so that ASR #18, 17 or 16 then produces the original value
+; times 1, 2 or 4 (respectively), sign extended to 32 bits.
+
+conv_byte
+ [ UseLDRSH
+        LDRNESH r3, [r9, r3]
+ |
+        LDRNE   r3, [r9, r3, LSL #1]
+ ]
+
+; Instruction sequence (7): set or add linear value just loaded, in the
+; correct proportions according to stereo position for channel, into stereo
+; accumulators.  Some sequences are two instructions, others 3, so we store
+; them here as 3 words each (for indexing during compilation) with the 3rd
+; one 0 if not required.  The sequences come in pairs, the first of each
+; pair being for the first channel, when the accumulators are initialised,
+; and the second for subsequent channels, when the accumulators are added
+; to.  This saves at least one instruction in the generated code, over
+; pre-initialising both accumulators to 0, and more often than not, 2.
+
+stereo_code
+; 100% left
+; code for first channel: r6 = (r3 >> 18) * 6 = (r3 >> 17) + (r3 >> 16)
+ [ UseLDRSH ; LDRSH version can save 1 instruction here
+        ADD     r6, r3, r3, ASR #1
+        MOV     r7, #0
+        DCD     0
+ |
+        MOV     r6,     r3, ASR #17
+        MOV     r7, #0                  ; init right acc to 0
+        ADD     r6, r6, r3, ASR #16
+ ]
+; code for remaining channels
+        ADDASR  r6, r6, r3, 1
+        ADDASR  r6, r6, r3, 0
+        DCD     0
+; 83% left
+; code for first channel: r6 = (r3 >> 18) * 5 = (r3 >> 16) + (r3 >> 18); r7 = r3 >> 18
+ [ UseLDRSH ; LDRSH version can save 1 instruction here
+        ADD     r6, r3, r3, ASR #2
+        MOV     r7,     r3, ASR #2
+        DCD     0
+ |
+        MOV     r6,     r3, ASR #16
+        MOV     r7,     r3, ASR #18
+        ADD     r6, r6, r3, ASR #18
+ ]
+; code for remaining channels
+        ADDASR  r6, r6, r3, 0
+        ADDASR  r7, r7, r3, 2
+        ADDASR  r6, r6, r3, 2
+; 67% left
+; code for first channel: r6 = (r3 >> 18) * 4 = r3 >> 16; r7 = (r3 >> 18) * 2 = r3 >> 17
+        MOVASR  r6,     r3, 0
+        MOVASR  r7,     r3, 1
+        DCD     0
+; code for remaining channels
+        ADDASR  r6, r6, r3, 0
+        ADDASR  r7, r7, r3, 1
+        DCD     0
+
+; Centre position.  Note that to avoid overflow problems we compute
+; r3*1.5, then add r3 ASR #17 (== >> 18 then *2) to each accumulator.
+; The multiplication by 1.5 is exact because we have 2 spare 0 bits at
+; the bottom of the value.  Overflow from the multiplication in the
+; lower half (when that is -ve, i.e. when the required value is +ve)
+; does not interfere, since it may reach bit 16, but that gets shifted
+; out.
+
+; Code for first channel
+        ADD     r3, r3, r3, ASR #1      ; * 1.5
+        MOVASR  r6,     r3, 1           ; == shifted right by 18, then * 2
+        MOVASR  r7,     r3, 1
+; Code for remaining channels
+        ADD     r3, r3, r3, ASR #1
+        ADDASR  r6, r6, r3, 1
+        ADDASR  r7, r7, r3, 1
+
+; 67% right: the mirror of 67% left
+; code for first channel
+        MOVASR  r7,     r3, 0
+        MOVASR  r6,     r3, 1
+        DCD     0
+; code for remaining channels
+        ADDASR  r7, r7, r3, 0
+        ADDASR  r6, r6, r3, 1
+        DCD     0
+
+; 83% right: mirror of 83% left
+; code for first channel
+ [ UseLDRSH ; LDRSH version can save 1 instruction here
+        ADD     r7, r3, r3, ASR #2
+        MOV     r6,     r3, ASR #2
+        DCD     0
+ |
+        MOV     r7,     r3, ASR #16
+        MOV     r6,     r3, ASR #18
+        ADD     r7, r7, r3, ASR #18
+ ]
+; code for remaining channels
+        ADDASR  r7, r7, r3, 0
+        ADDASR  r6, r6, r3, 2
+        ADDASR  r7, r7, r3, 2
+
+; 100% right: mirror of 100% left
+; code for first channel
+ [ UseLDRSH ; LDRSH version can save 1 instruction here
+        ADD     r7, r3, r3, ASR #1
+        MOV     r6, #0
+        DCD     0
+ |
+        MOV     r7,     r3, ASR #17
+        MOV     r6, #0                  ; initialise left acc to 0
+        ADD     r7, r7, r3, ASR #16
+ ]
+; code for remaining channels
+        ADDASR  r7, r7, r3, 1
+        ADDASR  r7, r7, r3, 0
+        DCD     0
+
+; Instruction sequence (8): scaling code, to convert accumulated values
+; (32-bit) back into signed 16-bit numbers.  For 8 channels, the maximum
+; absolute value in either accumulator is 6*3952*8 = 189696.  To convert
+; this into the range 0..32767 requires multiplying by 32767/189696 =
+; .1727342...  We approximate this by multiplying by 11/64 = .171875,
+; achieved using ADDs/shifts for the *11 and ASR #6 for the /64.  Exactness
+; is unimportant, since all the slightly low value introduces is a small
+; gain reduction.  For 1, 2 or 4 channels, the maximum value reduces in
+; proportion to the number of channels, so the code is the same except for
+; the N in ASR #N which is 3,4,5,6 for 1,2,4,8 channels.
+
+; Version 1.52 onwards: supports *soundgain giving 0 to +21dB additional
+; gain, with 3dB increments, in mu-law to linear conversion.  This is
+; achieved by using a multiplier of *11 and a divisor of 64 (ASR #6) to give
+; 0dB for the 8-channel case, with reducing right shifts as channel count
+; decreases or gain is increased in 6dB steps.  For the +3dB steps, don't do
+; the mul by 11, but divide by 4 (ASR #2) for 8-channel case, to give
+; effectively a +3dB increment, and again reduce the right shift constant or
+; go to a left shift for reducing channel count or each extra +6dB gain.
+;
+
+; (8a): First the *11 code, the same for all configurations: this is inserted
+; only when soundgain is even (i.e. 0dB, 6dB, 12dB, 18dB)
+scale_mul_even
+        ADD     r0, r6, r6, LSL #1      ; r6 * 3
+        ADD     r6, r0, r6, LSL #3      ; + r6 * 8 = r6 * 11
+        ADD     r0, r7, r7, LSL #1      ; r7 * 3
+        ADD     r7, r0, r7, LSL #3      ; + r7 * 8 = r7 * 11
+
+; (8b): gain scaling code, 2 instructions; table indexed by
+;       7+log2nchan-soundgain DIV 2-(soundgain MOD 2 * 4).
+scale_TAB                       ;       1ch     2ch     4ch     8ch
+                                ;----------------------------------
+        MOV     r6, r6, LSL #4  ;0      +21     -       -       -  GAIN (soundgain odd)
+        MOV     r7, r7, LSL #4  ;       -       -       -       -  GAIN (soundgain even)
+
+        MOV     r6, r6, LSL #3  ;1      +15     +21     -       -
+        MOV     r7, r7, LSL #3  ;       -       -       -       -
+
+        MOV     r6, r6, LSL #2  ;2      +9      +15     +21     -
+        MOV     r7, r7, LSL #2  ;       -       -       -       -
+
+        MOV     r6, r6, LSL #1  ;3      +3      +9      +15     +21
+        MOV     r7, r7, LSL #1  ;       -       -       -       -
+
+        DCD     0               ;4      -       +3      +9      +15
+        DCD     0               ;       +18     -       -       -
+
+        MOV     r6, r6, ASR #1  ;5      -       -       +3      +9
+        MOV     r7, r7, ASR #1  ;       +12     +18     -       -
+
+        MOV     r6, r6, ASR #2  ;6      -       -       -       +3
+        MOV     r7, r7, ASR #2  ;       +6      +12     +18     -
+
+        MOV     r6, r6, ASR #3  ;7      -       -       -       -
+        MOV     r7, r7, ASR #3  ;       +0      +6      +12     +18
+
+        MOV     r6, r6, ASR #4  ;8      -       -       -       -
+        MOV     r7, r7, ASR #4  ;       -       +0      +6      +12
+
+        MOV     r6, r6, ASR #5  ;9      -       -       -       -
+        MOV     r7, r7, ASR #5  ;       -       -       +0      +6
+
+        MOV     r6, r6, ASR #6  ;10      -       -       -       -
+        MOV     r7, r7, ASR #6  ;       -       -       -       +0
+
+; Instruction sequence (8c): do limiting (clipping) on output values:
+; only used if soundgain > 0.
+limit
+      [ NoARMv6
+        MOV     r0, r6, ASR #31         ; get r6 sign bit throughout r0
+        CMP     r0, r6, ASR #15         ; check for overflow
+        EORNE   r6, r0, r5              ; if so, get &00007FFF or &FFFF8000 in r6
+        MOV     r0, r7, ASR #31         ; get r7 sign bit throughout r0
+        CMP     r0, r7, ASR #15         ; check for overflow
+        EORNE   r7, r0, r5              ; if so, get &00007FFF or &FFFF8000 in r7
+      |
+        SSAT    r6, #16, r6
+        SSAT    r7, #16, r7
+      ]
+
+; Instruction sequence (9): combine 2 x 16-bit values (sign-ext'd to
+; 32-bits) from r6 and r7 into r6 ready for storing.  Same for all
+; configurations.
+combine
+      [ NoARMv6
+        MOV     r6, r6, LSL #16
+        MOV     r7, r7, LSL #16
+        ORR     r6, r6, r7, LSR #16
+      |
+        PKHBT   r6, r7, r6, LSL #16
+      ]
+
+; Instruction sequence (10): store out the result: code for either
+; direction (1 instruction each).  Index by log2nchan>>1.
+store_sample
+; for 1,2 channels
+        STR     r6, [r11, #-4]!         ; backwards
+; for 4,8 channels
+        STR     r6, [r11], #4           ; forwards
+
+; Instruction sequence (11): branch back to start of loop.  This
+; instruction is adjusted in accordance with the total size of the loop
+; code, which is dependent on both configuration (# channels) and also on
+; individual stereo positions per channel.
+loop_end
+        B       .                       ; patched during compilation
+
+; Defined maximum size of the conversion code.  This is:
+;       size of sequence(1;2;3;4)         = 4 * (       (2 + 2 + 1 + 1)
+; + 8 * size of sequence(5;6;7(max-size))        +  8 * (1 + 1 + 3)
+; +     size of sequence(8a;8b;8c;9;10;11)       +      (4 + 2 + 6 + 3 + 1 + 1))
+; Note: This is a slight overestimate when ARMv6+ optimisations in use
+
+MAXLinConvCodeSize *  4 * ((2 + 2 + 1 + 1) + 8 * (1 + 1 + 3) + (4 + 2 + 6 + 3 + 1 + 1))
+
+
+; Compile: generate a conversion routine appropriate to current configuration and
+; stereo position settings.
+; Entry conditions:
+;   SVC or IRQ mode, IRQs disabled (essential for atomic rewrite of code!)
+; Parameters:
+;   r0 = log2nchan, i.e. 0 -> 1 channel, 1 -> 2 chans, 2 -> 4 chans, 3 -> 8 chans
+;   r1 = pointer to space for compiled routine, in module workspace
+;   r2 = compacted array of stereo position values, 8x3 bits each (1-based)
+;        in bits 0..23, with soundgain (0..7) in top byte.
+
+compile
+        STMFD   sp!, {r1,r3-r9,lr}      ; save r3-r9,pc', and code start address (r1) for later
+
+        ; (1): loop head code (fixed, 2 instructions)
+        ADR     r3, loop_head
+        LDMIA   r3,  {r4,r5}
+        STMIA   r1!, {r4, r5}
+        ; (2): data load and zero check: 2 instructions, indexed by log2nchan
+        ADR     r3, data_load_TAB
+        ADD     r3, r3, r0, LSL #3      ; 8 bytes each
+        LDMIA   r3,  {r4, r5}           ; get 2 instructions
+        STMIA   r1!, {r4, r5}           ; store them
+        ; (3): conditional zero-store
+        ADR     r3, zero_store_TAB
+        MOV     r4, r0, LSR #1          ; index by log2nchan>>1
+        LDR     r4, [r3, r4, LSL #2]    ; 4 bytes each, get 1 instr
+        STR     r4, [r1], #4            ; store it
+        ; (4): conditional branch back
+        LDR     r4, zero_branch         ; get the instruction
+        STR     r4, [r1], #4            ; store it out
+
+        ; preserve soundgain value, for later (r2 gets shifted in next loop)
+        MOV     r7, r2, LSR #24         ;
+
+        ; Now the per-channel code.  Get r9 as nchans, and use r8
+        ; as loop variable from 0 to nchans-1.
+        MOV     r9, #1
+        MOV     r9, r9, LSL r0          ; get nchans in r9
+        MOV     r8, #0                  ; start at channel 0
+10
+        ; (5): byte-extraction code, per channel
+        ADR     r3, byte_ext_TAB+8*4
+        SUB     r3, r3, r9, LSL #2      ; start from (8-nchan)th entry
+        LDR     r4, [r3, r8, LSL #2]    ; get the instruction for this channel
+        STR     r4, [r1], #4            ; store it out
+        ; (6): byte-conversion (1 instruction, fixed)
+        LDR     r4, conv_byte           ; get it
+        STR     r4, [r1], #4            ; store it
+        ; (7): stereo positioning: index by channel position, and by
+        ; whether this is the first channel (channel 0) or not.
+        ADR     r3, stereo_code
+        AND     r4, r2, #7              ; get this channel's value
+        MOV     r2, r2, LSR #3          ; shift remaining channels down
+        SUB     r4, r4, #1              ; convert to 0-based value
+        ADD     r4, r4, r4, LSL #1      ; * 24 (3 w/seq * 2 seq/pos * 4b/w), first *3...
+        ADD     r3, r3, r4, LSL #3      ; then *8, to index table of sequences
+        CMP     r8, #0                  ; if not on channel 0...
+        ADDNE   r3, r3, #3*4            ;  skip on to second 3-word seq of pair
+        LDMIA   r3, {r4,r5,r6}          ; pick up three words
+        CMP     r6, #0                  ; check for last being 0 (unused)
+        STMEQIA r1!, {r4,r5}            ; if so, store out 2 only
+        STMNEIA r1!, {r4,r5,r6}         ; else store out all 3
+
+        ; OK, done one channel's code.  Step on.
+        ADD     r8, r8, #1
+        CMP     r8, r9
+        BLT     %BT10                   ; branch back if more channels to do
+
+        ; (8): scaling code, in three parts.
+        ; (8a): if soundgain is even, multiply by 11 (same for all modes) - 4 insts
+        ;       note: r7 holds soundgain value from above
+        TST     r7, #1
+        ADREQ   r2, scale_mul_even
+        LDMEQIA r2!, {r3,r4,r5,r6}
+        STMEQIA r1!, {r3,r4,r5,r6}
+
+        ; (8b): next perform scaling (shifting) as required, using
+        ;  scale_TAB[7+log2nchan-soundgain DIV 2-(soundgain MOD 2 * 4)]
+
+        ADR     r2, scale_TAB+7*2*4     ; address scale_TAB[7]
+        SUB     r6, r0, r7, LSR #1      ; compute (log2nchan - soundgain DIV 2)
+        SUBNE   r6, r6, #4              ; if soundgain odd, subtract 4 (c/c still valid)
+        ADD     r2, r2, r6, LSL #3      ; then scale for 2 instructions/entry
+        LDMIA   r2, {r4,r5}             ; get the 2 instructions
+        CMP     r4, #0                  ; if first instr is not 0 (for NOP)...
+        STMNEIA r1!, {r4,r5}            ; ...store them
+
+        ; (8c) perform limiting on sample values if required (i.e. soundgain > 0)
+        ADR     r2, limit
+        CMP     r7, #0
+      [ NoARMv6
+        LDMNEIA r2,  {r3,r4,r5,r6,r7,r8}  ; 6 instructions (3/channel)
+        STMNEIA r1!, {r3,r4,r5,r6,r7,r8}  ; store them
+      |
+        LDMNEIA r2,  {r3,r4}              ; Only 2 instructions for ARMv6+
+        STMNEIA r1!, {r3,r4}
+      ]
+
+        ; (9): combining two samples into 1 word - 3 fixed instructions
+      [ NoARMv6
+        ADR     r3, combine
+        LDMIA   r3, {r4,r5,r6}          ; get them
+        STMIA   r1!, {r4,r5,r6}         ; store them
+      |
+        LDR     r3, combine             ; Only 1 instruction for ARMv6+
+        STR     r3, [r1], #4
+      ]
+
+        ; (10): store out the sample, 1 instruction - 2 cases.
+        ADR     r3, store_sample
+        MOV     r4, r0, LSR #1          ; get log2nchan>>1
+        LDR     r4, [r3, r4, LSL #2]    ; index table of single word instrs
+        STR     r4, [r1], #4            ; store it out
+
+        ; (11): branch back to loop start code.  Need to compute offset here
+        LDR     r4, loop_end            ; get the B . instruction (note: bits 23..3 are 1)
+        LDR     r0, [sp], #4            ; pop original code start (loop top)
+        SUB     r3, r1, r0              ; work out offset from there to . now
+        SUB     r4, r4, r3, LSR #2      ; subtract offset (in words) to get instr
+        STR     r4, [r1], #4            ; store it out and we're done!
+        
+    [ StrongARM
+        SetModeSEI SVC32_mode,,r3
+        MOV     r5, lr_svc
+        SUB     r2, r1, #1
+        MOV     r1, r0
+        MOV     r0, #1
+        SWI     XOS_SynchroniseCodeAreas
+        MOV     lr_svc, r5
+        MSR     CPSR_c, r3
+    ]
+
+        ; All done!
+        LDMFD   sp!, {r3-r9,pc}         ; recover saved regs and go home
+
+; Buffer processing routines - 5 of, done as out-of-line code sequences which
+; all return to "BufferDone"
+
+; DoFunc_Mono
+;
+;     Convert stereo into mono (in same buffer space)
+;
+;   r0 = base address of current buffer
+;   r1 = limit address (last+1) of source (Fs*1)
+;   r2-r9 free for general use (r6 = saved sample (oversampling only))
+  [ NoARMv6
+;   r11 = &FFFEFFFE
+;   r12 = &80008000
+  ]
+;   r14 = unavailable (IRQs enabled)
+; On exit:
+;   r0-r12,r14 corrupted
+
+DoFunc_Mono     ROUT
+        MOV     r7, r1
+01      LDMDB   r1!, {r2,r3,r4,r5}
+      [ NoARMv6
+        ; convert from signed to unsigned format
+        EOR     r2, r2, r12
+        EOR     r3, r3, r12
+        EOR     r4, r4, r12
+        EOR     r5, r5, r12
+        ; clear off LSB from each value (two in each reg)
+        AND     r2, r2, r11
+        AND     r3, r3, r11
+        AND     r4, r4, r11
+        AND     r5, r5, r11
+        ; Add the left and right samples together, simultaneously in both upper and
+        ; halves of each stereo pair. There will be no
+        ; interference between carry out from the RHS MSB into bit 16 (LSB of
+        ; LHS sample), and no carry from bit 16 into bit 17, since we cleared
+        ; bit 16 in both sources (i.e. bit 16 and bit 0 of pre-rotated single source!)
+        ; beforehand; therefore the subsequent right shift will correctly put the
+        ; average of the two channel samples back into bits 15..0 (and also into
+        ; bits 31..16, using RRX to recover carry out from bit 31).
+        ; Get back to signed 16 bit result for each channel afterwards by EOR'ing
+        ; with 0x80008000.
+        ADDS    r2, r2, r2, ROR #16
+        EOR     r2, r12, r2, RRX
+        ADDS    r3, r3, r3, ROR #16
+        EOR     r3, r12, r3, RRX
+        ADDS    r4, r4, r4, ROR #16
+        EOR     r4, r12, r4, RRX
+        ADDS    r5, r5, r5, ROR #16
+        EOR     r5, r12, r5, RRX
+      |
+        MOV     r8, r2, ROR #16
+        MOV     r9, r3, ROR #16
+        SHADD16 r2, r2, r8              ; { (L+R)/2, (R+L)/2 }
+        MOV     r8, r4, ROR #16
+        SHADD16 r3, r3, r9
+        MOV     r9, r5, ROR #16
+        SHADD16 r4, r4, r8
+        SHADD16 r5, r5, r9
+      ]
+        STMDB   r7!, {r2,r3,r4,r5}      ; store them all out
+        CMP     r1, r0                  ; have we just done last loop?
+        BNE     %B01                    ; round again if not
+        B       BufferDone              ; we're all done
+
+
+; DoFunc_Oversample:
+;     Oversample, expanding buffer by factor of 2 by performing linear interpolation
+;     between each pair of samples.  For the very first case, this uses a saved copy
+;     of the last stereo sample pair word (2x16-bit) from the end of the previous
+;     buffer, to interpolate against.  Note that this process is done in reverse
+;     order (working from end of buffer back to start) to avoid overwriting the
+;     initial data as would happen if we went forwards..
+DoFunc_Oversample ROUT
+        SetMode SVC32_mode,,,0          ; want to use R14...
+        Push    "r6,r14"
+        LDR     r14, [r1, #-4]!         ; get last sample in source buffer now
+      [ NoARMv6
+        EOR     r14, r14, r12           ; convert signed to unsigned
+        AND     r14, r14, r11           ; mask LSB bits from this sample-pair
+      ]
+        ADD     r0, r0, #8*4            ; need to do last group separately, so move base
+
+01      LDMDB   r1!, {r3,r5,r7,r9}      ; load 4 new samples
+
+02
+      [ NoARMv6
+        ; convert from signed to unsigned format (into separate regs apart from r3)
+        EOR     r3, r3, r12
+        EOR     r6, r5, r12
+        EOR     r8, r7, r12
+        EOR     r10, r9, r12
+        ; clear off LSB from each value (two in each reg)
+        AND     r3, r3, r11
+        AND     r6, r6, r11
+        AND     r8, r8, r11
+        AND     r10, r10, r11
+        ; oversampling: average pairs and turn back to signed format
+        ADDS    r4, r3, r6
+        EOR     r4, r12, r4, RRX
+        ADDS    r6, r6, r8
+        EOR     r6, r12, r6, RRX
+        ADDS    r8, r8, r10
+        EOR     r8, r12, r8, RRX
+        ADDS    r10, r10, r14
+        EOR     r10, r12, r10, RRX
+        EOR     r14, r12, r14                   ; put r14 back to signed format also
+      |
+        SHADD16 r4, r3, r5
+        SHADD16 r6, r5, r7
+        SHADD16 r8, r7, r9
+        SHADD16 r10, r9, r14
+      ]
+        STMDB   r2!, {r4,r5,r6,r7,r8,r9,r10,r14} ; store final results interleaved with originals
+        MOV     r14, r3                 ; set lowest sample for end of next group
+        CMP     r2, r0                  ; have we just done last normal loop?
+        BHI     %B01                    ; round again if not
+        Pull    r14, LO
+        BLO     BufferDone              ; all done if done extra, special loop
+
+        ; get last sample from previous buffer, to interpolate for first new sample of this
+        Pull    r3
+        ; (r2==r0) for last special loop, pick up very first 3 samples from this buffer
+        LDMDB   r1!, {r5,r7,r9}
+        B       %B02                    ; use main loop code to do it
+
+
+; DoFunc_Reverse_Oversample:
+;     As above, but with stereo swap
+DoFunc_Reverse_Oversample ROUT
+        SetMode SVC32_mode,,,0          ; want to use R14...
+        Push    "r6,r14"
+        LDR     r14, [r1, #-4]!         ; get last sample in source buffer now
+      [ NoARMv6
+        EOR     r14, r12, r14, ROR #16  ; convert signed to unsigned and stereo reverse
+        AND     r14, r14, r11           ; mask LSB bits from this sample-pair
+      |
+        MOV     r14, r14, ROR #16
+      ]
+        ADD     r0, r0, #8*4            ; need to do last group separately, so move base
+
+01      LDMDB   r1!, {r3,r5,r7,r9}      ; load 4 new samples
+
+02
+      [ NoARMv6
+        ; convert from signed to unsigned format (into separate regs apart from r3)
+        EOR     r3, r12, r3, ROR #16
+        MOV     r5, r5, ROR #16
+        EOR     r6, r12, r5
+        MOV     r7, r7, ROR #16
+        EOR     r8, r12, r7
+        MOV     r9, r9, ROR #16
+        EOR     r10, r12, r9
+        ; clear off LSB from each value (two in each reg)
+        AND     r3, r3, r11
+        AND     r6, r6, r11
+        AND     r8, r8, r11
+        AND     r10, r10, r11
+        ; oversampling: average pairs and turn back to signed format
+        ADDS    r4, r3, r6
+        EOR     r4, r12, r4, RRX
+        ADDS    r6, r6, r8
+        EOR     r6, r12, r6, RRX
+        ADDS    r8, r8, r10
+        EOR     r8, r12, r8, RRX
+        ADDS    r10, r10, r14
+        EOR     r10, r12, r10, RRX
+        EOR     r14, r12, r14                   ; put r14 back to signed format also
+      |
+        MOV     r3, r3, ROR #16
+        MOV     r5, r5, ROR #16
+        MOV     r7, r7, ROR #16
+        MOV     r9, r9, ROR #16
+        SHADD16 r4, r3, r5
+        SHADD16 r6, r5, r7
+        SHADD16 r8, r7, r9
+        SHADD16 r10, r9, r14
+      ]
+        STMDB   r2!, {r4,r5,r6,r7,r8,r9,r10,r14} ; store final results interleaved with originals
+        MOV     r14, r3                 ; set lowest sample for end of next group
+        CMP     r2, r0                  ; have we just done last normal loop?
+        BHI     %B01                    ; round again if not
+        Pull    r14, LO
+        BLO     BufferDone              ; all done if done extra, special loop
+
+        ; get last sample from previous buffer, to interpolate for first new sample of this
+        Pull    r3
+        ; (r2==r0) for last special loop, pick up very first 3 samples from this buffer
+        LDMDB   r1!, {r5,r7,r9}
+        MOV     r3, r3, ROR #16
+        B       %B02                    ; use main loop code to do it
+
+
+DoFunc_Reverse  ROUT
+; Reverse stereo only
+        MOV     r7, r1
+      [ NoUnaligned :LOR: :LNOT: NoARMv6
+01      LDMDB   r1!, {r2,r3,r4,r5}      ; get four new samples
+        MOV     r2, r2, ROR #16         ; stereo reverse
+        MOV     r3, r3, ROR #16
+        MOV     r4, r4, ROR #16
+        MOV     r5, r5, ROR #16
+        STMDB   r7!, {r2,r3,r4,r5}      ; write back the four samples
+        CMP     r1, r0                  ; have we finished?
+        BNE     %B01
+      |
+        ADD     r0, r0, #2
+        ADD     r1, r1, #2              ; misalign pointer for rotation
+01      LDR     r2, [r1, #-16]!         ; get four new samples, reversing
+        LDR     r3, [r1, #4]            ; left-right stereo pairs
+        LDR     r4, [r1, #8]
+        LDR     r5, [r1, #12]
+        STMDB   r7!, {r2,r3,r4,r5}      ; write back the four samples
+        CMP     r1, r0                  ; have we finished?
+        BNE     %B01
+        SUB     r0, r0, #2
+      ]
+        B       BufferDone
+
+; Convert to mono and oversample also
+DoFunc_Mono_Oversample ROUT
+        SetMode SVC32_mode,,,0          ; want to use R14...
+        Push    "r6,r14"
+        ADD     r0, r0, #8*4            ; need to do last group separately, so move base
+
+        LDR     r14, [r1, #-4]!         ; get last sample in source buffer now
+      [ NoARMv6
+        EOR     r14, r14, r12           ; convert signed to unsigned
+        AND     r14, r14, r11           ; mask LSB bits from this sample-pair
+        ADDS    r14, r14, r14, ROR #16  ; convert to mono
+        AND     r14, r11, r14, RRX
+      |
+        MOV     r3, r14, ROR #16
+        SHADD16 r14, r14, r3
+      ]
+01      LDMDB   r1!, {r3,r5,r7,r9}      ; get four new samples: signed, full 16-bit, stereo
+
+02
+      [ NoARMv6
+        ; convert from signed to unsigned format
+        EOR     r3, r3, r12
+        EOR     r5, r5, r12
+        EOR     r7, r7, r12
+        EOR     r9, r9, r12
+        ; clear off LSB from each value (two in each reg)
+        AND     r3, r3, r11
+        AND     r5, r5, r11
+        AND     r7, r7, r11
+        AND     r9, r9, r11
+        ; Monoise unsigned masked versions of input data; since we're also oversampling,
+        ; leave in unsigned form and mask off LSBs again
+        ADDS    r3, r3, r3, ROR #16
+        AND     r3, r11, r3, RRX
+        ADDS    r5, r5, r5, ROR #16
+        AND     r5, r11, r5, RRX
+        ADDS    r7, r7, r7, ROR #16
+        AND     r7, r11, r7, RRX
+        ADDS    r9, r9, r9, ROR #16
+        AND     r9, r11, r9, RRX
+        ; then oversample, generating new intermediate values in r4,r6,r8,r10, in signed format
+        ADDS    r4, r3, r5
+        EOR     r4, r12, r4, RRX
+        ADDS    r6, r5, r7
+        EOR     r6, r12, r6, RRX
+        ADDS    r8, r7, r9
+        EOR     r8, r12, r8, RRX
+        ADDS    r10, r9, r14
+        EOR     r10, r12, r10, RRX
+        ; must convert monoised unsigned masked originals back to signed format also
+        EOR     r5, r12, r5
+        EOR     r7, r7, r12
+        EOR     r9, r9, r12
+        EOR     r14, r12, r14           ; put r14 back to signed format also for store-out
+      |
+        ; Convert to mono
+        MOV     r4, r3, ROR #16
+        MOV     r6, r5, ROR #16
+        SHADD16 r3, r3, r4              ; { (L+R)/2, (R+L)/2 }
+        MOV     r4, r7, ROR #16
+        SHADD16 r5, r5, r6
+        MOV     r6, r9, ROR #16
+        SHADD16 r7, r7, r4
+        SHADD16 r9, r9, r6
+        ; Oversample
+        SHADD16 r4, r3, r5
+        SHADD16 r6, r5, r7
+        SHADD16 r8, r7, r9
+        SHADD16 r10, r9, r14
+      ]
+        STMDB   r2!, {r4,r5,r6,r7,r8,r9,r10,r14} ; store final results, interleaved with originals
+        MOV     r14, r3                 ; copy lo sample (mono,still unsigned & masked) for next group
+        CMP     r2, r0                  ; have we just done last normalloop?
+        BHI     %B01                    ; round again if not
+        Pull    r14, LO
+        BLO     BufferDone              ; return if just done extra, special loop
+
+        ; r2==r0: finally, pick up very first 3 samples from this buffer
+        LDMDB   r1!, {r5,r7,r9}
+        ; and last sample from previous buffer, to interpolate for first new sample of this
+        Pull    r3
+        ; use main loop code to do final (earliest) 8 samples of output
+        B       %B02
+
+        END

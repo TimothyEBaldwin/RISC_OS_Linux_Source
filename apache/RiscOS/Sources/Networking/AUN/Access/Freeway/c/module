@@ -1,0 +1,1964 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Freeway (module.c)
+ *
+ * Copyright (C) Acorn Computers Ltd. 1991-9
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/Services.h"
+#include "Global/CMOS.h"
+#include "Global/OsBytes.h"
+#include "Global/ModHand.h"
+#include "AsmUtils/irqs.h"
+
+#include "sys/types.h"
+#include "sys/uio.h"
+#include "sys/socket.h"
+#include "sys/time.h"
+#include "sys/ioctl.h"
+#include "sys/errno.h"
+#include "sys/dcistructs.h"
+#include "netinet/in.h"
+#include "net/if.h"
+#include "net/ethernet.h"
+
+#include "socklib.h"
+#include "inetlib.h"
+#include "module.h"
+
+#include "FreewayHdr.h"
+
+static void fw_final(void);
+static void release_msgs(int *);
+static int is_from_us(u_long src);
+
+static _kernel_oserror *FreewayStatus(_kernel_swi_regs *r);
+static _kernel_oserror *FreewaySerial(_kernel_swi_regs *r);
+static _kernel_oserror *init_msgs(char *filename, int *fd);
+static _kernel_oserror *fw_evenable(void);
+
+/*
+ * declare global variables
+ */
+struct fw fw = { 0 };
+struct serial_if serial_if = { 0 };
+u_long local_adr = 0;
+
+static void *module_wsp = 0;
+
+static int msg_fd[5] = { 0 }; /* 1st word is "open" flag */
+
+static struct eblk error_blocks[] = {
+    { 0, 0 },
+    { 0x809f00, "FWType" },
+    { 0x809f01, "FWOExt" },
+    { 0x809f02, "FWONEx" },
+    { 0x809f03, "FWDBuf" },
+    { 0x809f04, "FWNBuf" },
+    { 0x809f05, "FWNMem" },
+    { 0x809f06, "FWOUnk" },
+    { 0x809f07, "FWNNet" },
+    { 0x809f08, "FWLStr" },
+    { 0x809f09, "FWNLoc" },
+    { 0x809f0a, "FWNAut" },
+    { 0x809f0b, "FWNoInet" },
+    { 0x809f0c, "FWStatusMsg" },
+    { 0x809f0d, "FWInvalSWI" },
+    { 0x809f0e, "FWSNoInt" },
+    { 0x809f0f, "FWSBadParam" }
+    };
+
+
+struct swient
+{
+    _kernel_oserror *(*swi_call)();         /* swi handler */
+};
+
+static struct swient fw_ent[] = {
+    RegisterType,
+    WriteObject,
+    ReadObject,
+    EnumerateObjects,
+    FreewayStatus,
+    FreewaySerial,
+};
+
+static _kernel_oserror *fw_show(const char *, int);
+static _kernel_oserror *fw_add_net(const char *);
+static _kernel_oserror *fw_conf_auto_address(const char *, int);
+
+static _kernel_oserror *calleverytick(void (*fun)(void)), *fw_claimv(void);
+static _kernel_oserror *fw_real_init(void);
+static int inet_present(void);
+
+static const char protocol_name[] = "Internet";
+
+static int dostart = 0;
+static int startup_done = 0;
+static int setting_address = 0;
+
+int doobjects = 0;
+
+extern void readdevice_entry(void);
+
+/* Read and write the CMOS bit for controlled auto-address setting
+ * This routine returns non-zero if address setting is *enabled*
+ */
+static int auto_address_cmos_read(void)
+{
+    unsigned int byte;
+    (void) _swix(OS_Byte, _INR(0,1)|_OUT(2), OsByte_ReadCMOS, SparrowMarker, &byte);
+    return !(byte & FreewayNoAutoAddress);
+}
+
+static void auto_address_cmos_write(int enable)
+{
+    unsigned int byte;
+    (void) _swix(OS_Byte, _INR(0,1)|_OUT(2), OsByte_ReadCMOS, SparrowMarker, &byte);
+    if (enable) {
+    	byte &= ~FreewayNoAutoAddress;
+    }
+    else {
+            byte |= FreewayNoAutoAddress;
+    }
+    (void) _swix(OS_Byte, _INR(0,2), OsByte_WriteCMOS, SparrowMarker, byte);
+}
+
+/**********************************************************************
+ * This is used to set the environment variables to indicate local
+ * addresses.
+ */
+
+static void setadrvar(int ifcnt, char *adr)
+{
+    char varname[32];
+
+    /*
+     * Is it the 1st usable interface? If not, add a count to the name.
+     */
+    if( ifcnt == 0 )
+        sprintf(varname, "%s", "Inet$LocalAddr");
+    else
+        sprintf(varname, "%s%d", "Inet$LocalAddr", ifcnt);
+
+    dprintf(("module", "Setting \"%s\" to \"%s\"\n", varname, adr));
+    (void) _kernel_setenv(varname, adr);
+}
+
+/**********************************************************************/
+
+/*
+ * rmafree - return some claimed memory to RMA
+ */
+static void rmafree(void *mem)
+{
+    (void) _swix(OS_Module, _IN(0)|_IN(2), ModHandReason_Free, mem);
+}
+
+/**********************************************************************
+ * This code reads back the DIB for the DCI drivers that are known
+ * (the loopback device isnt read) and attempts to work out the
+ * device address in order to make up an address for freeway to use
+ * on the device.
+ */
+
+static void read_device_name(char *buf, char *etheradr)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    ChDibRef chd, chdnext;
+    struct ifreq ifreq;
+    int s;
+
+    dprintf(("module", "RD> Reading device information\n"));
+
+    /*
+     * error "return" is a null string in buf
+     */
+    buf[0] = '\0';
+
+
+    r.r[0] = NULL;
+    r.r[1] = Service_EnumerateNetworkDrivers;
+
+    if( (e = _kernel_swi(OS_ServiceCall, &r, &r)) != NULL )
+        return;
+
+    if( (chd = (struct chaindib *)(r.r[0])) == NULL )
+        return;
+
+    /*
+     * open a socket so we can read some interface details
+     */
+    if( (s = socket(PF_INET, SOCK_DGRAM, 0)) < 0 )
+        return;
+
+    /*
+     * 950322 KWelton
+     *
+     * this routine has been restructured so that
+     * only "suitable" interfaces are selected to
+     * have their address set. "Suitable" means
+     *
+     * a)  Interface must support broadcast. This
+     *     is a standard Freeway requirement.
+     *
+     * b)  Interface must support ARP.  If the i/f
+     *     doesn't support ARP, then the chances
+     *     are pretty good that it doesn't have a
+     *     "unique" hardware address we can use to
+     *     generate an interface address from
+     */
+    while( chd )
+    {
+        dprintf(("module", "RD> Reading %s's ether address\n", buf));
+        /*
+        dprintf(("module", "RD> Address is %s\n",
+               ether_sprintf(chd->chd_dib->dib_address));
+        */
+
+        sprintf(ifreq.ifr_name, "%.*s%d",
+                sizeof(ifreq.ifr_name) - 2,
+                chd->chd_dib->dib_name, chd->chd_dib->dib_unit);
+
+        /*
+         * check that Internet knows about this interface and
+         * that the interface features are acceptable.
+         */
+        if( (socketioctl(s, SIOCGIFFLAGS, (caddr_t)&ifreq) == 0 &&
+             (ifreq.ifr_flags & IFF_BROADCAST) &&
+             !(ifreq.ifr_flags & IFF_NOARP)) )
+        {
+            int i;
+
+            strcpy(buf, ifreq.ifr_name);
+
+            for( i = 0; i < ETHER_ADDR_LEN; i++ )
+                etheradr[i] = chd->chd_dib->dib_address[i];
+
+            break;
+        }
+
+        /*
+         * this interface is no good, free it here and now
+         * and try the next one.
+         */
+        chdnext = chd->chd_next;
+        rmafree(chd);
+        chd = chdnext;
+    }
+
+    /*
+     * 950308 KWelton
+     *
+     * As the initiator of Service_EnumerateNetworkDrivers,
+     * we have a responsibility to free the RMA claimed
+     * during the service call
+     */
+    while( chd )
+    {
+        chdnext = chd->chd_next;
+        rmafree(chd);
+        chd = chdnext;
+    }
+
+    /*
+     * finished - close the socket and go away
+     */
+    socketclose(s);
+    return;
+}
+
+/**********************************************************************
+ * This is the main part of the initialisation. It tries to evaluate
+ * all known ether drivers and see what if any are suitable for freeway
+ * to use. It does this by looking to see if the device is able to
+ * broadcast, isnt the loopback device and is able to be configured
+ * at the software level to the settings that freeway requires.
+ *
+ * This routine may be called on many occasions when new drivers start
+ * up. In this case it should find the last known suitable driver in the
+ * fw structure, then skip down the list that is avaliable from the INET
+ * module until it finds that one. Then it should start testing from there
+ * since no record is kept of failed interfaces. This is probably the
+ * most efficient way of doing this. [ Not Implemented yet ]
+ */
+static int read_ifs(void)
+{
+    char buf[512], name[16];
+    struct ifconf ifc;
+    struct ifreq ifreq, *ifr;
+    struct sockaddr_in *sin = NULL;
+    int s, n, flags;
+
+    char etheradr[ETHER_ADDR_LEN];
+    int retried = 0;
+    u_long byte0, byte1, byte2;
+
+    /* extern struct in_addr inet_makeaddr(int net, int host); */
+
+    fw.fw_ifcnt = 0;    /* Reset count of interfaces, since we're about to
+                         * re-enumerate them
+                         */
+
+    /*
+     * Open a socket in order to read back the info from the drivers.
+     * This is a UDP based application. If we can't open the socket
+     * abort.
+     */
+      dprintf(("module", "IC> Opening socket...."));
+
+    if( (s = socket(AF_INET, SOCK_DGRAM, 0)) < 0 )
+    {
+      dprintf(("module", "Failed - aborting\n"));
+    return -1;
+    }
+
+      dprintf(("module", "Succeeded (temp socket=%d)\n",s));
+
+    again: /* UGHHH! - used for found an interface without an IP address */
+
+    /*
+     * Initialise things, including reading back the way that the
+     * interface is currently set up.
+     */
+    ifc.ifc_len = sizeof(buf);
+    ifc.ifc_buf = buf;
+
+      dprintf(("module", "IC> Reading Interface(s) config (SIOCGIFCONF)..."));
+
+    if( socketioctl(s, SIOCGIFCONF, (char *)&ifc) < 0 )
+    {
+        dprintf(("module", "Failed - aborting\n"));
+      socketclose(s);
+      return -1;
+    }
+
+      dprintf(("module", "Succeeded\n"));
+
+    ifr = ifc.ifc_req;
+
+    /* 96/11/29 - CE
+     * Removed the 'skip over known usable interfaces guff'
+     * simply keep all interfaces in table, and mark those which are unusable
+     * as such ; need to take care in case order in chain changes (likely).
+     *
+     */
+    if (ifr == NULL)
+    {
+        dprintf(("module", "IC> Skipped all known interfaces - aborting\n"));
+      return fw.fw_ifcnt;
+    }
+
+    /*
+     * Loop around the possible devices evaluating each one.
+     */
+    for (n = ifc.ifc_len / sizeof (struct ifreq); n > 0; n--, ifr++)
+    {
+       ifreq = *ifr;
+
+        dprintf(("module", "IC> Evaluating found interface: (%s) :",ifreq.ifr_name));
+
+         /*
+          * KJB - fix to prevent each interface being marked twice until
+          * 4.4BSD Internet module (each interface also has an AF_LINK address)
+          */
+       if (((struct sockaddr *)&ifreq.ifr_addr)->sa_family != AF_INET)
+       {
+           dprintf(("module", "not an AF_INET address - skipping\n"));
+         continue;
+       }
+
+       /*
+        * Check to see if its the loop back device. We dont want this
+        */
+       if ((socketioctl(s, SIOCGIFFLAGS, (char *)&ifreq) < 0) || (ifreq.ifr_flags & IFF_LOOPBACK))
+       {
+            dprintf(("module", "loopback device - skipping\n"));
+          continue;
+       }
+
+       /*
+        * The interface needs to be able to broadcast, or to be a desired
+        * point to point link, in which case, we'll fudge 'broadcast'
+        */
+       flags = ifreq.ifr_flags;
+       /*
+        * Get the address of the interface
+        */
+      if (socketioctl(s, SIOCGIFADDR, (char *)&ifreq) < 0)
+      {
+            dprintf(("module", "cant get interface address - skipping\n"));
+          continue;
+      }
+
+      sin = (struct sockaddr_in *)&ifreq.ifr_addr;
+
+      /*
+       * If we dont currently know the local address, set it to
+       * the one we just found.
+       */
+      if (local_adr == 0)
+      {
+        local_adr = sin->sin_addr.s_addr;
+          dprintf(("module", "setting local_adr=%lx...", local_adr));
+      }
+
+      sprintf(name, "%lx", (unsigned long) sin->sin_addr.s_addr);
+
+      dprintf(("module", "Storing interface info.\n"));
+      setadrvar(fw.fw_ifcnt, name);
+      strncpy(&fw.fw_ifunit[fw.fw_ifcnt][0],ifreq.ifr_name,16);
+      fw.fw_ifaddrs[fw.fw_ifcnt] = sin->sin_addr.s_addr;
+
+      /*
+       * Find out the broadcast address. If we cant get it then
+       * check if it's a point to point interface.
+       */
+      if ((flags & IFF_BROADCAST) == IFF_BROADCAST)
+      {
+        if (socketioctl(s, SIOCGIFBRDADDR, (char *)&ifreq) < 0)
+         {
+             dprintf(("module", "Cant get broadcast address - unsetting local_addr\n"));
+           local_adr = 0;
+           fw.fw_ifbcast[(fw.fw_ifcnt)] = INADDR_NONE;
+         }
+         else
+         {
+           /*
+            * Keep account of this card since it meets the requirements.
+            */
+           sin = (struct sockaddr_in *)&ifreq.ifr_broadaddr;
+           fw.fw_ifbcast[(fw.fw_ifcnt)] = sin->sin_addr.s_addr;
+         }
+      }
+      else
+      if ((flags & IFF_POINTOPOINT) == IFF_POINTOPOINT)
+      {
+        if (serial_if.serial_if_request == 0)
+        {
+            dprintf(("module", "Serial support not requested - unsetting local_addr\n"));
+          local_adr = 0;
+          fw.fw_ifbcast[(fw.fw_ifcnt)] = INADDR_NONE;
+        }
+        else
+        if (socketioctl(s,SIOCGIFDSTADDR, (char *)&ifreq) < 0)
+        {
+            dprintf(("module", "Unable to get destination address - unsetting local_addr\n"));
+          local_adr = 0;
+          fw.fw_ifbcast[(fw.fw_ifcnt)] = INADDR_NONE;
+        }
+        else
+        {
+          /*
+           * Keep account of this card since it meets the requirements, and
+           * we're requested to use this serial interface.
+           */
+          sin = (struct sockaddr_in *)&ifreq.ifr_dstaddr;
+          fw.fw_ifbcast[(fw.fw_ifcnt)] = sin->sin_addr.s_addr;
+        }
+      }
+      if ((flags & IFF_UP) != IFF_UP)
+      {
+          dprintf(("module", "Interface is marked down - clearing broadaddr\n"));
+        fw.fw_ifbcast[(fw.fw_ifcnt)] = INADDR_NONE;
+      }
+      fw.fw_ifcnt++;
+    }
+
+    /*
+     * We havent found a valid interface. Make up an address etc.
+     * and use that instead (if we can find an ether driver.
+     */
+    if (fw.fw_ifcnt == 0 && !retried && auto_address_cmos_read())
+    {
+        dprintf(("module", "IC> No usable devices found. Trying to make up an address\n"));
+
+      read_device_name(name, etheradr);
+
+        dprintf(("module", "IC> Try using name: %s...",name));
+
+      if (name[0] != 0 )
+      {
+        int retc;
+        int irqstatus;
+
+           dprintf(("module", "Making up ether address..."));
+        byte0 = (u_char)etheradr[5];
+        byte1 = (u_char)etheradr[4];
+        byte2 = (u_char)name[1];
+          dprintf(("module", "Address derived from: %ld %ld %ld...", byte0, byte1, byte2));
+        sin = (struct sockaddr_in *)&ifreq.ifr_addr;
+
+        /* next line modified 25/7/94 gw */
+        /*
+         * 20120718 Changed by RG to assign a valid private IP
+         * address of 10.a.b.c.
+        */
+        sin->sin_addr = inet_makeaddr(10, (byte0 | byte1 << 8UL | byte2 << 16UL));
+        sin->sin_family = AF_INET;
+
+        strncpy(ifreq.ifr_name, name, sizeof(ifreq.ifr_name));
+
+        irqstatus = ensure_irqs_off();
+        ++setting_address;
+        restore_irqs(irqstatus);
+        retc = socketioctl(s, SIOCSIFADDR, (caddr_t)&ifreq);
+        irqstatus = ensure_irqs_off();
+        --setting_address;
+        restore_irqs(irqstatus);
+
+        if( retc >= 0 )
+        {
+            dprintf(("module", "Seeing if this setup works.\n"));
+          retried = 1;
+          goto again;
+        }
+          dprintf(("module", "Unable to setup address.\n"));
+      }
+    }
+
+    /*
+     * If we have found a valid interface....
+     */
+    if( fw.fw_ifcnt > 0 )
+    {
+      _kernel_swi_regs r;
+      _kernel_oserror *e;
+      struct address_q *q;
+      u_long ipadr;
+
+        dprintf(("module", "IC> Found valid interface. Looking at Econet_EnumerateMap:"));
+
+      r.r[4] = 0;
+      for(;;)
+      {
+        e = _kernel_swi(Econet_EnumerateMap,&r, &r);
+          dprintf(("module", "r4 = %d",r.r[4]));
+        if (e || r.r[4] == -1)
+        {
+          dprintf(("module", "\n"));
+        break;
+        }
+
+        q = (struct address_q *)malloc(sizeof(struct address_q));
+        if (!q)
+        {
+            dprintf(("module", "No more Found\n"));
+          break;
+        }
+
+        ipadr = (u_long)r.r[3];
+          dprintf(("module", "Found: %s, adding. ", (char *) r.r[3]));
+        q->q_bcast.s_addr = ipadr | 0xffff0000;
+        q->q_next = fw.fw_netadrs;
+        fw.fw_netadrs = q;
+      }
+    }
+
+    /*
+     * Tidy up and return
+     */
+      dprintf(("module", "IC> Done\n"));
+
+    socketclose(s);
+      dprintf(("module", "IC> fw struct at %p\n",&fw));
+    return fw.fw_ifcnt;
+}
+
+/**********************************************************************/
+
+static int do_getsock(int port, int inputsocket)
+{
+    struct sockaddr_in addr;
+    int sock, on = 1;
+
+    if( (sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+        dprintf(("module", "DGS> Failed to open a socket - aborting\n"));
+        return (-1);
+        }
+    dprintf(("module", "DGS> Opened socket %d - ", sock));
+
+    if( socketioctl(sock, FIONBIO, &on) < 0 ||
+       socketioctl(sock, FIOASYNC, &on) < 0 )
+    {
+        dprintf(("module", "Cannot set FIONBIO and/or FIOASYNC.. Aborting\n"));
+        socketclose (sock);
+        return (-1);
+    }
+    dprintf(("module", "FIONBIO..FIOASYNC.."));
+
+
+    if( setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &on, sizeof (on)) < 0 )
+    {
+        dprintf(("module", "Unable to toggle SO_BROADCAST.. Aborting\n"));
+        socketclose(sock);
+        return (-1);
+    }
+    dprintf(("module", "SO_BROADCAST.."));
+
+
+    if( inputsocket )
+    {
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port        = htons((u_short)port);
+        dprintf(("module", "Input socket, binding to %d..", port));
+
+        if( bind(sock, (struct sockaddr *)&addr, sizeof (addr)) < 0 )
+        {
+            dprintf(("module", "Bind failed - aborting\n"));
+            socketclose(sock);
+            return (-1);
+        }
+    }
+
+    dprintf(("module", "Bound.\n"));
+
+    return(sock);
+}
+
+/**********************************************************************/
+
+static int callback(void (*func)())
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = (int)func;
+    r.r[1] = (int)module_wsp;
+    return(_kernel_swi(OS_AddCallBack, &r, &r) != 0 ? -1 : 0);
+}
+
+/**********************************************************************/
+
+static void clear_callback(void (*func)())
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = (int)func;
+    r.r[1] = (int)module_wsp;
+    (void)_kernel_swi(OS_RemoveCallBack, &r, &r);
+}
+
+/**********************************************************************/
+
+extern void callb_entry(void);
+static volatile int callbackflag = 0;
+static volatile int readdevice_callback = 0;
+#ifdef OldCode
+static volatile int rscallbackflag = 0;
+#endif
+
+void setcallback(void)
+{
+    dprintf(("module", "SCB> setcallback (flag = %d)", callbackflag));
+
+    if( callbackflag == 0 )
+    {
+        callbackflag = 1;
+
+        if( callback(callb_entry) != 0 ) {
+            dprintf(("module", "Failed\n"));
+            callbackflag = 0;
+        }
+    }
+
+    dprintf(("module", "Ok!\n"));
+
+}
+
+/**********************************************************************/
+
+/*
+ * fw_prime - prepare module for start/restart
+ */
+static void fw_prime(void)
+{
+    dprintf(("module", "FWP> In Freeway Prime\n"));
+
+    /*
+     * clear down the main Freeway information structure.
+     */
+    memset((char *)&fw, 0, sizeof(fw));
+
+    /*
+     * we currently have no sockets open
+     */
+    fw.fw_rssock = fw.fw_rssock1 = -1;
+
+    /*
+     * we no longer have a local address
+     */
+    local_adr = 0;
+
+    /*
+     * we have not yet completed a full startup
+     */
+    startup_done = 0;
+}
+
+/**********************************************************************/
+
+/*ARGSUSED*/
+_kernel_oserror *fw_init(const char *cmd_tail, int pbase, void *pw)
+{
+    _kernel_oserror *e;
+    module_wsp = pw;
+
+    /* shut the compiler up */
+    (void) cmd_tail;
+    (void) pbase;
+
+    debug_initialise("Freeway", "", "");
+    debug_atexit();
+    debug_set_options(0, 0, 0);
+    debug_output_device(PRINTF_OUTPUT);
+
+#ifdef TRACE_ENABLED
+    debug_initialise_trace (PRINTF_OUTPUT, "");
+#endif
+    e = init_msgs(Module_MessagesFile, msg_fd);
+    if (e)
+        return (e);
+
+    fw_prime();
+
+    /*
+     * Look to see if the internet modules are present. If so
+     * continue with initialisation.
+     */
+    dprintf(("module", "IN> Attempting to find the Internet module\n"));
+
+    if (inet_present() == 0)
+    {
+        dprintf(("module", "IN> Returning Internet not found\n"));
+        return NULL;
+    }
+
+    e = fw_real_init();
+    if (e)
+    {
+        dprintf(("module", "IN> real init returned %s\n", e->errmess));
+        release_msgs(msg_fd);
+        return (e);
+    }
+
+    return NULL;
+}
+
+/*
+ * Set up the various even handlers.
+ */
+static _kernel_oserror *fw_setup_events(void)
+{
+    _kernel_oserror *e;
+
+    /*
+     * Set up a claim on an event vector (EventV)
+     */
+    dprintf(("module", "FWE> Looking to claim: EventV..."));
+
+    e = fw_claimv();
+
+    if (e)
+    {
+        dprintf(("module", "Failed.\n"));
+
+        fw_final();
+        return(e);
+    }
+
+    /*
+     * Set up a claim on another event vector (Event_Internet)
+     * to enable early trapping of read signals on sockets.
+     */
+     dprintf(("module", "OK.. Event_Internet..."));
+
+    e = fw_evenable();
+
+    if (e)
+    {
+        dprintf(("module", "Failed.\n"));
+        fw_final();
+        return(e);
+    }
+
+    /*
+     * Set up a claim on an event vector (TickerV)
+     * to be called every 10ms
+     */
+    dprintf(("module", "OK.. TickerV..."));
+
+    e = calleverytick(tick_entry);
+
+    if (e)
+    {
+        dprintf(("module", "Failed\n"));
+
+        fw_final();
+        return(e);
+    }
+
+    dprintf(("module", "Ok.\n"));
+    return NULL;
+}
+
+/**********************************************************************
+ * This routine gets called once Internet has started. There is either
+ * no point in doing some of these things before then (event handling)
+ * or we cant do it (Device Driver evaluation). This can be called
+ * from one of 2 places. Either the fw_init() if FW is initialising
+ * after Internet and the DDs have loaded, or else from a SWI handle
+ * when the required modules have been loaded.
+ */
+static _kernel_oserror *fw_real_init(void)
+{
+    _kernel_oserror *e;
+    int s;
+
+    /*
+     * Look to see what (if any) suitable DD are present.
+     */
+    fw.fw_ifcnt = 0;
+
+    dprintf(("module", "RI> Doing interface count\n"));
+
+    read_ifs();
+    if (fw.fw_ifcnt == 0)
+    {
+        /*
+         * Internet has started, but no device drivers are present so
+         * we should wait until some are.
+         */
+        return NULL;
+    }
+
+    /*
+     * Now set up event handlers
+     */
+    dprintf(("module", "RI> Setting up event handlers\n"));
+
+    e = fw_setup_events();
+    if (e)
+        goto out;
+
+    /*
+     * If we found no suitable interfaces or cannot open the required
+     * socket, abort here.
+     */
+
+    s = do_getsock(FWPORT, 1); /* Don't make an assignment to fw_rssock yet! */
+    if( (fw.fw_ifcnt <= 0) || (s < 0) )
+    {
+        /* Couldn't get the desired socket.Iff we already had some lingering close them too */
+        if (fw.fw_rssock >= 0)  socketclose(fw.fw_rssock);
+        if (fw.fw_rssock1 >= 0) socketclose(fw.fw_rssock1);
+        fw.fw_rssock = fw.fw_rssock1 = -1;
+        e = fw_error(Err_FWNNet);
+        goto out;
+    }
+    fw.fw_rssock = s; /* Success,now make an assignment */
+    dprintf(("module", "RI> Opened Socket (Unauth socket) - %d\n", fw.fw_rssock));
+
+    /*
+     * Again, if we cant open the required socket, abort.
+     */
+    s = do_getsock(FWPORT1, 1); /* Don't make an assignment to fw_rssock1 yet! */
+    if (s < 0)
+    {
+        /* Couldn't get the other desired socket,clear up any lingering sockets */
+        socketclose(fw.fw_rssock);
+        if (fw.fw_rssock1 >= 0) socketclose(fw.fw_rssock1);
+        fw.fw_rssock = fw.fw_rssock1 = -1;
+        e = fw_error(Err_FWNNet);
+        goto out;
+    }
+    fw.fw_rssock1 = s; /* Success,now make an assignment */
+    dprintf(("module", "RI> Opened Socket1 (Auth Socket) - %d\n", fw.fw_rssock1));
+
+    /*
+     * Notify that we have started.
+     */
+    dprintf(("module", "RI> Initialisation succeded\n"));
+    dostart = 1;
+    startup_done = 1;
+    setcallback();
+    return NULL;
+
+out:
+    dprintf(("module", "RI> Initialisation failed\n"));
+    fw_final();
+    return(e);
+}
+
+/**********************************************************************
+ * Notify an interest in the main event vector.
+ */
+static _kernel_oserror *fw_claimv(void)
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = EventV;
+    r.r[1] = (int)fw_event_entry;
+    r.r[2] = (int)module_wsp;
+    dprintf(("module", ":FWC: Claiming EventV.."));
+    return(_kernel_swi(OS_Claim, &r, &r));
+}
+
+/*
+ * 950330 KWelton
+ *
+ * Keep a count of event enables
+ */
+static volatile int nenables = 0;
+
+/**********************************************************************
+ * Lookout for Internet based Events. (SIGIO, SIGPIPE etc).
+ */
+_kernel_oserror *fw_evenable(void)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+    r.r[0] = OsByte_EnableEvent;
+    r.r[1] = Event_Internet;
+    dprintf(("module", ":FEV: Enabling Event_Internet.."));
+
+    if( (e = _kernel_swi(OS_Byte, &r, &r)) == NULL )
+    {
+        int s = ensure_irqs_off();
+        ++nenables;
+        restore_irqs(s);
+    }
+
+    return(e);
+}
+
+/**********************************************************************
+ * Release event handlers
+ */
+static void fw_releasev(void)
+{
+    _kernel_swi_regs r;
+
+    dprintf(("module", "FWR> Releasing Event_Internet (nenables = %d)...", nenables));
+
+    r.r[0] = OsByte_DisableEvent;
+
+    while( nenables > 0 )
+    {
+        r.r[1] = Event_Internet;
+
+        if( _kernel_swi(OS_Byte, &r, &r) == NULL )
+        {
+            int s = ensure_irqs_off();
+            --nenables;
+            restore_irqs(s);
+        }
+        else
+        {
+            /*
+             * make the best of a very bad job
+             */
+            nenables = 0;
+            continue;                           /* XXX */
+        }
+    }
+
+    dprintf(("module", "EventV\n"));
+
+    r.r[0] = EventV;
+    r.r[1] = (int)fw_event_entry;
+    r.r[2] = (int)module_wsp;
+    (void)_kernel_swi(OS_Release, &r, &r);
+}
+
+/**********************************************************************
+ * Attempt to open the message file.
+ */
+
+_kernel_oserror *init_msgs(char *filename, int *fd)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+
+#ifndef ROM
+    /*
+     * Place the messages into ResourceFS
+     */
+    r.r[0] = (int)Resources();
+    e = _kernel_swi(ResourceFS_RegisterFiles, &r, &r);
+    if (e)
+        return e;
+#endif
+
+    /*
+     * Look to see if the messages file exists. If it doesnt,
+     * there isnt much point in continuing.
+     */
+    r.r[1] = (int)filename;
+    e = _kernel_swi(MessageTrans_FileInfo, &r, &r);
+    if (e)
+        return (e);
+
+    /*
+     * If we can get file information then we should be able to open it
+     * so look to see if we can.
+     */
+    r.r[0] = (int)(fd+1);
+    r.r[1] = (int)filename;
+    r.r[2] = 0;
+    e = _kernel_swi(MessageTrans_OpenFile, &r, &r);
+    fd[0] = e == NULL;
+    return (e);
+}
+
+/**********************************************************************
+ * Close the messages file
+ */
+
+static void release_msgs(int *fd)
+{
+    _kernel_swi_regs r;
+
+    if (fd) {
+        r.r[0] = (int)(fd+1);
+        (void)_kernel_swi(MessageTrans_CloseFile, &r, &r);
+        fd[0] = 0;
+#ifndef ROM
+        r.r[0] = (int)Resources();
+        (void)_kernel_swi(ResourceFS_DeregisterFiles, &r, &r);
+#endif
+    }
+}
+
+/**********************************************************************
+ * Lookup a non error message
+ */
+
+const char *fw_lookup(const char *token)
+{
+    _kernel_swi_regs r;
+    _kernel_oserror *e;
+    static char string[64];
+
+    if (msg_fd) {
+        r.r[0] = (int)(msg_fd+1);
+        r.r[1] = (int)token;
+        r.r[2] = (int)string;
+        r.r[3] = sizeof(string);
+        r.r[4] = r.r[5] = r.r[6] = r.r[7] = 0; /* No params */
+        e = _kernel_swi(MessageTrans_Lookup, &r, &r);
+        if (e == NULL)
+            return string;
+    }
+    return "";
+}
+
+/**********************************************************************
+ * Error handler
+ */
+
+_kernel_oserror *fw_error(int error)
+{
+    static _kernel_oserror ebuf;
+    _kernel_swi_regs r;
+
+    if( !error )
+        return NULL;
+
+    ebuf.errnum = error_blocks[error].err_nbr;
+    strcpy(ebuf.errmess, error_blocks[error].err_token);
+    if (!msg_fd[0]) return (_kernel_oserror *)&ebuf;
+    memset ((char *)&r, 0, sizeof(r));
+    r.r[0] = (int)&ebuf;
+    r.r[1] = (int)(msg_fd+1);
+    return _kernel_swi(MessageTrans_ErrorLookup, &r, &r);
+}
+
+/**********************************************************************
+ * Command line interface handler...
+ */
+
+/*ARGSUSED*/
+_kernel_oserror *fw_cli_handler(const char *arg_string, int arg_count,
+                                int cmd_no, void *pw)
+{
+    _kernel_oserror *error = NULL;
+
+    /* shut the compiler up */
+    (void) pw;
+    switch (cmd_no) {
+        default:
+            break;
+        case CMD_FwShow:
+            if (startup_done) {
+                error = fw_show(arg_string, arg_count);
+            }
+            else {
+                error = fw_error(Err_FWNoInet);
+            }
+            break;
+        case CMD_FwAddNet:
+            error = fw_add_net (arg_string);
+            break;
+        case CMD_FreewayAutoAddress:
+            error = fw_conf_auto_address(arg_string, arg_count);
+            break;
+    }
+
+    return(error);
+}
+
+
+/**********************************************************************
+ * FreewayAutoAddress configuration command.
+ *
+ */
+static void fw_conf_syntax(const char *suffix)
+{
+    _swix(OS_Write0, _IN(0), "FreewayAutoAddress ");
+    _swix(OS_Write0, _IN(0), suffix);
+    _swix(OS_NewLine, 0);
+}
+
+static _kernel_oserror *fw_conf_auto_address(const char *a, int b)
+{
+    (void) b;
+
+    if (a == arg_CONFIGURE_SYNTAX) {
+        fw_conf_syntax("On|Off");
+    }
+    else if (a == arg_STATUS) {
+        fw_conf_syntax(auto_address_cmos_read() ? "On" : "Off");
+    }
+    else {
+        _kernel_oserror *e;
+        union {
+            char *args[2];
+            char bytes[24];
+        } buffer;
+        e = _swix(OS_ReadArgs, _INR(0,3), ",", a, &buffer, sizeof(buffer));
+        if (e != NULL) {
+            return e;
+        }
+        if (buffer.args[1] != NULL) {
+            return configure_TOO_MANY_PARAMS;
+        }
+        if (buffer.args[0] == NULL) {
+            return configure_BAD_OPTION;
+        }
+        else {
+            char *arg;
+            for (arg = buffer.args[0]; *arg; ++arg) {
+                *arg = tolower(*arg);
+            }
+            arg = buffer.args[0];
+            if (strcmp(arg, "on") == 0) {
+                auto_address_cmos_write(1);
+            }
+            else if (strcmp(arg, "off") == 0) {
+                auto_address_cmos_write(0);
+            }
+            else {
+                return configure_BAD_OPTION;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/**********************************************************************
+ * FWShow command. This lists all known access hosts and discs that
+ * can be shared. -- Added in the definitions of DOMAIN_DISC and
+ * DOMAIN_HOST (PWain).
+ *
+ * 96/12/03 - CE
+ * Have removed specific knowledge of types - now added by client.
+ */
+
+/*ARGSUSED*/
+static _kernel_oserror *fw_show(const char *a, int b)
+{
+    struct fwtype *f;
+    struct object_q *rl;
+    struct address_q *q;
+
+    /* shut the compiler up */
+    (void) a;
+    (void) b;
+
+    /*
+     * Display any remote networks known about.
+     */
+    if( fw.fw_netadrs == NULL )
+        printf("%s\n", fw_lookup("NoRNet"));
+    else
+    {
+        printf("%s:\n", fw_lookup("RNet"));
+        for( q = fw.fw_netadrs; q; q = q->q_next )
+            printf("    %s\n", inet_ntoa(q->q_bcast));
+    }
+
+    /*
+     * Gap before the types (if any)
+     */
+    if( fw.fw_types != NULL )
+        printf("\n");
+
+    /*
+     * Display information about Freeway types that are known.
+     */
+    for (f = fw.fw_types; f; f = f->fw_next)
+    {
+        printf("%s %u: ", fw_lookup("ShowT" /* Type */), f->fw_number);
+        if (f->fw_name[0])
+            printf("(%s)\n",f->fw_name);
+        else
+            printf("\n");
+
+        for (rl = f->fw_remobj; rl; rl = rl->r_next)
+        {
+            /*
+             * If this entry isnt in use ignore it.
+             */
+            if (!rl->r_inuse)
+                continue;
+
+            /*
+             * Show entry. Local ones are prefixed with a "*"
+             */
+            printf("   %c%s=%-10s ", 
+                   rl->r_local ? '*' : ' ',
+                   fw_lookup("ShowN" /* Name */), 
+                   rl->r_title);
+            printf("%s=%s\n", 
+                   fw_lookup("ShowH" /* Holder */), 
+                   inet_ntoa(rl->r_ip));
+        }
+
+        if (f->fw_next)
+            printf("\n");
+    }
+
+    return NULL;
+}
+
+/**********************************************************************
+ * FwAddNet command. This adds a remote network for freeway to broadcast
+ * on.  The broadcast address of the remote network must be specified
+ */
+
+static _kernel_oserror* fw_add_net (const char* args)
+{
+    struct address_q *q;
+    u_long ipadr = 0, hostmask;
+    int netbits;
+    char buf[256], *p = buf;
+
+    /* copy the string so that it's null terminated */
+    while ((*p++ = *args++) > ' ' && p - buf < 254);
+    *--p = 0;
+
+    if ((netbits = inet_net_pton (AF_INET, buf, &ipadr, sizeof ipadr)) < 0)
+        return fw_error (Err_FWLStr);
+    ipadr = ntohl (ipadr);
+
+    q = (struct address_q *)malloc(sizeof(struct address_q));
+    if (!q)
+    {
+        dprintf(("module", "No more Found\n"));
+        return fw_error (Err_FWNMem);
+    }
+
+    hostmask = (1ul << (32 - netbits)) - 1ul;
+    if (!(ipadr & hostmask)) ipadr |= hostmask;
+
+    q->q_bcast.s_addr = htonl (ipadr);
+    q->q_next = fw.fw_netadrs;
+    fw.fw_netadrs = q;
+
+    return 0;
+}
+
+/**********************************************************************/
+
+static void fw_servicecall(int sc)
+{
+    _kernel_swi_regs r;
+
+    dprintf(("module", "FSC> Sending service call: %x\n",sc));
+    r.r[1] = sc;
+    (void) _kernel_swi(OS_ServiceCall, &r, &r);
+}
+
+/**********************************************************************/
+
+void fw_upcall(int upc, int type, struct object_q *rq)
+{
+    _kernel_swi_regs r;
+
+#ifdef DEBUGLIB
+    switch(upc) {
+        case FW_ADDED: dprintf(("module", "FWU> Upcall: added ")); break;
+        case FW_REMOVED: dprintf(("module", "FWU> Upcall: removed ")); break;
+        case FW_CHANGED: dprintf(("module", "FWU> Upcall: changed ")); break;
+        case FW_DELETED: dprintf(("module", "FWU> Upcall: deleted ")); break;
+        default: dprintf(("module", "FWU> Upcall: operation: %d ",upc)); break;
+        }
+    switch(type) {
+        case DOMAIN_DISC: dprintf(("module", "disc ")); break;
+        case DOMAIN_HOST: dprintf(("module", "host ")); break;
+        case DOMAIN_PRINTER: dprintf(("module", "printer ")); break;
+        default: dprintf(("module", "type=%d",type)); break;
+        }
+    dprintf(("module", "Name: %s, Address: %x\n", rq->r_title , rq->r_ip.s_addr));
+#endif/* DEBUGLIB */
+
+    r.r[0] = UpCall_Freeway;
+    r.r[1] = upc;
+    r.r[2] = type;
+    r.r[3] = (int)rq->r_title;
+    r.r[4] = rq->r_desclen;
+    r.r[5] = (int)rq->r_desc;
+    r.r[6] = (u_int)rq->r_ip.s_addr;
+    (void)_kernel_swi(OS_UpCall, &r, &r);
+}
+
+/**********************************************************************
+ * The main SWI handler. This basically looks up and calls the desired
+ * (real) handler.
+ */
+_kernel_oserror *fw_swi_handler(int swinum, _kernel_swi_regs *r, void *pw)
+{
+    struct swient *callp;
+
+    /* shut the compiler up */
+    pw = pw;
+
+    /* range check the SWI number */
+    if( swinum >= (sizeof(fw_ent) / sizeof(fw_ent[0])) )
+        return(fw_error(Err_FWInvalSWI));
+
+    if (startup_done || (swinum == (Freeway_Status - Freeway_00)) )
+    {
+        /*
+         * Call the desired SWI handler.
+         */
+#ifdef DEBUGLIB
+        switch(swinum) {
+            case 0: dprintf(("module", "FWS> Handling SWI: Freeway_Register\n")); break;
+            case 1: dprintf(("module", "FWS> Handling SWI: Freeway_Write\n")); break;
+            case 2: dprintf(("module", "FWS> Handling SWI: Freeway_Read\n")); break;
+            case 3: dprintf(("module", "FWS> Handling SWI: Freeway_Enumerate\n")); break;
+            case 4: dprintf(("module", "FWS> Handling SWI: Freeway_Status\n")); break;
+            case 5: dprintf(("module", "FWS> handling SWI: Freeway_Serial\n")); break;
+            default: dprintf(("module", "FWS> Handling SWI: %d\n", swinum)); break;
+            }
+#endif /* DEBUGLIB */
+        callp = &fw_ent[swinum];
+        return((_kernel_oserror *)((callp->swi_call)(r)));
+    }
+
+    /*
+     * Note: if we had done startup, a return would have been
+     * encountered by this point so we can safely do the rest
+     * without needing to test. This removes a compiler warning.
+     * (No return from function)
+     */
+    return(fw_error(Err_FWNoInet));
+}
+
+/**********************************************************************/
+
+struct fwtype *gettype(int type)
+{
+    struct fwtype *f;
+
+    for( f = fw.fw_types; f != 0; f = f->fw_next )
+        if( f->fw_number == type )
+            return(f);
+
+    return ((struct fwtype *)0);
+}
+
+/**********************************************************************/
+
+int type_id(char *str)
+{
+    int type = atoi(str);
+
+    if (type > 0)
+        return(type);
+
+    return(-1);
+}
+
+/**********************************************************************/
+
+_kernel_oserror *callb_handler(_kernel_swi_regs *r, void *pw)
+{
+    (void) r;
+    (void) pw;
+    dprintf(("module", "CBH> In callback handler: "));
+
+    if( callbackflag == 0 ) {
+        dprintf(("module", "No callbacks to do - aborting\n"));
+        return NULL;
+        }
+
+    callbackflag = 0;
+
+    if( dostart )
+    {
+        dostart = 0;
+        dprintf(("module", "Send FreewayStarting service call..\n"));
+        fw_servicecall(Service_FreewayStarting);
+    }
+
+    if( doobjects )
+    {
+        dprintf(("module", "Calling do_objects_on_callback.\n"));
+
+        doobjects = 0;
+        do_objects_on_callback();
+    }
+
+    dprintf(("module", "\n"));
+
+    return (NULL);
+}
+
+/**********************************************************************/
+
+static _kernel_oserror *calleverytick(void (*fun)(void))
+{
+    _kernel_oserror *e;
+    _kernel_swi_regs r;
+
+    r.r[0] = TickerV;
+    r.r[1] = (int)fun;
+    r.r[2] = (int)module_wsp;
+    e = _kernel_swi(OS_Claim, &r, &r);
+    if (e)
+        return (e);
+
+    return NULL;
+}
+
+/**********************************************************************/
+
+static void removetickerevent(void (*fun)(void))
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = TickerV;
+    r.r[1] = (int)fun;
+    r.r[2] = (int)module_wsp;
+    (void)_kernel_swi(OS_Release, &r, &r);
+}
+
+/**********************************************************************/
+
+_kernel_oserror *tick_handler(_kernel_swi_regs *r, void *pw)
+{
+    struct fwtype *f;
+
+/*
+ * This produces WAY too much stuff
+ *
+    dprintf(("module", "FTH> In tickerV handler. Checking all objects.\n"));
+ */
+
+    (void) r;
+    (void) pw;
+
+    for( f = fw.fw_types; f != 0; f = f->fw_next )
+        check_objects(f);
+
+    return (NULL);
+}
+
+/**********************************************************************/
+
+_kernel_oserror *fw_module_final(int fatal, int podule, void *pw)
+{
+    (void) fatal;
+    (void) podule;
+    (void) pw;
+    fw_final();
+    dprintf(("module", "FWMF> Closing messages\n"));
+    release_msgs(msg_fd);
+
+    return NULL;
+}
+
+static void fw_final(void)
+{
+    struct fwtype *f, *fnext;
+    struct address_q *q, *qnext;
+    struct object_q *oq, *oqnext;
+    struct authreq_q *aq, *aqnext;
+
+
+    for( f = fw.fw_types, fw.fw_types = 0; f != 0; f = fnext )
+    {
+#if 0
+        do_protocol(f, INADDR_BROADCAST, 0, REMOVE);
+#else
+        /*
+         * XXX - the wrong number of parameters are passed
+         * in the version above: make a *guess* at passing
+         * it the correct values.
+         */
+#ifdef DEBUGLIB
+        switch(f->fw_number) {
+            case DOMAIN_DISC: dprintf(("module", "Discs..")); break;
+            case DOMAIN_PRINTER: dprintf(("module", "Printers..")); break;
+            case DOMAIN_HOST: dprintf(("module", "Hosts..")); break;
+            default: dprintf(("module", "type: %d..", f->fw_number)); break;
+            }
+#endif /* DEBUGLIB */
+        do_protocol(f, INADDR_BROADCAST, 0, REMOVE, 0, 0, 1);
+#endif
+       /* Now go free all the blocks malloc'd earlier */
+       dprintf(("module", "Free fwtype at %08X\n", (int)f));
+       fnext = f->fw_next;
+       for(oq = f->fw_remobj; oq != 0; oq = oqnext)
+          {
+          oqnext = oq->r_next;
+          free(oq->r_title);
+          free(oq->r_desc);
+          free(oq);
+          }
+#if 0
+       for(oq = f->fw_locobj; oq != 0; oq = oqnext)
+          {
+          oqnext = oq->r_next;
+          free(oq->r_title);
+          free(oq->r_desc);
+          free(oq);
+          }
+#endif
+       for(aq = f->fw_authreq; aq != 0; aq = aqnext)
+          {
+          aqnext = aq->a_next;
+          free(aq);
+          }
+       free(f);
+    }
+
+    dprintf(("module", "Events...\n"));
+    fw_releasev();
+
+    if( fw.fw_rssock >= 0 )
+    {
+        dprintf(("module", "FWF> Closing: Socket.."));
+        socketclose(fw.fw_rssock);
+        fw.fw_rssock = -1;
+    }
+
+    if( fw.fw_rssock1 >= 0 )
+    {
+        dprintf(("module", "Socket1.."));
+        socketclose(fw.fw_rssock1);
+        fw.fw_rssock1 = -1;
+    }
+
+    dprintf(("module", "Ticker events.."));
+    removetickerevent(tick_entry);
+
+    dprintf(("module", "Sending termination call\n"));
+    fw_servicecall(Service_FreewayTerminating);
+
+    /*
+     * 950331 KWelton
+     *
+     * clear any pending callbacks
+     */
+    if( callbackflag != 0 )
+    {
+        clear_callback(callb_entry);
+        callbackflag = 0;
+    }
+
+    if( readdevice_callback != 0 )
+    {
+        clear_callback(readdevice_entry);
+        readdevice_callback = 0;
+    }
+
+    /* free the structures malloc'ed by read_ifs() */
+    dprintf(("module", "FWF> Freeing memory\n"));
+
+    for( q = fw.fw_netadrs, fw.fw_netadrs = 0; q; q = qnext )
+    {
+        qnext = q->q_next;
+        free(q);
+    }
+}
+
+/**********************************************************************/
+
+static void rs_process_input(int format)
+{
+    struct sockaddr_in from;
+    int fromlen, r;
+    char inbuf[1024];
+
+    dprintf(("rpi", "RPI> Reading network activity (%sauth):-\n", format == 0 ? "un" : ""));
+
+    for(;;)
+    {
+        fromlen = sizeof (from);
+        r = recvfrom(format == 0 ? fw.fw_rssock : fw.fw_rssock1,
+                     inbuf, sizeof(inbuf), 0,
+                     (struct sockaddr *)(&from), &fromlen);
+
+        if( r < 0 || fromlen != sizeof(struct sockaddr_in) ) {
+            dprintf(("rpi", "RPI: read failed. r=%d, errno=%d\n", r, errno));
+            break;
+            }
+
+       dprintf(("rpi", "RPI: read %d bytes from %s\n", r,
+        inet_ntoa (from.sin_addr)));
+
+        if( !is_from_us(from.sin_addr.s_addr) )
+            process_message(from.sin_addr.s_addr, (struct rs_msg *)inbuf,
+                            r, format);
+    }
+}
+
+/**********************************************************************/
+
+int fw_event_handler(_kernel_swi_regs *r, void *pw)
+{
+    int s, format;
+
+    (void) pw;
+
+    dprintf(("event", "FEH> r0=%s r1=%s ",
+         r->r[0]==Event_Internet ? "Internet_Event" : "Other Event" ,
+         r->r[1]==SocketIO ? "SIGIO" : "SIGOther"));
+
+    if (r->r[2]==fw.fw_rssock) {
+        dprintf(("event", "r2=Socket(unauth) "));
+        }
+    else if (r->r[2]==fw.fw_rssock1) {
+        dprintf(("event", "r2=Socket1(auth) "));
+        }
+    else dprintf(("event", "r2=%d ",r->r[2]));
+
+    if( r->r[0] == Event_Internet && r->r[1] == SocketIO )
+    {
+        if( r->r[2] == fw.fw_rssock )
+            format = 0;
+        else if( r->r[2] == fw.fw_rssock1 )
+            format = 1;
+        else
+            return (1);
+
+        dprintf(("event", "Format=%s\n", format==0 ? "Unauth" : "Auth"));
+
+        s = ensure_irqs_on();
+        rs_process_input(format);
+        restore_irqs(s);
+        return(0);
+    }
+
+    return(1);
+}
+
+/**********************************************************************/
+
+static int is_from_us(u_long src)
+{
+    int i;
+
+    for( i = 0; i < fw.fw_ifcnt; i++ )
+        if( fw.fw_ifaddrs[i] == src )
+            return (1);
+
+    return (0);
+}
+
+/**********************************************************************
+ * To see if the Internet module is present do a lookup on its name.
+ * This will succeed if it is loaded :) Much simpler than the old
+ * method.
+ */
+static int inet_present(void)
+{
+    _kernel_oserror *err;
+
+    dprintf(("module", "IP>> Looking for module: %s\n", protocol_name));
+    err = _swix(OS_Module, _INR(0,1), 18, protocol_name);
+
+    if (!err)
+    {
+        dprintf(("module", "IP>> Found Internet module!\n"));
+        return 1;
+    }
+
+    dprintf(("module", "IP>> Found error : %s\n",err->errmess));
+    dprintf(("module", "IP>> Found error : %x\n",err->errnum));
+
+    return 0;
+}
+
+/*
+ * This is the main entry point that we have for picking up if new
+ * devices come on line. DCI4 has service calls that announce them
+ * for us. Other events may (or maynot) be worth watching for.
+ */
+void fw_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+    /* shut the compiler up */
+    pw = pw;
+
+    switch( service_number )
+    {
+#ifndef ROM
+      case Service_ResourceFSStarting:
+        /* Reregister the messages */
+        (*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+        break;
+#endif
+        /*
+         * If we get a device driver status call we need to update
+         * our own count of the drivers present and see if its one
+         * that we are going to use.
+         */
+      case Service_DCIDriverStatus:
+        dprintf(("module", "DD> Received Driver status request\n"));
+        dprintf(("module", "DD> Device: %s\n", ((struct dib *)r->r[0])->dib_name));
+        /*
+         * 950315 KWelton
+         *
+         * we are only interested in device
+         * drivers that are starting up
+         */
+        if( r->r[2] == DCIDRIVER_STARTING )
+        {
+            readdevice_callback = 1;
+            callback(readdevice_entry);
+        }
+
+        break;
+
+        /*
+         * DCIProtocol calls are done when any protocol (eg internet)
+         * startup.
+         */
+      case Service_DCIProtocolStatus:
+        /*
+         * we are only interested in the internet module
+         */
+        if( !strncmp((char *)r->r[4], (char *)protocol_name,
+                     sizeof(protocol_name) + 1) )
+        {
+            /*
+             * it's internet - check its status
+             */
+            if (r->r[2] == DCIPROTOCOL_STARTING)
+            {
+                /* internet is starting */
+                dprintf(("module", "PP> Internet startup\n"));
+
+                /*
+                 * 950306 KWelton
+                 *
+                 * we don't need to worry if we have already initialised
+                 */
+                if( startup_done )
+                    break;
+
+                dprintf(("module", "PP> Looking to start up Freeway.\n"));
+
+                (void)fw_real_init();
+            }
+            else if( r->r[2] == DCIPROTOCOL_DYING )
+            {
+                /*
+                 * internet is terminating - shut freeway
+                 * down, then prepare it for restart
+                 */
+                dprintf(("module", "PP> Internet termination\n"));
+                fw_final();
+                fw_prime();
+            }
+        }
+
+        break;
+
+      case Service_InternetStatus:
+        dprintf(("module", "Service_InternetStatus: reason %d subreason %d (setting_address = %d)\n",
+               r->r[0], r->r[2], setting_address));
+
+        switch( r->r[0] )
+        {
+          case InternetStatus_AddressChanged:
+          case InternetStatus_NetMapChanged:
+          case InternetStatus_InterfaceUpDown:
+            serial_if.serial_if_action = r->r[2];
+            /*
+             * an internet interface has had its address
+             * changed - shutdown and restart Freeway as
+             * long as it's not us that set the address.
+             */
+            if( !setting_address )
+            {
+                fw_final();
+                fw_prime();
+                fw_real_init();
+            }
+
+            break;
+
+          default:
+            break;
+        }
+
+        break;
+
+      default:
+        break;
+    }
+
+    return;
+}
+
+_kernel_oserror *readdevice_handler(_kernel_swi_regs *r, void *pw)
+{
+    (void) r;
+    (void) pw;
+
+    if (startup_done == 0) {
+        /*
+         * This is the 1st interface we know of that we can use so
+         * we should try and finish the initialisation.
+         */
+        dprintf(("module", "CB> Calling real initialisation.\n"));
+        (void)fw_real_init();
+        }
+    else {
+        /*
+         * Otherwise just add the interface to the list.
+         */
+        dprintf(("module", "CB> Calling interface count\n"));
+        (void)read_ifs();
+        }
+    return NULL;
+}
+
+/*
+ * FreewayStatus added 16-02-95. Status request is:
+ *
+ * calling:
+ *
+ * r0 == reason code.
+ * all other registers reserved.
+ *
+ * return
+ *
+ * if r0 = 0  status request
+ *
+ * r1 = 0 freeway loaded but idle - eg no ether drivers
+ * r1 = 1 freeway running.
+ * all other registers reserved.
+ *
+ */
+static _kernel_oserror *FreewayStatus(_kernel_swi_regs *r)
+{
+    switch(r->r[0])
+    {
+      case 0:
+        /* status request - return startup flag */
+        r->r[1] = startup_done;
+        return(NULL);
+
+        /*NOTREACHED*/
+        break;
+
+      default:
+        return(fw_error(Err_FWStatus));
+    }
+}
+
+
+/*
+ * FreewaySerial SWI handler added 96/12/02 - CE
+ * To provide support for use of serial interface
+ * for freeway/sharefs link
+ *
+ * In : r0 : 0 => disable serial support
+ *           1 => enable serial support
+ *      r2 : pointer to unit name
+ *
+ */
+static _kernel_oserror *FreewaySerial(_kernel_swi_regs *r)
+{
+  int i;
+
+    dprintf(("serial", "FWSer> reason %d",r->r[0]));
+    if (r->r[2])
+      dprintf(("serial", " unit (%s)",(char *) r->r[2]));
+    else
+      dprintf(("serial", "\n"));
+
+  switch(r->r[0])
+  {
+    case 0:     /* serial - remove serial support */
+      serial_if.serial_if_request = 0;
+      break;
+    case 1:     /* serial - add serial support */
+      serial_if.serial_if_request = 1;
+      break;
+
+    default:
+      return(fw_error(Err_FWSerParam));
+  }
+  if (r->r[2])
+  {
+    /* strncpy(serial_if.serial_if_name, (char *) r->r[2], 16); */
+    for (i=0; i < fw.fw_ifcnt; i++)
+    {
+      if (strcmp((char *) r->r[2], &fw.fw_ifunit[i][0]) == 0)
+      {
+        dprintf(("serial", "\nMatched unit %s - restarting freeway\n\n", (char *) r->r[2]));
+        fw_final();
+        fw_prime();
+        fw_real_init();
+        break;
+      }
+    }
+  }
+  else
+    return(fw_error(Err_FWSerNoInt));
+
+  return(NULL);
+}
+/**********************************************************************/
+
+/* EOF module.c */

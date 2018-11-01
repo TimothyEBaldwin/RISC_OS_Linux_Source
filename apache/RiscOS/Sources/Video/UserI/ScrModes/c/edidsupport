@@ -1,0 +1,1937 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* edidsupport.c */
+
+/*
+ * EDID support.
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/RISCOS.h"
+#include "Global/GraphicsV.h"
+#include "Global/Services.h"
+#include "Global/FileTypes.h"
+#include "Global/OsWords.h"
+#include "Global/VIDCList.h"
+#include "Global/VduExt.h"
+#include "Interface/HighFSI.h"
+
+#include "edidmemory.h"
+#include "errors.h"
+#include "monitors.h"
+#include "modex.h"
+#include "edidsupport.h"
+#include "tables.h"
+
+#define ROUND_DIV(n,d)     (((n) + ((d) >> 1)) / (d)) /* Excel's ROUND(n/d,0) */
+#define ROUNDDOWN_DIV(n,d) ((n) / (d))                /* Excel's ROUNDDOWN(n/d,0) */
+
+/* By default we only use DMT timings; we will check for additional support later */
+static int timing_support = EDID_USE_DMT;
+
+/* Single head resource block anchor */
+static void *resourceblk = NULL;
+#define RESFS_EXPORT_PATH  "Resources.ScreenMode.Monitors.EDID"
+
+#if DODEBUG
+/* Produce debug output showing the
+ * mode descriptor being passed for a particular mode
+ */
+static void display_mode_parameters(ModeDescriptionRef mode_desc)
+{
+    printf("XRes: %i YRes: %i ",
+           mode_desc->definition.timings.xres,
+           mode_desc->definition.timings.yres);
+    if (mode_desc->definition.timings.interlaced == 1)
+    {
+        printf("(interlaced)");
+    }
+    else
+    {
+        printf("(non-interlaced)");
+    }
+    printf(" PixRate: %i\n", mode_desc->definition.timings.pixel_khz);
+    printf("HSync:%i Hbpch:%i Hlbdr:%i Hdisp:%i Hrbdr:%i Hfpch:%i\n"
+           "VSync:%i Vbpch:%i Vtbdr:%i Vdisp:%i Vbbdr:%i Vfpch:%i\n",
+           mode_desc->definition.timings.hpar[FR_SYNC],
+           mode_desc->definition.timings.hpar[FR_BPCH],
+           mode_desc->definition.timings.hpar[FR_BDR1],
+           mode_desc->definition.timings.hpar[FR_DISP],
+           mode_desc->definition.timings.hpar[FR_BDR2],
+           mode_desc->definition.timings.hpar[FR_FPCH],
+           mode_desc->definition.timings.vpar[FR_SYNC],
+           mode_desc->definition.timings.vpar[FR_BPCH],
+           mode_desc->definition.timings.vpar[FR_BDR1],
+           mode_desc->definition.timings.vpar[FR_DISP],
+           mode_desc->definition.timings.vpar[FR_BDR2],
+           mode_desc->definition.timings.vpar[FR_FPCH]);
+}
+#endif
+
+/* Check if a new mode is present already, don't add it if it is.
+ * Return true if successful, and false if rejected for any reason.
+ */
+static bool add_proposed_mode(MonitorDescriptionRef monitor_definition, ModeDescriptionRef proposed_mode, int32_t frame_hz, uint8_t priority)
+{
+    sprintf(proposed_mode->definition.name, "%u x %u", proposed_mode->definition.timings.xres,
+                                                       proposed_mode->definition.timings.yres);
+    compute_modedescription(proposed_mode);
+    if (frame_hz != -1)
+    {
+        proposed_mode->frame_hz = frame_hz; /* Override computed value */
+    }
+    proposed_mode->priority = priority;
+    proposed_mode->next = monitor_definition->modelist;
+    monitor_definition->modelist = proposed_mode;
+#if DODEBUG
+    display_mode_parameters(proposed_mode);
+#endif
+    return true;
+}
+
+/* Copy a builtin mode and add it to the monitor description
+ */
+static _kernel_oserror *add_builtin_mode(MonitorDescriptionRef monitor, const ModeDef *mode, uint8_t priority)
+{
+    ModeDescriptionRef mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+    if (mode_desc == NULL)
+    {
+        return error(ERR_NOSPACE, 0, 0, 0);
+    }
+
+    mode_desc->definition.timings = *mode;
+
+    if (!add_proposed_mode(monitor, mode_desc, mode->freq, priority))
+    {
+        free(mode_desc);
+    }
+    return NULL;
+}
+
+/* generate_dmt_mode creates a mode using standardised timing parameters.
+ * These come from the Display Monitor Timing Document (VESA).
+ * They are part of EDID 1.0 to 1.3 and should be used where a DMT
+ * standard exists (refer Appendix B of EDID 1.4 spec and the DMT document).
+ */
+static bool generate_dmt_mode(char dmt, MonitorDescriptionRef monitor, uint8_t priority)
+{
+    /* If there is no established timing, ignore (for now).
+     * Later we will generate a mode here and add
+     */
+    if ((dmt > 0) && (dmt <= MAXDMTMODENUM))
+    {
+        dmt--; /* Convert DMT back to array number */
+        IFDEBUG printf("Established Modes Display Monitor Timing :\n");
+
+        return (add_builtin_mode(monitor, &display_monitor_timings[dmt], priority) == NULL);
+    }
+    IFDEBUG printf("Ignoring established timing (not a standard mode).\n");
+
+    return false;
+}
+
+static _kernel_oserror *check_edid_checksum(EDIDBlockRef edidblock, bool checkall)
+{
+    _kernel_oserror *res = NULL;
+    size_t byte, block, blocks_to_check = 0;
+
+    for (block = 0; block <= blocks_to_check; block++)
+    {
+        uint8_t count = 0;
+        uint8_t *ediddata = (uint8_t *)&edidblock[block];
+        for (byte = 0; byte < sizeof(EDIDBlock); byte++)
+        {
+            count = count + ediddata[byte];
+        }
+        if (count != 0)
+        {
+            char linebuff1[4];
+            char linebuff2[4];
+            sprintf(linebuff1, "%u", block);
+            sprintf(linebuff2, "%u", blocks_to_check);
+            res = error(ERR_BADCHECKSUM, linebuff1, linebuff2, 0);
+        }
+        else
+        {
+            if ((block == 0) && checkall)
+            {
+                blocks_to_check = edidblock->extension_block_count;
+            }
+            IFDEBUG printf("Checksum: Block %i of %i OK\n", block, blocks_to_check);
+        }
+    }
+
+    return res;
+}
+
+static _kernel_oserror *check_edid_header(EDIDBlockRef edidblock)
+{
+    /* Look for the EDID header 0x00ffffffffffff00 */
+    int is_edid = 1;
+    for (int i = 0; i<8;i++)
+    {
+        uint8_t c = edidblock->header[i];
+        if (((i == 0) || (i == 7)) && (c != 0x00))
+        {
+            is_edid = 0;
+        }
+        if (((i > 0) && (i < 7)) && (c != 0xff))
+        {
+            is_edid = 0;
+        }
+    }
+    if (!is_edid)
+    {
+        return error(ERR_INVALIDEDID, 0, 0, 0);
+    }
+    return NULL;
+}
+
+static _kernel_oserror *check_edid_valid(EDIDBlockRef edidblock, bool checkall)
+{
+    /* Perform sanity checks on the EDID prior to the full parsing */
+    _kernel_oserror *res = check_edid_header(edidblock);
+    if (!res)
+    {
+        res = check_edid_checksum(edidblock, checkall);
+    }
+    return res;
+}
+
+/* Takes a block of text from an 18-byte EDID data block
+ * And fills a supplied character buffer with a usable 0-terminated string
+ * Buffer must be at least 14 bytes in length.
+ */
+static void get_dtd_ascii(EDIDBlockRef edidblockref, int block_number, char *data)
+{
+    int i;
+    for (i = 0; i < 13; ++i)
+    {
+        data[i] = edidblockref->data_block[block_number][i+5];
+        if (data[i] == 0x0A)
+        {
+            break;
+        }
+        else if ((data[i] < 32) || (data[i] == 127))
+        {
+            /* Strip out any control characters for safety */
+            data[i] = ' ';
+        }
+    }
+    data[i] = 0;
+}
+
+static bool generate_mode_using_gtf(uint32_t h_pixels, uint32_t v_lines, uint32_t ip_freq_rqd, ModeDescriptionRef mode_desc, MonitorDescriptionRef monitor)
+{
+    /* Based on VESA GTF spec 1.1, the variable names match those in the spec and equation
+     * numbers labelled for cross referencing.
+     * Stage 1 uses basic timing parameters and vertical frequency, then follows Stage 2.
+     * Most of the results are integer values (lines, pixels), only a few timings (탎, Hz, %)
+     * need to keep fractional bits which are suffixed "[un|signed]whole<p>fractional".
+     * The v_lines & ip_freq_rqd are as though progressive scan, eg. PAL would be 720x576 @ 25Hz. 
+     */
+#define GTF_MARGIN_PTHOU    18     /* 1.8% */
+#define GTF_CELL_GRAN_RND   8      /* Char cell granularity, must be a multiple of 2 */
+#define GTF_2CELL_GRAN_RND  (2*GTF_CELL_GRAN_RND)
+#define GTF_MIN_PORCH       1      /* Lines (or char cells) porch */
+#define GTF_V_SYNC_RQD      3      /* Lines */
+#define GTF_H_SYNC_PTHOU    80     /* 8% */
+#define GTF_MIN_VSYNC_BP    550uLL /* 탎 */
+#define GTF_C_PRIME         30     /* ((C - J) x (K / 256)) + J   where C=40% M=600%/kHz K=128 J=20% */
+#define GTF_M_PRIME         300    /* (K / 256) x M */
+
+    uint32_t h_pixels_rnd, h_blank, total_active_pixels;
+    uint32_t h_period_u8p24, h_period_est_u8p24;
+    uint32_t h_back_porch, h_sync_pixels, h_front_porch, total_pixels;
+
+    uint32_t v_field_rate_est_u8p24, v_frame_rate_u8p24, v_field_rate_u8p24;
+    uint32_t v_lines_rnd, v_sync_bp, v_field_rate_rqd;
+    uint32_t v_back_porch, v_sync_rqd, v_front_porch, total_v_lines;
+
+    uint32_t top_margin, bottom_margin, left_margin, right_margin;
+    uint32_t pixel_freq;
+    uint64_t num, den;
+    int32_t  ideal_duty_cycle_s7p24;
+    ModeDef *mp;
+    const bool int_rqd = false; /* Interlacing not propagated to mode description */
+    const bool margins_rqd = false; /* Margins currently not offered */
+
+    /* 7.3.1 horizontal pixels rounded to whole character cells */
+    h_pixels_rnd = GTF_CELL_GRAN_RND * ROUND_DIV(h_pixels, GTF_CELL_GRAN_RND);
+
+    /* 7.3.2 vertical lines per field & 7.3.3 field rate */
+    if (int_rqd)
+    {
+        v_lines_rnd = ROUND_DIV(v_lines, 2);
+        v_field_rate_rqd = ip_freq_rqd * 2;
+    }
+    else
+    {
+        v_lines_rnd = v_lines;
+        v_field_rate_rqd = ip_freq_rqd;
+    }
+
+    /* 7.3.4 top margin & 7.3.5 bottom margin */
+    top_margin = margins_rqd ? ROUND_DIV(v_lines_rnd * GTF_MARGIN_PTHOU, 1000)
+                             : 0;
+    bottom_margin = top_margin;
+
+    /* 7.3.7 estimate horizontal period in 탎 */
+    num = ((1000000uLL << 24) / v_field_rate_rqd) - (GTF_MIN_VSYNC_BP << 24);
+    den = v_lines_rnd + (2uLL * top_margin) + GTF_MIN_PORCH;
+    if (int_rqd)
+    {
+        h_period_est_u8p24 = (uint32_t)((2 * num) / ((2 * den) + 1));
+    }
+    else
+    {
+        h_period_est_u8p24 = (uint32_t)(num / den);
+    }
+
+    /* 7.3.8 lines in vsync and vertical back porch & 7.3.9 vertical back porch alone */
+    v_sync_bp = (uint32_t)ROUND_DIV(GTF_MIN_VSYNC_BP << 24, h_period_est_u8p24);
+    v_back_porch = v_sync_bp - GTF_V_SYNC_RQD;
+
+    /* 7.3.10 lines in the field period (actually, half lines) */
+    total_v_lines = (2 * (v_lines_rnd + top_margin + bottom_margin + v_sync_bp + GTF_MIN_PORCH)) +
+                    (int_rqd ? 1 : 0);
+
+    /* 7.3.11 estimate vertical field rate */
+    num = (1uLL << (24 + 24 + 1));
+    den = (uint64_t)h_period_est_u8p24;
+    num = 1000000 * (num / den);
+    v_field_rate_est_u8p24 = (uint32_t)(num / total_v_lines);
+
+    /* 7.3.12 find actual horizontal period */
+    num = (uint64_t)h_period_est_u8p24 * v_field_rate_est_u8p24;
+    den = v_field_rate_rqd;
+    h_period_u8p24 = (uint32_t)((num / den) >> 24);
+
+    /* 7.3.13 find actual vertical field rate & 7.3.14 frame rate */
+    num = (1uLL << (24 + 24 + 1));
+    den = (uint64_t)h_period_u8p24;
+    num = 1000000 * (num / den);
+    v_field_rate_u8p24 = (uint32_t)(num / total_v_lines);
+    v_frame_rate_u8p24 = int_rqd ? (v_field_rate_u8p24 / 2) : v_field_rate_u8p24;
+
+    /* 7.3.15 left margin & 7.3.16 right margin */
+    left_margin = margins_rqd ? ROUND_DIV(h_pixels_rnd * GTF_MARGIN_PTHOU, 1000 * GTF_CELL_GRAN_RND)
+                              : 0;
+    left_margin = GTF_CELL_GRAN_RND * left_margin;
+    right_margin = left_margin;
+
+    /* 7.3.17 total active pixels & 7.3.18 ideal duty cycle */
+    total_active_pixels = h_pixels_rnd + left_margin + right_margin;
+    num = (uint64_t)GTF_M_PRIME * h_period_u8p24;
+    den = 1000;
+    ideal_duty_cycle_s7p24 = (int32_t)((GTF_C_PRIME << 24) - (uint32_t)(num / den));
+    if (ideal_duty_cycle_s7p24 < 0)
+    {
+        IFDEBUG printf("Error - negative duty cycle\n");
+        /* If this happens we should just ignore the mode */
+        return false;
+    }
+
+    /* 7.3.19 horizontal blanking period in pixels & 7.3.20 total pixels */
+    num = (uint64_t)total_active_pixels * ideal_duty_cycle_s7p24;
+    den = (100uLL << 24) - ideal_duty_cycle_s7p24;
+    h_blank = GTF_2CELL_GRAN_RND * ROUND_DIV((uint32_t)(num / den), GTF_2CELL_GRAN_RND);
+    total_pixels = total_active_pixels + h_blank;
+
+    /* 7.3.21 pixel clock (actually, kHz) */
+    num = ((1000uLL << 24) * total_pixels);
+    den = h_period_u8p24; 
+    pixel_freq = (uint32_t)(num / den);
+
+    /* 7.6.17 pixels in horizontal sync */
+    h_sync_pixels = (total_pixels * GTF_H_SYNC_PTHOU) / 1000;
+    h_sync_pixels = GTF_CELL_GRAN_RND * ROUND_DIV(h_sync_pixels, GTF_CELL_GRAN_RND);
+
+    /* 7.6.18 horizontal front porch & 7.6.19 horizontal back porch */
+    h_front_porch = (h_blank / 2) - h_sync_pixels;
+    h_back_porch = h_front_porch + h_sync_pixels;
+
+    /* 7.6.36 vertical front porch */
+    v_front_porch = GTF_MIN_PORCH;
+    v_sync_rqd = GTF_V_SYNC_RQD;
+
+    mp = &mode_desc->definition.timings;
+    mp->xres = h_pixels;
+    mp->yres = v_lines;
+    mp->hpar[FR_SYNC] = h_sync_pixels;
+    mp->hpar[FR_BPCH] = h_back_porch;
+    mp->hpar[FR_BDR1] = left_margin;
+    mp->hpar[FR_DISP] = h_pixels;
+    mp->hpar[FR_BDR2] = right_margin;
+    mp->hpar[FR_FPCH] = h_front_porch;
+    mp->vpar[FR_SYNC] = v_sync_rqd;
+    mp->vpar[FR_BPCH] = v_back_porch; /* Note, loss of interlacing */
+    mp->vpar[FR_BDR1] = top_margin;
+    mp->vpar[FR_DISP] = v_lines; 
+    mp->vpar[FR_BDR2] = bottom_margin;
+    mp->vpar[FR_FPCH] = v_front_porch; /* Note, loss of interlacing */
+    mp->pixel_khz = pixel_freq;
+    mp->external_clock = -1;
+    if (timing_support == EDID_USE_GTF)
+    {
+        mp->syncpol = HSync_Negative+VSync_Positive; /* Default GTF */
+    }
+    else
+    {
+        mp->syncpol = HSync_Positive+VSync_Negative; /* Secondary GTF */
+    }
+    mp->interlaced = int_rqd ? 1 : 0;
+
+    if (!add_proposed_mode(monitor, mode_desc, ip_freq_rqd, 6))
+    {
+        return false;
+    }
+    return true;    
+}
+
+/* Compute a mode using CVT, based on section 5 of VESA CVT Standard 1.2.
+ * The variable names used below are those from the standard where possible.
+ */
+static bool generate_mode_using_cvt_rb(uint32_t h_pixels, uint32_t v_lines, uint32_t ip_freq_rqd, ModeDescriptionRef mode_desc, MonitorDescriptionRef monitor)
+{
+    /* Based on VESA CVT spec 1.2, the variable names match those in the spec and equation
+     * numbers labelled for cross referencing.
+     * Most of the results are integer values (lines, pixels), only a few timings (탎, Hz, %)
+     * need to keep fractional bits which are suffixed "[un|signed]whole<p>fractional".
+     * The v_lines & ip_freq_rqd are as though progressive scan, eg. PAL would be 720x576 @ 25Hz. 
+     */
+#define CVT_MARGIN_PTHOU    18     /* 1.8% */
+#define CVT_C_PRIME         30     /* ((C - J) x (K / 256)) + J   where C=40% M=600%/kHz K=128 J=20% */
+#define CVT_CLOCK_STEP      250    /* 0.25MHz */
+#define CVT_H_SYNC_PTHOU    80     /* 8% */
+#define CVT_M_PRIME         300    /* (K / 256) x M */
+#define CVT_MIN_V_PORCH_RND 3      /* Lines */
+#define CVT_MIN_V_BPORCH    6      /* Lines */
+#define CVT_MIN_VSYNC_BP    550uLL /* 탎 */
+#define CVT_RB_H_BLANK      160    /* 탎 */
+#define CVT_RB_H_SYNC       32     /* 탎 */
+#define CVT_RB_MIN_V_BLANK  460uLL /* 탎 */
+#define CVT_RB_V_FPORCH     3      /* Lines */
+#define CVT_CELL_GRAN_RND   8      /* Char cell granularity, must be a multiple of 2 */
+#define CVT_2CELL_GRAN_RND  (2*CVT_CELL_GRAN_RND)
+
+    uint32_t h_pixels_rnd, h_blank, total_active_pixels;
+    uint32_t h_period_est_u8p24;
+    uint32_t h_back_porch, h_sync_pixels, h_front_porch, total_pixels;
+
+    uint32_t v_lines_rnd, v_sync_bp, vbi_lines, v_field_rate_rqd;
+    uint32_t v_back_porch, v_sync_rnd = 0, v_front_porch, total_v_lines;
+
+    uint32_t top_margin, bottom_margin, left_margin, right_margin;
+    uint32_t pixel_freq;
+    uint64_t num, den;
+    int32_t  ideal_duty_cycle_s7p24;
+    ModeDef *mp;
+    const bool int_rqd = false; /* Interlacing not propagated to mode description */
+    const bool margins_rqd = false; /* Margins currently not offered */
+
+    /* Table 3-2 vertical sync based on the aspect ratio */
+    if (((v_lines % 3) == 0) &&
+        ((v_lines * 4 / 3) == h_pixels)) v_sync_rnd = 4; /* 4:3 */
+    if (((v_lines % 9) == 0) &&
+        ((v_lines * 16 / 9) == h_pixels)) v_sync_rnd = 5; /* 16:9 */
+    if (((v_lines % 10) == 0) &&
+        ((v_lines * 16 / 10) == h_pixels)) v_sync_rnd = 6; /* 16:10 */
+    if (((h_pixels == 1280) && (v_lines == 1024)) ||
+        ((h_pixels == 1280) && (v_lines == 768))) v_sync_rnd = 7; /* Specials */
+    if (v_sync_rnd == 0)
+    {
+        IFDEBUG printf("Error - Cannot handle this aspect ratio\n");
+        /* If this happens we should just ignore the mode */
+        return false;
+    }
+
+    /* 5.2.1 field rate & 5.2.5 vertical lines per field */
+    if (int_rqd)
+    {
+        v_lines_rnd = ROUNDDOWN_DIV(v_lines, 2);
+        v_field_rate_rqd = ip_freq_rqd * 2;
+    }
+    else
+    {
+        v_lines_rnd = v_lines;
+        v_field_rate_rqd = ip_freq_rqd;
+    }
+
+    /* 5.2.2 horizontal pixels rounded to whole character cells */
+    h_pixels_rnd = CVT_CELL_GRAN_RND * ROUNDDOWN_DIV(h_pixels, CVT_CELL_GRAN_RND);
+
+    /* 5.2.3 left margin and right margins */
+    left_margin = margins_rqd ? ROUNDDOWN_DIV(h_pixels_rnd * CVT_MARGIN_PTHOU, 1000)
+                              : 0;
+    left_margin = CVT_CELL_GRAN_RND * ROUNDDOWN_DIV(left_margin, CVT_CELL_GRAN_RND);
+    right_margin = left_margin;
+
+    /* 5.2.4 total active pixels */
+    total_active_pixels = h_pixels_rnd + left_margin + right_margin;
+
+    /* 5.2.6 top and bottom margin */
+    top_margin = margins_rqd ? ROUNDDOWN_DIV(v_lines_rnd * CVT_MARGIN_PTHOU, 1000)
+                             : 0;
+    bottom_margin = top_margin;
+
+    /* Select CRT or CRT reduced blanking */
+    if (timing_support == EDID_USE_CVT)
+    {
+        /* 5.3.8 estimate horizontal period in 탎 */
+        num = ((1000000uLL << 24) / v_field_rate_rqd) - (CVT_MIN_VSYNC_BP << 24);
+        den = v_lines_rnd + (2uLL * top_margin) + CVT_MIN_V_PORCH_RND;
+        if (int_rqd)
+        {
+            h_period_est_u8p24 = (uint32_t)((2 * num) / ((2 * den) + 1));
+        }
+        else
+        {
+            h_period_est_u8p24 = (uint32_t)(num / den);
+        }
+
+        /* 5.3.9 lines in vsync and vertical back porch & 5.3.10 vertical back porch alone */
+        v_sync_bp = (uint32_t)ROUNDDOWN_DIV(CVT_MIN_VSYNC_BP << 24, h_period_est_u8p24) + 1;
+        v_sync_bp = MAX(v_sync_bp, v_sync_rnd + CVT_MIN_V_BPORCH);
+        v_back_porch = v_sync_bp - v_sync_rnd;
+
+        /* 5.3.12 ideal duty cycle */
+        num = (uint64_t)CVT_M_PRIME * h_period_est_u8p24;
+        den = 1000;
+        ideal_duty_cycle_s7p24 = (int32_t)((CVT_C_PRIME << 24) - (uint32_t)(num / den));
+        ideal_duty_cycle_s7p24 = MAX(ideal_duty_cycle_s7p24, (20 << 24));
+
+        /* 5.3.13 horizontal blanking period in pixels & 5.3.14 total pixels */
+        num = (uint64_t)total_active_pixels * ideal_duty_cycle_s7p24;
+        den = (100uLL << 24) - ideal_duty_cycle_s7p24;
+        h_blank = CVT_2CELL_GRAN_RND * ROUNDDOWN_DIV((uint32_t)(num / den), CVT_2CELL_GRAN_RND);
+        total_pixels = total_active_pixels + h_blank;
+
+        /* 5.3.15 pixel clock (actually, kHz) */
+        num = ((1000uLL << 24) * total_pixels);
+        den = h_period_est_u8p24;
+        pixel_freq = (uint32_t)(num / den);
+        pixel_freq = CVT_CLOCK_STEP * ROUNDDOWN_DIV(pixel_freq, CVT_CLOCK_STEP);
+
+        /* 5.3.?? vertical front porch */
+        v_front_porch = CVT_MIN_V_PORCH_RND;
+
+        /* 5.3.?? horizontal sync */
+        h_sync_pixels = (total_pixels * CVT_H_SYNC_PTHOU) / 1000;
+        h_sync_pixels = CVT_CELL_GRAN_RND * ROUNDDOWN_DIV(h_sync_pixels, CVT_CELL_GRAN_RND);
+    }
+    else
+    {
+        /* 5.4.8 estimate horizontal period in 탎 */
+        num = ((1000000uLL << 24) / v_field_rate_rqd) - (CVT_RB_MIN_V_BLANK << 24);
+        den = (uint64_t)v_lines_rnd + top_margin + bottom_margin;
+        h_period_est_u8p24 = (uint32_t)(num / den);
+
+        /* 5.4.9 lines in vsync and vertical back porch & 5.4.10 vertical back porch alone */
+        vbi_lines = (uint32_t)ROUNDDOWN_DIV(CVT_RB_MIN_V_BLANK << 24, h_period_est_u8p24) + 1;
+        vbi_lines = MAX(vbi_lines, CVT_RB_V_FPORCH + v_sync_rnd + CVT_MIN_V_BPORCH);
+        v_back_porch = vbi_lines - v_sync_rnd - CVT_RB_V_FPORCH;
+
+        /* 5.4.11 lines in the field period (actually, half lines) */
+        total_v_lines = (2 * (vbi_lines + v_lines_rnd + top_margin + bottom_margin)) +
+                        (int_rqd ? 1 : 0);
+
+        /* 5.4.?? horizontal blanking period in pixels && 5.4.12 total pixels */
+        h_blank = CVT_RB_H_BLANK;
+        total_pixels = CVT_RB_H_BLANK + total_active_pixels;
+
+        /* 5.4.13 pixel clock (actually, kHz) */
+        num = (uint64_t)v_field_rate_rqd * total_v_lines * total_pixels;
+        den = 2 * 1000;
+        pixel_freq = (uint32_t)(num / den);
+        pixel_freq = CVT_CLOCK_STEP * ROUNDDOWN_DIV(pixel_freq, CVT_CLOCK_STEP);
+
+        /* 5.4.?? vertical front porch */
+        v_front_porch = CVT_RB_V_FPORCH;
+
+        /* 5.4.?? horizontal sync */
+        h_sync_pixels = CVT_RB_H_SYNC;
+    }
+
+    /* 5.2.?? horizontal front porch & 5.2.?? horizontal back porch */
+    h_front_porch = (h_blank / 2) - h_sync_pixels;
+    h_back_porch = h_front_porch + h_sync_pixels;
+ 
+    mp = &mode_desc->definition.timings;
+    mp->xres = h_pixels;
+    mp->yres = v_lines;
+    mp->hpar[FR_SYNC] = h_sync_pixels;
+    mp->hpar[FR_BPCH] = h_back_porch;
+    mp->hpar[FR_BDR1] = left_margin;
+    mp->hpar[FR_DISP] = h_pixels;
+    mp->hpar[FR_BDR2] = right_margin;
+    mp->hpar[FR_FPCH] = h_front_porch;
+    mp->vpar[FR_SYNC] = v_sync_rnd;
+    mp->vpar[FR_BPCH] = v_back_porch;
+    mp->vpar[FR_BDR1] = top_margin;
+    mp->vpar[FR_DISP] = v_lines; 
+    mp->vpar[FR_BDR2] = bottom_margin;
+    mp->vpar[FR_FPCH] = v_front_porch;
+    mp->pixel_khz = pixel_freq;
+    mp->external_clock = -1;
+    if (timing_support == EDID_USE_CVT)
+    {
+        mp->syncpol = HSync_Negative+VSync_Positive; /* CVT */
+    }
+    else
+    {
+        mp->syncpol = HSync_Positive+VSync_Negative; /* CVT reduced blanking */
+    }
+    mp->interlaced = int_rqd ? 1 : 0;
+
+    if (!add_proposed_mode(monitor, mode_desc, ip_freq_rqd, 6))
+    {
+        return false;
+    }
+    return true;    
+}
+
+static _kernel_oserror *generate_standard_timing(char std1, char std2, MonitorDescriptionRef monitor)
+{
+    ModeDescriptionRef mode_desc = NULL;
+    /* If this mode is defined as a DMT standard, use this by checking the
+     * bytes directly with the lookup table
+     */
+    int i = 0;
+
+    IFDEBUG printf("Standard Timing (%x %x) ", std1, std2);
+
+    while (std_timings[i].stdcode[0] || std_timings[i].stdcode[1])
+    {
+        if ((std1 == std_timings[i].stdcode[0]) &&
+            (std2 == std_timings[i].stdcode[1]))
+        {
+            mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+            if (mode_desc == NULL)
+            {
+                return error(ERR_NOSPACE, 0, 0, 0);
+            }
+
+            mode_desc->definition.timings = display_monitor_timings[std_timings[i].dmt-1];
+
+            if (!add_proposed_mode(monitor, mode_desc,
+                                   display_monitor_timings[std_timings[i].dmt-1].freq, 5))
+            {
+                free(mode_desc);
+            }
+            return NULL;
+        }
+        i++;
+    }
+
+    /* If it's not in the DMT lookups and we can generate a timing, do so */
+    if (timing_support != EDID_USE_DMT)
+    {
+        bool success = false;
+        int yres = 0;
+        int xres = (std1 + 31) * 8;
+        int freq = (std2 & 0x3f) + 60;
+
+        char pixel_ratio_flags = (std2 & 0xC0) >> 6;
+        switch (pixel_ratio_flags)
+        {
+            case 0:
+                yres = (xres * 10) / 16; /* 16:10 */
+                break;
+            case 1:
+                yres = (xres * 3) / 4; /* 4:3 */
+                break;
+            case 2:
+                yres = (xres * 4) / 5; /* 5:4 */
+                break;
+            case 3:
+                yres = (xres * 9) / 16; /* 16:9 */
+                break;
+        }
+
+        mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+        if (mode_desc == NULL)
+        {
+            return error(ERR_NOSPACE, 0, 0, 0);
+        }
+        IFDEBUG printf("(calculated):\n");
+
+        if ((timing_support == EDID_USE_GTF) ||
+            (timing_support == EDID_USE_GTF2))
+        {
+            success = generate_mode_using_gtf(xres, yres, freq, mode_desc, monitor);
+        }
+        if ((timing_support == EDID_USE_CVT) ||
+            (timing_support == EDID_USE_CVTRB))
+        {
+            success = generate_mode_using_cvt_rb(xres, yres, freq, mode_desc, monitor);
+        }
+        if (!success)
+        {
+            free(mode_desc);
+        }
+    }
+    return NULL;
+}
+
+/* Generates a mode from a 3-byte CVT code
+ * NB this is UNTESTED as I haven't got an appropriate EDID to test from
+ */
+static _kernel_oserror *generate_cvt3_timing(char cvt1, char cvt2, char cvt3, MonitorDescriptionRef monitor)
+{
+    ModeDescriptionRef mode_desc = NULL;
+    /* If this mode is defined as a DMT standard, use this by checking the
+     * bytes directly with the lookup table
+     */
+    IFDEBUG printf("CVT 3-byte Timing (%x %x %x) ", cvt1, cvt2, cvt3);
+
+    /* Check the reserved bits are 00. If not, let this mode fail silently */
+    if ((cvt2 & 0x03) != 0)
+    {
+        IFDEBUG printf("has unknown values in the reserved bits of byte 2 - skipped.\n");
+        return NULL;
+    }
+
+#ifdef DERIVE_CVT3_FROM_DMT
+    int i = 0;
+    while (cvt_timings[i].cvtcode[0] || cvt_timings[i].cvtcode[1] || cvt_timings[i].cvtcode[2])
+    {
+        if ((cvt1 == cvt_timings[i].cvtcode[0]) &&
+            (cvt2 == cvt_timings[i].cvtcode[1]) &&
+            (cvt3 == cvt_timings[i].cvtcode[2]))
+        {
+            mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+            if (mode_desc == NULL)
+            {
+                return error(ERR_NOSPACE, 0, 0, 0);
+            }
+
+            mode_desc->definition.timings = display_monitor_timings[cvt_timings[i].dmt-1];
+
+            if (!add_proposed_mode(monitor, mode_desc,
+                                   display_monitor_timings[cvt_timings[i].dmt-1].freq, 4))
+            {
+                free(mode_desc);
+            }
+            return NULL;
+        }
+        i++;
+    }
+#endif
+
+    /* If it's not in the DMT lookups and we can generate a timing, do so */
+    if ((mode_desc == NULL) && (timing_support != EDID_USE_DMT))
+    {
+        bool success;
+        int vsize = cvt1 + ((cvt2 & 0xf0) << 4);
+        int yres = (vsize + 1) * 2;
+        int xres = 0;
+        int freq = 0;
+
+        /* Use the vertical line count to generate the horizontal addressable
+         * Resolution (HAdd). Use 8 x {RoundDown[(VAdd x Aspect ratio) / 8]}
+         * Per the EDID guidance (p48).
+         */
+        char pixel_ratio_flags = (cvt2 & 0x0C) >> 2;
+        switch (pixel_ratio_flags)
+        {
+            case 0:
+                xres = 8 * ((yres * 4) / (3 * 8));
+                break;
+            case 1:
+                xres = 8 * ((yres * 16) / (9 * 8));
+                break;
+            case 2:
+                xres = 8 * ((yres * 16) / (10 * 8));
+                break;
+            case 3:
+                xres = 8 * ((yres * 15) / (9 * 8));
+                break;
+        }
+
+        /* First generate a descriptor using the display-preferred frequency
+         * (bits 5 and 6 of cvt3)
+         */
+        switch ((cvt3 & 0x60) >> 5)
+        {
+            case 0:
+                freq = 50;
+                break;
+            case 1:
+                freq = 60;
+                break;
+            case 2:
+                freq = 75;
+                break;
+            case 3:
+                freq = 85;
+                break;
+        }
+        if (freq != 0)
+        {
+            mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+            if (mode_desc == NULL)
+            {
+                return error(ERR_NOSPACE, 0, 0, 0);
+            }
+            IFDEBUG printf("\nAt %x Hz (calculated):\n", freq);
+            success = generate_mode_using_cvt_rb(xres, yres, freq, mode_desc, monitor);
+            if (!success)
+            {
+                free(mode_desc);
+            }
+        }
+        int preferred_freq = freq;
+
+        /* Now we add any other frequencies it supports */
+
+        /* Use timing_support to switch the timing method we use in the
+         * CVT calculations and restore it at the end.
+         */
+        int timing_support_preferred = timing_support;
+
+        for (int supported_freq=0; supported_freq<5; supported_freq++)
+        {
+            if ((cvt3 & (1<<supported_freq)) == (1<<supported_freq))
+            {
+                switch (supported_freq)
+                {
+                    case 0:
+                        freq = 60;
+                        timing_support = EDID_USE_CVTRB;
+                        break;
+                    case 1:
+                        freq = 85;
+                        timing_support = EDID_USE_CVT;
+                        break;
+                    case 2:
+                        freq = 75;
+                        timing_support = EDID_USE_CVT;
+                        break;
+                    case 3:
+                        freq = 60;
+                        timing_support = EDID_USE_CVT;
+                        break;
+                    case 4:
+                        freq = 50;
+                        timing_support = EDID_USE_CVT;
+                        break;
+                }
+          
+                if (freq != preferred_freq)
+                {
+                    mode_desc = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+                    if (mode_desc == NULL)
+                    {
+                        return error(ERR_NOSPACE, 0, 0, 0);
+                    }
+                    IFDEBUG printf("\nAt %x Hz(calculated):\n", freq);
+                    success = generate_mode_using_cvt_rb(xres, yres, freq, mode_desc, monitor);
+                    if (!success)
+                    {
+                        free(mode_desc);
+                    }
+                }
+            }
+        }
+        timing_support = timing_support_preferred;
+    }
+    return NULL;
+}
+
+/* Converts a detailed timing descriptor block into a mode descriptor
+ * block. The defines above help it pick out the data which is split
+ * across nibbles into the parameters.
+ * dtd_data on entry should be a pointer to the first byte of the 18 byte
+ * dtd block.
+ */
+static bool dtd_block_to_modedesc(const uint8_t *dtd_data, MonitorDescriptionRef monitor, ModeDescriptionRef mode_desc, uint8_t priority)
+{
+    ModeDef *mp = & mode_desc->definition.timings;
+    
+    IFDEBUG printf("Detailed timing descriptor:\n");
+    mp->xres          = dtd_data[2] + ((dtd_data[4] & 0xf0) << 4);
+    mp->yres          = dtd_data[5] + ((dtd_data[7] & 0xf0) << 4);
+    mp->interlaced    = ((dtd_data[17]>>7) & 1);
+    mp->hpar[FR_SYNC] = dtd_data[9] + ((dtd_data[11] & 0x30) << 4);
+    mp->hpar[FR_BDR1] = dtd_data[15];
+    mp->hpar[FR_DISP] = mp->xres;
+    mp->hpar[FR_BDR2] = dtd_data[15];
+    mp->hpar[FR_FPCH] = dtd_data[8] + ((dtd_data[11] & 0xc0) << 2);
+    mp->hpar[FR_BPCH] = dtd_data[3] + ((dtd_data[4] & 0x0f) << 8) -
+                        mp->hpar[FR_SYNC] -
+                        mp->hpar[FR_FPCH] -
+                        mp->hpar[FR_BDR1] -
+                        mp->hpar[FR_BDR2];
+    mp->vpar[FR_SYNC] = (dtd_data[10] & 0xf) + ((dtd_data[11] & 0x3) << 4);
+    mp->vpar[FR_BDR1] = dtd_data[16];
+    mp->vpar[FR_DISP] = mp->yres;
+    mp->vpar[FR_BDR2] = dtd_data[16];
+    mp->vpar[FR_FPCH] = (dtd_data[10] >> 4) + ((dtd_data[11] & 0xc) << 2);
+    mp->vpar[FR_BPCH] = dtd_data[6] + ((dtd_data[7] & 0x0f) << 8) -
+                        mp->vpar[FR_SYNC] -
+                        mp->vpar[FR_FPCH] -
+                        mp->vpar[FR_BDR1] -
+                        mp->vpar[FR_BDR2];
+    mp->pixel_khz     = (dtd_data[0] + (dtd_data[1]<<8)) * 10;
+    mp->external_clock = -1;
+
+    /* Only accept non-stereoscopic modes
+     * Technically we should check for sync here (since we only really support
+     * digital separate syncs), but for now we'll assume that misrepresenting
+     * the sync isn't going to cause major problems, as it will allow more
+     * modes to work (e.g. BenQ FP241W HDMI port advertises 1080p as being
+     * serrated sync-on-RGB, even though the monitor is perfectly happy with
+     * digital syncs)
+     */
+    if ((dtd_data[17] & 0x60) != 0x00)
+    {
+        IFDEBUG printf("Rejecting DTD due to unsupported frame format\n");
+        return false;
+    }
+
+    /* -----00- is negative-negative, start with that and then invert if necessary */
+    mp->syncpol = HSync_Negative+VSync_Negative;
+    if (dtd_data[17] & 4)
+    {
+        mp->syncpol ^= VSync_Negative^VSync_Positive;
+    }
+    if (dtd_data[17] & 2)
+    {
+        mp->syncpol ^= HSync_Negative^HSync_Positive;
+    }
+
+    /* If we are interlaced, we need to double the number of vertical pixels */
+    if (mp->interlaced == 1)
+    {
+        mp->yres = mp->yres * 2;
+    }
+
+    if (!add_proposed_mode(monitor, mode_desc, -1, priority))
+    {
+        return false;
+    }
+    return true;
+}
+
+/* Checks the 18-byte data blocks for their type.
+ * The type returned is then either 10 (empty), 0 (detailed mode descriptor)
+ * or other type numbers per the EDID specification
+ */
+static int get_extd_type(EDIDBlockRef edidblockref, int block_no)
+{
+    if (edidblockref->data_block[block_no][0] +
+        edidblockref->data_block[block_no][1] +
+        edidblockref->data_block[block_no][2] == 0)
+    {
+        if (edidblockref->data_block[block_no][3] == DATA_TYPE_RANGELIMITS)
+        {
+            return DATA_TYPE_RANGELIMITS; /* Don't check for 0 at byte 4 */
+        }
+        if (edidblockref->data_block[block_no][4] != 0)
+        {
+            return -2; /* -2 = undefined */
+        }
+        return edidblockref->data_block[block_no][3];
+    }
+    return -1; /* -1 = display descriptor */
+}
+
+/* Add to our list of audio formats */
+static _kernel_oserror *add_audio_format(uint8_t byte1, uint8_t byte2, uint8_t byte3, MonitorDescriptionRef new_monitor)
+{
+    AudioFormat newformat;
+    newformat.format_code = (byte1 >> 3) & 0x7f;
+    newformat.max_channels = (byte1 & 7) + 1;
+    newformat.sample_rates = byte2;
+    newformat.format_specific = byte3;
+    /* Discard if bogus */
+    if ((!newformat.sample_rates) || ((newformat.format_code == 1) && !(newformat.format_specific)))
+    {
+        return NULL;
+    }
+    /* Work out where to merge it into our list
+     * CEA 861-D doesn't state what we should do if multiple descriptors are
+     * found for the same format code, so we should be conservative with how
+     * we merge blocks together
+     */
+    int i;
+    for (i=0;i<new_monitor->audio_format_count;i++)
+    {
+        AudioFormat *candidate = &new_monitor->audio_formats[i];
+        if (candidate->format_code > newformat.format_code)
+        {
+            break;
+        }
+        else if (candidate->format_code < newformat.format_code)
+        {
+            continue;
+        }
+        /* Try and merge with this entry
+         * note - currently not doing any fancy merging of the format-specific
+         * byte (could be a bit tricky for LPCM depending on what future meaning
+         * is given to the reserved bits)
+         */
+        if (newformat.format_specific == candidate->format_specific)
+        {
+            if (newformat.max_channels == candidate->max_channels)
+            {
+                /* Merge our list of sample rates into the candidate and call
+                 * it a day.
+                 */
+                candidate->sample_rates |= newformat.sample_rates;
+                return NULL;
+            }
+            else if (newformat.max_channels < candidate->max_channels)
+            {
+                /* Candidate supports more channels than us with same
+                 * format-specific settings, so ignore any sample rates which
+                 * the candidate supports.
+                 */
+                newformat.sample_rates &= ~candidate->sample_rates;
+                if (!newformat.sample_rates)
+                {
+                    return NULL;
+                }
+            }
+            else if (newformat.max_channels > candidate->max_channels)
+            {
+                /* We support more channels than the candidate, so remove
+                 * sample rates from the candidate.
+                 */
+                candidate->sample_rates &= ~newformat.sample_rates;
+                if (!candidate->sample_rates)
+                {
+                    /* Candidate can be removed completely */
+                    new_monitor->audio_format_count--;
+                    memmove(candidate, candidate+1, sizeof(AudioFormat)*(new_monitor->audio_format_count-i));
+                    void *new = realloc(new_monitor->audio_formats, new_monitor->audio_format_count*sizeof(AudioFormat));
+                    if (new || !new_monitor->audio_format_count)
+                    {
+                        new_monitor->audio_formats = (AudioFormat*) new;
+                    }
+                    /* Everything's been shuffled down, so process this entry
+                     * again.
+                     */
+                    i--;
+                    continue;
+                }
+            }
+        }
+    }
+    /* Need to insert a new entry */
+    void *new = realloc(new_monitor->audio_formats, (new_monitor->audio_format_count+1)*sizeof(AudioFormat));
+    if (!new)
+    {
+        return error(ERR_NOSPACE, 0, 0, 0);
+    }
+    new_monitor->audio_formats = (AudioFormat*) new;
+
+    /* Shuffle following entries up */
+    memmove(new_monitor->audio_formats+i+1, new_monitor->audio_formats+i, sizeof(AudioFormat)*(new_monitor->audio_format_count-i));
+
+    new_monitor->audio_format_count++;
+    new_monitor->audio_formats[i] = newformat;
+
+    return NULL;
+}
+
+/* Process an audio data block from a CEA extension block */
+static _kernel_oserror *process_cea_audio_data_block(EDIDExtensionBlockRef ext_block, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    while (length >= 3)
+    {
+        IFDEBUG printf("CEA Short Audio Descriptor %02x %02x %02x\n",block[0],block[1],block[2]);
+
+        /* Ignore if any reserved bits in the first couple of bytes are set */
+        if (!(block[0] & 128) && !(block[1] & 128))
+        {
+            _kernel_oserror *err = add_audio_format(block[0], block[1], block[2], new_monitor);
+            if (err)
+            {
+                return err;
+            }
+        }
+        block += 3;
+        length -= 3;
+    }
+    return NULL;
+}
+
+/* Process a video data block from a CEA extension block */
+static _kernel_oserror *process_cea_video_data_block(EDIDExtensionBlockRef ext_block, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    /* Parse SVDs and add to mode list */
+    while (length--)
+    {
+        _kernel_oserror *err;
+        uint8_t num = block[0] & 0x7f;
+        const ModeDef *mode;
+         
+        IFDEBUG printf("CEA SVD %02x -> CEA mode %d%s\n", block[0], num, (block[0] & 128) ? " (native)" : "");
+        block++;
+        if ((num == 0) || (num > MAXCEAMODENUM))
+        {
+            continue;
+        }
+        mode = &cea_modes[num-1];
+        if ((mode->xres != mode->hpar[FR_DISP]) || (mode->xres == 2880))
+        {
+            /* Ignore modes that require pixel repetition (currently we have no way of
+             * indicating that requirement to the driver).
+             */
+            continue;
+        }
+        err = add_builtin_mode(new_monitor, mode, 3); /* SVDs should be considered the same priority as DTDs */
+        if (err)
+        {
+            return err;
+        }
+    }
+    return NULL;
+}
+
+/* Process a speaker allocation block from a CEA extension block */
+static _kernel_oserror *process_cea_speaker_allocation_data_block(EDIDExtensionBlockRef ext_block, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    if (length == 3)
+    {
+        IFDEBUG printf("CEA Speaker Allocation %02x %02x %02x\n",block[0],block[1],block[2]);
+        new_monitor->speaker_mask = block[0] & 0x7f;
+        new_monitor->speaker_mask_provided = true;
+    }
+    return NULL;
+}
+
+/* Process a data block from a CEA extension block */
+static _kernel_oserror *process_cea_data_block(EDIDExtensionBlockRef ext_block, int tag_code, int length, const uint8_t *block, MonitorDescriptionRef new_monitor)
+{
+    if (tag_code == 7)
+    {
+        /* Extended tag */
+        tag_code = *block++;
+        length--;
+        IFDEBUG printf("CEA extended data block code %d data length %d\n",tag_code,length);
+
+        /* TODO: Process any interesting ones */
+        return NULL;
+    }
+    IFDEBUG printf("CEA data block code %d data length %d\n",tag_code,length);
+    switch (tag_code)
+    {
+        case 1:  return process_cea_audio_data_block(ext_block, length, block, new_monitor);
+        case 2:  return process_cea_video_data_block(ext_block, length, block, new_monitor);
+        case 4:  return process_cea_speaker_allocation_data_block(ext_block, length, block, new_monitor);
+        default: return NULL;
+    }
+}
+
+/* Process a CEA extension block */
+static _kernel_oserror *process_cea_extension(EDIDExtensionBlockRef ext_block, MonitorDescriptionRef new_monitor)
+{
+    /* Offset from the start of the extension block to the
+     * first dtd in the extension block. Uses the offset from block+2.
+     */
+    const uint8_t *extdata = (uint8_t *) ext_block;
+    int dtd_offset = extdata[2];
+
+    if (dtd_offset > (126 - 18))
+    {
+        /* Bogus DTD offset, ignore block */
+        return NULL;
+    }
+
+    bool basic_audio = (ext_block->revision >= 2) && (extdata[3] & 0x40);
+    if (basic_audio)
+    {
+        IFDEBUG printf("Basic audio supported\n");
+        /* 2-ch LPCM at 32kHz, 44.1kHz, 48kHz
+         * Assume 16/20/24bit supported (spec is a bit vague, but in reality it
+         * shouldn't matter that much because they all get packaged the same)
+         */
+        _kernel_oserror *err = add_audio_format(0x9, 0x7, 0x7, new_monitor);
+        if (err)
+        {
+            return err;
+        }
+    }
+
+    if ((ext_block->revision >= 3) && (dtd_offset > 4))
+    {
+        /* CEA Data Block Collection present */
+        int block_offset = 4;
+        while (block_offset < dtd_offset)
+        {
+            int tag_code = extdata[block_offset] >> 5;
+            int length = extdata[block_offset] & 0x1f;
+            block_offset++;
+            if (!tag_code || !length || (length > (dtd_offset-block_offset)))
+            {
+                /* Bad block length or invalid tag code. TODO - Should probably throw away everything we've learnt so far from this extension block. */
+                return NULL;
+            }
+            _kernel_oserror *err = process_cea_data_block(ext_block, tag_code, length, extdata+block_offset, new_monitor);
+            if (err)
+            {
+                return err;
+            }
+            block_offset += length;
+        }
+    }
+
+    if (dtd_offset < 4)
+    {
+        /* No DTD's provided in this block */
+        return NULL;
+    }
+
+    while ((dtd_offset <= (126 - 18)) &&
+           (extdata[dtd_offset] != 0) && (extdata[dtd_offset+1] != 0))
+    {
+        ModeDescriptionRef mp;
+        mp = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+        if (mp == NULL)
+        {
+            return error(ERR_NOSPACE, 0, 0, 0);
+        }
+
+        if (!dtd_block_to_modedesc(&extdata[dtd_offset], new_monitor, mp, 3))
+        {
+            free(mp);
+        }
+        dtd_offset += 18; /* 18 is the size of a DTD block */
+    }
+
+    return NULL;
+}
+
+/* Process a VTB extension block */
+static _kernel_oserror *process_vtb_extension_block(EDIDExtensionBlockRef ext_block, MonitorDescriptionRef new_monitor)
+{
+    _kernel_oserror *res = NULL;
+    const uint8_t *extdata = (uint8_t *) ext_block;
+
+    /* 'w', 'y' and 'z' originate from the VTB specification */
+    int w = extdata[2]; /* 'w' is the number of detailed timing blocks (DTB) */
+    int y = extdata[3]; /* 'y' is the number of CVT descriptions */
+    int z = extdata[4]; /* 'z' is the number of standard timing descriptions */
+
+    /* There's only space for 122 bytes of timing data. If the block looks like it needs more than that then it's a bad block. */
+    if (w*0x12 + y*0x3 + z*0x2 > 122)
+    {
+        return NULL;
+    }
+    /* Unused bytes should be zero */
+    for (int byte = 0x5 + w*0x12 + y*0x3 + z*0x2; byte < 127; byte++)
+    {
+        if (extdata[byte])
+        {
+            return NULL;
+        }
+    }
+
+    for (int dtb_blockno = 0; dtb_blockno < w; dtb_blockno++)
+    {
+        ModeDescriptionRef mp;
+        mp = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+        if (mp == NULL)
+        {
+            return error(ERR_NOSPACE, 0, 0, 0);
+        }
+
+        if (!dtd_block_to_modedesc(&extdata[0x5 + dtb_blockno*0x12], new_monitor, mp, 3))
+        {
+            free(mp);
+        }
+    }
+
+    for (int cvt_blockno = 0; cvt_blockno < y; cvt_blockno++)
+    {
+        int cvt_byte = 0x5 + w*0x12 + cvt_blockno*0x3;
+        if (!((extdata[cvt_byte] == 0) &&
+            (extdata[cvt_byte+1] == 0) &&
+            (extdata[cvt_byte+2] == 0)))
+        {
+            res = generate_cvt3_timing(extdata[cvt_byte], extdata[cvt_byte+1], extdata[cvt_byte+2], new_monitor);
+            if (res)
+            {
+                return res;
+            }
+        }
+    }
+
+    for (int std_blockno = 0; std_blockno < z; std_blockno++)
+    {
+        int std_byte = 0x5 + w*0x12 + y*0x3 + std_blockno*0x2;
+        if (!((extdata[std_byte] == 0x1) &&
+            (extdata[std_byte+1] == 0x1)))
+        {
+            res = generate_standard_timing(extdata[std_byte], extdata[std_byte+1], new_monitor);
+            if (res)
+            {
+                return res;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static _kernel_oserror *parseedid(EDIDBlockRef edidblockref)
+{
+    _kernel_oserror *res;
+    MonitorDescriptionRef new_monitor;
+    ModeDescriptionRef preferred_mode_desc = NULL; /* None */
+    int RangeBlock = -1;                           /* EDID block containing timimg limits */
+
+    /* OK, commit to reading a monitor description - go allocate space */
+    res = new_monitordescription(&new_monitor);
+    if (res != NULL)
+    {
+        return res;
+    }
+
+    /* Map DPM bits to DPMS, aiming for the highest (most power saving) */
+    new_monitor->dpms_state = 0;
+    if (edidblockref->feature_support & FEATURE_SUPPORT_DPM_STANDBY_SUPPORTED)
+    {
+        new_monitor->dpms_state = 1;
+    }
+    if (edidblockref->feature_support & FEATURE_SUPPORT_DPM_SUSPEND_SUPPORTED)
+    {
+        new_monitor->dpms_state = 2;
+    }
+    if (edidblockref->feature_support & FEATURE_SUPPORT_DPM_ACTIVE_OFF_SUPPORTED)
+    {
+        new_monitor->dpms_state = 3;
+    }
+    
+    /* If we are EDID 1.4 compliant or above GTF and CVT support should be
+     * present. Use CVT in preference, fallback to DMT only.
+     */
+    timing_support = EDID_USE_DMT; /* Default at DMT */
+    if ((edidblockref->edid_version >= 1) && (edidblockref->edid_revision >= 4))
+    {
+        IFDEBUG printf("Use CVT; fallback to DMT if unavailable\n");
+        timing_support = EDID_USE_CVT;
+    }
+
+    /* If we are EDID 1.4 compliant or above GTF support should be
+     * present. Use GTF in preference, fallback to DMT only.
+     */
+    if ((edidblockref->edid_version == 1) && ((edidblockref->edid_revision == 2) || (edidblockref->edid_revision == 3)))
+    {
+        IFDEBUG printf("Use GTF; fallback to DMT if unavailable\n");
+        timing_support = EDID_USE_GTF;
+    }
+#if DODEBUG
+    if (timing_support == EDID_USE_DMT)
+    {
+        printf("Use DMT only\n");
+    }
+    else
+    {
+        if (edidblockref->feature_support & FEATURE_SUPPORT_CONTINUOUS_FREQUENCY)
+        {
+            printf("This display supports continuous frequency modes, but we don't use this yet\n");
+        }
+        else
+        {
+            printf("This display supports only non-continuous frequency modes - use only the resolutions defined\n");
+        }
+    }
+#endif
+
+#ifdef FORCE_TIMINGS
+    /* Now if we have set force_timings as a debug option, override the
+     * timing_support setting for testing calculations
+     */
+    timing_support = FORCE_TIMINGS;
+#endif
+
+    /* Next do each of the 2-byte 'standard timings' (Priority 5). */
+    /* NB GTF support must be functional for these */
+    for (int std_timing_code = 0; std_timing_code < 8; std_timing_code++)
+    {
+        if (!((edidblockref->standard_timings[std_timing_code*2] == 0x01) &&
+              (edidblockref->standard_timings[std_timing_code*2+1] == 0x01)))
+        {
+            res = generate_standard_timing(edidblockref->standard_timings[std_timing_code*2],
+                                           edidblockref->standard_timings[std_timing_code*2+1], new_monitor);
+            if (res)
+            {
+                return res;
+            }
+        }
+    }
+
+    /* Sort the data blocks - store information strings and detailed
+     * timing descriptors. Defer CVT codes and Established timings III
+     * The first block is the 'preferred timing mode' and has highest
+     * priority to go in the MDF. Any other 'detailed timing modes'
+     * have second priority so they will go in next.
+     */
+    for (int blockno = 0; blockno < 4; blockno++)
+    {
+        switch (get_extd_type(edidblockref, blockno))
+        {
+            case -1: /* Normal descriptor block */
+            {
+                IFDEBUG printf("Data block\n");
+                uint8_t priority;
+                ModeDescriptionRef mp;
+
+                mp = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+                if (mp == NULL)
+                {
+                    return error(ERR_NOSPACE, 0, 0, 0);
+                }
+
+                priority = (blockno == 0) ? 0x01 : 0x02;
+                if (!dtd_block_to_modedesc((uint8_t *)&edidblockref->data_block[blockno][0], new_monitor, mp, priority))
+                {
+                    free(mp);
+                    break;
+                }
+                IFDEBUG printf("Detailed Mode: %s, X: %i Y: %i\n", mp->definition.name, mp->definition.timings.xres, mp->definition.timings.yres);
+                if (blockno == 0)
+                {
+                    /* The first block should define the preferred mode */
+                    preferred_mode_desc = mp;
+                }
+                break;
+            }
+            case DATA_TYPE_RANGELIMITS:
+            {
+                IFDEBUG printf("Display range limits\n");
+                RangeBlock = blockno; /* remember */
+
+                /* Not 100% sure about this but think this is how we pick up CVT-RB support */
+                if (timing_support == EDID_USE_CVT)
+                {
+                    char cvt_blanking = edidblockref->data_block[blockno][15];
+                    if ((cvt_blanking & 0x10) == 0x10)
+                    {
+                        timing_support = EDID_USE_CVTRB;
+                    }
+                }
+                break;
+            }
+            case DATA_TYPE_MONITORNAME:
+            {
+                get_dtd_ascii(edidblockref, blockno, new_monitor->name);
+                IFDEBUG printf("Model name: %s\n", new_monitor->name);
+                break;
+            }
+            case DATA_TYPE_ESTTIMINGS3:
+            {
+                IFDEBUG printf("Established timings III");
+                for (int timings_byte=0; timings_byte<6; timings_byte++)
+                {
+                    for (int timings_bit=0; timings_bit<8; timings_bit++)
+                    {
+                        if ((edidblockref->data_block[blockno][6+timings_byte] & (1<<(timings_bit%8))) == (1<<(timings_bit%8)))
+                        {
+                            generate_dmt_mode(established_timings3[(timings_byte * 8) + (7 - timings_bit)],
+                                              new_monitor, 6);
+                        }
+                    }
+                }
+                break;
+            }
+            case DATA_TYPE_CVT3BYTE:
+            {
+                IFDEBUG printf("CVT 3 Byte timing codes, priority 4\n");
+                for (int cvt_byte = 6;cvt_byte < 18; cvt_byte+=3)
+                {
+                    if (!((edidblockref->data_block[blockno][cvt_byte] == 0) &&
+                          (edidblockref->data_block[blockno][cvt_byte+1] == 0) &&
+                          (edidblockref->data_block[blockno][cvt_byte+2] == 0)))
+                    {
+                        res = generate_cvt3_timing(
+                            edidblockref->data_block[blockno][cvt_byte],
+                            edidblockref->data_block[blockno][cvt_byte+1],
+                            edidblockref->data_block[blockno][cvt_byte+2],
+                            new_monitor);
+                        if (res)
+                        {
+                            return res;
+                        }
+                    }
+                }
+                break;
+            }
+#if DODEBUG
+            case DATA_TYPE_MONITORSERIALNUM:
+            {
+                char serial_number[15];
+
+                get_dtd_ascii(edidblockref, blockno, serial_number);
+                printf("Product serial number %s\n", serial_number);
+                break;
+            }
+            case DATA_TYPE_COLOURPOINT:
+                printf("Colour point data\n");
+                break;
+            case DATA_TYPE_STDTIMING:
+                printf("Standard timing identifications\n");
+                break;
+            case DATA_TYPE_DCM:
+                printf("Display colour management (DCM) data\n");
+                break;
+            case DATA_TYPE_DUMMY:
+                printf("Empty\n");
+                break;
+#endif
+        }
+    }
+
+#if DODEBUG
+    printf("Timings bitfield 0 = %02x\n",edidblockref->established_timings[0]);
+    printf("Timings bitfield 1 = %02x\n",edidblockref->established_timings[1]);
+    printf("Timings bitfield 2 = %02x\n",edidblockref->established_timings[2]);
+#endif
+
+    /* Add Established timings I and II  (priority 6) */
+    for (int timings_byte=0; timings_byte<2; timings_byte++)
+    {
+        for (int timings_bit=0; timings_bit<8; timings_bit++)
+        {
+            if ((edidblockref->established_timings[timings_byte] & (1<<timings_bit)) == (1<<timings_bit))
+            {
+                IFDEBUG printf("Timings bitfield byte %d bit %d:\n", timings_byte, timings_bit);
+                int dmt_mode = established_timings[(timings_byte * 8)+(7 - timings_bit)];
+                if (dmt_mode > 0)
+                {
+                    generate_dmt_mode(dmt_mode, new_monitor, 6);
+                }
+                else
+                {
+                    /* Established timings for 720x400 @ 70Hz, derived from:
+                     * http://www.javiervalcarce.eu/html/vga-signal-format-timming-specs-en.html
+                     * http://www.epanorama.net/documents/pc/vga_timing.html
+                     */
+                    static const ModeDef established_timing_7 =
+                    {
+                        /* 720 x 400 @ 70Hz */
+                        720, 400,   108, 54, 0,  720, 0, 18,
+                                    2,   34, 0,  400, 0, 13,
+                                    28322, -1, NP, 0, 70, 0
+                    };
+                
+                    /* There are 3 cases which do not have defined DMT codes.
+                     * These are byte 0 bits 7, 6 and 4 which we will calculate.
+                     */
+                    int xres = 0;
+                    int yres = 0;
+                    int freq = 0;
+                    switch (timings_bit | (timings_byte << 3))
+                    {
+                        case 7: /* 720 x 400 @ 70Hz */
+                            /* Use some fixed timings for better compatibility */
+                            add_builtin_mode(new_monitor, &established_timing_7, 6);
+                            break;
+                        case 6: /* 720 x 400 @ 88Hz */
+                            xres = 720;
+                            yres = 400;
+                            freq = 88;
+                            break;
+                        case 4: /* 640 x 480 @ 67Hz */
+                            xres = 640;
+                            yres = 480;
+                            freq = 67;
+                            break;
+                    }
+                
+                    if (xres > 0)
+                    {
+                        ModeDescriptionRef mp;
+                        bool success = false;
+
+                        mp = (ModeDescriptionRef) malloc(sizeof(ModeDescription));
+                        if (mp == NULL)
+                        {
+                            return error(ERR_NOSPACE, 0, 0, 0);
+                        }
+                
+                        if ((timing_support == EDID_USE_GTF) ||
+                            (timing_support == EDID_USE_GTF2))
+                        {
+                            success = generate_mode_using_gtf(xres, yres, freq, mp, new_monitor);
+                        }
+                        if ((timing_support == EDID_USE_CVT) ||
+                            (timing_support == EDID_USE_CVTRB))
+                        {
+                            success = generate_mode_using_cvt_rb(xres, yres, freq, mp, new_monitor);
+                        }
+                        if (!success)
+                        {
+                            free(mp);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Now check extension blocks for modes. Detailed timing modes found here have 3rd priority */
+    if (edidblockref->extension_block_count > 0)
+    {
+        IFDEBUG printf("%i Extension block(s) found\n", edidblockref->extension_block_count);
+
+        for (int ext_block_id = 1; ext_block_id <= edidblockref->extension_block_count; ext_block_id++)
+        {
+            EDIDExtensionBlockRef ext_block = (EDIDExtensionBlockRef)&edidblockref[ext_block_id];
+
+            /* Different block types to be handled here */
+
+            /* CEA Extension - uses Tag 0x02 */
+            if (ext_block->tag == 0x02)
+            {
+                IFDEBUG printf("Block %i: CEA Extension block found\n", ext_block_id);
+                IFDEBUG printf("Version %i\n", ext_block->revision);
+
+                if (ext_block->revision != 0) /* Revision 0 doesn't exist. All othe revisions(including future ones we don't know about) should be at least partially parseable. */
+                {
+                    res = process_cea_extension(ext_block, new_monitor);
+                    if (res)
+                    {
+                        return res;
+                    }
+                }
+            }
+
+            /* VTB Extension block - Uses Tag 0x10, revision 0x01 */
+            if ((ext_block->tag == 0x10) && (ext_block->revision == 0x01))
+            {
+                res = process_vtb_extension_block(ext_block, new_monitor);
+                if (res)
+                {
+                    return res;
+                }
+            }
+        }
+    }
+
+    /* Then sort the modes */
+    if (new_monitor->modelist == NULL)
+    {
+        return error(ERR_NOMODES, "(EDID)", 0, 0);
+    }
+    else
+    {
+        sort_modelist(&new_monitor->modelist);
+    }
+
+    IFDEBUG printf("Modes sorted\n");
+
+    /* Below taken from the loadmodefile code
+     * If we haven't got a file loaded at present, then
+     * read current monitortype, to restore on module shutdown
+     */
+    if (old_monitortype == -1)
+    {
+        old_monitortype = read_monitortype();
+    }
+
+    res = set_monitortype(MONITOR_FILE);
+    if (res != NULL)
+    {
+        _kernel_oserror *res2;
+        IFDEBUG printf("setting of monitor type to type `FILE' failed\n");
+        res2 = restore_monitortype(); /* restore old value */
+        if (res2 != NULL)
+        {
+            IFDEBUG printf("couldn't reset monitor type to CMOS default!\n");
+        }
+    }
+    else
+    {
+        IFDEBUG printf("Monitor type changed\n");
+
+        release_currentmonitor();
+        current_monitor = new_monitor;
+
+        /* Set up the mode specifier */
+        if (preferred_mode)
+        {
+            preferred_mode->bit0 = 0; /* Invalidate it */
+        }
+        if (preferred_mode && preferred_mode_desc)
+        {
+            PixelFormat pf;
+            ModeParam  *params = preferred_mode->param;
+
+            preferred_mode->xresol = preferred_mode_desc->definition.timings.xres;
+            preferred_mode->yresol = preferred_mode_desc->definition.timings.yres;
+            preferred_mode->framerate = preferred_mode_desc->frame_hz;
+            IFDEBUG printf("Looking for deepest preferred mode %d x %d @ %dHz\n", preferred_mode->xresol, preferred_mode->yresol, preferred_mode->framerate);
+            if (find_deepest_by_xyhz(&pf, preferred_mode_desc))
+            {
+                /* Now know the deepest colour preferred mode */
+                preferred_mode->bit0 = 1;
+                preferred_mode->format = 0;
+                preferred_mode->depth = pf.log2bpp;
+                if (!is_old_format(&pf))
+                {
+                    params->index = VduExt_NColour;
+                    params->value = pf.ncolour;
+                    params++;
+                    params->index = VduExt_ModeFlags;
+                    params->value = pf.modeflags;
+                    params++;
+                }
+                params->index = -1;
+            }
+        }
+
+        /* Set the preferred sync type from video input definition bit 3. */
+        /* (ref EDID spec table 3.11) */
+        if ((edidblockref->video_input_definition & 0x8) == 0x8)
+        {
+            preferred_sync_type = 0;
+        }
+        else
+        {
+            preferred_sync_type = 1;
+        }
+
+        /* Newly defined monitor, announce it */
+        _swix(OS_ServiceCall, _IN(1), Service_ModeFileChanged);
+        IFDEBUG printf("Service_ModeFileChanged issued\n");
+    }
+
+    return res;
+}
+
+/* Use the graphics driver to read one or more EDID blocks via DDC */
+static _kernel_oserror *readedidblock(int displaynum, EDIDBlockRef edidblock, int offset, int count)
+{
+    _kernel_oserror *res;
+    int iic_code = (0xa1 << 16) | (0x80*offset << 0);
+    int op_code = (displaynum << 24) | (0 << 16) | (GraphicsV_IICOp << 0);
+    int remain;
+
+    res = _swix(OS_CallAVector, _INR(0,2) | _IN(4) | _IN(9) | _OUT(0) | _OUT(2) | _OUT(4), iic_code, edidblock+offset, 0x80*count, op_code, GraphicsV, &iic_code, &remain, &op_code);
+    /* OS_CallAVector / GraphicsV shouldn't return a RISC OS error,
+     * but deal with it just in case
+     */
+    if (res)
+    {
+        return res;
+    }
+
+    /* If GraphicsV 14 was not claimed, R4 (op_code) should return
+     * unchanged in which case we need to alert the user that the
+     * hardware doesn't like EDID :-(
+     */
+    if (op_code != 0)
+    {
+        res = error(ERR_CANTREADEDID, 0, 0, 0);
+    }
+    else
+    {
+        /* Call was claimed, check for any IIC-related errors.
+         * Most of the time a non-zero iic_code will be the indicator that
+         * something has gone wrong, but for safety we also check that there
+         * are no remaining bytes left to transfer (could be a buggy driver)
+         */
+        if ((iic_code != 0) || (remain != 0))
+        {
+            res = error(ERR_IICOPFAIL, 0, 0, 0);
+        }
+    }
+
+    return res;
+}
+
+/* Export the raw EDID as a file in ResourceFS. Handy for debugging, but also
+ * scanned by Screen Setup plugin and added to its list of known
+ * monitors.
+ */
+static _kernel_oserror *export_edidblocks(int displaynum, EDIDBlockRef data, size_t datasize)
+{
+    _kernel_oserror *res;
+    uint32_t *desc, *next;
+    uint8_t   time[5];
+    size_t    len;
+
+    desc = malloc((6*4) + ALIGN(strlen(RESFS_EXPORT_PATH)+3+1) + ALIGN(datasize) +
+                  (1*4) /* List end */);
+    if (desc == NULL)
+    {
+        return error(ERR_NOSPACE, 0, 0, 0);
+    }
+
+    /* Build the descriptor */
+    time[0] = OWReadRTC_5ByteInt;
+    _swix(OS_Word, _INR(0,1), OsWord_ReadRealTimeClock, time);
+    desc[1] = 0xFFF00000u | (FileType_EDID << 8) | time[4];
+    desc[2] = *(uint32_t *)time;
+    desc[3] = datasize;
+    desc[4] = read_attribute;
+    len = sprintf((char *)&desc[5], "%s%u", RESFS_EXPORT_PATH, displaynum & 0xFF);
+    next = (uint32_t *)ALIGN(len + 1 + (uintptr_t)&desc[5]);
+    next[0] = datasize + sizeof(uint32_t);
+    memcpy(&next[1], data, datasize);
+    next = (uint32_t *)ALIGN(datasize + (uintptr_t)&next[1]);
+
+    /* Form a list */
+    desc[0] = (uint32_t)((uintptr_t)next - (uintptr_t)desc);
+    next[0] = 0;
+
+    res = _swix(ResourceFS_RegisterFiles, _IN(0), desc);
+    if (res == NULL)
+    {
+        resourceblk = desc;
+    }
+    return res;
+}
+
+/* Remove a previously exported EDID file from ResourceFS */
+void release_edidblocks(void)
+{
+    if (resourceblk != NULL)
+    {
+        _swix(ResourceFS_DeregisterFiles, _IN(0), resourceblk);
+        free(resourceblk);
+        resourceblk = NULL;
+    }
+}
+
+/* Called from LoadModeFile <filename> when the filename looks like
+ * EDID data. Load the EDID data into a data block and parse it.
+ */
+_kernel_oserror *loadedid(const char *file)
+{
+    _kernel_oserror *res;
+    int file_length, object_found;
+
+    res = _swix(OS_File, _INR(0,1) | _OUT(0) | _OUT(4),
+                OSFile_ReadWithTypeNoPath, file, &object_found, &file_length);
+    if (!res && (object_found == object_file))
+    {
+        EDIDBlockRef edidblock = malloc(file_length);
+
+        if (edidblock == NULL)
+        {
+            return error(ERR_NOSPACE, 0, 0, 0);
+        }
+        res = _swix(OS_File, _INR(0,3), OSFile_Load, file, edidblock, 0);
+        if (!res)
+        {
+            res = check_edid_valid(edidblock, true);
+            if (!res)
+            {
+                /* All block checksum OK, parse */
+                res = parseedid(edidblock);
+            }
+        }
+        free(edidblock);
+    }
+    return res;
+}
+
+/* Try to read the EDID data direct from the monitor via the given
+ * display driver (may fail). If the EDID block looks valid export
+ * it in ResourceFS, and do the internal equivalent
+ * of LoadModeFile <EDIDBlock> if configured so.
+ */
+_kernel_oserror *readedid(int displaynum, bool parse)
+{
+    _kernel_oserror *res;
+    EDIDBlockRef edidblock = (EDIDBlockRef) malloc(sizeof(EDIDBlock));
+
+    if (edidblock == NULL)
+    {
+        return error(ERR_NOSPACE, 0, 0, 0);
+    }
+    IFDEBUG printf("ReadEDID called\n");
+
+    /* Read the base block & check it */
+    res = readedidblock(displaynum, edidblock, 0, 1);
+    if (!res)
+    {
+        res = check_edid_valid(edidblock, false);
+    }
+
+    if (!res)
+    {
+        /* Base block OK, resize to accomodate extension blocks */
+        IFDEBUG printf("%i EDID extension blocks found\n", edidblock->extension_block_count);
+
+        if (edidblock->extension_block_count > 0)
+        {
+            EDIDBlockRef blocks;
+            
+            blocks = (EDIDBlockRef)realloc(edidblock, sizeof(EDIDBlock) * (edidblock->extension_block_count + 1));
+            if (blocks == NULL)
+            {
+                res = error(ERR_NOSPACE, 0, 0, 0);
+            }
+            else
+            {
+                /* Read in extension blocks 1 to extension_block_count */
+                edidblock = blocks;
+                res = readedidblock(displaynum, edidblock, 1, edidblock->extension_block_count);
+                if (!res)
+                {
+                    res = check_edid_valid(edidblock, true);
+                }
+            }
+        }
+    }
+
+    if (resourceblk != NULL) release_edidblocks(); /* Free existing */
+    if (!res)
+    {
+        IFDEBUG printf("Exporting EDID block in ResourceFS\n");
+        /* Valid looking EDID gets exported, bad ones do not */
+        export_edidblocks(displaynum, edidblock, sizeof(EDIDBlock) * (edidblock->extension_block_count + 1));
+    }
+    if (parse)
+    {
+        if (res)
+        {
+            /* We're in trouble now, having been asked to parse the EDID we just failed to read from
+             * the monitor (the configured MonitorType is EDID). Make up a safe VESA monitor.
+             */
+            IFDEBUG printf("Creating a safe monitor stand in.\n");
+            memset(edidblock, 0, sizeof(EDIDBlock));
+            memset(&edidblock->standard_timings, 1, sizeof(edidblock->standard_timings)); /* No STD timings */
+            edidblock->edid_version = 1; /* EDID 1.0 */
+            edidblock->established_timings[0] = 0x3F; /* 640 x 480, 800 x 600 */
+            edidblock->established_timings[1] = 0xCF; /* 800 x 600, 1024 x 768, 1280 x 1024 */ 
+            edidblock->data_block[0][3] =
+            edidblock->data_block[1][3] =
+            edidblock->data_block[2][3] =
+            edidblock->data_block[3][3] = DATA_TYPE_DUMMY;
+        }
+        IFDEBUG printf("Parsing EDID block\n");
+        res = parseedid(edidblock);
+    }
+    free(edidblock);
+
+    return res;
+}
+
+/* EOF edidsupport.c */

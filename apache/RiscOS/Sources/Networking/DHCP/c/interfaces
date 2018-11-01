@@ -1,0 +1,596 @@
+/* Copyright 1999 Element 14 Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ *  DHCP (interfaces.c)
+ *
+ * Copyright (C) Element 14 Ltd. 1999
+ *
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OsWords.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "net/if.h"
+#include "protocols/dhcp.h"
+#include "sys/dcistructs.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+
+#include "dhcpintern.h"
+#include "interfaces.h"
+#include "sockets.h"
+#include "module.h"
+#include "packets.h"
+#include "voting.h"
+
+/* Data structure holding details of active DHCP leasing interfaces */
+static dhcp_interface *ichain;
+
+
+int interfaces_current_time(void)
+{
+	int timenow;
+	(void) _swix(OS_ReadMonotonicTime, _OUT(0), &timenow);
+	return timenow;
+}
+
+/* Return the current time + a random interval uniformly chosen from [1..max_secs].
+ */
+dhcp_time interfaces_random_delay(int max_secs)
+{
+        if (max_secs <= 1) {
+                return interfaces_current_time() + 100;
+        }
+        return interfaces_current_time() + 100 + (rand() % ((max_secs-1) * 100 + 1));
+}
+
+/* Initialisation and finalisation routines */
+void interfaces_init(void)
+{
+	ichain = NULL;
+}
+
+/* Throws away all known interface information - relies on tail recursion
+ * and is more efficient than a while loop in Norcroft!
+ *
+ * 19990702 KJB - You're a very sick bunny.
+ */
+void interfaces_discard(void)
+{
+	if (ichain != NULL) {
+		interfaces_forget(ichain);
+		interfaces_discard();
+	}
+}
+
+/* Locate interfaces given various attributes: name or transaction ID */
+dhcp_interface *interfaces_find(const char *name)
+{
+	dhcp_interface *di;
+
+	for (di = ichain; di != NULL; di = di->next) {
+		if (strcmp(di->di_name, name) == 0) {
+			break;
+		}
+	}
+
+	return di;
+}
+
+dhcp_interface *interfaces_find_by_xid(u_long xid)
+{
+	dhcp_interface *di;
+
+	for (di = ichain; di != NULL; di = di->next) {
+		if (di->di_dhcp.xid == xid)  {
+			break;
+		}
+	}
+
+	return di;
+}
+
+/* Creation of structure representing new interface based on incoming dynamic boot
+ * start service call.  If we were asked to DHCP explicitly through a call to SWI
+ * DHCP_Execute, we just ask Internet to "BOOTP" and then trap the service call to
+ * minimise the number of entry points into the system.
+ */
+dhcp_interface *interfaces_create(const dhcp_start_params *dsp)
+{
+	dhcp_interface *di;
+	u_int *hwint;
+
+	di = interfaces_find(dsp->ifname);
+	if (di != NULL) {
+	        /* We already know about this interface.  Probably caused by
+	         * something trying to prod Internet (IPConfig, for example).
+	         */
+		return di;
+	}
+
+	di = calloc(1, sizeof(dhcp_interface));
+	if (di != NULL) {
+	        /* Name is copied to ensure that the
+	         * struct ifreq is initialised correctly
+	         */
+		(void) strncpy(di->di_name, dsp->ifname, IFNAMSIZ);
+		dhcp_empty_blacklist(di);
+		di->next = ichain;
+		di->request_lease = dhcp_any_lease;
+		di->dib = dsp->dib;
+		di->t1 = interfaces_random_delay(10);
+		di->t2 = dhcp_infinite_lease;
+		di->orig_t1 = dhcp_infinite_lease;
+		di->orig_t2 = dhcp_infinite_lease;
+		di->kill_if = dhcp_infinite_lease;
+		sockets_set_preferred_ip_address(di, INADDR_ANY);
+		if (di->preferred_ip.s_addr != INADDR_ANY) {
+                        di->state = dhcpstate_INITREBOOT;
+		}
+		else {
+			di->state = dhcpstate_INIT;
+		}
+		ichain = di;
+		/* A good opportunity to randomise */
+		hwint = (u_int *) di->dib->dib_address;
+		srand(hwint[0] ^ hwint[1] ^ interfaces_current_time());
+
+		trace(("interfaces_create: state: %s  addr: %s  mac: %08x %08x  name: %s%d\n",
+		  dhcp_state_name(di), inet_ntoa(di->preferred_ip), hwint[0], hwint[1],
+		  di->dib->dib_name, di->dib->dib_unit));
+
+	}
+
+	return di;
+}
+
+void interfaces_address_changed(void)
+{
+        /* Check all the interfaces */
+	dhcp_interface *di, *next;
+
+	for (di = ichain; di != NULL; di = next) {
+	        next = di->next;
+        	if (sockets_verify_address(di) < 0) {
+                	/* Interface configuration is incorrect. */
+                        dhcp_release(di, "Manual reconfiguration");
+                	interfaces_forget(di);
+                }
+	}
+}
+
+int interfaces_address_clash(Dib *dib, u_long iap)
+{
+        /* Check all the interfaces */
+	dhcp_interface *di, *next;
+
+#ifdef TRACE
+	struct in_addr ia; ia.s_addr = iap;
+	trace(("Internet has notified of an address clash (%s)\n", inet_ntoa(ia)));
+#endif
+	(void) iap;
+
+	for (di = ichain; di != NULL; di = next) {
+	        next = di->next;
+        	if (di->dib == dib) {
+                	/* This interface clashed - decommission it */
+                	trace(("Decommissioning interface due to ARP probe clash\n"));
+                        dhcp_decline(di, "Address clash detected by ARP probe");
+                        di->binding.yiaddr = iap;
+                        sockets_kill_interface(di);
+        		sockets_trigger_internet_dhcp(di->di_name);
+                	return 1; /* Instruct module.c to claim the service call */
+                }
+	}
+
+	return 0; /* Don't claim the service call */
+}
+
+/* Deletion of a structure.  Triggered by module finalisation or explicit request
+ * through SWI interface.
+ */
+void interfaces_forget(dhcp_interface *i)
+{
+	dhcp_interface *di = ichain, *prev = NULL;
+
+       	trace(("DHCP abandons interface %s (%s)\n", i->di_name, dhcp_state_name(i)));
+
+	for (di = ichain; di != NULL; prev = di, di = di->next) {
+		if (di == i) {
+			if (prev != NULL) {
+				prev->next = di->next;
+			}
+			else {
+				ichain = di->next;
+			}
+			free(di);
+			return;
+		}
+	}
+}
+
+const char *dhcp_state_name(const dhcp_interface *di)
+{
+	char token[5];
+
+	sprintf(token, "St%x", di->state & 0xFF);
+	return module_lookup_msg(token);
+}
+
+/* Convert the time and display as a string.  The times passed in are
+ * centisecond monotonic time values.  Hence we need to compute when the
+ * time is relative to the current time.
+ */
+static void interfaces_print_time(const dhcp_time t)
+{
+	if (t == dhcp_infinite_lease) {
+		printf("%s\n", module_lookup_msg("NevInf"));
+	}
+	else if (t == dhcp_maximum_lease) {
+		printf("%s\n", module_lookup_msg("NevMax"));
+	}
+	else {
+		char     buff[64];
+		uint64_t fbt;
+
+		*(uint64_t *)buff = 0;
+		buff[0] = OWReadRTC_5ByteInt;
+		_swix(OS_Word, _INR(0,1), OsWord_ReadRealTimeClock, buff);
+		fbt = *(uint64_t *)buff + t - (uint64_t)interfaces_current_time();
+		_swix(OS_ConvertStandardDateAndTime, _INR(0,2),
+		      &fbt, buff, sizeof(buff));
+		printf("%s\n", buff);
+	}
+}
+
+/* Print a column heading, line up, a separator, line up.  Uses the module
+ * message lookup therefore uses the shared static buffer.
+ */
+static void interfaces_print_heading(const char *token, char sep, size_t len)
+{
+	size_t output;
+
+	output = printf(module_lookup_msg(token));
+	while (output <= len)
+	{
+		putchar(' ');
+		output++;
+	}
+	putchar(sep);
+	putchar(' ');
+}
+
+void interfaces_print_information(const dhcp_interface *di)
+{
+        if (di == NULL) {
+                /* Print information about all known interfaces */
+                for (di = ichain; di != NULL; di = di->next) {
+                        printf("\n");
+                        interfaces_print_information(di);
+                }
+        }
+	else {
+		size_t column = strlen(module_lookup_msg("Headr"));
+
+		interfaces_print_heading("Iface", ':', column);
+		printf("%s\n", di->di_name);
+		interfaces_print_heading("State", ':', column);
+		printf("%s\n", dhcp_state_name(di));
+
+		if (di->state == dhcpstate_BOUND || di->state == dhcpstate_RENEWING ||
+		    di->state == dhcpstate_REBINDING) {
+			interfaces_print_heading("IPadd", ':', column);
+			printf("%s\n", inet_ntoa(*(struct in_addr *)&di->binding.yiaddr));
+		}
+
+		if (di->state == dhcpstate_BOUND || di->state == dhcpstate_RENEWING) {
+		        struct in_addr ip;
+			if (dhcp_find_server_identifier(&di->binding, &ip)) {
+				interfaces_print_heading("DServ", ':', column);
+				printf("%s\n", inet_ntoa(ip));
+			}
+		}
+
+		if (di->state == dhcpstate_BOUND || di->state == dhcpstate_RENEWING ||
+		    di->state == dhcpstate_REBINDING) {
+			if (di->orig_t1 != dhcp_infinite_lease) {
+				interfaces_print_heading("Renew", '@', column);
+				interfaces_print_time(di->orig_t1);
+			}
+
+			if (di->orig_t2 != dhcp_infinite_lease) {
+				interfaces_print_heading("Rbind", '@', column);
+				interfaces_print_time(di->orig_t2);
+			}
+
+			interfaces_print_heading("Xpire", '@', column);
+			interfaces_print_time(di->kill_if);
+		}
+
+		if (di->t1 != dhcp_infinite_lease && di->t1 != di->orig_t1) {
+			interfaces_print_heading("Retry", '@', column);
+			interfaces_print_time(di->t1);
+		}
+	}
+}
+
+/* This routines finds the earliest trigger date for the next interesting timed
+ * event and returns it.  It is allowed to return times which are in the past -
+ * as interfaces_reschedule specifically handles that.  Returns dhcp_infinite_lease
+ * if there are no interesting events scheduled to happen at specific times.
+ */
+static dhcp_time interfaces_get_next_event_time(void)
+{
+        const dhcp_interface *di;
+        dhcp_time earliest = dhcp_infinite_lease;
+
+        for (di = ichain; di != NULL; di = di->next) {
+                if (di->t1 < earliest) earliest = di->t1;
+                if (di->t2 < earliest) earliest = di->t2;
+                if (di->kill_if < earliest) earliest = di->kill_if;
+        }
+
+        return earliest;
+}
+
+
+/* The Kill Interface timer triggered.  This should only occur in the REBINDING state
+ * (as we would have been attempting to RENEW and REBIND as the end of the lease
+ * approached).  We must take the interface out of commission immediately and try to
+ * get a new address.  Behaviour of other network software on the host in response to
+ * this sudden change of IP address appears to be "beyond the scope of RFC2131".  How
+ * convenient!
+ */
+static void interfaces_terminate(dhcp_interface *di)
+{
+        trace(("Interface kill timer triggered on %s in state %s\n", di->di_name,
+                	dhcp_state_name(di)));
+
+	if (sockets_kill_interface(di) < 0) {
+	        /* Unable to manipulate interface as we wanted to.  Go into a
+	         * huff and forget about the interface.
+	         */
+	        interfaces_forget(di);
+	}
+	else {
+		/* In the unlikely event of the machine not have died unrecoverably
+		 * by now, re-initialise the interface's DHCP state so that it attempts
+		 * to find a new IP address to use.  Frankly, I'll be amazed if this
+		 * works.
+		 */
+		di->state = dhcpstate_INIT;
+		di->t1 = interfaces_random_delay(10);
+		di->t2 = dhcp_infinite_lease;
+		di->kill_if = dhcp_infinite_lease;
+		di->orig_t1 = dhcp_infinite_lease;
+		di->orig_t2 = dhcp_infinite_lease;
+		sockets_trigger_internet_dhcp(di->di_name);
+	}
+}
+
+
+/* Timer 2 triggered on this interface.  When BOUND, this means that we haven't been
+ * able to renew our lease and that we should now try to rebind.  If we are in any
+ * other state, then it means that we need to give up the current operation and not
+ * retry it any more (retries would have been occuring on T1).
+ */
+static void interfaces_T2_triggered(dhcp_interface *di)
+{
+        trace(("T2 triggered on %s in state %s\n", di->di_name, dhcp_state_name(di)));
+
+	if (di->state == dhcpstate_SELECTING) {
+	        /* Our initial collection period has expired */
+		if (di->offer.op == BOOTREQUEST) {
+		        /* No response yet - if the -p flag was used, abort the
+		         * process and assign a private IP address
+		         */
+		       if (di->flags & dse_ASSIGN_PRIVATE_IP) {
+		         trace(("timed out on %s - abandoning interface\n", di->di_name));
+
+		         if (di->flags & dse_BLOCKING_MODE) {
+		           /*
+		            * Mark this interface for deletion by the swi handler
+		            */
+		           di->state = dhcpstate_ABANDON;
+		           di->t2 = dhcp_infinite_lease;
+
+		         } else {
+		           /*
+		            * It's safe to delete it now. And in fact we must, as in
+		            * non blocking mode the swi handler is not called again
+		            */
+		           Dib dib = *di->dib; /* Copy the driver information block */
+		           struct in_addr del = di->preferred_ip;
+                           interfaces_forget(di);
+		           sockets_delete_address(&dib, &del);
+  		           module_apply_private_ip(&dib);
+		         }
+
+		       } else {
+		         /*
+		          * Start again
+		          */
+		         trace(("timed out on %s - restarting\n", di->di_name));
+  		         dhcp_discover(di);
+		       }
+
+		}
+		else {
+		        /* Had a response - try it! */
+		        dhcp_accept_offer(di);
+		}
+	}
+	else if (di->state == dhcpstate_BOUND ||
+	         di->state == dhcpstate_RENEWING) {
+	        /* We have lost contact with our original server, so break the
+	         * binding and try to find a new server to continue holding our lease.
+	         */
+		di->binding.siaddr = htonl(INADDR_ANY);
+		dhcp_request(di, dhcpstate_REBINDING, dhcprequest_set_T2);
+	}
+	else {
+		struct in_addr difficult_server;
+	        /* No response to the request message - try again?  Add the
+	         * server to the blacklist, as it's being naughty.
+	         */
+	        if (dhcp_find_server_identifier(&di->offer, &difficult_server)) {
+	        	dhcp_add_to_blacklist(di, difficult_server);
+	        }
+		dhcp_discover(di);
+	}
+}
+
+/* Timer 1 triggered on this interface.  In the BOUND state, it is time to attempt
+ * to renew the lease.  If already renewing the lease, this is a retry of that op.
+ * If we are in the INIT state, kick off the discover message (this event is timed so
+ * we can enforce random fuzz to desynchronise synchronised network power restoration,
+ * for example).  If we were waiting for offers (SELECTING) and none have been
+ * forthcoming, retry the discover message, otherwise kick of the acceptance of the
+ * favourite offer.  If we were already REQUESTING, then retry that.
+ */
+static void interfaces_T1_triggered(dhcp_interface *di)
+{
+        trace(("T1 triggered on %s in state %s\n", di->di_name, dhcp_state_name(di)));
+
+        if (di->state == dhcpstate_BOUND) {
+        	/* The time to attempt a lease extension has arrived.
+        	 * In a "standard" configuration, this means that the lease
+        	 * has reached its half-life and we should attempt to renew
+        	 * it, but not all *that* urgently.
+        	 */
+                di->offer = di->binding;
+                dhcp_request(di, dhcpstate_RENEWING, dhcprequest_retain_T2);
+        }
+        else if (di->state == dhcpstate_INIT) {
+                /* Start-up fuzz timer has expired.  Let's get going! */
+                dhcp_discover(di);
+        }
+        else if (di->state == dhcpstate_INITREBOOT) {
+                /* Start-up fuzz timer has expired.  Let's get going! */
+                dhcp_request(di, dhcpstate_REBOOTING, dhcprequest_set_T2);
+        }
+        else if (di->state == dhcpstate_SELECTING) {
+                /* We are waiting for offers to arrive.  When this timer fires,
+                 * this means we want to retransmit the DHCPDISCOVER packet
+                 */
+                if (di->offer.op == BOOTREQUEST) {
+                        /* No responses yet */
+	                dhcp_transmit(di);
+		        module_idle(mir_WAKEUP);
+                }
+                else {
+                        /* OK - we're happy with the one we have been offered */
+		        dhcp_accept_offer(di);
+                }
+        }
+        else {
+                /* Time to retry the request message */
+                dhcp_transmit(di);
+	        module_idle(mir_WAKEUP);
+        }
+}
+
+static void interfaces_check_timers(dhcp_interface *di, dhcp_time trigger)
+{
+        if (trigger > di->kill_if) {
+                /* We have a major problem - our interface allocation has
+                 * expired.  The following call will bring down the interface
+                 * probably with spectacular consequences for the system,
+                 * but the RFC is quite clear on this issue.  This condition
+                 * will never occur if we are holding an infinite lease.
+                 */
+                interfaces_terminate(di);
+        }
+        else if (trigger > di->t2) {
+                /* We have a minor problem - we were unable to negotiate a
+                 * lease extension with our original DHCP server.  This
+                 * condition will never occur if we are holding an infinite
+                 * lease.  However, we also use this as a retry giveup timeout,
+                 * so this call can be made in those circumstances.
+                 */
+                interfaces_T2_triggered(di);
+        }
+        else if (trigger > di->t1) {
+                /* The re-acquisition timer has fired.  In a system such as
+                 * that recommended by the DHCP RFC, this condition indicates
+                 * that half of our lease time has expired and that now is a
+                 * good time to try to negotiate an extension.  This condition
+                 * will never occur if we are holding an infinite lease. However,
+                 * we also use this as a retry timer, so it may be called in
+                 * those circumstances.
+                 */
+                interfaces_T1_triggered(di);
+        }
+}
+
+
+/* This routine is called on a callback (set on the callafter).
+ * It is called when one of our timers has expired.  Note that
+ * if the earliest timer has been moved, nothing will happen except
+ * that a new callafter will be scheduled if necessary.
+ */
+void interfaces_timer_fired(void *private_word)
+{
+        dhcp_interface *di;
+
+	/* Release the block on the original caller, thus enforcing a timeout
+	 * or wakeup (in this case, a timeout) so that the original caller's
+	 * retry algorithms can function correctly.
+	 */
+
+        for (di = ichain; di != NULL; ) {
+                /* The timer check may result in the deletion of the
+                 * dhcp_interface object - so we cannot rely on the next
+                 * field still being there after the function call!
+                 */
+                dhcp_interface *const next = di->next;
+                interfaces_check_timers(di, interfaces_current_time());
+                di = next;
+        }
+
+	interfaces_reschedule(private_word);
+}
+
+/* Be very careful of the two routines either side of this comment.  They
+ * are mutually recursive, and they have been carefully written to ensure
+ * that they are both tail-recursive.
+ */
+
+void interfaces_reschedule(void *private_word)
+{
+        int timenow = interfaces_current_time();
+        dhcp_time next_event = interfaces_get_next_event_time();
+
+	if (next_event != dhcp_infinite_lease) {
+	        /* Allow an event to be scheduled in the past - and don't
+	         * actually set a timer, but just cross-recurse back into
+	         * interfaces_timer_fired to make things go quickly.
+	         */
+	        if (next_event > timenow) {
+		        module_reschedule(next_event - timenow, private_word);
+	        }
+	        else {
+		        interfaces_timer_fired(private_word);
+	        }
+	}
+}
+

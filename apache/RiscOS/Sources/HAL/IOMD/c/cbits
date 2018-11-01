@@ -1,0 +1,369 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#ifdef TESTBED
+#include <stdlib.h>
+#include <stdio.h>
+#else
+/* Note: _global_reg not needed here since the code in this file is only executed pre- OS_Start */
+//__global_reg(6) void *sb;
+#endif
+
+/* IOMD RAM setup code
+
+   The code in this file has two main jobs:
+
+   1. Decide how to present the DRAM banks to RISC OS, in order to have the
+      largest possible contiguous physical regions
+   2. Locate somewhere to relocate the ROM image to (if ROM is compressed, or
+      we've been softloaded)
+
+   Part 2 is pretty simple. It's part 1 which is the fiddly bit; if a bank has
+   gaps in its address lines then it will appear as several blocks of RAM
+   instead of just one. Furthermore, by setting the unused address lines to
+   different values, we can access the same block of RAM from different
+   addresses; this is the core technique we're going to use to coalesce the
+   blocks into larger chunks of RAM.
+
+
+   Different RAM configurations
+   ----------------------------
+
+   After some thought, I've concluded that for each bank there will only be two
+   useful RAM configurations. I've called these 'spanning' and 'non-spanning'.
+   The 'spanflags' variable indicates whether each bank spans or not.
+
+   The behaviour of the algorithm (implemented in Iterate_RAM) is as follows:
+
+   * For DRAM banks containing a single block of RAM, the span flag is used to
+     indicate whether the block should be at the high (span=1) or low (span=0)
+     end of the bank
+   * For DRAM banks containing multiple blocks of RAM, the span flag is used to
+     indicate whether there should be blocks touching the high and low end of
+     the bank or whether all blocks should be somewhere in the middle of the
+     bank.
+
+   The behaviour of the algorithm when dealing with multiple blocks of RAM is
+   best explained by example. So lets say we're dealing with a bank of RAM
+   with address lines 0x0111ffff connected. This is 512K of RAM, but the
+   smallest contiguous block ('smallest') is 128K (0x1ffff+1)
+
+   A naive approach to handling the RAM would be to simply register 4 blocks of
+   128K, like the original code did (I think!):
+
+   0x00000000 - 0x0001ffff length 0x00020000
+   0x00100000 - 0x0011ffff length 0x00020000
+   0x01000000 - 0x0101ffff length 0x00020000
+   0x01100000 - 0x0111ffff length 0x00020000
+
+   But what this algorithm does is as follows. First, if the span flag is false:
+
+   0x000e0000 - 0x0011ffff length 0x00040000
+   0x010e0000 - 0x0111ffff length 0x00040000
+
+   By adding an offset of 0x000e0000 to the address, it causes any overflow from
+   bit 16 to ripple up to bit 20, allowing the block length to be doubled. This
+   has the effect of merging blocks 1 & 2 and blocks 3 & 4 from the original
+   list. Iterate_RAM calculates this offset value in the 'offset' variable.
+
+   If the span flag is true, then the memory will be presented like this:
+
+   0x00000000 - 0x0001ffff length 0x00020000
+   0x00fe0000 - 0x0101ffff length 0x00040000
+   0x03fe0000 - 0x03ffffff length 0x00020000
+
+   The placement of the first and last blocks are easy to calculate, as they're
+   touching the low and high end of the bank respectively. The middle block(s)
+   (which are blocks 2 & 3 from the original list) are a bit more fiddly. You'll
+   notice in Iterate_RAM that 'span' will be set to 'next' (0x00100000) if
+   spanflag is true. This is the magic offset that's subtracted from each
+   middle block to convert it from a non-spanning block to a spanning block.
+
+
+   Determining the best RAM configuration
+   --------------------------------------
+
+   Rather than spend ages scratching my head to come up with a computationally
+   simple method of determining the best RAM configuration, I've instead just
+   implemented a brute-force approach. Since there are only 16 configurations
+   to try (1 span flag setting for each bank) this shouldn't have any
+   significant impact on boot times.
+
+   For each configuration, the Calculate_RAM_Blocks function is used to
+   iterate through all the RAM blocks and construct a sorted list in a memblocks
+   struct. The list is in reverse order (for no particular reason), with the
+   high halfword of each entry containing the block size and the low halfword
+   containing the number of times such a block has been seen. This simplifies
+   the work of deciding if one set of results is better than another (see
+   the loop in Decide_On_Memory_Layout). The algorithm favours big block sizes
+   over reducing the block count; so a theoretical configuration with one 1MB
+   block and a thousand 1KB blocks would be deemed better than a configuration
+   with two 512KB blocks.
+
+
+   Deciding where to place the OS image
+   ------------------------------------
+
+   This is pretty simple - just use Iterate_RAM to call Find_ROM_Placement and
+   make a note of the last (i.e. highest) block of RAM that the (uncompressed)
+   OS image will fit into.
+
+*/
+
+typedef struct {
+  uint32_t addresslines[6]; /* Valid address lines for all DRAM/SDRAM banks */
+  uint32_t base; /* Our ROM base address */
+  uint32_t compressedsize; /* Compressed ROM size */
+  uint32_t uncompressedsize; /* Uncompressed ROM size */
+} params;
+
+#define MAX_RAM_BLOCKS 13 /* 6 for blocks in the middle of banks, 2 for blocks at high/low end of RAM, 5 for blocks spanning banks */
+
+typedef struct {
+  uint32_t results[MAX_RAM_BLOCKS]; /* Table of results. High halfword = block size, low halfword = count */
+  uint32_t spanflags; /* Which flags we used to generate the table */
+} memblocks;
+
+#define LOWBIT(X) ((X) & ~((X)-1)) /* Return lowest bit set in X */
+#define DRAMPhysRam(X) (0x10000000+((((X)==5)?8:(X))<<26))
+#define DRAMSize(X) (((X)&4)?(1<<27):(1<<26))
+
+typedef void (*RAMIterCallback)(const params *p,void *v,uint32_t base,uint32_t size);
+
+static inline void Iterate_Block(const params *p,void *v,uint32_t base,uint32_t size,RAMIterCallback cb,uint32_t *lastblock,uint32_t *lastsize)
+{
+  /* Coalesce any adjacent blocks before calling the user callback
+     This coalescing is only relevant for blocks which touch the start/end of
+     banks */
+  if((*lastblock)+(*lastsize) == base)
+  {
+    *lastsize += size;
+  }
+  else
+  {
+    cb(p,v,*lastblock,*lastsize);
+    *lastblock = base;
+    *lastsize = size;
+  }
+}
+
+static void Iterate_RAM(const params *p,uint32_t spanflags,RAMIterCallback cb,void *v)
+{
+  uint32_t lastblock=0;
+  uint32_t lastsize=0;
+#ifndef TESTBED
+  /* Relocate callback pointer :(
+     Should probably compile this file as PIC */
+  uint32_t temp = (uint32_t) cb;
+  temp -= 0xFC000000;
+  temp += p->base;
+  cb = (RAMIterCallback) temp;
+#endif
+  for(int i=0;i<6;i++,spanflags>>=1)
+  {
+    if(!p->addresslines[i])
+      continue;
+    uint32_t mask = p->addresslines[i];
+    uint32_t smallest = LOWBIT(~mask);
+    uint32_t pos = 0;
+    if(smallest == mask+1)
+    {
+      /* One block */
+      if(spanflags & 1)
+        pos = DRAMSize(i)-smallest; /* Position at end of bank */
+      Iterate_Block(p,v,DRAMPhysRam(i)+pos,smallest,cb,&lastblock,&lastsize);
+    }
+    else
+    {
+      /* Multiple blocks */
+      uint32_t next = LOWBIT(mask-smallest+1); /* Next bit that's set in the mask above 'smallest' */
+      uint32_t offset = next-smallest;
+      uint32_t span = (spanflags & 1)?next:0;
+      do {
+        pos += offset; /* Apply base offset */
+        if(pos >= span)
+          Iterate_Block(p,v,DRAMPhysRam(i)+pos-span,smallest*2,cb,&lastblock,&lastsize);
+        else
+          Iterate_Block(p,v,DRAMPhysRam(i),smallest,cb,&lastblock,&lastsize);
+        pos += (~mask)+smallest*2; /* Step up offset by block size, and add negative mask to trigger ripple-up */
+        pos &= mask; /* Mask off unwanted bits */
+      } while(pos);
+      if(span)
+        Iterate_Block(p,v,DRAMPhysRam(i)+DRAMSize(i)-smallest,smallest,cb,&lastblock,&lastsize);
+    }
+  }
+  if(lastblock)
+  {
+    cb(p,v,lastblock,lastsize);
+  }
+}
+
+
+static void Calculate_RAM_Blocks_cb(const params *p,void *v,uint32_t base,uint32_t size)
+{
+  (void) base;
+  (void) p;
+  memblocks *m = (memblocks *) v;
+  if(!size)
+    return;
+  for(int i=MAX_RAM_BLOCKS-1;i>=0;i--)
+  {
+    if(size > m->results[i])
+    {
+      /* Shuffle everything down */
+      for(int j=0;j<i;j++)
+        m->results[j] = m->results[j+1];
+      m->results[i] = size+1;
+      return;
+    }
+    if((size>>16) == (m->results[i]>>16))
+    {
+      m->results[i]++;
+      return;
+    }
+  }
+}
+
+
+static void Calculate_RAM_Blocks(const params *p,memblocks *m)
+{
+  for(int i=0;i<MAX_RAM_BLOCKS;i++)
+    m->results[i] = 0;
+  Iterate_RAM(p,m->spanflags,Calculate_RAM_Blocks_cb,m);
+#ifdef TESTBED
+  printf("RAM blocks for spanflags %x:\n",m->spanflags);
+  uint32_t tot=0;
+  for(int i=MAX_RAM_BLOCKS-1;i>=0;i--)
+    if(m->results[i])
+    {
+      uint32_t size = m->results[i] & 0xffff0000;
+      uint32_t count = (m->results[i] & 0xffff);
+      printf("  Size %08x count %d\n",size,count);
+      tot += size*count;
+    }
+  printf("  Total %08x\n",tot);
+#endif
+}
+
+
+static void Find_ROM_Placement(const params *p,void *v,uint32_t base,uint32_t size)
+{
+  uint32_t *highest = (uint32_t *) v;
+  /* Aim for 1MB alignment */
+  base += size-p->uncompressedsize;
+  uint32_t align = base & 0xfffff;
+  if(size < p->uncompressedsize+align)
+    return;
+  *highest = base-align;
+}
+
+extern uint32_t Decide_On_Memory_Layout(params *p);
+
+uint32_t Decide_On_Memory_Layout(params *p)
+{
+  /* Our job is to do two things:
+     1. Decide on the physical memory layout; i.e. how we'll coalesce the
+        different blocks of RAM
+     2. Locate somewhere suitable to copy the ROM image (if necessary)
+  */
+
+  memblocks m1,m2;
+  m1.spanflags = 0;
+  Calculate_RAM_Blocks(p,&m1);
+  for(int i=1;i<64;i++)
+  {
+    m2.spanflags = i;
+    Calculate_RAM_Blocks(p,&m2);
+    for(int j=MAX_RAM_BLOCKS-1;j>=0;j--)
+    {
+      if(m1.results[j] < m2.results[j])
+      {
+        m1 = m2;
+        break;
+      }
+      else if(m1.results[j] > m2.results[j])
+      {
+        break;
+      }
+    }
+  }
+  /* We've now selected (in m1) the RAM setup that'll give us the most/largest
+     contiguous physical areas
+     Now scan for somewhere to copy the ROM, if necessary */
+  uint32_t highest = 0;
+  if((p->base >= DRAMPhysRam(0)) /* Are we softloaded? */
+  || (p->compressedsize != p->uncompressedsize) /* Are we compressed? */
+  || p->addresslines[4] || p->addresslines[5]) /* Are we on a Kinetic? */ 
+  {
+     Iterate_RAM(p,m1.spanflags,Find_ROM_Placement,&highest);
+  }
+  /* Return with results packed into one word */
+  return highest | m1.spanflags;
+}
+
+void *memcpy(void *dst, const void *src, size_t len)
+{
+    char *d = dst;
+    const char *s = src;
+    while (len--)
+        *d++ = *s++;
+    return dst;
+}
+
+#ifdef TESTBED
+static void dotest(params *p)
+{
+  printf("\
+Address lines:    %08x\n\
+                  %08x\n\
+                  %08x\n\
+                  %08x\n\
+                  %08x\n\
+                  %08x\n\
+Base:             %08x\n\
+CompressedSize:   %08x\n\
+UncompressedSize: %08x\n",
+p->addresslines[0],
+p->addresslines[1],
+p->addresslines[2],
+p->addresslines[3],
+p->addresslines[4],
+p->addresslines[5],
+p->base,
+p->compressedsize,
+p->uncompressedsize);
+  uint32_t res = Decide_On_Memory_Layout(p);
+  printf("-> spanflags %x ROM addr %08x\n",res & 0x3f,res & ~0x3f);
+}
+
+int main(int argc,char **argv)
+{
+  params p;
+  p.addresslines[0] = 0x00ffffff;
+  p.addresslines[1] = 0x00ffffff;
+  p.addresslines[2] = 0x00000000;
+  p.addresslines[3] = 0x00000000;
+  p.addresslines[4] = 0x00000000;
+  p.addresslines[5] = 0x00000000;
+  p.base = DRAMPhysRam(0);
+  p.compressedsize = 2<<20;
+  p.uncompressedsize = 4<<20;
+  dotest(&p);
+  return 0;
+}
+#endif

@@ -1,0 +1,1473 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*
+*  LanMan.C -- Lan Manager network client main module
+*
+*  Versions
+*
+*  28-02-94 INH Derived from FSinC (added c.Statics)
+*
+*
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <locale.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/Services.h"
+#include "Global/FileTypes.h"
+#include "Global/NewErrors.h"
+#include "Interface/HighFSI.h"
+
+#include "sys/dcistructs.h"
+#include "sys/types.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+
+#include "stdtypes.h"
+#include "LanMan.h"
+#include "LMVars.h"
+#include "Params.h"
+#include "CoreFn.h"
+#include "BufLib.h"
+#include "NetBIOS.h"
+#include "SMB.h"
+#include "Xlate.h"
+#include "VersionNum"
+#include "Omni.h"
+#include "Printers.h"
+#include "RPC.h"
+#include "Stats.h"
+#include "Logon.h"
+#include "LanMan_MH.h"
+
+/* ---------------------------------- */
+
+extern void *Resources(void);
+
+#define DEFAULT_ETHER_TYPE 	"_default_"
+
+typedef void (*pfnShutdown)(void);
+typedef void (*pfnTransportInit)(void);
+
+enum {
+        LMInitState_Uninitialised,
+        LMInitState_PreInit,
+        LMInitState_FullyInited,
+        LMInitState_Boot
+};
+
+static void startcallbacks(void);
+static void stopcallbacks(void);
+
+static _kernel_oserror *LM_init_phase_2(void);
+
+/* ---------------------------------- */
+
+struct LMvars LM_Vars;
+static volatile int callbackflag = 0;
+static int msg_struct[4]; /* MessageTrans block */
+static _kernel_oserror msg_buff; /* MessageTrans buffer */
+static _kernel_oserror *msg_oserr;
+int    LM_pw;          /* Our module's private word */
+struct NETBIOS_TRANSPORT *NB_ActiveTransport; /* Selected net transport */
+static pfnTransportInit NB_InitedTransport; /* Identify active transport */
+static bool LM_Declared;  /* True if we're registered as a filing system */
+
+/* ---------------------------------- */
+
+#define CMOS_FSNUMBER   5
+/* Contains number of FS to be booted */
+#define CMOS_FSFLAGS    16
+/* Contains flags, bit 4 is set if booting is enabled */
+#define FSF_BOOT        0x10
+
+#define CMOS_FSSTAT     1 /* NAS 11/Feb/97 */
+#define CMOS_FSERVER1   2 /* NAS 11/Feb/97 */
+#define CMOS_FSERVER    158 /* NAS 11/Feb/97 */
+#define FSERVER_LEN     (172-159+1)
+/* Locations in CMOS containing file server name.
+   It's assumed this is less than NAME_LIMIT. If it's not, put FSERVER_LEN
+   at NAME_LIMIT-1, and it'll have to be truncated. */
+
+#define CMOS_NB_TYPE    0x6F
+#define	NBTYPE_IP_BIT	(1<<0)
+
+/* ------------------ */
+
+const char *MsgLookup(const char *token)
+{
+  if (_swix(MessageTrans_Lookup, _INR(0,7),
+            msg_struct, token, &msg_buff, sizeof(msg_buff), 0, 0, 0, 0) != NULL)
+  {
+    return "";
+  }
+  return (const char *)&msg_buff;
+}
+
+/* ------------------ */
+
+err_t MsgSetOSError (_kernel_oserror *err)
+{
+  /* Record the last OS error, and translate that into a LanMan
+   * error number so we can retrieve the actual error later in MsgError().
+   */
+  msg_oserr = err;
+  if (err == NULL)
+    return OK;
+
+  return EUSELASTSETOSERR; /* Hint hint */
+}
+
+/* ------------------ */
+
+_kernel_oserror *MsgError(int which)
+{
+  struct {
+    int errnum;
+    char errmess[8];
+  } token;
+
+  if (which == OK) return NULL; /* No error */
+
+  if (which == EUSELASTSETOSERR)
+  {
+    /* An OS error outside this module */
+    if (msg_oserr != NULL) return msg_oserr;
+    which = EHOWDTHATHAPPEN;
+  }
+  
+  sprintf(token.errmess, "E%02u", which);
+  if ((which == EDIRNOTEMPTY) || (which == ENOACCESS))
+  {
+      /* Fudge for Filer_Action which expects a FileCore
+       * style specific error return code
+       */
+      which = ErrorNumber_DirNotEmpty;
+  }
+  token.errnum = Our_Error_Base + which;
+  return _swix(MessageTrans_ErrorLookup, _INR(0,3),
+            &token, msg_struct, &msg_buff, sizeof(msg_buff));
+}
+
+/* ------------------ */
+
+int RdCMOS ( int addr )
+{
+  return (_kernel_osbyte ( 161, addr, 0 ) & 0xFF00 ) >> 8;
+}
+
+/* ------------------ */
+
+static void WrCMOS ( int addr, unsigned int data )
+{
+  _kernel_osbyte ( 162, addr, data );
+}
+
+/* --------------------- */
+
+static void SetFSName(char *buf_in)
+{
+  int i, t;
+
+  WrCMOS(CMOS_FSSTAT, 0);
+  WrCMOS(CMOS_FSERVER1, buf_in[0]);
+  if (buf_in[0] == 0) return;
+
+  for (i=1; i < FSERVER_LEN; i++)
+  {
+    /* NAS 11/Feb/97 */
+    t = buf_in[i];
+    if (t <= 0x20 || t > 0x7F) t = 0;
+    WrCMOS ( CMOS_FSERVER+i-1, t);
+    if (t == 0) break;
+  }
+}
+
+/* --------------------- */
+
+static void GetFSName ( char *buf_out )
+{
+  int i;
+
+  if (!_kernel_getenv("Inet$ServerName", buf_out, CMOS_FSERVER)) {
+          return;
+  }
+
+  if ( RdCMOS ( CMOS_FSSTAT ) == 0 )
+  {
+    /* NAS 11/Feb/97 */
+    *buf_out++ = RdCMOS ( CMOS_FSERVER1 );
+    for ( i=1; i < FSERVER_LEN; i++ )
+      *buf_out++ = RdCMOS ( CMOS_FSERVER+i-1 );
+  }
+
+  *buf_out = 0;
+}
+
+/* --------------------- */
+
+static void lanman_announce_lanmanfs(int r2, void *pw)
+{
+#ifndef NO_NETBEUI
+  /* Send the service call announcing the presence/absence of a protocol module */
+  if (NB_InitedTransport == NB_NetBEUI_Setup)
+    (void) _swix(OS_ServiceCall, _INR(0,4), pw,
+      Service_DCIProtocolStatus, r2, DCIVERSION, Module_Title);
+#endif
+}
+
+/* Finalisation code ------------------------------------ */
+
+static void LM_Undeclare ( void )
+{
+  _kernel_swi_regs r;
+
+  if ( LM_Declared )
+  {
+    r.r[0] = FSControl_RemoveFS;
+    r.r[1] = (int)FilingSystemName;
+
+    _kernel_swi( XOS_Bit | OS_FSControl, &r, &r );
+    LM_Declared = false;
+  }
+}
+
+/* ------------------ */
+
+static void LM_GracefulClosedown(void)
+{
+  stopcallbacks();
+  SMB_Shutdown();            /* Dismounts all SMB mounts first as */
+  Omni_Shutdown();           /* Omni_Shutdown zeros the Mounts lists */
+  Prn_Shutdown();            /* Free print jobs */
+  NB_Shutdown();             /* Also calls LLC_Shutdown */
+  Buf_Shutdown();            /* Tell MBufManager we're done */
+  LM_Vars.initialised = LMInitState_PreInit;
+}
+
+_kernel_oserror * LM_Finalise (int fatal, int podule, void *pw)
+{
+  debug0("Finalise\n");
+  (void) fatal;
+  (void) podule;
+
+  /* Dismount all (NB.Before announcing we're done with the protocol) */
+  LM_GracefulClosedown();
+  /* Tell the DCI driver the NetBEUI protocol is gone */
+  lanman_announce_lanmanfs(DCIPROTOCOL_DYING, pw);
+  /* Now mark this filing system as gone */
+  LM_Undeclare();
+
+  _swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+  _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+
+  return NULL;
+}
+
+
+/* LM_declare ------------------------------------------ */
+
+static _kernel_oserror *LM_Declare ( void )
+{
+  _kernel_oserror *err;
+  int InfoBlk[12];
+
+  LM_Declared = false;
+
+  InfoBlk[0] = (int)FilingSystemName             - (int)Image_RO_Base;
+  InfoBlk[1] = -1; /* Self-ident - request call FSFunc_PrintStartupBanner */
+  InfoBlk[2] = (int) veneer_fsentry_open         - (int)Image_RO_Base;
+  InfoBlk[3] = (int) veneer_fsentry_getbytes     - (int)Image_RO_Base;
+  InfoBlk[4] = (int) veneer_fsentry_putbytes     - (int)Image_RO_Base;
+  InfoBlk[5] = (int) veneer_fsentry_args         - (int)Image_RO_Base;
+  InfoBlk[6] = (int) veneer_fsentry_close        - (int)Image_RO_Base;
+  InfoBlk[7] = (int) veneer_fsentry_file         - (int)Image_RO_Base;
+  InfoBlk[8] = Information_Word;
+  InfoBlk[9] = (int) veneer_fsentry_func         - (int)Image_RO_Base;
+  InfoBlk[10] = (int)veneer_fsentry_gbpb         - (int)Image_RO_Base;
+  InfoBlk[11] = Information2_Word;
+
+  err = _swix(OS_FSControl, _INR(0,3), FSControl_AddFS, Image_RO_Base,
+    (int)InfoBlk - (int)Image_RO_Base, LM_pw);
+  if ( err == NULL )
+    LM_Declared = true;
+
+  return err;
+}
+
+
+/* *Command processor ------------------------------------ */
+
+#define MAX_ARGS    20
+#define MAX_CMDLEN  256
+
+static char Cmdbuf[ MAX_CMDLEN ];
+
+/* --------------------- */
+
+static int GetArgs ( const char *args, char *argv_out[], int maxargs )
+{
+  /* Splits "args" into a number of separate arguments. Each one is
+     copied into Cmdbuf so it is held statically. Pointers to the
+     start of each one are put in argv_out. Any unused spaces in
+     argv_out are set to NULL for convenience. Returns the number
+     of arguments actually found.  */
+
+  int i, argc;
+
+  for (i=0; i < maxargs; i++ ) argv_out[i] = NULL;
+
+  i=0; /* In this loop, i counts characters in Cmdbuf */
+  argc=0;
+
+  do
+  {
+    while ( *args == ' ' ) /* Skip spaces */
+      args++;
+
+    if ( *args < ' ' )  /* The end */
+      break;
+
+    /* Got one */
+
+    if ( argc >= maxargs )  /* Too many! */
+      break;
+
+    argv_out[argc++] = Cmdbuf+i;
+
+    while ( i < MAX_CMDLEN-1 && *args > ' ' ) /* Copy it */
+      Cmdbuf[i++] = *args++;
+
+    Cmdbuf[i++] = 0;     /* Terminate it */
+  }
+    while ( i < MAX_CMDLEN-1 );
+
+  return argc;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LanMan ( const char *args )
+{
+  /* No args! */
+  _kernel_swi_regs r;
+  (void) args;
+
+  r.r[0] = FSControl_SelectFS;
+  r.r[1] = (int)FilingSystemName;
+
+  return _kernel_swi( XOS_Bit | OS_FSControl, &r, &r );
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_Free ( const char *args )
+{
+  _kernel_swi_regs r;
+  _kernel_oserror *e;
+  int values[6];
+  char *argv[1];
+
+  if (GetArgs(args, argv, sizeof(argv)/sizeof(*argv)) == 0)
+    argv[0] = getenv("FileSwitch$" FilingSystemName "$CSD");
+
+  if (argv[0] == NULL)
+    return MsgError( EBADDRV );
+
+  r.r[0] = 4; /* 64-bit free space - will not fail! */
+  r.r[1] = Our_FS_Number;
+  r.r[2] = (int) values;
+  r.r[3] = (int) argv[0];
+  e = Omni_FreeOp_SWI(&r);
+
+  if (e == NULL) {
+    if (values[3] == 0 && values[5] == 0) {
+      printf("%s &%08X\n", MsgLookup("Free"), values[2] );
+      if (values[4] != -1) {
+        printf("%s &%08X\n", MsgLookup("Used"), values[4] );
+      }
+      else {
+        printf("%s\n", MsgLookup("UsedUK")); /* Unknown */
+      }
+    }
+    else {
+      printf("%s &%08X%08X\n", MsgLookup("Free"), values[3], values[2] );
+      if (values[4] != -1) {
+        printf("%s &%08X%08X\n", MsgLookup("Used"), values[5], values[4] );
+      }
+      else {
+        printf("%s\n", MsgLookup("UsedUK")); /* Unknown */
+      }
+    }
+  }
+
+  return e;
+}
+
+/* --------------------- */
+static _kernel_oserror *Cmd_ListFS ( const char *args )
+{
+  char *argv[1];
+
+  if (GetArgs(args, argv, sizeof(argv)/sizeof(*argv)) == 0) {
+    return Omni_DumpServers();
+  }
+  else {
+    return Omni_DumpShares(argv[0]);
+  }
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMConnect ( const char *args )
+{
+  char *argv[5];
+  err_t res;
+  int   tmp;
+
+  if ( GetArgs ( args, argv, 5 ) < 3 )
+    return MsgError(EBADPARAM);
+
+  /* Convert '-' user name to NULL */
+
+  if ( argv[3] != NULL    &&
+       argv[3][0] == '-'  &&
+       argv[3][1] == 0 )
+    argv[3] = NULL;
+
+  res =  Omni_MountServer ( argv[1],  /* Server */
+          argv[3], /* User name or NULL */
+          argv[4], /* password or NULL */
+          argv[0], /* Mountname */
+          argv[2], /* Drive name */
+          &tmp ); /* MountID_out */
+
+  Omni_RecheckInfo ( RI_MOUNTS );
+  return MsgError(res);
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMDisconnect ( const char *args )
+{
+  char *argv[1];
+  int mountID;
+  err_t res;
+
+  if ( GetArgs( args, argv, 1 ) < 1 )
+    return MsgError(EBADPARAM);
+
+  mountID = Omni_GetMountID(argv[0]);
+  if ( mountID == 0 ) return MsgError ( EBADDRV );
+
+  res = Omni_DismountServer(mountID);
+  Omni_RecheckInfo ( RI_MOUNTS );
+  return MsgError (res);
+}
+
+
+/* --------------------- */
+
+static void LanMan_InitTransport(pfnTransportInit i)
+{
+        NB_InitedTransport = i;
+        (*i)();
+}
+
+static void SetDefaultVars ( void )
+{
+  char *name;
+  char fs_name [ FSERVER_LEN+1 ];
+
+  LM_Vars.initialised = LMInitState_Uninitialised;
+  LM_Vars.namemode = NM_FIRSTCAPS;
+
+  /* See where IP packets are going to be sent */
+  name = getenv("Inet$EtherType");
+  strcpyn ( LM_Vars.drivername,
+                (name==NULL) ? DEFAULT_ETHER_TYPE : name, NAME_LIMIT );
+
+  name = getenv("Inet$HostName");
+  /* Trap added to catch 'ARM_NoName', as set by STB OS */
+  if ((name == NULL) || (stricmp(name,"ARM_NoName")==0))
+    strcpy ( LM_Vars.machinename,   "" );
+  else
+  {
+    strcpyn_upper ( LM_Vars.machinename, name, NAME_LIMIT );
+    /* Truncate at first dot - it might be a full domain name */
+    name = strchr ( LM_Vars.machinename, '.' );
+    if ( name != NULL ) *name = 0;
+  }
+
+  /* See if the user has overridden the default filetype */
+  name = getenv("LanMan$DefaultType");
+  if (name != NULL)
+  {
+    _swix(OS_FSControl, _INR(0,1)|_OUT(2), 31, name, &LM_Vars.default_type);
+  }
+  else
+  {  
+    LM_Vars.default_type = CNV_DEFAULT_TYPE;
+  }
+
+  /* Read the base of the OS ROM so there's an address to use for
+   * untyped load/exec address, ensuring they would abort if used
+   */
+  _swix(OS_Module, _INR(0,2)|_OUT(3), 12, 0, 0, &LM_Vars.untyped_address);
+  LM_Vars.untyped_address = LM_Vars.untyped_address & ~((1<<20) - 1);
+
+  /* Following 'get from CMOS' bits added 980127:RCE
+   * to address user complaints that it has to be typed in every time
+   */
+  Lgn_Init();
+  GetFSName(fs_name);
+  if (fs_name[0] != '\0')
+  {
+    strcpy(LM_Vars.workgroup,fs_name);
+  }
+
+  /* Set transport type from CMOS, unless overridden on command line */
+#ifdef NO_NETBEUI
+  LanMan_InitTransport(NB_NBIP_Setup);
+#else
+  LanMan_InitTransport(RdCMOS ( CMOS_NB_TYPE ) & NBTYPE_IP_BIT  ?
+    NB_NBIP_Setup : NB_NetBEUI_Setup);
+#endif
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMLogoff( const char *args )
+{
+  (void) args;
+  Lgn_Logoff();
+  return NULL;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMLogon( const char *args )
+{
+  char *argv[3];
+  if ( GetArgs(args, argv, 3) < 2 )
+    return MsgError(EBADPARAM);
+
+  /* argv[2] may be NULL for blank password */
+
+  return MsgError (Lgn_Logon ( argv[0], argv[1], argv[2] ) );
+}
+
+/* --------------------- */
+
+#ifdef DEBUG
+static char *LM_Status(void)
+{
+        switch (LM_Vars.initialised) {
+        case LMInitState_Uninitialised: return "Dormant";
+        case LMInitState_PreInit: return "Waiting for driver";
+        case LMInitState_FullyInited: return "Active";
+        case LMInitState_Boot: return "Waiting to boot";
+        default: return "Dead";
+        }
+}
+#endif
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMInfo ( const char *args )
+{
+  (void) args;
+  Omni_Debug();
+#ifdef DEBUG
+  debug1("Status: %s\n", LM_Status());
+  Stat_Show();
+#endif
+  return NULL;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMNameMode ( const char *args )
+{
+  char *argv[1];
+  int tmp;
+
+  if ( GetArgs( args, argv, 1 ) < 1 ||
+       sscanf( argv[0], "%d", &tmp) != 1 ||
+       tmp < 0 ||
+#ifdef TRACE
+       0
+#else
+       tmp > 2
+#endif
+     )
+    return MsgError (EBADPARAM);
+
+  LM_Vars.namemode = tmp;
+  return NULL;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMServer ( const char *args )
+{
+  char *argv[MAX_ARGS];
+  int i;
+
+  if ( GetArgs( args, argv, MAX_ARGS ) < 1 )
+    return MsgError ( EBADPARAM );
+
+  if ( argv[1] == NULL ) /* Just name of server */
+  {
+    Omni_AddInfo ( OAI_SERVER, argv[0], NULL, NULL );
+  }
+  else
+  {
+    for ( i=1; i < MAX_ARGS && argv[i] != NULL; i++ )
+      Omni_AddInfo ( OAI_DISK, argv[0], argv[i], NULL );
+  }
+
+  Omni_RecheckInfo (RI_SERVERS);
+  return NULL;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMPrinters ( const char *args )
+{
+  char *argv[MAX_ARGS];
+  int i;
+
+  if ( GetArgs( args, argv, MAX_ARGS ) < 1 )
+    return MsgError ( EBADPARAM );
+
+  if ( argv[1] == NULL ) /* Just name of server */
+  {
+    Omni_AddInfo ( OAI_SERVER, argv[0], NULL, NULL );
+  }
+  else
+  {
+    for ( i=1; i < MAX_ARGS && argv[i] != NULL; i++ )
+      Omni_AddInfo ( OAI_PRINTER, argv[0], argv[i], NULL );
+  }
+
+  Omni_RecheckInfo (RI_SERVERS);
+  Omni_RecheckInfo (RI_PRINTERS);
+  return NULL;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_FS ( const char *args )
+{
+  /* This is a *Configure/Status command handler - it's therefore unusual */
+  char *argv[1];
+
+  if ( (int) args == 0 ) /* Show 'Configure' options */
+  {                      /* Syntax corrected 980127 RCE */
+    printf("FS           %s\n", MsgLookup("ConfFS"));
+    return NULL;
+  }
+  else if ( (int) args == 1 ) /* Show FS status */
+  {
+    char buf[NAME_LIMIT];
+    GetFSName(buf);
+    printf("FS           %s\n", buf[0] ? buf : MsgLookup("NoHome"));
+    return NULL;
+  }
+
+  if ( GetArgs( args, argv, 1 ) < 1 )
+    return MsgError ( EBADPARAM );
+
+  SetFSName(argv[0]);
+  return NULL;
+}
+
+/* --------------------- */
+
+static _kernel_oserror *Cmd_LMTransport ( const char *args )
+{
+  /* This is a *Configure/Status command handler */
+  char *argv[1];
+  static const char *tp1 = "IP";
+
+#ifdef NO_NETBEUI
+  if (args == arg_CONFIGURE_SYNTAX || args == arg_STATUS)
+  {
+    printf("LMTransport  IP\n");
+    return NULL;
+  }
+#else
+  static const char *tp0 = "NetBEUI";
+  if ( args == arg_CONFIGURE_SYNTAX ) /* Show 'Configure' options */
+  {
+    printf("LMTransport  <%s | %s>\n", tp0, tp1);
+    return NULL;
+  }
+  else if ( args == arg_STATUS ) /* Show FS status */
+  {
+    printf("LMTransport  %s\n",
+      (RdCMOS(CMOS_NB_TYPE) & NBTYPE_IP_BIT) ? tp1:tp0);
+    return NULL;
+  }
+#endif
+  if ( GetArgs( args, argv, 1 ) < 1 )
+    return MsgError ( EBADPARAM );
+
+#ifndef NO_NETBEUI
+  if ( stricmp ( argv[0], tp0 ) == 0 )
+    WrCMOS(CMOS_NB_TYPE, RdCMOS(CMOS_NB_TYPE) & ~NBTYPE_IP_BIT );
+  else
+#endif
+  if ( stricmp ( argv[0], tp1 ) == 0 )
+    WrCMOS(CMOS_NB_TYPE, RdCMOS(CMOS_NB_TYPE) | NBTYPE_IP_BIT );
+  else
+    return configure_BAD_OPTION;
+
+  return NULL;
+}
+
+/* --------------------- */
+static _kernel_oserror *Cmd_LMNameServer( const char *args )
+{
+  /* This is a *Configure/Status command handler - it's therefore unusual */
+  char *argv[1];
+  struct in_addr address;
+  int result;
+
+  if ( args == arg_CONFIGURE_SYNTAX ) /* Show 'Configure' options */
+  {
+    printf("LMNameServer xx.xx.xx.xx\n");
+    return NULL;
+  }
+  else if ( args == arg_STATUS ) /* Show FS status */
+  {
+    int b0, b1, b2, b3;
+
+    b0 = RdCMOS(NBNSIPCMOS0);
+    b1 = RdCMOS(NBNSIPCMOS1);
+    b2 = RdCMOS(NBNSIPCMOS2);
+    b3 = RdCMOS(NBNSIPCMOS3);
+
+    if ( ((b0 != 0) && (b0 != 127) && (b0 <= 223))  &&  ((b3 != 0) && (b3 != 255)) )
+    {
+      printf("LMNameServer %d.%d.%d.%d\n", b0,b1,b2,b3);
+    }
+    else
+    {
+      printf("LMNameServer %s\n", MsgLookup("NoHome"));
+    }
+    return NULL;
+  }
+  else if (GetArgs(args,argv,1) == 1)
+  {
+    result = inet_aton(argv[0],&address);
+    if (result)
+    {
+      unsigned char b0, b1, b2, b3;
+
+      b0 = (unsigned char)(address.s_addr >> 0);
+      b1 = (unsigned char)(address.s_addr >> 8);
+      b2 = (unsigned char)(address.s_addr >> 16);
+      b3 = (unsigned char)(address.s_addr >> 24);
+
+      if ( ((b0 != 127) && (b0 <= 223))  &&  ((b3 != 255)) )
+      {
+        WrCMOS(NBNSIPCMOS0,(int) b0);
+        WrCMOS(NBNSIPCMOS1,(int) b1);
+        WrCMOS(NBNSIPCMOS2,(int) b2);
+        WrCMOS(NBNSIPCMOS3,(int) b3);
+        return NULL;
+      }
+    }
+  }
+  return MsgError(EBADPARAM);
+}
+
+/* --------------------- */
+
+typedef _kernel_oserror * (*CommandFnPtr) ( const char *args );
+
+#define CmdEntry(X) [CMD_##X] = Cmd_##X
+static CommandFnPtr Cmd_Dispatch[] =
+{
+  CmdEntry(LanMan),
+  CmdEntry(LMConnect),
+  CmdEntry(LMDisconnect),
+  CmdEntry(LMLogon),
+  CmdEntry(LMInfo),
+  CmdEntry(LMNameMode),
+  CmdEntry(LMLogoff),
+  CmdEntry(LMServer),
+  CmdEntry(LMPrinters),
+  CmdEntry(FS),
+  CmdEntry(LMTransport),
+  CmdEntry(LMNameServer),
+  CmdEntry(Free),
+  CmdEntry(ListFS)
+};
+
+#define MAX_CMDS (sizeof Cmd_Dispatch / sizeof Cmd_Dispatch[0])
+
+/* --------------------- */
+
+_kernel_oserror *LM_Command ( const char *args, int argc, int cmd_no, void *pw )
+{
+  (void) pw;
+  (void) argc;
+
+  if ( cmd_no < 0 || cmd_no >= MAX_CMDS )
+    return MsgError(ENOTPRESENT);
+
+  return Cmd_Dispatch[cmd_no](args);
+}
+
+/* Service call handler --------------------------------- */
+static void LM_check_driver_status(_kernel_swi_regs *r);
+static void LM_check_internet_status(_kernel_swi_regs *r);
+static void LM_check_protocol_status(_kernel_swi_regs *r);
+
+void LM_Service ( int service_number, _kernel_swi_regs *r, void *pw )
+{
+  (void) pw;
+  /* Any changes to list of service calls?  Must mirror in cmhg inputfile too! */
+
+  switch(service_number)
+  {
+    case Service_FSRedeclare:
+      LM_Declare();
+      break;
+
+    case Service_OmniAction:
+      Omni_ServiceCall (r);
+      break;
+
+    case Service_ResourceFSStarting:
+      /* Reregister with ResourceFS */
+      (*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+      break;
+
+    case Service_DCIDriverStatus:
+      LM_check_driver_status(r);
+      break;
+
+    case Service_DCIProtocolStatus:
+      LM_check_protocol_status(r);
+      break;
+
+    case Service_InternetStatus:
+      if (NB_InitedTransport == NB_NBIP_Setup) {
+          LM_check_internet_status(r);
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+/* SWI handler ------------------------------------------ */
+
+_kernel_oserror *LM_Swi( int swi_ofs, _kernel_swi_regs *r, void *pw )
+{
+  (void) pw;  /* Not used */
+  switch ( swi_ofs )
+  {
+    case LanMan_OmniOp - LanMan_00:
+      return OmniOp_SWI(r);
+
+    case LanMan_LogonOp - LanMan_00:
+      return Lgn_LogonOp_SWI(r);
+
+    case LanMan_FreeOp - LanMan_00:
+      return Omni_FreeOp_SWI(r);
+
+    case LanMan_NameOp - LanMan_00:
+      return MsgError(RPC_NameOp(r->r[0], /* reason code */
+                                  (char *)(r->r[1]), /* name in */
+                                  (char *)(r->r[2])  /* buffer out */
+                                   ));
+    case LanMan_Transact - LanMan_00:
+      return MsgError(RPC_Transact((char *)(r->r[0]), /* server */
+                                    (char *)(r->r[1]), /* share name */
+                                    (void *)(r->r[2]) /* params */
+                                     ));
+
+    default:
+      return MsgError(ENOTPRESENT);
+  }
+
+  return NULL;
+}
+
+/* Initialisation code ---------------------------------- */
+
+static char *copy_space ( char *dst, char *src, int maxlen )
+{
+  while ( *src > ' ' )
+  {
+    if ( --maxlen > 0 )
+      *dst++ = *src;
+    src++;
+  }
+
+  *dst = 0;
+  return src;
+}
+
+/* ------------------------------- */
+
+static err_t ProcessCmdLine ( const char *_line )
+{
+  char cli[256];
+  char *end;
+  char *line;
+
+  /* This code relies on NB_xxx_Setup() only setting variables, not
+     allocating anything. Multiple NB_xxx_Setup()'s may be called if
+     the user is being perverse */
+
+  /* NAS 20/3/97 - RO doesn't pass a 0-terminated string, but a ctrl-terminated one */
+  strncpy(cli, _line, 255);
+  line = end = cli;
+  while (*end >= ' ') end++;
+  *end = '\0';
+
+  while ((line = strchr(line, '-')) != NULL)
+  {
+    line++;
+    switch ( toupper(*line) )
+    {
+      case 'D': /* -d<driver_name> specify driver name */
+         line = copy_space ( LM_Vars.drivername, line+1, NAME_LIMIT );
+         break;
+
+      case 'N': /* -n disable network browsing */
+         Lgn_Logoff();
+         break;
+
+      case 'M': /* -m<name> use name as the advertised NETBIOS name */
+         line = copy_space( LM_Vars.machinename, line+1, NAME_LIMIT );
+         strcpyn_upper( LM_Vars.machinename,LM_Vars.machinename,NAME_LIMIT );
+         break;
+
+      case 'I': /* -i use NBIP */
+         LanMan_InitTransport(NB_NBIP_Setup);
+         break;
+
+#ifndef NO_NETBEUI
+      case 'T': /* -t use NetBEUI */
+         LanMan_InitTransport(NB_NetBEUI_Setup);
+         break;
+#endif
+
+      default:
+         return ECMDLINE;
+    }
+  }
+
+  return OK;
+}
+
+
+/* ------------------------------- */
+
+void LM_Boot(void)
+{
+  int tries=1;
+  int tmp;
+  err_t res;
+  char *serv_name;
+  char fs_name [ FSERVER_LEN+1 ];
+
+  if (LM_Vars.initialised < LMInitState_FullyInited) {
+    debug1("LM_Boot called, but cannot comply: %s\n", LM_Status());
+    LM_Vars.initialised = LMInitState_Boot;
+    return;
+  }
+
+  GetFSName(fs_name);
+
+  if ( strlen(fs_name) == 0 )
+  {
+    debug0("Auto-boot: server name has not been set...\n");
+    return;
+  }
+
+  /* Ready to go... */
+
+  for (;;) {
+    serv_name = RPC_GetDomainController(fs_name);
+    if ( serv_name == NULL )
+      serv_name = fs_name;
+
+    debug1( "Server name '%s'\n", serv_name );
+
+    /* Wash'n'go... */
+
+    res =  Omni_MountServer ( serv_name,  /* Server */
+            "ARMBOOT", "", /* User name & password */
+            "BOOT",        /* Mountname */
+            "ARMBOOT",     /* Drive name */
+            &tmp );          /* MountID_out */
+
+    if ( res != OK )
+    {
+      printf("%s '%s' - ", MsgLookup("BootBad"), serv_name);
+      printf("%s", MsgError(res)->errmess);
+      /* tmp will be zero unless the share was successfully created */
+      if (tmp == 0)
+      {
+        char var_name[sizeof("Inet$ServerName12")];
+        sprintf(var_name, "Inet$ServerName%d", ++tries);
+        if (!_kernel_getenv(var_name, fs_name, FSERVER_LEN))
+          continue; /* Try next server */
+      }
+    }
+    break;
+  }
+}
+
+
+/* ------------------------------- */
+
+
+/* SNB 980224.
+ *
+ *
+ *  This function has been split into two as it is inappropriate for some
+ *  parts of this code to be executed during a service call.  The initialised
+ *  member of LM_Vars has been promoted to 'int' type so that it can hold any
+ *  of the values in the anonymous enum at the top of this file.  This is used
+ *  to control the execution of the LM_init_phase_2 function.
+ *
+ *
+ */
+
+_kernel_oserror *LM_Initialise(const char *cmd_tail, int pod_base, void *pw)
+{
+  _kernel_oserror *err;
+  _kernel_swi_regs R;
+
+  debug_initialise("LanManFS", "", "");
+  debug_atexit();
+  debug_set_options(0,0,0);
+  debug_output_device(DEBUGIT_OUTPUT);
+  LM_Vars.initialised = LMInitState_Uninitialised;
+
+  (void)pod_base;
+  if (pw != NULL)
+  {
+    LM_pw = (int)pw;
+  }
+
+  err = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+  if (err != NULL) return err;
+  err = _swix(MessageTrans_OpenFile, _INR(0,2),
+              msg_struct, "Resources:$.ThirdParty.OmniClient.LanManFS.Messages", 0);
+  if (err != NULL) goto initdereg;
+
+  SetDefaultVars();
+
+  R.r[0] = 129;
+  R.r[1] = 0;
+  R.r[2] = 255;
+  _kernel_swi(OS_Byte, &R, &R);
+  if (R.r[1] < 0xA2)
+  {
+    err = MsgError(ERISCOSVER);
+    goto initclose;
+  }
+
+  if (cmd_tail != NULL)
+  {
+    err = MsgError(ProcessCmdLine(cmd_tail));
+    if (err != NULL) goto initclose;
+  }
+
+  err = LM_Declare();
+  if (err != NULL) goto initclose;
+
+  LM_Vars.initialised = LMInitState_PreInit;
+
+  (void) LM_init_phase_2();
+
+#ifndef NO_NETBEUI
+  /* Cheap way to set a callback ;-) Send service call announcing ourselves */
+  if (NB_InitedTransport == NB_NetBEUI_Setup) {
+    callevery_handler(&R, pw);
+    callbackflag = 2;
+  }
+#endif
+
+  return NULL;
+
+initclose:
+  _swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+initdereg:
+  _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+  return err; 
+}
+
+static _kernel_oserror *LM_init_phase_2(void)
+{
+  /* Initialise various modules */
+
+  enum { MAXEXITS = 4 };
+  pfnShutdown shutdowns[MAXEXITS];
+  int ctr = 0;
+  int want_boot;
+  int oldstate = LM_Vars.initialised;
+  _kernel_oserror *err;
+
+  want_boot = (LM_Vars.initialised == LMInitState_Boot);
+
+  debug0("Initialising...\n");
+
+  if (!FS_Init() || !SMB_Init()) goto initfailed;
+  shutdowns[ctr++] = (pfnShutdown) SMB_Shutdown;
+  if (!RPC_Init() || !Prn_Init()) goto initfailed;
+  shutdowns[ctr++] = (pfnShutdown) Prn_Shutdown;
+  if (!Stat_Init()) goto initfailed;
+
+  err = MsgError(Buf_Init());
+  if (err != NULL) goto abort;
+
+  shutdowns[ctr++] = (pfnShutdown) Buf_Shutdown;
+
+  /* Try to start various modules */
+
+  debug0("Starting network transport...\n");
+
+  err = MsgError( NB_Startup() );
+  if (err != NULL)
+  {
+    debug2(    "Error - NB_Startup() returned %d (%s)\n",err->errnum,err->errmess);
+    goto abort;
+  }
+
+#if 0
+  debug0("Starting filing system...\n");
+
+  err = LM_Declare();
+  if (err != NULL) {
+          debug1("LanManFS: %s\n", err->errmess);
+          NB_Shutdown();
+          goto abort;
+  }
+#endif
+
+  startcallbacks();
+
+  /* We have now managed to fully initialise everything that we need - whee! */
+  LM_Vars.initialised = LMInitState_FullyInited;
+  ctr=0; /* Forget destructors */
+
+  _kernel_oscli("IconSprites Resources:$.ThirdParty.OmniClient.LanManFS.Sprites");
+
+  Omni_StartUp();  /* Try to contact OmniFiler */
+
+  /*LM_StartupBoot();*/
+  if (want_boot) {
+          debug0("Booting...\n");
+          LM_Boot();
+  }
+
+  debug0("All done...\n");
+
+  return NULL;
+
+initfailed:
+  err = MsgError(EINITFAILED);
+  debug2("LanManFS: %s (%s)\n", err->errmess, LM_Status());
+  while (--ctr >= 0) (shutdowns[ctr])();
+  return err;
+
+abort:
+  LM_Vars.initialised = oldstate;
+  while (--ctr >= 0) (shutdowns[ctr])();
+  debug1("LanManFS: %s\n", LM_Status());
+  return NULL;
+
+/* abort used to use this, but that assumes deterministic module startup,   *
+ * which can't be assumed under DCI4, so now it just sits around waiting    *
+ * for an appropriate set of service calls to wake it up.  RCE 980212       *
+
+abort:
+  LM_Finalise();
+  return err;
+ */
+}
+
+/* SNB 980224 added this function to verify the actual contents of the
+ * Service_DCIDriverStatus service call
+ */
+static void LM_check_driver_status(_kernel_swi_regs *r)
+{
+        char if_name[16];
+        Dib *dib = (Dib *) (r->r[0]);
+
+        sprintf(if_name, "%-.8s%d", dib->dib_name, dib->dib_unit);
+
+#ifdef TRACE
+        printf ("Service_DCIDriverStatus called (interface %s%d is %sing)\n"
+        	"  Driver supports DCI version %d.%02d\n",
+        	dib->dib_name, dib->dib_unit, r->r[2] ? "dy" : "start",
+		r->r[3] / 100, r->r[3] % 100
+                );
+
+        printf ("We are looking for driver `%s' - got `%s'\n", LM_Vars.drivername,
+        	if_name);
+
+#endif
+        if ((strcmp(LM_Vars.drivername, DEFAULT_ETHER_TYPE) == 0) &&
+            (r->r[2] == DCIDRIVER_STARTING) &&
+            (if_name[0] != 'l')) {
+                /* Capture the first interface to start which isn't loopback */
+                (void) strncpy(LM_Vars.drivername, if_name, NAME_LIMIT);
+        }
+
+#ifndef NO_NETBEUI
+        if (NB_InitedTransport != NB_NetBEUI_Setup) {
+                return;
+        }
+
+        if (stricmp(LM_Vars.drivername, if_name) == 0) {
+                debug0("Ding!  This was our interface\n");
+		if (r->r[2] == DCIDRIVER_STARTING) {
+		        /*if (LM_Vars.initialised ==  LMInitState_FullyInited)*/ {
+                        	LM_GracefulClosedown();
+		        }
+	                LM_init_phase_2();
+		}
+		else if (r->r[2] == DCIDRIVER_DYING) {
+		        LM_GracefulClosedown();
+		}
+        }
+#endif
+}
+
+static void LM_check_protocol_status(_kernel_swi_regs *r)
+{
+  /* A protocol module came or went (could be us in NetBEUI mode!)
+   * Inform our transport layer if we find it was Internet leaving.
+   */
+  const char *proto = (char *) r->r[4];
+
+  if (r->r[2] == DCIPROTOCOL_DYING && strcmp(proto, "Internet") == 0) {
+    NB_InternetGone();
+  }
+  else if (r->r[2] == DCIPROTOCOL_STARTING && strcmp(proto, "Internet") == 0) {
+    NB_InternetInit();
+  }
+}
+
+
+#ifdef TRACE
+
+static void DumpBuffer(void *ptr, int len)
+{
+        static char db[512];
+        char *p = db;
+
+        const char *membuf = ptr;
+        int i,j;
+	db[0] = '\0';
+        for (i=0; i<((len+31)&~31); ++i) {
+                if (!(i & 31)) {
+                        p += sprintf (p, "  ");
+                        if (i) for (j = i - 32; j != i; ++j) {
+                                p+=sprintf(p, "%c", (membuf[j]>=32 && membuf[j] != 0x7f) ?
+                                membuf[j] : '.');
+                        }
+                        printf("$%s\n", db);
+                        p=db+sprintf(db,"%04x: ", i);
+                }
+                if (i>=len) {
+                        p+=sprintf (p,"  ");
+                        if (3==(i & 3)) p+=sprintf (p," ");
+                }
+                else {
+                        p+=sprintf (p,"%02x", membuf[i]);
+                        if (3==(i & 3)) p+=sprintf (p," ");
+                }
+        }
+        if (i) for ( p+=sprintf (p,"  "), j = i - 32; j != i; ++j) p+=sprintf (p,"%c",
+            j>=len ? ' ' : (membuf[j]>=32 && membuf[j] != 0x7f) ?
+            membuf[j] : '.');
+        printf("$%s\n", db);
+}
+#endif
+
+/* SNB 981029 added this function to verify the contents of the Service_InternetStatus
+ * service call to determine whether we were waiting for the interface to go up so
+ * that we could boot
+ */
+static void LM_check_internet_status(_kernel_swi_regs *r)
+{
+        char *cp = (char *) r->r[3];
+
+	if (r->r[0] == InternetStatus_AddressChanged) {
+	  if (LM_Vars.initialised != LMInitState_PreInit &&
+	      LM_Vars.initialised != LMInitState_Boot) {
+            return;
+	  }
+	  /* An interface address was set - almost certainly ours! */
+	}
+#ifdef TRACE
+	else if (r->r[0] == InternetStatus_DynamicBootReply) {
+	  DumpBuffer((void *)r->r[4], r->r[5]);
+	}
+	else if (r->r[0] == InternetStatus_DynamicBootStart) {
+	  DumpBuffer((void *)r->r[4], r->r[5]);
+	}
+#endif
+        else {
+          /* Were we actually waiting for the driver to appear */
+    	  if (LM_Vars.initialised != LMInitState_PreInit &&
+              LM_Vars.initialised != LMInitState_Boot) return;
+     	  /* Was it the right reason code? */
+	  if (r->r[0] != InternetStatus_InterfaceUpDown) return;
+	  /* Was it the right interface? */
+	  if (stricmp(LM_Vars.drivername, cp) != 0) return;
+	  /* was the interface coming up? */
+	  if (r->r[2] != 1) return;
+        }
+
+	/*if (LM_Vars.initialised == LMInitState_FullyInited)*/ {
+	        /* Should never happen nowadays ?? */
+	        LM_GracefulClosedown();
+	}
+	LM_init_phase_2();
+}
+
+#ifdef TRACE
+/* Debugging routine.  If str is NULL, then the log is printed to 'f' (or stderr
+ * if f was NULL).  If f is NULL, the message is added to the log but not displayed
+ * on the screen.  If neither f nor str was NULL, the screen characteristcs are set
+ * to useful things (text window is reset, default colours restored and text origin
+ * restored to 0,0, and the message is printed to the screen and copied to tne log.
+ * A monotonic coumnter is incremented for each debug message logged.  Timestamps
+ * are stored in the log buffer too.
+ */
+#include <stdarg.h>
+int module_printf(const char *str, ...)
+{
+	static int callcount = 0;
+	static char pbuffer[65536];
+	static int pbufferptr = 0;
+	va_list ap;
+	int inblock[2];
+	FILE *f;
+
+	f=stderr;
+
+	if (f != NULL || str == NULL)  {
+		inblock[1] = -1;
+		inblock[0] = 132;
+		_swix(OS_ReadVduVariables, _INR(0,1), inblock, inblock);
+		_swix(OS_WriteC, _IN(0), 6);
+		if (inblock[0] > 20) {
+			int i;
+			for (i=0; i<0; ++i) (void) _kernel_osbyte(19,0,0);
+			_swix(OS_WriteN, _INR(0,1), "\x1a\x0c", 2);
+		}
+		_swix(OS_WriteC, _IN(0), 20);
+	}
+
+	if (!str) {
+		if (pbufferptr > 0) fprintf(f?f:stderr, "%s\n", pbuffer);
+		return 0;
+	}
+
+	++callcount;
+	if (*str != '$' && f != NULL) {
+		va_start(ap, str);
+		vfprintf(f, str, ap);
+		va_end(ap);
+	}
+	va_start(ap, str);
+	_swix(OS_ReadMonotonicTime, _OUT(0), inblock);
+	if (*str == '$') ++str; else
+	pbufferptr += sprintf(pbuffer + pbufferptr, "(%8d) (%4d) ", inblock[0], callcount);
+	pbufferptr += vsprintf(pbuffer + pbufferptr, str, ap);
+	if (pbufferptr > 60000) pbufferptr = 0;
+	return 0;
+}
+#endif
+
+
+/* ========== Callback code ========== */
+
+/* Callback management.  Some servers tend to idle-out connections.  This code stops
+ * that happening.
+ */
+
+_kernel_oserror *callback_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	switch (callbackflag) {
+	  case 2:
+                /* Re-entrancy on this code is OK - announce we are starting */
+                callbackflag = 0;
+                lanman_announce_lanmanfs(DCIPROTOCOL_STARTING, pw);
+                break;
+	  case 1:
+	        debug0("Anti IdleOut Callback entered\n");
+	        SMB_AntiIdle();
+		callbackflag = 0;
+	}
+	return 0;
+}
+
+static void clearcallback(void)
+{
+	if (callbackflag != 0) {
+		(void) _swix(OS_RemoveCallBack, _INR(0,1), callback_entry, LM_pw);
+		callbackflag = 0;
+	}
+}
+
+_kernel_oserror *callevery_handler(_kernel_swi_regs *r, void *pw)
+{
+        (void) r;
+	if (callbackflag == 0) {
+		if (_swix(OS_AddCallBack, _INR(0,1), callback_entry, pw) == NULL) {
+			callbackflag = 1;
+			debug0(Module_Title ": (setcallback) just set a callback\n");
+		}
+	}
+	return 0;
+}
+
+static void startcallbacks(void)
+{
+        /* Remember that as the SMB_AntiIdle routine rotates through all the shares,
+         * each share will only be every pinged MAX_SHARES * 100 * 45 seconds.
+         */
+        (void) _swix(OS_CallEvery, _INR(0,2), (100*45) - 1, callevery_entry, LM_pw);
+}
+
+static void stopcallbacks(void)
+{
+        (void) _swix(OS_RemoveTickerEvent, _INR(0,1), callevery_entry, LM_pw);
+        clearcallback();
+}

@@ -1,0 +1,729 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;
+; Micro Controller
+; ----------------
+;
+; Handles battery and keyboard commands/events between
+; PS2Driver and the Stork battery-manager/keyboard controller.
+;
+; R C Manby 21/9/94
+;
+
+
+;******************************************************************************
+
+        MakeErrorBlock  BadBMUVariable
+        MakeErrorBlock  BadBMUCommand
+        MakeErrorBlock  BMUBusy
+        MakeErrorBlock  BMUVecClaim
+
+
+;******************************************************************************
+;
+; InitMicroController
+;
+InitMicroController
+        Entry   "R0"
+        MOV     R0, #0
+        STRB    R0, BMUDevFlag
+        STR     R0, DriverPrivateWord
+        STR     R0, Threaded
+        STR     R0, PseudoIntMask
+;>>>    Mask off interrupt???
+        STRB    R0, PMInts_Enabled
+        STRB    R0, CommandState
+        EXIT
+
+
+;******************************************************************************
+;
+; ClaimMicroControllerEvent
+;
+; Claims event, but DOES NOT enable interrupts from device.
+;
+; N.B. The Stork Keyboard/Battery-manager is mapped into 'Network'
+;      space, so our event is actually Network IRQ.
+;
+ClaimMicroControllerEvent
+        Entry   "R1-R2"
+
+; preinitialise copy of BMU_Flags in case something fails during initialisation
+; and we want the module to carry on
+
+        MOV     R0,#PortableBMUF_ChargerPresent :OR: PortableBMUF_BatteryPresent :OR: PortableBMUF_LidOpen
+        STRB    R0,BMU_Flags
+
+        MOV     R0, #IOMD_Network_DevNo         ;Reused as microController event
+        ADR     R1, MicroControllerEventHandler
+        MOV     R2, R12                         ;Value we are passed, in R12, when called
+        SWI     XOS_ClaimDeviceVector
+        addr    R1,ErrorBlock_BMUVecClaim,VS    ; save error for SWI routines
+        STRVS   R1,BMUerrorpointer
+        EXIT    VS
+
+        MOV     R0,#1                           ; indicate claimed device
+        STRB    R0,BMUDevFlag
+;
+; We would like to check the BMU version number (the PortableA4 does), but can't.
+; Unfortunately we can't communicate with BMU, because the PS2Driver hasn't yet
+; enabled the INTs.
+;
+        MOV     R1,#0                           ; flag all ok for SWI routines
+        STR     R1,BMUerrorpointer
+
+        EXIT
+
+
+;******************************************************************************
+;
+; ReleaseMicroControllerEvent
+;
+ReleaseMicroControllerEvent
+        Entry   "R1-R2"
+        LDRB    R1,BMUDevFlag
+        TEQS    R1,#0
+        EXITS   EQ
+
+        MOV     R0, #IOMD_Network_DevNo         ;Reused as microController event
+        ADR     R1, MicroControllerEventHandler
+        MOV     R2, R12                         ;Value we are passed, in R12, when called
+        SWI     XOS_ReleaseDeviceVector
+
+; if released device, flag it as not claimed
+
+        MOVVC   R1,#0
+        STRVCB  R1,BMUDevFlag
+
+; remove any pending callback for IRQ handler
+
+        ADR     R0,BMUIRQCallback
+        MOV     R1,wp
+        SWI     XOS_RemoveCallBack
+
+        EXIT
+
+
+;******************************************************************************
+;
+; MicroControllerEventHandler - Service Rx interrupts from the
+;                               Keyboard/Battery-manager controller.
+;
+; Entry
+;   In IRQ mode with interrupts disabled
+;   R12 = value passed in R2 to XOS_ClaimDeviceVector
+;
+; R0-R3 and R12 may be corrupted
+;
+; N.B. This is actually the Network IRQ event, hijacked by Stork.
+;
+MicroControllerEventHandler
+        Entry  "R4,R9"                          ;Scratch registers, R9 needed for OS_CallAVector
+        MOV     R0, #1                          ;Mark as threaded, cos sending data to PS2Driver
+        STR     R0, Threaded                    ; may cause us to be re-entered.
+;
+;Process Rx interrupt
+;
+        BL      RxFromController                ;Out: R1=status, R2=data byte
+        TST     R1, #uC_Status_PnK              ;Is it Power or Key data
+        BLEQ    PseudoRxInterrupt               ; EQ, Key. In : R2=byte to send to keyboard driver
+        TST     R1, #uC_Status_PnK              ;Is it Power or Key data
+        BLNE    PowerInterrupt                  ; NE, Power
+
+        BL      ProcessAnyTxInterrupts          ;While Tx interrupt enabled
+                                                ;  do service Tx interrupt
+        MOV     R0, #0
+        STR     R0, Threaded
+        EXIT
+
+
+;******************************************************************************
+;
+; PowerInterrupt - Process power interrupt
+;
+; Entry
+;   R1  = status
+;   R2  = data byte
+;
+;   MODE: IRQ
+;   IRQs disabled
+;
+; Exit
+;   Corrupts R0, all other registers preserved
+;
+PowerInterrupt
+        Entry
+        TST     R1, #uC_Status_PwrChg           ;Is this a power state changed interrupt
+        BNE     %FT10                           ; NE: yes
+
+                                                ; EQ: this is an acknowledgement of, or a reply
+                                                ;     to a power command that we sent
+        LDRB    LR, CommandState                ;Are we expecting this?
+        TEQ     LR, #1                          ;
+        STREQB  R2, CommandResult               ; EQ: yes, stash reply
+        MOVEQ   LR, #2                          ;
+        STREQB  LR, CommandState                ;     indicate result available
+        EXITS
+
+10
+;
+; Add a callback, so IRQ is handled at a safer time.
+;
+        STRB    R2, Callback_Value              ;stash value to save re-reading
+                                                ; switch to SVC mode for SWI
+        MOV     R0, PC                          ; save mode
+        TEQP    PC, #SVC_mode :OR: I_bit        ; enter SVC mode, with IRQs still disabled
+        NOP
+
+        Push    "R0, LR"
+        ADR     R0, BMUIRQCallback
+        MOV     R1, wp
+        SWI     XOS_AddCallBack
+        Pull    "R0, LR"
+        TEQP    PC, R0                          ; reenter old mode
+        NOP
+
+        EXITS
+
+
+;******************************************************************************
+;
+;
+BMUIRQCallback
+        Entry   "R0-R1"
+        LDRB    R1, Callback_Value              ;value stashed by PowerInterrupt
+
+; update flags and generate event
+; R1 = BMU flags
+; OS_GenerateEvent switches to SVC mode, disabling IRQs
+
+        LDRB    LR, BMU_Flags                   ; get old flags
+        EOR     LR, LR, R1                      ; EORed with new flags
+        TST     LR, #PortableBMUF_LidOpen       ; has lid opened or closed?
+        STRB    R1, BMU_Flags                   ; store new flags anyway
+        BEQ     %FT05                           ; [no, so skip]
+
+; lid switch has opened or closed, so make a dummy call to PortableControl
+; which may turn on or off the LCDEnable and Backlight bits in LC.
+
+        Push    "R0,R1"
+        MOV     R0, #0                          ; EOR mask (ie no change)
+        MOV     R1, #-1                         ; AND mask (ditto)
+        BL      SWIControl
+        Pull    "R0,R1"
+
+05
+        MOV     R0,#Event_PortableBMU
+        SWI     XOS_GenerateEvent
+
+        EXITS
+
+
+;******************************************************************************
+;
+; KeyVHandler - Action stream control commands for the Keyboard from the
+;               PS2Driver.
+;
+; Entry
+;   R0  = reason code (KeyV_Xxxxx)
+;
+; Exit
+;
+KeyVHandler ROUT
+        TEQ     r0, #KeyV_PseudoEnable          ;Pseudo stream enable
+        TEQNE   r0, #KeyV_PseudoDisable         ;Pseudo stream disable
+        TEQNE   r0, #KeyV_PseudoIntMask         ;Pseudo stream RX/TX interrupt enable
+        MOVNES  pc, lr                          ;Not for us, so pass on call (to previous owner)
+
+        Push    "R0-R4,R9"                      ;Scratch registers, R9 needed for OS_CallAVector
+
+        TEQ     r0, #KeyV_PseudoIntMask
+        BEQ     DoKeyV_PseudoIntMask
+
+        TEQ     R0, #KeyV_PseudoEnable
+        BEQ     DoKeyV_PseudoEnable
+
+        TEQ     R0, #KeyV_PseudoDisable
+        BEQ     DoKeyV_PseudoDisable
+        Pull    "R0-R4,R9,PC"                   ;Restore stacked registers, use stacked PC value
+                                                ; to return directly to caller
+
+
+;
+; DoKeyV_PseudoEnable
+;
+; Entry
+;   R0  = 5
+;   R1  = channel wsptr
+;
+DoKeyV_PseudoEnable
+       ;DLINE   "StPortable: Pseudo stream enable"
+        STR     R1, DriverPrivateWord
+        Pull    "R0-R4,R9,PC"                   ;Restore stacked registers, use stacked PC value
+                                                ; to return directly to caller
+
+
+;
+; DoKeyV_PseudoDisable
+;
+; Entry
+;   R0  = 6
+;   R1  = channel wsptr
+;
+DoKeyV_PseudoDisable
+       ;DLINE   "StPortable: Pseudo stream disable"
+        MOV     R1, #0
+        STR     R1, DriverPrivateWord
+        Pull    "R0-R4,R9,PC"                   ;Restore stacked registers, use stacked PC value
+                                                ; to return directly to caller
+
+
+;
+; DoKeyV_PseudoIntMask
+;
+; Entry
+;   R1 = Interrupt mask
+;        2_00  Both Rx & Tx disabled
+;        2_01  Rx enabled, Tx disabled
+;        2_10  Tx enabled, Rx disabled
+;
+DoKeyV_PseudoIntMask
+       ;DREG    R1, "StPortable: Pseudo stream RX/TX interrupt enable mask=&",,LongWord
+
+        STR     R1, PseudoIntMask
+        IOMDBase R3
+
+;Turn IRQ & FIQ off whilst changing IOCIRQMSKB
+        MOV     R4, PC                          ;Save IRQ and FIQ bits for later restoration
+        ORR     R0, R4, #I_bit :OR: F_bit
+        TEQP    R0, #0
+
+; Set Network IRQ enable to same as Rx Int enable bit
+        TST     R1, #2_01
+        LDRB    R2, [R3, #IOCIRQMSKB]
+        BICEQ   R2, R2, #IOMD_Network_IRQ_bit
+        ORRNE   R2, R2, #IOMD_Network_IRQ_bit
+        STRB    R2, [R3, #IOCIRQMSKB]
+
+        TEQP    R4, #0                          ;restore IRQ and FIQ state
+
+        LDR     R0, Threaded
+        TEQ     R0, #0
+        Pull    "R0-R4,R9,PC", NE               ;Restore stacked registers, use stacked PC value
+                                                ; to return directly to caller
+        MOV     R0, #1
+        STR     R0, Threaded
+
+        BL      ProcessAnyTxInterrupts          ;While Tx interrupt enabled
+                                                ;  do service Tx interrupt
+        MOV     R0, #0
+        STR     R0, Threaded
+        Pull    "R0-R4,R9,PC",                  ;Restore stacked registers, use stacked PC value
+                                                ; to return directly to caller
+
+;******************************************************************************
+;
+; ProcessAnyTxInterrupts
+;
+; Corrupts R0-R4,R9
+;
+ProcessAnyTxInterrupts
+        Entry
+        LDR     R1, PseudoIntMask
+        TST     R1, #2_10                       ;Are Tx interrupts enabled?
+        EXIT EQ                                 ; EQ, no, so return
+42
+;
+; Tx interrupt enabled, this means that the PS2Driver has
+; one or more bytes queued to send to the controller.
+; Fetch a byte and send it.
+;
+        BL      PseudoTxInterrupt               ;Out: R2=command byte from driver
+        BL      TxToKeyboard                    ;In : R2=byte to transmit
+        LDR     R1, PseudoIntMask
+        TST     R1, #2_10                       ;Are Tx interrupts still enabled?
+        BNE     %BT42                           ; NE, yes, branch back to allow further transmittions
+        EXIT
+
+
+;******************************************************************************
+;
+; PseudoRxInterrupt - Generate a 'byte received from the keyboard' interrupt
+;                     in the keyboard driver
+;
+; Entry
+;   R2  = Byte to send to PS2Driver
+;
+; Exit
+;   All registers preserved
+;
+PseudoRxInterrupt
+        Entry   "R0-R2,R9,R11"
+        SVCMode r11                             ;Go into SVC mode for SWI
+        MOV     R0, #KeyV_PseudoRXInt           ;No need for NOP, this will do
+        LDR     R1, DriverPrivateWord
+        MOV     R9, #KEYV
+        Push    "lr"                            ;Save r14_svc.
+        SWI     XOS_CallAVector
+        Pull    "lr"                            ;Restore r14_svc.
+        SetPSR  r11                             ;Go back to IRQ/SVC mode
+        NOP
+        EXITS
+
+
+;******************************************************************************
+;
+; PseudoTxInterrupt - Generate a 'give me a byte to send to the keyboard'
+;                     interrupt in the keyboard driver
+;
+; Exit
+;   R2  = Byte that driver wishes to be transmitted
+;   All other registers preserved
+;
+PseudoTxInterrupt
+        Entry   "R0,R1,R9,R11"
+        SVCMode r11                             ;Go into SVC mode for SWI
+        MOV     R0, #KeyV_PseudoTXInt           ;No need for NOP, this will do
+        LDR     R1, DriverPrivateWord
+        MOV     R9, #KEYV
+        Push    "lr"                            ;Save r14_svc.
+        SWI     XOS_CallAVector
+        Pull    "lr"                            ;Restore r14_svc.
+        SetPSR  r11                             ;Go back to IRQ/SVC mode
+        NOP
+        EXITS
+
+
+;******************************************************************************
+;
+; TxToKeyboard
+;
+; Entry
+;   R2  = Byte to send to keyboard
+;
+TxToKeyboard
+        Entry   "R0, R1"
+        LDR     R0, =uC_StatusReg               ;Get Tx buffer status bit
+10                                              ;
+        LDRB    R1, [R0]                        ;
+        TST     R1, #uC_Status_OBF              ;
+        BNE     %BT10                           ;Loop until buffer empties
+
+        LDR     R0, =uC_KeyDataTxReg
+        STRB    R2, [R0]                        ;Write byte to keyboard
+        EXIT
+
+
+;******************************************************************************
+;
+; RxFromController
+;
+; Exit
+;   R1  = Status from Controller
+;   R2  = Byte received from Controller
+;
+RxFromController
+        Entry
+        LDR     R2, =uC_StatusReg               ;Get Rx buffer status bit
+10                                              ;
+        LDRB    R1, [R2]                        ; since we are interrupt driven,
+        TST     R1, #uC_Status_IBF              ; the data should be waiting, but...
+        BEQ     %BT10                           ;Loop until data arrives
+
+        LDR     R2, =uC_DataRxReg
+        LDRB    R2, [R2]                        ;Get data byte
+
+        EXIT
+
+        LTORG
+
+
+;******************************************************************************
+;
+
+InvalidCommand * &FF
+
+; Mapping table of 'BMU variable' numbers onto micro-controller commands
+; that will return the required information.
+;
+;
+BMUVarTable
+        DCB     InvalidCommand                  ;  0 : version number
+        DCB     InvalidCommand                  ;  1 : nominal battery capacity
+        DCB     InvalidCommand                  ;  2 : measured battery capacity
+        DCB     InvalidCommand                  ;  3 : used battery capacity
+        DCB     InvalidCommand                  ;  4 : usable capacity
+        DCB     InvalidCommand                  ;  5 : reserved
+        DCB     InvalidCommand                  ;  6 : charge estimate
+        DCB     &32                             ;  7 : voltage
+        DCB     InvalidCommand                  ;  8 : current
+        DCB     &33                             ;  9 : temperature
+        DCB     PwrCmd_Send_A4_flags            ; 10 : flags/status
+        DCB     &30                             ; 11 : charge rate (b7..b4)
+;
+; Stork variables
+;
+        DCB     PwrCmd_Send_I_charge            ; 12 : charge current
+        DCB     PwrCmd_Send_I_Discharge         ; 13 : discharge current
+        DCB     PwrCmd_Send_V                   ; 14 : voltage
+        DCB     PwrCmd_Send_T1                  ; 15 : temperature 1
+        DCB     PwrCmd_Send_T2                  ; 16 : temperature 2
+        DCB     PwrCmd_Send_charge_level        ; 17 : charge level
+        DCB     PwrCmd_Send_A4_flags            ; 18 : status flags
+        DCB     PwrCmd_Send_input_signals       ; 19 : input signals
+        DCB     PwrCmd_Send_battery_capacity    ; 20 : battery capacity
+        ASSERT  (. - BMUVarTable) = PortableBMU_Num_Variables
+
+        ALIGN
+
+BMUCmdTable
+        DCB     PwrCmd_Power_down               ;  1 : remove power  : power down
+        DCB     InvalidCommand                  ;  2
+        DCB     InvalidCommand                  ;  3
+        DCB     InvalidCommand                  ;  4
+        DCB     PwrCmd_AC_OFF                   ;  5 : AC_OFF
+        DCB     PwrCmd_AC_ON                    ;  6 : AC_ON
+        DCB     PwrCmd_Disable_PMstat           ;  7 : Disable power managment status reporting
+        DCB     PwrCmd_Enable_PMstat            ;  8 : Enable power managment status reporting
+
+        ALIGN
+
+
+;******************************************************************************
+;
+; SWI_ReadBMUVariable
+;
+; Entry
+;    R0 = variable (0..11)
+;
+; Exit
+;    VS => R0 -> error
+;          R1 preserved
+;    VC => R0 preserved
+;          R1 value of variable
+;    All other registers and flags preserved
+;
+
+;
+; PortableBMUV_ChargeEstimate
+; PortableBMUV_UsedCapacity
+; PortableBMUV_Current
+; PortableBMUV_Flags
+; PortableBMUV_ChargeRate
+; PortableBMUV_MeasuredCapacity
+;
+
+SWI_ReadBMUVariable Entry       "R0-R2"
+;
+; If Power management interupts are enabled then BMU flags are read from a soft copy (kept
+; up-to-date by the interrupt routine). If not, or if reading another variable, we command
+; the micro-controller to send the data.
+;
+        TEQS    R0, #PortableBMUV_Flags
+        BNE     %FT10                           ;NE, not flags
+
+        LDRB    R1, PMInts_Enabled              ;Is soft-copy up-to-date?
+        TEQ     R1, #1
+
+        LDREQB  R1, BMU_Flags                   ;EQ, yes, fetch soft copy
+        STREQ   R1, [SP,#4]                     ;         and overwrite stacked R1
+        EXITS   EQ
+                                                ;Must ask micro-controller to send the flags
+        BL      ReadBMUVariableInternal         ;call body of routine to read flags
+        STRVS   R0, [SP]                        ;VS, overwrite stack R0 with error
+        STRVC   R1, [SP,#4]                     ;VC, overwrite stacked R1 with result
+        STRVCB  R1, BMU_Flags                   ;VC, update soft copy
+        PullEnv
+        BICVCS  PC,LR,#V_bit
+        ORRVSS  PC,LR,#V_bit
+
+ReadBMUVariableInternal ALTENTRY
+10
+        ASSERT  PortableBMU_Min_Variable = 0
+        CMPS    R0,#PortableBMU_Num_Variables
+        BHS     %FT90
+
+        ADR     LR,BMUVarTable                  ; LR -> table of commands
+        LDRB    R2, [LR,R0]                     ; R0 = BMU RAM address
+        CMP     R2, #InvalidCommand
+        BEQ     %FT90
+        BL      SendPowerCommand                ;In: R2=command byte. Out: R2=reply byte
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        STRVC   R2,[SP,#4]                      ; if ok, overwrite stack R1
+        PullEnv
+        ORRVSS  PC,LR,#V_bit
+        BICVCS  PC,LR,#V_bit
+
+;~~~~~~~~~~~~~~~
+
+90
+; bad BMU variable number
+
+        addr    R0,ErrorBlock_BadBMUVariable
+92
+; error, R0 -> tokenised error block
+
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+
+;******************************************************************************
+;
+; BatMgr uses reason code PortableBMUV_ChargeEstimate only
+;
+SWI_WriteBMUVariable Entry
+        EXIT
+
+
+;******************************************************************************
+;
+; SWI_CommandBMU
+;
+; Entry
+;    R0 = command
+;    R1 etc. parameters
+;
+; Exit
+;    VS => R0 -> error
+;    VC => R0 preserved
+
+;
+;
+; PortableBMUC_ConnectCharger
+; PortableBMUC_DisconnectCharger
+; PortableBMUC_RemovePower
+; PortableBMUC_EnablePMInts
+; PortableBMUC_DisablePMInts
+;
+
+; PortableBMUC_DisablePMInts and PortableBMUC_EnablePMInts are specifically tested for.
+; If they are sucessfully commanded, the flag PMInts_Enabled is set/cleared.
+
+SWI_CommandBMU  Entry   "R0-R3"
+        ASSERT  (PortableBMUC_EnablePMInts - PortableBMUC_DisablePMInts) = 1
+        SUBS    R2, R0, #PortableBMUC_DisablePMInts
+        TEQNES  R0, #PortableBMUC_EnablePMInts
+        BNE     %FT10
+                                                ; R2 holds 0 for Disable and 1 for Enable
+        BL      CommandBMUInternal              ; call body of routine to send command
+        STRVS   R0, [SP]                        ;VS, overwrite stack R0 with error
+        STRVCB  R2, PMInts_Enabled              ;VC, store 0/1 for PMInts disabled/enabled
+        PullEnv
+        BICVCS  PC,LR,#V_bit
+        ORRVSS  PC,LR,#V_bit
+
+CommandBMUInternal ALTENTRY
+10
+        CMPS    R0, #PortableBMU_Num_Commands
+        BHS     %FT90
+        SUBS    R0, R0, #PortableBMU_Min_Command
+        BLO     %FT90
+
+        ADR     LR, BMUCmdTable
+        LDRB    R2, [LR, R0]
+        CMP     R2, #InvalidCommand
+        BEQ     %FT90
+        BL      SendPowerCommand                ;In: R2=command byte. Out: R2=reply byte (ignored)
+        STRVS   R0,[SP]                         ; if error, overwrite stack R0
+        PullEnv
+        BICVCS  PC,LR,#V_bit
+        ORRVSS  PC,LR,#V_bit
+
+;~~~~~~~~~~~~~~~
+
+90
+; bad BMU command code
+
+        addr    R0,ErrorBlock_BadBMUCommand
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+
+;******************************************************************************
+;
+; SendPowerCommand
+;
+; Entry
+;   R2  = Command code
+;
+; Exit
+;   R2  = Response byte
+;
+SendPowerCommand
+        Entry   "R0, R1"
+
+        ORR     LR, LR, #I_bit                  ; disable IRQ
+        TEQP    PC, LR
+
+        LDRB    R1, CommandState
+        TEQ     R1, #0
+        BNE     %FT89                        ;BMU command in progress
+
+        MOV     R1, #1
+        STRB    R1, CommandState
+
+        LDR     R0, =uC_StatusReg               ;Get Tx buffer status bit
+10                                              ;
+        LDRB    R1, [R0]                        ;
+        TST     R1, #uC_Status_OBF              ;
+        BNE     %BT10                           ;Loop until buffer empties
+
+        LDR     R0, =uC_PwrDataTxReg
+        STRB    R2, [R0]                        ;Write byte to Power manager
+
+        BIC     LR, LR, #I_bit                  ;ints on
+        TEQP    PC, LR
+
+        TEQ     R2, #PwrCmd_Power_down          ;These two don't send a reply,
+        TEQNE   R2, #PwrCmd_Suspend             ; so skip the code that would try to fetch one
+        BEQ     %FT30                           ;
+
+20
+        LDRB    R1, CommandState                ;Reply expected, so loop until it arrives
+        TEQ     R1, #1                          ; under interrupt
+        BEQ     %BT20
+
+        LDRB    R2, CommandResult               ;Get reply
+30
+        MOV     R1, #0
+        STRB    R1, CommandState
+        EXIT
+
+;~~~~~~~~~~~~~~~
+
+89
+; BMU command in progress
+
+        BIC     LR, LR, #I_bit                  ;ints on
+        TEQP    PC, LR
+
+        addr    R0,ErrorBlock_BMUBusy
+92
+        BL      ErrorLookupNoParms
+        STR     R0,[SP]                         ; overwrite stack R0
+        PullEnv
+        ORRS    PC,LR,#V_bit
+
+
+;******************************************************************************
+
+
+        END
+
+

@@ -1,0 +1,713 @@
+/* Copyright 1999 Element 14 Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ *  DHCP (sockets.c)
+ *
+ * Copyright (C) Element 14 Ltd. 1999
+ *
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "sys/types.h"
+#include "sys/socket.h"
+#include "sys/ioctl.h"
+#include "sys/filio.h"
+#include "sys/sockio.h"
+#include "net/if.h"
+#include "protocols/dhcp.h"
+#include "sys/dcistructs.h"
+#include "netinet/in.h"
+#include "arpa/inet.h"
+#include "net/if_dl.h"
+#include "net/if_arp.h"
+#include "net/if_types.h"
+#include "sys/errno.h"
+
+#include "dhcpintern.h"
+#include "interfaces.h"
+#include "sockets.h"
+#include "socklib.h"
+#include "packets.h"
+#include "iparp.h"
+#include "module.h"
+
+/* This is the minimum number of bytes in the option buffer that must be
+ * present in order to process an incoming packet.  This value MUST be
+ * at least 4.  The DHCP standard mandates that this value MUST be 64.
+ * Microsoft DHCP servers are broken and require it to be 4.
+ */
+#ifndef MINIMUM_OPTIONS_LENGTH
+#  define MINIMUM_OPTIONS_LENGTH 64
+#endif
+#if MINIMUM_OPTIONS_LENGTH < 4
+#  error "MINIMUM_OPTIONS_LENGTH must be at least 4"
+#endif
+
+/* This is the socket handle which we can use for all our activities, including
+ * sending ioctls to the Internet module, and actually receiving the incoming
+ * datagrams that are responses to our requests.
+ */
+static int s;
+
+
+/* This routine pulls the loopback interface into existence, otherwise we are
+ * unable to bind to the bootp client port because there are no active IP
+ * addresses,
+ */
+static void sockets_get_loopback(void)
+{
+        struct ifreq req;
+        di_ifdhcpreq *dif = (di_ifdhcpreq *) &req; /* Note - not the full thing! */
+
+        (void) strncpy(dif->ifr_in.name, "lo0", IFNAMSIZ);
+        (void) memset(&dif->ifr_in.sin, '\0', sizeof(dif->ifr_in.sin));
+        dif->ifr_in.sin.sin_family = AF_INET;
+#ifndef COMPAT_INET4
+        dif->ifr_in.sin.sin_len = sizeof(dif->ifr_in.sin);
+#endif
+        dif->ifr_in.sin.sin_port = 0;
+        inet_aton("127.0.0.1", &dif->ifr_in.sin.sin_addr);
+        (void) socketioctl(s, SIOCSIFADDR, &req);
+}
+
+/* Creates a new datagram socket and binds it to the DHCP client port so that it
+ * receives copies of any incoming datagrams on any interface.  This allows it
+ * to bypass the Internet module.
+ */
+void sockets_init(void)
+{
+	struct sockaddr_in sin;
+
+        s = socket(PF_INET, SOCK_DGRAM, 0);
+        if (s == -1) {
+                trace(("socket() failed -> errno %d (%s)\n", errno, _inet_err()));
+                return;
+        }
+	(void) memset(&sin, '\0', sizeof(sin));
+	sin.sin_family = AF_INET;
+#ifndef COMPAT_INET4
+	sin.sin_len = sizeof(sin);
+#endif
+	sin.sin_addr.s_addr = htonl(INADDR_ANY);
+	sin.sin_port = htons(DHCP_client);
+
+	sockets_get_loopback();
+
+	if (bind(s, (struct sockaddr *) &sin, sizeof(sin)) < 0) {
+	        /* Erk - unable to bind.  We have a problem - reset ourselves,
+	         * although it probably won't do much good.  This is serious.
+	         * Surely the Internet module must be broken if this fails?
+	         */
+                trace(("bind() failed -> errno %d (%s)\n", errno, _inet_err()));
+	        sockets_discard();
+	}
+	else {
+		/* Set taskwindow flag - for testing mainly, but it doesn't actually
+		 * harm it having the bit set.  Request events when data is delivered
+		 * to the socket, and ensure that it is using non-blocking I/O.  If
+		 * events are not enabled, this module will not work as it relies on
+		 * them to drive the DHCP processing engine.
+		 */
+	        int one = 1;
+
+	        (void) ioctl(s, FIOSLEEPTW, &one);
+	        (void) ioctl(s, FIOASYNC, &one);
+	        (void) ioctl(s, FIONBIO, &one);
+	}
+}
+
+void sockets_discard(void)
+{
+        if (s != -1) {
+                (void) socketclose(s);
+                s = -1;
+        }
+}
+
+int sockets_data_arrived(int ns, void *private_word)
+{
+        static DHCP packet;
+        int res;
+
+        if (ns != s) {
+                /* Not our socket - pass the event on */
+                return 1;
+        }
+
+        /* Note.  The PRMs will harp on about re-enabling interrupts by calling
+         * _kernel_irqs_on() at this point, and that it is safe because it is in
+         * a callback already.  Unfortunately, that static DHCP packet up above
+         * puts a spanner in the works.  IRQs cannot even be re-enabled once the
+         * packet is copied into the dhcp_interface structure, because in the event
+         * of multiple replies arriving "simultaneously", they are almost certainly
+         * going to be destined for the same dhcp_interface (eg. multiple DHCPOFFER
+         * messages).  So, basically, don't do it!
+         */
+
+	/* Drain socket ... no more events unless we do */
+	while ((res = recv(ns, &packet, sizeof(packet), 0)) > 0) {
+	        if (res < offsetof(DHCP, options[MINIMUM_OPTIONS_LENGTH])) {
+	                /* Not a valid BOOTP or DHCP packet - too short!
+	                 * (RFC 1542 mandates that the packet must have at least
+	                 * the minimum 64 bytes of options as specified in RFC 951).
+	                 */
+	                continue;
+	        }
+	        if (packet.op != BOOTREPLY) {
+	                /* This was a request, not a reply.  If we do happen to be
+	                 * running a BOOTP/DHCP server on this host, it will have
+	                 * its own socket and will get its own copy of this packet.
+	                 */
+	                continue;
+	        }
+	        if (*(u_long *) packet.options != htonl(OPTIONS_COOKIE)) {
+	        	/* No magic cookie. We'll put one in and blank out the
+	        	 * options.
+	        	 */
+			*(u_long *) packet.options = htonl(OPTIONS_COOKIE);
+			packet.options[4] = OPTION_END;
+			memset(packet.options + 5, OPTION_PAD, res - offsetof(DHCP, options[5]));
+	        }
+	        else if (res < sizeof(DHCP)) {
+	                /* Not the maximum length we were expecting.  For
+	                 * a little bit of security and safety, we'll try
+	                 * to blat out the rest of the packet with OPTION_PAD
+	                 * and put an OPTION_END in.
+	                 */
+	                size_t ores = res - offsetof(DHCP, options);
+	                const size_t blank = sizeof(DHCP) - res;
+	                (void) memset(&packet.options[ores], OPTION_PAD, blank);
+	                /* Search back through any OPTION_PAD characters to the
+	                 * last non-pad character ...
+	                 */
+	                while (ores > 4 && packet.options[ores-1] == OPTION_PAD) {
+	                        --ores;
+	                }
+	                /* If the last non-pad character wasn't the end option,
+	                 * then put one in to defend ourselves against rubbish.
+	                 */
+	                if (packet.options[ores-1] != OPTION_END) {
+		                packet.options[ores] = OPTION_END;
+	                }
+	        }
+	        (void) dhcp_deliver_incoming_packet(&packet, private_word);
+	}
+
+	/* Claim the event - it's our socket, nobody else should be interested.
+	 * If they were, then it's tough because they should have bound their
+	 * own datagram socket to the bootpc port, then they'd have got a copy
+	 * of the packet too.
+	 */
+        return 0;
+}
+
+/* Sets an IP address type field on an interface - command indicates which types of
+ * address - netmask (SIOCSIFNETMASK) or address (SIOCSIFADDR).  Any other calls
+ * which use the sockaddr version of the ifr union may use this too.
+ */
+static int sockets_set_address(dhcp_interface *di, struct in_addr in, u_long command)
+{
+        struct sockaddr_in *const sin = &di->req.ifr_in.sin;
+
+	sockets_ensure_init();
+
+	(void) memset(sin, '\0', sizeof(*sin));
+        sin->sin_family = AF_INET;
+#ifndef COMPAT_INET4
+        sin->sin_len = sizeof(*sin);
+#endif
+	sin->sin_port = 0;
+	sin->sin_addr = in;
+
+	return socketioctl(s, command, &di->req.ifr);
+}
+
+/* Unfortunately, the interface cannot use its bound IP address any longer because
+ * it has expired.  Tell Internet to disable the interface immediately.
+ */
+int sockets_kill_interface(dhcp_interface *di)
+{
+        struct ifreq *ifr = &di->di_ifr;
+        struct in_addr in;
+
+	sockets_ensure_init();
+
+	/* Disassociate the bound address from this interface
+	 * If no error was returned, then attempt to read the interface address
+	 * and if this fails, then put the interface down.
+	 */
+        in.s_addr = di->binding.yiaddr;
+
+	trace(("delete address: %s\n", inet_ntoa(in)));
+
+	if (sockets_set_address(di, in, SIOCDIFADDR) < 0) {
+	        /* Failed to delete this IP address from the interface.  User has
+	         * presumably reconfigured the interface manually.  Bail out.
+	         */
+	        trace(("sockets_kill_interface: failed to delete address: %d\n", errno));
+	        return 0;
+	}
+
+	if (socketioctl(s, SIOCGIFADDR, ifr) < 0 && errno == EADDRNOTAVAIL) {
+	        /* No more addresses on the interface, so kill the interface */
+
+		if (socketioctl(s, SIOCGIFFLAGS, ifr) < 0) {
+	        	/* Erk - an error - the interface has gone? Let's assume so */
+	        	return -1;
+		}
+		ifr->ifr_flags &= ~(IFF_UP|IFF_RUNNING);
+
+		/* Finally, force the interface down.  Do this after setting the address
+		 * as setting the address can affect the flags
+		 */
+		if (socketioctl(s, SIOCSIFFLAGS, ifr) < 0) {
+		        /* Unable to table interface down - nasty.  Let's stick our
+		         * heads in the sand and assume the interface died.
+		         */
+		        return -1;
+		}
+	}
+
+	return 0;
+}
+
+void sockets_direct_transmit(ifdhcpreq *req, int ioctl_flags)
+{
+        sockets_ensure_init();
+        req->ifr.ifr_flags = ioctl_flags;
+        if (socketioctl(s, SIOCGWHOIAMD, req) < 0) {
+                trace(("sockets_transmit: Internet module error %d\n", errno));
+                sockets_discard();
+                sockets_ensure_init();
+        }
+}
+
+void sockets_transmit(dhcp_interface *di, int ioctl_flags)
+{
+	/* This is the function that causes packets to be sent.  It asks the
+   	 * Internet module to do this on its behalf, because there are many
+   	 * complex issues to consider, such as claiming frames in the driver,
+   	 * interface manipulation etc.  Requires Internet 5.20 or later to
+   	 * recognise the IOCTL command being used.  The IOCTL is provided
+   	 * solely for this module's benefit.  This routine is the gateway to
+   	 * the Internet module's DHCP interfaces.  The ifr_flags are used
+   	 * to indicate what action the Internet module should be taking.
+	 */
+        trace(("sockets_transmit: Transmit (DHCP Message Type %d).\n",
+        	dhcp_find_option(&di->di_dhcp, OPTION_DHCPMESSAGETYPE) ?
+        	dhcp_find_option(&di->di_dhcp, OPTION_DHCPMESSAGETYPE)[2] : -1));
+
+	sockets_direct_transmit(&di->req.ifd, ioctl_flags);
+}
+
+/* This routine is called by the handler for SWI DHCP_Execute to get the Internet
+ * module to set itself up for a BOOTP.  It won't get very far though, because when
+ * it sends around the dynamic boot start service call, we're going to claim it.
+ * Doing it this way lets Internet get into a vaguely sensible internal state first
+ * and tricks it into revealing the DCI4 driver DIB that we need for hardware
+ * address validation.  It also means that DHCP initiation is done through a
+ * single call point (the service call handler).
+ */
+void sockets_trigger_internet_dhcp(const char *if_name)
+{
+        struct ifreq ifr;
+        int res;
+
+	trace(("sockets_trigger_internet_dhcp: poking Internet module\n"));
+	sockets_ensure_init();
+	(void) memset(&ifr, '\0', sizeof(ifr));
+       	(void) strncpy(ifr.ifr_name, if_name, sizeof(ifr.ifr_name));
+       	module_idle(mir_THREAD);
+       	res = socketioctl(s, SIOCGWHOIAMB, &ifr);
+       	module_idle(mir_UNTHREAD);
+       	if (res<0) {
+                trace(("SIOCWHOIAMB -> error %d\n", errno));
+        }
+}
+
+/* Called before using the socket to make sure we really did create it.  It may
+ * have been the case that we tried to create it before the Internet module was
+ * present, in which case creation would have failed.  Repeated failure to create
+ * the datagram socket is not a feasible situation except in the absense of the
+ * Internet module - which would be a rather serious problem in itself!
+ */
+void sockets_ensure_init(void)
+{
+        if (s == -1) {
+                sockets_init();
+        }
+}
+
+/* This is called to find out whether the DHCP module thinks it has a valid
+ * socket handle.  It is called when the service call from the Internet module
+ * is received indicating that the Internet module has re-initialised.  If both
+ * Internet and DHCP are exclusively in ROM, this causes DHCP to abandon the
+ * socket that it got during its module initialisation on the basis that it is
+ * no longer a legal handle (not legal to close it).  This check allows the
+ * service call handler to recognise that the socket may be closed safely.
+ */
+int sockets_init_ok(void)
+{
+        return (s != -1);
+}
+
+/* This routine takes a local IP address and determines it which interface it belongs
+ * and what the link address of that interface is.  The interface table is searched for
+ * the AF_INET record which matches the specified IP address and then a matching AF_LINK
+ * structure is sought which gives the details on the interface itself.
+ *
+ * A buffer is malloced for the data retrieval from the Internet module.  Once the
+ * appropriate sockaddr_dl entry has been located in the buffer, it is copied down to
+ * the start of the buffer and the address of the buffer is returned.  The caller is
+ * responsible for freeing the returned buffer.  The return value is NULL if the
+ * AF_INET lookup has failed, AF_LINK lookup has failed or memory allocation has failed.
+ *
+ */
+static struct sockaddr_dl *sockets_ip_to_hardware_address(struct in_addr ia, char *actual_if)
+{
+        struct ifconf ifc;
+        struct ifreq *ifr, *end;
+        char *ifname = 0;
+        static const size_t bufsize = 1500;
+        int found = 0;
+
+        ifc.ifc_len = bufsize;
+        ifc.ifc_buf = malloc(ifc.ifc_len);
+        if (ifc.ifc_buf == NULL) {
+                return NULL;
+        }
+
+	trace(("sockets_ip_to_hardware_address\n"));
+
+        if (socketioctl(s, SIOCGIFCONF, &ifc) == 0) {
+                ifr = ifc.ifc_req;
+                end = (struct ifreq *) (ifc.ifc_buf + ifc.ifc_len);
+                trace(("SIOCGIFCONF succeeded: %p -> %p\n", ifr, end));
+                if (ia.s_addr == INADDR_ANY) {
+                        found = 1;
+                        ifname = actual_if;
+                }
+                else while (ifr < end) {
+                        trace(("Entry family: %d\n", ifr->ifr_addr.sa_family));
+                        if (ifr->ifr_addr.sa_family == AF_INET) {
+                                struct sockaddr_in *sin;
+                                sin = (struct sockaddr_in *) &ifr->ifr_addr;
+                                trace(("Internet address %s\n", inet_ntoa(sin->sin_addr)));
+                                if (sin->sin_addr.s_addr == ia.s_addr) {
+                                        ifname = ifr->ifr_name;
+                                        trace(("This is the one we wanted: %s\n",
+                                        	ifr->ifr_name));
+                                        found = 1;
+                                        /*break;*/
+                                }
+                        }
+                        if (ifr->ifr_addr.sa_len) {
+                                /* Dodgy hack for dual Internet 4/Internet 5 compat */
+                                ifr = (struct ifreq *) ((caddr_t) ifr +
+                                	ifr->ifr_addr.sa_len - sizeof(struct sockaddr));
+                        }
+                        ++ifr;
+                }
+                if (found) for (ifr = ifc.ifc_req; ifr < end; ++ifr) {
+                        if (ifr->ifr_addr.sa_family == AF_LINK) {
+                                struct sockaddr_dl *sdl = (struct sockaddr_dl *)
+                                       	&ifr->ifr_addr;
+                                int matches = !strncmp(ifr->ifr_name, ifname, IFNAMSIZ);
+
+                                trace(("Found a link address.  Interface `%*s'; type %d; MAC: %s\n",
+                                	sdl->sdl_nlen, sdl->sdl_data, sdl->sdl_type,
+                                	link_ntoa(sdl)));
+
+                                if (matches) {
+                                        /* Got it */
+                                        if (ifname != actual_if) {
+                                                (void) strncpy(actual_if, ifname, IFNAMSIZ);
+                                        }
+                                        (void) memmove(ifc.ifc_buf, sdl, sdl->sdl_len);
+                                        return (struct sockaddr_dl *) ifc.ifc_buf;
+                                }
+                        }
+                        if (ifr->ifr_addr.sa_len) {
+                                /* Dodgy hack for dual Internet 4/Internet 5 compat */
+                                ifr = (struct ifreq *) ((caddr_t) ifr +
+                                	ifr->ifr_addr.sa_len - sizeof(struct sockaddr));
+                        }
+                }
+        }
+
+        free(ifc.ifc_buf);
+        trace(("sockets_ip_to_hardware_address ends\n"));
+        return 0;
+}
+
+/* This is the inform sending socket - we use a separate socket so that we don't
+ * inadvertantly bind our *.bootpc socket to a specific interface
+ */
+static int is;
+
+static void sockets_ensure_inform_init(void)
+{
+        int one = 1;
+
+        if (is == -1) {
+	        is = socket(PF_INET, SOCK_DGRAM, 0);
+	        if (is == -1) {
+        	        trace(("socket() failed -> errno %d (%s)\n", errno, _inet_err()));
+                	return;
+	        }
+        }
+
+        (void) ioctl(is, FIOSLEEPTW, &one);
+	(void) ioctl(is, FIOASYNC, &one);
+	(void) ioctl(is, FIONBIO, &one);
+	(void) setsockopt(is, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+
+}
+
+static void sockets_inform_discard(void)
+{
+        if (is != -1) {
+	        socketclose(is);
+        	is = -1;
+        }
+}
+
+
+/* This routine is called to get hold of the handle of the inform sender socket,
+ * which will already have been bound to the correct interface ready for
+ * transmission.  It fills in a network-order 32-bit IP address in ciaddr with a
+ * value suitable for going in a DHCP packet's ciaddr header field.  The
+ * socket handle is the function's return value.
+ */
+
+int sockets_inform(DHCP *d, struct in_addr dest_ip, char *actual_interface)
+{
+        struct sockaddr_in sin;
+        int res;
+
+        sockets_ensure_init();
+        sockets_ensure_inform_init();
+
+	if (dest_ip.s_addr == htonl(INADDR_ANY)) {
+	        dest_ip.s_addr = htonl(INADDR_BROADCAST);
+	}
+
+	(void) memset(&sin, '\0', sizeof(sin));
+	sin.sin_family = AF_INET;
+#ifndef COMPAT_INET4
+	sin.sin_len = sizeof(sin);
+#endif
+	sin.sin_addr = dest_ip;
+	sin.sin_port = htons(DHCP_server);
+
+	if (connect(is, (struct sockaddr *) &sin, sizeof(sin)) < 0) {
+	        /* Erk - unable to associate - probably can't reach that IP address */
+                trace(("connect() failed -> errno %d (%s)\n", errno, _inet_err()));
+                res = -1;
+	}
+	else {
+	        /* Managed to associate socket - now find the local address ... */
+	        struct sockaddr_in lin;
+	        int sizeof_lin = sizeof(lin);
+
+	        if (getsockname(is, (struct sockaddr *)&lin, &sizeof_lin) < 0) {
+	                /* Unable to read it?  Oh dear - don't fill it in then */
+	                trace(("getsockname() failed -> %s\n", _inet_err()));
+	        }
+	        else {
+	                struct sockaddr_dl *sdl;
+	                d->ciaddr = lin.sin_addr.s_addr;
+	                sdl = sockets_ip_to_hardware_address(lin.sin_addr, actual_interface);
+	                if (sdl != NULL) {
+	                        char *address = LLADDR(sdl);
+	                        size_t len = sdl->sdl_alen;
+
+	                        if (len > sizeof(d->chaddr)) len = sizeof(d->chaddr);
+	                        d->hlen = len;
+	                        if (len) {
+	                                memcpy(d->chaddr, address, len);
+	                        }
+	                        switch (sdl->sdl_type) {
+	                                default:
+	                                        /* Allow default to Ethernet */
+	                                        if (len == 0) {
+	                                                d->htype = 0;
+	                                        }
+	                                        break;
+	                                case IFT_MODEM:
+                                        case IFT_PPP:
+                                        case IFT_SLIP:
+                                        case IFT_ISDNBASIC:
+                                        case IFT_ISDNPRIMARY:
+                                        case IFT_RS232:
+                                                if (len == 0) {
+	                                                d->htype = ARPHRD_SERIAL;
+                                                }
+                                                break;
+	                        }
+	                        free(sdl);
+	                }
+	        }
+
+		res = send(is, d, sizeof(*d), 0);
+		if (res < 0) {
+	        	trace(("send: %s\n", _inet_err));
+		}
+	}
+
+	sockets_inform_discard();
+
+        return res;
+}
+
+int sockets_unicast_transmit(DHCP *d, struct in_addr dest)
+{
+        struct sockaddr_in sin;
+
+	sockets_ensure_init();
+
+        (void) memset(&sin, '\0', sizeof(sin));
+        sin.sin_family = AF_INET;
+#ifndef COMPAT_INET4
+	sin.sin_len = sizeof(sin);
+#endif
+        sin.sin_port = htons(DHCP_server);
+        sin.sin_addr = dest;
+
+        return sendto(s, d, sizeof(*d), 0, (struct sockaddr *) &sin, sizeof(sin));
+}
+
+void sockets_set_preferred_ip_address(dhcp_interface *di, u_long ip)
+{
+        if (ip == INADDR_ANY) {
+                if (socketioctl(s, SIOCGIFADDR, &di->di_ifr) == 0) {
+                        ip = di->req.ifr_in.sin.sin_addr.s_addr;
+                        di->state = dhcpstate_INITREBOOT;
+                }
+        }
+
+        di->preferred_ip.s_addr = ip;
+}
+
+int sockets_verify_address(dhcp_interface *di)
+{
+        struct in_addr if_ip;
+
+        if (socketioctl(s, SIOCGIFADDR, &di->req) < 0) {
+                if_ip.s_addr = INADDR_ANY;
+        }
+        else {
+                if_ip.s_addr = di->req.ifr_in.sin.sin_addr.s_addr;
+        }
+
+        switch (di->state) {
+	        case dhcpstate_INIT:
+	        case dhcpstate_SELECTING:
+        	case dhcpstate_REQUESTING:
+	        case dhcpstate_INITREBOOT:
+        	case dhcpstate_REBOOTING:
+                        if (di->preferred_ip.s_addr != if_ip.s_addr) {
+                                return -1; /* Is changed */
+                        }
+                        break;
+
+		case dhcpstate_BOUND:
+	        case dhcpstate_RENEWING:
+        	case dhcpstate_REBINDING:
+
+			if (di->binding.yiaddr != if_ip.s_addr) {
+			        return -1; /* Faulty */
+			}
+			break;
+
+        	default:
+                        break;
+        }
+
+	return 0; /* OK */
+}
+
+
+int sockets_delete_address(Dib *dib, struct in_addr *addr) {
+  struct ifreq r;
+  struct sockaddr_in *p;
+
+  snprintf(r.ifr_name, IFNAMSIZ, "%s%d", dib->dib_name, dib->dib_unit);
+
+  p = (struct sockaddr_in *) &r.ifr_addr;
+  memset(p, 0, sizeof(struct sockaddr_in));
+
+  p->sin_len = sizeof(struct sockaddr_in);
+  p->sin_family = AF_INET;
+  p->sin_addr = *addr;
+
+  trace(("delete addr %s\n", inet_ntoa(p->sin_addr)));
+
+  if (socketioctl(s, SIOCDIFADDR, &r) < 0) {
+    trace(("delete address ioctl failed: %d %s\n", errno, _inet_err()));
+    return -1;
+  }
+
+  return 0;
+}
+
+
+/* Set interface address directly	*/
+int sockets_set_if_address(char *ifname, struct in_addr *addr, struct in_addr *broad, struct in_addr *mask) {
+  struct ifaliasreq r;
+  struct sockaddr_in *p;
+
+  trace(("sockets_set_if_address: %s\n", inet_ntoa(*addr)));
+  sockets_ensure_init();
+
+  memset(&r, 0, sizeof(r));
+  memcpy(r.ifra_name, ifname, IFNAMSIZ);
+
+  p = (struct sockaddr_in *) &r.ifra_addr;
+#ifndef COMPAT_INET4
+  p->sin_len = sizeof(struct sockaddr_in);
+#endif
+  p->sin_family = AF_INET;
+  p->sin_port = 0;
+  p->sin_addr = *addr;
+
+  p = (struct sockaddr_in *) &r.ifra_broadaddr;
+#ifndef COMPAT_INET4
+  p->sin_len = sizeof(struct sockaddr_in);
+#endif
+  p->sin_family = AF_INET;
+  p->sin_port = 0;
+  p->sin_addr = *broad;
+
+  p = (struct sockaddr_in *) &r.ifra_mask;
+#ifndef COMPAT_INET4
+  p->sin_len = sizeof(struct sockaddr_in);
+#endif
+  p->sin_family = AF_INET;
+  p->sin_port = 0;
+  p->sin_addr = *mask;
+
+  if (socketioctl(s, SIOCAIFADDR, &r) < 0) {
+    trace(("add address ioctl failed: %d %s\n", errno, _inet_err()));
+    return -1;
+  }
+
+  return 0;
+}

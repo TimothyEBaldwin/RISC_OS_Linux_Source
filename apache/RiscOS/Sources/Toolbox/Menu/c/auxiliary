@@ -1,0 +1,577 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* Title:   auxiliary.c
+ * Purpose: support functions for the Menu object class
+ * Author:  TGR
+ * History: 1-Nov-93: TGR: created
+ *          7-Oct-96: EPW: Added flag so clicking on a menu item can centre
+ *                         an object
+ *
+ *
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "Global/Sprite.h"
+#include "swis.h"
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "twimp.h"
+#include "os.h"
+#include "style.h"
+#include "string32.h"
+#include "messages.h"
+#include "objects/toolbox.h"
+#include "objects/menu.h"
+
+#include "auxiliary.h"
+#include "object.h"
+#include "task.h"
+
+GlobalMenu  global_menu =
+                {0,0,0,NULL,NULL,NULL};
+int        *global_wimp_wrkspc = NULL;
+
+EventInterest   messages_of_interest[] =
+                {{wimp_MHELP_REQUEST  ,  0},
+                 {wimp_MMENUS_DELETED ,  0},
+                 {wimp_MMENU_WARNING  ,  0},
+                 {-1                  , -1}
+                };
+
+EventInterest   events_of_interest[] =
+                {{wimp_EMENU          , -1},
+                 {wimp_ETOOLBOX_EVENT ,  0},
+                 {-1                  , -1}
+                };
+
+EventInterest   toolbox_events_of_interest[] =
+                {{Menu_AboutToBeShown        , 0x828c0},
+                 {-1                         ,      -1}
+                };
+
+
+
+extern _kernel_oserror *menu_update_size(MenuInternal *menu_int) {
+
+   wimp_Menu        *menu       = menu_int->hdr.wimp_menu;
+   wimp_MenuEntry   *entry;
+   _kernel_swi_regs  regs;
+   _kernel_oserror  *e;
+   int               i,mode,
+                     max_width,
+                     width       = (menu_int->hdr.wimp_menu->hdr.title.indirect_text.buff_len)<<4,
+                     height      = 0,
+                     num_entries = menu_int->hdr.num_entries;
+   max_width=width;
+
+   entry=wimp_menu_entry(menu,0);
+
+   for (i=0;i<num_entries;i++) {
+
+      entry=wimp_menu_entry(menu,i);
+
+      if (entry->icon_flags & wimp_ICONFLAGS_TEXT) {
+         /* KJB: 12-Nov-96: width should be 16*len+12 = 16*buflen - 4*/
+         width = (entry->icon_data.indirect_text.buff_len<<4) - 4;
+      } else {
+         /* IDJ: 22-May-95: bug-fix AQU-01264: look in user sprite area if
+            one is defined first, then in wimp sprite area as a
+            fall-back.
+         */
+         e = NULL;
+
+         if (entry->icon_data.indirect_sprite.sprite_area != (void *)1 /* user area */)
+         {
+            regs.r[0] = SpriteReason_ReadSpriteSize + 256;
+            regs.r[1] = (int) entry->icon_data.indirect_sprite.sprite_area;
+            regs.r[2] = (int) entry->icon_data.indirect_sprite.sprite.name;
+
+            e = _kernel_swi (OS_SpriteOp, &regs, &regs);
+         }
+
+         if (e != NULL || entry->icon_data.indirect_sprite.sprite_area == (void *)1 /* WIMP area */)
+         {
+            regs.r[0] = SpriteReason_ReadSpriteSize;
+            regs.r[2] = (int) entry->icon_data.indirect_sprite.sprite.name;
+
+            if ((e = _kernel_swi (Wimp_SpriteOp, &regs, &regs)) != NULL)
+               return e;
+         }
+         width = regs.r[3];
+         mode  = regs.r[6];
+
+         regs.r[0] = mode;
+         regs.r[1] = ReadModeVariable_XEigFactor;
+         if ((e = _kernel_swi (OS_ReadModeVariable, &regs, &regs)) != NULL) {
+            return e;
+         }
+         width = width << regs.r[2];
+
+      }
+      if (width>max_width) max_width=width;
+      height += ((entry->flags & wimp_MENUFLAGS_DOTTED_LINE) ? 68 : 44);
+   }
+
+   menu_int->hdr.height = height;
+   menu->hdr.width = max_width;
+
+   DEBUG debug_output ("a","Menu: height = %d; width = %d\n",menu_int->hdr.height,menu->hdr.width);
+
+   return NULL;
+}
+
+#define has_submenu     (temp_flags & Menu_Entry_SubMenu)
+#define is_sprite       (temp_flags & Menu_Entry_IsSprite)
+#define dotted_line     (temp_flags & Menu_Entry_DottedLine)
+#define is_ticked       (temp_flags & Menu_Entry_Ticked)
+#define is_faded        (temp_flags & Menu_Entry_Faded)
+#define cause_event     (temp_flags & Menu_Entry_GenerateSubMenuEvent)
+#define click_trans     (temp_flags & Menu_Entry_ClickShowTransient)
+#define click_centre    (temp_flags & Menu_Entry_ClickShowCentred)
+#define click_atpointer (temp_flags & Menu_Entry_ClickShowAtPointer)
+
+extern _kernel_oserror *create_menu_entry(wimp_MenuEntry *entry, MenuTemplateEntry *temp_entry, MenuInternalEntry *int_entry) {
+
+   _kernel_swi_regs  regs;
+   _kernel_oserror  *e;
+   int               temp_flags     = temp_entry->flags;
+   int               text_len       = temp_entry->max_text;
+   int               help_len       = temp_entry->max_entry_help;
+
+   entry->flags =
+        ((is_ticked)   ? wimp_MENUFLAGS_TICKED          : 0)
+      | ((dotted_line) ? wimp_MENUFLAGS_DOTTED_LINE     : 0)
+      | ((has_submenu) ? wimp_MENUFLAGS_SUBMENU_MESSAGE : 0);
+
+   int_entry->flags =
+        ((cause_event) ? MENU_INT_ENTRY_FLAGS_GENERATE_SUBMENU_EVENT : 0)
+      | ((click_trans) ? MENU_INT_ENTRY_FLAGS_CLICK_SHOW_TRANSIENT   : 0)
+      | ((click_centre) ? MENU_INT_ENTRY_FLAGS_CLICK_SHOW_CENTRED    : 0)
+      | ((click_atpointer) ? MENU_INT_ENTRY_FLAGS_CLICK_SHOW_AT_POINTER : 0);
+
+   /* icon flags: is text?, is sprite?, no border, no Hcentre,
+    *             Vcentre, no filled bgnd, no anti-aliasing, no redraw help,
+    *             indirected?, no Rjustify, same ESG uncancelled, no sprite 1/2,
+    *   (little   button type (4bits) = 9,
+    *   endian)   ESG (5) = 0, no invert, ? shading, no deleted,
+    *             fgcol (4),
+    *             bgcol (4).
+    */
+
+   entry->icon_flags = wimp_ICONFLAGS_FORECOL * style_MENU_ENTRY_FORECOL
+                     | wimp_ICONFLAGS_BACKCOL * style_MENU_ENTRY_BACKCOL
+                     | wimp_ICONFLAGS_VCENTRE
+                     | wimp_ICONFLAGS_FILLED
+                     | wimp_ICONFLAGS_INDIRECT
+                     | wimp_ICONFLAGS_NO_CANCEL
+                     | wimp_ICONFLAGS_BUTTON_TYPE * 9
+                     | wimp_ICONFLAGS_ESG * 0
+                     | ((is_faded)?wimp_ICONFLAGS_FADED:0)
+                     | ((is_sprite)?wimp_ICONFLAGS_SPRITE:wimp_ICONFLAGS_TEXT);
+
+   DEBUG debug_output ("a","Menu: entry, icon flags = 0x%x\n",entry->icon_flags);
+   if (is_sprite) {
+      regs.r[0] = 4;
+      if ((e = _kernel_swi (Toolbox_GetSysInfo, &regs, &regs)) != NULL)
+         return e;
+      entry->icon_data.indirect_sprite.sprite_area = (void *) regs.r[0];
+      if (text_len == 0 || temp_entry->text == NULL)
+           return make_error (Menu_NoSpriteName,0);
+/*         entry->icon_data.indirect_sprite.sprite.name = NULL;*/
+      else if ((entry->icon_data.indirect_sprite.sprite.name = mem_alloc(text_len)) == NULL) {
+         return make_error (Menu_AllocFailed,0);
+      } else {
+         if (!string_copy_chk (entry->icon_data.indirect_sprite.sprite.name, temp_entry->text,text_len)) {
+            mem_freek(entry->icon_data.indirect_sprite.sprite.name);
+            return make_error (Menu_ShortBuffer,0);
+         }
+      }
+      entry->icon_data.indirect_sprite.name_len    = string_length (temp_entry->text) + 1;
+   } else {
+      entry->icon_data.indirect_text.valid_string  = NULL;
+
+      if (text_len == 0 || temp_entry->text == NULL) {
+         entry->icon_data.indirect_text.buffer = mem_alloc(1);
+         if (entry->icon_data.indirect_text.buffer == NULL) {
+            return make_error (Menu_AllocFailed,0);
+         }
+         text_len = 1;
+         entry->icon_data.indirect_text.buffer[0] = '\0';
+      }
+      else if ((entry->icon_data.indirect_text.buffer = mem_alloc(text_len)) == NULL) {
+         return make_error (Menu_AllocFailed,0);
+      } else {
+         if (!string_copy_chk (entry->icon_data.indirect_text.buffer, temp_entry->text, text_len)) {
+            mem_freek(entry->icon_data.indirect_text.buffer);
+            return make_error (Menu_ShortBuffer,0);
+         }
+      }
+      entry->icon_data.indirect_text.buff_len      = string_length (temp_entry->text) + 1;
+      DEBUG debug_output ("a","String, '%s', text_len, %d, buff_len, %d\n",temp_entry->text,text_len,entry->icon_data.indirect_text.buff_len);
+   }
+   if (temp_entry->click_show) {  /* create the object */
+      regs.r[0] = 0;
+      regs.r[1] = (int) temp_entry->click_show;
+
+      if ((e = _kernel_swi (Toolbox_CreateObject, &regs, &regs)) != NULL) {
+         mem_freek ((is_sprite)?entry->icon_data.indirect_sprite.sprite.name:entry->icon_data.indirect_text.buffer);
+         return e;
+      }
+      int_entry->click_show = (ObjectID) regs.r[0];
+
+   } else
+      int_entry->click_show = NULL;
+
+   if (has_submenu) {
+
+      entry->submenu = (wimp_Menu *) 0x8000;
+
+      if (temp_entry->submenu_show) {          /* create the submenu */
+         regs.r[0] = 0;
+         regs.r[1] = (int) temp_entry->submenu_show;
+
+         if ((e = _kernel_swi (Toolbox_CreateObject, &regs, &regs)) != NULL) {
+            mem_freek ((is_sprite)?entry->icon_data.indirect_sprite.sprite.name:entry->icon_data.indirect_text.buffer);
+            return e;
+         }
+         int_entry->submenu_show = (ObjectID) regs.r[0];
+      } else {
+         int_entry->submenu_show = NULL;
+      }
+   } else {
+      int_entry->submenu_show = NULL;
+      entry->submenu          = (wimp_Menu *) -1;
+   }
+
+   int_entry->text_len      = text_len;
+   int_entry->help_len      = help_len;
+   int_entry->component_id  = temp_entry->component_id;
+   int_entry->submenu_event = temp_entry->submenu_event;
+   int_entry->click_event   = temp_entry->click_event;
+
+   if (help_len == 0 || temp_entry->help_message == NULL)
+      int_entry->help_message=NULL;
+   else if ((int_entry->help_message = mem_alloc (help_len)) == NULL) {
+      mem_freek ((is_sprite)?entry->icon_data.indirect_sprite.sprite.name:entry->icon_data.indirect_text.buffer);
+      return make_error (Menu_AllocFailed,0);
+   } else {
+      if (!string_copy_chk (int_entry->help_message,temp_entry->help_message,help_len)) {
+         mem_freek ((is_sprite)?entry->icon_data.indirect_sprite.sprite.name:entry->icon_data.indirect_text.buffer);
+         mem_freek(int_entry->help_message);
+         return make_error (Menu_ShortBuffer,0);
+      }
+   }
+   return NULL;
+}
+
+#undef has_submenu
+#undef is_sprite
+#undef dotted_line
+#undef is_ticked
+#undef is_faded
+#undef cause_event
+#undef click_trans
+
+
+/*
+extern _kernel_oserror *copy_menu_entry (wimp_MenuEntry *entry, MenuInternalEntry *int_entry, wimp_MenuEntry *entryx, MenuInternalEntry *int_entryx) {
+
+   if (entry->icon_flags | wimp_ICONFLAGS_TEXT) {
+      if (!entry->icon_data.indirect_text.buffer) {
+         entryx->icon_data.indirect_text.buffer = NULL;
+      } else
+      if ((entryx->icon_data.indirect_text.buffer = mem_alloc(int_entry->text_len)) == NULL) {
+         return make_error (Menu_AllocFailed,0);
+      } else
+         memcpy (entryx->icon_data.indirect_text.buffer, entry->icon_data.indirect_text.buffer, int_entry->text_len);
+   } else {
+      if (!entry->icon_data.indirect_sprite.sprite.name) {
+         entryx->icon_data.indirect_sprite.sprite.name = NULL;
+      } else
+      if ((entryx->icon_data.indirect_sprite.sprite.name = mem_alloc(int_entry->text_len)) == NULL) {
+         return make_error (Menu_AllocFailed,0);
+      } else
+         memcpy (entryx->icon_data.indirect_sprite.sprite.name, entry->icon_data.indirect_sprite.sprite.name, int_entry->text_len);
+   }
+   if (!int_entry->help_message) {
+      int_entryx->help_message = NULL;
+   } else
+   if ((int_entryx->help_message = mem_alloc (int_entry->help_len)) == NULL) {
+      return make_error (Menu_AllocFailed,0);
+   } else strcpy (int_entryx->help_message, int_entry->help_message);
+
+   return NULL;
+}
+*/
+void remove_menu_entry (wimp_MenuEntry *entry, MenuInternalEntry *int_entry) {
+
+   char *text;
+
+   text = (entry->icon_flags & wimp_ICONFLAGS_SPRITE)?entry->icon_data.indirect_sprite.sprite.name:entry->icon_data.indirect_text.buffer;
+
+   if (text) mem_freek (text);
+   if (int_entry->help_message) mem_freek (int_entry->help_message);
+}
+
+int find_component (MenuInternal *menu_int, ComponentID component_id) {
+
+   int                num_entries = menu_int->hdr.num_entries,
+                      i;
+
+   for (i = 0; i < num_entries; i++) {
+      if (component_id == menu_internal_entry(menu_int, i)->component_id)
+         return i;
+   }
+   return -1;
+}
+
+extern BOOL menu_showing (MenuInternal *menu_inta) {
+
+   _kernel_swi_regs   regs;
+   MenuInternal      *menu_intb  = global_menu.top;
+   MenuInternalEntry *int_entryb;
+   ObjectID           submenu,
+                      object_id;
+   ComponentID        component_id;
+   int                buffer[64],
+                     *pposition;
+
+   if (menu_intb == menu_inta) {
+
+      DEBUG debug_output ("a","Menu: showing top-level\n");
+      return TRUE;
+   } else if (menu_intb != NULL) {
+      DEBUG debug_output ("a","Menu: looking for menu\n");
+      object_id   = global_menu.top->hdr.object_id;
+      pposition = buffer;
+
+      regs.r[0] = 0;
+      regs.r[1] = (int) buffer;
+
+      if (_kernel_swi (Wimp_GetMenuState, &regs, &regs)) {
+         return FALSE;
+      }
+      if (!menu_intb || *pposition == -1) {
+         return FALSE;
+      }
+      while (*(pposition+1) != -1) {
+
+         int_entryb    = menu_internal_entry (menu_intb,*pposition++);
+         submenu       = int_entryb->submenu_show;
+         component_id  = int_entryb->component_id;
+
+         if (!submenu) {
+            return FALSE;
+         }
+         regs.r[0] = 0;
+         regs.r[1] = (int) submenu;
+
+         if (_kernel_swi (Toolbox_GetInternalHandle, &regs, &regs)) {
+            return FALSE;
+         }
+         menu_intb = (MenuInternal *) regs.r[0];
+         DEBUG debug_output ("a","Menu: got 0x%x\n",(int)menu_intb);
+
+         regs.r[0] = 0;
+         regs.r[1] = (int) submenu;
+
+         if (_kernel_swi (Toolbox_GetObjectClass, &regs, &regs)) {
+            return FALSE;
+         }
+         if (regs.r[0] != Menu_ObjectClass) return FALSE;
+
+         if (menu_intb == menu_inta) {
+           DEBUG debug_output ("a","Menu: found subsidiary\n");
+           return TRUE;
+         }
+      }
+   }
+   return FALSE;
+}
+
+extern _kernel_oserror *update_tree (void) {
+
+   _kernel_oserror  *e;
+   _kernel_swi_regs  regs;
+
+   DEBUG debug_output ("a","Menu: trying to keep menu tree\n");
+
+   if (global_wimp_wrkspc) {
+      global_wimp_wrkspc[208] = 0;
+   } else {
+      regs.r[1] = wimp_KeepMenu;
+
+      if ((e = _kernel_swi (Wimp_CreateMenu, &regs, &regs)) != NULL)
+         return e;
+   }
+   if ((global_menu.current = global_menu.top) != NULL) {
+      DEBUG debug_output ("a","Menu: preparing to show global_menu.top = 0x%x\n",global_menu.top);
+      global_menu.flags |= GLOBAL_MENU_INFO_FLAGS_SHOW_NEXT;
+   }
+   return NULL;
+}
+
+extern _kernel_oserror *query_update_tree(MenuInternal *d)
+{
+   if (menu_showing(d)) return update_tree();
+   else return NULL;
+}
+
+_kernel_oserror *menu_show_actual (void) {
+
+   _kernel_swi_regs  regs;
+
+   /* Added by NK to cope with showing zero entry menus */
+
+   if (global_menu.top->hdr.num_entries == 0) {
+       char tmm [sizeof(wimp_Menu) + sizeof(wimp_MenuEntry)] ;
+       wimp_Menu *tm = (wimp_Menu *)tmm;
+       wimp_MenuEntry *te = (wimp_MenuEntry *) (tm+1);
+       memcpy(tm,global_menu.top->hdr.wimp_menu,sizeof(wimp_Menu));
+       tm->hdr.height = 0;
+       te->icon_flags = 0;
+       te->flags =  wimp_MENUFLAGS_LAST_ITEM | wimp_MENUFLAGS_TITLE_INDIRECT;
+
+       regs.r[1] = (int) tm;         /* Wimp menu block */
+       regs.r[2] = global_menu.x;
+       regs.r[3] = global_menu.y;
+
+       DEBUG debug_output ("e","Menu: showing menu, 0x%x (0x%x)\n",global_menu.top,global_menu.top->hdr.object_id);
+
+       return _kernel_swi (Wimp_CreateMenu, &regs, &regs);
+   }
+   regs.r[1] = (int) global_menu.top->hdr.wimp_menu;         /* Wimp menu block */
+   regs.r[2] = global_menu.x;
+   regs.r[3] = global_menu.y;
+
+   DEBUG debug_output ("e","Menu: showing menu, 0x%x (0x%x)\n",global_menu.top,global_menu.top->hdr.object_id);
+
+   return _kernel_swi (Wimp_CreateMenu, &regs, &regs);
+}
+
+_kernel_oserror *menu_show_submenu_actual (void) {
+
+   _kernel_swi_regs  regs;
+
+   /* Copied zero length menu hack from above */
+
+  if (global_menu.current->hdr.num_entries == 0) { /* build up new menu on heap - 1 zero height entry */
+       char tmm [sizeof(wimp_Menu) + sizeof(wimp_MenuEntry)] ;
+       wimp_Menu *tm = (wimp_Menu *)tmm;
+       wimp_MenuEntry *te = (wimp_MenuEntry *) (tm+1);
+       memcpy(tm,global_menu.top->hdr.wimp_menu,sizeof(wimp_Menu));
+       tm->hdr.height = 0;
+       te->icon_flags = 0;
+       te->flags =  wimp_MENUFLAGS_LAST_ITEM | wimp_MENUFLAGS_TITLE_INDIRECT;
+
+       regs.r[1] = (int) tm;         /* Wimp menu block */
+       regs.r[2] = global_menu.x;
+       regs.r[3] = global_menu.y;
+
+       DEBUG debug_output ("e","Menu: showing submenu, 0x%x\n",global_menu.current->hdr.object_id);
+
+       return _kernel_swi (Wimp_CreateSubMenu, &regs, &regs);
+   }
+   regs.r[1] = (int) global_menu.current->hdr.wimp_menu;      /* Wimp menu block */
+   regs.r[2] = global_menu.x;
+   regs.r[3] = global_menu.y;
+
+   DEBUG debug_output ("e","Menu: showing submenu, 0x%x\n",global_menu.current->hdr.object_id);
+
+   return _kernel_swi (Wimp_CreateSubMenu, &regs, &regs);
+}
+
+extern _kernel_oserror *has_been_hidden (void) {
+
+   _kernel_oserror  *e;
+   _kernel_swi_regs  regs;
+   ToolboxEvent      toolbox_event;
+
+   if (global_menu.top->hdr.flags & MENU_INT_FLAGS_GENERATE_HIDE_EVENT) {
+
+      if (global_menu.top->hdr.hide_event) {
+         toolbox_event.hdr.event_code = global_menu.top->hdr.hide_event;
+      } else {
+         toolbox_event.hdr.event_code = Menu_HasBeenHidden;
+      }
+      toolbox_event.hdr.size       = sizeof (Menu_HasBeenHidden_Event);
+      toolbox_event.hdr.flags      = 0;
+
+      regs.r[0] = 0;
+      regs.r[1] = global_menu.top->hdr.object_id;
+      regs.r[2] = -1;
+      regs.r[3] = (int) &toolbox_event;
+
+      if ((e = _kernel_swi (Toolbox_RaiseToolboxEvent, &regs, &regs)) != NULL)
+         return e;
+   }
+   global_menu.top      =  NULL;
+   global_menu.current  =  NULL;
+   global_menu.flags   &= ~GLOBAL_MENU_INFO_FLAGS_IS_SHOWING;
+
+   return NULL;
+}
+
+/*
+void write_back_wimp_menu (ObjectID object_id, wimp_Menu *wimp_menu) {
+
+    _kernel_oserror  *e;
+    _kernel_swi_regs  regs;
+    ObjectID          parent_id;
+    ComponentID       parent_component;
+    int               position;
+    MenuInternal     *menu_int;
+
+    regs.r[0] = 0;
+    regs.r[1] = object_id;
+
+    if (_kernel_swi (Toolbox_GetParent, &regs, &regs)) return;
+
+    if ((parent_id = regs.r[0]) == 0) return;
+    parent_component = regs.r[1];
+
+    regs.r[1] = parent_id;
+    regs.r[0] = 0;
+
+    if ((e = _kernel_swi (Toolbox_GetObjectClass, &regs, &regs)) != NULL) {
+       raise_toolbox_oserror (e, parent_id, -1);
+       return;
+    }
+    if (regs.r[0] != Menu_ObjectClass) return;
+
+    regs.r[0] = 0;
+    regs.r[1] = parent_id;
+
+    if ((e = _kernel_swi (Toolbox_GetInternalHandle, &regs, &regs)) != NULL) {
+       raise_toolbox_oserror (e, parent_id, -1);
+       return;
+    }
+
+    menu_int = (MenuInternal *) regs.r[0];
+
+    if ((position = find_component (menu_int, parent_component)) == -1)
+       return;
+
+    DEBUG debug_output ("a","Menu: writing back to parent (0x%x), component 0x%x at position %d, menu (wimp) 0x%x\n", parent_id, parent_component, position, wimp_menu);
+
+    (wimp_menu_entry (menu_int->hdr.wimp_menu, position))->submenu = wimp_menu;
+}
+*/

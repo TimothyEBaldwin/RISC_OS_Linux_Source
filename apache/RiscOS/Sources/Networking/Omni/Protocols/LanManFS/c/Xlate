@@ -1,0 +1,1350 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+*  Lan Manager client
+*
+*  Xlate.C --  DOS to  RISCOS name & attrib mapping
+*
+*  Versions
+*  07-03-94 INH Original
+*
+*/
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "swis.h"
+#include "Interface/MimeMap.h"
+
+#include "stdtypes.h"
+#include "LanMan.h"
+#include "Xlate.h"
+#include "Attr.h"
+#include "Omni.h"
+#include "LMVars.h"
+#include "SMB.h"
+#include "Transact.h"
+#include "NameCache.h"
+
+#ifdef LONGNAMES
+#define FileChar_TypedNamePrefix        ','
+#define FileString_DeadFile             "xxx"
+#define FileString_UntypedFile          "lxa"
+
+/* Magic value used to indicate an incomplete file - used by the Filer,
+ * for example, when writing a new file
+ */
+static const int deaddead = (int)0xDEADDEAD;
+#endif
+
+/* Macro returns non-zero if the specific load address is indicative of
+ * a filetyped object.   Rather than checking for the top 12 bits being
+ * set, it's much quicker to arithmetic shift it right 20 bits and test
+ * for -1.  (Norcroft generates:  MVN rn, #0: TEQ rn, ra, ASR #20)
+ */
+#define IS_FILETYPED(load_addr) ((((signed int)(load_addr)) >> 20) == -1)
+
+/* Extracts the filetype from a load address.  Assumes that IS_FILETYPED
+ * would return non-zero.  In isolation, Norcroft generates:
+ * MOV ra, ra, LSL #12: MOV ra, ra, LSR #20.
+ */
+#define GET_FILETYPE(load_addr) ((((unsigned int)(load_addr)) << 12) >> 20)
+
+/* Encodes a filetype into a load address - Norcroft compiler makes a
+ * nice job of this macro (result in load): ORR rn, load, #0xf0000000
+ * ORR rn, rn, #0x0FF00000: MOV load,load,LSL #12:
+ * EOR load, type, load LSR #20: EOR load,rn,load LSL #8
+ */
+#define ENCODE_FILETYPE(load,type) (((load)|0xFFF00000)^((GET_FILETYPE(load)^(type))<<8))
+
+
+
+/* stricmp(): ignore-case string compare ------------------------ */
+/* returns 0 if they match, > 0 if s1 > s2, < 0 if s1 < s2 */
+
+/* Function to compare two strings case insensitively
+ *
+ * Originally: sbrodie
+ *
+ * Parameters: matches those of strcmp.
+ * Result: matches the exit conditions of strcmp.
+ *
+ *
+ * The conversions to unsigned int stop the compiler messing around with
+ * shifts all over the place whilst trying to promote the chars to int
+ * whilst retaining the sign.
+ *
+ * Problems: Choice of return value when strings do not match is based
+ *           upon character number rather than any alphabetic sorting.
+ *
+ */
+int stricmp(const char *first, const char *second)
+{
+  for (;;) {
+    unsigned int a = *first++;
+    unsigned int b = *second++;
+  
+    if (a == 0) return -b;
+    if (a != b) {
+      unsigned int c = (unsigned int) tolower(a);
+      unsigned int d = (unsigned int) tolower(b);
+      signed int result = c - d;
+      if (result != 0) return result;
+    }
+  }
+}
+
+/* strcpyn(): copies a string with given max length. Note that
+    unlike strncpy(), this will always correctly put terminating
+    zeros on the end. len is the max number of characters including
+    terminating zero to copy (= length of buffer where result is to
+    be put).
+*/
+
+void strcpyn ( char *d, const char *s, int len )
+{
+#ifdef OLD_SLOW_METHOD
+  while ( --len > 0 && *s != 0 )
+    *d++ = *s++;
+  *d = 0;
+#else
+  *d = 0;
+  (void) strncat(d, s, len);
+#endif
+}
+
+/* strcpyn_upper(): copies a string making all characters uppercase --- */
+
+void strcpyn_upper ( char *d, const char *s, int len )
+{
+  while ( --len > 0 && *s != 0 )
+   *d++ = toupper (*s++);
+
+  *d=0;
+}
+
+/* strcpyn_lower(): doubtless you can guess --- */
+
+void strcpyn_lower ( char *d, const char *s, int len )
+{
+  while ( --len > 0 && *s != 0 )
+   *d++ = tolower (*s++);
+
+  *d=0;
+}
+
+/* -------------------------- */
+
+static const ushort daycount[13] =
+{
+  0,
+  0,      /* Jan=31 */
+  31,     /* Feb=28 */
+  59,     /* Mar=31 */
+  90,     /* Apr=30 */
+  120,    /* May=31 */
+  151,    /* Jun=30 */
+  181,    /* Jul=31 */
+  212,    /* Aug=31 */
+  243,    /* Sep=30 */
+  273,    /* Oct=31 */
+  304,    /* Nov=30 */
+  334     /* Dec=31 */
+};
+
+/* --------------------------- */
+
+/* Directory entries, as returned from the 'search' command
+   have the time & date returned in a packed-binary DD/MM/YY
+   HH:MM:SS format. This routine converts it to 'Utime',
+   which is the format used in other DOS calls.
+*/
+
+static uint DMYtoUtime ( int dtime, int ddate )
+{
+  uint x, dd, mm, yy, hrs, min, sec;
+
+  dd = ddate & 31;
+  mm = (ddate >> 5) & 15;
+  yy = ((ddate >> 9) & 127); /* Years since 1980 */
+  sec = (dtime & 31) << 1;
+  min = (dtime >> 5) & 63;
+  hrs = (dtime >> 11) & 31;
+
+  /*
+  debug2("%08x %08x => ", dtime, ddate);
+  debug3("HH:MM:SS => %02d:%02d:%02d   ", hrs, min, sec);
+  debug3("DD:MM:YY => %02d:%02d:%04d \n", dd, mm, yy + 1980);
+  */
+
+  /* Calc. no. of days since 1-1-70 */
+  x = 3652 + (yy*365) + ((yy+3)/4);
+  x += daycount[mm] + (dd-1);
+  if ( mm >= 3 && ((yy & 3)==0) ) /* March or later, in leap year */
+    x++;
+
+  return ((x*24+hrs)*60+min)*60 + sec;
+}
+
+
+
+/* ----------------------- */
+
+/* Xlt_CnvDOStoRO translates DOS attributes into RISCOS attributes;
+   it is used by a variety of read-info calls. Flags can be passed
+   to specify whether the date/time or the 'flags' are to be converted.
+
+   The file type filled in the 'load address' and 'exec address' is a
+   default value; if this is important, Attr_GetInfo() should be
+   called to fill this in accurately.
+
+*/
+
+void Xlt_CnvDOStoRO ( DOS_ATTRIBS *pDA, RISCOS_ATTRIBS *pRA, int flags )
+{
+  uint thi, tlo;
+
+/* The "load address" attribute used by RISCOS is equal to
+   0xFFFtttdd, where ttt is a 12-bit file type and dd is
+   bits 32..39 of the time stamp. This is defined as the number
+   of centiseconds since 01-Jan-1900.
+
+   DOS deals (in the main) with time as 'Utime' - the number of seconds
+   since 01-Jan-1970, which is to be RISCOS time 0x33 6E99 6A00.
+   Hence the conversion is relatively simple.
+     RISCOS time = 336E996A00h + 100*Utime
+*/
+
+  if ( flags & CNV_DATETIME )
+  {
+    thi = 0x336E99 + (pDA->utime >> 16) * 100;
+    tlo = 0x6A00 + (pDA->utime & 0xFFFF) * 100;
+
+    /* Total = (thi << 16)+tlo; */
+
+    pRA->loadaddr = 0xFFF00000 + ( (thi+ (tlo >> 16) ) >> 16) +
+                       (LM_Vars.default_type << 8); /* Default type */
+    pRA->execaddr = (thi << 16) + tlo;
+  }
+
+
+  if ( flags & CNV_ATTRIBS )
+  {
+    if ( pDA->attr & ATTR_DIR )
+    {
+      pRA->flags = (pDA->attr & ATTR_RO) ? ROA_LOCKED :0;
+    }
+    else
+    {
+      pRA->flags = (pDA->attr & ATTR_RO) ? ROA_READ | ROA_LOCKED :
+                       ROA_READ | ROA_WRITE;
+    }
+  }
+}
+
+/* --------------------------- */
+
+/* Xlt_CnvROtoDOS converts RISCOS attributes to DOS attributes;
+   this is usually prior to some set-attributes call.
+*/
+
+void Xlt_CnvROtoDOS ( RISCOS_ATTRIBS *pRA, DOS_ATTRIBS *pDA, int flags )
+{
+  uint x, res;
+  /* Here, we convert RISCOS time to DOS Utime. Here,
+     Utime = (RISCOStime - 0x336E996A00h) / 100 */
+
+  if ( flags & CNV_DATETIME )
+  {
+    if ( !IS_FILETYPED(pRA->loadaddr) )
+    {
+      /* If this is not a time/date/type-stamped file... */
+      pDA->utime = 0;
+    }
+    else
+    {
+      x = ((pRA->loadaddr & 0xFF) << 24) + (pRA->execaddr >> 8);
+      /* Clip these values to DOS range */
+      if ( x < 0x336E996A )
+        x = 0;
+      else
+        x -= 0x336E996A;
+
+      if ( x >= 100 * 0xFFFFFF ) x = 100*0xFFFFFF;
+      res = x/100;
+      x = ((x - res*100) << 8) + (pRA->execaddr & 0xFF);
+      res = (res << 8) + (x / 100);
+      pDA->utime = res;
+    }
+  }
+
+  if ( flags & CNV_ATTRIBS )
+  {
+    if ( (pRA->flags & ROA_WRITE) == 0 &&
+         (pRA->flags & ROA_LOCKED)  != 0
+       )
+      pDA->attr = ATTR_ARC | ATTR_RO;
+    else
+      pDA->attr = ATTR_ARC;
+  }
+}
+
+/* --------------------------- */
+
+/* Xlt_Jumble() and Xlt_Unjumble() are used to avoid keeping passwords
+   lying round in plain text in memory; it's hardly invincible,
+   but it'll stop people spotting passwords simply by dumping memory.
+
+   All strings passed to Jumble & Unjumble should be NAME_LIMIT bytes
+   long.
+*/
+
+void Xlt_Jumble ( char *str )
+{
+  int i;
+  uint key = (uint) str | 0x40000;
+
+  for ( i=0; i < NAME_LIMIT; i++ )
+  {
+    key <<= 1;
+    if ( key & 0x80000 )
+      key ^= 39;
+    *str -= (key ^ 0x40);
+    str++;
+  }
+}
+
+/* ------------------- */
+
+void Xlt_Unjumble ( char *str )
+{
+  int i;
+  uint key = (uint) str | 0x40000;
+
+  for ( i=0; i < NAME_LIMIT; i++ )
+  {
+    key <<= 1;
+    if ( key & 0x80000 )
+      key ^= 39;
+    *str += (key ^ 0x40);
+    str++;
+  }
+}
+
+/* Name conversion, etc =========================================== */
+
+static char Xlt_DefaultDrv = 'A';
+
+/* Wildcards, it seems, are not in fact used:
+   A 'delete' operation reads directory entries
+   first, and passes us individual filenames to
+   delete. A 'rename' operation tries to do a
+   'get file info' function on the wildcarded
+   filename, then complains when it fails. ADFS
+   doesn't allow wildcarded renames (although it
+   does allow "move to new directory" renames), so
+   we won't either. This means we can dispense with
+   all wildcards in filenames.
+*/
+
+/* Character translate table ------------- */
+
+#define CH_END  0
+#define CH_ERR  1
+#define CH_WILD 2
+#define CH_PATH 3
+#define CH_SEP  4
+#define CH_DUD '_'
+
+/*
+  Illegal in DOS names:    SPACE / < > ? + , ; = [ ] : * \ " | DEL
+  Illegal in RISCOS names: SPACE . $ ^ # &   % @     : * \ " | DEL
+  Additionally:
+    All control characters are bad
+    All top bit set characters are swapped for _
+*/
+static const char xlt_RO2DOS[256] =
+{
+  CH_END, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, /* 00-07 */
+  CH_ERR, CH_ERR, CH_END, CH_ERR, CH_ERR, CH_END, CH_ERR, CH_ERR, /* 08-0F */
+  CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, /* 10-17 */
+  CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, CH_ERR, /* 17-1F */
+
+/* SPACE   !       "       #       $       %       &       '         20-27 */
+  CH_ERR, '!',    CH_ERR, CH_WILD,CH_ERR, CH_ERR, CH_ERR, '\'',
+/* (       )       *       +       ,       -       .       /         28-2F */
+  '(',    ')',    CH_WILD,'&',    CH_ERR, '-',    CH_PATH,CH_SEP,
+/* 0       1       2       3       4       5       6       7         30-37 */
+  '0',    '1',    '2',    '3',    '4',    '5',    '6',    '7',
+/* 8       9       :       ;       <       =       >       ?         38-3F */
+  '8',    '9',    CH_ERR, '%',    '$',    '@',    '^',    '#',
+/* @       A       B       C       D       E       F       G         40-47 */
+  CH_ERR, 'A',    'B',    'C',    'D',    'E',    'F',    'G',
+  'H',    'I',    'J',    'K',    'L',    'M',    'N',    'O',
+  'P',    'Q',    'R',    'S',    'T',    'U',    'V',    'W',
+/* X       Y       Z       [       \       ]       ^       _         58-5F */
+  'X',    'Y',    'Z',    CH_ERR, CH_ERR, CH_ERR, CH_ERR, '_',
+/* `       a       b       c       d       e       f       g         60-67 */
+  '`',    'A',    'B',    'C',    'D',    'E',    'F',    'G',
+  'H',    'I',    'J',    'K',    'L',    'M',    'N',    'O',
+  'P',    'Q',    'R',    'S',    'T',    'U',    'V',    'W',
+/* x       y       z       {       |       }       ~       DEL       78-7F */
+  'X',    'Y',    'Z',    '{',    CH_ERR, '}',    '~',    CH_ERR,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD
+};
+
+static const char xlt_DOS2RO[256] =
+{
+  CH_END, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, /* 00-07 */
+  CH_DUD, CH_DUD, CH_END, CH_DUD, CH_DUD, CH_END, CH_DUD, CH_DUD, /* 08-1F */
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, /* 10-17 */
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, /* 17-1F */
+
+/* SPACE   !       "       #       $       %       &       '         20-27 */
+  CH_DUD, '!',    CH_DUD, '?',    '<',    ';',    '+',    '\'',
+/* (       )       *       +       ,       -       .       /         28-2F */
+  '(',    ')',    CH_DUD, CH_DUD, CH_DUD, '-',    CH_SEP, CH_DUD,
+/* 0       1       2       3       4       5       6       7         30-37 */
+  '0',    '1',    '2',    '3',    '4',    '5',    '6',    '7',
+/* 8       9       :       ;       <       =       >       ?         38-3F */
+  '8',    '9',    CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+/* @       A       B       C       D       E       F       G         40-47 */
+  '=',    'A',    'B',    'C',    'D',    'E',    'F',    'G',
+  'H',    'I',    'J',    'K',    'L',    'M',    'N',    'O',
+  'P',    'Q',    'R',    'S',    'T',    'U',    'V',    'W',
+/* X       Y       Z       [       \       ]       ^       _         58-5F */
+  'X',    'Y',    'Z',    CH_DUD, CH_DUD, CH_DUD, '>',    '_',
+/* `       a       b       c       d       e       f       g         60-67 */
+  '`',    'a',    'b',    'c',    'd',    'e',    'f',    'g',
+  'h',    'i',    'j',    'k',    'l',    'm',    'n',    'o',
+  'p',    'q',    'r',    's',    't',    'u',    'v',    'w',
+/* x       y       z       {       |       }       ~       DEL       78-7F */
+  'x',    'y',    'z',    '{',    CH_DUD, '}',    '~',     CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD,
+  CH_DUD, CH_DUD, CH_DUD, CH_DUD,  CH_DUD, CH_DUD, CH_DUD, CH_DUD
+};
+
+static err_t nameROtoDOS ( char *dst, char *src )
+{
+  int ch;
+  int o_name= 0;
+  int o_ext = 0;
+
+  while (1)  /* Process as many chars as we can */
+  {
+    ch = xlt_RO2DOS[(*src++) & 0xFF];
+
+    /* o_name counts the number of characters in the
+       'name' part which we have output, in the range 0..8;
+       it is set to 9 when we are outputting the 'ext' part.
+       o_ext counts the number of characters in the 'ext'
+       part which we have output.
+    */
+
+    switch( ch )
+    {
+      case CH_END:      /* End of string */
+        *dst = 0;
+        return OK;
+
+      case CH_ERR:      /* No-good chars */
+        return EBADNAME;
+
+      case CH_WILD:
+        return ENOWILDCARD;
+
+      case CH_PATH:      /* RISCOS pathname separator */
+        *dst++ = '\\';
+        o_name = 0;
+        o_ext = 0;
+        continue;
+
+      case CH_SEP:      /* Separator for name/ext */
+        if ( o_name >= 1 && o_name <= 8 )
+        {
+          *dst++ = '.';
+          o_name = 9;   /* Stop any more */
+        }
+        continue;
+
+      default:
+        if ( o_name == 8 ) /* Time for a separator? */
+        {
+          *dst++ = '.';
+          *dst++ = '~';
+          *dst++ = ch;
+          o_name = 9;
+          o_ext  = 2;
+        }
+        else if ( o_name < 8 )
+        {
+          *dst++ = ch;
+          o_name++;
+        }
+        else if ( o_ext < 3 )
+        {
+          *dst++ = ch;
+          o_ext++;
+        }
+
+        continue;
+    }
+  }
+
+}
+
+
+
+/* -------------------------- */
+
+void Xlt_NameDOStoRO ( char *dst, char *src )
+{
+  int i, c;
+  int lcl_name_mode = LM_Vars.namemode & (NM_LOWERCASE | NM_FIRSTCAPS | NM_PRESERVED);
+
+  for ( i=0; i<12; i++ )      /* Up to 12 chars in 8.3 name */
+  {
+    c = xlt_DOS2RO[src[i] & 0xFF];
+
+    if ( c == CH_END )
+      break;
+
+    if ( c == CH_SEP ) /* Name/ext separator */
+    {
+      if ( i == 8 && src[9] == '~' ) /* Skip ".~" */
+        i=9;
+      else
+        *dst++ = '/';
+    }
+    else switch (lcl_name_mode)
+    {
+      case NM_LOWERCASE:
+        *dst++ = tolower(c);
+        break;
+
+      case NM_FIRSTCAPS:
+        if ( isalpha(c) )
+        {
+          *dst++ = toupper(c);
+          lcl_name_mode = NM_LOWERCASE;
+          break;
+        }
+        /* else drop through into */
+      case NM_PRESERVED:
+      default:
+        *dst++ = c;
+        break;
+
+    }
+  }
+
+  *dst = 0;
+}
+
+#ifdef LONGNAMES
+
+/* OK, the mappings for long filename discs are different.
+ *
+ * They are:
+ *
+ *       DOS     ->     RISC OS         ->       DOS
+ *
+ *        *                *                      *    (wildcard)
+ *        ?                #                      ?    (wildcard)
+ *        #                ?                      #    (swap match for above)
+ *
+ *        :                :                      :    (won't be seen)
+ *        \                .                      \    (dir sep)
+ *        .                /                      .
+ *
+ *        &                +                    + or &
+ *        +                +                    & or +
+ *        @                =                    @ or =
+ *        =                =                    = or @
+ *        %                >                    % or >
+ *        >                >                    > or %
+ *        $                <                    $ or <
+ *        <                <                    < or $
+ *        ^                ,                    ^ or ,  (don't like this map)
+ *        ,                , (or extn)          , or ^
+ *      space          hard space               space or hard space
+ *    hard space       hard space               hard space or space
+ *
+ */
+static const char lanmanfs_lookup_table[257]=
+     "________________________________"
+     "\xa0!\"?<>+'()*+,-/_0123456789:;<=>#"
+     "=ABCDEFGHIJKLMNOPQRSTUVWXYZ[.],_"
+     "`abcdefghijklmnopqrstuvwxyz{|}~_"
+     "ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü"
+     "\xa0°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø"
+     "¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ"
+     "‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ";
+
+static const char lanmanfs_inverse_lookup_table[257]=
+     "________________________________"
+     "\x20!\"?$%+'()*+,-\\.0123456789:;<=>#"
+     "=ABCDEFGHIJKLMNOPQRSTUVWXYZ[.],_"
+     "`abcdefghijklmnopqrstuvwxyz{|}~_"
+     "ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü"
+     "\x20°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø"
+     "¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ"
+     "‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ";
+
+
+/* These two structures MUST be kept in step in order to allow the
+ * wildcard resolution code to function correctly.
+ */
+static const char lanmanfs_contentious_characters[]=
+     "+=><,\x20";
+static const char lanmanfs_contentious_pairing[]=
+     "&@%$^\xa0";
+
+/* Translate DOS names to RISC OS names using the translation table
+ *
+ * This routine translates the given DOS filename into the RISC OS filename,
+ * stripping the file extension if there is one and setting up the pRA
+ * structure with the type details of the file.
+ */
+static void Xlt_NameDOStoROX2 ( char *dst, char *src, RISCOS_ATTRIBS *pRA )
+{
+  int i;
+  char *odst = dst;
+
+  for ( i=0; i<(DOS_NAME_LEN-1); i++ )      /* Length limit is 255 chars */
+  {
+    int c = src[i] & 0xFF;
+    if (c == 0) break; /* Found the terminator */
+    *dst++ = lanmanfs_lookup_table[c];
+  }
+
+  *dst = 0;
+  dst = strrchr(odst, '.');
+  if (dst == NULL) dst = odst; else ++dst;
+  if (dst != NULL) {
+    if (Xlt_SplitLeafnameX2 ( dst, pRA, &dst ) == OK) {
+      /* Strip off the extension */
+      *dst = 0;
+    }
+  }
+}
+
+/* This function copies the string src to dst.  Once it gets past the
+ * level'th character, it maps each character through the RISC OS->DOS
+ * character conversion table.
+ *
+ * This means that partially converted filenames can be copied verbatim
+ * and the not-yet-done portions translated as required.
+ */
+static void Xlt_CopyViaInverseTable( char *dst, const char *src, int level )
+{
+  int i;
+
+  for ( i=0; i<(DOS_NAME_LEN-1); i++ )
+  {
+    int c = src[i] & 0xFF;
+    if (c == 0) break;
+    if (level != 0) { /* Whole path has already been through  */
+      dst[i] = c;     /* inverse lookup table when level != 0 */
+    }
+    else {
+      dst[i] = lanmanfs_inverse_lookup_table[c];
+    }
+  }
+  dst[i] = 0;
+}
+
+/* Temporary state data structure for the filename mangling */
+typedef struct {
+        char *dstcpy;
+        char dstcpybuf[DOS_NAME_LEN + 4];
+        char matchbuf[DOS_NAME_LEN + 4];
+} Xlt_NXCX2_Data;
+
+
+/* Xlt_ContentiousCharCheck
+ *
+ * Checks contentious characters. Returns the actual remote char if
+ * the chars are not equal but match under the contentious char table.
+ * Returns '\0' if no match is found.
+ */
+static char Xlt_ContentiousCharCheck(char e, char d)
+{
+   int i;
+
+   for (i=0; lanmanfs_contentious_characters[i]; ++i) {
+     if ((e == lanmanfs_contentious_characters[i] ||
+          e == lanmanfs_contentious_pairing[i]) &&
+         (d == lanmanfs_contentious_characters[i] ||
+          d == lanmanfs_contentious_pairing[i])) {
+            return e;
+          }
+   }
+
+   return '\0';
+}
+
+/* An unusual routine.  The SMB_ReadDirectoryEntriesX2 routine calls this
+ * function back in order to process each directory entry as it is
+ * discovered whilst we are searching for filename matches.  In order to
+ * get that routine to stop when we have found a match, we return it a
+ * value of EOUTOFMEM.  If we want it to continue, we return OK.  The
+ * private handle (_dst) is actually a pointer to the state structure
+ * and that structure is updated with the real filename once a match
+ * has been found.  The format parameter should always be 1.
+ */
+static err_t Xlt_NameXlateCallbackX2 ( BYTE *entry, int format, bool *taken, void *_dst )
+{
+    Xlt_NXCX2_Data *dst = _dst;
+    char *eptr = (char *) (entry + 23);
+    char *dptr = 1 + strrchr(dst->matchbuf, '\\');
+    err_t res = OK;
+
+    (void) format; /* Unused */
+    *taken = true;
+
+    if (dst->dstcpy[0] != '*') {
+      return EOUTOFMEM;
+    }
+
+    for (;;) {
+      char e = *eptr++;
+      char d = *dptr++;
+
+      if (e == d || toupper(e) == toupper(d)) {
+        if (e) continue;
+        /* We have a match */
+        res = EOUTOFMEM;
+        break;
+      }
+      else if (e == ',' && d == 0) {
+        /* Might have been a filetype suffix */
+        int type, num;
+        if ((sscanf(eptr, "%x%n", &type, &num) == 1 && num == 3)
+          || strcmp(eptr, FileString_DeadFile) == 0
+          || strcmp(eptr, FileString_UntypedFile) == 0) {
+          /* It was */
+          res = EOUTOFMEM;
+          break;
+        }
+      }
+      else {
+        if (!Xlt_ContentiousCharCheck(e, d)) {
+          /* No match */
+          return OK;
+        }
+      }
+    }
+
+    if (res == EOUTOFMEM) {
+      /* Update stored leafname */
+      if (dst->dstcpy[0] == '*') {
+         dst->dstcpy[0] = '\0';
+         NameCache_Add(dst->dstcpybuf, entry);
+      }
+      strcpy(dst->dstcpy, (char *) entry+23);
+    }
+    return res;
+}
+
+/* Map RISC OS names onto DOS names.  Complicated by the need to
+ * resolve the duplicate mapped characters.  All lookups invoke a
+ * directory search at the remote end, looking for the actual object
+ * name.  If any of the path components have nasty characters in them,
+ * then sub-searches are performed to resolve those too.  Only a single
+ * level of recursion is required (and supported).
+ */
+static err_t Xlt_NameROtoDOSX2_sub ( char *dst, char *src, int level )
+{
+  static Xlt_NXCX2_Data private;
+  static Transact_SearchContext con;
+  char *inptr;
+  int   i;
+  err_t status;
+
+  private.matchbuf[0] = dst[0];
+  private.matchbuf[1] = dst[1];
+  Xlt_CopyViaInverseTable(private.matchbuf + 2, src, level);
+  debug0("\n\n");
+  debug1("Xlt_NameROtoDOSX2: `%s'\n", src);
+  debug1("Xlt_CopyViaInverseTable -> `%s'\n", private.matchbuf);
+
+  /* Construct the search pathname buffer, by taking the parent directory
+   * and ensuring that the name ends \*
+   * private.dstcpy must point at the * character so that the callback
+   * function can write the matched target name straight in
+   */
+#if 0 /* No side effects */
+  (void) NameCache_Locate(private.matchbuf);
+#endif
+  strcpy(private.dstcpybuf, private.matchbuf);
+  private.dstcpy = strrchr(private.dstcpybuf, '\\');
+  if (private.dstcpy) {
+    strcpy(++private.dstcpy, "*");
+  }
+  else {
+    private.dstcpy = strchr(private.dstcpybuf, '\0');
+    strcpy(private.dstcpy, "\\*");
+  }
+
+  debug1("Xlt_NameROtoDOSX2 initiates a dir search of `%s'\n",
+    private.dstcpybuf);
+
+  if (level == 0)
+  for (inptr = private.dstcpybuf + 2 + level; inptr != private.dstcpy; ++inptr) {
+    if (Xlt_ContentiousCharCheck(*inptr, *inptr)) {
+      /* We have a problem - there are contentious characters in the
+       * path leading to the actual object we are going to seek!
+       * We now have to mess about doing sub-searching for the required
+       * contentious directory names, remembering to patch back the
+       * private.matchbuf with the matched name so that if any search
+       * component fails (eg. the top-level one when the object does
+       * not exist (consider *Cdir or *Create)) does remember the path
+       * did exist.
+       */
+      static Xlt_NXCX2_Data sub_search;
+      static char srccpy[DOS_NAME_LEN];
+      char *ptr, preserved, *okptr;
+      size_t len;
+
+      /* Preserve existing state whilst sub-search is performed */
+      sub_search = private;
+
+      /* Duplicate source string and truncate it appropriately for
+       * the sub-search target
+       */
+      strcpy(srccpy, private.matchbuf + 2);
+      okptr = srccpy + (inptr - (private.dstcpybuf + 2));
+      while (okptr != srccpy && *okptr != '\\') --okptr;
+      ptr = srccpy + (inptr - (private.dstcpybuf + 2));
+      while (*ptr != '\0' && *ptr != '\\') ++ptr;
+      preserved = ptr[0];
+      ptr[0] = '\0';
+      /* Search for the name.  Don't worry about failures, dst will be
+       * safe to use whatever the result
+       */
+      Xlt_NameROtoDOSX2_sub(dst, srccpy, okptr - srccpy + 1);
+      len = strlen(dst);
+      ptr[0] = preserved;
+      /* Restore state, update matchbuf (answer on fail), and dstcpybuf
+       * (current copy buffer).
+       */
+      private = sub_search;
+      memcpy(private.dstcpybuf, dst, len);
+      memcpy(private.matchbuf, dst, len);
+      /* Skip to next component - we've already tried to resolve this
+       * one and, with success or failure, we already have the best we
+       * can do for this component
+       */
+      inptr = private.dstcpybuf + len;
+    }
+  }
+
+  debug1("Xlt_NameROtoDOSX2 initiates a dir search of `%s' (post-mangle)\n",
+    private.dstcpybuf);
+
+  /* Repeatedly search the directory until we find a match, or there are
+   * no more entries to be read back
+   */
+  con.resume_key = 0;
+  for (status = OK, inptr = private.dstcpybuf; status == OK; inptr = NULL) {
+    status = SMB_ReadDirEntries(inptr, 32, Xlt_NameXlateCallbackX2,
+                                &private, &con);
+    switch (status) {
+      case OK:
+        /* More entries to read, and no match found yet */
+        break;
+
+      case EOUTOFMEM:
+        /* Found it */
+        strcpy(dst, private.dstcpybuf);
+        debug1("**RIGHT.  Got a match: `%s'\n", dst);
+        break;
+
+      default:
+        /* Definitely didn't find it - revert to original filename
+         * or at least filename with nasties resolved as far as possible
+         */
+        strcpy(dst, private.matchbuf);
+        debug1("**WRONG.  Not got a match. Reverting to `%s'\n", dst);
+        break;
+    }
+  }
+
+  /* Go back and respect the case given regardless of the case on the
+   * server so that "*RENAME Test TEST" does something
+   */
+  i = 0;
+  while (src[i]) {
+    if (isalpha(src[i])) dst[i + 2] = src[i];
+    i++;
+  }
+
+  return OK;
+}
+
+/* Kicks off the RISC OS to DOS name conversion process - setting up the
+ * number of already-translated characters as zero.
+ */
+static err_t Xlt_NameROtoDOSX2 ( char *dst, char *src )
+{
+  if (strchr(src, '*') != NULL) return ENOWILDCARD; /* As per nameROtoDOS() */
+  return Xlt_NameROtoDOSX2_sub(dst, src, 0);
+}
+
+#endif
+
+/* --------------------------- */
+
+
+err_t Xlt_SetDefaultDrv ( char *dospath )
+{
+  Xlt_DefaultDrv = dospath[0];
+  return OK;
+}
+
+/* --------------------------- */
+
+static char mount_name[20];
+
+err_t Xlt_ConvertPath ( char *name_in, char *name_out )
+{
+  int i;
+  char drvc = Xlt_DefaultDrv;
+
+  if ( name_in[0] == ':' )  /* Mount name is given */
+  {
+    name_in++;
+    for (i=0; i<19; i++)
+    {
+      mount_name[i] = name_in[i];
+      if ( name_in[i] < ' ' )  /* Premature end of name */
+        return EBADNAME;
+
+      if ( name_in[i] == '.' )
+        break;
+    }
+
+    mount_name[i] = 0;
+    drvc = Omni_GetDrvLetter(mount_name);
+    if ( drvc == 0 )
+      return EBADDRV;
+
+    name_in += (i+1); /* Skip '.' */
+  }
+
+  if ( name_in[0] != '$' )
+    return EBADNAME;
+
+  name_out[0] = drvc;
+  name_out[1] = ':';
+
+  if ( name_in[1] < ' ' ) /* Just '$' as pathname */
+  {
+    strcpy(name_out+2, "\\");
+    return OK;
+  }
+  else if ( name_in[1] == '.' )
+  {
+#ifdef LONGNAMES
+    /* We use a different system for long filename shares.  Call
+     * the long name resolution routine if necessary
+     */
+    if (SMB_IsLongNameFS( name_out )) {
+      return ( Xlt_NameROtoDOSX2 ( name_out, name_in+1 ) );
+    }
+#endif
+    return ( nameROtoDOS ( name_out+2, name_in+1 ) );
+  }
+
+  name_out[0] = 0;
+  return EBADNAME;
+}
+
+/* --------------------------- */
+
+/* Gets a leaf name from a RISC OS name */
+
+char *Xlt_GetRISCOSLeafName ( char *name_in )
+{
+  char *tmp;
+  tmp = strrchr ( name_in, '.' );
+  return ( tmp == NULL ) ? name_in : tmp + 1;
+}
+
+/* Directory entry conversion ================================== */
+
+err_t Xlt_ExpandSearchEntry ( BYTE *entry, char *path_base,
+            char *name_out,
+            DOS_ATTRIBS *da_out,
+            RISCOS_ATTRIBS *ra_out )
+{
+  /* Old SMBsearch format.  For reference, entry points to the following
+   * structure (treat strictly as byte array with no padding except where
+   * stated:
+   *  BYTE find_buf_attr;
+   *  WORD find_buf_time;
+   *  WORD find_buf_date;
+   *  WORD find_buf_size_l;
+   *  WORD find_buf_size_h;
+   *  BYTE find_buf_pname[13];  ASCII - NUL terminated
+   * =====
+   *   22  bytes.
+   */
+  DOS_ATTRIBS da;
+
+  if ( entry == NULL )
+    return EBADPARAM;
+
+  if ( name_out != NULL )
+  {
+    Xlt_NameDOStoRO ( name_out, (char *)entry+9 );
+  }
+
+  if ( da_out != NULL || ra_out != NULL )
+  {
+    da.attr   = entry[0];
+    da.utime  = DMYtoUtime ( entry[1] + (entry[2] << 8),
+                          entry[3] + (entry[4] << 8) );
+    da.length = entry[5] + (entry[6]<<8) +
+                       (entry[7]<<16) + (entry[8]<<24);
+
+    if ( da_out != NULL )
+      *da_out = da;
+
+    if ( ra_out != NULL )
+    {
+      Xlt_CnvDOStoRO ( &da, ra_out, CNV_DATETIME+CNV_ATTRIBS );
+      Attr_GetInfo ( path_base, (char *)entry+9, ra_out );
+    }
+  }
+
+  return OK;
+}
+
+#ifdef LONGNAMES
+err_t Xlt_ExpandSearchEntryX2 ( BYTE *entry, char *path_base,
+            char *name_out,
+            DOS_ATTRIBS *da_out,
+            RISCOS_ATTRIBS *ra_out )
+{
+  /* New TRANSACT2/FINDFIRST format.  For reference, entry points to the
+   * following structure (treat strictly as byte array with no padding
+   * except where stated:   (SMB_DATE and SMB_TIME are actually WORD)
+   *
+   * WORD   CreationDate
+   * WORD   CreationTime
+   * WORD   LastAccessDate
+   * WORD   LastAccessTime
+   * WORD   LastWriteDate
+   * WORD   LastWriteTime
+   * DWORD  DataSize
+   * DWORD  AllocationSize
+   * WORD   Attributes
+   * BYTE   FilenameLength
+   * STRING FileName
+   * =====
+   */
+  DOS_ATTRIBS da;
+  RISCOS_ATTRIBS ra_name;
+
+  (void) path_base; /* Unused */
+  
+  if ( entry == NULL )
+    return EBADPARAM;
+
+  if ( name_out != NULL )
+  {
+    Xlt_NameDOStoROX2 ( name_out, (char *)entry+23, &ra_name );
+  }
+  else
+  {
+    char *dst;
+    if (Xlt_SplitLeafnameX2 ( (char *)entry+23, &ra_name, &dst ) == OK) {
+      *dst = 0;
+    }
+  }
+
+  if ( da_out != NULL || ra_out != NULL )
+  {
+    da.attr   = entry[20];
+    da.utime  = DMYtoUtime ( entry[10] + (entry[11] << 8),
+                          entry[8] + (entry[9] << 8) );
+    da.length = entry[12] + (entry[13]<<8) +
+                       (entry[14]<<16) + (entry[15]<<24);
+
+    if ( da_out != NULL )
+      *da_out = da;
+
+    if ( ra_out != NULL )
+    {
+      /* Always populate the access attributes of ra_out */
+      Xlt_CnvDOStoRO ( &da, ra_out, CNV_DATETIME+CNV_ATTRIBS );
+      if (IS_FILETYPED(ra_name.loadaddr))
+      {
+        /* Mix the filetype in with the date and time from Xlt_CnvDOStoRO */
+        ra_out->loadaddr = (ra_out->loadaddr & 0xFFF000FF) | (ra_name.loadaddr & 0x000FFF00);
+      }
+      else
+      {
+        /* Unstamped, so force back to those discovered by Xlt_SplitLeafnameX2 */
+        ra_out->loadaddr = ra_name.loadaddr;
+        ra_out->execaddr = ra_name.execaddr;
+      }
+    }
+  }
+
+  return OK;
+}
+
+/* Xlt_SplitLeafname2
+ *
+ * This routine examines the supplied leafname/pathname and looks to
+ * see if it has a type suffix.  If it does, then the type suffix is
+ * decoded and the RISCOS_ATTRIBS structure is updated to hold the
+ * load/exec address data, a pointer to the type suffix separator (the
+ * comma) is stored in *terminator and the function returns OK.  The
+ * caller can strip the suffix by zeroing the byte pointed to by
+ * *terminator.  If there was no type suffix, ENOTPRESENT is returned
+ * and NULL is stored in *terminator.
+ *
+ */
+err_t Xlt_SplitLeafnameX2 ( char *leafname, RISCOS_ATTRIBS *pRA,
+  char **terminator)
+{
+  int type, len;
+  char *term, *oldname;
+  err_t res = ENOTPRESENT;
+  _kernel_swi_regs rset;
+
+  *terminator = NULL;
+  if (leafname == NULL) 
+    {
+    /* Oh dear - don't understand this - just claim it's text */
+    pRA->loadaddr = ENCODE_FILETYPE(pRA->loadaddr, 0xFFF);
+    return res;
+    }
+
+  debug1("Xlt_SplitLeafnameX2('%s',...)\n", leafname);
+
+  term = strchr(leafname, '\0');
+  oldname = leafname;
+  if ((term - leafname) > 4)
+     {
+     /* Ah good,it's at least 5 letters long */
+     leafname = term - 4;
+     if (leafname[0] == FileChar_TypedNamePrefix) 
+        {
+        /* At least 5 letters long and of the form ",ttt" */
+        if (stricmp(leafname+1, FileString_UntypedFile) == 0) 
+           {
+           debug0("File is untyped (,lxa)\n");
+           pRA->loadaddr = pRA->execaddr = LM_Vars.untyped_address;
+           *terminator = leafname;
+           res = OK;
+           }
+        else 
+           {
+           if (stricmp(leafname+1, FileString_DeadFile) == 0) 
+              {
+              debug0("File is DEADDEAD\n");
+              pRA->loadaddr = pRA->execaddr = deaddead;
+              *terminator = leafname;
+              res = OK;
+              }
+           else
+              { 
+              if (sscanf(leafname+1, "%x%n", &type, &len) == 1 && len == 3) 
+                 {
+                 /* note.  sscanf returns the number of conversions which were
+                  * successfully performed.  the %n conversion never fails and
+                  * does not count towards the total number of conversions, but
+                  * holds the number of characters consumed from the source
+                  * string.  Therefore, provided that len was 3, then we have
+                  * consumed three hex digits.
+                  */
+                 pRA->loadaddr = ENCODE_FILETYPE(pRA->loadaddr, type);
+                 *terminator = leafname;
+                 debug3("Filetype is %#03x; load/exec=%#08x %#08x\n", type,
+                         pRA->loadaddr, pRA->execaddr);
+                 res = OK;
+                 }
+              }
+           }
+        }
+     }
+
+  if (res != OK)
+     {
+     /* No ",ttt" was found,try the mimemap for ".ext" */
+     leafname = oldname;
+     /* This function can get called with "A:\dosname.txt" paths or "riscosname/txt" leafs */
+     if (leafname[1] == ':')
+        {
+        term = strrchr(leafname, '.');  /* strrchr catches names like "file.tar.gz" */
+        }
+     else
+        {
+        term = strrchr(leafname, '/');  /* strrchr catches names like "file/tar/gz" */
+        }
+     
+     if (term != NULL)
+        {
+        /* A dot was found so try to lookup the dos style extension */
+        term++;  /* Skip '.' */
+        rset.r[0] = MMM_TYPE_DOT_EXTN;
+        rset.r[1] = (int)term;
+        rset.r[2] = MMM_TYPE_RISCOS;
+        if (_kernel_swi(MimeMap_Translate, &rset, &rset) == NULL)
+           {
+           pRA->loadaddr = ENCODE_FILETYPE(pRA->loadaddr, rset.r[3]);
+           debug2("Mimemap gave type %X for '%s'\n", rset.r[3], leafname );
+           *terminator = strchr(leafname, '\0'); /* Safe to point to that null on exit */
+           res = OK;
+           }
+        }
+     }
+
+  if (res != OK)
+     {
+     /* No ",ttt" and no mimemap lookup - mark as default type */
+     pRA->loadaddr = ENCODE_FILETYPE(pRA->loadaddr, LM_Vars.default_type);
+     } 
+
+return res;
+}
+#endif
+
+/* ------------------------------- */
+
+#ifdef LONGNAMES
+/* Trims the optional ",ttt" extension from 'name'
+ * and returns the updated string
+ */
+err_t Xlt_RemoveROType ( char *name )
+{
+  RISCOS_ATTRIBS RA;
+  char          *nterm;
+
+  if (Xlt_SplitLeafnameX2( name, &RA, &nterm ) != OK) {
+    /* No type information - nothing to do */
+  }
+  else {
+    /* Poke a terminator to get just the base name */
+    *nterm = '\0';
+  }
+
+  return OK;
+}
+#endif
+
+/* ------------------------------- */
+
+#ifdef LONGNAMES
+/* Adds the type suffix for a RISC OS filename.  The type is extracted
+ * from the passed load address, unless DOS name is sufficient
+ */
+int Xlt_AddROType ( char *leafname, uint loadaddr )
+{
+   RISCOS_ATTRIBS RA;
+   char *nterm, *term;
+   char typebuf[8],ftypebuf[8];
+   int ftype;
+
+   typebuf[0] = FileChar_TypedNamePrefix;
+   if (loadaddr == deaddead) {
+     strcpy(typebuf+1, FileString_DeadFile);
+   }
+   else if (!IS_FILETYPED(loadaddr)) {
+     strcpy(typebuf+1, FileString_UntypedFile);
+   }
+   else {
+     const int type = GET_FILETYPE(loadaddr);
+     sprintf(typebuf+1, "%03x", type);
+   }
+
+   /* Strip any acorn filetype suffix */
+   if (Xlt_SplitLeafnameX2 ( leafname, &RA, &nterm ) != OK) {
+     /* No type information - find end of string */
+     nterm = strchr(leafname, '\0');
+   }
+   else {
+     /* Strip old type information in case source didn't have any either */
+     *nterm = '\0';
+   }
+   /* Check leaf for DOS file type, else add acorn extra... */
+   if (leafname[1] == ':') {
+     term = strrchr(leafname, '.');  /* strrchr catches names like "file.tar.gz" */
+   }
+   else {
+     term = strrchr(leafname, '/');  /* strrchr catches names like "file/tar/gz" */
+   }
+
+   if (term) {
+     /* Found a DOS type so check the mimemap */
+     if (!_swix(MimeMap_Translate, _INR(0,2)|_OUT(3),
+                MMM_TYPE_DOT_EXTN, term,
+                MMM_TYPE_RISCOS, &ftype)) {
+        /* Got a name valid in RISCOS */
+        sprintf(ftypebuf, ",%03x", ftype);
+        if (!strcmp(typebuf, ftypebuf)) return 1;
+     }
+   }
+   /* Don't append ,xxx filetype if its the default */
+   sprintf(ftypebuf,",%03x",LM_Vars.default_type);
+   if (strcmp(typebuf,ftypebuf)) strcat(leafname, typebuf);
+   return 1;
+}
+#endif
+
+/* ------------------------------- */

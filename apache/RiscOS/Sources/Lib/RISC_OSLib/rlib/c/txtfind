@@ -1,0 +1,955 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * File: txtfind.c
+ * Purpose: search/replace given possibly wild patterns
+ * Author: IDJ
+ * History:  24-Jan-90: IDJ  Created
+ *           29-Jan-90: IDJ  Added twin-like MOST feature
+ *                           Performance seems usually < 3 times slower than Twin
+ *           30-Jan-90: IDJ  Fixed some bugs in MOST, and added initial sub-string
+ *                           optimisation (nicked from 'find', including the goto's!)
+ *           16-Feb-90: IDJ  Added hex char stuff
+ *           01-Mar-90: IDJ  Fixed bug in escaped magic chars in replacement string
+ *           05-Apr-90: IDJ  Fixed hexchar in replacement string bug
+ *           19-Jul-90: IDJ  copy of ambig pats is now inclusive of end-points
+ *           23-Jul-90: IDJ  fixed bug in use of | in replacement string
+ *           21-Aug-90: IDJ  introduced old !Edit patterns to satisfy marketting
+ *                           who want backwards compatibility
+ *           22-Aug-90: IDJ  now you can do any size replacements!!
+ *           31-Aug-90: IDJ  bug-fix/bodge - only create 'most' node when no
+ *                           following patterns (otherwise %x == ^x)
+ *                           eg.  *y%x  --> *y^x~x
+ *                                *y%xz --> *y^xz
+ *                           side-effect of this is that
+ *                                %@t matches the text aaaat  (unlike Twin which says no match)
+ *                           We believe this is better (well Harry does!)
+ *           11-Sep-90: IDJ  fixed strange behaviour in sets containing normal ch (ie \)
+ *                           correctly parse [a-\~] as range a to ~
+ *            1-Feb-91: IDJ: fixed two bugs in old pattern matching
+ *                           resulted in crash whenever 'magic' picked
+ *           05-Apr-91: IDJ: allow \X in old patterns for hex chs.
+ *           06-Jun-91: IDJ: fixed RO-6058 - use of special chars as end of ranges
+ *           27-Jun-91: IDJ: further fixing to RO-6058:
+ *                              - fault [a-]
+ *                              - handle [#-z] and [@-z] correctly
+ *                              - handle [a-\\] correctly
+ *           01-Jul-91: IDJ: fixed \ca bug to find |A not ~|A !!!!!
+ */
+
+/* Find Syntax:
+       .      matches any single character
+       $      matches end-of-line
+       @      matches any identifier character (a-z,A-Z,_)
+       #      matches any digit
+       |c     matches CTRL-c
+       \c     matches c, even if it is special
+       [abc]  matches any one of a, b, c. c1-c2 matches any char between c1 and c2
+              eg. [a-g] matches lower-case a to g
+       ~x     if x is any of the above simple character patterns, then ~x matches any
+              character other than x
+       *x     if x is any of the above simple character patterns, then *x matches 0 or
+              more occurrences of x
+       ^x     if x is any of the above simple character patterns, then ^x matches 1 or
+              more occurrences of x
+       %x     if x is any of the above simple character patterns, then %x matches the
+              most contiguous characters matching x (like MOST in Twin)
+       &      matches found string
+       ?n     matches field n of the found string (0<=n<=9)
+       Xnn    matches hex char 0xnn (X is in fact char 0x84, but C disallows non-printables)
+*/
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "werr.h"
+#include "txt.h"
+#include "EditIntern/txtregexp.h"
+#include "EditIntern/txtfind.h"
+#include "trace.h"
+#include "msgs.h"
+#include "visdelay.h"
+#include "VerIntern/messages.h"
+
+#ifdef LIB_DEBUGGING
+extern void print_nfa(NFA *nfa);
+#endif
+
+#define txtfind__CTRL_SHIFT 128
+#define txtfind__DEL        127
+#define BAD (-1)
+#define OK   0
+
+static int txtfind__hexval(char c1) 
+{
+  /* returns -1 if no good. */
+  if (c1 >= '0' && c1 <= '9') return c1 - '0';
+  if (c1 >= 'A' && c1 <= 'F') return 10 + c1 - 'A';
+  if (c1 >= 'a' && c1 <= 'f') return 10 + c1 - 'a';
+  return BAD;
+}
+
+static int txtfind__hexpair(char c1, char c2) 
+{
+  /* returns BAD if no good. */
+  int d1 = txtfind__hexval(c1);
+  int d2 = txtfind__hexval(c2);
+  if (d1 == BAD || d2 == BAD) return BAD;
+  return (16*d1) + d2;
+}
+
+static int txtfind__ctrl_char(char *s)
+{
+  int ctrl = 0 - '@';
+  char *s0 = s;
+  int ch = *++s;
+  if (ch == '?')
+    ch = txtfind__DEL;
+  else
+  {
+    if (ch == '!')
+    {
+      ctrl = txtfind__CTRL_SHIFT;
+      ch = *++s;
+      if (ch == '|')
+      {
+        ctrl -= '@';  ch = *++s;
+      }
+    }
+    if (islower(ch)) ch = toupper(ch);
+    else if (ch < '@' || ch > '_') return BAD;
+    ch += ctrl;
+  }
+  return ch + ((s - s0) << 8);
+}
+
+
+void txtfind_replace(txt t, txt_index start, txt_index *end, char *rtemplate, BOOL magic
+#ifdef FIELDNUM
+, Ambiguous_entry *ambiguous
+#endif
+#ifdef ALLOW_OLD_PATTERNS
+, BOOL old_patterns
+#endif
+)
+
+/*
+ *  Called when we have found a match for rtemplate in txt t at position at
+ *  We construct the appropriate string and replace the one we found.
+ */
+
+{
+char              *repls=0;
+int               i, j, k;
+int               ii = 0, repl_space = 0;
+
+/* IDJ 23-Aug-90: first we see how much space we need for expanded replacement string */
+while (rtemplate[ii] != '\0')
+{
+   if (magic)
+   {
+#ifdef ALLOW_OLD_PATTERNS
+      if (old_patterns)
+      {
+         if (rtemplate[ii] == txtfind_old_magic_ch)
+         {
+            ii++; if (rtemplate[ii] == '\0') continue;
+            switch (rtemplate[ii])
+            {
+               case txtfind_old_hex_ch:
+               case txtfind_old_upper_hex_ch:
+                  ii++; if (rtemplate[ii] == '\0') continue;
+                  ii++; if (rtemplate[ii] == '\0') continue;
+                  repl_space++;
+                  break;
+               case txtfind_old_newline_ch:
+                  repl_space++;
+                  break;
+               case txtfind_old_ctrl_ch:
+                  ii++; if (rtemplate[ii] == '\0') continue;
+                  repl_space++;
+                  break;
+               case txtfind_old_foundstring_ch:
+                  repl_space+= *end-start;
+                  break;
+               default:
+                  repl_space++;
+                  break;
+            }
+         }
+         else
+            repl_space++;
+      }
+      else
+#endif    
+      {
+         switch (rtemplate[ii])
+         {
+            case txtfind_newline_ch:
+              repl_space++;
+              break;
+            case txtfind_ctrl_ch:
+            { int ch = txtfind__ctrl_char(&rtemplate[ii]); 
+              ii += ch>>8;
+              repl_space++;
+            }
+               break;
+            case txtfind_hex_ch:
+               ii++; if (rtemplate[ii] == '\0') continue;
+               ii++; if (rtemplate[ii] == '\0') continue;
+               repl_space++;
+               break;
+            case txtfind_normal_ch:
+               ii++; if (rtemplate[ii] == '\0') continue;
+               repl_space++;
+               break;
+            case txtfind_found_ch:
+               repl_space+= *end-start;
+               break;
+#ifdef FIELDNUM
+            case txtfind_field_ch:
+            {
+               int s;
+               ii++;
+               s = rtemplate[ii] - '0';
+               repl_space+=ambiguous[s].end-ambiguous[s].start;
+            }
+               break;
+#endif
+            default:
+               repl_space++;
+               break;
+         }
+      }
+   }
+   else
+   {
+      repl_space++;
+   }
+
+   ii++;
+}
+
+if ((repls = malloc(repl_space+1)) == 0)
+      werr(FALSE, msgs_lookup(MSGS_txtfind1));
+
+i = 0; j = 0;
+while (rtemplate[i] != '\0')
+{
+    if (magic)
+    {
+#ifdef ALLOW_OLD_PATTERNS
+        if (old_patterns)
+        {
+           if (rtemplate[i] == txtfind_old_magic_ch)
+           {
+              i++;
+              switch(rtemplate[i])
+              {
+                 case txtfind_old_hex_ch:
+                 case txtfind_old_upper_hex_ch:
+                    {
+                       char c1, c2;
+                       i++;
+                       c1 = rtemplate[i++];
+                       if (c1 == '\0' || !isxdigit(c1))
+                       {
+                           werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                           if (repls) free(repls);
+                           return;
+                       }
+                       c2 = rtemplate[i++];
+                       if (c2 == '\0' || !isxdigit(c2))
+                       {
+                           werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                           if (repls) free(repls);
+                           return;
+                       }
+                       repls[j++] = txtfind__hexpair(c1, c2);
+                    }
+                    break;
+
+                 case txtfind_old_newline_ch:
+                    repls[j] = '\n';
+                    j++;
+                    i++;
+                    break;
+
+                 case txtfind_old_ctrl_ch:
+                    {
+                       char ch;
+                       ch = rtemplate[++i];
+                       if (ch == 0)
+                       {
+                           werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                           return;
+                       }
+                       if (islower(ch)) ch = toupper(ch);
+                       else if (ch < '@' || ch > '_')
+                       {
+                           werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                           if (repls) free(repls);
+                           return;
+                       }
+                       ch -= '@';
+                       ch |= (1<<8);
+                       repls[j] = ch;
+                       j++;
+                    }
+                    i++;
+                    break;
+
+                 case txtfind_old_foundstring_ch:
+                    for (k = start; k < *end; k++)
+                    {
+                        repls[j] = txt_charat(t, k);
+                        j++;
+                    }
+                    i++;
+                    break;
+
+                 default:
+                    repls[j] = rtemplate[i];
+                    j++;
+                    i++;
+                    break;
+               }
+           }
+           else
+           {
+               repls[j] = rtemplate[i];
+               j++;
+               i++;
+           }
+        }
+        else  /* new-style regular expressions */
+#endif
+        {
+           switch (rtemplate[i])
+           {
+           case txtfind_newline_ch:
+               repls[j] = '\n';
+               j++;
+               i++;
+               break;
+
+           case txtfind_ctrl_ch:
+               { int ch = txtfind__ctrl_char(&rtemplate[i]); 
+                 if (ch >= 0)
+                 {
+                    i += ch >> 8;   /* txtfind__ctl_char tells us how far to advance in string */
+                    ch &= 255;
+                    if (j < 255)
+                       repls[j++] = ch;
+                 }
+                 i++;
+               }
+               break;
+
+           case txtfind_found_ch:
+               for (k = start; k < *end; k++)
+               {
+                   repls[j] = txt_charat(t, k);
+                   j++;
+               }
+               i++;
+               break;
+           case txtfind_hex_ch: 
+               {
+                 char c1, c2;
+                 i++;
+                 c1 = rtemplate[i++];
+                 if (c1 == '\0' || !isxdigit(c1))
+                 {
+                     werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                     if (repls) free(repls);
+                     return;
+                 }
+                 c2 = rtemplate[i++];
+                 if (c2 == '\0' || !isxdigit(c2))
+                 {
+                     werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                     if (repls) free(repls);
+                     return;
+                 }
+                 repls[j++] = txtfind__hexpair(c1, c2);
+               }
+               break;  
+   #ifdef FIELDNUM
+           case txtfind_field_ch:
+               { int s;
+                 i++;
+                 if (rtemplate[i] == '\0' || !isdigit(rtemplate[i]))
+                 { 
+                     werr(FALSE, msgs_lookup(MSGS_txtfind2));
+                     if (repls) free(repls);
+                     return;
+                 }
+                 s = rtemplate[i] - '0';
+                 i++;
+                 
+                 if (ambiguous[s].start != -1 && ambiguous[s].end != -1)
+                 {
+                    for (k = start + ambiguous[s].start; k < start + ambiguous[s].end; k++)
+                    {
+   #ifdef LIB_DEBUGGING
+   werr(FALSE, "Replace repls[%d] %c", j, txt_charat(t,k));
+   #endif
+                       repls[j] = txt_charat(t, k);
+                       j++;
+                    }
+                 }
+               } 
+               break;
+   #endif
+
+           case txtfind_normal_ch:
+               repls[j++] = rtemplate[++i];
+               i++;
+               break;
+
+           default :
+               repls[j] = rtemplate[i];
+               j++;
+               i++;
+               break;
+           }
+        } 
+    }
+    else
+    {
+        repls[j] = rtemplate[i];
+        j++;
+        i++;
+    }
+}
+repls[j] = '\0';
+
+/* dot should be here anyway, but take no chances */
+txt_setdot(t, start);
+txt_replacechars(t, *end - start, repls, j);
+*end = start + j;
+if (repls) free(repls);
+}
+
+
+static void txtfind__charset_include(CharSet *cs, int ch)
+{
+  (*cs)[ch >> 5] |= (1L << (ch & 31));
+}
+
+
+static int txtfind__charset_insert(CharSet *cs, char *s, BOOL nocase)
+{
+  int j, ch, lastch;
+  lastch = -1;
+  for (ch = *s;  ch != 0;  ch = *++s)
+  {
+    if ((ch == txtfind_to_ch) && (lastch >= 0))
+    {
+      ch = *(s + 1);
+      if (ch == 0)
+      {
+#if FALSE
+        ch = txtfind_to_ch;
+#endif
+        return BAD;
+      }
+      else
+      {
+        ++s;
+        if (ch == txtfind_normal_ch) 
+        {
+            ch = *(s+1);
+            if (ch == 0)
+            {
+               ch = txtfind_normal_ch;
+            }
+            else
+            {
+               ++s;
+            }
+        }
+        else if (ch == txtfind_ctrl_ch)
+        {
+           ch = txtfind__ctrl_char(s);
+           if (ch < 0) return BAD;
+           s += ch >> 8;
+           ch &= 255;
+        }
+        else if (ch == txtfind_newline_ch)
+        {
+           ch = '\n';
+        }
+        else if (ch == txtfind_hex_ch) /* hex pattern */
+        { char c1, c2;
+          c1 = *++s;
+          if (c1 == 0) return BAD; else c2 = *++s;
+          if (c2 == 0) return BAD;
+          if ((ch = txtfind__hexpair(c1, c2)) == BAD) return BAD;
+        }
+        if (lastch > ch) return BAD;   /* fault c1-c2, where c1>c2 */
+        for (j = lastch;  j <= ch;  ++j) txtfind__charset_include(cs, j);
+        lastch = -1;
+        continue;
+      }
+    }
+
+    if (ch == txtfind_alphanum_ch && *(s+1) != txtfind_to_ch)
+    {
+      for (j = 'A';  j <= 'Z';  ++j) txtfind__charset_include(cs, j);
+      for (j = 'a';  j <= 'z';  ++j) txtfind__charset_include(cs, j);
+      txtfind__charset_include(cs, '_');
+    }
+    if (((ch == txtfind_alphanum_ch) || (ch == txtfind_digit_ch)) && *(s+1) != txtfind_to_ch)
+    {
+      lastch = ch;
+      for (j = '0';  j <= '9';  ++j) txtfind__charset_include(cs, j);
+      continue;
+    }
+    if (ch == txtfind_normal_ch)
+    {
+      ch = *(s + 1);
+      if (ch == 0) ch = txtfind_normal_ch;  else ++s;
+    }
+    else if (ch == txtfind_ctrl_ch)
+    {
+      ch = txtfind__ctrl_char(s);
+      if (ch < 0) return BAD;
+      s += ch >> 8;
+      ch &= 255;
+    }
+    else if (ch == txtfind_newline_ch)
+    {
+      ch = '\n';
+    }
+    else if (ch == txtfind_hex_ch) /* hex pattern */
+    { char c1, c2;
+      c1 = *++s;
+      if (c1 == 0) return BAD; else c2 = *++s;
+      if (c2 == 0) return BAD;
+      if ((ch = txtfind__hexpair(c1, c2)) == BAD) return BAD;
+    }
+ 
+    txtfind__charset_include(cs, ch);
+    lastch = ch;
+  }
+  return OK;
+}
+
+static void txtfind__charset_empty(CharSet *cs)
+{
+  int j;
+  for (j = 0;  j < 8;  ++j) (*cs)[j] = 0;
+}
+
+static void txtfind__charset_negate(CharSet *cs)
+{
+  int j;
+  for (j = 0;  j < 8;  ++j) (*cs)[j] = ~(*cs)[j];
+}
+
+
+static int txtfind__parse_pattern(REHandle *h, char *pattern, BOOL magic, BOOL nocase
+#ifdef ALLOW_OLD_PATTERNS
+, BOOL old_patterns
+#endif
+)
+{
+  int ch, not, modifier, most=0;
+
+  for (ch = *pattern; ch != 0;  ch = *++pattern)
+  { 
+    if (magic)
+    {
+#ifdef ALLOW_OLD_PATTERNS
+      if (old_patterns)
+      {
+         if (ch == txtfind_old_magic_ch)
+         {
+            ch = *++pattern;
+            if (ch == 0) return BAD;
+            if (ch == txtfind_old_anystring_ch)
+            {
+                ch = RE_ANY;
+                re_char(h, ch, '*');
+                re_modify(h, '*');
+            }
+            else if (ch == txtfind_old_alphanum_ch)
+            {
+               CharSet cs;
+               txtfind__charset_empty((CharSet *)(&cs));
+               txtfind__charset_insert((CharSet *)(&cs), "@", nocase);
+               re_charset(h, (CharSet *)(&cs), 0);
+            }
+            else if (ch == txtfind_old_digit_ch)
+            {
+               ch = RE_DIGIT;
+               re_char(h, ch, 0);
+            }
+            else if (ch == txtfind_old_any_ch)
+            {
+               ch = RE_ANY;
+               re_char(h, ch, 0);
+            }
+            else if (ch == txtfind_old_newline_ch)
+            {
+               ch = '\n';
+               re_char(h, ch, 0);
+            }
+            else if (ch == txtfind_old_ctrl_ch)
+            {
+               ch = *++pattern;
+               if (ch == 0) return BAD;
+               if (islower(ch)) ch = toupper(ch);
+               else if (ch < '@' || ch > '_') return BAD;
+               ch -= '@';
+               ch &= 255;
+               re_char(h, ch, 0);
+            }
+            else if (ch == txtfind_old_magic_ch)
+            {
+               ch = '\\';
+               re_char(h, ch, 0);
+            }
+            else if (ch == txtfind_old_hex_ch || ch == txtfind_old_upper_hex_ch)
+            {
+               char c1, c2;
+       
+               c1 = *++pattern;
+               if (c1 == 0) return BAD; else c2 = *++pattern;
+               if (c2 == 0) return BAD;
+               if ((ch = txtfind__hexpair(c1, c2)) == BAD) return BAD;
+               re_char(h, ch, 0); 
+            }
+         }
+         else
+            re_char(h, ch, 0);
+      }
+      else    /* new regular expression style patterns */
+#endif
+      {
+         if ((ch == txtfind_0ormore_ch) || (ch == txtfind_1ormore_ch) || (ch == txtfind_most_ch))
+         {
+           if (ch == txtfind_0ormore_ch) modifier = '*'; 
+           else if (ch == txtfind_1ormore_ch) modifier = '+';
+           else {modifier = '+'; most = '%';}
+           ch = *++pattern;
+           if (ch == 0) return BAD;
+         } else {modifier = 0; most = 0;}
+         if (ch == txtfind_not_ch)
+         {
+           not = 1;
+           ch = *++pattern;
+           if (ch == 0) return BAD;
+         }
+         else not = 0;
+         if ((ch == txtfind_setbra_ch) || (ch == txtfind_alphanum_ch))
+         { /* CharClass... */
+           CharSet cs;
+           txtfind__charset_empty((CharSet *)(&cs));
+           if (ch == txtfind_alphanum_ch)
+           {
+             txtfind__charset_insert((CharSet *)(&cs), "@", nocase);
+           }   
+           else
+           {
+             char *ket = pattern;
+             int lastch = 0, beforelastch = 0;
+             for (;;)
+             {
+               ch = *++ket;
+               if ((ch == 0) ||
+                   (ch == txtfind_setket_ch) && (lastch != txtfind_normal_ch || lastch == txtfind_normal_ch && beforelastch == txtfind_normal_ch) && (lastch != txtfind_ctrl_ch)) break;
+               beforelastch = lastch;
+               lastch =ch;
+             }
+             if (ch == 0) return BAD;
+             *ket = 0;
+             if (txtfind__charset_insert((CharSet *)(&cs), pattern+1, nocase) != OK) return BAD;
+             *ket = txtfind_setket_ch;
+             pattern = ket;
+           }
+           if (not) txtfind__charset_negate((CharSet *)(&cs));
+           re_charset(h, (CharSet *)(&cs), modifier);
+           if (modifier) re_modify(h, modifier);
+           /* now the 'orrible hack - add a not of previous pattern!!! */
+           /* IDJ: 27-Jun-91: only if no pattern follows */
+           if (most == '%' && *(pattern+1) == 0)
+           {
+               txtfind__charset_negate(&cs);
+               re_charset(h, &cs, most);
+           }
+         } 
+         else  
+         { /* single char */
+           if (ch == txtfind_any_ch) ch = RE_ANY;
+           else if (ch == txtfind_newline_ch) ch = '\n';
+           else if (ch == txtfind_digit_ch) ch = RE_DIGIT;
+           else if (ch == txtfind_hex_ch)
+           {
+              char c1, c2;
+      
+              c1 = *++pattern;
+              if (c1 == 0) return BAD; else c2 = *++pattern;
+              if (c2 == 0) return BAD;
+              if ((ch = txtfind__hexpair(c1, c2)) == BAD) return BAD;
+           }
+           else if (ch == txtfind_normal_ch)
+           {
+             ch = *++pattern;
+             if (ch == 0) return BAD;
+           }
+           else if (ch == txtfind_ctrl_ch)
+           {
+             ch = txtfind__ctrl_char(pattern);
+             if (ch < 0) return BAD;
+             pattern += ch >> 8;
+             ch &= 255; 
+           }
+
+           if (not) ch += RE_NOT;
+           re_char(h, ch, modifier);
+           if (modifier) re_modify(h, modifier);
+           if (most == '%' && *(pattern+1) == 0)
+           {
+               if (ch == RE_ANY) return(BAD);   /* disallow %. */
+               if (not) ch -= RE_NOT; else ch += RE_NOT;
+               re_char(h, ch, most);
+           }
+         }
+      }
+    } 
+    else  /* not magic */
+        re_char(h, ch, 0);
+  }
+  return OK;
+}
+
+
+extern Pattern *txtfind_build_pattern(char *pattern, BOOL magic, BOOL nocase
+#ifdef ALLOW_OLD_PATTERNS
+, BOOL old_patterns
+#endif
+#ifdef FIELDNUM
+, SubPattern *sub_patterns
+#endif
+)
+{
+   /* this could be parameterised to call other parsers for different wild-carding */
+   REHandle h;
+   Pattern *pat;
+   NFA *pattern_nfa = NULL;
+
+   if ((pat = malloc(sizeof(Pattern))) == 0)
+   {
+      werr(FALSE, msgs_lookup(MSGS_txtfind3));
+      return 0;
+   }
+
+   /* first pass of RE assembler */
+   re_begin1(&h);
+
+   /* now parse the pattern */
+   if (txtfind__parse_pattern(&h, pattern, magic, nocase
+#ifdef ALLOW_OLD_PATTERNS
+, old_patterns
+#endif
+) == OK)
+   {
+       /* second pass of RE assembler */
+       re_begin2(&h);
+       if (txtfind__parse_pattern(&h, pattern, magic, nocase
+#ifdef ALLOW_OLD_PATTERNS
+, old_patterns
+#endif
+) == OK) 
+           pattern_nfa = re_end(&h);
+   }
+   if (pattern_nfa == NULL)
+   {
+       werr(FALSE, msgs_lookup(MSGS_txtfind4));
+       return NULL;
+   }
+   else
+   {
+       pat->nfa = pattern_nfa;
+       pat->p = pattern;
+   }
+
+#ifdef FIELDNUM
+   if (sub_patterns)
+      re_make_subpattern_table(pat->nfa, sub_patterns);
+#endif
+
+   return pat;
+}
+
+
+/* --- ************************* functions for enhanced Boyer-Moore algorithm ******** --- */
+
+extern void txtfind_build_TD1(int TD1[], Pattern *pat, BOOL nocase)
+{
+   int l, i;
+   char *pstr, *p;
+
+   l = strlen(pat->p);
+   re_head(pat->nfa, pat->p, l+1);
+   pat->len = strlen(pat->p);
+   pstr = pat->p;
+
+   for (i = 0; i < 256; i++)
+      TD1[i] = pat->len+1;
+   for(p = pstr; *p; p++)
+      TD1[(nocase)?tolower(*p):(*p)] = pat->len-(p-pstr);
+}
+
+
+static txt_index txtfind_match_pattern(txt t, Pattern *p, txt_index *nowat, BOOL nocase
+#ifdef FIELDNUM
+, Ambiguous_entry *ambiguous
+, SubPattern *sub_patterns
+, BOOL rescanning
+#endif
+, int TD1[]
+)
+{
+  int l, size, i = 0;
+  char *text;
+  txt_index start = (txt_index)-1, wasat = *nowat, end = 0;
+
+  /* get head of pattern for initial sub-string search */
+  l = strlen(p->p);
+  re_head(p->nfa, p->p, l+1);
+  p->len = strlen(p->p);
+
+  /* get a chunk of text */
+#ifdef LIB_DEBUGGING
+  werr(FALSE, "match pattern, nowat == %d", *nowat);
+#endif
+  txt_arrayseg(t, *nowat, &text, &size);
+ 
+   /* --- initial substring optimisation --- */
+   if (p->len > 0)
+   {
+      /* --- try a Quick Search on initial substring (CACM Aug. 1990, p.132) --- */
+      char *t, *tx = text;
+      int plen = p->len;
+      char *ps;
+
+      if (nocase)
+      {
+         while(tx + plen <= text + size)
+         {
+            for (ps = p->p, t = tx; *ps; ps++, t++)
+               if (tolower(*ps) != tolower(*t)) break;
+            if (*ps == 0) {i = tx - text; goto match_pattern;}
+            tx += TD1[tolower(*(tx+plen))];
+         } 
+         goto set_nowat;
+      }
+      else
+      {
+         while(tx + plen <= text + size)
+         {
+            for (ps = p->p, t = tx; *ps; ps++, t++)
+               if (*ps != *t) break;
+            if (*ps == 0) {i = tx - text; goto match_pattern;}
+            tx += TD1[*(tx+plen)];
+         } 
+         goto set_nowat;
+      }   
+   }
+
+  /* do a search using the NFA for pattern */ 
+
+match_pattern: 
+#ifdef LIB_DEBUGGING
+  werr(FALSE, "match_pattern text start %c @ %p", *(text+i), text+i);
+#endif
+/* DANGER: we must not pass the pointer "text" beacuse it may be wrong
+   due to stack/heap/slot extension!!! */
+
+  start = (txt_index)re_match(t, *nowat+i, p->nfa, 1, &end, nocase
+#ifdef FIELDNUM
+, ambiguous
+, sub_patterns 
+, rescanning
+#endif
+);
+
+set_nowat:
+  *nowat = wasat + end + i;
+
+#ifdef LIB_DEBUGGING
+  werr(FALSE, "match pattern start %d, wasat %d", start, wasat);
+#endif
+  if (start >= 0)
+     return (wasat + start + i);
+  else
+     return (txt_index)-1;
+}
+
+extern txt_index txtfind_find(txt t, txt_index *nowat, Pattern *p, BOOL nocase
+#ifdef FIELDNUM
+, Ambiguous_entry *ambiguous
+, SubPattern *sub_patterns
+, BOOL rescanning
+#endif
+, int TD1[]
+)
+{
+  txt_index at;
+
+  /* check for bad pattern */
+  if (p == 0) return BAD;
+
+#ifdef LIB_DEBUGGING
+  werr(FALSE, "txtfind, nowat == %d", *nowat);
+#endif
+
+  /* match pattern against it */
+  at = txtfind_match_pattern(t, p, nowat, nocase
+#ifdef FIELDNUM
+, ambiguous
+, sub_patterns
+, rescanning
+#endif
+, TD1
+);
+ 
+  /* return start of match BAD ==> failure */
+#ifdef LIB_DEBUGGING
+  werr(FALSE, "txtfind ==> at %d, nowat %d", at, *nowat);
+#endif
+  return at;
+  
+}
+
+
+/*****************************
+Client of txtfind_find should:
+   i) build a pattern from
+      search string
+  ii) call find with start at
+      point to start search
+      (ends up pointing at
+       start of match)
+******************************/

@@ -1,0 +1,1242 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*> c.DOSdirs <*/
+/*---------------------------------------------------------------------------*/
+/* Directory manipulation and cache               Copyright (c) 1989 JGSmith */
+/*---------------------------------------------------------------------------*/
+
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include "kernel.h"
+#include "Interface/HighFSI.h"
+#include "DebugLib/DebugLib.h"
+
+#include "DOSFS.h"
+#include "TIMEconv.h"
+#include "Helpers.h"
+#include "MsgTrans.h"
+#include "DOSclusters.h"
+#include "DOSnaming.h"
+#include "DOSshape.h"
+#include "DOSdirs.h"
+
+static void realloc_dir_cache(DIR_info *oldstruct, DIR_info *newstruct);
+
+/*---------------------------------------------------------------------------*/
+
+static int extend_dir(DIR_info **cdir,DOS_direntry **dentry,DOSdisc *ihand,DIR_info **pdir)
+{
+ int       startCLUSTER ;   /* start of existing CLUSTER chain */
+ DIR_info *newdir ;         /* reference to new directory buffer */
+ int       newsize;
+ int       CLUSTERsize = cluster_size(&(ihand->disc_boot)) ;
+ char     *cptr;
+
+ dprintf(("","extend_dir: directory needs extending = %s\n",(*cdir)->dir_name));
+
+ *pdir = NULL ; /* ensure we do not have a parent directory reference */
+
+ /* If the directory is the ROOT directory or has no parent then it cannot be extended */
+ if ((*cdir)->dir_root != 0 || (*cdir)->dir_parentsec == 0)
+  {
+   return_error0(int,err_dirfull) ;
+  }
+
+ /* Load the parent directory for updating (cdir should be locked at a higher level). */
+ dprintf(("","extend_dir: loading parent directory\n"));
+ cptr = strrchr((*cdir)->dir_name, dir_sep);
+ if (cptr == NULL)
+  *pdir = loadDIR("", ihand);
+ else {
+  int index = cptr - (*cdir)->dir_name;
+  if ((cptr = malloc(index + 1)) == NULL)
+   return_errorT(int, err_heapexhausted, tok_heapexhausted, 0, 0);
+  strncpy(cptr, (*cdir)->dir_name, index);
+  cptr[index] = '\0';
+  *pdir = loadDIR(cptr, ihand);
+  free(cptr);
+ }
+ if ((int)*pdir < 0)
+  return -1;
+
+ dprintf(("","extend_dir: Old Dir address = %p\n",(*cdir)));
+ dprintf(("","extend_dir: old directory size = &%08X\n",(*cdir)->dir_size));
+ newsize = (*cdir)->dir_size + CLUSTERsize ;
+ dprintf(("","extend_dir: new directory size = &%08X\n",newsize));
+
+ /* Copy the current directory "(*cdir)" into a new (larger) buffer
+  * (adding the new CLUSTER).
+  */
+
+ //CBC: Need to obtain 4 more bytes of memory (for lfn pointer) for each 32 bytes of newsize; looks a bit ugly
+// newdir = (DIR_info *)malloc(sizeof(DIR_info) + (newsize-sizeof(DOS_direntry)) + (CLUSTERsize/32)*sizeof(char*));
+ newdir = (DIR_info *)malloc(sizeof(DIR_info) + (newsize-sizeof(DOS_direntry)) + (((newsize/32)*sizeof(char*))-sizeof(char*)));
+ if (newdir == NULL)
+  {
+   *pdir = NULL ;
+   return_errorT(int,err_heapexhausted, tok_heapexhausted, 0, 0) ;
+  }
+ dprintf(("","extend_dir: new dir address = %p, size %x\n",newdir,sizeof(DIR_info) + (newsize-sizeof(DOS_direntry)) + (((newsize/32)*sizeof(char*))-sizeof(char*))));
+ //CBC: Need to move the LFN pointers as well as the direntrys. Again, ugly.
+ memmove((char *)newdir, (char *)(*cdir),(int)DI_Base((*cdir)) - (int)(*cdir));
+
+ //CBC: Extend the length of the LFN pointer array
+ newdir->dir_entryoffset = DI_Offset(newsize);
+
+ //Copy up the dir entrys
+ memmove((char*)DI_Base(newdir),(char*)DI_Base((*cdir)),(*cdir)->dir_size); 
+
+ //CBC: Point to the next free direntry
+ *dentry = (DOS_direntry *)((int)DI_Base(newdir)+(*cdir)->dir_size);
+// bzero((char *)*dentry, CLUSTERsize) ;
+ memset((char *)*dentry, 0, CLUSTERsize); // Memset() is a faster zeroing routine than 'bzero()'
+ (*dentry)->FILE_status = FILE_lastentry ;
+
+ int lfn_zero_end = newsize/sizeof(DOS_direntry);
+ int lfn_zero_loop= ((*cdir)->dir_size)/sizeof(DOS_direntry);
+ for(;lfn_zero_loop<lfn_zero_end;lfn_zero_loop++)
+ { // Very important, this loop.
+  newdir->lfnp[lfn_zero_loop] = NULL;
+ }
+
+ /* JRS 27/3/92 recognising that dentry[0] is about to be used, we should make a
+  * new end-of-directory entry. However, the bzero above acheives this as a
+  * side-effect since FILE_lastentry=0. */
+
+ /* We've done the main bits that could go wrong so claim the space from the FAT. */
+ dprintf(("","extend_dir: (*cdir)->dir_sector = %x\n",(*cdir)->dir_sector));
+ dprintf(("","extend_dir: ihand = %p\n",ihand));
+ startCLUSTER = SECTORtoCLUSTER((*cdir)->dir_sector,ihand);
+ dprintf(("","extend_dir: Directory start cluster = &%03X\n",startCLUSTER));
+
+ if ((startCLUSTER = adjustusedchain(startCLUSTER, newsize / CLUSTERsize, ihand)) < 0) {
+   free(newdir);
+   *pdir = NULL;
+   return -1;
+ }
+
+ /* and update the directory pointer */
+ realloc_dir_cache(*cdir, newdir);
+ *cdir = newdir ;
+ (*cdir)->dir_size = newsize;
+ set_dir_flags(*cdir, dir_MODIFIED) ; /* directory has been updated */
+
+ /* update the relevant directory entry in the parent */
+ ( (DOS_direntry*) DI_Base((*pdir))
+   /*(int)&(*pdir)->dir_entries +  (int)((*pdir)->dir_entryoffset)*/
+ )
+ [(*cdir)->dir_parentindex].FILE_size = newsize;
+   
+ dprintf(("","extend_dir: Dir address  = %p\n",(*cdir)));
+ dprintf(("","extend_dir: Dir lnfpbase = %p\n",(*cdir)->lfnp));
+ dprintf(("","extend_dir: Dir dirbase  = %x\n",DI_Base((*cdir))));
+ dprintf(("","extend_dir: directory size = &%08X\n",(*cdir)->dir_size));
+
+ set_dir_flags(*pdir, dir_MODIFIED);
+
+ /* and return to the caller */
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+//Compress' a directory structure by removing deleted entries
+static void packdir(DIR_info * cdir, DOS_direntry ** preserve)
+{
+ dprintf(("","packdir: cdir = %p, preserve = %p\n",cdir, (preserve?*preserve:NULL)));
+ int ip,op;
+ int ipend = (cdir->dir_size/32);
+ DOS_direntry * dir = (DOS_direntry*)DI_Base(cdir);
+ for(ip=0,op=0;ip<ipend;ip++,op++)
+ {
+//  if( (dir+ip)->FILE_status == FILE_deleted)
+//  {//This is a deleted entry
+//   ip++;
+   while ( (ip<ipend)
+       &&  ((dir+ip)->FILE_status == FILE_deleted)) ip++;
+//  }else
+  if((dir+ip)->FILE_status == 0x00) ip=ipend;
+//  {//If there are no more dir entrys it is pointless to continue the loop
+//   ip=ipend;
+//   continue; //Break the loop
+//  }
+  if((ip != op) && (ip<ipend))
+  {//If we need to move entrys in the dir
+   if(preserve && ((dir+ip) == *preserve)) *preserve = (dir+op);
+   dprintf(("","packdir: ip = %d, op = %d\n",ip,op));
+   memmove(dir+op,dir+ip,sizeof(DOS_direntry));
+   (dir+ip)->FILE_status = FILE_deleted;
+   cdir->lfnp[op] = cdir->lfnp[ip];
+   cdir->lfnp[ip] = NULL;
+  }
+ }
+ dprintf(("","packdir @ exit: cdir = %p, preserve = %p\n",cdir, (preserve?*preserve:NULL)));
+}
+
+/*---------------------------------------------------------------------------*/
+
+//This function claims creates an array of contiguous *DOS_direntry used for LFNs
+int get_dir_entry_array(DOS_direntry *lfn[], DOSdisc *ihand, int numreq, DIR_info **cdir, DIR_info **pdir, DOS_direntry ** preserve)
+{
+ int i;
+ int tempp;
+ int index=0;
+ DOS_direntry * dir = (DOS_direntry*)DI_Base(*cdir);
+ 
+ for(i=0;i<numreq;i++)
+ {
+  tempp = (int)findemptyDIRentry((DOS_direntry*)((int)dir+(index*32)),
+                                 (*cdir)->dir_size-(index*32));
+  if(tempp==NULL)
+  {//There are no free entrys left
+   dprintf(("","get_dir_entry_array: extending directory\n"));
+   if (extend_dir(cdir,(DOS_direntry**)&tempp,ihand,pdir) < 0)
+   {
+     return(-1); /* error already defined */
+   }
+   i=-1; index=0; // restart in new directory
+   dir = (DOS_direntry*)DI_Base(*cdir);
+  }
+  else
+  {
+   lfn[i] = (DOS_direntry*)(index=((int)tempp-(int)dir)/32);    // index fudge
+   index ++;      // next after found..
+   dprintf(("","get_dir_entry_array: i = %d, diff = %d\n",
+                           i,((int)lfn[i]-(int)lfn[i-1])));
+   if( (i != 0) && (((int)lfn[i]-(int)lfn[i-1]) != 1))
+   {
+    dprintf(("","get_dir_entry_array: packing directory %p\n",cdir));
+    packdir(*cdir, preserve);
+    i=-1;
+    index=0;
+   }
+  }
+ }
+
+ for(i=0;i<numreq;i++)
+ {
+  lfn[i] = (DOS_direntry*)((int)dir + ((int)(lfn[i])*32));
+ }
+ return 0;
+}
+
+/*-------------------------------------------------------------------------*/
+/* Provide facilities for directory cacheing.                              */
+/*-------------------------------------------------------------------------*/
+#define CACHED_DIRS 5
+
+static DIR_info *dir_cache[CACHED_DIRS] = { NULL };
+static int      next_cache_entry = 0;
+
+static void realloc_dir_cache(DIR_info *oldstruct, DIR_info *newstruct)
+{
+  int index;
+  for (index = 0; index < CACHED_DIRS; index++)
+    if (dir_cache[index] == oldstruct) {
+      dir_cache[index] = newstruct;
+      break;
+    }                
+  /* We don't free the directory name as that is still used by the new directory. */
+  free(oldstruct);
+}
+
+void free_dir_cache(char *dirname, DOSdisc *ihand)
+{
+  int index;
+  int namelen = strlen(dirname);
+  int i;
+  for (index = 0; index < CACHED_DIRS; index++)
+    if (dir_cache[index] != NULL && dir_cache[index]->ihand == ihand) {
+      if (!dir_flag_is_set(dir_cache[index], dir_LOCKED)
+          && (namelen == 0 || strncmp(dir_cache[index]->dir_name, dirname, namelen) == 0)) {
+        char c = *(dir_cache[index]->dir_name + namelen);
+        if (c == dir_sep || c == '\0') {
+          dprintf(("","free_dir_cache: freeing '%s'\n", dir_cache[index]->dir_name));
+          for(i=0;i<(((dir_cache[index])->dir_size)/(sizeof(DOS_direntry)));i++)
+          {
+           if( (dir_cache[index])->lfnp[i] != NULL) free( (dir_cache[index])->lfnp[i] ); 
+          }
+          free(dir_cache[index]->dir_name);
+          free(dir_cache[index]);
+          dir_cache[index] = NULL;
+        }
+      }
+    }
+}
+
+void flush_dir_cache(DOSdisc *ihand)
+{
+  int index;
+  for (index = 0; index < CACHED_DIRS; index++)
+    if (dir_cache[index] != NULL && !dir_flag_is_set(dir_cache[index], dir_LOCKED)
+        && (dir_cache[index]->ihand == ihand || ihand == 0)) {
+      free(dir_cache[index]->dir_name);
+      free(dir_cache[index]);
+      dir_cache[index] = NULL;
+    }
+  dprintf(("","flush_dir_cache: directory cache flushed\n"));
+}
+
+/* Find the DIR_info structure in the cache which matches the path name as
+ * closely as possible.  If an exact match is not found then the nearest
+ * direct ancestor of the directory is returned and nameleft is set to
+ * point to the remainder of the path name.  If no match is found at all
+ * then NULL is returned.
+ */
+static DIR_info *match_cached_dir(char *dirpathname, char **nameleft, DOSdisc *ihand)
+{
+  int match = -1;
+  int maxmatch = 0;
+  int index;
+
+  dprintf(("","match_cached_dir: dirpathname = \"%s\"\n",dirpathname));
+  for (index = 0; index < CACHED_DIRS; index++)
+  {
+    dprintf(("","match_cached_dir: index = %d, dir_cache[index] = %p\n",index,dir_cache[index]));
+    if (dir_cache[index] != NULL && dir_cache[index]->ihand == ihand)
+    {
+      int len = strlen(dir_cache[index]->dir_name);
+      dprintf(("","match_cached_dir: dir_name = \"%s\"\n",dir_cache[index]->dir_name));
+      if (len == 0 || strncmp(dirpathname, dir_cache[index]->dir_name, len) == 0)
+      {
+        char c = *(dirpathname + len);
+        dprintf(("","match_cached_dir: char[0] = %02x string = %s \n",c,c?(dirpathname + len):""));
+        if (c == '\0')
+        {
+          dprintf(("","match_cached_dir: exactly matched '%s'\n", dirpathname));
+          *nameleft = NULL;
+          return dir_cache[index];
+        }
+        if ((len == 0 || c == dir_sep) && len >= maxmatch)
+        {
+          match = index;
+          maxmatch = len;
+        }
+      }
+    }
+  }
+  *nameleft = dirpathname + maxmatch;
+
+  if (match < 0)
+    return NULL;
+  dprintf(("","match_cached_dir: matched '%s' with '%s' left, match = %d\n", dir_cache[match]->dir_name, *nameleft,match));
+  return dir_cache[match];
+}
+
+/* Cache the directory in the next cache slot.
+ */
+static DIR_info *cache_dir(DIR_info *dirstruct)
+{
+  int i;
+
+  dprintf(("","cache_dir: finding a free cache entry ..\n"));
+  /* Try to find a free cache entry. */
+  for (i = 0; i < CACHED_DIRS; i++)
+    if (dir_cache[i] == NULL) {
+      dir_cache[i] = dirstruct;
+      return dirstruct;
+    }
+
+  /* Otherwise try to find one which isn't locked. */
+  i = next_cache_entry;
+  while (dir_flag_is_set(dir_cache[next_cache_entry], dir_LOCKED)) {
+   if (++next_cache_entry == CACHED_DIRS)
+     next_cache_entry = 0;
+   if (next_cache_entry == i)
+    break;
+  }
+
+  free(dir_cache[next_cache_entry]->dir_name);
+  free(dir_cache[next_cache_entry]);
+
+  /* Cache the directory and return it. */
+  dir_cache[next_cache_entry] = dirstruct;
+  if (++next_cache_entry == CACHED_DIRS)
+    next_cache_entry = 0;
+  dprintf(("","cache_dir: done\n"));
+  return dirstruct;
+}
+
+/*-------------------------------------------------------------------------*/
+
+DOS_direntry *getnextDIRentry(DOS_direntry *directory,int dir_size,int *index)
+{
+ DOS_direntry *dentry ;
+ int           entries = (dir_size / sizeof(DOS_direntry)) ;
+
+// dprintf(("","getnextDIRentry: entered with : DOS_direntry * directory = %p\n",directory));
+// dprintf(("","getnextDIRentry:              : dir_size = %x\n",dir_size));
+// dprintf(("","getnextDIRentry:              : index = %d\n",*index));
+ /* return the directory entry pointer (or NULL if directory end)
+  * NOTE: the index is also set to (-1) if we have reached the end
+  */
+ if (*index == -1)
+  return(NULL) ;
+                                 
+ if (*index >= entries)
+  {
+//   dprintf(("","getnextDIRentry: Last entry reached, returning -1\n"));
+   /* End of directory already reached (no last file marker present?) */
+   *index = -1 ;
+   return(NULL) ;
+  }
+
+ dentry = &directory[*index] ;
+
+// dprintf(("","getnextDIRentry: & FILE_status = %p, FILE_status = %x\n",dentry,dentry->FILE_status));
+
+ if (dentry->FILE_status == FILE_lastentry)
+  {
+   *index = -1 ;
+   return(NULL) ;
+  }
+
+ /* if this entry has been deleted (or is a directory) then step over it */
+ if ((dentry->FILE_status == FILE_deleted) || (dentry->FILE_status == FILE_directory))
+  {
+   *index += 1 ;
+   return(getnextDIRentry(directory,dir_size,index)) ;
+  }
+
+ /* increment the index counter onto the next directory entry */
+ *index += 1 ;
+
+ return(dentry) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+DOS_direntry *findemptyDIRentry(DOS_direntry *directory,int dir_size)
+{
+ DOS_direntry *dentry ;
+ int           index ;
+ int           entries = (dir_size / sizeof(DOS_direntry)) ;
+
+ /* return the first available directory entry pointer (or NULL if
+  * there are no free directory entries)
+  */
+ for (index=0; (index < entries); index++)
+  {
+   dentry = &directory[index] ;
+
+   /* if this entry has been deleted then we can use it */
+   if (dentry->FILE_status == FILE_deleted)
+    return(dentry) ;
+
+   /* if this entry is the last then use it and clear the following */
+   if (dentry->FILE_status == FILE_lastentry)
+    {
+     /* mark the successive entry as the last */
+     if (++index < entries)
+      directory[index].FILE_status = FILE_lastentry ;
+     return(dentry) ;
+    }
+  }
+
+ /* we could NOT find a free entry in this directory */
+ return(NULL) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/* findDIRentry:
+ * find the first object that matches the given wildcarded text
+ */
+
+DOS_direntry *findDIRentry(char *wcname,DIR_info *cdir,int dir_size,int *index)
+{
+ DOS_direntry *dir = (DOS_direntry*)DI_Base(cdir);
+ DOS_direntry *dentry = NULL ;
+ char         *cfile = NULL ;
+ char         *nbuff = malloc(257) ; //CBC: stupidly large
+ int oldindex;
+ if (nbuff == NULL)
+  /* JRS changed 5/3/92 to trap out of memory error. Ideally all callers should test
+   * this out of memory case, but there is not time to modify, and at least if gives a valid error
+   * before doing something invalid! */
+  { global_errorT(err_heapexhausted, tok_heapexhausted, 0, 0); return NULL; }
+
+// dprintf(("","findDIRentry: wcname = \"%s\"\n",wcname));
+// dprintf(("","findDIRentry: DIR_info = %p\n",cdir));
+// dprintf(("","findDIRentry: dir_size = %x\n",dir_size));
+// dprintf(("","findDIRentry: index = %d\n",*index));
+
+ for (;;)
+  {                              
+   oldindex = *index;
+   dentry = getnextDIRentry(dir,dir_size,index) ;
+//   dprintf(("","findDIRentry: dentry = %p\n",dentry));
+   if (dentry == NULL)
+    break ;
+
+   if ((dentry->FILE_attribute & FILE_volume) != 0) continue ;
+//CBC:
+//   dprintf(("","findDIRentry: dentry = %p\n",dentry));
+//   dprintf(("","findDIRentry: nbuff = %p\n",nbuff));
+//   dprintf(("","findDIRentry: cdir = %p\n",cdir));
+//   dprintf(("","findDIRentry: index = %d\n",*index));
+   dprintf(("", "findDIRentry: cdir->lfnp[*index-1] = %p idx:%d oidx:%d\n", cdir->lfnp[*index-1], *index, oldindex));
+   cfile = (cdir->lfnp[oldindex] != NULL) ? cdir->lfnp[oldindex] : buildFILEname(dentry, nbuff);
+   dprintf(("", "findDIRentry: this file name is \"%s\"\n", cfile));
+
+   if (namematch(wcname,cfile) == TRUE)
+   {
+    goto matchfound;
+   }
+   else if((strlen(wcname) == 12) || (strlen(wcname) == 8))
+   {
+    cfile=buildFILEname(dentry,nbuff);
+    dprintf(("","findDIRentry: this shortfile name is \"%s\"\n",cfile));
+    if (namematch(wcname,cfile) == TRUE)
+     goto matchfound;
+   }
+
+  }
+matchfound:
+  dprintf(("","findDIRentry: EndOfLoop, match was \"%s\" -<>- \"%s\" dentry:%p\n",
+               wcname, (cfile != NULL) ? cfile : "", dentry));
+
+ if (dentry)
+  strcpy(wcname, cfile);
+
+ free(nbuff) ;
+
+ /* will either be NULL (index set to -1), or a valid directory entry */
+ return(dentry) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+static DOS_direntry *findSUBDIR(char *wcname,DIR_info *cdir,int dir_size,int *index)
+{
+ DOS_direntry *dentry = NULL ;
+ DOS_direntry *dir = (DOS_direntry*)DI_Base(cdir);;
+ char         nbuff[DOSnamesize];
+ char         *cfile = NULL;
+ int oldindex;
+
+ do
+  {
+   oldindex=*index;
+   dentry = getnextDIRentry(dir,dir_size,index) ;
+   if(!dentry)
+    break;
+   cfile = ((cdir->lfnp[oldindex])!=NULL)?(cdir->lfnp[oldindex]):buildFILEname(dentry,nbuff);
+//   cfile = buildFILEname(dentry,nbuff);
+  } while ((((dentry->FILE_attribute & FILE_subdir) == 0) || (namematch(wcname,cfile) != TRUE))) ;
+
+ if (dentry)
+  strcpy(wcname, cfile);
+
+ /* will either be NULL (index set to -1), or a valid directory entry */
+ return(dentry) ;
+}
+
+/*---------------------------------------------------------------------------*/
+
+int ensure_directory(DIR_info *dir)
+{
+ if (dir_flag_is_set(dir, dir_MODIFIED))
+  {
+   dprintf(("","ensure_directory: directory &%08X to be saved\n",(int)dir));
+
+   if (dir->dir_root != 0) /* ROOT directory is a special case */
+    {
+   dprintf(("","ensure_directory: root.. dirsec %x\n",dir->dir_sector));
+     if (DOS_image_RW(Wdata,dir->dir_sector,0,(byte *)DI_Base(dir),dir->dir_size,dir->ihand) < 0)
+      return(-1) ; /* error already defined */
+    }
+   else
+    {
+   dprintf(("","ensure_directory: nonroot,dirsec %x\n",dir->dir_sector));
+   dprintf(("","ensure_directory:ssec %x secsalloc:%x \n",(dir->ihand)->disc_startsec,secsalloc(dir->ihand)));
+     if (DOS_object_RW(Wdata,SECTORtoCLUSTER(dir->dir_sector,dir->ihand),
+                             (char *)DI_Base(dir),(word)dir->dir_size,
+                             dir->ihand) < 0)
+      return(-1) ; /* error already defined */
+    }
+
+   unset_dir_flags(dir, dir_MODIFIED) ; /* directory has been written successfully */
+  }
+ return(0) ;
+}
+
+/* Set up a DIR_info struct for the given directory and cache it. */
+static DIR_info *read_cache_dir(
+  char *dirname,
+  int is_root,
+  word sector,
+  word size, // Size of all dir entrys in bytes, = num entrys * 32
+  word parsec,
+  word parindex,
+  word parsize,
+  DOSdisc *ihand
+) {
+  dprintf(("","read_cache_dir: at start; sector = %x, isroot = %d\n",sector,is_root));
+  //CBC: also allocate memory for a char* for each entry, + ((( size/sizeof(DOS_direntry) ) * sizeof(char*)) - sizeof(char*))
+  DIR_info *dirstruct = (DIR_info *)malloc(DI_Size(size));
+  if (dirstruct == NULL) {
+   flush_dir_cache(0);   /* Flush every unlocked directory from the cache - we're desperate!! */
+   //CBC: also allocate memory for a char* for each entry, + ((( size/sizeof(DOS_direntry) ) * sizeof(char*)) - sizeof(char*))
+   dirstruct = (DIR_info *)malloc(DI_Size(size));
+   if (dirstruct == NULL)
+    return_errorT(DIR_info *, err_heapexhausted, tok_heapexhausted, 0, 0);
+  }
+  dprintf(("","read_cache_dir: allocated ram size = %x\n",DI_Size(size)));
+  dprintf(("","read_cache_dir: allocated ram address = %08X\n",(int)dirstruct));
+  dirstruct->ihand = ihand;
+  if ((dirstruct->dir_name = malloc(strlen(dirname) + 1)) == NULL) {
+    free(dirstruct);
+    return_errorT(DIR_info *,err_heapexhausted, tok_heapexhausted, 0, 0);
+  }
+  strcpy(dirstruct->dir_name, dirname);       
+  dirstruct->dir_root = is_root;
+  dirstruct->dir_sector = sector;
+  dirstruct->dir_size = size;
+  dirstruct->dir_parentsec = parsec;
+  dirstruct->dir_parentindex = parindex;
+  dirstruct->dir_parentsize = parsize;
+  dirstruct->dir_flags = 0;
+  dirstruct->dir_entryoffset = DI_Offset(size);
+  //CBC: somewhere round here I need to read out the long file names + extend and shift the filenames
+
+  dprintf(("","read_cache_dir: infoblock\n"));
+  dprintf(("","read_cache_dir: dir info base = %p\n",dirstruct));
+  dprintf(("","read_cache_dir: lfn entry base = %p\n",dirstruct->lfnp));
+  dprintf(("","read_cache_dir: dir entry original base = %p\n",dirstruct->dir_entries));
+  dprintf(("","read_cache_dir: dir entry offset = %x\n",dirstruct->dir_entryoffset));
+  dprintf(("","read_cache_dir: Dir entry base = %x\n",(DI_Base(dirstruct))));
+  dprintf(("","read_cache_dir: dir size = %x startsec = %x\n",dirstruct->dir_size,ihand->disc_startsec));
+
+  if (is_root)
+  {
+    if(ihand->disc_FATentry != 32)
+    {
+      if (DOS_image_RW(Rdata, sector, 0, (byte *)(DI_Base(dirstruct)) , size, ihand) < 0)
+      {
+        free(dirstruct->dir_name);
+        free(dirstruct);
+        dprintf(("","read_cache_dir: imager fails:1\n"));
+        return (DIR_info *)-1;
+      }
+    }
+    else
+    {
+     if (DOS_object_RW(Rdata,ihand->disc_RootCluster,(char *)(DI_Base(dirstruct)), size, ihand) < 0)
+      {
+        free(dirstruct->dir_name);
+        free(dirstruct);
+        dprintf(("","read_cache_dir: imager fails:2\n"));
+        return (DIR_info *)-1;
+      }
+    }
+  }
+  else
+  {
+    if (DOS_object_RW(Rdata,SECTORtoCLUSTER(sector, ihand),(char *)(DI_Base(dirstruct)), size, ihand) < 0)
+    {
+      free(dirstruct->dir_name);
+      free(dirstruct);
+      dprintf(("","read_cache_dir: imager fails:3\n"));
+      return (DIR_info *)-1;
+    }
+  }                          
+
+  // NULL the lfn pointer store
+  int i,j;
+  for(i=0;i<((dirstruct->dir_size)/sizeof(DOS_direntry));i++) dirstruct->lfnp[i] = NULL; 
+  dprintf(("","read_cache_dir: last lfnp NULLed:%p \n", &dirstruct->lfnp[i-1]));
+
+//CBC: Get long file names where appropriate
+  DOS_direntry * fentry = (DOS_direntry*)(DI_Base(dirstruct));
+  DOS_lfnentry * lfnentry;
+  int lfnnum=0;
+  dprintf(("","_read lfns: starting lfn search, &dentry[] = %x\n",(int)(fentry+0)));
+  i=1;
+  while((fentry+i)->FILE_status != 0)// There are still directory entrys I have not looked at
+  {
+   if(((fentry+(i-1))->FILE_attribute == FILE_win95) &&
+      ((fentry+i)->FILE_attribute != FILE_win95) && //Its file with a LFN entry before it
+      (fentry+i)->FILE_status != FILE_deleted &&
+      (fentry+(i-1))->FILE_status != FILE_deleted ) //And neither entrys are marked as deleted
+   {
+    lfnentry = (DOS_lfnentry*)(fentry+(i-1));
+    lfnnum=1;
+    dprintf(("","_read lfns: lfn entry\n"));
+    while(lfnentry->FILE_attribute == FILE_win95 &&
+          (lfnentry->FILE_Ordinal & 0x40) != 0x40)//Not last in chain
+    {
+     dprintf(("","_read lfns: extended lfn"));
+     lfnentry--;
+     lfnnum++;
+    }
+    if(lfnentry->FILE_checksum != lfnchecksum((char*)&((fentry+i)->FILE_status)))
+    {
+      dprintf(("","_read lfns: extended lfn but no cksum match \n"));
+      dprintf(("","_read lfns: sfentry: %p \n",fentry+i));
+    // We'd better delete backwards the duff entries..
+    // leave till later to write out
+      j=i;
+      while(--j>=0)
+      {
+        if((fentry+j)->FILE_attribute==FILE_win95)
+        {
+      dprintf(("","_read lfns: Nulling: %p \n",fentry+j));
+         (fentry+j)->FILE_status = FILE_deleted;
+        }
+        else j=0;
+      }
+      break;
+    }
+    
+    dirstruct->lfnp[i] = calloc( ((((int)(fentry+i)-(int)lfnentry)/sizeof(DOS_direntry)) * 13)+1, sizeof(char));
+    dprintf(("","_read lfns: Creating a long filename buffer: size = %d, address = %p\n",(((int)(fentry+i)-(int)lfnentry)/sizeof(DOS_direntry))*13,dirstruct->lfnp[i]));
+    dprintf(("","_read lfns: Index = %d, Address = %p\n",i,&(dirstruct->lfnp[i])));
+    char * offset=dirstruct->lfnp[i];
+    dprintf(("","_read lfns: offsetadd = %p, at = %p dirinfo:%p cacoffset:%x\n",offset,(dirstruct->lfnp[i]),dirstruct,offsetof(DIR_info,lfnp)));
+
+
+    for(lfnentry=(DOS_lfnentry*)(fentry+(i-1));lfnnum>0;lfnnum--,lfnentry--)
+    {
+     *offset=lfnentry->FILE_uchar0;
+     offset++;
+     *offset=lfnentry->FILE_uchar1;
+     offset++;
+     *offset=lfnentry->FILE_uchar2;
+     offset++;
+     *offset=lfnentry->FILE_uchar3;
+     offset++;
+     *offset=lfnentry->FILE_uchar4;
+     offset++;
+     *offset=lfnentry->FILE_uchar5;
+     offset++;
+     *offset=lfnentry->FILE_uchar6;
+     offset++;
+     *offset=lfnentry->FILE_uchar7;
+     offset++;
+     *offset=lfnentry->FILE_uchar8;
+     offset++;
+     *offset=lfnentry->FILE_uchar9;
+     offset++;
+     *offset=lfnentry->FILE_uchar10;
+     offset++;
+     *offset=lfnentry->FILE_uchar11;
+     offset++;
+     *offset=lfnentry->FILE_uchar12;
+     offset++;
+    }
+   }
+   i++;
+  }
+
+
+  dprintf(("","read_cache_dir: read & cached '%s' into dirstruct %p \n", dirname,dirstruct));
+  return cache_dir(dirstruct);
+}
+
+/*---------------------------------------------------------------------------*/
+/* NOTE: The ROOT directory size is fixed (detailed in BOOT BLOCK).
+ *       Sub-directories are special files and hence can grow like files
+ *       (when buffering directories we can load the complete "FILE" into
+ *       a suitably sized DIR_info buffer).
+ */
+
+DIR_info *loadDIR(char *dirpathname,DOSdisc *ihand)
+{
+ DIR_info     *dirstruct = NULL ;             /* directory description */
+ DOS_direntry *dentry ;                       /* directory entry structure */
+ int           index = 0 ;                    /* general directory index */
+ char         *tptr ;                         /* temporary pointer */
+ char          c ;                            /* character */
+ char         *fullname;
+
+ dprintf(("","loadDIR: \"%s\" ihand = &%08X\n",((dirpathname == NULL) ? "" : dirpathname),(word)ihand));
+
+ /* If the disc may have been changed then flush the directory cache. */
+ if (ihand->disc_flags & disc_CHANGED) {
+  flush_dir_cache(ihand);
+  ihand->disc_flags &= ~disc_CHANGED;
+ }
+
+ if (dirpathname == NULL)
+  dirpathname = "";
+ fullname = dirpathname;
+ /* Look in the cache for the directory.  If only the nearest ancestor is found then
+  * dirpathname is set to point to the remainder of the path name.
+  */
+ dirstruct = match_cached_dir(fullname, &dirpathname, ihand);
+ if (dirpathname == NULL)    /* If none of the path name remains then we've got an exact match. */
+ {
+  dprintf(("","loadDIR: dir loaded successfully at %p\n",dirstruct));
+  return dirstruct;
+ }
+ dprintf(("","loadDIR: dirstruct == %p\n",dirstruct));
+ if (dirstruct == NULL)
+ {
+  /* Have to descend from the root directory. */
+  dprintf(("","loadDIR: dirstruct == NULL\n"));
+
+  int DIRsize;
+  /* calculate the ROOT directory size in bytes */
+  if(ihand->disc_FATentry == 32)
+  {
+   int numclusters=0;
+   int nextcluster=2;
+   do
+   {
+    nextcluster=getnextCLUSTER(nextcluster, ihand);
+    numclusters++;
+   }while(nextcluster < CLUSTER_end(ihand));
+   DIRsize = secsalloc(ihand) * DOSsecsize * numclusters;
+  }else
+  {
+   DIRsize = (ihand->disc_ROOTsize * DOSsecsize) ;
+  }
+
+  int numFATs = ihand->disc_boot.BOOT_num_fats ; /* number of FAT copies */
+  dprintf(("","numFATS = %x\nFATsize = %x\nRESVDsec = %x\n",numFATs,ihand->disc_FATsecs,ihand->disc_RESVDsec));
+  dirstruct = read_cache_dir("", -1,
+                             (numFATs * ihand->disc_FATsecs) + ihand->disc_RESVDsec + 1,
+                             DIRsize, 0, 0, 0, ihand);
+ }
+
+ /* actually step down through the directory structure */
+ while (*dirpathname)
+  {
+   while (*dirpathname == dir_sep)    /* step over directory seperators */
+    dirpathname++ ;
+
+   tptr = dirpathname ;                  /* start of this directory entry */
+
+   /* step over object looking for terminator */
+   while ((*tptr != dir_sep) && (*tptr != '\0'))
+    tptr++ ;
+
+   /* SMC_DIR_CACHE: the following moved before writing '\0' to dirpathname */
+   if (tptr == dirpathname)
+    /* if we haven't moved then we assume "\" means "\." and the last
+     * directory we loaded is the desired directory
+     */
+    break ;
+
+   c = *tptr ;                /* remember character */
+   *tptr = '\0' ;             /* and ensure we have a valid terminator */
+
+   /* We must only search for entries that have the "FILE_subdir" flag
+    * set.
+    * Note: Sub-directories can have file extensions.
+    *       Sub-directories are FILEs.
+    */
+   dprintf(("","hunting for = \"%s\"\n",dirpathname));
+   /* look for "dirpathname" at this directory level */ 
+   index = 0 ;
+   if ((dentry = findSUBDIR(dirpathname,dirstruct,dirstruct->dir_size,&index)) != NULL)
+    {
+     int count = 0;
+     DIR_info *olddir = dirstruct ;                 /* remember the old directory */
+     word      sizedir = 0;
+     int       next = get_FILE_cluster(dentry,ihand);
+     word      allocsize = secsalloc(ihand) * DOSsecsize;
+   dprintf(("","next = \"%x\"\n",next));
+
+     while (next < CLUSTER_end(ihand)) {
+      sizedir += allocsize;
+      next = getnextCLUSTER(next, ihand);
+      if ( (++count > ihand->disc_FATentries) || (next < CLUSTER_first(ihand)) )
+        /* JRS 6/3/92 Added test to terminate loop in bad FAT */
+        return_error0(DIR_info *,err_clusterchain) ;
+     }
+
+     dirstruct = read_cache_dir(fullname, 0, CLUSTERtoSECTOR(get_FILE_cluster(dentry,ihand), ihand),
+                                sizedir, olddir->dir_sector, index - 1, olddir->dir_size, ihand);
+
+     if (c == '\0')           /* if last terminator was NULL */
+      break ;                 /* we have successfully scanned the tree */
+
+     *tptr = c ;              /* replace character */
+     dirpathname = tptr ;     /* and update the path pointer */
+
+     continue ;               /* and continue down the path */
+    }
+   else
+    {
+     return_errorT(DIR_info *,err_objectnotfound,tok_objectnotfound,dirpathname,0) ;
+    }
+  }
+
+ dprintf(("","loadDIR: dir load succesfully at %p\n",dirstruct));
+ /* we have successfully found and loaded the last entry */
+ return(dirstruct) ;
+}
+
+
+/*---------------------------------------------------------------------------*/
+
+
+
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/* resolvePATH: from a given object resolve the actual directory referenced  */
+/*              lname is set to point to the leafname part of pname and      */
+/*                pname is 0 terminated before the leafname                  */
+
+int resolvePATH(char *pname,DIR_info **ndir,char **lname,DOSdisc *ihand)
+{
+ char *cptr = &pname[strlen(pname)] ;
+
+ dprintf(("","DOSFS: resolvePATH: \"%s\"\n",pname));
+
+ /* step backwards looking for directory seperator or beginning */
+ for (; ((*cptr != dir_sep) && (cptr != pname)); cptr--) ;
+
+ if (cptr == pname)
+  {
+   dprintf(("","DOSFS: resolvePATH: (cptr == pname)\n"));
+   if (*cptr != dir_sep) {
+    char c1 = '\0', c2;
+    do {
+     c2 = *cptr;
+     *cptr++ = c1;
+     c1 = c2;
+    } while (c1 != '\0');
+   }
+   *cptr = '\0';
+   *lname = pname + 1;
+  }
+ else
+  {
+   dprintf(("","DOSFS: resolvePATH: we must resolve the path to the directory\n"));
+   *cptr++ = '\0';
+   *lname = cptr ;
+  }
+
+ *ndir = loadDIR(pname, ihand) ;
+ if ((int)(*ndir) == -1)
+  return(-1) ; /* error already defined */
+
+ return(0) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/* restorePATH: return a pointer to a restored path split by resolvePATH     */
+
+char *restorePATH(char *pname, char *lname)
+{
+  if (--lname == pname)
+    return ++lname;
+  *lname = dir_sep;
+  return pname;
+}
+
+/*---------------------------------------------------------------------------*/
+
+int write_dirinfo(char *fname,word bitmap,word loadaddr,word execaddr,word attr,word filelen,int startCLUSTER,DOSdisc *ihand)
+{
+ DIR_info     *cdir ;       /* directory where "leafname" resides */
+ char         *DOSname ;    /* pathname of referenced file */
+ char         *leafname ;   /* pointer into "DOSname" of leaf filename */
+ int           loop ;       /* general counter */
+ DOS_direntry *dentry ;     /* directory entry structure pointer */
+
+ dprintf(("","write_dirinfo: bitmap &%08X, ld &%08X, ex &%08X, attr &%08X, flen &%08X, sC = &%03X\n",bitmap,loadaddr,execaddr,attr,filelen,startCLUSTER));
+
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  return_errorT(int,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  return -1;
+ }
+
+ /* resolve the path (ie. load the directory the file is in) */
+ if (resolvePATH(DOSname,&cdir,&leafname,ihand) < 0)
+  {
+   free(DOSname) ;
+   return(-1) ; /* error already defined */
+  }
+
+ /* search the directory for the named object */
+ loop = 0 ;
+ dprintf(("","write_dirinfo: looking for leafname \"%s\"\n",leafname));
+ if ((dentry = findDIRentry(leafname,cdir,cdir->dir_size,&loop)) != NULL)
+  {
+   time5byte le ;
+   char      dosext[8] = {0,0,0,0,0,0,0,0} ;
+
+   /* If changing length or start cluster then make sure that the file is not open. */
+   if (bitmap & ((1 << wdi_FLEN) | (1 << wdi_SCLUSTER))) {
+     if (find_open_file(fname, dentry, ihand) >= 0) {
+       free(DOSname);
+       return_error1(int, err_fileopen, fname);
+     }
+   }
+
+   if (buildFILEname(dentry,DOSname) != NULL)
+    (void)after(dosext,DOSname,file_sep,1) ;
+
+   read_loadexec(dentry,dosext,&le) ;
+
+   /* We read the current load and exec addresses, so that they can be
+    * written together, but changed seperately (if required).
+    */
+   if (bitmap & (1 << wdi_LOAD))
+    le.hi = loadaddr ;
+
+   if (bitmap & (1 << wdi_EXEC))
+    le.lo = execaddr ;
+
+   update_loadexec(dentry,le.hi,le.lo) ;    /* and update the load/exec info */
+
+   /* preserve directory bit over attr change (should possibly do archive) */
+   if (bitmap & (1 << wdi_ATTR)) {
+    if ((dentry->FILE_attribute & FILE_subdir) != 0) {
+     if ((attr & locked_attribute) == 0)
+      attr |= write_attribute;
+     dentry->FILE_attribute = RISCOStoDOSattributes(attr) | FILE_subdir;
+    } else
+     dentry->FILE_attribute = RISCOStoDOSattributes(attr) ;
+   }
+
+   if (bitmap & (1 << wdi_FLEN))
+    dentry->FILE_size = filelen ;           /* update the length */
+
+   if (bitmap & (1 << wdi_SCLUSTER))
+    put_FILE_cluster(dentry,startCLUSTER,ihand) ; /* update the starting CLUSTER */
+
+   set_dir_flags(cdir, dir_MODIFIED) ; /* directory entry had been updated */
+
+   if (ensure_directory(cdir)!= 0)
+    {
+     flush_dir_cache(ihand);
+     free(DOSname) ;
+     return(-1) ; /* error already defined */
+    }
+  }
+ else
+  {
+   /* file not found in this directory */
+   free(DOSname) ;
+   return_errorT(int,err_objectnotfound,tok_objectnotfound,fname,0) ;
+  }
+
+ free(DOSname) ;
+ return(0) ;
+}
+
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+/*-------------------------------------------------------------------------*/
+
+FS_dir_block *read_dir(int rtype,char *fname,void *dest,word num,word off,word blen,DOSdisc *ihand)
+{
+ /* in:
+  *     rtype : leafnames (0) or full information (-1)
+  *     fname : NULL terminated ASCII pathname, relative to ROOT of image
+  *     dest  : destination memory address for data
+  *     num   : number of objects to read
+  *     off   : offset into directory
+  *     blen  : "dest" buffer length
+  *     ihand : filesystem image handle
+  */
+ char          *DOSname = NULL ;     /* converted pathname */
+ DIR_info      *cdir = NULL ;        /* pointer to the loaded directory */
+ FS_entry_info *entries = (FS_entry_info *)dest ;
+ int            numread = 0 ;
+ DOS_direntry  *dentry ;
+ char          *nbuff = (char *)malloc(MaxString) ;
+ int            loop ;               /* general counter */
+
+ dprintf(("","read_dir: rtype = %d, ihand = &%08X\n",rtype,(int)ihand));
+ dprintf(("","read_dir: \"%s\" (dest = &%08X) num = %d, off = %d, blen = %d\n",fname,dest,num,off,blen));
+
+ /* out:
+  *     dblock.objects_read = number of records read
+  *     dblock.next_offset  = offset of next item to be read (-1 if end)
+  */
+ /* default return state */
+ dblock.objects_read = 0 ;      /* no records read */
+ dblock.next_offset = -1 ;      /* next entry is end of directory */
+
+ if (nbuff == NULL) /* check name buffer allocation */
+  return_errorT(FS_dir_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+
+ /* parse the name and load the relevant directory */
+ /* the "(DOSdisc *)ihand" structure references the cached information */
+ /* a NULL path refers to the ROOT of the filesystem */
+ /* always return ACORN style names (truncated if necessary) */
+ /* convert "fname" to DOS path format */
+ if ((DOSname = (char *)malloc(MaxString)) == NULL)
+  {
+   free(nbuff) ;
+   return_errorT(FS_dir_block *,err_heapexhausted,tok_heapexhausted,0,0) ;
+  }
+
+ if ((int)convertRISCOStoLFN(fname, DOSname) < 0) {
+  free(DOSname);
+  free(nbuff);
+  return (FS_dir_block *)-1;
+ }
+
+ /* load the desired directory */
+ cdir = loadDIR(DOSname, ihand) ;
+ if ((int)cdir == -1)
+  {
+   dprintf(("","read_dir: no directory loaded\n"));
+   free(DOSname) ;
+   free(nbuff) ;
+   return((FS_dir_block *)-1) ; /* error message already defined */
+  }
+
+ /* start reading entries from the requested offset */
+ int oldindex;
+ loop = off ;
+ do
+  {
+   dprintf(("","read_dir: loop = %d\n",loop));
+   oldindex=loop;
+   if ((dentry = getnextDIRentry((DOS_direntry *)DI_Base(cdir),cdir->dir_size,&loop)) != NULL)
+    {
+     dprintf(("","read_dir: returned *dentry = %p\n",dentry));
+    /* "getnextDIRentry" returns all FILE types:
+      * This includes volume labels and hidden and system files. At the
+      * moment we only stop volume labels from being returned.
+      */
+     if ((dentry->FILE_attribute & FILE_volume) == 0)
+      {
+       /* we have a listable directory entry */
+       char *cfile ;
+       word  entrysize ;
+       //CBC:
+       cfile = cdir->lfnp[oldindex]?(cdir->lfnp[oldindex]):buildFILEname(dentry,nbuff);
+       dprintf(("","read_dir: lfnp = %p act:%p holds:%s\n",
+                              &cdir->lfnp[loop],
+                              cdir->lfnp[loop],
+                              cdir->lfnp[loop]?cdir->lfnp[loop]:"NULLptr"));
+       dprintf(("","read_dir: cdir = %p\n",cdir));
+       dprintf(("","read_dir: cfile = '%s' %x %x\n",
+                              (cfile == NULL) ? "" : cfile,
+                              &cdir->lfnp[oldindex],
+                              oldindex));
+       if (cfile)
+        {
+         char dosext[8] = {0,0,0,0,0,0,0,0} ; /* ensure zero start */
+
+         /* check to see if we have an ".ext" -> RISC OS filetype mapping */
+         (void)after(dosext,cfile,file_sep,1) ;
+
+         if ((int)convertDOStoRISCOS(cfile, DOSname) < 0) {
+          dprintf(("","read_dir: *PANIC* convertDOStoRISCOS() died; exiting\n"));
+          free(DOSname) ; /* release converted pathname buffer */
+          free(nbuff) ;   /* release converted name buffer */
+          return (FS_dir_block *)-1;
+         }
+         cfile = DOSname ;
+
+         /* calculate the size of this entry (word-aligned) */
+         if (rtype)
+          {
+           entrysize = strlen(cfile) + (sizeof(FS_entry_info) - 3) ;
+           entrysize = WORDALIGN(entrysize) ;
+          }
+         else
+          entrysize = strlen(cfile) + 1 ; /* include terminating NULL */
+
+         if (((word)entries + entrysize) <= ((word)dest + blen))
+          {
+           time5byte le ;
+
+           if (rtype)
+            MSDOStoRISCOS(get_FILE_time(dentry),get_FILE_date(dentry),&le) ;
+
+           /* check if the file has RISC OS information in its spare bytes */
+           if (rtype)
+            {
+             /* Try to find the filetype */
+             map_FILE_ROStype(dentry,dosext,&le);
+
+             /* RISC OS required information */
+             entries->loadaddr = le.hi ;
+             entries->execaddr = le.lo ;
+             entries->flength = dentry->FILE_size ;
+             entries->attributes = DOStoRISCOSattributes(dentry) ;
+             entries->type = (((dentry->FILE_attribute & FILE_subdir) == 0) ? object_file : object_directory) ;
+            }
+           dprintf(("","read_dir: file name = %s\n",cfile));
+           /* copy the filename into the destination structure */
+           if (rtype)
+            strcpy(entries->fname,cfile) ;
+           else
+            strcpy((char *)entries,cfile) ;
+
+           /* and update the reference information */
+           entries = (FS_entry_info *)((word)entries + entrysize) ;
+           numread++ ;        /* count this entry */
+          }
+         else
+          {
+           loop-- ; /* we need to re-do this entry on the next call */
+       dprintf(("","read_dir: redo the loop\n"));
+           break ;
+          }
+        }
+       else
+        {
+ dprintf(("","read_dir: NULL dentry returned\n"));
+         free(DOSname) ; /* release converted pathname buffer */
+         free(nbuff) ;   /* release converted name buffer */
+         return_error0(FS_dir_block *,err_namereadfailed) ;
+        }
+      }
+    }
+  } while ((numread < num) && ((dentry != NULL) && (loop >= 0))) ;
+ dprintf(("","read_dir: loop done\n"));
+
+ if (numread > 0) {
+  dblock.objects_read = numread ;
+  dblock.next_offset = loop ;
+ }
+
+ free(DOSname) ;        /* release converted pathname buffer */
+ free(nbuff) ;          /* release converted name buffer */
+
+ dprintf(("","read_dir: dblock.objects_read = %d, dblock.next_offset = %d\n",dblock.objects_read,dblock.next_offset));
+ return(&dblock) ;
+}
+
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/*---------------------------------------------------------------------------*/
+/* findDIRtype:
+ * look for the first object with the given attributes flags set
+ */
+
+DOS_direntry *findDIRtype(byte mask,byte ftype,DOS_direntry *directory,int dir_size,int *index)
+{
+ DOS_direntry *dentry = NULL ;
+
+// dprintf(("","findDIRtype: mask &%02X, ftype &%02X, directory = &%08X, index = %d\n",mask,ftype,(int)directory,*index));
+
+ do
+  {
+   dentry = getnextDIRentry(directory,dir_size,index) ;
+  } while ((dentry != NULL) && ((dentry->FILE_attribute & mask) != ftype)) ;
+
+// dprintf(("","findDIRtype: FILE_attribute = &%02X\n",dentry->FILE_attribute));
+
+ /* will either be NULL (index set to -1), or a valid directory entry */
+ return(dentry) ;
+}

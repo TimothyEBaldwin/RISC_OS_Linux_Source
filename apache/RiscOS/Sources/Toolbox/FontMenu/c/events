@@ -1,0 +1,374 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* Title:   events.c
+ * Purpose: filters registered with the Toolbox.  Events are delivered here.
+ * Author:  TGR
+ * History: 12-Jan-94: TGR: created
+ *
+ */
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+
+#include "const.h"
+#include "macros.h"
+#include "debug.h"
+#include "mem.h"
+#include "string32.h"
+#include "messages.h"
+#include "objects.toolbox.h"
+#include "objects.fontmenu.h"
+#include "objects.menu.h"
+
+#include "object.h"
+#include "auxiliary.h"
+#include "events.h"
+
+_kernel_oserror *event_help_request (wimp_Message message_block, TaskDescriptor *t);
+_kernel_oserror *event_menu_warning (wimp_Message message_block, TaskDescriptor *t);
+_kernel_oserror *event_menus_deleted (wimp_Message message_block, TaskDescriptor *t);
+_kernel_oserror *event_menu_selection (int *menu_tree, TaskDescriptor *t, IDBlock *id_block,_kernel_swi_regs *r);
+_kernel_oserror *event_menu_to_show (TaskDescriptor *t, IDBlock *id_block,_kernel_swi_regs *r);
+_kernel_oserror *menu_show_actual (void);
+_kernel_oserror *menu_show_submenu_actual (void);
+
+extern _kernel_oserror *events_postfilter (_kernel_swi_regs *r)
+{
+
+    /*
+     * called from the main Toolbox postfilter, when an event happens which
+     * this module has expressed an interest in.
+     * R0 = Wimp event reason code
+     * R1 ->client's Wimp event block
+     * R2 = Task Descriptor of task interested in the event
+     * R3 ->6-word "ID block" as passed to Toolbox_Initialise
+     *
+     */
+
+    /*
+     * This function gets a pointer to the task interested in the event in
+     * R2 (since this was the value passed to Toolbox_RegisterPostFilter).
+     * If the event is dealt with by this module (eg ID block gets updated).
+     * then set R0 to non-null before return.
+     */
+
+   wimp_PollBlock  *block      = (wimp_PollBlock *)r->r[1];
+   IDBlock         *id_block   = (IDBlock *)r->r[3];
+   int              event_code = r->r[0];
+   TaskDescriptor  *t          = (TaskDescriptor *) r->r[2];
+
+   DEBUG debug_output ("e","FontMenu: Postfilter entered, received wimp event code = 0x%x\n",event_code);
+
+   r->r[0] = 0;
+
+   if (t == NULL)
+      return NULL;
+
+   switch (event_code) {
+      case wimp_ESEND:
+      case wimp_ESEND_WANT_ACK:
+         DEBUG debug_output ("e","FontMenu: Message action = 0x%x\n",block->msg.hdr.action);
+         switch (block->msg.hdr.action) {
+            case wimp_MMENUS_DELETED:
+               return event_menus_deleted(block->msg,t);
+               break;
+            case wimp_MHELP_REQUEST:
+               return event_help_request(block->msg,t);
+               break;
+            default:
+               break;
+         }
+         break;
+      case wimp_EMENU:
+         return event_menu_selection((int *) r->r[1],t,id_block,r);
+                                       /* ... R1 points to a list of menu selections */
+         break;
+      case wimp_ETOOLBOX_EVENT:
+         DEBUG debug_output ("e","FontMenu: toolbox event = %x\n", block->toolbox_event.hdr.event_code);
+         if (block->toolbox_event.hdr.event_code == FontMenu_AboutToBeShown) {
+            DEBUG debug_output ("e","FontMenu: AboutToBeShown event returned\n");
+            return event_menu_to_show (t,id_block,r);
+         }
+         break;
+      default:
+         break;
+   }
+   return NULL;
+}
+
+
+
+extern _kernel_oserror *events_prefilter (_kernel_swi_regs *r)
+{
+
+    /*
+     * called from the main Toolbox prefilter, when Wimp_Poll is called.
+     * R0 = mask passed to Wimp_Poll
+     * R1 ->client's poll block passed to Wimp_Poll
+     * R2 = Task Descriptor.
+     *
+     */
+
+    /*
+     * This function gets a pointer to the current task in
+     * R2 (since this was the value passed to Toolbox_RegisterPreFilter).
+     * This function can enable additional events by zero-ing bits in
+     * r->r[0]
+     */
+
+   _kernel_oserror *e;
+
+   DEBUG debug_output ("e","FontMenu: prefilter entered\n");
+
+   if (global_menu.flags & GLOBAL_MENU_INFO_FLAGS_SHOW_NEXT) {
+
+      global_menu.flags = (global_menu.flags
+                        |   GLOBAL_MENU_INFO_FLAGS_IS_SHOWING)
+                        &  ~GLOBAL_MENU_INFO_FLAGS_SHOW_NEXT;
+
+      if ((e = generate_fontmenu()) != NULL)
+         return e;
+
+      if ((e = ((global_menu.flags & GLOBAL_MENU_INFO_FLAGS_TOP_LEVEL)?menu_show_actual():menu_show_submenu_actual())) != NULL) {
+         return e;
+      }
+   }
+
+   r->r[0] &= ~wimp_EMMENU           /* 'EM' stands for 'Event Mask' = 1 << (event number) */
+           &  ~wimp_EMSEND
+           &  ~wimp_EMSEND_WANT_ACK;
+
+   return NULL;
+}
+
+
+/* Respond to request for help ******************************************************************/
+
+_kernel_oserror *event_help_request (wimp_Message message_block, TaskDescriptor *t) {
+
+   _kernel_oserror  *e;
+   FontMenuInternal *menu_int = global_menu.current;
+   wimp_Message       help_reply;
+   ObjectID          object_id;
+   int               buffer[64];
+
+   if (!menu_int) return NULL;
+
+   object_id = menu_int->object_id;
+
+   DEBUG debug_output ("e","FontMenu: request for help\n");
+
+   if ((e = _swix (Wimp_GetMenuState, _INR(0,1), 0, buffer)) != NULL) {
+      return e;
+   }
+
+   if (!menu_showing(buffer)) return NULL;
+
+   if (global_menu.t == t) {
+
+      int str_len;
+
+      help_reply.hdr.your_ref = message_block.hdr.my_ref;
+      help_reply.hdr.action   = wimp_MHELP_REPLY;
+      help_reply.hdr.size = sizeof(wimp_Message);
+      string_copy_chk (help_reply.data.chars, global_help_message, wimp_MAX_MSG_DATA_SIZE);
+
+      str_len = strlen(global_help_message);
+
+      if (str_len < wimp_MAX_MSG_DATA_SIZE) {
+         global_help_message[str_len+1] = '\0';
+         if (str_len+1 < wimp_MAX_MSG_DATA_SIZE)
+            global_help_message[str_len+2] = '\0';
+      }
+   }
+
+   if ((e = _swix (Wimp_SendMessage, _INR(0,2),
+                                     wimp_ESEND,
+                                     &help_reply,
+                                     message_block.hdr.task_handle
+                  )) != NULL) {
+      return e;
+   }
+   return NULL;
+}
+
+
+/* Menu will be deleted. Mark it as not showing *************************************************/
+
+_kernel_oserror *event_menus_deleted (wimp_Message message_block, TaskDescriptor *t){
+
+   FontMenuInternal *menu_int     = global_menu.current;
+   ObjectID          object_id;
+
+   if (!menu_int) return NULL;
+
+   /* Test removed - still want a has been hidden event, even if it's not the
+      top level menu - KJB
+   if (global_menu.wimp_menu != (wimp_Menu *) (*message_block.data.words))
+      return NULL; */
+
+   object_id = menu_int->object_id;
+
+   DEBUG debug_output ("e","FontMenu: menus deleted, tidying up\n");
+
+   if (global_menu.wimp_menu) {
+      mem_freek (global_menu.wimp_menu);
+      global_menu.wimp_menu = NULL;
+   }
+   if (global_menu.wimp_menu_indirect) {
+      mem_freek (global_menu.wimp_menu_indirect);
+      global_menu.wimp_menu_indirect = NULL;
+   }
+   IGNORE(t);
+   IGNORE(message_block);
+
+   return has_been_hidden ();
+}
+
+
+ /* Respond to a menu selection *****************************************************************/
+
+_kernel_oserror *event_menu_selection (int *menu_tree, TaskDescriptor *t, IDBlock *id_block,_kernel_swi_regs *r) {
+
+   _kernel_oserror     *e;
+   FontMenuInternal    *menu_int       = global_menu.current;
+   ObjectID             object_id;
+   FontMenu_Selection_Event
+                       *fms_event;
+   ToolboxEvent         toolbox_event;
+   int                 *pposition      = global_menu_state;
+   wimp_PointerInfo     pointer_info;
+
+   DEBUG debug_output ("e","FontMenu: selection entered\n");
+
+      DEBUG debug_output ("e", "FontMenu: menu tree before processing:");
+      DEBUG {
+                int *p = menu_tree;
+                while (*p != -1)
+                {
+                    debug_output ("e", " %d", *p);
+                    p++;
+                }
+                debug_output ("e", "\n");
+            }
+
+   if (!menu_int || (*menu_tree == -1)) {
+      return NULL;
+   }
+   if ( !(menu_showing(menu_tree))) {
+      DEBUG debug_output ("e","FontMenu: menu not found, returning\n");
+      return NULL;
+   }
+   object_id = global_menu.current->object_id;
+
+   while (*pposition != -1) {
+      if (*pposition++ != *menu_tree++) {
+         return NULL;
+      }
+   }
+
+   DEBUG debug_output ("e","FontMenu: about to decode menu\n");
+
+   fms_event = (FontMenu_Selection_Event *) &toolbox_event;
+
+   if (global_menu.current->flags & FontMenuInternal_IncludeSystemFont && (!(*menu_tree))) {
+      strcpy (fms_event->font_id, "SystemFont");
+   } else {
+      DEBUG debug_output ("e", "FontMenu: about to decode menu\n");
+      DEBUG debug_output ("e", "FontMenu: menu tree:");
+      DEBUG {
+                int *p = menu_tree;
+                while (*p != -1)
+                {
+                    debug_output ("e", " %d", *p);
+                    p++;
+                }
+                debug_output ("e", "\n");
+            }
+      if ((e = _swix (Font_DecodeMenu, _INR(0,4),
+                                       0,
+                                       global_menu.wimp_menu,
+                                       menu_tree,
+                                       fms_event->font_id,
+                                       256-20-sizeof(ToolboxEventHeader)
+                                                -sizeof(ObjectID)-sizeof(ComponentID)
+                      )) != NULL) {
+         return e;
+      }
+      DEBUG debug_output ("e","FontMenu: decoded menu successfully, font is '%s'\n", fms_event->font_id);
+   }
+   if (((e = fontmenu_set_font (global_menu.current, fms_event->font_id)) != NULL) || ((e = generate_fontmenu()) != NULL)) {
+      DEBUG debug_output ("e", "FontMenu", "Error: %s\n", e->errmess);
+      return e;
+   }
+   DEBUG debug_output ("e","FontMenu: generated new font menu\n");
+
+   toolbox_event.hdr.size       = sizeof(FontMenu_Selection_Event);
+   toolbox_event.hdr.event_code = FontMenu_Selection;
+   toolbox_event.hdr.flags      = 0;
+
+   if ((e = _swix (Toolbox_RaiseToolboxEvent, _INR(0,3), 0,
+                                                         object_id,
+                                                         -1,
+                                                         &toolbox_event
+                   )) != NULL) {
+      return e;
+   }
+
+   if ((e = _swix (Wimp_GetPointerInfo, _IN(1), &pointer_info)) != NULL) {
+      return e;
+   }
+
+   if (   (pointer_info.button_state & wimp_ADJUST_BUTTON)
+       && (global_menu.flags & GLOBAL_MENU_INFO_FLAGS_IS_SHOWING)) {
+
+      DEBUG debug_output ("e","FontMenu: adjust click\n");
+
+      if ((e = update_tree()) != NULL)
+         return e;
+
+   } else if (pointer_info.button_state & (wimp_SELECT_BUTTON|wimp_MENU_BUTTON)) {
+      has_been_hidden ();
+   }
+   r->r[0] = 1;
+   id_block->self_id        = object_id;
+
+   IGNORE(r);
+   IGNORE(t);
+
+   return NULL;
+}
+
+_kernel_oserror *event_menu_to_show (TaskDescriptor *t, IDBlock *id_block,_kernel_swi_regs *r) {
+
+   if (global_menu.t == t) { /* No further checking - assume this is it */
+      global_menu.flags |= GLOBAL_MENU_INFO_FLAGS_SHOW_NEXT;
+/*
+      id_block->self_id = global_menu.current->object_id;
+*/
+   }
+
+   IGNORE (r);
+   IGNORE (id_block);
+
+   return NULL;
+}
+
+
