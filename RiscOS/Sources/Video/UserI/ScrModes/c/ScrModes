@@ -74,6 +74,39 @@ int preferred_sync_type = 0;
  */
 int old_monitortype = -1; /* -1 means we haven't loaded a file yet */
 
+/* Bit mask of which control list items are supported by the current driver */
+static uint32_t supported_controllist_items = 0;
+
+static void check_supported_controllist_items(int driver)
+{
+    _kernel_swi_regs r;
+    uint32_t items[ControlList_InvalidReason+1];
+    r.r[0] = GVReadInfo_ControlListItems;
+    r.r[1] = (int) items;
+    r.r[2] = sizeof(items);
+    r.r[4] = GraphicsV_ReadInfo | (driver<<24);
+    r.r[9] = GraphicsV;
+    _kernel_swi(OS_CallAVector, &r, &r);
+
+    supported_controllist_items = 0;
+
+    if (r.r[4] != 0)
+    {
+        return;
+    }
+    int len = (r.r[2] >= 0 ? sizeof(items) - r.r[2] : sizeof(items));
+    len >>= 2;
+    int idx = 0;
+    while (idx < len)
+    {
+        if (items[idx] < 32)
+        {
+            supported_controllist_items |= 1u << items[idx];
+        }
+        idx++;
+    }
+}
+
 /* Construct an error block from the given ScreenModes module-specific
  * error code and the list of up to 3 arguments.  To ensure easy
  * internationalisability, this is done using text from our Messages
@@ -463,15 +496,37 @@ static _kernel_oserror *savemodefile(const char *file)
     return NULL;
 }
 
-/* List of new PixelFormats available from old GraphicsV_DisplayFeatures */
-static PixelFormat oldformats[] = {
+/* List of pixel formats supported by the kernel, in priority order for higher BPP search by service_modetranslation */
+/* Also, for GraphicsV drivers that don't support GraphicsV_PixelFormats, the first few entries are expected to be the 'old formats' that they may support */
+static const PixelFormat pixelformats[] = {
     {1,0,0},
     {3,0,1},
     {15,0,2},
     {255,ModeFlag_FullPalette,3},
     {65535,0,4},
     {-1,0,5},
+    /* RISC OS 6 64K */
+    {65535,  ModeFlag_64k,         4},
+    /* Red/blue swapped */
+    {65535,  ModeFlag_DataFormatSub_RGB,              4},
+    {-1,     ModeFlag_DataFormatSub_RGB,              5},
+    {65535,  ModeFlag_DataFormatSub_RGB+ModeFlag_64k, 4},
+    /* 4K */
+    {4095,   0,                                       4},
+    {4095,   ModeFlag_DataFormatSub_RGB,              4},
+    /* Alpha */
+    {65535,  ModeFlag_DataFormatSub_Alpha,                                         4},
+    {-1,     ModeFlag_DataFormatSub_Alpha,                                         5},
+    {65535,  ModeFlag_DataFormatSub_Alpha+ModeFlag_64k,                            4},
+    {65535,  ModeFlag_DataFormatSub_Alpha+ModeFlag_DataFormatSub_RGB,              4},
+    {-1,     ModeFlag_DataFormatSub_Alpha+ModeFlag_DataFormatSub_RGB,              5},
+    {65535,  ModeFlag_DataFormatSub_Alpha+ModeFlag_DataFormatSub_RGB+ModeFlag_64k, 4},
+    {4095,   ModeFlag_DataFormatSub_Alpha,                                         4},
+    {4095,   ModeFlag_DataFormatSub_Alpha+ModeFlag_DataFormatSub_RGB,              4},
 };
+
+#define OLDFORMATS pixelformats
+#define NUM_OLDFORMATS 6
 
 /* Convert an old pixel depth value to a PixelFormat value */
 static void pixelformat_from_depth(PixelFormatRef pf,int depth)
@@ -482,7 +537,7 @@ static void pixelformat_from_depth(PixelFormatRef pf,int depth)
 }
 
 /* Can this PixelFormat be represented as a pixel depth? (if so, pf->log2bpp is the value) */
-bool is_old_format(const PixelFormatRef pf)
+bool is_old_format(const PixelFormat *pf)
 {
     if (pf->log2bpp > 5)
         return false;
@@ -503,10 +558,65 @@ static int current_graphicsv_driver(void)
     return variables[0];
 }
 
+/* Return mask of which pixel formats are supported by the driver (from pixelformats table) */
+static int get_supported_pixel_formats(int driver)
+{
+    _kernel_swi_regs r;
+    r.r[4] = GraphicsV_PixelFormats | (driver<<24);
+    r.r[9] = GraphicsV;
+    _kernel_swi(OS_CallAVector, &r, &r);
+    if (r.r[4] != 0)
+    {
+        /* Old driver, just spam it with some basic formats */
+        return (1<<NUM_OLDFORMATS)-1;
+    }
+    /* Scan the list to build up a flag word of supported formats */
+    const PixelFormat *list = pixelformats;
+    const PixelFormat *f = (const PixelFormat *) r.r[0];
+    int bit = 1;
+    int supported = 0;
+    while (--r.r[1] >= 0)
+    {
+        if (f->modeflags & ModeFlag_DataFormatFamily_Mask)
+        {
+            continue;
+        }
+        /* Note that for each step of the outer loop, we retain the 'list' and
+           'bit' values from the inner loop so that drivers which arrange
+           their format lists in a similar order to ours will require fewer
+           iterations */
+        for (int i=0;i<sizeof(pixelformats)/sizeof(pixelformats[0]);i++)
+        {
+            bool match = false;
+            if ((f->ncolour == list->ncolour) && (f->modeflags == list->modeflags) && (f->log2bpp == list->log2bpp))
+            {
+                supported |= bit;
+                match = true;
+            }
+            if (bit == (1 << ((sizeof(pixelformats)/sizeof(pixelformats[0]))-1)))
+            {
+                bit = 1;
+                list = pixelformats;
+            }
+            else
+            {
+                bit = bit<<1;
+                list++;
+            }
+            if (match)
+            {
+                break;
+            }
+        }
+        f++;
+    }
+    return supported;
+}
+
 /* Build a VIDC list
  * Returns the number of control list items
  */
-static int build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelFormatRef pf)
+static int build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelFormat *pf)
 {
     int fn;
     int ctrllistpos = 0;
@@ -596,9 +706,10 @@ static int build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelFo
  * If the mode is valid, it optionally copies the VIDC list into the
  * provided buffer.
  */
-static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
+static int mode_valid(ModeDescriptionRef mp, const PixelFormat *pf,
                        uint32_t maxdatarate /* kB/s */,
                        uint32_t maxdatasize /* bytes */,
+                       int extrabytes,
                        VIDCListRef outlist)
 {
     _kernel_swi_regs r;
@@ -680,6 +791,28 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
 
     /* Propose the resulting mode to the graphics driver */
     int ctrllistpos = build_a_vidclist(&vetlist, mp, pf);
+
+    if (extrabytes < 0)
+    {
+        extrabytes = 0;
+    }
+    if (extrabytes > 0)
+    {
+        if (!(supported_controllist_items & (1 << ControlList_ExtraBytes)))
+        {
+            return 0; /* ExtraBytes wanted by user but not supported by driver */
+        }
+        /* Check this won't push us over maxdatasize */
+        if (extrabytes * my + datasize > maxdatasize)
+        {
+            return 0;
+        }
+        vetlist.vcparam[ctrllistpos].index = ControlList_ExtraBytes;
+        vetlist.vcparam[ctrllistpos].value = extrabytes;
+        ctrllistpos++;
+        vetlist.vcparam[ctrllistpos].index = -1;      /* List terminator */
+    }
+
     r.r[0] = (int)&vetlist;
     r.r[1] = 0; /* Flags */
     r.r[4] = GraphicsV_VetMode2 | (driver<<24);
@@ -695,8 +828,6 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
         {
             /* Check to see if this ExtraBytes value will cause us to exceed
              * maxdatasize.
-             * (n.b. it's assumed that build_a_vidclist will never set
-             * ExtraBytes itself)
              */
             datasize += r.r[2] * my;
             if (datasize > maxdatasize)
@@ -704,6 +835,10 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
                 return 0;
             }
             /* ExtraBytes value is acceptable, use it */
+            if ((ctrllistpos > 0) && (vetlist.vcparam[ctrllistpos-1].index == ControlList_ExtraBytes))
+            {
+                ctrllistpos--;
+            }
             vetlist.vcparam[ctrllistpos].index = ControlList_ExtraBytes;
             vetlist.vcparam[ctrllistpos].value = r.r[2];
             ctrllistpos++;
@@ -734,7 +869,7 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormatRef pf,
 bool find_deepest_by_xyhz(PixelFormatRef fp, ModeDescriptionRef mp)
 {
     _kernel_swi_regs r;
-    PixelFormatRef   pflist;
+    const PixelFormat *pflist;
     size_t pflistlen;
     int    driver, maxlog2bpp = 0;
     bool   found = false;
@@ -752,8 +887,8 @@ bool find_deepest_by_xyhz(PixelFormatRef fp, ModeDescriptionRef mp)
     else
     {
         /* Use the old list */
-        pflist = oldformats;
-        pflistlen = sizeof(oldformats)/sizeof(oldformats[0]);
+        pflist = OLDFORMATS;
+        pflistlen = NUM_OLDFORMATS;
     }
     IFDEBUG printf("Trying %d pixel formats\n", pflistlen);
 
@@ -762,7 +897,7 @@ bool find_deepest_by_xyhz(PixelFormatRef fp, ModeDescriptionRef mp)
      */
     while (pflistlen)
     {
-        if (mode_valid(mp, pflist, INT32_MAX, INT32_MAX, NULL))
+        if (mode_valid(mp, pflist, INT32_MAX, INT32_MAX, 0, NULL))
         {
             /* That depth is achievable, keep it if bigger */
             if (pflist->log2bpp > maxlog2bpp)
@@ -885,12 +1020,15 @@ static void service_modeextension(_kernel_swi_regs *regs)
     /* Examine the mode selector to deduce the pixel format */
     pixelformat_from_depth(&pf,sel->depth);
     ModeParam *param = sel->param;
+    int extrabytes = 0;
     while (param->index != -1)
     {
         if (param->index == VduExt_ModeFlags)
             pf.modeflags = param->value;
         else if (param->index == VduExt_NColour)
             pf.ncolour = param->value;
+        else if (param->index == VduExt_LineLength)
+            extrabytes = param->value - (((sel->xresol << sel->depth) + 7) >> 3);
         param++;
     }
 
@@ -949,7 +1087,7 @@ static void service_modeextension(_kernel_swi_regs *regs)
     {
         /* Test whether this mode can satisfy the requirements */
         if ((sel->framerate == -1 || sel->framerate == mp->frame_hz) &&
-            mode_valid(mp, &pf, dataratelimit, datasizelimit, &thevidclist))
+            mode_valid(mp, &pf, dataratelimit, datasizelimit, extrabytes, &thevidclist))
         {
             /* And claim the service */
             regs->r[1] = 0;                 /* Service_Serviced */
@@ -965,9 +1103,15 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
 {
     ModeDescriptionRef mp;
     uint32_t dataratelimit, datasizelimit;
-    PixelFormatRef pf,pflist;
+    const PixelFormat *pf,*pflist;
     int numformats,pflistlen;
     _kernel_swi_regs r;
+
+    /* We do monitor type 7 only */
+    if (regs->r[3] != MONITOR_FILE || !current_monitor)
+    {
+        return;
+    }
 
     /* See comments re. data-rate spec in service_modeextension */
     dataratelimit = restrict_bandwidth(regs->r[4]) / 1000;
@@ -987,8 +1131,8 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
     else
     {
         /* Use the old list */
-        pflist = oldformats;
-        pflistlen = sizeof(oldformats)/sizeof(oldformats[0]);
+        pflist = OLDFORMATS;
+        pflistlen = NUM_OLDFORMATS;
     }
 
     /* Scan all available modes at all available pixel formats */
@@ -998,7 +1142,7 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
 
     for (;;)
     {
-        if (!mode_valid(mp, pf, dataratelimit, datasizelimit, NULL))
+        if (!mode_valid(mp, pf, dataratelimit, datasizelimit, 0, NULL))
         {
             /* TMD 03-Nov-93: Fix bug MED-00833
              * Code used to set depth to 5 here, assuming that if the mode
@@ -1100,126 +1244,380 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
     }
 }
 
-static int mode_available(uint32_t xres, uint32_t yres, const PixelFormatRef pf, int framerate)
+static int modevar(int mode, int var, int dfault)
 {
-    ModeDescriptionRef mp;
-    int nmodes;
-
-    mp = find_by_xy(current_monitor->modelist, xres, yres, &nmodes);
-    if (mp == NULL)
-    {
-        return 0;
+    int value, flags;
+    if (_swix(OS_ReadModeVariable, _INR(0,1)|_OUT(2)|_OUT(_FLAGS),
+              mode, var, &value, &flags) || (flags & _C)) {
+        value = dfault;
     }
-    do
-    {
-        if ((framerate == -1 || framerate == mp->frame_hz) &&
-            mode_valid(mp, pf, INT32_MAX, INT32_MAX, NULL))
-        {
-            return 1;
-        }
-        mp = mp->next;
-    } while (--nmodes);
-
-    return 0;
+    return value;
 }
 
+static bool resolution_supported(int x,int y,int doublepixel)
+{
+    int nmodes;
+    if (find_by_xy(current_monitor->modelist, x, y, &nmodes))
+    {
+        return true;
+    }
+    if (!doublepixel)
+    {
+        return false;
+    }
+    /* Try non-doublepixel version */
+    return find_by_xy(current_monitor->modelist, x >> 1, y, &nmodes) != NULL;
+}
+
+/* Call Service_ModeExtension, but also tries downgrading doublepixel modes to non-doublepixel */
+static bool offer_doublepixel_modeextension(ModeSelector *m, int *doublepixel)
+{
+    /* Assume that we're the only thing providing support for this monitor type */
+    _kernel_swi_regs regs;
+    regs.r[1] = Service_ModeExtension;
+    regs.r[2] = (int) m;
+    regs.r[3] = MONITOR_FILE;
+    regs.r[4] = INT32_MAX;
+    regs.r[5] = INT32_MAX;
+    if (!*doublepixel)
+    {
+        service_modeextension(&regs);
+        return (regs.r[1] == Service_Serviced);
+    }
+    /* Double-pixel only valid for <= 16bpp */
+    if (m->depth > 4)
+    {
+        return false;
+    }
+    service_modeextension(&regs);
+    if (regs.r[1] == Service_Serviced)
+    {
+        return true;
+    }
+    /* Halve the width and try again */
+    int orig = m->xresol;
+    m->xresol = orig>>1;
+    service_modeextension(&regs);
+    if (regs.r[1] == Service_Serviced)
+    {
+        *doublepixel = false;
+        return true;
+    }
+    m->xresol = orig;
+    return false;
+}
+
+/* Some industry-standard resolutions to use as fallbacks.
+   We could simply try all the resolutions listed in the MDF/EDID, but that
+   might not work so well if we end up picking a mode with an odd aspect ratio.
+ */
+static const int fallback_resolutions[] = {
+    640, 350,
+    640, 400,
+    720, 400,
+    640, 480,
+    720, 480,
+    720, 576,
+    800, 600,
+    1024, 768,
+    1280, 1024,
+    1280, 720,
+    1920, 1080,
+};
+static const int num_fallbacks = sizeof(fallback_resolutions)/8;
+
+/*
+
+  Find an alternative mode which is supported by the hardware:
+
+  * Try higher BPPs (including true colour)
+  * Try lower BPPs
+  * Try alternate resolutions
+
+  Check for validity using Service_ModeExtension (although since we're only
+  dealing with known modes for known monitor types, we could optimise it to
+  go straight to HandleServiceModeExtension instead)
+
+  Be careful with special mode types (double-vertical, BBC gap mode, etc.)
+  because Service_ModeExtension won't be aware of kernel restrictions (and
+  using OS_CheckModeValid instead will introduce the risk of recursion
+  - although maybe we can mitigate that by only passing mode selector blocks
+  to OS_CheckModeValid?)
+
+  Non-teletext special mode type handling:
+
+  * Allow special mode types to be downgraded to non-special types:
+    * Double-pixel to normal
+    * BBC gap mode to regular gap mode
+    * Double-vertical to normal
+    * Hi-res mono to regular mono (always downgraded)
+  * There's no need to downgrade gap modes to non-gap modes, since gap modes
+    can be supported in any BPP
+  * Double-pixel is the only one that will affect Service_ModeExtension, since
+    that affects the physical resolution of the mode. So we'll potentially have
+    to vet double-pixel modes twice (once with it enabled, once with it
+    disabled)
+  * Theoretically we could upgrade regular modes to double-pixel in order to
+    work around hardware restrictions - but since double-pixel modes aren't
+    widely supported it's probably best to avoid that.
+
+ */
 static void service_modetranslation(_kernel_swi_regs *regs)
 {
-    unsigned int flags;
-    int depth;
-    PixelFormat pf;
-
-    static const char pal[4]  = {  0,  8, 12, 15 };
-    static const char ntsc[4] = { 44, 45, 46, 46 };
-    static const char vga[4]  = { 25, 26, 27, 28 };
-
     /* We do monitor type 7 only */
-    if (regs->r[3] != 7 || !current_monitor)
+    if (regs->r[3] != MONITOR_FILE || !current_monitor)
     {
         return;
     }
 
-    /* Someone has asked for an old-style mode number, but we
-     * must have refused it.
-     *
-     * If we don't handle this, the Kernel will select one of
-     * modes 25, 26, 27 or 28. This would be fine, except
-     * we may not have mode 25, due to interlacing problems, or
-     * we may have only non-interlaced modes.
-     *
-     * Note we're not told the bandwidth and memory limits.
-     * Could deal with this by issuing OS_CheckModeValid for
-     * each mode, but that adds reentrancy problems :) The
-     * selection of modes above are within the limits of even
-     * an A310, so we assume they won't be too big/fast.
-     */
+    /* Mode selector block with space for 8 parameters:
+       ModeFlags, NColour, XEig, YEig, Log2BPC, ScrRCol, ScrBRow, XWindLimit */
+    union {
+        ModeSelector m;
+        char c[sizeof(ModeSelector) + sizeof(ModeParam)*7 + 4];
+    } u;
 
-    /* What depth are they looking for? If the mode is
-     * unknown, use 1bpp (as the Kernel does).
-     */
-    if (_swix(OS_ReadModeVariable, _INR(0,1)|_OUT(2)|_OUT(_FLAGS),
-              regs->r[2], 9, &depth, &flags) || (flags & _C)) {
-        depth = 0;
-    }
-
-    /* Clamp depth to 8bpp to restrict ourselves to old-style
-     * modes.
-     */
-    if (depth > 3)
+    /* Convert input mode to selector block (as a standard bitmap mode) */
+    u.m.bit0 = 1;
+    u.m.format = 0;
+    u.m.flags = 0;
+    int log2bpc = modevar(regs->r[2], VduExt_Log2BPC, 3);
+    int log2bpp = modevar(regs->r[2], VduExt_Log2BPP, 3);
+    int doublepixel = log2bpc - log2bpp;
+    if (log2bpp > 5) /* TODO: Handle unusual colour depths better */
     {
-        depth = 3;
+        log2bpp = 5;
+    }
+    int orig_xresol = (modevar(regs->r[2], VduExt_XWindLimit, 639) + 1) << doublepixel;
+    u.m.xresol = orig_xresol;
+    int orig_yresol = modevar(regs->r[2], VduExt_YWindLimit, 479) + 1;
+    u.m.yresol = orig_yresol;
+    u.m.framerate = -1; /* Don't care (yet) */
+    u.m.param[0].index = VduExt_ModeFlags;
+    u.m.param[1].index = VduExt_NColour;
+    u.m.param[2].index = -1;
+
+    int driver = current_graphicsv_driver();
+    int formatmask = get_supported_pixel_formats(driver);
+
+    int orig_modeflags = modevar(regs->r[2], VduExt_ModeFlags, ModeFlag_FullPalette);
+
+    /* Restrict pixel formats for teletext modes */
+    if (orig_modeflags & ModeFlag_Teletext)
+    {
+        formatmask &= ~7;
     }
 
-retry_with_4bpp:
-     pixelformat_from_depth(&pf,depth);
+    int fallback_phase = 0;
+    int fallback_res = -1;
 
-    /* Check if 640x480xdepth @ 60Hz is available. If so, allow
-     * kernel to do normal.
-     */
-     if (mode_available(640, 480, &pf, 60))
-     {
-         regs->r[1] = Service_Serviced;
-         regs->r[2] = vga[depth];       /* substitute mode */
-         return;
-     }
+    while(1)
+    {
+        /* Assume that we're the only thing providing support for this monitor type, and peek at
+           the mode list to see if this resolution is supported at all */
+        if (resolution_supported(u.m.xresol, u.m.yresol, doublepixel))
+        {
+            /* Try same-or-higher colour depths */
+            int depthidx = log2bpp-1;
+            while ((1 << ++depthidx) <= formatmask)
+            {
+                if (!(formatmask & (1 << depthidx)))
+                {
+                    continue;
+                }
+                u.m.depth = pixelformats[depthidx].log2bpp;
+                u.m.param[0].value = pixelformats[depthidx].modeflags;
+                u.m.param[1].value = pixelformats[depthidx].ncolour;
+                if (offer_doublepixel_modeextension(&u.m, &doublepixel))
+                {
+                    goto found;
+                }
+            }
 
-     /* We don't have a standard VGA mode. Let's try a PAL TV
-      * mode.
-      */
-     if (mode_available(640, 256, &pf, 50))
-     {
-         regs->r[1] = Service_Serviced;
-         regs->r[2] = pal[depth];       /* substitute mode */
-         return;
-     }
+            /* Try lower colour depths */
+            depthidx = log2bpp;
+            while (--depthidx >= 0)
+            {
+                if (!(formatmask & (1 << depthidx)))
+                {
+                    continue;
+                }
+                u.m.depth = pixelformats[depthidx].log2bpp;
+                u.m.param[0].value = pixelformats[depthidx].modeflags;
+                u.m.param[1].value = pixelformats[depthidx].ncolour;
+                if (offer_doublepixel_modeextension(&u.m, &doublepixel))
+                {
+                    goto found;
+                }
+            }
+        }
+        /* Try assorted fallback resolutions */
+        switch (fallback_phase)
+        {
+        case 0:
+            /* Fallback resolutions, but only if higher than current */
+            while (++fallback_res < num_fallbacks)
+            {
+                u.m.xresol = fallback_resolutions[fallback_res*2];
+                u.m.yresol = fallback_resolutions[fallback_res*2+1];
+                if (((u.m.xresol >= orig_xresol) && (u.m.yresol >= orig_yresol))
+                 && ((u.m.xresol != orig_xresol) || (u.m.yresol != orig_yresol)))
+                {
+                    break;
+                }
+            }
+            if (fallback_res < num_fallbacks)
+            {
+                break;
+            }
+            /* Fall through ... */
+            fallback_phase = 1;
+        case 1:
+            /* Preferred mode (assumed to be the highest res mode the monitor supports) */
+            if ((preferred_mode != NULL) && (preferred_mode->bit0 == 1) && (u.m.xresol != preferred_mode->xresol) && (u.m.yresol != preferred_mode->yresol))
+            {
+                u.m.xresol = preferred_mode->xresol;
+                u.m.yresol = preferred_mode->yresol;
+                break;
+            }
+            /* Fall through... */
+            fallback_phase = 2;
+            fallback_res = num_fallbacks;
+        default:
+            /* Fallback resolutions, but lower resolutions */
+            while (--fallback_res >= 0)
+            {
+                u.m.xresol = fallback_resolutions[fallback_res*2];
+                u.m.yresol = fallback_resolutions[fallback_res*2+1];
+                if (!((u.m.xresol >= orig_xresol) && (u.m.yresol >= orig_yresol))
+                 && ((u.m.xresol != orig_xresol) || (u.m.yresol != orig_yresol)))
+                {
+                    break;
+                }
+            }
+            if (fallback_res >= 0)
+            {
+                break;
+            }
+            /* Give up */
+            return;
+        }
+    }
+found:;
+    /* Successfully found a mode
+       Fill in any extra attributes that are necessary for the mode */
 
-     /* Alright then. How about a NTSC TV mode? */
-     if (mode_available(640, 200, &pf, 60))
-     {
-         regs->r[1] = Service_Serviced;
-         regs->r[2] = ntsc[depth];      /* substitute mode */
-         return;
-     }
+    ModeParam *p = &u.m.param[2];
+    /* XEig, YEig are always stored */
+    p->index = VduExt_XEigFactor;
+    p->value = modevar(regs->r[2], VduExt_XEigFactor, 1);
+    p++;
+    p->index = VduExt_YEigFactor;
+    p->value = modevar(regs->r[2], VduExt_YEigFactor, 1);
+    p++;
 
-     /* Check if 640x480xdepth @ any rate is available */
-     if (mode_available(640, 480, &pf, -1))
-     {
-         regs->r[1] = Service_Serviced;
-         regs->r[2] = vga[depth];       /* substitute mode */
-         return;
-     }
+    /* Log2BPC, XWindLimit, ScrRCol only needed for double-pixel */
+    if (doublepixel)
+    {
+        p->index = VduExt_Log2BPC;
+        p->value = u.m.depth+1;
+        p++;
+        p->index = VduExt_XWindLimit;
+        p->value = (u.m.xresol>>1)-1;
+        p++;
+        p->index = VduExt_ScrRCol;
+        p->value = (u.m.xresol>>4)-1;
+        p++;
+    }
 
-     /* Still getting nowhere? Maybe we can't do 1bpp or 8bpp for
-      * various reasons. Try again with 4bpp.
-      */
-     if (depth != 2)
-     {
-         depth = 2;
-         goto retry_with_4bpp;
-     }
+    int modeflags = u.m.param[0].value | (orig_modeflags & (ModeFlag_GapMode+ModeFlag_BBCGapMode+ModeFlag_DoubleVertical+ModeFlag_NonGraphic+ModeFlag_Teletext));
 
-     /* I give up. Let someone else worry about it. */
-     return;
+    /* Teletext doesn't need any more attributes specified, and doesn't want the following rules applying */
+    if (!(orig_modeflags & ModeFlag_Teletext))
+    {
+        /* (non-Teletext) Double-vertical only supported by kernel for 1bpp */
+        if (u.m.depth)
+        {
+            modeflags &= ~ModeFlag_DoubleVertical;
+        }
+
+        if (modeflags & ModeFlag_BBCGapMode)
+        {
+            /* BBC gap modes only supported by kernel for 2bpp */
+            if (u.m.depth != 1)
+            {
+                modeflags &= ~(ModeFlag_BBCGapMode | ModeFlag_NonGraphic); /* Assume BBC gap modes and teletext are the only non-graphic modes (and teletext won't get here). So if it's no longer a BBC gap mode, it's no longer non-graphic. */
+            }
+            else
+            {
+                /* Set the correct NColour value if it's remaining a BBC gap mode */
+                p->index = VduExt_NColour;
+                p->value = 1;
+                p++;
+            }
+        }
+
+        /* Downgrade to partial 8bpp palette, for consistency with numbered modes */
+        if (u.m.depth == 3)
+        {
+            modeflags &= ~ModeFlag_FullPalette;
+            u.m.param[1].value = 63;
+        }
+
+        /* ScrBRow needed for gap modes, double-vertical */
+        if (modeflags & (ModeFlag_GapMode | ModeFlag_DoubleVertical))
+        {
+            int charheight = 8;
+            if (modeflags & ModeFlag_GapMode)
+            {
+                charheight = 10;
+            }
+            if (modeflags & ModeFlag_DoubleVertical)
+            {
+                charheight <<= 1;
+            }
+            p->index = VduExt_ScrBRow;
+            p->value = (u.m.yresol / charheight) - 1;
+            p++;
+        }
+    }
+    else
+    {
+        /* If the new mode is higher-res than the original, restrict ScrRCol & ScrBRow so that software which expects standard teletext (i.e. mode 7) resolution will continue to work */
+        int charwidth = 3; /* Shift */
+        int charheight = 10; /* Rows */
+        if (modeflags & ModeFlag_DoubleVertical)
+        {
+            /* HiResTTX */
+            charwidth = 4;
+            charheight = 20;
+        }
+        int orig_cols = modevar(regs->r[2], VduExt_ScrRCol, 39) + 1;
+        int orig_rows = modevar(regs->r[2], VduExt_ScrBRow, 24) + 1;
+        if ((u.m.xresol >> charwidth) > orig_cols)
+        {
+            p->index = VduExt_ScrRCol;
+            p->value = orig_cols - 1;
+            p++;
+        }
+        if ((u.m.yresol / charheight) > orig_rows)
+        {
+            p->index = VduExt_ScrBRow;
+            p->value = orig_rows - 1;
+            p++;
+        }
+    }
+
+    u.m.param[0].value = modeflags;
+    p->index = -1;
+
+    /* TODO: Try and map back to a numbered mode */
+
+    /* Copy the mode selector block to somewhere safe so we can return it */
+    static char static_mode[sizeof(ModeSelector) + sizeof(ModeParam)*7 + 4];
+    memcpy(static_mode, u.c, sizeof(u.c));
+    regs->r[1] = Service_Serviced;
+    regs->r[2] = (int) static_mode;
 }
 
 static void service_displaychanged(_kernel_swi_regs *regs)
@@ -1229,8 +1627,11 @@ static void service_displaychanged(_kernel_swi_regs *regs)
         case DisplayChanged_Changing:
             /* The current driver is changing. We must recache any
              * driver-specific things which we store.
-             * At the moment all the driver-specific stuff happens during the
-             * enumerate/translate calls, so just check the monitor's still there.
+             */
+            check_supported_controllist_items(regs->r[2]);
+
+            /*
+             * Check the monitor's still there.
              * Note that doing it here means:
              * a) ScreenModes must precede the driver if you want a mode defined
              *    during module init AND the MonitorType is EDID. If the MonitorType
@@ -1444,6 +1845,8 @@ _kernel_oserror *ScreenModes_initialise(const char *cmd_tail, int podule_base, v
     {
         using_edid = ((config & MonitorTypeBits) >> MonitorTypeShift) == MONITOR_EDID;
     }
+
+    check_supported_controllist_items(current_graphicsv_driver());
 
     UNUSED(cmd_tail);
     UNUSED(podule_base);
