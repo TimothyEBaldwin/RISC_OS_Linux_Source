@@ -1,14 +1,18 @@
 # Linux port of RISC OS
 
-This is experimental software, there is a good chance it won't work!
+It is currently being discussed on the [RISC OS Open website](https://www.riscosopen.org/forum/forums/3/topics/9068). There is no sound support at present, and is incomplete in other ways. You should not reguard any new APIs to be stable.
 
-It is currently being discussed on the [RISC OS Open website](https://www.riscosopen.org/forum/forums/3/topics/9068).
-
-It should run on ARM Linux system natively, or slow on other Linux systems with the aid of a slightly [modified](mixed/Linux/Support/qemu_swi.diff) QEMU.
+It should run on a 32-bit capable ARM Linux system natively, or slow on other Linux systems with the aid of a slightly [modified](mixed/Linux/Support/qemu_swi.diff) QEMU. Unfortunately server class ARM hardware is typically 64-bit only.
 
 The RISC OS "ROM" Image is a Linux executable.
 
 If you run RISC OS directly then, unlike virtual machines such as RPCEmu, there is **no restriction on what RISC OS programs can do to the Linux environment** beyond that provided by Linux. If you use the provided scripts then RISC OS should be prevented from causing harm.
+
+You can disable the secure sandbox by seting the environment variable `RISC_OS__INSECURE` to `YES` when running `run_RISC_OS`, for example:
+
+```
+RISC_OS__INSECURE=YES ./run_RISC_OS
+```
 
 RISC OS Open Limited’s DDE is required to build RISC OS, this is proprietary software that may be brought from [RISC OS Open Limited](https://www.riscosopen.org/content/sales/dde)
 
@@ -113,11 +117,14 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 - [x] Support writing timestamps in IXFS.
 - [x] Support reading timestamps in IXFS to centisecond resolution.
 - [x] Test timestamps.
+- [ ] Add sound modules.
+- [ ] Add sound output.
 - [ ] Officially allocate names and SWI numbers etc.
 - [x] Fix failure to truncate of unbuffered files when opened for output, and associated race condition.
 - [ ] Fix spurious calls of FSEntry_Args 6 (flush file to disc) when files are closed.
 - [ ] Perform proper error handling in IXFS.
 - [x] Split video keyboard and mouse driver into separate module.
+- [ ] Detect screen updates to avoid copying full screen 20 times a second.
 - [ ] Finish video keyboard and mouse driver.
 - [ ] Fix overwriting of ROM image when rebuilding RISC OS, which will cause a crash if the overwritten ROM image is currently being run.
 - [ ] Provide a means to run Linux programs.
