@@ -699,6 +699,43 @@ static int build_a_vidclist(VIDCListRef vp, ModeDescriptionRef mp, const PixelFo
     return ctrllistpos;
 }
 
+static uint32_t true_bpp(const PixelFormat *pf)
+{
+    /* Get true bpp value */
+    uint32_t bpp = 1<<pf->log2bpp;
+    if (pf->log2bpp == 6) /* 24bit packed formats */
+        bpp = 24;
+    else if (pf->log2bpp == 7) /* YUV formats - TODO! */
+        return 0;
+    return bpp;
+}
+
+static int default_extrabytes(ModeDescriptionRef mp, const PixelFormat *pf)
+{
+    uint32_t mx = mp->definition.timings.xres;
+    uint32_t bpp = true_bpp(pf);
+    uint32_t linelength;
+    if (bpp < 8)
+    {
+        uint8_t shift = 3 - pf->log2bpp;
+        uint32_t round = (1 << shift) - 1;
+        linelength = (mx + round) >> shift;
+    }
+    else
+    {
+        uint8_t mult = bpp>>3;
+        linelength = mx * mult;
+    }
+
+    /* The OS requires that framebuffer rows start on word boundaries;
+     * if padding is needed for this, signal it to the driver via ExtraBytes,
+     * so that drivers don't need to know of the OS's limitation (although
+     * we do assume that the driver doesn't request that ExtraBytes be
+     * modified to something inappropriate!)
+     */
+    return ((linelength+3) & ~3) - linelength;
+}
+
 /* Test for whether a given mode definition is usable within the
  * specified data rate and video memory size bounds, at a given pixel
  * depth.  Limitations of the current video controller chip (if known)
@@ -720,12 +757,11 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormat *pf,
     uint32_t pixels = mx * my;
     uint32_t datarate, datasize;
 
-    /* Get true bpp value */
-    uint32_t bpp = 1<<pf->log2bpp;
-    if (pf->log2bpp == 6) /* 24bit packed formats */
-        bpp = 24;
-    else if (pf->log2bpp == 7) /* YUV formats - TODO! */
+    uint32_t bpp = true_bpp(pf);
+    if (!bpp)
+    {
         return 0;
+    }
 
     /* Convert from pixels to bytes: method varies according to depth */
     if ((bpp > 4) && (current_monitor->lcd_support == 1))
@@ -733,19 +769,21 @@ static int mode_valid(ModeDescriptionRef mp, const PixelFormat *pf,
         return 0;         /** Eek! 4bpp is max for b/w panels! **/
     }
 
+    uint32_t linelength;
     if (bpp < 8)
     {
         uint8_t shift = 3 - pf->log2bpp;
         uint32_t round = (1 << shift) - 1;
         datarate = (pixrate + round) >> shift;
-        datasize = (pixels + round) >> shift;
+        linelength = (mx + round) >> shift;
     }
     else
     {
         uint8_t mult = bpp>>3;
         datarate = pixrate * mult;
-        datasize = pixels * mult;
+        linelength = mx * mult;
     }
+    datasize = (linelength + extrabytes) * my;
 
     /* Check global data rate/size limits */
     if (datarate > maxdatarate || datasize > maxdatasize)
@@ -897,7 +935,7 @@ bool find_deepest_by_xyhz(PixelFormatRef fp, ModeDescriptionRef mp)
      */
     while (pflistlen)
     {
-        if (mode_valid(mp, pflist, INT32_MAX, INT32_MAX, 0, NULL))
+        if (mode_valid(mp, pflist, INT32_MAX, INT32_MAX, default_extrabytes(mp, pflist), NULL))
         {
             /* That depth is achievable, keep it if bigger */
             if (pflist->log2bpp > maxlog2bpp)
@@ -1020,7 +1058,8 @@ static void service_modeextension(_kernel_swi_regs *regs)
     /* Examine the mode selector to deduce the pixel format */
     pixelformat_from_depth(&pf,sel->depth);
     ModeParam *param = sel->param;
-    int extrabytes = 0;
+    int orig_linelength = ((sel->xresol << sel->depth) + 7) >> 3;
+    int linelength = orig_linelength;
     while (param->index != -1)
     {
         if (param->index == VduExt_ModeFlags)
@@ -1028,7 +1067,7 @@ static void service_modeextension(_kernel_swi_regs *regs)
         else if (param->index == VduExt_NColour)
             pf.ncolour = param->value;
         else if (param->index == VduExt_LineLength)
-            extrabytes = param->value - (((sel->xresol << sel->depth) + 7) >> 3);
+            linelength = param->value;
         param++;
     }
 
@@ -1057,6 +1096,15 @@ static void service_modeextension(_kernel_swi_regs *regs)
     /* Bail if we see something unexpected */
     if (pf.modeflags & ~(ModeFlag_FullPalette | ModeFlag_64k | ModeFlag_ChromaSubsampleMode | ModeFlag_DataFormat_Mask))
         return;
+
+    /* The OS requires that framebuffer rows start on word boundaries;
+     * if padding is needed for this, signal it to the driver via ExtraBytes,
+     * so that drivers don't need to know of the OS's limitation (although
+     * we do assume that the driver doesn't request that ExtraBytes be
+     * modified to something inappropriate!)
+     */
+    linelength = (linelength+3) & ~3;
+    int extrabytes = linelength - orig_linelength;
 
     /* Pick up data size limit from args to service call */
     datasizelimit = regs->r[5]; /* data size is measured in bytes */
@@ -1142,7 +1190,7 @@ static void service_enumeratescreenmodes(_kernel_swi_regs *regs)
 
     for (;;)
     {
-        if (!mode_valid(mp, pf, dataratelimit, datasizelimit, 0, NULL))
+        if (!mode_valid(mp, pf, dataratelimit, datasizelimit, default_extrabytes(mp, pf), NULL))
         {
             /* TMD 03-Nov-93: Fix bug MED-00833
              * Code used to set depth to 5 here, assuming that if the mode
@@ -1285,14 +1333,13 @@ static bool offer_doublepixel_modeextension(ModeSelector *m, int *doublepixel)
         return (regs.r[1] == Service_Serviced);
     }
     /* Double-pixel only valid for <= 16bpp */
-    if (m->depth > 4)
+    if (m->depth <= 4)
     {
-        return false;
-    }
-    service_modeextension(&regs);
-    if (regs.r[1] == Service_Serviced)
-    {
-        return true;
+        service_modeextension(&regs);
+        if (regs.r[1] == Service_Serviced)
+        {
+            return true;
+        }
     }
     /* Halve the width and try again */
     int orig = m->xresol;
@@ -1305,6 +1352,46 @@ static bool offer_doublepixel_modeextension(ModeSelector *m, int *doublepixel)
     }
     m->xresol = orig;
     return false;
+}
+
+static const char compared_mode_variables[] = {
+    VduExt_XWindLimit, /* Compare resolution first since that has the most variance */
+    VduExt_YWindLimit,
+    VduExt_ModeFlags,
+    VduExt_Log2BPP,
+    VduExt_XEigFactor,
+    VduExt_YEigFactor,
+    VduExt_Log2BPC,
+    VduExt_ScrRCol,
+    VduExt_ScrBRow,
+    VduExt_LineLength,
+    VduExt_NColour,
+    VduExt_ScreenSize,
+};
+static const int num_compared_mode_variables = sizeof(compared_mode_variables);
+
+static int mode_selector_to_mode_number(const ModeSelector *m)
+{
+    /* Attempt to map back to a numbered mode, looking for an exact match in all mode variables (except YShftFactor) */
+    int vars[num_compared_mode_variables];
+    for (int i=0;i<num_compared_mode_variables;i++)
+    {
+        vars[i] = modevar((int) m, compared_mode_variables[i], 0);
+    }
+    for (int mode=0;mode<64;mode++) /* Only check kernel modes? */
+    {
+        for(int i=0;i<num_compared_mode_variables;i++)
+        {
+            int val = modevar(mode, compared_mode_variables[i], 0);
+            if (val != vars[i])
+            {
+                goto nextmode;
+            }
+        }
+        return mode;
+nextmode:;
+    }
+    return -1;
 }
 
 /* Some industry-standard resolutions to use as fallbacks.
@@ -1611,7 +1698,13 @@ found:;
     u.m.param[0].value = modeflags;
     p->index = -1;
     
-    /* TODO: Try and map back to a numbered mode */
+    int mode_number = mode_selector_to_mode_number(&u.m);
+    if (mode_number != -1)
+    {
+        regs->r[1] = Service_Serviced;
+        regs->r[2] = mode_number;
+        return;
+    }
     
     /* Copy the mode selector block to somewhere safe so we can return it */
     static char static_mode[sizeof(ModeSelector) + sizeof(ModeParam)*7 + 4];
