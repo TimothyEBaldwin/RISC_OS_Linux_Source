@@ -178,7 +178,7 @@ ifndef FAST
 endif
 	(
 	  cd Support/bin
-	  git fetch --force https://github.com/TimothyEBaldwin/RO_Linux.git master:master
+	  git fetch --force https://github.com/TimothyEBaldwin/RISC_OS_Linux_Binary.git master:master
 	  git checkout master
 	)
 	rm -rf Support/bin/Support 'Support/bin/!Boot'
