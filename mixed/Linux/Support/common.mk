@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-HARDDISC4=$(HOME)/Downloads/HardDisc4.5.24.zip
+HARDDISC4=$(HOME)/Downloads/HardDisc4.5.24.util
 QEMU_SRC=$(HOME)/Downloads/qemu-3.0.0.tar.xz
 RPCEMU=$(HOME)/Downloads/rpcemu-0.8.15.tar.gz
 IOMD=$(HOME)/Downloads/IOMD-Soft.5.24.zip
@@ -219,34 +219,24 @@ Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
 	sandbox_root:=$${sandbox_root[@]@Q}
 	QEMU:=$$QEMU1" > $@
 
-HardDisc4: | $(HARDDISC4)
+HardDisc4: | $(HARDDISC4) Built/sandbox_config_sh $(LINUX_ROM)
 	set -o pipefail
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files
-	cp --reflink=auto '$(HARDDISC4)' HardDisc4_files/HardDisc4.zip
-	unpack() {
-	  echo 'b2229fbf5f08026d99e2fd552431187d868b3276816b1429709d0594b4a400bc *HardDisc4.zip' | sha256sum -c
-	  unzip HardDisc4.zip
-	  rm HardDisc4.zip
-	  chmod -R u+rw .
-	  mv 'HardDisc4/!Boot/!Run' 'HardDisc4/!Boot/!Run_real,feb'
-	  {
-	    echo 'Dir <Obey$$Dir>.^'
-	    cat ../Support/hd4_types
-	    echo -n '
-	      Remove <Obey$$Dir>.!Run
-	      Rename <Obey$$Dir>.!Run_real <Obey$$Dir>.!Run
-	      /<Obey$$Dir>'
-	  } >> 'HardDisc4/!Boot/!Run,feb'
-	  cp -a --reflink=auto 'HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4/!Boot/Choices/Boot'
-	  printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
-	}
+	cp --reflink=auto '$(HARDDISC4)' HardDisc4_files/hd4,ffc
+	echo 'c6e19fcc9a9783cbb8ebf5d1c52464ca810bf94ad6509bbe4818391c6bc8d4f4 *HardDisc4_files/hd4,ffc' | sha256sum -c
 ifeq ($(INSECURE), YES)
-	( cd HardDisc4_files && unpack )
+	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.proc.self.cwd.HardDisc4_files.hd4
+	BASIC -quit IXFS:$$.proc.self.cwd.Support.Finish' '$(LINUX_ROM)'
 else
-	export -f unpack
-	$(sandbox_base) $(sandbox_misc) --ro-bind Support /Support --bind HardDisc4_files /hd4 --chdir /hd4 bash -x -e -c unpack
+	. Built/sandbox_config_sh
+	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.HardDisc4_files.hd4
+	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
+	 --ro-bind Support/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
+	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS </dev/null 2>&1 | cat
 endif
+	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
+	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built
@@ -256,7 +246,7 @@ Built/boot_iomd_rom: $(IOMD) | Built
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 
 $(HARDDISC4):
-	sh Support/download.sh '$(HARDDISC4)' "https://www.riscosopen.org/zipfiles/platform/common/HardDisc4.5.24.zip" "b2229fbf5f08026d99e2fd552431187d868b3276816b1429709d0594b4a400bc"
+	sh Support/download.sh '$(HARDDISC4)' "https://www.riscosopen.org/zipfiles/platform/common/HardDisc4.5.24.util" "c6e19fcc9a9783cbb8ebf5d1c52464ca810bf94ad6509bbe4818391c6bc8d4f4"
 	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 $(IOMD):
