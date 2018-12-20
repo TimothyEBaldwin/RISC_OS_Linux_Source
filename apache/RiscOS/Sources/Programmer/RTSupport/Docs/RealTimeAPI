@@ -1,0 +1,377 @@
+RTSUPPORT MODULE API
+====================
+
+The RTSupport module provides facilities supporting real-time code, at a
+priority just below that of the interrupt dispatch system, and above that
+of any SWIs being handled by the foreground application. Multiple priority
+levels are supported, so routines with tighter timing constraints can
+pre-empt other real-time routines. Code can be designed either using a
+callback model (where the system makes a function call to your entry point)
+or using a thread model (where the rest of the system gets CPU time while
+your thread sleeps).
+
+Code typically executes in system (SYS) mode and has its own SYS and SVC
+stacks, and it may call SWIs (but only re-entrant SWIs) without preventing
+higher-priority routines from executing. There is no automatic time-slicing
+of routines; it is assumed that the application takes responsibility for
+ensuring that the system is not overloaded (although there is a relief valve
+to cope with overloaded systems, which ensures that the foreground process
+gets a little CPU time at least a few times per second).
+
+Possible future enhancements:
+* Per-routine option of maintaining a floating point context for the routine
+  (traps would need to be disabled while real-time routines execute)
+* Per-routine data storage (for example to support C++ exception handling)
+* Reusing spare stack frames in the IRQ stack when nearing overflow (useful
+  for timeslicing schemes)
+* The facility to recache the priority lookup file after module
+  initialisation
+
+
+                                                        RT_Register
+                                                       (SWI &575C0)
+
+Register a routine with the RTSupport module
+
+On entry
+  R0 = flags (reserved, should be zero)
+  R1 = pointer to default entry point for routine
+  R2 = handle to pass in R0 to routine
+  R3 = handle to pass in R12 to routine
+  R4 = default pointer to pollword for routine
+  R5 = initial value of R10 for routine
+  R6 = initial value of R13_sys for routine
+  R7 = initial priority for routine: integer between 1-255, or a pointer to
+       a string
+
+On exit
+  R0 = RTSupport module's handle for this routine
+  All other registers are preserved
+
+Interrupts
+  Interrupts are disabled
+  Fast interrupts are enabled
+
+Processor Mode
+  Processor is in SVC mode
+
+Re-entrancy
+  SWI is re-entrant
+
+Use
+  This SWI adds a new routine to the list of routines to potentially be
+  executed each time the interrupt dispatcher is unthreaded (but before
+  transient and non-transient callbacks are executed, if the dispatcher
+  is returning to USR mode). Each routine remains registered until removed
+  by a call to RT_Deregister, but it may sleep for a time by use of a
+  pollword. It is recommended that if it is known that a routine will sleep
+  for an extended time, that a Deregister/Register pair should be used
+  instead, to reduce cache thrashing during interrupt handling (when the
+  RTSupport module has to check all possible pollwords).
+
+  Each time the RTSupport module gains control of the CPU, it scans its
+  list of routines in decreasing priority order for routines that are
+  unblocked (ie where the pollword is non-zero). If a real-time routine was
+  interrupted, then routines of a higher priority are executed, followed by
+  the interrupted routine, and then equal and lower priority routines are
+  examined. (However, note that if and only if routines have their
+  priorities changed dynamically, it is possible that while a routine is
+  executing, a second routine at the same priority level may be in a
+  pre-empted state.) If the RTSupport module encounters two unblocked
+  routines at the same priority level, then the calling order is undefined.
+
+  The routines are called as follows:
+
+  On entry:
+    R0      = contents of R2 when registered
+    R10     = first time, this is contents of R5 when registered;
+              subsequently, it is preserved from the previous call
+    R11     = 0 (to support C code)
+    R12     = contents of R3 when registered
+    R13_sys = first time, this is contents of R6 when registered;
+              subsequently, it is preserved from the previous call
+    R13_svc = first time, this is the top of an 8K stack based at a megabyte
+              boundary (the same logical address is used for all real-time
+              routine SVC stacks, but it differs from the SVC stack address
+              used by the foreground process); subsequently, it is preserved
+              from the previous call
+    R14_sys = return address (only needed if using the callback model)
+    SYS mode
+    First time, IRQs and FIQs enabled;
+    subsequently IRQ disable state is preserved
+    Other registers undefined
+    Static relocation offsets at base of SVC stack are undefined
+
+  On exit:
+    R0      = flags:
+              bit 0 set => rescan all higher priority routines (for example,
+                           if this routine unblocked a semaphore that a
+                           higher priority routine may be sleeping on)
+                           otherwise rescan all equal priority routines,
+                           including this routine, before descending
+              bit 1 set => R1 contains new pollword pointer (otherwise the
+                           pollword given at registration is used)
+              bit 2 set => R2 contains a monotonic time after which control
+                           should be returned even if the pollword is not
+                           set
+              bit 3 set => R14_sys contains the address to enter next time
+                           (otherwise the address used at registration is
+                           re-entered)
+              other bits are reserved and will currently be zero
+    R1      = pollword pointer (if R0 bit 1 is set)
+    R2      = timeout monotonic time (if R0 bit 2 is set)
+    R10     = value to use at next entry
+    R13_sys = value to use at next entry
+    R13_svc = value to use at next entry
+    R14_sys = next entry point (if R0 bit 3 is set)
+    SYS mode, IRQs enabled or disabled, FIQs enabled
+    SVC stack may be non-empty
+    Processor flags, R1-R9 (except where used to return parameters), R11,
+    R12 and R14_svc may be corrupted
+
+  So for example the routine may be implemented as
+
+  * Assembler, with the static data referenced using R12 as is conventional
+    in RISC OS.
+
+  * C code interfaced directly, as long as R10 and R13_sys are set up to
+    describe a standard stack chunk with the reserved words at its base set
+    up to enable static data relocation, for example by copying them from
+    the base of the SVC stack prior to the RT_Register call:
+
+    _kernel_stack_chunk *chunk = calloc(1, CHUNK_SIZE);
+    chunk->sc_mark = 0xF60690FF;
+    chunk->sc_size = CHUNK_SIZE;
+    memcpy(chunk + 1, _kernel_current_stack_chunk() + 1, 28);
+    _kernel_swi_regs r = { /* ... */ .r[5] = ((int) chunk) + 560,
+                           .r[6] = ((int) chunk) + CHUNK_SIZE, /* ... */ };
+    _kernel_swi(RT_Register, &r, &r);
+
+    Here is an example callback-model routine written in C that repeatedly
+    sleeps for a second at a time (assuming the default pollword is never
+    set):
+
+    typedef struct {
+      unsigned int flags;
+      unsigned int *pollword;
+      unsigned int timeout;
+    } routine_result_t;
+
+    __value_in_regs routine_result_t MyRoutine(void *r0) {
+      unsigned int time;
+      _swix(OS_ReadMonotonicTime, _OUT(0), &time);
+      return (routine_result_t) { 1<<2, NULL, time + 100 };
+    }
+
+  * C code interfaced via a veneer: if you want to be able to call
+    _kernel_raise_error() and functions which rely upon it like exit(),
+    abort() and assert(), which assume the outermost stack frame was called
+    as a function returning a _kernel_oserror *, or for use as a threading
+    library where actions need to be taken when the thread exits (eg
+    unblocking joining threads) you will need an assembler veneer to the C
+    code, to patch the r14_sys the C code sees on entry with a pointer to a
+    suitable cleanup function.
+
+  The priority passed in R7 can be an integer from 1 (lowest priority) to
+  255 (highest priority). Priority 0 is reserved for the exclusive use of
+  the foreground process. However, it is preferred that a string pointer
+  be used instead: the string is used to look up a priority in the file
+  RTSupport:Priorities. This enables easy tuning of priority levels for a
+  given system, without the need for each real-time component to be
+  individually configurable. For example, the file might be as follows:
+    Critical:224
+    AudioFill:192
+    VideoPaint:160
+    Normal:128
+    AudioDecode:96
+    VideoDecode:64
+    Coroutine:32
+
+Related SWIs
+  RT_Deregister
+
+
+                                                      RT_Deregister
+                                                       (SWI &575C1)
+
+Remove a routine previously registered with the RTSupport module
+
+On entry
+  R0 = flags (reserved, should be zero)
+  R1 = routine handle returned from RT_Register
+
+On exit
+  All registers are preserved
+
+Interrupts
+  Interrupts are disabled
+  Fast interrupts are enabled
+
+Processor Mode
+  Processor is in SVC mode
+
+Re-entrancy
+  SWI is re-entrant
+
+Use
+  This SWI can be used to remove a routine from the list held by the
+  RTSupport module. If the routine in question is currently executing then
+  this call does not return.
+
+Related SWIs
+  RT_Register
+
+
+                                                           RT_Yield
+                                                       (SWI &575C2)
+
+Sleep the current thread and force a test of all pollwords
+
+On entry
+  R1 = pointer to pollword
+
+On exit
+  All registers are preserved
+
+Interrupts
+  Interrupts are disabled
+  Fast interrupts are enabled
+
+Processor Mode
+  Processor is in SVC mode
+
+Re-entrancy
+  SWI is re-entrant
+
+Use
+  This SWI has two uses: firstly it enables code in real-time context to
+  sleep, and secondly it enables the foreground process to force a test
+  of all pollwords (for example if the foreground sets the pollword of a
+  thread, this may be used to wake the thread rather than having to wait
+  for the next interrupt). The pollword is usually insignificant for the
+  foreground process, because by definition control returns to it when no
+  pollwords are set; however, it may be useful if the foreground is
+  currently set to a priority above that of a real-time routine.
+
+  It is an error to make this call from interrupt context.
+
+  While in real-time context, OS_UpCall 6 is interpreted as a call to this
+  SWI. (UpCall 7 is also intercepted if an attempt is made to remove a
+  pollword being used by the real-time system.)
+
+Related SWIs
+  RT_TimedYield
+
+
+                                                      RT_TimedYield
+                                                       (SWI &575C3)
+
+Perform a time-limited sleep of the current thread and force a test of
+all pollwords
+
+On entry
+  R1 = pointer to pollword
+  R2 = monotonic time at which to return control even if pollword is unset
+
+On exit
+  All registers are preserved
+
+Interrupts
+  Interrupts are disabled
+  Fast interrupts are enabled
+
+Processor Mode
+  Processor is in SVC mode
+
+Re-entrancy
+  SWI is re-entrant
+
+Use
+  This SWI is similar to RT_Yield except that the sleep does not extend
+  indefinitely.
+
+Related SWIs
+  RT_Yield
+
+
+                                                  RT_ChangePriority
+                                                       (SWI &575C4)
+
+Change the priority of an existing real-time routine
+
+On entry
+  R0 = flags (reserved, should be zero)
+  R1 = routine handle returned from RT_Register, or 0 to change the priority
+       of the foreground process
+  R2 = new priority (as for RT_Register)
+
+On exit
+  R0 = previous priority level (as a number from 0-255)
+  All other registers are preserved
+
+Interrupts
+  Interrupts are disabled
+  Fast interrupts are enabled
+
+Processor Mode
+  Processor is in SVC mode
+
+Re-entrancy
+  SWI is re-entrant
+
+Use
+  This SWI allows the priority setting of a routine to be changed on the
+  fly, for example if process has become more time-critical, or if it is
+  blocking a routine of a higher priority. It may cause a thread switch
+  if a different thread is promoted above the priority of the current
+  thread, or if the current thread is demoted below other unblocked threads.
+
+  The priority level of the foreground process may be changed, but this is
+  only intended for short-term use and not when the foreground is in USR
+  mode (otherwise system callbacks will also be promoted above some
+  real-time threads, which is undesirable behaviour).
+
+Related SWIs
+  RT_Register
+
+
+                                                        RT_ReadInfo
+                                                       (SWI &575C5)
+
+Read status information
+
+On entry
+  R0 = reason code
+
+On exit
+  R0 = value
+  All other registers are preserved
+  V flag is set if the reason code was not recognised
+
+Interrupts
+  Interrupt state is unchanged
+  Fast interrupts are enabled
+
+Processor Mode
+  Processor is in SVC mode
+
+Re-entrancy
+  SWI is re-entrant
+
+Use
+  This SWI enables you to read current state variables. Reason codes
+  currently defined are:
+    reason  meaning
+    0       RTSupport handle for current routine, or
+            0 if in foreground, or
+            -1 if in interrupt context
+    1       Priority setting (integer value) of current routine, or
+            -1 if in interrupt context
+    2       Base address of SVC stack for real-time routines
+
+Related SWIs
+  RT_Register
+
+
+
+BJGA, 2004-11-01
