@@ -31,6 +31,7 @@ EXPORTS   = ${C_EXP_HDR}.${ASMCHEADER1}
 HELPSRC   = HelpSrc
 TOKHELPSRC= ${TOKENSOURCE}
 RESFSDIR  = ${RESDIR}.${COMPONENT}
+ROM_LIBS  = ${PVLIBS}
 
 include StdTools
 include AAsmModule
