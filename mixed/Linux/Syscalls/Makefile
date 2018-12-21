@@ -26,6 +26,7 @@ h.syscalls: GenSyscall
 export_hdrs: h.syscalls
 	${MKDIR} <CExport$dir>.ix.h
 	${CP} LinuxSyscalls <Export$Dir>.LinuxSyscalls ${CPFLAGS}
+	${CP} LinuxDefs <Export$Dir>.LinuxDefs ${CPFLAGS}
 	${CP} h.syscalls <CExport$dir>.ix.h.syscalls ${CPFLAGS}
 	${CP} h.syscall_defs <CExport$dir>.ix.h.syscall_defs ${CPFLAGS}
 	${CP} h.syscall_types <CExport$dir>.ix.h.syscall_types ${CPFLAGS}
