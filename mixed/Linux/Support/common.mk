@@ -247,7 +247,7 @@ Built/boot_iomd_rom: $(IOMD) | Built
 
 $(HARDDISC4):
 	sh Support/download.sh '$(HARDDISC4)' "https://www.riscosopen.org/zipfiles/platform/common/HardDisc4.5.24.util" "c6e19fcc9a9783cbb8ebf5d1c52464ca810bf94ad6509bbe4818391c6bc8d4f4"
-	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
+	setfattr -n user.RISC_OS.LoadExec -v 0x00fcffff00000000 $@ || true
 
 $(IOMD):
 	sh Support/download.sh '$(IOMD)' "https://www.riscosopen.org/zipfiles/platform/riscpc/IOMD-Soft.5.24.zip" "a9eb33be72f0ead8c6263dd15da5648639094e6b34001739363571fe08fc9d91"
