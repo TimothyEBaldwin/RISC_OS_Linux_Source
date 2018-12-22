@@ -181,12 +181,16 @@ endif
 	  git fetch --force https://github.com/TimothyEBaldwin/RISC_OS_Linux_Binary.git master:master
 	  git checkout master
 	)
-	rm -rf Support/bin/Support 'Support/bin/!Boot'
+	rm -rf Support/bin/*
 	mkdir -p Support/bin/Support
 	cp -v --reflink=auto --preserve=mode,xattr Support/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Support/bin/Support/
 	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Support/bin/
-	ln -sf 'Support/Start_RISC_OS.desktop' 'Support/bin/Start_RISC_OS.desktop'
-	ln -sf 'Support/run_RISC_OS' 'Support/bin/run_RISC_OS'
+	#
+	mkdir -p Support/bin/Unix
+	cp -vrL Unix/SocketKVMFrontends Support/bin/Unix/SocketKVMFrontends
+	ln -sf ../Support Support/bin/Unix/LinuxSupport
+	ln -sf 'Unix/LinuxSupport/Start_RISC_OS.desktop' 'Support/bin/Start_RISC_OS.desktop'
+	ln -sf 'Unix/LinuxSupport/run_RISC_OS' 'Support/bin/run_RISC_OS'
 	#
 	echo "# Source and build GIT commits
 	SOURCE=$$SOURCE

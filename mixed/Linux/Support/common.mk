@@ -60,38 +60,18 @@ sandbox_build := $(sandbox_root) $(call robind,/usr /etc/alternatives) --dev /de
 sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all $(if $(use_seccomp), --seccomp 9 9< <(Built/gen_seccomp $(1)), --new-session) --proc /proc --dir /tmp --dir /dev/shm
 ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
-frontend_depends := Support/Keyboard.h Support/frontend_common.h Support/SocketKVM_Protocol.h $(lib_depends)
 
 include $(wildcard Support/build.mk)
 
-script-all: Built/sdl RISC_OS HardDisc4 Built/wrapper
+script-all: RISC_OS HardDisc4 Built/wrapper
 
 RISC_OS:
-
-Built:
-	mkdir Built
-
-sdl: Built/sdl
-	ln -sf Built/sdl sdl
-
-opengl: Built/opengl
-	ln -sf Built/opengl opengl
 
 comma2attr: Built/comma2attr
 	ln -sf Built/comma2attr comma2attr
 
 Start_RISC_OS.desktop:
 	ln -s Support/Start_RISC_OS.desktop
-
-Built/sdl: Support/sdl.cpp Built/sdlkey.h $(frontend_depends)
-	g++ --std=c++11 -Wall -pthread -g -O2 -IBuilt Support/sdl.cpp  `sdl2-config --cflags --libs` -o Built/sdl
-
-Built/opengl: Support/opengl.cpp $(frontend_depends)
-	g++ -pthread -g -O2 --std=c++11 Support/opengl.cpp -lGL -lGLU -lglut -o Built/opengl
-
-Built/sdlkey.h: Support/sdlkey.c $(lib_depends) Support/Keyboard.h | Built
-	gcc -std=gnu99 -Wall -IBuilt Support/sdlkey.c `sdl2-config --cflags --libs` -o Built/sdlkey
-	Built/sdlkey > $@
 
 Built/comma2attr: Support/comma2attr.c $(lib_depends) | Built
 	gcc -std=gnu99 -Wall -g Support/comma2attr.c -o Built/comma2attr
