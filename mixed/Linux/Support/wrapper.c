@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
   // Get terminal status, if successful reopen terminal for input.
   if (!tcgetattr(0, &oldTioIn)) {
 
-    // Standard input is a terminal, ro reopen it avoid
+    // Standard input is a terminal, so reopen to it avoid
     // other programs having to cope with non-blocking etc.
     int fd = open("/proc/self/fd/0", O_RDONLY);
     if (fd > 0) {
@@ -125,6 +125,7 @@ int main(int argc, char **argv) {
         .msg_control = u.buf,
         .msg_controllen = sizeof(u.buf)
       };
+
       struct cmsghdr *cmsg;
       cmsg = CMSG_FIRSTHDR(&msg);
       cmsg->cmsg_level = SOL_SOCKET;
