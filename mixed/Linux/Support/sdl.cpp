@@ -136,6 +136,7 @@ int main(int argc, char **argv) {
           log2bpp = c.mode.vidc[1];
           //cerr << "Set mode " << log2bpp << ' ' << height << ' ' << width << endl;
           SDL_FreeSurface(screen);
+          screen = nullptr;
           switch (log2bpp) {
             case 3:
               screen = SDL_CreateRGBSurfaceFrom(pixels, width, height, 8, width, 0, 0, 0, 0);
