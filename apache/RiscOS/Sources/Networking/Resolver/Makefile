@@ -36,4 +36,4 @@ rom_link-Resolver:
 	@${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
 
 clean::
-	${RM} linked.Resolver
+	${WIPE} linked ${WFLAGS}

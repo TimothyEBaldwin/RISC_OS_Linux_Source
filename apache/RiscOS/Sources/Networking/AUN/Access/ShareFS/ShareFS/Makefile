@@ -32,4 +32,4 @@ rom_link-ShareFS:
 	@${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
 
 clean::
-	${RM} linked.ShareFS
+	${WIPE} linked ${WFLAGS}
