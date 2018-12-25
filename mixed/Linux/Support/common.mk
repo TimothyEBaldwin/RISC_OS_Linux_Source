@@ -44,7 +44,7 @@ SHELL=$(warning Building $@)$(BASH)
 .DELETE_ON_ERROR:
 .PHONY: all script-all
 
-all: sdl Start_RISC_OS.desktop comma2attr
+all: comma2attr
 
 ifeq ($(INSECURE), YES)
 QEMU:=/usr/bin/env
@@ -69,9 +69,6 @@ RISC_OS:
 
 comma2attr: Built/comma2attr
 	ln -sf Built/comma2attr comma2attr
-
-Start_RISC_OS.desktop:
-	ln -s Support/Start_RISC_OS.desktop
 
 Built/comma2attr: Support/comma2attr.c $(lib_depends) | Built
 	gcc -std=gnu99 -Wall -g Support/comma2attr.c -o Built/comma2attr
