@@ -54,7 +54,7 @@
   fprintf(ass, "ix_%s * 0x%x\n", name, (unsigned)value); \
   fprintf(c, "#define ix_%s 0x%x\n", name, (unsigned)value);
 #define DEF(x) DEF2(#x, x)
-  
+
 #define SYSDEF(x) \
   fprintf(ass, "%s * %i\n", #x, x); \
   fprintf(c, "#define %s %i\n", #x, x);

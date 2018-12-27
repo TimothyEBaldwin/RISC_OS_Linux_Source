@@ -47,7 +47,7 @@
 using std::cerr;
 using std::endl;
 
-#define NUM_SCREENS 3 
+#define NUM_SCREENS 3
 
 #include <chrono>
 
@@ -107,10 +107,10 @@ void init_keyboard(){
   keycode['y']=KeyNo_LetterY;
   keycode['z']=KeyNo_LetterZ;
   keycode[' ']=KeyNo_Space;
-  
-  
-  
-  
+
+
+
+
   keycode['1'] = keycode['!'] = KeyNo_Digit1;shctrl['!']=1;
   keycode['2'] = keycode['@'] = KeyNo_Digit2;shctrl['@']=1;
   keycode['3'] = keycode['#'] = KeyNo_Digit3;shctrl['#']=1;
@@ -133,7 +133,7 @@ void init_keyboard(){
   keycode[','] = keycode['<'] = KeyNo_Comma;shctrl['<']=1;
   keycode['.'] = keycode['>'] = KeyNo_Dot;shctrl['>']=1;
   keycode['/'] = keycode['?'] = KeyNo_Slash;shctrl['?']=1;
-  
+
 
   for (int k=0;k<26;k++)
     { keycode[k+'A']=keycode[k+'a'];shctrl[k+'A']=1;
@@ -152,7 +152,7 @@ void OnMouseClick(int button, int state, int, int)
 {
    report r;
    buttons=button;
-     
+
    switch (state) {
      case GLUT_DOWN:
         report_key(KeyNo_LeftMouse + button, true);
@@ -225,7 +225,7 @@ unsigned short special_to_code(int key) {
     case 115:                 return KeyNo_CtrlRight;
     case 116:                 return KeyNo_AltLeft;
     case 117:                 return KeyNo_AltRight;
-     
+
     default:
       break;
   }
@@ -253,34 +253,34 @@ void myspecialdown(int key, int x, int y)
 // Setup Texture
 void setupTexture()
 {
-    // Create a texture 
+    // Create a texture
     glTexImage2D(GL_TEXTURE_2D, 0, 3, SCREEN_WIDTH, SCREEN_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, current_pixels);
- 
+
     // Set up the texture
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP); 
- 
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+
     // Enable textures
     glEnable(GL_TEXTURE_2D);
         draw_pixels=1;
 }
- 
+
 void updateTexture()
-{   
+{
     display_width = glutGet(GLUT_WINDOW_WIDTH);
     display_height = glutGet(GLUT_WINDOW_HEIGHT);
-    
+
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluOrtho2D(0, display_width, display_height, 0);        
+    gluOrtho2D(0, display_width, display_height, 0);
     glMatrixMode(GL_MODELVIEW);
     glViewport(0, 0, display_width, display_height);
     // Update Texture
     switch(log2bpp) {
       case 3:
-        
+
         glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, width, height, GL_RGB,  GL_UNSIGNED_BYTE_3_3_2, current_pixels);
         break;
       case 4:
@@ -290,10 +290,10 @@ void updateTexture()
         glTexSubImage2D(GL_TEXTURE_2D, 0 ,0, 0, width, height, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV, current_pixels);
         break;
     }
- 
+
 
     glBegin( GL_QUADS );
-    
+
         glTexCoord2d(0.0, 0.0);                                           glVertex2d(0.0, 0.0);
         glTexCoord2d(1.0*width/SCREEN_WIDTH, 0.0);                        glVertex2d(display_width, 0.0);
         glTexCoord2d(1.0*width/SCREEN_WIDTH, 1.0*height/SCREEN_HEIGHT);   glVertex2d(display_width, display_height);
@@ -301,7 +301,7 @@ void updateTexture()
 
     glEnd();
 }
- 
+
 void display()
 {
   // Clear framebuffer
@@ -309,18 +309,18 @@ void display()
   // Draw pixels to texture
   updateTexture();
   // Swap buffers!
-  glutSwapBuffers();    
+  glutSwapBuffers();
 }
- 
+
 void reshape_window(GLsizei w, GLsizei h)
 {
     glClearColor(0.0f, 0.0f, 0.5f, 0.0f);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluOrtho2D(0, w, h, 0);        
+    gluOrtho2D(0, w, h, 0);
     glMatrixMode(GL_MODELVIEW);
     glViewport(0, 0, w, h);
- 
+
     // Resize quad
     display_width = w;
     display_height = h;
@@ -328,28 +328,28 @@ void reshape_window(GLsizei w, GLsizei h)
     glutPostRedisplay();
 }
 
-int init_my_GL(int argc, char **argv) 
-{       
+int init_my_GL(int argc, char **argv)
+{
     // Setup OpenGL
-    glutInit(&argc, argv);          
+    glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
- 
+
     glutInitWindowSize(width, height);
     glutInitWindowPosition(320, 320);
     glutCreateWindow("RISC OS 5");
- 
+
     glutDisplayFunc(display);
     glutMouseFunc(OnMouseClick);
     glutMotionFunc( My_mouse_routine );
-    glutPassiveMotionFunc( My_mouse_routine );   
+    glutPassiveMotionFunc( My_mouse_routine );
     glutReshapeFunc(reshape_window);
-    
+
     glutKeyboardUpFunc(myupfunc);
     glutKeyboardFunc(mydownfunc);
     glutMouseWheelFunc(mouseWheel);
     glutSpecialFunc(myspecialdown);
     glutSpecialUpFunc(myspecialup);
-    
+
     setupTexture();
 
     return 0;
@@ -358,7 +358,7 @@ int init_my_GL(int argc, char **argv)
 auto start = std::chrono::steady_clock::now();
 void interact_rule()
 {
-  
+
     report r;
 
     exit_poll();
@@ -395,7 +395,7 @@ void interact_rule()
             glutFullScreen();
           else
             glutReshapeWindow(width, height);
-          
+
           glutPostRedisplay();
           r.reason = report::ev_mode_sync;
           write(sockets[0], &r.reason, sizeof(r.reason));
@@ -487,7 +487,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  
+
   run_RISC_OS(argv + optind);
 
   int cursor_active_x = 0;

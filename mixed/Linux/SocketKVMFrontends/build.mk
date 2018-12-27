@@ -38,4 +38,3 @@ Built/opengl: Unix/SocketKVMFrontends/opengl.cpp $(frontend_depends)
 Built/sdlkey.h: Unix/SocketKVMFrontends/sdlkey.c $(lib_depends) Unix/SocketKVMFrontends/Keyboard.h | Built
 	gcc -std=gnu99 -Wall -IBuilt Unix/SocketKVMFrontends/sdlkey.c `sdl2-config --cflags --libs` -o Built/sdlkey
 	Built/sdlkey > $@
-

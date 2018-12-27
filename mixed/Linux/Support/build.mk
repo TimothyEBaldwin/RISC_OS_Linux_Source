@@ -207,5 +207,3 @@ endif
 	)
 	git add -u
 	git commit -m "Rebuilt bootstrap binary"
-
-
