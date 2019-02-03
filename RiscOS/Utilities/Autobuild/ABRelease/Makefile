@@ -18,8 +18,8 @@
 # so that it can perform any final installation tasks, such as copying files
 # into archives, adding pre-built binaries, etc.
 #
-# If we're not running in an autobuild environemnt (i.e. AutoBuild$InstScript
-# is unset) then this component will not do anything.
+# If we're not running in an autobuild environment (i.e. AutoBuild$Build & AutoBuild$Root
+# are unset) then this component will not do anything.
 
 include StdTools
 
