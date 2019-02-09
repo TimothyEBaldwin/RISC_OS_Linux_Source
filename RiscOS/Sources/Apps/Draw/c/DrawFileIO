@@ -35,6 +35,7 @@
 #include <ctype.h>
 #include <swis.h>
 #include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
 
 #include "os.h"
 #include "bbc.h"
@@ -68,6 +69,7 @@
 #include "DrawSelect.h"
 #include "DrawTextC.h"
 #include "DrawUndo.h"
+#include "DrawClipb.h"
 
 static struct
 { diagrec *diag;
@@ -883,6 +885,82 @@ static BOOL write_fontlist (int filehand, char *fontusedp, int *bytecount)
   }
 }
 
+static BOOL write_fontlist_clipboard (char **store, char *fontusedp, int *bytecount)
+{ int objsize = 0;
+  int padby;
+  /*The following: fonthdr,i (fontref),fournulls are passed to write_bytes,
+    this takes char** (ie a pointer to a flex_anchor) so it can output
+    data in any size chunks even if the source flex block shifts in the
+    process. fonthdrp,ip,fournullsp allow us to do this with
+    'write_bytes (...., &fonthdrp, ......);'*/
+  draw_fontliststrhdr fonthdr;            /*header for a fontlist*/
+  int i;                                  /*loop counter & fontref*/
+  char *ip = (char*)&i;                   /*pointer to it*/
+  int fournulls = 0;                      /*a useful source of four nulls*/
+  char *fournullsp = (char*)&fournulls;   /*pointer to it*/
+
+  ftracef0 ("draw_file: write_fontlist_clipboard\n");
+  for (i = 1; i <= 255; i++)
+    if (fontusedp[i])
+      objsize += sizeof (draw_fontref) + strlen (draw_fontcat.name[i]) + 1;
+
+  if (objsize == 0) return TRUE;      /*No fonts used - no fontlist needed*/
+
+  padby = (4 - objsize) & 3;           /*0..3 bytes padding at EOobject*/
+  objsize += sizeof (draw_fontliststrhdr) + padby;
+
+  fonthdr.tag  = draw_OBJFONTLIST;     /*build, then output a fontlist hdr*/
+  fonthdr.size = objsize;
+
+  memcpy(*store + *bytecount, &fonthdr, sizeof (draw_fontliststrhdr));
+  *bytecount = *bytecount + sizeof (draw_fontliststrhdr);
+
+  for (i = 1; i <= 255; i++)/*output each fontref + fontname & terminator*/
+    if (fontusedp[i]) {
+      memcpy(*store + *bytecount, ip, sizeof(draw_fontref));
+      *bytecount = *bytecount + sizeof(draw_fontref);
+      memcpy(*store + *bytecount, draw_fontcat.name[i], 1 + strlen(draw_fontcat.name[i]));
+      *bytecount = *bytecount + 1 + strlen(draw_fontcat.name[i]);
+    }
+  memcpy(*store+*bytecount,fournullsp,padby);
+
+  *bytecount = *bytecount + padby;
+  return TRUE;
+}
+
+void draw_file_typemask(draw_objptr hdrptr, int *mask)
+
+{ switch (hdrptr.objhdrp->tag) {
+    case draw_OBJTEXT:
+    case draw_OBJTEXTAREA:
+    case draw_OBJTRFMTEXT:
+    case draw_OBJTEXTCOL:
+    case draw_OBJTRFMTEXTAREA:
+    case draw_OBJTRFMTEXTCOL:
+      *mask=*mask | _tm_text;
+      break;
+
+      case draw_OBJGROUP:
+      { draw_objptr objptr;
+
+        for (objptr.bytep = hdrptr.bytep + sizeof (draw_groustr);
+             objptr.bytep < hdrptr.bytep + hdrptr.objhdrp->size;
+             objptr.bytep += objptr.objhdrp->size)
+          draw_file_typemask (objptr, mask);
+      }
+      break;
+
+    case draw_OBJSPRITE:
+    case draw_OBJTRFMSPRITE:
+      *mask = *mask | _tm_sprite;
+      break;
+
+    case draw_OBJJPEG:
+      *mask = *mask | _tm_jpeg;
+      break;
+  }
+}
+
 void draw_file_fontuse_object (draw_objptr hdrptr, char *fontusetab)
 
 { ftracef0 ("draw_file_fontuse_object\n");
@@ -1233,6 +1311,79 @@ static BOOL saveselection (diagrec *diag, char *filename, fileIO_method method,
   return (ok);
 }
 
+BOOL draw_file_copy_selection(diagrec *diag)
+
+{ /* Create in-memory version and move to clipboard */
+
+  draw_bboxtyp hdrbox;
+  char fontusetab[256];                    /*slot 0..255 are valid fontrefs*/
+  int  i, bytecount;
+  BOOL ok=TRUE;
+  draw_objptr hdrptr;
+
+  ftracef0 ("draw_file: draw_file_copy_selection\n");
+  /*Deselect all text columns -- they cannot be saved individually*/
+  if (draw_select_deselect_type (diag, draw_OBJTEXTCOL))
+    return TRUE;                              /*Nothing to save*/
+
+  draw_obj_bound_selection (&hdrbox);
+
+  /*find fonts used in each selected object*/
+  (void) memset (fontusetab, 0, 256);       /*clear fontusetab*/
+  for (i = 0; hdrptr = draw_select_find (i), hdrptr.bytep != NULL; i++)
+    draw_file_fontuse_object (hdrptr, &fontusetab[0]);
+
+  /* First pass to determine file size. */
+  bytecount = 0;
+  (void) save_selected_data (&hdrbox, fontusetab, diag, 0, &bytecount);
+
+  /* Create somewhere to receive the data */
+  if (clipdata != NULL) {
+    FLEX_FREE((flex_ptr)&clipdata);
+    clipdata = NULL;
+  }
+
+  if (FLEX_ALLOC((flex_ptr)&clipdata, bytecount) == 0) {
+    /* Out of space */
+    return FALSE;
+  } else {
+    cliplength = bytecount;
+  }
+
+  int offset = 0;
+  int typemask = _tm_draw;
+  int typelist[5];
+
+  /* Drawfile header */
+  draw_fileheader header = draw_blank_header;
+  header.bbox = hdrbox;
+  memcpy(clipdata + offset, &header, sizeof(draw_fileheader));
+  offset += sizeof(draw_fileheader);
+
+  /* fontlist (if any) */
+  write_fontlist_clipboard(&clipdata, fontusetab, &offset);
+
+  /*do each selected object*/
+  for (i = 0; ok && (hdrptr = draw_select_find (i), hdrptr.bytep != NULL); i++)
+  {
+    memcpy(clipdata + offset, draw_selection->owner->paper + draw_selection->array[i], hdrptr.objhdrp->size);
+    /* File types... */
+    draw_file_typemask(hdrptr, &typemask);
+    offset += hdrptr.objhdrp->size;
+  }
+
+  offset = 0;
+  if (typemask & _tm_draw)   typelist[offset++] = FileType_Draw;
+  if (typemask & _tm_sprite) typelist[offset++] = FileType_Sprite;
+  if (typemask & _tm_text)   typelist[offset++] = FileType_Text;
+  if (typemask & _tm_jpeg)   typelist[offset++] = FileType_JPEG;
+  typelist[offset] = wimp_MDATAREQUEST_types_end;
+
+  /* We have the clipboard */
+  draw_clipboard_claim(wimp_MCLAIMENTITY_flags_clipboard);
+  return ok;
+}
+
 BOOL draw_file_file_saveselection (char *filename, void *handle)
 { ftracef2 ("draw_file_file_saveselection: filename: %s; handle: 0x%X\n", filename, handle);
   return saveselection ((diagrec*) handle, filename, via_FILE, 0);
@@ -1472,62 +1623,71 @@ diagrec *draw_file_loadfile (diagrec *diag, viewrec *vuue, char *name,
   ftracef0 ("draw_file_loadfile\n");
 
   if (commandLine) method = via_FILE;
-  if (method == via_FILE)
-  { os_filestr  blk;
-    diagrec    *rec;
+  switch (method) {
+    case via_FILE:
+    { os_filestr  blk;
+      diagrec    *rec;
 
-    blk.action   = 5;             /*Read catalogue info*/
-    blk.name     = name;          /*for name*/
+      blk.action = OSFile_ReadInfo;
+      blk.name   = name;          /*for name*/
 
-    if (wimpt_complain (os_file (&blk)) != NULL)
-      return NULL;
+      if (wimpt_complain (os_file (&blk)) != NULL)
+        return NULL;
 
-    if (blk.action != 1) /*save two messages by using OS_File 19*/
-    { blk.loadaddr = blk.action;
-      blk.action = 19;
-      #if TRACE
+      if (blk.action != object_file) /*save two messages by using OS_File 19*/
+      { blk.loadaddr = blk.action;
+        blk.action = OSFile_MakeError;
+#if TRACE
         wimpt_noerr (os_file (&blk));
-      #else
+#else
         wimpt_complain (os_file (&blk));
-      #endif
-      return NULL;
-    }
-
-    ftracef1 ("draw_file_loadfile found file, size %d bytes\n",blk.start);
-    loadaddr = blk.loadaddr, execaddr = blk.execaddr;
-
-    if ((loadaddr & 0xFFF00000) != 0xFFF00000)
-    { Error (0, "FileF2");
-      return NULL;
-    }
-
-    filetype = (loadaddr & 0x000FFF00) >> 8;
-    filesize = blk.start;
-
-    /*See if this is an attempt to load a new file that's already open,
-      with the same date stamp, that's not modified, called the
-      same thing*/
-    for (rec = draw_startdiagchain; rec != NULL; rec = rec->nextdiag)
-    { if ((diag == NULL) &&
-          (rec->misc->options.datestamped && (rec->misc->address.load == loadaddr) &&
-                                             (rec->misc->address.exec == execaddr)) &&
-          !rec->misc->options.modified &&
-          (strcmp (rec->misc->filename, name) == 0))
-      { wimp_wstate state;
-
-        /*Pop to top and gain the caret*/
-        wimp_get_wind_state (rec->view->w, &state);
-        state.o.behind = -1;
-        draw_open_wind (&state.o, rec->view);
-        draw_enter_claim_focus (rec, rec->view);
-        return rec;
+#endif
+        return NULL;
       }
+
+      ftracef1 ("draw_file_loadfile found file, size %d bytes\n",blk.start);
+      loadaddr = blk.loadaddr, execaddr = blk.execaddr;
+
+      if ((loadaddr & 0xFFF00000) != 0xFFF00000)
+      { Error (0, "FileF2");
+        return NULL;
+      }
+
+      filetype = (loadaddr & 0x000FFF00) >> 8;
+      filesize = blk.start;
+
+      /*See if this is an attempt to load a new file that's already open,
+        with the same date stamp, that's not modified, called the
+        same thing*/
+      for (rec = draw_startdiagchain; rec != NULL; rec = rec->nextdiag)
+      { if ((diag == NULL) &&
+            (rec->misc->options.datestamped && (rec->misc->address.load == loadaddr) &&
+             (rec->misc->address.exec == execaddr)) &&
+            !rec->misc->options.modified &&
+            (strcmp (rec->misc->filename, name) == 0))
+        { wimp_wstate state;
+
+          /*Pop to top and gain the caret*/
+          wimp_get_wind_state (rec->view->w, &state);
+          state.o.behind = -1;
+          draw_open_wind (&state.o, rec->view);
+          draw_enter_claim_focus (rec, rec->view);
+          return rec;
+        }
+      }
+      break;
     }
-  }
-  else
-  { /*Filesize is a guess, but we can't allow transfer of zero bytes
-      into zero-sized buffer. 6 Aug 1991*/
-    if (filesize <= 0) filesize = 1024;
+
+    case via_CLIPBOARD:
+    case via_CLIPBOARD_INT:
+      /*We have the file size; name actually points to the file data already for us*/
+      break;
+
+    default:
+      /*Filesize is a guess, but we can't allow transfer of zero bytes
+        into zero-sized buffer. 6 Aug 1991*/
+      if (filesize <= 0) filesize = 1024;
+      break;
   }
 
   /*Create new diagram if diag is NULL*/
@@ -1774,35 +1934,54 @@ BOOL draw_file_get (char *name, char **buffp, int offset, int *filelenp,
 
 { ftracef0 ("draw_file_get\n");
 
-  if (owner_xferrecv.method == via_FILE)
-  { os_filestr blk;
+  switch (owner_xferrecv.method) {
+    case via_FILE:
+    { os_filestr blk;
 
-    blk.action   = 255;           /*Load file into buffer*/
-    blk.name     = name;
-    blk.loadaddr = (int) (*buffp + offset);
-    blk.execaddr = 0;
+      blk.action   = 255;           /*Load file into buffer*/
+      blk.name     = name;
+      blk.loadaddr = (int) (*buffp + offset);
+      blk.execaddr = 0;
 
-    if (wimpt_complain (os_file (&blk)))
-      return FALSE;
-  }
-  else
-  { int final;
+      if (wimpt_complain (os_file (&blk)))
+        return FALSE;
+      break;
+    }
 
-    owner_xferrecv.filelen = 0;   /*updated by loadram_extend, if called*/
+    case via_CLIPBOARD_INT:
+      /*Data is already present locally*/
+      if (clipdata == NULL) {
+        return FALSE;
+      } else {
+        memcpy(*buffp + offset, clipdata, *filelenp);
+      }
+      break;
 
-    ftracef2 ("loadfile calls xferrecv_doimport, "
-        "owner_xferrecv.diag->paper is %d, *filelenp is %d\n",
-        (int) owner_xferrecv.diag->paper, *filelenp);
+    case via_CLIPBOARD:
+      /*Data is already present.  Copy it to our destination.*/
+      memcpy(*buffp + offset, name, *filelenp);
+      break;
 
-    final = xferrecv_doimport (*buffp + offset, *filelenp,
-        extender != NULL? extender: &Extend_Diag);
+    default:
+    { int final;
 
-    ftracef1 ("returned to loadfile, final block transfer was %d bytes\n",
-        final);
+      owner_xferrecv.filelen = 0;   /*updated by loadram_extend, if called*/
 
-    if (final < 0) return FALSE;
+      ftracef2 ("loadfile calls xferrecv_doimport, "
+                "owner_xferrecv.diag->paper is %d, *filelenp is %d\n",
+                (int) owner_xferrecv.diag->paper, *filelenp);
 
-    *filelenp = owner_xferrecv.filelen + final;      /*total size*/
+      final = xferrecv_doimport (*buffp + offset, *filelenp,
+                                 extender != NULL? extender: &Extend_Diag);
+
+      ftracef1 ("returned to loadfile, final block transfer was %d bytes\n",
+                final);
+
+      if (final < 0) return FALSE;
+
+      *filelenp = owner_xferrecv.filelen + final;      /*total size*/
+      break;
+    }
   }
 
   return TRUE;
