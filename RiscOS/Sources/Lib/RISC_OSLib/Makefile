@@ -492,9 +492,6 @@ clean_all:
 	${XWIPE} syms.* ${WFLAGS}
 	${RM} derived.swis
 	${RM} s.swioptions
-	${RM} s.abssym
-	${RM} s.c_abssym
-	${RM} s.a_abssym
 	${RM} rom_link_Entries
 	${XWIPE} lib.* ${WFLAGS}
 	@echo ${COMPONENT}: cleaned
@@ -805,8 +802,8 @@ m_o.clib: clib.s.cl_obj_m
 m_o.kernel: kernel.s.k_obj_m
 	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_obj_m -to $@
 
-rm_o.clib:  clib.s.cl_obj_r
-	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.cl_obj_r -to $@
+#rm_o.clib:  clib.s.cl_obj_r
+#	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.cl_obj_r -to $@
 
 rm_o.cl_modbody: clib.s.cl_mod_r
 	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} ${UROM_ROM_DEFS} -from clib.s.cl_mod_r -to $@
@@ -817,8 +814,8 @@ rm_o_rl.rl_modbody: rlib.s.rl_mod_r
 rm_o.k_modbody: kernel.s.k_mod_r
 	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from kernel.s.k_mod_r -to $@
 
-rm_o.memcpy: s.memcpy s.h_regs
-	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from s.memcpy -to $@
+#rm_o.memcpy: s.memcpy s.h_regs
+#	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from s.memcpy -to $@
 
 o.initmodule: clib.s.initmod_r
 	${AS} ${AFLAGS} ${ASFLAGS} ${OPTIONS} -from clib.s.initmod_r -to $@
@@ -887,7 +884,7 @@ o_rl.trace: rlib.c.trace
 m_o_rl.trace: rlib.c.trace
 	${CC} ${CFLAGS} -ffah ${DFLAGS} -zM -DTRACE -o m_o_rl.trace rlib.c.trace
 
-rm_o_rl.trace: rlib.c.trace
-	${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${STK_EXTN} ${OPTIONS} -DTRACE -o rm_o_rl.trace rlib.c.trace
+#rm_o_rl.trace: rlib.c.trace
+#	${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${STK_EXTN} ${OPTIONS} -DTRACE -o rm_o_rl.trace rlib.c.trace
 
 # Dynamic dependencies:
