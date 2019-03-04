@@ -126,10 +126,10 @@ mk ()
             if [ -z "$COMPONENT" ]; then
                 ARGS="$ARGS COMPONENT=$DB_COMPONENT"
             fi
-            if [ -z "$TARGET" ]; then
+            if [ -z "$TARGET" ] && [ -n "$DB_TARGET" ]; then
                 ARGS="$ARGS TARGET=$DB_TARGET"
             fi
-            if [ -z "$INSTDIR" ]; then
+            if [ -z "$INSTDIR" ] && [ -n "$DB_INSTDIR" ]; then
                 ARGS="$ARGS INSTDIR=$INSTALLDIR/$DB_INSTDIR"
             fi
             make -C $COMPONENTDIR $ARGS $@
