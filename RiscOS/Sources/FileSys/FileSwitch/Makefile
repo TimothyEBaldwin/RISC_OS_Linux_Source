@@ -29,13 +29,14 @@ HEADER2     = HighFSI
 # C headers to generate from the assembler sources
 ASMCHEADER1 = LowFSI
 ASMCHEADER2 = HighFSI
-EXPORTS     = ${C_EXP_HDR}.${ASMCHEADER1} ${C_EXP_HDR}.${ASMCHEADER2}
+EXPORTS     = ${C_EXP_HDR}${SEP}${ASMCHEADER1}${SUFFIX_HEADER} ${C_EXP_HDR}${SEP}${ASMCHEADER2}${SUFFIX_HEADER}
+ASFLAGS    += -PD "ImageSize SETS \"${IMAGESIZE}\""
 ROM_LIBS    = ${PVLIBS}
 
 TOKHELPSRC  = ${TOKENSOURCE}
 HELPSRC     = HelpSrc
+SOURCES_TO_SYMLINK = HelpSrc
 
-include StdTools
 include AAsmModule
 
 # Dynamic dependencies:
