@@ -1,4 +1,4 @@
-# Copyright 1996 Acorn Computers Ltd
+# Copyright 2019 RISC OS Open Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,69 +14,23 @@
 #
 # Makefile for TML_HostFS
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 26-May-94  AMcC         Created.
-#
 
-#
-# Paths
-#
-EXP_HDR = <export$dir>
+COMPONENT ?= TML_HostFS
 
-#
-# Generic options:
-#
-MKDIR   = cdir
-AS      = aasm
-CP      = copy
-RM      = remove
-CCFLAGS = -c -depend !Depend -IC:
-ASFLAGS = -depend !Depend -Stamp -quit
-CPFLAGS = ~cfr~v
+include StdTools
 
-#
-# Program specific options:
-#
-COMPONENT = TML_HostFS
-SOURCE    = s.${COMPONENT}
-TARGET    = rm.${COMPONENT}
-EXPORTS   = ${EXP_HDR}.HostFS \
-            ${EXP_HDR}.HostDebug
+all: DumpFile SpewChars standalone
 
-#
-# Generic rules:
-#
-all: DumpFile SpewChars ${TARGET}
-	@echo ${COMPONENT}: all complete
+DumpFile:
+	@${MAKE} -f app${EXT}mk COMPONENT=${COMPONENT} TARGET=DumpFile
 
-export: ${EXPORTS}
-	@echo ${COMPONENT}: export complete
+SpewChars:
+	@${MAKE} -f app${EXT}mk COMPONENT=${COMPONENT} TARGET=SpewChars
+
+export_hdrs export_libs export resources rom rom_link standalone install debug gpa_debug prepro links:
+	@${MAKE} -f mod${EXT}mk COMPONENT=${COMPONENT} $@
 
 clean:
-	${RM} ${TARGET}
-	${RM} DumpFile
-	${RM} SpewChars
-	@echo ${COMPONENT}: cleaned
-
-DumpFile: s.DumpFile
-	${AS} ${ASFLAGS} -To $@ -From s.DumpFile
-	SetType $@ Absolute
-
-SpewChars: s.SpewChars
-	${AS} ${ASFLAGS} -To $@ -From s.SpewChars
-	SetType $@ Absolute
-
-${TARGET}: ${SOURCE}
-	${AS} ${ASFLAGS} -module -To $@ -From ${SOURCE}
-
-${EXP_HDR}.HostFS: hdr.HostFS
-	${CP} hdr.HostFS $@ ${CPFLAGS}
-
-${EXP_HDR}.HostDebug: hdr.HostDebug
-	${CP} hdr.HostDebug $@ ${CPFLAGS}
-
-# Dynamic dependencies:
+	@${MAKE} -f app${EXT}mk COMPONENT=${COMPONENT} TARGET=DumpFile clean
+	@${MAKE} -f app${EXT}mk COMPONENT=${COMPONENT} TARGET=SpewChars clean
+	@${MAKE} -f mod${EXT}mk COMPONENT=${COMPONENT} clean
