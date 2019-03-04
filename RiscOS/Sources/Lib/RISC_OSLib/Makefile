@@ -530,6 +530,18 @@ bbe-clibrary: bbe-generic
 	${CP} clib.rom_link_v ${VERBATIMROMLINK} ${CPFLAGS}
 
 dirs:
+	${MKDIR} aof
+	${MKDIR} derived
+	${MKDIR} lib
+	${MKDIR} linked
+	${MKDIR} map
+	${MKDIR} m_o
+	${MKDIR} m_o_rl
+	${MKDIR} o
+	${MKDIR} o_rl
+	${MKDIR} rm_o
+	${MKDIR} rm_o_rl
+	${MKDIR} syms
 	${MKDIR} ${LIBDIR}
 	${MKDIR} ${LIBDIR}.CLib
 	${MKDIR} ${LIBDIR}.CLib.h

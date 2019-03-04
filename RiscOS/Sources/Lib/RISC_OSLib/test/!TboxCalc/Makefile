@@ -36,6 +36,7 @@ Squeezeflags = -f $@
 	   cc $(ccflags) -o @.o.Calc @.c.Calc
 
 @.o.foo:      @.s.foo
+	   CDir @.o
 	   objasm $(asflags) -o @.o.foo @.s.foo           
 	   
 # Dynamic dependencies:
