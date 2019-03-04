@@ -16,18 +16,17 @@
 
 COMPONENT    ?= Filer_Action
 TARGET       ?= FilerAct
-HDRS          =
-ASMHDRS       = FilerAct
-INSTRES_FILES = Templates
-CMHGFILE      =
 OBJS          = actionwind Initialise Buttons allerrs memmanage listfiles Chains dboxlong debug
-RES_OBJ       =
-SA_LIBS       = ${RSTUBS}
-ROM_LIBS      = ${ROMSTUBS}
-ROM_SYMS      = ${ABSSYM}
-CFLAGS        = ${C_STKCHK}
-MODULEWRAP    = yes
+LIBS          = ${RLIB}
 
-include CModule
+include CApp
+
+test: app.FilerAct
+	Set FilerAct$Path <Obey$Dir>.Resources.UK.
+	Set Alias$Filer_Action <Obey$Dir>.app.FilerAct %%*0
+
+reset:
+	Set FilerAct$Path Resources:$.Resources.FilerAct.
+	UnSet Alias$Filer_Action
 
 # Dynamic dependencies:
