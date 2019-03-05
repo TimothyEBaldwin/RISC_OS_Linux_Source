@@ -22,6 +22,6 @@ elif [ -n "$ZSH_NAME" ]; then script=${(%):-%x}
 elif [ ${0##*/} = dash ]; then x=$(lsof -p $$ -Fn0 | tail -1); script=${x#*n}
 fi
 
-export BUILDDIR="$(cd $(dirname $(readlink -f "$script"))/../../../.. && pwd)"
+export BUILDDIR="$(cd $(dirname $(readlink -f "$script"))/../.. && pwd)"
 
 . $BUILDDIR/Env/!Common.sh
