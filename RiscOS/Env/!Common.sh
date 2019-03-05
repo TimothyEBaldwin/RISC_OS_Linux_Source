@@ -115,7 +115,7 @@ mk ()
     if [ -n "$COMPONENT" ]; then
         grep "^$COMPONENT " "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
     else
-        grep "$RELPATH" "$BUILDDIR/BuildSys/ModuleDB" | grep -v "$RELPATH\." > "$MYTMP"
+        grep "$RELPATH\( \|$\)" "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
     fi
     
     if [ $? -ne 0 ]; then
