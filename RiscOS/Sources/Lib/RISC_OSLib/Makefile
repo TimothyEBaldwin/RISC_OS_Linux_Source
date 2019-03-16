@@ -160,6 +160,7 @@ HEADERS =\
  CLIB:h.complex \
  CLIB:h.ctype \
  CLIB:h.errno \
+ CLIB:h.fenv \
  CLIB:h.float \
  CLIB:h.inttypes \
  CLIB:h.iso646 \
