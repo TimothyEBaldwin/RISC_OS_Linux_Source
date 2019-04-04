@@ -249,6 +249,7 @@ static _kernel_oserror *rtclock_adjust(_kernel_swi_regs *r)
 	uint64_t lo, hi, product;
 	uint32_t now, period;
 	_kernel_oserror *err;
+	uint32_t actual_last_priority = last_priority;
 
 	_swix(OS_ReadMonotonicTime, _OUT(0), &now);
 
@@ -258,7 +259,7 @@ static _kernel_oserror *rtclock_adjust(_kernel_swi_regs *r)
 	 * otherwise error.
 	 */
 	if ((r->r[3] < last_priority) &&
-	    ((now - last_duration) <= last_monotonic))
+	    ((now - last_monotonic) <= last_duration))
 	{
 		DPRINTF(("Priority battle lost\n"));
 		return rtclock_error(ERR_HIPRI);
@@ -282,6 +283,19 @@ static _kernel_oserror *rtclock_adjust(_kernel_swi_regs *r)
 	 *
 	 * when behind (-ve) period gets smaller so the cs timer speeds up
 	 * when ahead (+ve) period gets longer so the cs timer slows down
+	 *
+	 * The (P+C)/P term is responsible for applying the correction that was
+	 * requsted in R0,R1. But if the 100Hz ticker is inaccurate, we'll only be
+	 * able to apply the correction properly if we know its true frequency.
+	 * That's where the P'/(P'-C+W) term comes in - it's calculating the speed
+	 * of the 100Hz ticker relative to the trusted RTC. P' gives us the number
+	 * of 100Hz ticker ticks, and P'-C+W (indirectly) gives us the number of
+	 * RTC ticks that occurred during the same time period.
+	 *
+	 * Note that the algorithm is expected to be used as part of a PID control
+	 * loop - once the duration in R2 has passed, RTC_Adjust must be called
+	 * again, otherwise it will overshoot and apply more correction than
+	 * needed.
 	 */
 	correction = (uint32_t)r->r[0] | ((uint64_t)r->r[1] << 32);
 	if (llabs(correction) > INT16_MAX)
@@ -311,8 +325,23 @@ static _kernel_oserror *rtclock_adjust(_kernel_swi_regs *r)
 
 	/* P' is 31 bit (max), W is 15 bit (max), promote by 32 bits */
 	elapsed = (int32_t)(now - last_monotonic);
-	term2.dword = elapsed - correction + last_adjust;
-	term2.dword = (elapsed << 32) / term2.dword;
+	if ((elapsed < 100) || (last_priority != actual_last_priority))
+	{
+		/* Not enough time passed since last adjustment, or last adjustment was from a different time source. Ignore this part of the equation. */
+		term2.dword = ((uint64_t)1) << 32;
+	}
+	else
+	{
+		term2.dword = elapsed - correction + last_adjust;
+		if (term2.dword > 0) /* Avoid bad denominators */
+		{
+			term2.dword = (elapsed << 32) / term2.dword;
+		}
+		else
+		{
+			term2.dword = ((uint64_t)1) << 32;
+		}
+	}
 
 	/* Cross multiply */
 	lo = (uint64_t)term1.word.lo * term2.word.lo;
@@ -388,6 +417,12 @@ _kernel_oserror *rtclock_init(const char *cmd_tail, int podule_base, void *pw)
 
 	/* Start the default adjuster */
 	_swix(OS_CallEvery, _INR(0,2), MY_ADJ_DURATION - 1, rtclock_ticker_entry, pw);
+	/* Set last_priority to our builtin adjustment, so that (if nothing else
+	 * takes priority) the P' term will be applied the first time we suggest an
+	 * adjustment (assuming the OS synchronises the time from the RTC on
+	 * startup - i.e. that the last_adjust of 0 will be correct)
+	 */
+	last_priority = MY_ADJ_PRIORITY;
 
 	UNUSED(podule_base);
 	UNUSED(pw);
@@ -428,6 +463,16 @@ void rtclock_service(int service_number, _kernel_swi_regs *r, void *pw)
 		 */
 		_swix(OS_RemoveTickerEvent, _INR(0,1), rtclock_ticker_entry, pw);
 		_swix(OS_CallEvery, _INR(0,2), MY_ADJ_DURATION - 1, rtclock_ticker_entry, pw);
+	}
+	else if ((service_number == Service_RTCSynchronised) && (last_priority == MY_ADJ_PRIORITY))
+	{
+		/* The clocks have just been synchronised, and we know we're the active
+		 * adjustment source - so reset our P' and W values so that the
+		 * P' / (P'-C+W) term will be correct the next time we suggest an
+		 * adjustment.
+		 */
+		_swix(OS_ReadMonotonicTime, _OUT(0), &last_monotonic);
+		last_adjust = 0;
 	}
 	UNUSED(r);
 }
