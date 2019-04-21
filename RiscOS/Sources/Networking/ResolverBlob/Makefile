@@ -14,11 +14,20 @@ install_rom:
 	${CP} rm.${TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: installed
 
+install: resmsgs
+	${LD} -rmf -o ResolverSA aof.${TARGET}SA resmsgs
+	${MKDIR} ${INSTDIR}
+	${CP} ResolverSA ${INSTDIR}.${TARGET} ${CPFLAGS}
+	@echo ${COMPONENT}: ram module installed
+
 # Resource export phases
 
 resources: resources-${TARGET}-${LOCALE}
 	@echo ${COMPONENT}: ${LOCALE} resources exported
 
+resmsgs: LocalRes:Messages LocalRes:CmdHelp
+	${FAPPEND} resjoined LocalRes:Messages LocalRes:CmdHelp
+	${RESGEN} Resources $@ resjoined Resources.${TARGET}.Messages
 
 rom_link: rom_link-${TARGET}
 	@echo ${COMPONENT}: rom_link complete
@@ -37,3 +46,6 @@ rom_link-Resolver:
 
 clean::
 	${WIPE} linked ${WFLAGS}
+	${RM} resjoined
+	${RM} resmsgs
+	${RM} ResolverSA
