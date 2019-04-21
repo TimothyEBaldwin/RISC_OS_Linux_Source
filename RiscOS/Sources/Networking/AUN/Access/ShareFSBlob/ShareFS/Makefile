@@ -14,6 +14,12 @@ install_rom:
 	${CP} rm.${TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@echo ${COMPONENT}: installed
 
+install: resmsgs
+	${LD} -rmf -o ShareFSSA aof.${TARGET}SA resmsgs
+	${MKDIR} ${INSTDIR}
+	${CP} ShareFSSA ${INSTDIR}.${TARGET} ${CPFLAGS}
+	@echo ${COMPONENT}: ram module installed
+
 # Resource export phases
 
 resources:
@@ -23,13 +29,21 @@ resources:
 	${CP} LocalRes:Templates ${RESDIR}.${TARGET}.Templates ${CPFLAGS}
 	@echo ${COMPONENT}: resources copied to Messages module
 
+resmsgs: LocalRes:!Boot LocalRes:Messages LocalRes:Templates
+	${RESGEN} lookup_area $@\
+        LocalRes:!Boot     Resources.${TARGET}.!Boot\
+        LocalRes:Messages  Resources.${TARGET}.Messages\
+        LocalRes:Templates Resources.${TARGET}.Templates
+
 rom_link: rom_link-${TARGET}
 	@echo ${COMPONENT}: rom_link complete
 
 rom_link-ShareFS:
 	${MKDIR} linked
-	link -o linked.${TARGET} -rmf -base ${ADDRESS} aof.${TARGET} RISCOSLIB:o.c_abssym
+	${LD} -o linked.${TARGET} -rmf -base ${ADDRESS} aof.${TARGET} RISCOSLIB:o.c_abssym
 	@${CP} linked.${TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
 
 clean::
 	${WIPE} linked ${WFLAGS}
+	${RM} resmsgs
+	${RM} ShareFSSA
