@@ -18,14 +18,13 @@
 COMPONENT    = LanManFS
 OBJS         = Xlate Transact Stats SMB RPC Printers Omni NetBIOS NBIP \
                NameCache Logon LLC LanMan CoreFn buflib Attr \
-               Interface Auth md5c md4c MyResObj
+               Interface Auth md5c md4c
 CINCLUDES    = -ITCPIPLibs:,C:
 HDRS         =
 CMHGFILE     = Lanman_MH
 CMHGDEPENDS  = LanMan LLC Logon NBIP Omni
 LIBS         = ${NET4LIBS} ${ASMUTILS}
 RES_PATH     = ThirdParty.OmniClient
-CUSTOMRES    = custom
 CDEFINES     = -DCOMPAT_INET4 -DLONGNAMES ${OPTIONS}
 CFLAGS       = -Wp
 CDFLAGS      = -DDEBUG -DDEBUGLIB -DTRACE -Dprintf=module_printf
@@ -34,18 +33,9 @@ CMHGDEFINES  = ${OPTIONS}
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
 endif
+INSTRES_FILES = ROM.Sprites
+INSTRES_VERSION = Messages
 
 include CModule
-
-#
-# Static dependencies
-#
-o.MyResObj od.MyResObj: LocalRes:ROM.Sprites ${MERGEDMSGS}PP ${DIRS}
-	${RESGEN} ${RES_AREA} $@ ${MERGEDMSGS}PP ${RES_PATH}.${TARGET}.Messages LocalRes:ROM.Sprites ${RES_PATH}.${TARGET}.Sprites 
-
-${MERGEDMSGS}PP: LocalRes:Messages LocalRes:CmdHelp
-	${MKDIR} ${MERGEDRDIR}${SEP}${TARGET}
-	${FAPPEND} ${MERGEDMSGS} LocalRes:Messages LocalRes:CmdHelp
-	${INSERTVERSION} ${MERGEDMSGS} > $@
 
 # Dynamic dependencies:
