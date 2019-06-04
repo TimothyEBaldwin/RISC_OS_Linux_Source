@@ -33,6 +33,10 @@ CMHGDEFINES  = ${OPTIONS}
 ifeq ("${CMDHELP}","None")
 CMHGDEFINES += -DNO_INTERNATIONAL_HELP
 endif
+# Carry our own ThirdParty resources, don't put them in the Messages module
+CUSTOMRES    = custom
+RESDIR       = ${MERGEDRDIR}
+OBJS        += ${RES_OBJ}
 INSTRES_FILES = ROM.Sprites
 INSTRES_VERSION = Messages
 
