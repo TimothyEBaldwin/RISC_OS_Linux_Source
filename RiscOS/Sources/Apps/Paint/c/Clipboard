@@ -1,0 +1,478 @@
+/* Copyright 2019 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "Global/FileTypes.h"
+#include "Global/Sprite.h"
+#include "Interface/HighFSI.h"
+
+#include "event.h"
+#include "flex.h"
+#include "msgs.h"
+#include "os.h"
+#include "werr.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "xferrecv.h"
+#include "help.h"
+#include "swis.h"
+
+#include "ftrace.h"
+#include "guard.h"
+
+#include "main.h"
+#include "Menus.h"
+#include "MenuD.h"
+#include "PSprite.h"
+#include "Clipboard.h"
+#include "Drawfile.h"
+
+/*Globals: current clipboard data if we have ownership*/
+static sprite_area *clipdata = NULL;
+static BOOL paint_owns_clipboard = FALSE;
+
+BOOL paint_clipboard_openup(const char *name, int *handle)
+
+{ os_regset  blk;
+
+  blk.r[0] = 0x87; /*OpenOut, Ignore file$path, give err if a dir.!*/
+  blk.r[1] = (int)name;
+
+  if (wimpt_complain(os_find(&blk))) return FALSE;
+  if (blk.r[0] == 0)
+  { /*In case the FileSwitch bug returns a 0 handle.*/
+    werr (FALSE, "PntE4",name);
+    return FALSE;
+  }
+  *handle = blk.r[0];
+  return TRUE;
+}
+
+BOOL paint_clipboard_close(const char *name, int *handle, int filetype)
+
+{ os_regset  blk;
+
+  blk.r[0] = 0; blk.r[1] = *handle;
+  if (wimpt_complain (os_find (&blk))) return FALSE;
+
+  os_filestr osf;
+  memset(&osf,0,sizeof(os_filestr));
+
+  /*Set filetype*/
+  osf.action = OSFile_SetType;
+  osf.name = (char *)name;
+  osf.loadaddr = filetype;
+  if (wimpt_complain(os_file(&osf))) return FALSE;
+
+  return TRUE;
+}
+
+BOOL paint_clipboard_write_bytes(int handle, const char *buffer, int buffer_length)
+
+{ os_regset blk;
+
+  blk.r[0] = OSGBPB_WriteAtPTR;
+  blk.r[1] = handle;
+  blk.r[2] = (int)buffer;
+  blk.r[3] = buffer_length;
+  while (blk.r[3] > 0)
+  { /*ensure we transfer all data if possible*/
+    if (wimpt_complain(os_swix(OS_GBPB,&blk))) return FALSE;
+  }
+
+  return TRUE;
+}
+
+void paint_clipboard_export_ramxfer_do(wimp_eventstr *ev, char *export_buffer, int export_length)
+
+{ int export_offset = 0;
+  BOOL abort = FALSE, messaged = FALSE;
+
+  while (export_offset <= export_length && abort == FALSE)
+  { /*Send the requested amount of data (or less if necessary)*/
+    int xfer_amount = ev->data.msg.data.ramfetch.nbytes;
+    wimp_msgstr msg;
+
+    if (xfer_amount > (export_length-export_offset)) xfer_amount = export_length - export_offset; /*not too much though*/
+
+    if (xfer_amount) wimp_transferblock(wimpt_task(), export_buffer + export_offset, ev->data.msg.hdr.task, ev->data.msg.data.ramfetch.addr, xfer_amount);
+
+    memset(&msg, 0, sizeof(wimp_msgstr));
+
+    msg.hdr.size = sizeof(wimp_msghdr) + sizeof(wimp_msgramtransmit);
+    msg.hdr.your_ref = ev->data.msg.hdr.my_ref;
+    msg.hdr.action = wimp_MRAMTRANSMIT;
+    msg.data.ramtransmit.addr = ev->data.msg.data.ramfetch.addr;
+    msg.data.ramtransmit.nbyteswritten = xfer_amount;
+    export_offset += xfer_amount;
+    wimp_sendmessage(xfer_amount == 0 ? wimp_ESEND : wimp_ESENDWANTACK, &msg,ev->data.msg.hdr.task);
+
+    if (xfer_amount == 0) abort=TRUE;
+
+    while (!messaged && !abort)
+    { wimpt_poll(event_getmask(), ev);
+      switch (ev->e)
+      { case wimp_EACK:
+          /*Bounced message; abort*/
+          abort = TRUE;
+        break;
+
+        case wimp_ESENDWANTACK:
+        case wimp_ESEND:
+          /*we can send more stuff*/
+          if (ev->data.msg.hdr.action != wimp_MRAMFETCH) abort = TRUE;
+          else messaged = TRUE;
+        break;
+      }
+    }
+  }
+}
+
+void paint_clipboard_release(void)
+
+{ /*Another task has claimed the clipboard*/
+  paint_owns_clipboard = FALSE;
+  if (clipdata != NULL)
+  { flex_free((flex_ptr)&clipdata);
+    clipdata = NULL;
+  }
+}
+
+void paint_clipboard_claim(int claimtype)
+
+{ /*Claimtype is as per the Wimp Message*/
+  if (!paint_owns_clipboard)
+  { wimp_msgstr msg;
+
+    memset(&msg, 0, sizeof(wimp_msgstr));
+    msg.hdr.size   = 24;
+    msg.hdr.action = wimp_MCLAIMENTITY;
+    msg.data.claimentity.flags = claimtype;
+    wimp_sendmessage(wimp_ESEND, &msg, 0);
+
+    if ((claimtype & wimp_MCLAIMENTITY_flags_clipboard) != 0)
+      paint_owns_clipboard = TRUE;
+  }
+}
+
+static BOOL paint_clipboard_send_datarequest(wimp_eventstr *e)
+
+{ /*Request from other tasks*/
+  wimp_msgstr msg;
+  int *types;
+
+  memset(&msg, 0, sizeof(wimp_msgstr));
+  msg.hdr.size   = 20 + ((3-1) * sizeof(int)) + sizeof(wimp_msghdr);
+  msg.hdr.action = wimp_MDATAREQUEST;
+  msg.data.datarequest.w = 0;
+  msg.data.datarequest.h = &clipdata;
+  msg.data.datarequest.x = 0;
+  msg.data.datarequest.y = 0;
+  msg.data.datarequest.flags = wimp_MDATAREQUEST_flags_clipboard;
+
+  types = &msg.data.datarequest.types[0];
+  types[0] = FileType_Sprite;
+  types[1] = FileType_JPEG;
+  types[2] = wimp_MDATAREQUEST_types_end;
+
+  wimp_sendmessage(wimp_ESENDWANTACK, &msg, 0);
+
+  /*We either get back a datasave or a bounce*/
+  while (1)
+  { wimpt_poll(event_getmask(), e);
+    switch (e->e)
+    { case wimp_EACK:
+        if (e->data.msg.hdr.action == wimp_MDATAREQUEST)
+        { /*Bounced message - no data on clipboard to paste*/
+          return FALSE;
+        }
+      break;
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+        if (e->data.msg.hdr.action == wimp_MDATASAVE)
+          /*Check the filetypes supported*/
+          return (e->data.msg.data.datasave.type == FileType_Sprite ||
+                  e->data.msg.data.datasave.type == FileType_JPEG);
+      break;
+    }
+  }
+
+  return FALSE;
+}
+
+BOOL paint_clipboard_check_paste(void)
+
+{ wimp_eventstr e;
+
+  /*See if there's anything on the clipboard for pasting*/
+  if (paint_owns_clipboard) return TRUE; /*Quick check*/
+
+  return paint_clipboard_send_datarequest(&e);
+}
+
+BOOL paint_clipboard_get_selection(main_window *window,void *buffer,selbuffer_type type)
+
+{ char *ptr;
+  main_sprite *sprite;
+  int size = main_selection_file_size(window);
+  char **rawdata=(char **)buffer;
+
+  /* see if we can allocate it */
+  /* +4 bytes as we have an area rather than a file */
+
+  if (!flex_alloc((flex_ptr)rawdata, size + (type == SELBUFFER_SPRITEAREA ? 4:0)))
+  { /* out of space */
+    werr (FALSE, "PntEG");
+    return FALSE;
+  }
+
+  if (type == SELBUFFER_SPRITEAREA)
+  { sprite_area *spr = *((sprite_area **)buffer);
+    spr->size    = size + 4;
+    spr->number  = window->selection.count;
+    spr->sproff  = sizeof (sprite_area);
+    spr->freeoff = size + 4;
+
+    ptr = *rawdata + spr->sproff;
+  }
+  else
+  { struct fileheader
+    { int number;
+      int sproff;
+      int freeoff;
+    } **header = (struct fileheader **)buffer;
+    (*header)->number = window->selection.count;
+    (*header)->sproff = sizeof(sprite_area);
+    (*header)->freeoff = size + 4;
+
+    ptr = *rawdata + (*header)->sproff - 4;
+  }
+
+  for (sprite = window->data->file.sprites; sprite != NULL; sprite = sprite->link)
+  { if (sprite->flags & MSF_SELECTED)
+    { sprite_header *header = psprite_address (sprite);
+      memcpy (ptr, header, header->next);
+      ptr += header->next;
+    }
+  }
+
+  return TRUE;
+}
+
+BOOL paint_clipboard_set_data_from_selection(main_window *window)
+
+{ /* Transfer data from a selection to the clipboard */
+
+  if (!window || (window->selection.count==0)) return FALSE; /* Nothing to do */
+
+  /* Clear any existing area first */
+
+  if (clipdata) {
+    flex_free((flex_ptr)&clipdata);
+    clipdata = NULL;
+  }
+
+  if (!paint_clipboard_get_selection(window, &clipdata, SELBUFFER_SPRITEAREA)) return FALSE;
+
+  /* Data set up, so send out our clipboard claim */
+  paint_clipboard_claim(wimp_MCLAIMENTITY_flags_clipboard);
+
+  return TRUE;
+}
+
+void paint_clipboard_paste(main_window *window)
+
+{ /*Paste clipboard data into sprite file*/
+  wimp_eventstr e;
+
+  /*We either just do an internal copy, or pull from external clipboard task*/
+  if (paint_owns_clipboard)
+  { /* Internal action */
+
+    /* Transfer data to ramfetch_buffer for import */
+    if (!flex_alloc((flex_ptr)&ramfetch_buffer,clipdata->size - 4))
+    { werr (FALSE, "PntEG");
+      return;
+    }
+
+    memcpy(ramfetch_buffer, (char *)clipdata + 4, clipdata->size - 4);
+  }
+  else
+  { /* Request from external clipboard task*/
+    if (!paint_clipboard_send_datarequest(&e)) return; /*Message was bounced, oddly*/
+
+    /* Acquire the data */
+    if (!ramtransfer_file(&e.data.msg.data.datasave)) return; /* Failed to acquire data */
+  }
+
+  /* Delete any currently selected sprites */
+  if (window->selection.count != 0)
+  { char hit[2];
+    hit [0] = m_Sprite;
+    hit [1] = m_Sprite_Delete;
+    menus_file_handler(window, hit);
+  }
+
+  Load_File(window, (char *)-1, 1, 0);
+}
+
+void paint_clipboard_claimed(wimp_eventstr *e)
+
+{ /* Claimed... */
+  if (e->data.msg.hdr.task == wimpt_task()) return; /* Was us! */
+
+  paint_clipboard_release();
+}
+
+void paint_clipboard_send_dataload(wimp_eventstr *ev, int buffer_length)
+
+{ wimp_msgstr msg;
+
+  memset(&msg, 0, sizeof(wimp_msgstr));
+  msg.hdr.action      = wimp_MDATALOAD;
+  msg.hdr.size        = (msg.data.dataload.name - (char *)&msg + 1 + strlen(ev->data.msg.data.dataload.name) + 3) &~ 3;
+  msg.hdr.your_ref    = ev->data.msg.hdr.my_ref;
+  msg.data.dataload.w = ev->data.msg.data.datasaveok.w;               /* target window */
+  msg.data.dataload.i = ev->data.msg.data.datasaveok.i;               /* target icon */
+  msg.data.dataload.x = ev->data.msg.data.datasaveok.x;                  /* target coords in target window work area */
+  msg.data.dataload.y = ev->data.msg.data.datasaveok.y;
+  msg.data.dataload.size = buffer_length;
+  msg.data.dataload.type = ev->data.msg.data.datasaveok.type;            /* type of file */
+  strcpy(msg.data.dataload.name, ev->data.msg.data.dataload.name);
+
+  wimp_sendmessage(wimp_ESENDWANTACK, &msg, ev->data.msg.hdr.task); /*Return to destination task*/
+}
+
+static void paint_clipboard_export_file(wimp_eventstr *ev, char *data, int length, int filetype)
+
+{ /*Export data to file and then issue DATALOAD*/
+  int handle;
+  BOOL success = FALSE;
+
+  if (!paint_clipboard_openup(ev->data.msg.data.datasaveok.name, &handle))
+    return; /*Error already reported; bail out*/
+
+  success = paint_clipboard_write_bytes(handle, data, length);
+
+  if (success)
+    success = paint_clipboard_close(ev->data.msg.data.datasaveok.name, &handle, filetype);
+  else
+  { /*Don't change success - want to keep it as FALSE */
+    paint_clipboard_close(ev->data.msg.data.datasaveok.name, &handle, filetype);
+  }
+
+  if (success) paint_clipboard_send_dataload(ev, length);
+}
+
+BOOL paint_clipboard_list_has_type(int *listptr, int filetype)
+
+{ /*Check the list to see if it has a particular filetype or not*/
+  int i;
+  for (i = 0; i < (256 - 24 - sizeof(wimp_msghdr))/4 && *(listptr+i) != wimp_MDATAREQUEST_types_end; i++)
+  {
+    if (*(listptr + i) == filetype)
+      return TRUE;
+  }
+   return FALSE;
+}
+
+void paint_clipboard_rx_datarequest(wimp_eventstr *e)
+
+{ wimp_msgstr msg;
+  int output_type;
+  char *draw_buffer = NULL;
+  int draw_length = 0;
+
+  /*Can we service this?*/
+
+  if (!paint_owns_clipboard) return; /*We don't have anything to shout about*/
+  if (e->data.msg.data.datarequest.flags != wimp_MDATAREQUEST_flags_clipboard)
+    return; /*Unknown flags, bail out*/
+
+  /*Send a datasave with a matching mask*/
+
+  memset(&msg, 0, sizeof(wimp_msgstr));
+  msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+  msg.hdr.action   = wimp_MDATASAVE;
+
+  msg.data.datasave.w = e->data.msg.data.datarequest.w;
+  msg.data.datasave.i = (int)e->data.msg.data.datarequest.h;
+  msg.data.datasave.x = e->data.msg.data.datarequest.x;
+  msg.data.datasave.y = e->data.msg.data.datarequest.y;
+
+  /* At the moment we only export Sprites or a Drawfile.  In future we'll likely need
+     to alter this to export PNG on request too. */
+
+  /* determine export options */
+  if (clipdata->number > 1 && paint_clipboard_list_has_type(&e->data.msg.data.datarequest.types[0],FileType_Draw))
+  { output_type = FileType_Draw;
+    if (!clipboard_to_drawfile(clipdata, &draw_buffer, &draw_length)) return;
+    msg.data.datasave.estsize = draw_length;
+  }
+  else
+  { output_type = FileType_Sprite;
+    msg.data.datasave.estsize = clipdata->size - 4;
+  }
+
+  msg.data.datasave.type = output_type;
+  strcpy(msg.data.datasave.leaf, msgs_lookup("PntG6"));
+
+  msg.hdr.size = (msg.data.datasave.leaf - (char *)&msg + 1 + strlen(msg.data.datasave.leaf) + 3) &~ 3;
+
+  wimp_sendmessage(wimp_ESENDWANTACK, &msg, e->data.msg.hdr.task);
+
+  /*See if we get a reply...*/
+  wimp_eventstr ev;
+  BOOL complete = FALSE;
+  while (!complete)
+  { wimpt_poll(event_getmask(), &ev);
+
+    switch (ev.e)
+    { case wimp_EACK:
+        if (ev.data.msg.hdr.action == wimp_MDATASAVE)
+        { /*Bounced message - no data on clipboard to paste, just bail out*/
+          complete = TRUE;
+        }
+      break;
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+        switch (ev.data.msg.hdr.action)
+        { case wimp_MDATASAVEOK: /*File xfer*/
+            if (output_type == FileType_Sprite)
+              paint_clipboard_export_file(&ev, ((char *)clipdata) + 4, clipdata->size - 4, output_type);
+            else
+              paint_clipboard_export_file(&ev, draw_buffer, draw_length, output_type);
+
+            complete = TRUE;
+          break;
+
+        case wimp_MRAMFETCH: /*Memory xfer*/
+            if (output_type == FileType_Sprite)
+              paint_clipboard_export_ramxfer_do(&ev, ((char *)clipdata) + 4, clipdata->size - 4);
+            else
+              paint_clipboard_export_ramxfer_do(&ev, draw_buffer, draw_length);
+
+            complete = TRUE;
+          break;
+        }
+      break;
+    }
+  }
+
+  if (draw_buffer) flex_free((flex_ptr)&draw_buffer);
+}
