@@ -1,0 +1,251 @@
+/* Copyright 2019 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdlib.h>
+
+#include "bbc.h"
+#include "flex.h"
+#include "werr.h"
+#include "drawftypes.h"
+#include "drawfdiag.h"
+#include "drawfobj.h"
+#include "sprite.h"
+
+#include "main.h"
+#include "Drawfile.h"
+
+/* default settings for our layout */
+#define XMIN  0
+#define XMAX  675
+#define GRID  75
+#define SCALE 512
+#define TOP   1000
+
+static int drawfile_get_selection_length(main_window *window)
+{
+  /* returns the required length for a drawfile export */
+  int size = sizeof(draw_fileheader);
+
+  /* iterate the selection and find the individual sprite lengths */
+  main_sprite *sprite;
+  sprite_header *entry;
+
+  for (sprite = window->data->file.sprites; sprite != NULL; sprite = sprite->link)
+  { if (sprite->flags & MSF_SELECTED)
+    { entry = (sprite_header *) ((char *)sprite->file->spritearea + sprite->offset);
+      size += sizeof(draw_spristrhdr) + sizeof(draw_spristr) + entry->next;
+    }
+  }
+
+  return size;
+}
+
+static int drawfile_get_clipboard_length(sprite_area *clipdata)
+{
+  /* returns the required length for a drawfile export */
+  int size = sizeof(draw_fileheader);
+  int offset = clipdata->sproff;
+  int sprite;
+
+  for (sprite = 0; sprite < clipdata->number; sprite++)
+  { sprite_header *spriteptr = (sprite_header *)((char *)clipdata + offset);
+    offset += spriteptr->next;
+    size += sizeof(draw_spristrhdr) + sizeof(draw_spristr) + spriteptr->next;
+  }
+
+  return size;
+}
+
+static BOOL drawfile_sprite_fits(char **buffer, int *end_offset, int width, int height, int x, int y)
+{
+  /* see if the bounding box intersects an existing one... */
+  int xmax = width + x;
+  int ymax = height + y;
+  draw_spristrhdr *ptr;
+
+  for (ptr = (draw_spristrhdr *)(*buffer + sizeof(draw_fileheader));
+       ptr < (draw_spristrhdr *)(*buffer + *end_offset);
+       ptr = (draw_spristrhdr *)((char *)ptr + ptr->size))
+    if (!(ptr->bbox.x0 > xmax || ptr->bbox.x1 < x || ptr->bbox.y1 < y || ptr->bbox.y0 > ymax)) return FALSE;
+
+  return TRUE;
+}
+
+
+static void drawfile_find_gap(sprite_area *area, sprite_header *sprite, char **buffer, int *end_offset, draw_box *bbox)
+{
+  /* Find a hole to position the sprite in */
+  /* We'll create as many rows as needed */
+  main_scaling_block mode;
+  int y = (TOP + GRID) * SCALE;
+  int x;
+  BOOL found = FALSE;
+
+  /* find sprite */
+  sprite_info info;
+  sprite_id id;
+  id.s.addr = (sprite_ptr) sprite;
+  id.tag = sprite_id_addr;
+  sprite_readsize(area, &id, &info);
+
+  /* work out scale factor for the sprite */
+  mode.scale_xmul = 1 << bbc_modevar (info.mode, bbc_XEigFactor);
+  mode.scale_xdiv = 2;
+  mode.scale_ymul = 1 << bbc_modevar (info.mode, bbc_YEigFactor);
+  mode.scale_ydiv = 2;
+
+  /* work out the bounding box for this sprite from its size and the scale factors */
+  bbox->x0 = 0;
+  bbox->y0 = 0;
+  bbox->x1 = (info.width * SCALE * mode.scale_xmul) / mode.scale_xdiv;
+  bbox->y1 = (info.height * SCALE * mode.scale_ymul) / mode.scale_ydiv;
+
+  while (!found)
+  { y -= (GRID * SCALE);
+    for (x = XMIN * SCALE; x < XMAX * SCALE; x += GRID * SCALE)
+      if (drawfile_sprite_fits(buffer, end_offset, bbox->x1, bbox->y1, x, y))
+        { found = TRUE;
+          bbox->x0 += x;
+          bbox->x1 += x;
+          bbox->y0 += y;
+          bbox->y1 += y;
+          break;
+        }
+  }
+}
+
+static BOOL drawfile_append_sprite(sprite_area *area, sprite_header *sprheader, char **buffer, int *offset)
+{
+  /* Append sprite to drawfile */
+  draw_box bbox;
+  draw_spristrhdr *hdrptr;
+  draw_spristr *dataptr;
+
+  /* find a convenient location to place sprite in the output document */
+  drawfile_find_gap(area, sprheader, buffer, offset, &bbox);
+
+  /* append to the Drawfile.  Memory has already been allocated */
+
+  /* generate our object */
+  hdrptr = (draw_spristrhdr *) (*buffer + *offset);
+  dataptr = (draw_spristr *) (hdrptr+1); /* +1 as pointer will add size of struct for us */
+
+  /* fill header */
+  hdrptr->tag  = draw_OBJSPRITE;
+  hdrptr->size = sizeof(draw_spristrhdr) + sizeof(draw_spristr) + sprheader->next;
+  hdrptr->bbox = bbox;
+
+  /* copy in sprite */
+  memcpy(dataptr, sprheader, sprheader->next);
+
+  /* update offset for the next one */
+  *offset = *offset + hdrptr->size;
+
+  return TRUE;
+}
+
+static void drawfile_calc_bbox(char **buffer,int *length)
+{
+  /* sort out the file bounding box from the individual components */
+  draw_fileheader *header = (draw_fileheader *)*buffer;
+  draw_spristrhdr *ptr;
+
+  header->bbox.y1 = header->bbox.x1 = 0;
+  header->bbox.y0 = header->bbox.x0 = 0x7fffffff;
+
+  /* iterate each object in the drawfile */
+  for (ptr = (draw_spristrhdr *)(*buffer + sizeof(draw_fileheader));
+       ptr < (draw_spristrhdr *)(*buffer + *length);
+       ptr = (draw_spristrhdr *)((char *)ptr + ptr->size))
+  { if (header->bbox.x0 > ptr->bbox.x0) header->bbox.x0 = ptr->bbox.x0;
+    if (header->bbox.y0 > ptr->bbox.y0) header->bbox.y0 = ptr->bbox.y0;
+    if (header->bbox.x1 < ptr->bbox.x1) header->bbox.x1 = ptr->bbox.x1;
+    if (header->bbox.y1 < ptr->bbox.y1) header->bbox.y1 = ptr->bbox.y1;
+  }
+
+  /* and now move everything down the page */
+  for (ptr = (draw_spristrhdr *)(*buffer + sizeof(draw_fileheader));
+       ptr < (draw_spristrhdr *)(*buffer + *length);
+       ptr = (draw_spristrhdr *)((char *)ptr + ptr->size))
+  { ptr->bbox.y0 -= header->bbox.y0;
+    ptr->bbox.y1 -= header->bbox.y0;
+  }
+
+  header->bbox.y1 -= header->bbox.y0;
+  header->bbox.y0 = 0;
+}
+
+BOOL clipboard_to_drawfile(sprite_area *clipdata, char **buffer, int *length)
+{
+  /* Take the clipboard data and create a simple Drawfile */
+  draw_box bbox = {0,0,0,0};
+  int fileoffset;
+  draw_diag drawfile;
+  int offset = clipdata->sproff;
+  int sprite;
+
+  *length = drawfile_get_clipboard_length(clipdata); /* we can precalculate this easily */
+
+  if (flex_alloc((flex_ptr)buffer, *length) == 0)
+  { werr (FALSE, "PntEG"); /* out of memory */
+    return FALSE;
+  }
+
+  drawfile.data   = *buffer;
+  drawfile.length = *length;
+  draw_create_diag(&drawfile, "Paint", bbox);
+
+  fileoffset = sizeof(draw_fileheader);
+
+  for (sprite = 0; sprite < clipdata->number; sprite++)
+  { sprite_header *spriteptr = (sprite_header *)((char *)clipdata + offset);
+    offset += spriteptr->next;
+    drawfile_append_sprite(clipdata, spriteptr, buffer, &fileoffset);
+  }
+
+  /* set up a final bounding box */
+  drawfile_calc_bbox(buffer, length);
+
+  return TRUE;
+}
+
+BOOL selection_to_drawfile(main_window *window, char **buffer, int *length)
+{
+  /* Take the selected sprites and create a simple Drawfile from them */
+  draw_box bbox = {0,0,0,0};
+  main_sprite *sprite;
+  int offset;
+  draw_diag drawfile;
+
+  *length = drawfile_get_selection_length(window); /* we can precalculate this easily */
+
+  if (!flex_alloc((flex_ptr)buffer, *length))
+  { werr (FALSE, "PntEG"); /* out of memory */
+    return FALSE;
+  }
+
+  drawfile.data   = *buffer;
+  drawfile.length = *length;
+  draw_create_diag(&drawfile, "Paint", bbox);
+
+  offset = sizeof(draw_fileheader);
+  for (sprite = window->data->file.sprites; sprite != NULL; sprite = sprite->link)
+    if (sprite->flags & MSF_SELECTED)
+      drawfile_append_sprite(sprite->file->spritearea, (sprite_header *)(((char *)sprite->file->spritearea) + sprite->offset), buffer, &offset);
+
+  /* set up a final bounding box */
+  drawfile_calc_bbox(buffer, length);
+
+  return TRUE;
+}

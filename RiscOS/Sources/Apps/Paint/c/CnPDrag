@@ -1,0 +1,735 @@
+/* Copyright 2019 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "Global/Variables.h"
+#include "Global/FileTypes.h"
+#include "Global/OsBytes.h"
+#include "Global/CMOS.h"
+#include "Global/Sprite.h"
+
+#include "os.h"
+#include "akbd.h"
+#include "alarm.h"
+#include "bbc.h"
+#include "flex.h"
+#include "pointer.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "msgs.h"
+#include "xferrecv.h"
+#include "help.h"
+#include "font.h"
+#include "dragasprit.h"
+#include "event.h"
+
+#include "main.h"
+#include "Menus.h"
+#include "MenuD.h"
+#include "CnPDrag.h"
+#include "Clipboard.h"
+#include "Drawfile.h"
+
+#include "swis.h"
+
+/*Global state variables*/
+cnp_dragstr current_drag_op = {0,0,0,0,0,0,0,0,0,0,0};
+cnp_dragclaimstr current_dragclaim = {FALSE,FALSE};
+
+static BOOL cnp_using_dragasprite (void)
+
+{ int r1, r2;
+
+  r1 = FileSwitchCMOS;
+  os_byte (OsByte_ReadCMOS, &r1, &r2);
+  return r2 & DragASpriteCMOSBit;
+}
+
+static void cnp_drag_set_ptr_drop(void)
+
+{ sprite_id id;
+  id.tag    = sprite_id_name;
+  id.s.name = "ptr_drop";
+  wimpt_noerr (pointer_set_shape (wimp_spritearea, &id, 1, 15));
+}
+
+/*Reinstate a dragbox or draganobject if during a drag process*/
+static void cnp_drag_restart_dragbox(wimp_dragtype type, wimp_mousestr *mouse)
+
+{ wimp_dragstr dragbox;
+
+  memset(&dragbox, 0, sizeof (wimp_dragstr));
+  dragbox.window = current_drag_op.window->handle;
+  dragbox.type   = type;
+  dragbox.box    = current_drag_op.osunits;
+  /*Offset by mouse pointer*/
+  if (mouse!=0)
+  { dragbox.box.x0 += mouse->x;
+    dragbox.box.x1 += mouse->x;
+    dragbox.box.y0 += mouse->y;
+    dragbox.box.y1 += mouse->y;
+  }
+  else
+  { wimp_mousestr pointer;
+
+    wimp_get_point_info(&pointer);
+    dragbox.box.x0 += pointer.x;
+    dragbox.box.x1 += pointer.x;
+    dragbox.box.y0 += pointer.y;
+    dragbox.box.y1 += pointer.y;
+  }
+
+  dragbox.parent = current_drag_op.parent;
+
+  switch (type)
+  { case wimp_USER_HIDDEN:
+      dragasprite_stop ();
+      wimp_drag_box (&dragbox);
+    break;
+
+    case wimp_USER_FIXED:
+      if (current_drag_op.dragasprite[0])
+      { wimpt_complain (dragasprite_start (dragasprite_HJUSTIFY_CENTRE | dragasprite_VJUSTIFY_CENTRE |
+                                           dragasprite_BOUNDTO_SCREEN | dragasprite_BOUND_POINTER |
+                                           dragasprite_DROPSHADOW_PRESENT, wimp_spritearea,
+                                           current_drag_op.dragasprite, &dragbox.box, NULL));
+      }
+      else
+        wimp_drag_box (&dragbox);
+    break;
+  }
+}
+
+/* get main window data but only if it's a filer window and not a sprite window */
+
+static BOOL cnp_drag_window_to_mainwindow(wimp_w w, main_window **mw)
+
+{ main_window *ptr;
+  for (ptr = main_windows; ptr != NULL; ptr = ptr->link)
+  { if (ptr -> handle == w)
+    { if (ptr -> tag != main_window_is_file)
+      { if (mw != NULL) *mw = NULL;
+        return FALSE;
+      }
+      else
+      { if (mw != NULL) *mw = ptr;
+        return TRUE;
+      }
+    }
+  }
+
+  if (mw != NULL) *mw = NULL;
+
+  return FALSE;
+}
+
+/*Determine if a window is owned by this instance.*/
+/*If so, we can skip overheads of messaging and just move stuff directly.*/
+#define cnp_drag_window_is_local(a) cnp_drag_window_to_mainwindow(a, NULL)
+
+static wimp_t cnp_window_owner(wimp_w handle)
+
+{ /* Determine owner of a window via Wimp_SendMessage */
+  wimp_msgstr m;
+  wimp_t owner;
+
+  memset(&m, 0, sizeof(wimp_msgstr));
+  m.hdr.size = 20;
+  _swix(Wimp_SendMessage, _INR(0,2)|_OUT(2), wimp_EACK, &m, handle, &owner);
+
+  return owner;
+}
+
+static void cnp_drag_message_dragging(wimp_mousestr mouse)
+
+{ /*Send Message_Dragging*/
+  wimp_msgstr msg;
+  wimp_etype messagetype;
+  int *types,typecount = 1;
+
+  if (cnp_drag_window_is_local(mouse.w))
+  { /*We bypass the mechanism and sort out the drag box etc in case it had been closed*/
+    if (current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_removedragbox)
+      cnp_drag_restart_dragbox (wimp_USER_FIXED, 0);
+
+    current_drag_op.old_dragclaim_flags = 0;
+
+    return; /*No need to send as it's us*/
+  }
+
+  /* Is the window a non-main window owned by us though? */
+  if (cnp_window_owner(mouse.w) == wimpt_task())
+  { /*We bypass the mechanism and sort out the drag box etc in case it had been closed*/
+    if (current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_removedragbox)
+      cnp_drag_restart_dragbox (wimp_USER_FIXED, 0);
+
+    current_drag_op.old_dragclaim_flags = 0;
+
+    return; /*No need to send as it's us*/
+  }
+
+  memset(&msg, 0, sizeof(msg));
+
+  msg.hdr.action          = wimp_MDRAGGING;
+  msg.hdr.your_ref        = current_drag_op.lastref;
+  msg.data.dragging.w     = mouse.w;
+  msg.data.dragging.i     = mouse.i;
+  msg.data.dragging.x     = mouse.x;
+  msg.data.dragging.y     = mouse.y;
+  msg.data.dragging.flags = wimp_MDRAGGING_flags_datafromselection |
+    (current_drag_op.shift_pressed == TRUE ? wimp_MDRAGGING_flags_deletesource : 0);
+  msg.data.dragging.box   = current_drag_op.millipt;
+
+  /*Fill in the filetypes based on the selection mask*/
+  types = &msg.data.dragging.types[0]; /*else we get a compiler warning for out of bounds*/
+  types[0] = FileType_Sprite;
+  if (current_drag_op.datasource->selection.count > 1)
+    types [typecount++] = FileType_Draw;
+  types [typecount++] = wimp_MDRAGGING_types_end;
+
+  msg.hdr.size = (int)&types[typecount] - (int)&msg;
+
+  if (current_drag_op.claimant != -1)
+    messagetype = wimp_ESENDWANTACK;
+  else
+  { if (current_drag_op.drag_finished) messagetype = wimp_ESENDWANTACK;
+    else messagetype = wimp_ESEND;
+  }
+  wimpt_complain (wimp_sendmessage (messagetype, &msg, current_drag_op.claimant != -1 ? current_drag_op.claimant : mouse.w));
+}
+
+void cnp_drag_stop_current(void)
+
+{ if (current_drag_op.autoscrolling)
+  { wimp_autoscroll (0, 0, 0);
+    current_drag_op.autoscrolling = FALSE;
+  }
+
+  current_drag_op.window = NULL;
+
+  if (current_drag_op.dragasprite[0]) dragasprite_stop();
+    else wimp_drag_box ((wimp_dragstr *)-1);
+
+  pointer_reset_shape ();
+
+  /* Stop null events */
+  main_claim_idle (-1);
+}
+
+void cnp_drag_abort_current(void)
+
+{ if (current_drag_op.window != NULL)
+  { wimp_mousestr mouse;
+
+    cnp_drag_stop_current ();
+
+    current_drag_op.drag_finished = TRUE;
+    current_drag_op.drag_aborted = TRUE;
+
+    wimp_get_point_info (&mouse);
+    cnp_drag_message_dragging (mouse);
+  }
+}
+
+static void cnp_drag_claim_autoscroll(wimp_w w)
+
+{ wimp_autoscrollblk scroll;
+
+  scroll.w                      = w;
+  scroll.left_pausezonewidth    = 80;
+  scroll.bottom_pausezoneheight = 80;
+  scroll.right_pausezonewidth   = 80;
+  scroll.top_pausezoneheight    = 80;
+  scroll.pause                  = 25;
+  scroll.handler                = wimp_AUTOSCROLL_handler_wimp;
+  scroll.handle                 = 0;
+  wimp_autoscroll (2, &scroll, 0);
+}
+
+static void cnp_drag_autoscroll(wimp_w w,BOOL status)
+
+{ if (status)
+  { cnp_drag_claim_autoscroll (w);
+    current_drag_op.autoscroll_w  = w;
+    current_drag_op.autoscrolling = TRUE;
+  }
+  else
+  { wimp_autoscroll (0, 0, 0);
+    current_drag_op.autoscroll_w  = -1;
+    current_drag_op.autoscrolling = FALSE;
+  }
+}
+
+
+void cnp_drag_check_current_op(void)
+
+{ /*Check current drag op for updates*/
+  /*May need to turn autoscroll on/off*/
+
+  wimp_mousestr mouse;
+  int now;
+
+  if (current_drag_op.window == NULL || current_drag_op.drag_aborted || current_drag_op.drag_finished)
+    return;
+
+  wimp_get_point_info (&mouse);
+
+  if (current_drag_op.autoscrolling)
+  { /*Are we in the same window still?*/
+    if (mouse.w != current_drag_op.autoscroll_w)
+    {
+      /*Moved out of window.  Need to stop the autoscroll here*/
+      cnp_drag_autoscroll(0, FALSE);
+
+      /*Did we move into another Paint window?*/
+      if (cnp_drag_window_is_local(mouse.w))
+        cnp_drag_autoscroll(mouse.w, TRUE);
+    }
+  }
+  else
+  { /*We aren't autoscrolling.  Do we need to start it up, though?*/
+    if (cnp_drag_window_is_local(mouse.w))
+    { cnp_drag_autoscroll (mouse.w, TRUE);
+
+      /*Do we need to restart pointer shape and dragbox?*/
+      if (current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_removedragbox)
+        cnp_drag_restart_dragbox (wimp_USER_FIXED, &mouse);
+
+      if (current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_ptrchanged)
+        cnp_drag_set_ptr_drop ();
+
+      current_drag_op.old_dragclaim_flags = 0;
+    }
+  }
+
+  /*Do we need to send a Message_Dragging message?*/
+  now = alarm_timenow ();
+  if (now - current_drag_op.last_msg >= 25)
+  { cnp_drag_message_dragging (mouse);
+    current_drag_op.last_msg = now;
+  }
+}
+
+void cnp_drag_start_export(main_window *window, char *spritename)
+
+{ int width,height;
+
+  cnp_drag_stop_current ();
+
+  memset (&current_drag_op, 0, sizeof(cnp_dragstr));
+
+  if (cnp_using_dragasprite()) strcpy(current_drag_op.dragasprite,spritename);
+
+  cnp_drag_autoscroll (window->handle, TRUE);
+
+  /* Bounding box is filer thumbnail size */
+  if (window->data->file.fullinfo)
+  { width = main_FILER_XSize/2;
+    height = main_FILER_YSize/2;
+  }
+  else
+  { width = main_FILER_XSize;
+    height = main_FILER_YSize;
+  }
+
+  /* Centre on mouse pointer */
+  current_drag_op.osunits.x0 = -width/2;
+  current_drag_op.osunits.x1 = width/2;
+  current_drag_op.osunits.y0 = -height/2;
+  current_drag_op.osunits.y1 = height/2;
+
+  current_drag_op.millipt.x0 = current_drag_op.osunits.x0 * 400;
+  current_drag_op.millipt.x1 = current_drag_op.osunits.x1 * 400;
+  current_drag_op.millipt.y0 = current_drag_op.osunits.y0 * 400;
+  current_drag_op.millipt.y1 = current_drag_op.osunits.y1 * 400;
+
+  current_drag_op.parent.x0 = -width/2;
+  current_drag_op.parent.y0 = -height/2;
+  current_drag_op.parent.x1 = (bbc_vduvar (bbc_XWindLimit) << bbc_vduvar (bbc_XEigFactor)) + width/2;
+  current_drag_op.parent.y1 = (bbc_vduvar (bbc_YWindLimit) << bbc_vduvar (bbc_YEigFactor)) + height/2;
+
+  /*Set pointer shape - ptr_drop*/
+  cnp_drag_set_ptr_drop ();
+
+  cnp_drag_restart_dragbox (wimp_USER_FIXED, 0);
+
+  current_drag_op.window        = window;
+  current_drag_op.datasource    = window;
+  current_drag_op.last_msg      = alarm_timenow ();
+  current_drag_op.drag_finished = FALSE;
+  current_drag_op.drag_aborted  = FALSE;
+  current_drag_op.lastref       = 0;
+  current_drag_op.claimant      = -1;
+  current_drag_op.shift_pressed = akbd_pollsh ();
+
+  /* Enable null events */
+  main_claim_idle (window->handle);
+}
+
+void cnp_drag_poll_response(wimp_eventstr *e)
+
+{ /*We received a userdrag event code. See if we need to act.*/
+  wimp_mousestr mouse;
+  wimp_w source_w = current_drag_op.window->handle;
+
+  e=e; /*Stops the compiler warning*/
+  wimp_get_point_info (&mouse);
+
+  current_drag_op.drag_finished=TRUE;
+  pointer_reset_shape ();
+
+  /*Call draganobject_stop if nec as well*/
+  if (current_drag_op.window != NULL)
+  { /*We have a source window.  Are we going to the same window or different?*/
+    /*If same, then we do nothing*/
+
+    if (source_w != mouse.w)
+    { /*If different, then export may be needed*/
+      main_window *destwin;
+      if (cnp_drag_window_to_mainwindow(mouse.w, &destwin))
+      { /* Copy data internally */
+        wimp_caretstr caret;
+
+        /* copy data over */
+        if (paint_clipboard_get_selection(current_drag_op.datasource, &ramfetch_buffer, SELBUFFER_FILEDATA))
+        { if (Load_File(destwin, (char *)-1, 1, 0) > 0)
+          { /* clear source selection */
+            if (current_drag_op.shift_pressed ||
+                (e->data.msg.data.dragclaim.flags & wimp_MDRAGCLAIM_flags_deletesource) )
+            { /*Delete source data*/
+              char hit [2];
+
+              hit [0] = m_Sprite;
+              hit [1] = m_Sprite_Delete;
+              menus_file_handler (current_drag_op.datasource, hit);
+            }
+            else
+              main_clear_all(current_drag_op.datasource);
+
+            /*Make sure destination windows gains input focus*/
+            memset (&caret, 0, sizeof(wimp_caretstr));
+            caret.w = mouse.w;
+            caret.i = -1;
+            wimp_set_caret_pos (&caret);
+          }
+        }
+        cnp_drag_stop_current ();
+      }
+      else
+      { /*Final dragging message goes out*/
+        cnp_drag_message_dragging (mouse);
+        cnp_drag_stop_current ();
+      }
+    }
+  }
+  else
+  { /*Just stop it*/
+    cnp_drag_stop_current ();
+  }
+}
+
+
+static void cnp_drag_export_file(wimp_eventstr *ev, char *buffer, int length, int filetype)
+
+{ /*Export data to file and then issue Message_DataLoad*/
+  int handle;
+  BOOL success = FALSE;
+
+  if (!paint_clipboard_openup (ev->data.msg.data.datasaveok.name, &handle)) return; /*Error already reported; bail out*/
+  success = paint_clipboard_write_bytes (handle, buffer, length);
+
+  if (success)
+    success = paint_clipboard_close (ev->data.msg.data.datasaveok.name, &handle, filetype);
+  else
+  { /*Don't change success - want to keep it as FALSE */
+    paint_clipboard_close (ev->data.msg.data.datasaveok.name, &handle, filetype);
+  }
+
+  if (!success) return; /*Failed to write data*/
+
+  paint_clipboard_send_dataload (ev, length);
+}
+
+static int cnp_drag_negotiate_filetype(wimp_t taskh, wimp_eventstr *e)
+
+{ if (taskh == -1 || current_drag_op.datasource->selection.count == 1) return FileType_Sprite;
+  return paint_clipboard_list_has_type(&e->data.msg.data.dragclaim.types[0],FileType_Draw) ? FileType_Draw : FileType_Sprite;
+}
+
+static void cnp_drag_send_datasave(wimp_eventstr *e, wimp_t taskh, wimp_w windowh)
+
+{ /*Send Message_DataSave to claimant using first possible data type if possible or native if not*/
+  char *buffer = NULL;
+  int length   = 0;
+  int output_type;
+  wimp_msgstr msg;
+  wimp_mousestr mouse;
+  wimp_eventstr ev;
+  BOOL complete;
+
+  wimp_get_point_info (&mouse);
+
+  memset(&msg, 0, sizeof(wimp_msgstr));
+  msg.hdr.action      = wimp_MDATASAVE;
+  msg.data.datasave.w = mouse.w;
+  msg.data.datasave.i = mouse.i;
+  msg.data.datasave.x = mouse.x;
+  msg.data.datasave.y = mouse.y;
+
+  /* negotiate filetype.  If there's >1 selection and the receiver accepts Draw, send as a Drawfile */
+  /* else send as a Spritefile */
+  output_type = cnp_drag_negotiate_filetype(taskh, e);
+  msg.data.datasave.type = output_type;
+
+  switch (output_type)
+  { case FileType_Draw:
+      if (!selection_to_drawfile(current_drag_op.datasource, &buffer, &length)) return;
+      msg.data.datasave.estsize = length;
+    break;
+
+    case FileType_Sprite:
+      if (!paint_clipboard_get_selection(current_drag_op.datasource, &buffer, SELBUFFER_SPRITEAREA)) return;
+      length = ((sprite_area *)buffer)->size;
+      msg.data.datasave.estsize = length - 4;
+    break;
+  }
+  strcpy (msg.data.datasave.leaf, msgs_lookup("PntG6"));
+
+  msg.hdr.size = (msg.data.datasave.leaf - (char *)&msg + 1 + strlen(msg.data.datasave.leaf) + 3) &~ 3;
+
+  if (taskh!=-1)
+    wimp_sendmessage(wimp_ESENDWANTACK, &msg, taskh);
+  else
+    wimp_sendmessage(wimp_ESENDWANTACK, &msg, windowh);
+
+  /*See if we get a reply...*/
+  complete = FALSE;
+  while (!complete)
+  { wimpt_poll (event_getmask(), &ev);
+
+    switch (ev.e)
+    { case wimp_EACK:
+        if (ev.data.msg.hdr.action == wimp_MDATASAVE)
+        { /*Bounced message - no data on clipboard to paste.  Just bail out*/
+          complete = TRUE;
+        }
+      break;
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+        switch (ev.data.msg.hdr.action)
+        { case wimp_MDATASAVEOK: /*File transfer*/
+            cnp_drag_export_file (&ev, buffer + (output_type == FileType_Sprite ? 4 : 0),
+                                  length - (output_type == FileType_Sprite ? 4 : 0), output_type);
+            complete = TRUE;
+          break;
+
+          case wimp_MRAMFETCH: /*Memory transfer*/
+            paint_clipboard_export_ramxfer_do (&ev, buffer + (output_type == FileType_Sprite ? 4 : 0),
+                                               length - (output_type == FileType_Sprite ? 4 : 0));
+            complete = TRUE;
+          break;
+        }
+      break;
+    }
+  }
+
+  /*Tidy up export buffer*/
+  flex_free ((flex_ptr)&buffer);
+}
+
+void cnp_drag_rx_mdragclaim (wimp_eventstr *e)
+
+{ if (current_drag_op.drag_aborted)
+  { current_drag_op.window = NULL;
+    return; /*Shouldn't happen*/
+  }
+
+  if (current_drag_op.drag_finished)
+  { /*Drag ended successfully while a claim in force*/
+    /*Set up enhanced drop operation*/
+    /*Send message_datasave to claimant using first possible data type if possible or native if not*/
+    cnp_drag_send_datasave(e, e->data.msg.hdr.task, -1);
+
+    /*Finalise selection bits*/
+    if (current_drag_op.shift_pressed ||
+        (e->data.msg.data.dragclaim.flags & wimp_MDRAGCLAIM_flags_deletesource) )
+    { /*Delete source data*/
+      char hit [2];
+
+      hit[0] = m_Sprite;
+      hit[1] = m_Sprite_Delete;
+      menus_file_handler (current_drag_op.datasource,hit);
+    }
+    else
+      main_clear_all(current_drag_op.datasource);
+
+    return;
+  }
+  else
+  { if (current_drag_op.lastref != 0)
+    { /*Claim is continuing, not starting*/
+      if ((current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_ptrchanged)
+          && ((e->data.msg.data.dragclaim.flags & wimp_MDRAGCLAIM_flags_ptrchanged) == 0))
+      { cnp_drag_set_ptr_drop();
+      }
+
+      if ((current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_removedragbox)
+          && ((e->data.msg.data.dragclaim.flags & wimp_MDRAGCLAIM_flags_removedragbox) == 0))
+      { /*Call wimp drag box, type wimp_USER_FIXED (or draganobject_start)*/
+        cnp_drag_restart_dragbox(wimp_USER_FIXED, 0);
+      }
+
+      if (((current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_removedragbox) == 0)
+          && (e->data.msg.data.dragclaim.flags & wimp_MDRAGCLAIM_flags_removedragbox))
+      { /*Call wimp drag box, type wimp_USER_HIDDEN (and draganobject_stop if necessary first)*/
+        cnp_drag_restart_dragbox(wimp_USER_HIDDEN, 0);
+      }
+    }
+    else
+    { /*Claim is just starting*/
+      if (e->data.msg.data.dragclaim.flags & wimp_MDRAGCLAIM_flags_removedragbox)
+      { /*Call wimp drag box type wimp_USER_HIDDEN (and draganobject_stop if necessary first)*/
+        cnp_drag_restart_dragbox(wimp_USER_HIDDEN, 0);
+      }
+    }
+
+    current_drag_op.claimant            = e->data.msg.hdr.task;
+    current_drag_op.lastref             = e->data.msg.hdr.my_ref;
+    current_drag_op.old_dragclaim_flags = e->data.msg.data.dragclaim.flags;
+  }
+}
+
+static BOOL cnp_drag_accept_filetypes(int *list)
+
+{ int i;
+
+  for (i = 0; i < (256 - sizeof(wimp_msgdragging) - sizeof(wimp_msghdr)) / 4  &&  list[i] != wimp_MDRAGCLAIM_types_end; i++)
+  {
+    if (list[i] == FileType_Sprite  ||  list[i] == FileType_JPEG)
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static void cnp_drag_dragclaim_send(wimp_eventstr *e)
+
+{ wimp_msgstr msg;
+  int *list;
+
+  memset (&msg, 0, sizeof(wimp_msgstr));
+  msg.hdr.your_ref         = e->data.msg.hdr.my_ref;
+  msg.hdr.action           = wimp_MDRAGCLAIM;
+  msg.data.dragclaim.flags = 0;
+
+  list = &msg.data.dragclaim.types[0];
+  list[0] = FileType_Sprite;
+  list[1] = FileType_JPEG;
+  list[2] = wimp_MDRAGCLAIM_types_end;
+
+  msg.hdr.size = sizeof(wimp_msghdr) + (3-1)*sizeof(int) + sizeof(wimp_msgdragclaim);
+
+  wimp_sendmessage (wimp_ESEND, &msg, e->data.msg.hdr.task);
+}
+
+void cnp_drag_release_claim(void)
+
+{ if (!current_dragclaim.claiming) return;
+
+  current_dragclaim.claiming = FALSE;
+
+  if (current_dragclaim.autoscrolling)
+  { wimp_autoscroll(0, 0, 0);
+    current_dragclaim.autoscrolling   = FALSE;
+    current_dragclaim.autoscrolling_w = 0;
+  }
+}
+
+void cnp_drag_rx_mdragging(wimp_eventstr *e)
+
+{ /*Inspect the data types available to see if we're interested*/
+  if (!cnp_drag_accept_filetypes (&e->data.msg.data.dragging.types[0])) return;
+
+  if (!current_dragclaim.claiming)
+  { if ((e->data.msg.data.dragging.flags & wimp_MDRAGGING_flags_donotclaim) == 0)
+    { current_dragclaim.claiming = TRUE;
+      /*Set up autoscroll*/
+      cnp_drag_claim_autoscroll (e->data.msg.data.dragging.w);
+      current_dragclaim.autoscrolling   = TRUE;
+      current_dragclaim.autoscrolling_w = e->data.msg.data.dragging.w;
+
+      cnp_drag_dragclaim_send (e);
+    }
+  }
+  else
+  { /*Still over the same window?*/
+    if (e->data.msg.data.dragging.w == current_dragclaim.autoscrolling_w)
+      cnp_drag_dragclaim_send (e);
+    else
+    { /*Stop autoscroll for this window*/
+      if (current_dragclaim.autoscrolling)
+      { wimp_autoscroll (0, 0, 0);
+        current_dragclaim.autoscrolling = FALSE;
+      }
+      current_dragclaim.autoscrolling_w = 0;
+
+      /*Do we own the new window at all?*/
+      if (cnp_drag_window_is_local(e->data.msg.data.dragging.w))
+      { cnp_drag_claim_autoscroll (e->data.msg.data.dragging.w);
+        current_dragclaim.autoscrolling   = TRUE;
+        current_dragclaim.autoscrolling_w = e->data.msg.data.dragging.w;
+
+        cnp_drag_dragclaim_send (e);
+      }
+      else
+      { /*Release claim*/
+        current_dragclaim.claiming = FALSE;
+
+        /*Do not reply*/
+      }
+    }
+  }
+}
+
+void cnp_drag_rx_mdragging_bounce(wimp_eventstr *e)
+
+{ wimp_mousestr mouse;
+
+  wimp_get_point_info(&mouse);
+  if (current_drag_op.claimant!=-1)
+  { /*Claimant is releasing claim*/
+    if (!current_drag_op.drag_finished)
+    { if (current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_ptrchanged)
+        cnp_drag_set_ptr_drop ();
+      if (current_drag_op.old_dragclaim_flags & wimp_MDRAGCLAIM_flags_removedragbox)
+      { /*Call wimp drag box type wimp_USER_FIXED (or draganobject_start if nec)*/
+        cnp_drag_restart_dragbox (wimp_USER_FIXED, &mouse);
+      }
+    }
+
+    current_drag_op.claimant = -1;
+    current_drag_op.lastref  = 0;
+
+    cnp_drag_message_dragging(mouse);
+  }
+  else
+  { if (!current_drag_op.drag_aborted)
+    { /*Send message_datasave to window owner*/
+      if (current_drag_op.drag_finished)
+        cnp_drag_send_datasave (e, -1, mouse.w);
+    }
+  }
+}
