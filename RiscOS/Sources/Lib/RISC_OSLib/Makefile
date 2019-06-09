@@ -349,6 +349,7 @@ ROM_OBJS =\
  rm_o_rl.dboxquery \
  rm_o_rl.dboxtcol \
  rm_o_rl.dragasprit \
+ rm_o_rl.drawfobj \
  rm_o_rl.drawmod \
  rm_o_rl.event \
  rm_o_rl.fileicon \
