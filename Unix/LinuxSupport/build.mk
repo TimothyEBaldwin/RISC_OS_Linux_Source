@@ -31,9 +31,9 @@ ifeq ($(TARGET), Linux)
 all check: RISC_OS
 endif
 
-build_binds = $(foreach dir,apache bsd cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
+build_binds = $(foreach dir,Unix apache bsd cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
-Build/src-stamp: $(shell find apache bsd cddl gpl mixed)
+Build/src-stamp: $(shell find Unix apache bsd cddl gpl mixed)
 	ln -sfn . lock_source_1510718522
 	mkdir -p Build
 	touch Build/src-stamp
@@ -56,8 +56,8 @@ endif
 	  # Find directories and files
 	  shopt -s globstar
 	  shopt -s extglob
-	  dirs=({apache,bsd,cddl,gpl,mixed}/**/)
-	  files=({apache,bsd,cddl,gpl,mixed}/**)
+	  dirs=({Unix,apache,bsd,cddl,gpl,mixed}/**/)
+	  files=({Unix,apache,bsd,cddl,gpl,mixed}/**)
 	  #
 	  cd Build/$*
 	  #
@@ -101,7 +101,7 @@ else
 endif
 	#
 ifeq ($(METHOD), rpcemu)
-	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build rpcemu $* $(PHASES)' | \
+	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build rpcemu $* $(PHASES)' | \
 	$(BWRAP) --unshare-pid --unshare-net $(sandbox_misc) \
 	--ro-bind /tmp/.X11-unix /tmp/.X11-unix \
 	--proc /proc \
@@ -115,10 +115,10 @@ ifeq ($(METHOD), rpcemu)
 	/r/rpcemu
 else
   ifeq ($(INSECURE), YES)
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
   else
 	. Built/sandbox_config_sh
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.mixed.Linux.Support.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
   endif
 	*BASIC
 	VDU 7
