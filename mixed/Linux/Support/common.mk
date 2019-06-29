@@ -55,8 +55,8 @@ script-all: Built/sandbox_config_sh
 endif
 
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
-sandbox_misc := $(sandbox_root) $(call robind,/usr/bin /usr/lib* /etc/alternatives)
-sandbox_build := $(sandbox_root) $(call robind,/usr /etc/alternatives) --dev /dev --tmpfs /usr/local
+sandbox_misc := $(call robind,/bin /lib* /usr/bin /usr/lib* /etc/alternatives)
+sandbox_build := $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
 sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all $(if $(use_seccomp), --seccomp 9 9< <(Built/gen_seccomp $(1)), --new-session) --proc /proc --dir /tmp --dir /dev/shm
 ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Support/*.mk)
@@ -177,14 +177,6 @@ Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
 	  use_seccomp=true
 	fi
 	#
-	for i in /bin /sbin /lib*; do
-	  if [[ -L $$i ]]; then
-	    sandbox_root+=(--symlink "$$(readlink "$$i")" "$$i")
-	  else
-	    sandbox_root+=(--ro-bind "$$i" "$$i")
-	  fi
-	done
-	#
 	export RISC_OS_Alias_IXFSBoot='BASIC -quit IXFS:$$.Finish'
 	if $(sandbox_base) --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS --help; then
 	  $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS;
@@ -193,7 +185,6 @@ Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
 	  QEMU1=Built/qemu-arm
 	fi
 	echo "use_seccomp:=$$use_seccomp
-	sandbox_root:=$${sandbox_root[@]@Q}
 	QEMU:=$$QEMU1" > $@
 
 HardDisc4: | $(HARDDISC4) Built/sandbox_config_sh $(LINUX_ROM)
