@@ -428,15 +428,26 @@ RLIB_MOD_OBJS =\
 #
 # Build rules:
 #
+
 rom: ${OBJECT}
 	@echo ${COMPONENT}: rom library built
 
 export: export_${PHASE}
 	@echo ${COMPONENT}: export complete (${PHASE})
 
+ifeq (${COMPONENT},SharedRISC_OSLib_Headers)
+
+export_hdrs: ${HEADERS} dirs; @
+
+export_libs: ; @
+
+else
+
 export_hdrs: ${EXP_HDR}.SharedCLib; @
 
 export_libs: ${EXPORTS} dirs; @
+
+endif
 
 install: install-${INSTTYPE}
 
