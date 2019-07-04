@@ -1,0 +1,401 @@
+/*
+ * Copyright (c) 2018, Timothy Baldwin
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <ctype.h>
+#include <kernel.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include "swis.h"
+
+#include "InternetLHdr.h"
+
+#define iovec ix_iovec
+#include "sys/types.h"
+#include "sys/filio.h"
+#include "sys/socket.h"
+#include "netinet/in.h"
+#include "netinet/tcp.h"
+#include "arpa/inet.h"
+
+#include "Global/HALEntries.h"
+
+#define ix_SYSCALL_branch 1
+#include "ix/syscalls.h"
+
+static int socket_server = -1;
+
+static struct socket {
+  bool async;
+} sockets[512];
+
+static void eprintf(const char *fmt, ...) {
+  static char s[1000];
+  va_list ap;
+
+  va_start(ap, fmt);
+  int c = vsprintf(s, fmt, ap);
+  va_end(ap);
+
+  ix_write(2, s, c);
+}
+
+struct ix_sockaddr_in {
+  uint16_t sin_family;
+  uint16_t sin_port;
+  struct in_addr sin_addr;
+  char sin_zero[8];
+};
+
+static int convert_sockopt(int level, int optname) {
+  switch(level) {
+    case IPPROTO_TCP:
+      switch(optname) {
+        case TCP_NODELAY: return ix_TCP_NODELAY;
+        case TCP_MAXSEG:  return ix_TCP_MAXSEG;
+        case TCP_NOPUSH:  return ix_TCP_CORK;
+      }
+    case SOL_SOCKET:
+      switch(optname) {
+    //  case SO_DEBUG:       return ix_SO_DEBUG;
+        case SO_REUSEADDR:   return ix_SO_REUSEADDR;
+    //  case SO_TYPE:        return ix_SO_TYPE;
+        case SO_ERROR:       return ix_SO_ERROR;
+        case SO_DONTROUTE:   return ix_SO_DONTROUTE;
+        case SO_BROADCAST:   return ix_SO_BROADCAST;
+        case SO_SNDBUF:      return ix_SO_SNDBUF;
+        case SO_RCVBUF:      return ix_SO_RCVBUF;
+        case SO_KEEPALIVE:   return ix_SO_KEEPALIVE;
+        case SO_OOBINLINE:   return ix_SO_OOBINLINE;
+        case SO_LINGER:      return ix_SO_LINGER;
+        case SO_REUSEPORT:   return ix_SO_REUSEPORT;
+        case SO_RCVLOWAT:    return ix_SO_RCVLOWAT;
+        case SO_SNDLOWAT:    return ix_SO_SNDLOWAT;
+    //  case SO_RCVTIMEO:    return ix_SO_RCVTIMEO;
+    //  case SO_SNDTIMEO:    return ix_SO_SNDTIMEO;
+      }
+  }
+  eprintf("Unhandled Internet Socket Option: level 0x%X option 0x%X\n", level, optname);
+  return -ix_ENOPROTOOPT;
+}
+
+static int convert_msg_flags(int ro) {
+  int l = 0;
+  if (ro & MSG_OOB       ) l |= ix_MSG_OOB       ;
+  if (ro & MSG_PEEK      ) l |= ix_MSG_PEEK      ;
+  if (ro & MSG_DONTROUTE ) l |= ix_MSG_DONTROUTE ;
+  if (ro & MSG_EOR	 ) l |= ix_MSG_EOR	 ;
+  if (ro & MSG_TRUNC	 ) l |= ix_MSG_TRUNC	 ;
+  if (ro & MSG_CTRUNC	 ) l |= ix_MSG_CTRUNC	 ;
+  if (ro & MSG_WAITALL	 ) l |= ix_MSG_WAITALL	 ;
+  if (ro & MSG_DONTWAIT	 ) l |= ix_MSG_DONTWAIT	 ;
+  if (ro & MSG_EOF	 ) eprintf("Not handling MSG_EOF\n");
+  if (ro & MSG_COMPAT    ) eprintf("Not handling MSG_COMPAT\n");
+  return l;
+}
+
+static inline void addr2riscos(void *a, unsigned len) {
+  struct sockaddr_in *ar = a;
+  if (ar) {
+    ar->sin_family = ar->sin_len;
+    ar->sin_len = len;
+  }
+}
+
+#define GET_ADDRESS_1(ADDR, LEN, CALL) {    \
+  struct sockaddr_in *addr = (void*)(ADDR); \
+  ix_socklen_t *len = (ix_socklen_t *)(LEN);\
+  result = (CALL);                          \
+  if (result >= 0) addr2riscos(addr, *len); \
+}
+
+static ssize_t do_recvmsg(int fd, struct ix_msghdr *m, int flags) {
+  return ix_recvmsg(fd, m, flags);
+}
+
+#define SET_ADDRESS(ADDR, CALL) {                                                       \
+  const struct sockaddr_in *addr_ro = (const struct sockaddr_in *)(ADDR);               \
+  if (addr_ro->sin_family == AF_INET || addr_ro->sin_len == AF_INET) {                  \
+    struct ix_sockaddr_in addr_linux = {AF_INET, addr_ro->sin_port, addr_ro->sin_addr}; \
+    result = (CALL);                                                                    \
+  } else {                                                                              \
+    result = -ix_EAFNOSUPPORT;                                                          \
+  }                                                                                     \
+}
+
+static ssize_t do_sendmsg(int fd, const struct msghdr *m, int flags) {
+  struct ix_msghdr msg = {
+    .msg_iov = m->msg_iov,
+    .msg_iovlen = m->msg_iovlen
+  };
+  struct ix_sockaddr_in al;
+  if (m->msg_name) {
+    struct sockaddr_in *ar = (void *)m->msg_name;
+    if (ar->sin_family != AF_INET && ar->sin_len != AF_INET)
+      return -ix_EAFNOSUPPORT;
+    al.sin_family = AF_INET;
+    al.sin_port = ar->sin_port;
+    al.sin_addr = ar->sin_addr;
+    msg.msg_name = &al;
+    msg.msg_namelen = sizeof(al);
+  }
+  // FIXME: Control message data
+
+  return ix_sendmsg(fd, &msg, flags);
+}
+
+static inline ssize_t do_sendto(int fd, const void *buf, size_t len, int flags, void *addr_ro) {
+  struct iovec iov = {(void *)buf, len};
+  struct msghdr msg = {
+    .msg_name = addr_ro,
+    .msg_iov = &iov,
+    .msg_iovlen = 1
+  };
+  return do_sendmsg(fd, &msg, flags);
+}
+
+_kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
+  (void)pw;
+  int result = -ix_EPROTONOSUPPORT;
+  switch (swi_no) {
+    case Socket_Creat - Socket_00:
+      if (r->r[0] == AF_INET && (r->r[1] == SOCK_DGRAM || r->r[1] == SOCK_STREAM)) {
+        if (socket_server != -1) {
+          ix_write(socket_server, &r->r[0], sizeof(int) * 3);
+          struct ix_iovec iov = {&result, sizeof(result)};
+          struct ix_cmsghdr_fd cmsg;
+          struct ix_msghdr msg = {
+            .msg_iov = &iov,
+            .msg_iovlen = 1,
+            .msg_control = &cmsg,
+            .msg_controllen = sizeof(cmsg),
+          };
+          ix_recvmsg(socket_server, &msg, 0);
+          if (cmsg.cmsg_level == 1 && cmsg.cmsg_type == 1) {
+            result = cmsg.fd;
+          }
+        } else {
+          result = ix_socket(r->r[0], r->r[1], r->r[2]);
+        }
+        if (result >= 0) {
+          _swix(OS_ClaimDeviceVector, _INR(0, 2), result, sigio, pw);
+          _swix(OS_Hardware, _IN(0) | _INR(8, 9), result, 0, EntryNo_HAL_IRQEnable);
+        }
+      }
+      break;
+    case Socket_Read - Socket_00: {
+      struct ix_iovec iov = {(void*)r->r[1], r->r[2]};
+      struct ix_msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1
+      };
+      result = do_recvmsg(r->r[0], &msg, 0);
+      break;
+    }
+    case Socket_Write - Socket_00:
+      result = do_sendto(r->r[0], (void*)r->r[1], r->r[2], 0, 0);
+      break;
+    case Socket_Recv - Socket_00: {
+      struct ix_iovec iov = {(void*)r->r[1], r->r[2]};
+      struct ix_msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1
+      };
+      result = do_recvmsg(r->r[0], &msg, convert_msg_flags(r->r[3]));
+      break;
+    }
+    case Socket_Send - Socket_00:
+      result = do_sendto(r->r[0], (void*)r->r[1], r->r[2], convert_msg_flags(r->r[3]), 0);
+      break;
+    case Socket_Sendto - Socket_00:
+      result = do_sendto(r->r[0], (void*)r->r[1], r->r[2], convert_msg_flags(r->r[3]), (void *)r->r[4]);
+      break;
+    case Socket_Sendmsg - Socket_00:
+      result = do_sendmsg(r->r[0], (void*)r->r[1], convert_msg_flags(r->r[3]));
+      break;
+    case Socket_Recvfrom - Socket_00: {
+      struct ix_iovec iov = {(void*)r->r[1], r->r[2]};
+      struct ix_msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_name = (void *)r->r[4]
+      };
+      int *namelen = (int *)r->r[5];
+      if (namelen) msg.msg_namelen = *namelen;
+      result = do_recvmsg(r->r[0], &msg, convert_msg_flags(r->r[3]));
+      if (namelen) *namelen = msg.msg_namelen;
+      break;
+    }
+    case Socket_Recvfrom_1 - Socket_00: {
+      struct ix_iovec iov = {(void*)r->r[1], r->r[2]};
+      struct ix_msghdr msg = {
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_name = (void *)r->r[4]
+      };
+      int *namelen = (int *)r->r[5];
+      if (namelen) msg.msg_namelen = *namelen;
+      result = do_recvmsg(r->r[0], &msg, convert_msg_flags(r->r[3]));
+      addr2riscos(msg.msg_name, msg.msg_namelen);
+      if (namelen) *namelen = msg.msg_namelen;
+      break;
+    }
+    case Socket_Recvmsg - Socket_00: {
+      struct msghdr *m = (void *)r->r[1];
+      struct ix_msghdr msg = {
+        .msg_iov = m->msg_iov,
+        .msg_iovlen = m->msg_iovlen,
+        .msg_name = (void *)m->msg_name,
+        .msg_namelen = m->msg_namelen
+      };
+      result = do_recvmsg(r->r[0], &msg, convert_msg_flags(r->r[2]));
+      m->msg_namelen = msg.msg_namelen;
+      break;
+    }
+    case Socket_Recvmsg_1 - Socket_00: {
+      struct msghdr *m = (void *)r->r[1];
+      result = do_recvmsg(r->r[0], (void *)m, convert_msg_flags(r->r[2]));
+      if (result >= 0) {
+        addr2riscos(m->msg_name, m->msg_namelen);
+        int f1 = m->msg_flags, f2 = 0;
+        if (f1 & ix_MSG_OOB) f2 |= MSG_OOB;
+        if (f1 & ix_MSG_EOR) f2 |= MSG_EOR;
+        if (f1 & ix_MSG_TRUNC) f2 |= MSG_TRUNC;
+        m->msg_flags = f2;
+        // FIXME: Control message data
+      }
+      break;
+    }
+    case Socket_Listen - Socket_00:
+      result = ix_listen(r->r[0], r->r[1]);
+      break;
+
+    case Socket_Connect - Socket_00:
+      SET_ADDRESS(r->r[1], ix_connect(r->r[0], &addr_linux, sizeof(addr_linux)))
+      break;
+    case Socket_Bind - Socket_00:
+      SET_ADDRESS(r->r[1], ix_bind(r->r[0], &addr_linux, sizeof(addr_linux)))
+      break;
+    case Socket_Accept - Socket_00:
+      result = ix_accept(r->r[0], (void*)r->r[1], (ix_socklen_t *)r->r[2]);
+      if (result >= 0) {
+        _swix(OS_ClaimDeviceVector, _INR(0, 2), result, sigio, pw);
+        _swix(OS_Hardware, _IN(0) | _INR(8, 9), result, 0, EntryNo_HAL_IRQEnable);
+      }
+      break;
+    case Socket_Accept_1 - Socket_00:
+      GET_ADDRESS_1(r->r[1], r->r[2], ix_accept(r->r[0], addr, len))
+      break;
+    case Socket_Getpeername - Socket_00:
+      result = ix_getpeername(r->r[0], (void*)r->r[1], (ix_socklen_t *)r->r[2]);
+      break;
+    case Socket_Getpeername_1 - Socket_00:
+      GET_ADDRESS_1(r->r[1], r->r[2], ix_getpeername(r->r[0], addr, len))
+      break;
+    case Socket_Getsockname - Socket_00:
+      result = ix_getsockname(r->r[0], (void*)r->r[1], (ix_socklen_t *)r->r[2]);
+      break;
+    case Socket_Getsockname_1 - Socket_00:
+      GET_ADDRESS_1(r->r[1], r->r[2], ix_getsockname(r->r[0], addr, len))
+      break;
+    case Socket_Select - Socket_00: {
+      struct ix_timeval timeout = *(const struct ix_timeval*)r->r[4];
+      result = ix_select(r->r[0], (void*)r->r[1], (void*)r->r[2], (void*)r->r[3], &timeout);
+      break;
+    }
+    case Socket_Shutdown - Socket_00:
+      result = ix_shutdown(r->r[0], r->r[1]);
+      break;
+    case Socket_Close - Socket_00:
+      _swix(OS_Hardware, _IN(0) | _INR(8, 9), r->r[0], 0, EntryNo_HAL_IRQDisable);
+      _swix(OS_ReleaseDeviceVector, _INR(0, 2), r->r[0], sigio, pw);
+      result = ix_close(r->r[0]);
+      break;
+    case Socket_Setsockopt - Socket_00: {
+      result = convert_sockopt(r->r[1], r->r[2]);
+      int level = r->r[1] == SOL_SOCKET ? ix_SOL_SOCKET : r->r[1];
+      if (result >= 0) result = ix_setsockopt(r->r[0], level, result, (void*)r->r[3], r->r[4]);
+      break;
+    }
+    case Socket_Getsockopt - Socket_00: {
+      result = convert_sockopt(r->r[1], r->r[2]);
+      int level = r->r[1] == SOL_SOCKET ? ix_SOL_SOCKET : r->r[1];
+      if (result >= 0) result = ix_getsockopt(r->r[0], level, result, (void*)r->r[3], (void*)r->r[4]);
+      if (result >= 0 && level == ix_SOL_SOCKET) {
+        switch (r->r[2]) {
+          case SO_ERROR:
+            if (*(int*)r->r[3]) *(int*)r->r[3] = _swix(IXSupport_ConvertError, _IN(0), *(int*)r->r[3])->errnum - 0x20E00;
+            break;
+        }
+      }
+      break;
+    }
+    case Socket_Ioctl - Socket_00:
+      switch ((uint32_t)r->r[1]) {
+
+        case FIOASYNC:
+          sockets[r->r[0]].async = !!*(int *)r->r[2];
+          ix_MESSAGE(2, "Handling FIOASYNC\n");
+          result = 0;
+          break;
+        case FIONBIO:
+          result = ix_ioctl(r->r[0], ix_FIONBIO, (int *)r->r[2]);
+          break;
+        case FIONREAD:
+          result = ix_ioctl(r->r[0], ix_FIONREAD, (int *)r->r[2]);
+          break;
+
+        default:
+          eprintf("Unhandled Internet Ioctl: 0x%08X\n", r->r[1]);
+          return error_BAD_SWI;
+      }
+      break;
+    default:
+      eprintf("Unhandled Internet SWI: %i\n", swi_no);
+      return error_BAD_SWI;
+  }
+  if (result < 0) {
+    return _swix(IXSupport_ConvertError, _IN(0), result);
+  }
+  r->r[0] = result;
+  return 0;
+}
+
+int sigio_handler(_kernel_swi_regs *regs, void *pw) {
+  int s = regs->r[0];
+  eprintf("sigio %i\n", s);
+  ix_siginfo_t *info = (void *)regs->r[1];
+  int band = info->u.sigpoll.band;
+
+  if (sockets[s].async) {
+    eprintf("Sending Internet Event for socket %i\n", s);
+    struct ix_sockaddr_in sa;
+    ix_socklen_t len = sizeof(sa);
+    ix_getsockname(s, &sa, &len);
+    _swix(OS_GenerateEvent, _INR(0, 3), 19, 1, s, sa.sin_port);
+  }
+
+  _swi(OS_Hardware, _IN(0) | _INR(8, 9), s, 0, EntryNo_HAL_IRQClear);
+  return 0;
+}
+
+ _kernel_oserror *init(const char *cmd_tail, int podule_base, void *pw) {
+  const char *s = getenv("Internet$SocketServer");
+  if (s) socket_server = atoi(s);
+  return 0;
+}
