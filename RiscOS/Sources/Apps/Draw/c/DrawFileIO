@@ -35,6 +35,7 @@
 #include <ctype.h>
 #include <swis.h>
 #include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
 
 #include "os.h"
 #include "bbc.h"
@@ -68,6 +69,7 @@
 #include "DrawSelect.h"
 #include "DrawTextC.h"
 #include "DrawUndo.h"
+#include "DrawClipb.h"
 
 static struct
 { diagrec *diag;
@@ -671,16 +673,64 @@ static BOOL fetch_jpeg (diagrec *diag, char *name, int filelen,
 
 /*---------------------- Text area handling ------------------------------*/
 
+static BOOL text_label_import (diagrec *diag, char **buffer, int length, draw_objcoord *mouse)
+
+{ draw_objptr hdrptr;
+
+  /*Text must be null terminated*/
+  if ((*buffer) [length-1] != 0)
+  { if (!FLEX_EXTEND ((flex_ptr) buffer, length+1))
+    { Error (0, "TextM1");
+      return FALSE;
+    }
+    (*buffer) [length++] = 0;
+  }
+
+  if (wimpt_complain (draw_obj_checkspace (diag, sizeof (draw_fileheader) +
+      sizeof (draw_textstrhdr) + length + 3 & ~3)))
+    return FALSE;
+
+  hdrptr.bytep = (char *) diag->paper + diag->misc->ghoststart + sizeof (draw_fileheader);
+
+  memset (hdrptr.bytep, 0, sizeof (draw_textstrhdr) + length + 3 & ~3);
+
+  hdrptr.textp->tag                  = draw_OBJTEXT;
+  hdrptr.textp->size                 = sizeof (draw_textstrhdr) + length + 3 & ~3;
+  hdrptr.textp->textcolour           = diag->misc->font.textcolour;
+  hdrptr.textp->background           = diag->misc->font.background;
+  hdrptr.textp->textstyle.fontref    = diag->misc->font.typeface;
+  hdrptr.textp->textstyle.reserved8  = 0;
+  hdrptr.textp->textstyle.reserved16 = 0;
+  hdrptr.textp->fsizex               = diag->misc->font.typesizex;
+  hdrptr.textp->fsizey               = diag->misc->font.typesizey;
+  hdrptr.textp->coord                = *mouse;
+
+  memcpy (hdrptr.textp->text, *buffer, length);
+
+  *--hdrptr.filehdrp = draw_blank_header;
+  diag->misc->ghoststart = hdrptr.bytep - diag->paper;
+  diag->misc->ghostlimit = diag->misc->ghoststart +
+      sizeof (draw_fileheader) + sizeof (draw_textstrhdr) + length + 3 & ~3;
+
+  return TRUE;
+}
+
+static BOOL text_file_contains_newline (const char *ptr, const int length)
+
+{ /*Does this text contain a plurality of lines?*/
+  int i;
+  for (i = 0; i < length; i++)
+    if (*(ptr + i) == '\n') return TRUE;
+
+  return FALSE;
+}
+
 static BOOL fetch_textArea_file (diagrec *diag, char *fileName, int length,
     draw_objcoord *mouse)
 
 { int columns;
 
   ftracef0 ("draw_file: fetch_textArea_file\n");
-  /*Create a file header so loading will work*/
-  if (wimpt_complain (draw_obj_checkspace (diag, sizeof (draw_fileheader))))
-    return FALSE;
-  draw_obj_fileheader (diag);
 
   /*Allocate initial memory for load*/
   ftracef1 ("draw_file: fetch_textArea_file: flex_alloc (, %d)\n", length);
@@ -698,6 +748,32 @@ static BOOL fetch_textArea_file (diagrec *diag, char *fileName, int length,
   ftracef2 ("flex buffer at 0x%X, size %d\n", Load_Base, length);
 
   ftracef2 ("File as initially loaded:\n[%.*s]", length, Load_Base);
+
+  /*See if there are newlines.  If so, it's a text area.*/
+  /*If not, then import as a text label.*/
+  if (!text_file_contains_newline (Load_Base, length))
+  { BOOL result = text_label_import (diag, &Load_Base, length, mouse);
+
+    FLEX_FREE ((flex_ptr) &Load_Base);
+
+    return result;
+  }
+
+  /*Text area must end with a newline.  If none present, append one.*/
+  if (Load_Base [length - 1] != '\n')
+  { if (!FLEX_EXTEND ((flex_ptr) &Load_Base, length+1))
+    { Error (0, "TextM1");
+      FLEX_FREE ((flex_ptr) &Load_Base);
+      return FALSE;
+    }
+    Load_Base [length] = '\n';
+    length++;
+  }
+
+  /*Create a file header so loading will work*/
+  if (wimpt_complain (draw_obj_checkspace (diag, sizeof (draw_fileheader))))
+    return FALSE;
+  draw_obj_fileheader (diag);
 
   ftracef0 ("Prepend standard header if none is present\n");
   if (Load_Base [0] != '\\')
@@ -883,6 +959,102 @@ static BOOL write_fontlist (int filehand, char *fontusedp, int *bytecount)
   }
 }
 
+static BOOL write_fontlist_clipboard (char **store, char *fontusedp, int *bytecount)
+{ int objsize = 0;
+  int padby;
+  /*The following: fonthdr,i (fontref),fournulls are passed to write_bytes,
+    this takes char** (ie a pointer to a flex_anchor) so it can output
+    data in any size chunks even if the source flex block shifts in the
+    process. fonthdrp,ip,fournullsp allow us to do this with
+    'write_bytes (...., &fonthdrp, ......);'*/
+  draw_fontliststrhdr fonthdr;            /*header for a fontlist*/
+  int i;                                  /*loop counter & fontref*/
+  char *ip = (char*)&i;                   /*pointer to it*/
+  int fournulls = 0;                      /*a useful source of four nulls*/
+  char *fournullsp = (char*)&fournulls;   /*pointer to it*/
+
+  ftracef0 ("draw_file: write_fontlist_clipboard\n");
+  for (i = 1; i <= 255; i++)
+    if (fontusedp[i])
+      objsize += sizeof (draw_fontref) + strlen (draw_fontcat.name[i]) + 1;
+
+  if (objsize == 0) return TRUE;      /*No fonts used - no fontlist needed*/
+
+  padby = (4 - objsize) & 3;           /*0..3 bytes padding at EOobject*/
+  objsize += sizeof (draw_fontliststrhdr) + padby;
+
+  fonthdr.tag  = draw_OBJFONTLIST;     /*build, then output a fontlist hdr*/
+  fonthdr.size = objsize;
+
+  memcpy(*store + *bytecount, &fonthdr, sizeof (draw_fontliststrhdr));
+  *bytecount = *bytecount + sizeof (draw_fontliststrhdr);
+
+  for (i = 1; i <= 255; i++)/*output each fontref + fontname & terminator*/
+    if (fontusedp[i]) {
+      memcpy(*store + *bytecount, ip, sizeof(draw_fontref));
+      *bytecount = *bytecount + sizeof(draw_fontref);
+      memcpy(*store + *bytecount, draw_fontcat.name[i], 1 + strlen(draw_fontcat.name[i]));
+      *bytecount = *bytecount + 1 + strlen(draw_fontcat.name[i]);
+    }
+  memcpy(*store+*bytecount,fournullsp,padby);
+
+  *bytecount = *bytecount + padby;
+  return TRUE;
+}
+
+void draw_file_typemask(draw_objptr hdrptr, int *mask)
+
+{ switch (hdrptr.objhdrp->tag)
+  { case draw_OBJTEXT:
+    case draw_OBJTEXTAREA:
+    case draw_OBJTRFMTEXT:
+    case draw_OBJTEXTCOL:
+    case draw_OBJTRFMTEXTAREA:
+    case draw_OBJTRFMTEXTCOL:
+      *mask = *mask | _tm_text | _tm_draw;
+      *mask = *mask &~ ( _tm_pure_sprite | _tm_pure_jpeg);
+      break;
+
+    case draw_OBJGROUP:
+      { draw_objptr objptr;
+
+        for (objptr.bytep = hdrptr.bytep + sizeof (draw_groustr);
+             objptr.bytep < hdrptr.bytep + hdrptr.objhdrp->size;
+             objptr.bytep += objptr.objhdrp->size)
+          draw_file_typemask (objptr, mask);
+      }
+      break;
+
+    case draw_OBJTAGG:
+      { draw_objptr tagptr;
+        tagptr.bytep = hdrptr.bytep + sizeof(draw_taggstr);
+        draw_file_typemask (tagptr, mask);
+      }
+      break;
+
+    case draw_OBJSPRITE:
+      *mask = *mask | _tm_sprite;
+      if (*mask == _tm_sprite)
+        *mask = *mask | _tm_pure_sprite;
+      break;
+
+    case draw_OBJTRFMSPRITE:
+      *mask = *mask | _tm_sprite;
+      *mask = *mask &~ (_tm_pure_sprite | _tm_pure_jpeg);
+      break;
+
+    case draw_OBJJPEG:
+      *mask = *mask | _tm_jpeg;
+      if (*mask == _tm_jpeg)
+        *mask = *mask | _tm_pure_jpeg;
+      break;
+
+    default:
+       *mask = *mask | _tm_draw;
+       break;
+  }
+}
+
 void draw_file_fontuse_object (draw_objptr hdrptr, char *fontusetab)
 
 { ftracef0 ("draw_file_fontuse_object\n");
@@ -1037,7 +1209,7 @@ static BOOL saveall (diagrec *diag, char *filename, fileIO_method method,
       method == via_DIRECTCLICK? "direct click": "", filename);
 
   /*Form file bbox*/
-  draw_obj_bound_all (diag, &hdrbox);
+  draw_obj_bound_all (diag->paper, diag->misc->solidstart, diag->misc->solidlimit, &hdrbox);
 
   /*find fonts used in each selected object*/
   { draw_objptr hdrptr, limit;
@@ -1231,6 +1403,75 @@ static BOOL saveselection (diagrec *diag, char *filename, fileIO_method method,
   ok &= draw_file_close_file (filehandle);
 
   return (ok);
+}
+
+BOOL draw_file_extract_selection(diagrec *diag, char **buffer, int *buffer_length)
+
+{ /* Create in-memory version and move to clipboard */
+
+  draw_bboxtyp hdrbox;
+  char fontusetab[256];                    /*slot 0..255 are valid fontrefs*/
+  int  i, bytecount, offset = 0;
+  BOOL ok=TRUE;
+  draw_objptr hdrptr;
+
+  draw_obj_bound_selection (&hdrbox);
+
+  /*find fonts used in each selected object*/
+  (void) memset (fontusetab, 0, 256);       /*clear fontusetab*/
+  for (i = 0; hdrptr = draw_select_find (i), hdrptr.bytep != NULL; i++)
+    draw_file_fontuse_object (hdrptr, &fontusetab[0]);
+
+  /* First pass to determine file size. */
+  bytecount = 0;
+  (void) save_selected_data (&hdrbox, fontusetab, diag, 0, &bytecount);
+
+  if (FLEX_ALLOC((flex_ptr)buffer, bytecount) == 0)
+    return FALSE; /* Out of space */
+  else
+    *buffer_length = bytecount;
+
+  /* Drawfile header */
+  draw_fileheader header = draw_blank_header;
+  header.bbox = hdrbox;
+  memcpy(*buffer + offset, &header, sizeof(draw_fileheader));
+  offset += sizeof(draw_fileheader);
+
+  /* fontlist (if any) */
+  write_fontlist_clipboard(buffer, fontusetab, &offset);
+
+  /*do each selected object*/
+  for (i = 0; ok && (hdrptr = draw_select_find (i), hdrptr.bytep != NULL); i++)
+  { memcpy(*buffer + offset, draw_selection->owner->paper + draw_selection->array[i],hdrptr.objhdrp->size);
+    offset += hdrptr.objhdrp->size;
+  }
+
+
+  return ok;
+}
+
+BOOL draw_file_copy_selection(diagrec *diag)
+
+{ ftracef0 ("draw_file: saveselection\n");
+  /*Deselect all text columns -- they cannot be saved individually*/
+  if (draw_select_deselect_type (diag, draw_OBJTEXTCOL))
+    return TRUE;                              /*Nothing to save*/
+
+  /*Create somewhere to receive the data*/
+  if (clipdata != NULL)
+  { FLEX_FREE((flex_ptr)&clipdata);
+    clipdata = NULL;
+  }
+
+  if (FALSE == draw_file_extract_selection(diag, &clipdata, &cliplength)) return FALSE;
+
+  /*We have the clipboard*/
+  draw_clipboard_claim(wimp_MCLAIMENTITY_flags_clipboard);
+
+  /*Work out print page parameters in case we export as PostScript*/
+  cliprotate = draw_print_get_limits (diag, &clippage, NULL);
+
+  return TRUE;
 }
 
 BOOL draw_file_file_saveselection (char *filename, void *handle)
@@ -1467,67 +1708,76 @@ diagrec *draw_file_loadfile (diagrec *diag, viewrec *vuue, char *name,
   BOOL cleanpaper, commandLine = method == via_COMMANDLINE, newdiag = FALSE,
       ok;
   draw_objptr hdrptr;
-  int atoff, size, loadaddr = 0, execaddr = 0;
+  int old_solidlimit, atoff, size, loadaddr = 0, execaddr = 0;
 
   ftracef0 ("draw_file_loadfile\n");
 
   if (commandLine) method = via_FILE;
-  if (method == via_FILE)
-  { os_filestr  blk;
-    diagrec    *rec;
+  switch (method) {
+    case via_FILE:
+    { os_filestr  blk;
+      diagrec    *rec;
 
-    blk.action   = 5;             /*Read catalogue info*/
-    blk.name     = name;          /*for name*/
+      blk.action = OSFile_ReadInfo;
+      blk.name   = name;          /*for name*/
 
-    if (wimpt_complain (os_file (&blk)) != NULL)
-      return NULL;
+      if (wimpt_complain (os_file (&blk)) != NULL)
+        return NULL;
 
-    if (blk.action != 1) /*save two messages by using OS_File 19*/
-    { blk.loadaddr = blk.action;
-      blk.action = 19;
-      #if TRACE
+      if (blk.action != object_file) /*save two messages by using OS_File 19*/
+      { blk.loadaddr = blk.action;
+        blk.action = OSFile_MakeError;
+#if TRACE
         wimpt_noerr (os_file (&blk));
-      #else
+#else
         wimpt_complain (os_file (&blk));
-      #endif
-      return NULL;
-    }
-
-    ftracef1 ("draw_file_loadfile found file, size %d bytes\n",blk.start);
-    loadaddr = blk.loadaddr, execaddr = blk.execaddr;
-
-    if ((loadaddr & 0xFFF00000) != 0xFFF00000)
-    { Error (0, "FileF2");
-      return NULL;
-    }
-
-    filetype = (loadaddr & 0x000FFF00) >> 8;
-    filesize = blk.start;
-
-    /*See if this is an attempt to load a new file that's already open,
-      with the same date stamp, that's not modified, called the
-      same thing*/
-    for (rec = draw_startdiagchain; rec != NULL; rec = rec->nextdiag)
-    { if ((diag == NULL) &&
-          (rec->misc->options.datestamped && (rec->misc->address.load == loadaddr) &&
-                                             (rec->misc->address.exec == execaddr)) &&
-          !rec->misc->options.modified &&
-          (strcmp (rec->misc->filename, name) == 0))
-      { wimp_wstate state;
-
-        /*Pop to top and gain the caret*/
-        wimp_get_wind_state (rec->view->w, &state);
-        state.o.behind = -1;
-        draw_open_wind (&state.o, rec->view);
-        draw_enter_claim_focus (rec, rec->view);
-        return rec;
+#endif
+        return NULL;
       }
+
+      ftracef1 ("draw_file_loadfile found file, size %d bytes\n",blk.start);
+      loadaddr = blk.loadaddr, execaddr = blk.execaddr;
+
+      if ((loadaddr & 0xFFF00000) != 0xFFF00000)
+      { Error (0, "FileF2");
+        return NULL;
+      }
+
+      filetype = (loadaddr & 0x000FFF00) >> 8;
+      filesize = blk.start;
+
+      /*See if this is an attempt to load a new file that's already open,
+        with the same date stamp, that's not modified, called the
+        same thing*/
+      for (rec = draw_startdiagchain; rec != NULL; rec = rec->nextdiag)
+      { if ((diag == NULL) &&
+            (rec->misc->options.datestamped && (rec->misc->address.load == loadaddr) &&
+             (rec->misc->address.exec == execaddr)) &&
+            !rec->misc->options.modified &&
+            (strcmp (rec->misc->filename, name) == 0))
+        { wimp_wstate state;
+
+          /*Pop to top and gain the caret*/
+          wimp_get_wind_state (rec->view->w, &state);
+          state.o.behind = -1;
+          draw_open_wind (&state.o, rec->view);
+          draw_enter_claim_focus (rec, rec->view);
+          return rec;
+        }
+      }
+      break;
     }
-  }
-  else
-  { /*Filesize is a guess, but we can't allow transfer of zero bytes
-      into zero-sized buffer. 6 Aug 1991*/
-    if (filesize <= 0) filesize = 1024;
+
+    case via_CLIPBOARD:
+    case via_CLIPBOARD_INT:
+      /*We have the file size; name actually points to the file data already for us*/
+      break;
+
+    default:
+      /*Filesize is a guess, but we can't allow transfer of zero bytes
+        into zero-sized buffer. 6 Aug 1991*/
+      if (filesize <= 0) filesize = 1024;
+      break;
   }
 
   /*Create new diagram if diag is NULL*/
@@ -1636,8 +1886,7 @@ diagrec *draw_file_loadfile (diagrec *diag, viewrec *vuue, char *name,
   /*Rebound all the objects. For DXF files, also set the file bbox*/
   ftracef0 ("draw_file_loadfile: draw_obj_bound_objects\n");
   draw_obj_bound_objects (diag, diag->misc->ghoststart,
-      diag->misc->ghostlimit, filetype == FileType_DataExchangeFormat ||
-      filetype == FileType_Draw? &hdrbox: NULL);
+      diag->misc->ghostlimit, &hdrbox);
 
   /*Strip the ghost area of options objects, setting options from the first
     found if paper is clean. If no options are set, try to deduce the size
@@ -1649,19 +1898,21 @@ diagrec *draw_file_loadfile (diagrec *diag, viewrec *vuue, char *name,
     into the diagram, and prevents undo subsequently corrupting the
     diagram. JRC 25th Nov 1994*/
   if (!read_options (diag, cleanpaper))
-    if (cleanpaper) draw_setPaperSize (diag, hdrbox.x1, hdrbox.y1);
+    if (cleanpaper)
+      if (newdiag) draw_setPaperSize (diag, hdrbox.x1, hdrbox.y1);
 
   /*If this is an addition to an existing file, move the insertion so that
     it is at the pointer position. JRC 5 Oct 1990*/
   atoff = diag->misc->solidlimit;
   size  = diag->misc->ghostlimit - diag->misc->ghoststart;
-  if (!cleanpaper && filetype == FileType_Draw)
+  if (!cleanpaper && mouse != NULL)
   { trans_str trans;
 
     trans.dx = mouse->x - hdrbox.x0;
     trans.dy = mouse->y - hdrbox.y0;
     ftracef2 ("draw_file_loadfile: draw_shift_Draw_file: "
         "atoff: %d; size: %d\n", atoff, size);
+
     draw_shift_Draw_file (diag, diag->misc->ghoststart,
         diag->misc->ghostlimit, &trans);
   }
@@ -1670,6 +1921,8 @@ diagrec *draw_file_loadfile (diagrec *diag, viewrec *vuue, char *name,
   ftracef0 ("draw_file_loadfile: draw_obj_appendghost\n");
   ftracef3 ("before appendghost, solidlimit %d, ghoststart %d, ghostlimit %d\n",
       diag->misc->solidlimit, diag->misc->ghoststart, diag->misc->ghostlimit);
+  old_solidlimit = diag->misc->solidlimit; /*We may need this in a moment... */
+
   draw_obj_appendghost (diag);
   ftracef3 ("after appendghost, solidlimit %d, ghoststart %d, ghostlimit %d\n",
       diag->misc->solidlimit, diag->misc->ghoststart, diag->misc->ghostlimit);
@@ -1678,6 +1931,17 @@ diagrec *draw_file_loadfile (diagrec *diag, viewrec *vuue, char *name,
   if (!newdiag && size != 0)
   { ftracef0 ("draw_file_loadfile: draw_undo_put\n");
     draw_undo_put (diag, draw_undo__insert, atoff, size);
+
+    /*We also want to select the objects inserted */
+    /*old_solidlimit contains the previous file endpoint, so we select all objects between that and the
+      new solidlimit */
+    draw_select_claim_selection(diag);
+    draw_objptr objptr;
+    while (old_solidlimit < diag->misc->solidlimit)
+    { objptr.bytep = diag->paper + old_solidlimit;
+      draw_select_object(diag, old_solidlimit);
+      old_solidlimit += objptr.objhdrp->size;
+    }
   }
 
   /*If diagram was empty and the source was good (ie from a file), take the
@@ -1774,35 +2038,54 @@ BOOL draw_file_get (char *name, char **buffp, int offset, int *filelenp,
 
 { ftracef0 ("draw_file_get\n");
 
-  if (owner_xferrecv.method == via_FILE)
-  { os_filestr blk;
+  switch (owner_xferrecv.method) {
+    case via_FILE:
+    { os_filestr blk;
 
-    blk.action   = 255;           /*Load file into buffer*/
-    blk.name     = name;
-    blk.loadaddr = (int) (*buffp + offset);
-    blk.execaddr = 0;
+      blk.action   = 255;           /*Load file into buffer*/
+      blk.name     = name;
+      blk.loadaddr = (int) (*buffp + offset);
+      blk.execaddr = 0;
 
-    if (wimpt_complain (os_file (&blk)))
-      return FALSE;
-  }
-  else
-  { int final;
+      if (wimpt_complain (os_file (&blk)))
+        return FALSE;
+      break;
+    }
 
-    owner_xferrecv.filelen = 0;   /*updated by loadram_extend, if called*/
+    case via_CLIPBOARD_INT:
+      /*Data is already present locally*/
+      if (clipdata == NULL) {
+        return FALSE;
+      } else {
+        memcpy(*buffp + offset, clipdata, *filelenp);
+      }
+      break;
 
-    ftracef2 ("loadfile calls xferrecv_doimport, "
-        "owner_xferrecv.diag->paper is %d, *filelenp is %d\n",
-        (int) owner_xferrecv.diag->paper, *filelenp);
+    case via_CLIPBOARD:
+      /*Data is already present.  Copy it to our destination.*/
+      memcpy(*buffp + offset, name, *filelenp);
+      break;
 
-    final = xferrecv_doimport (*buffp + offset, *filelenp,
-        extender != NULL? extender: &Extend_Diag);
+    default:
+    { int final;
 
-    ftracef1 ("returned to loadfile, final block transfer was %d bytes\n",
-        final);
+      owner_xferrecv.filelen = 0;   /*updated by loadram_extend, if called*/
 
-    if (final < 0) return FALSE;
+      ftracef2 ("loadfile calls xferrecv_doimport, "
+                "owner_xferrecv.diag->paper is %d, *filelenp is %d\n",
+                (int) owner_xferrecv.diag->paper, *filelenp);
 
-    *filelenp = owner_xferrecv.filelen + final;      /*total size*/
+      final = xferrecv_doimport (*buffp + offset, *filelenp,
+                                 extender != NULL? extender: &Extend_Diag);
+
+      ftracef1 ("returned to loadfile, final block transfer was %d bytes\n",
+                final);
+
+      if (final < 0) return FALSE;
+
+      *filelenp = owner_xferrecv.filelen + final;      /*total size*/
+      break;
+    }
   }
 
   return TRUE;
@@ -1836,9 +2119,7 @@ static BOOL exportTextArea (diagrec *diag, char *filename,
     }
   }
 
-  /*Check there are an
-
-y at all selected*/
+  /*Check there are any at all selected*/
   if (!found)
   { Error (FALSE, "TextX2");
     return FALSE;
@@ -1897,7 +2178,7 @@ static BOOL exportEPSF (diagrec *diag, char *filename, fileIO_method method,
     goto finish;
   done_select_driver = TRUE;
 
-  if ((error = draw_print_to_file (diag, job, /*illustration?*/ TRUE)) !=
+  if ((error = draw_print_to_file (diag, diag->paper, diag->misc->solidstart, diag->misc->solidlimit, job, /*illustration?*/ TRUE)) !=
       NULL)
     goto finish;
 

@@ -79,7 +79,6 @@ HDRS        = \
 
 CUSTOMLIB   = custom
 CUSTOMLIBZM = custom
-EXPDIR      = ${LIBDIR}.${TARGET}
 
 # Define the export-header rule before we include
 # Makefiles:CLibrary so that we take precedence
@@ -98,10 +97,5 @@ ${LIBEXT}.${LIBRARY}: !Desk.o.Normal
 ${LIBEXT}.${LIBRARYZM}: !Desk.o.Normalzm
         ${CP} !Desk.o.Normalzm $@ ${CPFLAGS}
         BASIC -quit Patch325 $@
-
-install: export_libs
-        ${MKDIR} ${INSTDIR}
-        ${CP} ${EXPDIR} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-        @${ECHO} ${COMPONENT}: install complete
 
 # Dynamic dependencies:
