@@ -24,26 +24,26 @@ PHASES=export_hdrs export_libs resources rom install_rom join
 
 .PHONY: update-binary build check fast
 
-all check: Build/$(TARGET)/Images/rom_check
-build: Build/$(TARGET)/Images/rom
+all check: Build/$(TARGET)/RiscOS/Images/rom_check
+build: Build/$(TARGET)/RiscOS/Images/rom
 
 ifeq ($(TARGET), Linux)
 all check: RISC_OS
 endif
 
-build_binds = $(foreach dir,Unix apache bsd cddl gpl mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
+build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
-Build/src-stamp: $(shell find Unix apache bsd cddl gpl mixed)
+Build/src-stamp: $(shell find Unix RiscOS mixed)
 	ln -sfn . lock_source_1510718522
 	mkdir -p Build
 	touch Build/src-stamp
 
 ifeq ($(METHOD), rpcemu)
-Build/%/Images/rom: Build/src-stamp | Built/rpcemu/rpcemu Built/boot_iomd_rom
+Build/%/RiscOS/Images/rom: Build/src-stamp | Built/rpcemu/rpcemu Built/boot_iomd_rom
 else ifeq ($(INSECURE), YES)
-Build/%/Images/rom: Build/src-stamp | ${LINUX_ROM}
+Build/%/RiscOS/Images/rom: Build/src-stamp | ${LINUX_ROM}
 else
-Build/%/Images/rom: Build/src-stamp | Built/sandbox_config_sh ${LINUX_ROM}
+Build/%/RiscOS/Images/rom: Build/src-stamp | Built/sandbox_config_sh ${LINUX_ROM}
 endif
 	set -o pipefail
 	uname -a
@@ -56,16 +56,16 @@ endif
 	  # Find directories and files
 	  shopt -s globstar
 	  shopt -s extglob
-	  dirs=({Unix,apache,bsd,cddl,gpl,mixed}/**/)
-	  files=({Unix,apache,bsd,cddl,gpl,mixed}/**)
+	  dirs=({Unix,RiscOS,mixed}/**/)
+	  files=({Unix,RiscOS,mixed}/**)
 	  #
 	  cd Build/$*
 	  #
 	  # Remove old output
-	  ! rm Images/rom*
+	  ! rm RiscOS/Images/rom*
 	  #
 	  # Create needed directories
-	  mkdir -p Apps "$${dirs[@]}"
+	  mkdir -p "$${dirs[@]}"
 	  #
 	  # Create relative symbolic links
 	  # Fast perl, fallback to slow shell
@@ -88,16 +88,13 @@ endif
 	    echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
 	    cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
 	  fi
-	  cp -ru --preserve=mode,timestamps ../../apache/RiscOS/Export .
-	  ln -sf mixed/RiscOS/{Library,Modules} apache/RiscOS/{Env,BuildSys} .
-	  cd Apps
-	  ln -sf ../../../lock_source_1510718522/Build/$*/*/RiscOS/Apps/\!* .
+	  #cp -ru --preserve=mode,timestamps ../../apache/RiscOS/Export .
 	}
 ifeq ($(INSECURE), YES)
 	( setup_build )
 else
 	export -f setup_build
-	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null --chdir /dev/fd/5 bash -e -c setup_build
+	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null --chdir /dev/fd/5 bash -e -x -c setup_build
 endif
 	#
 ifeq ($(METHOD), rpcemu)
@@ -125,28 +122,28 @@ else
 	SYS "IXSupport_LinuxSyscall",20,,,,,,,1
 	END
 endif
-	find Build/$*/Images -type l -delete
-	! mv 'Build/$*/Images/rom',??? 'Build/$*/Images/rom'
-	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build/$*/Images/rom'
+	find Build/$*/RiscOS/Images -type l -delete
+	! mv 'Build/$*/RiscOS/Images/rom',??? 'Build/$*/RiscOS/Images/rom'
+	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build/$*/RiscOS/Images/rom'
 	true
 
-Build/IOMD32/Images/rom_check: Build/IOMD32/Images/rom Built/rpcemu/rpcemu
-	mixed/Linux/Tests/runner_rpcemu.sh Build/IOMD32/Images/rom
-	touch Build/IOMD32/Images/rom_check
+Build/IOMD32/RiscOS/Images/rom_check: Build/IOMD32/RiscOS/Images/rom Built/rpcemu/rpcemu
+	mixed/Linux/Tests/runner_rpcemu.sh Build/IOMD32/RiscOS/Images/rom
+	touch Build/IOMD32/RiscOS/Images/rom_check
 
 ifeq ($(INSECURE), YES)
-Build/Linux/Images/rom_check: Build/Linux/Images/rom
-	chmod +x Build/Linux/Images/rom
-	touch Build/Linux/Images/rom_check
+Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom
+	chmod +x Build/Linux/RiscOS/Images/rom
+	touch Build/Linux/RiscOS/Images/rom_check
 else
-Build/Linux/Images/rom_check: Build/Linux/Images/rom Built/sandbox_config_sh
-	chmod +x Build/Linux/Images/rom
-	mixed/Linux/Tests/runner.sh Build/Linux/Images/rom
-	touch Build/Linux/Images/rom_check
+Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom Built/sandbox_config_sh
+	chmod +x Build/Linux/RiscOS/Images/rom
+	mixed/Linux/Tests/runner.sh Build/Linux/RiscOS/Images/rom
+	touch Build/Linux/RiscOS/Images/rom_check
 endif
 
-RISC_OS: Build/Linux/Images/rom_check
-	cp --preserve=mode,xattr --reflink=auto Build/Linux/Images/rom Built/RISC_OS
+RISC_OS: Build/Linux/RiscOS/Images/rom_check
+	cp --preserve=mode,xattr --reflink=auto Build/Linux/RiscOS/Images/rom Built/RISC_OS
 	ln -sf Built/RISC_OS RISC_OS
 
 fast: PHASES=install_rom join
