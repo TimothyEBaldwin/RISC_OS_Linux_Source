@@ -15,7 +15,7 @@
 #
 
 
-LINUX_ROM=Support/bin/RISC_OS
+LINUX_ROM=Unix/RISC_OS/RISC_OS
 ACORN_CPP=../DDE/AcornC.C++
 
 TARGET=Linux
@@ -150,7 +150,7 @@ fast: PHASES=install_rom join
 fast: check
 check: build
 
-Support/bin/RISC_OS:
+Unix/RISC_OS/RISC_OS:
 	git submodule init
 	git submodule update
 
@@ -161,33 +161,33 @@ ifndef FAST
 	git reset --hard
 endif
 	(
-	  cd mixed/Linux/Support/bin
+	  cd Unix/RISC_OS
 	  git reset --hard
 	  git clean -fxd
 	  git checkout master~0
 	)
 	git submodule update
 	SOURCE=$$(git rev-parse HEAD)
-	BINARY=$$(cd mixed/Linux/Support/bin && git rev-parse HEAD)
+	BINARY=$$(cd Unix/RISC_OS && git rev-parse HEAD)
 	#
 ifndef FAST
 	$(MAKE) JOBS=$(JOBS) METHOD=$(METHOD)
 endif
 	(
-	  cd Support/bin
+	  cd Unix/RISC_OS
 	  git fetch --force https://github.com/TimothyEBaldwin/RISC_OS_Linux_Binary.git master:master
 	  git checkout master
 	)
-	rm -rf Support/bin/*
-	mkdir -p Support/bin/Support
-	cp -v --reflink=auto --preserve=mode,xattr Support/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Support/bin/Support/
-	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Support/bin/
+	rm -rf Unix/RISC_OS/*
+	mkdir -p Unix/RISC_OS/Support
+	cp -v --reflink=auto --preserve=mode,xattr Support/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Support/
+	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Unix/RISC_OS/
 	#
-	mkdir -p Support/bin/Unix
-	cp -vrL Unix/SocketKVMFrontends Support/bin/Unix/SocketKVMFrontends
-	ln -sf ../Support Support/bin/Unix/LinuxSupport
-	ln -sf 'Unix/LinuxSupport/Start_RISC_OS.desktop' 'Support/bin/Start_RISC_OS.desktop'
-	ln -sf 'Unix/LinuxSupport/run_RISC_OS' 'Support/bin/run_RISC_OS'
+	mkdir -p Unix/RISC_OS/Unix
+	cp -vrL Unix/SocketKVMFrontends Unix/RISC_OS/Unix/SocketKVMFrontends
+	ln -sf ../Support Unix/RISC_OS/Unix/LinuxSupport
+	ln -sf 'Unix/LinuxSupport/Start_RISC_OS.desktop' 'Unix/RISC_OS/Start_RISC_OS.desktop'
+	ln -sf 'Unix/LinuxSupport/run_RISC_OS' 'Unix/RISC_OS/run_RISC_OS'
 	#
 	echo "# Source and build GIT commits
 	SOURCE=$$SOURCE
@@ -195,10 +195,10 @@ ifneq ($(METHOD), rpcemu)
 	BINARY=$$BINARY
 endif
 	LINUX='$$(uname -a)'
-	" > Support/bin/Support/source
+	" > Unix/RISC_OS/Support/source
 	#
 	(
-	  cd Support/bin
+	  cd Unix/RISC_OS
 	  git add -A
 	  git commit -m "Rebuilt binary from $$SOURCE"
 	)
