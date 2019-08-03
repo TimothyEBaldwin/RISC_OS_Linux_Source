@@ -28,7 +28,8 @@ TOKHELPSRC      = ${TOKENSOURCE}
 HELPSRC         = HelpStrs
 ROM_OBJECTS     = GetAll.o
 KERNEL_MODULE   = bin${SEP}${COMPONENT}
-ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}"
+ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}" -APCS 3/32bit/nofp/noswst
+CFLAGS          = -Wpn -APCS 3/32bit/nofp/noswst -IC:
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 CUSTOMSA        = custom
@@ -61,6 +62,10 @@ EXPORTS         = ${EXP_HDR}.AMBControl \
                   ${C_EXP_HDR}.VduExt \
                   ${C_EXP_HDR}.VIDCList
 
+ifeq (${Machine},Linux)
+ROM_OBJECTS += LinuxC.o ${PVLIBS}
+endif
+
 include StdTools
 include AAsmModule
 include StdRules
@@ -90,12 +95,25 @@ install: ${EXPORTS} inst_dirs
 
 ${KERNEL_MODULE}: ${ROM_OBJECTS} ${DIRS}
 	${MKDIR} bin
+ifeq (${Machine},Linux)
+	SetEval KernelBase &20800000 + ( HALSize LEFT ( LEN HALSize - 1 ) ) * 1024
+else
 	SetEval KernelBase "4" + STR ( 227858432 + ( HALSize LEFT ( LEN HALSize - 1 ) ) * 1024 )
+endif
 	Do ${LD} -bin -base <KernelBase> -o $@ ${ROM_OBJECTS}
 	Do ${LD} -aif -base <KernelBase> -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECTS}
 	${TOGPA} -s ${KERNEL_MODULE}_aif ${KERNEL_MODULE}_gpa
 
 GetAll.o: ${TOKHELPSRC}
+
+#
+# Internal C header
+#
+o.LinuxC: h.Kernel
+
+h.Kernel: o.GenHeader
+	${LD} -bin -o $@ o.GenHeader
+	SetType $@ FFF
 
 #
 # Custom exports:
@@ -210,5 +228,6 @@ Global.h.VIDCList: hdr.VIDCList
 clean::
 	${XWIPE} Global ${WFLAGS}
 	${XWIPE} bin    ${WFLAGS}
+	${RM} h.kernel
 
 # Dynamic dependencies:
