@@ -765,15 +765,10 @@ RISC_OSLib:h.win: rlib.h.win;                ${CP} rlib.h.win $@ ${CPFLAGS}
 RISC_OSLib:h.xferrecv: rlib.h.xferrecv;      ${CP} rlib.h.xferrecv $@ ${CPFLAGS}
 RISC_OSLib:h.xfersend: rlib.h.xfersend;      ${CP} rlib.h.xfersend $@ ${CPFLAGS}
 
-# Copy stubs atomically so that parallel builds work.
-CLib:o.stubs: lib.stubs
-	${RM} $@
-	${CP} lib.stubs $@_tmp ${CPFLAGS}
-	${MV} $@_tmp $@
-
 # Libraries
 Clib:o.ansilib:          lib.ansilib;        ${CP} lib.ansilib    $@ ${CPFLAGS}
 Clib:o.ansilibm:         lib.ansilibm;       ${CP} lib.ansilibm   $@ ${CPFLAGS}
+CLib:o.stubs:            lib.stubs;          ${CP} lib.stubs $@ ${CPFLAGS}
 RISC_OSLib:o.risc_oslib: lib.risc_oslib;     ${CP} lib.risc_oslib $@ ${CPFLAGS}
 RISC_OSLib:o.riscoslibm: lib.riscoslibm;     ${CP} lib.riscoslibm $@ ${CPFLAGS}
 RISC_OSLib:o.rstubs:     lib.rstubs;         ${CP} lib.rstubs $@ ${CPFLAGS}
