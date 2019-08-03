@@ -94,6 +94,7 @@ EXPORTS   = \
  ${HDRDIR}.ListOpts \
  ${HDRDIR}.MEMM.ARM600 \
  ${HDRDIR}.MEMM.MEMC1 \
+ ${HDRDIR}.MEMM.Linux \
  ${HDRDIR}.MEMM.VMSAv6 \
  ${HDRDIR}.Machine.<Machine> \
  ${HDRDIR}.Machine.All \
@@ -305,6 +306,7 @@ ${HDRDIR}.IO.IOMD:           hdr.IO.IOMD;           ${CP} hdr.IO.IOMD           
 ${HDRDIR}.IO.IOMDL:          hdr.IO.IOMDL;          ${CP} hdr.IO.IOMDL             $@ ${CPFLAGS}
 ${HDRDIR}.MEMM.ARM600:       hdr.MEMM.ARM600;       ${CP} hdr.MEMM.ARM600          $@ ${CPFLAGS}
 ${HDRDIR}.MEMM.MEMC1:        hdr.MEMM.MEMC1;        ${CP} hdr.MEMM.MEMC1           $@ ${CPFLAGS}
+${HDRDIR}.MEMM.Linux:        hdr.MEMM.Linux;        ${CP} hdr.MEMM.Linux           $@ ${CPFLAGS}
 ${HDRDIR}.MEMM.VMSAv6:       hdr.MEMM.VMSAv6;       ${CP} hdr.MEMM.VMSAv6          $@ ${CPFLAGS}
 ${HDRDIR}.VIDC.VIDC1a:       hdr.VIDC.VIDC1a;       ${CP} hdr.VIDC.VIDC1a          $@ ${CPFLAGS}
 ${HDRDIR}.VIDC.VIDC20:       hdr.VIDC.VIDC20;       ${CP} hdr.VIDC.VIDC20          $@ ${CPFLAGS}
