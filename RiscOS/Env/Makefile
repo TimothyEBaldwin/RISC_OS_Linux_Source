@@ -14,8 +14,6 @@
 #
 # Makefile for the Build System Binary Build Environment
 #
-# $Id$
-#
 
 BBETYPE = env
 bbe-env: bbe-generic-resources-get-alias
