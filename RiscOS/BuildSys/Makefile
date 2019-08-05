@@ -1,7 +1,5 @@
 # Makefile for the Build System Binary Build Environment
 #
-# $Id$
-#
 include StdTools
 
 COMPONENT ?= BuildSys
