@@ -94,7 +94,7 @@ ifeq ($(INSECURE), YES)
 	( setup_build )
 else
 	export -f setup_build
-	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null --chdir /dev/fd/5 bash -e -x -c setup_build
+	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null --chdir /dev/fd/5 $(BASH) -e -c setup_build
 endif
 	#
 ifeq ($(METHOD), rpcemu)

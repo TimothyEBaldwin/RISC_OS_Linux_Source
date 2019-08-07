@@ -36,7 +36,7 @@ JOBS:=$(shell getconf _NPROCESSORS_ONLN)
 export JOBS
 
 SHELL=$(warning Building $@)$(BASH)
-.SHELLFLAGS=-x -e -c
+.SHELLFLAGS=-e -c
 .ONESHELL:
 .SILENT:
 
@@ -94,7 +94,7 @@ Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
 	  touch stamp
 	}
 	export -f unpack
-	cat Support/rpcemu_exit.diff | $(sandbox_base) $(sandbox_misc) --bind Built/rpcemu_files /r --chdir /r bash -x -e -c unpack
+	cat Support/rpcemu_exit.diff | $(sandbox_base) $(sandbox_misc) --bind Built/rpcemu_files /r --chdir /r $(BASH) -e -c unpack
 	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
 
 Built/rpcemu/src/Makefile: Built/rpcemu/stamp
@@ -107,7 +107,7 @@ Built/rpcemu/src/Makefile: Built/rpcemu/stamp
 	  touch Makefile
 	}
 	export -f configure
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src bash -x -e -c configure
+	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASH) -e -c configure
 
 Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	+cp Support/rpcemu.cfg Built/rpcemu/rpc.cfg
@@ -120,7 +120,7 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	  touch rpcemu
 	}
 	export -f build
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r bash -x -e -c build
+	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASH) -e -c build
 
 Built/qemu_stamp-v4.0.0: ${QEMU_SRC} | Built/gen_seccomp
 	rm -rf Built/qemu*
@@ -133,7 +133,7 @@ Built/qemu_stamp-v4.0.0: ${QEMU_SRC} | Built/gen_seccomp
 	  patch -p1
 	}
 	export -f unpack
-	cat Support/qemu_swi.diff | $(call sandbox_base,-s) $(sandbox_misc) --bind Built/qemu_files /q --chdir /q bash -x -e -c unpack
+	cat Support/qemu_swi.diff | $(call sandbox_base,-s) $(sandbox_misc) --bind Built/qemu_files /q --chdir /q $(BASH) -e -c unpack
 	mv Built/qemu_files/qemu-4.0.0 Built/qemu
 	touch Built/qemu_stamp-v4.0.0
 
