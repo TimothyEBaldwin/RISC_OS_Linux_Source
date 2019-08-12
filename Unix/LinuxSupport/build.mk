@@ -143,7 +143,7 @@ Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom Built/sandbox
 endif
 
 RISC_OS: Build/Linux/RiscOS/Images/rom_check
-	cp --preserve=mode,xattr --reflink=auto Build/Linux/RiscOS/Images/rom Built/RISC_OS
+	cp --remove-destination --preserve=mode,xattr --reflink=auto Build/Linux/RiscOS/Images/rom Built/RISC_OS
 	ln -sf Built/RISC_OS RISC_OS
 
 fast: PHASES=install_rom join
