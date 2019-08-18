@@ -110,17 +110,11 @@ ifeq ($(METHOD), rpcemu)
 	--symlink /dev/fd /r/hostfs/dev/fd \
 	--file 0 '/r/hostfs/!Boot,fea' \
 	/r/rpcemu
+else ifeq ($(INSECURE), YES)
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --abort-on-input 5<. 8<'${ACORN_CPP}' </dev/null |& cat
 else
-  ifeq ($(INSECURE), YES)
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END |& cat
-  else
 	. Built/sandbox_config_sh
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END |& cat
-  endif
-	*BASIC
-	VDU 7
-	SYS "IXSupport_LinuxSyscall",20,,,,,,,1
-	END
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
 endif
 	find Build/$*/RiscOS/Images -type l -delete
 	! mv 'Build/$*/RiscOS/Images/rom',??? 'Build/$*/RiscOS/Images/rom'

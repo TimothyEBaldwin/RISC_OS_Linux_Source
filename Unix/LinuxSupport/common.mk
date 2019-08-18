@@ -179,9 +179,9 @@ Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
 	#
 	export RISC_OS_Alias_IXFSBoot='BASIC -quit IXFS:$$.Finish'
 	if $(sandbox_base) --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS --help </dev/null |& cat; then
-	  $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS </dev/null |& cat;
+	  $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS --abort-on-input </dev/null |& cat;
 	  QEMU1=/usr/bin/env
-	elif ! $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS $$($(call ldd2sandbox,"$$QEMU1")) --ro-bind "$$QEMU1" /qemu-arm /qemu-arm /RISC_OS </dev/null |& cat; then
+	elif ! $(sandbox_base) --ro-bind Support/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS $$($(call ldd2sandbox,"$$QEMU1")) --ro-bind "$$QEMU1" /qemu-arm /qemu-arm /RISC_OS --abort-on-input </dev/null |& cat; then
 	  QEMU1=Built/qemu-arm
 	fi
 	echo "use_seccomp:=$$use_seccomp
@@ -201,7 +201,8 @@ else
 	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
 	 --ro-bind Support/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
-	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS </dev/null |& cat
+	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" \
+	 $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
 endif
 	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
 	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
