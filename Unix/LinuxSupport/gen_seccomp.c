@@ -29,7 +29,7 @@ static scmp_filter_ctx ctx;
 
 static void ban(int syscall, const char* message) {
   int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(syscall), 0);
-  if (rc) error(1, -rc, message);
+  if (rc) error(1, -rc, "%s", message);
 }
 
 #define BAN(s) ban(SCMP_SYS(s), "Unable to create " #s " rule")
