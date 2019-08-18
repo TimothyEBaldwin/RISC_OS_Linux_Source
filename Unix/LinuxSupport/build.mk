@@ -112,10 +112,10 @@ ifeq ($(METHOD), rpcemu)
 	/r/rpcemu
 else
   ifeq ($(INSECURE), YES)
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --nofork  5<. 8<'${ACORN_CPP}' <<END |& cat
   else
 	. Built/sandbox_config_sh
-	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END 2>&1 | cat
+	env -i JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS --nofork <<END |& cat
   endif
 	*BASIC
 	VDU 7
