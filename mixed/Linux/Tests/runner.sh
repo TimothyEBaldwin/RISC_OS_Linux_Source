@@ -29,11 +29,11 @@ set -x
 
 if [[ $QEMU = "" ]]; then
   # Test ptrace SWI implemnation
-  RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run -p --noaborts
+  RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run -p --abort-on-input --noaborts
 fi
 
 # Various tests that shouldn't cause data aborts
-RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run '' --noaborts
+RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run '' --abort-on-input --noaborts
 
 # Various tests that require data aborts
 RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run ''
