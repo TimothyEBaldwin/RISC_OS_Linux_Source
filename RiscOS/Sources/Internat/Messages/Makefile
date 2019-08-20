@@ -216,4 +216,4 @@ ${DIRS}:
 	${MKDIR} rm.${BUILD}.<Build$LocaleListNumeric>
 	${TOUCH} ${DIRS}
 	
-# Dynamic dependencies:
+include Depends

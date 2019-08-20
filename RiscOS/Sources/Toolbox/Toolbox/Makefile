@@ -29,4 +29,4 @@ DBG_LIBS      = ${TBOXINTDBGLIB}
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

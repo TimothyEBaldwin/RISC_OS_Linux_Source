@@ -34,4 +34,4 @@ RESFSDIR    = ${RESDIR}.${COMPONENT}
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

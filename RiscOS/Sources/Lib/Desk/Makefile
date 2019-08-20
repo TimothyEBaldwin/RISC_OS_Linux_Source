@@ -98,4 +98,4 @@ ${LIBEXT}.${LIBRARYZM}: !Desk.o.Normalzm
         ${CP} !Desk.o.Normalzm $@ ${CPFLAGS}
         BASIC -quit Patch325 $@
 
-# Dynamic dependencies:
+include Depends

@@ -127,4 +127,4 @@ o.MaruGothic:
 rm.MaruGothic: o.MaruGothic
 	${LD} ${LDFLAGS} o.MaruGothic
 
-# Dynamic dependencies:
+include Depends

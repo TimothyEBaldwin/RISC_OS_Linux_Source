@@ -42,4 +42,4 @@ clean:;		${RM} ${TARGET}
 PathConf:	PathConf.o
 		Link -o $@ PathConf.o ${LIBS}
 	
-# Dynamic dependencies:
+include Depends

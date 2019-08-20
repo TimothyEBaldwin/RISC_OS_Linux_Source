@@ -18,15 +18,16 @@ OBJS = main
 LIBS = TCPIPLibs:o.inetlibzm
 CUSTOMEXP=no
 CUSTOMRES=no
-
 CMHGDEPENDS = main
 
 include StdTools
 include CModule
+
 ROM_SYMS += ${PVLIBS}
 
 ${DIRS} ::
 	${MKDIR} h
 
-
 CFLAGS += -Wpn -ITCPIPLibs:
+
+include Depends

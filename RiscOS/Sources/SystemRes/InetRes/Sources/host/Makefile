@@ -78,4 +78,4 @@ ${DIRS}:
 bin.Host: ${OBJS} ${NET5LIBS} ${CLIB} ${DIRS}
         ${LD} -o $@ ${OBJS} ${NET5LIBS} ${CLIB}
 
-# Dynamic dependencies:
+include Depends

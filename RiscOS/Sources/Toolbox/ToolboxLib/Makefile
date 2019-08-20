@@ -134,4 +134,4 @@ install:
 	@echo ${COMPONENT}: installed
 
 
-# Dynamic dependencies:
+include Depends

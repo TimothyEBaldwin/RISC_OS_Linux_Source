@@ -142,4 +142,4 @@ bbe-alarm: bbe-generic
 	BBE_Export_Dir Resources
 
 #---------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

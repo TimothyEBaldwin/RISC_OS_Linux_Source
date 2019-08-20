@@ -64,3 +64,5 @@ clean::
 	${RM} HAL_Linux
 	${RM} HAL_Linux/rw
 	${RM} HAL_Linux_sym
+
+include Depends

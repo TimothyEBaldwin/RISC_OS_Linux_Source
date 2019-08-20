@@ -23,4 +23,4 @@ HDRS      = callbacks clz escape fpsr heapswis irqs\
 
 include CLibrary
 
-# Dynamic dependencies:
+include Depends

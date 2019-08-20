@@ -112,4 +112,4 @@ $(TARGET): $(OBJS) local_dirs
 
 
 # ------------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

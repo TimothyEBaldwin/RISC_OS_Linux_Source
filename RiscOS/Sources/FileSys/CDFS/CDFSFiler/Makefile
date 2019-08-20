@@ -41,4 +41,4 @@ resources-special:
 	${CP} LocalRes:Templates ${RESFSDIR}.Templates ${CPFLAGS}
 	@@echo ${COMPONENT}: resource files copied
 
-# Dynamic dependencies:
+include Depends

@@ -222,4 +222,4 @@ clean::
 	${XWIPE} bin    ${WFLAGS}
 	${RM} h.kernel
 
-# Dynamic dependencies:
+include Depends

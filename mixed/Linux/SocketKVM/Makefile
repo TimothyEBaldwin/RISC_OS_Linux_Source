@@ -27,3 +27,5 @@ include CModule
 
 ROM_SYMS += ${PVLIBS}
 CFLAGS += -Wpn -IOSLib:
+
+include Depends

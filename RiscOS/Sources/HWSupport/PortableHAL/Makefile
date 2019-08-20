@@ -35,4 +35,4 @@ ROM_LIBS = ${PVLIBS}
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

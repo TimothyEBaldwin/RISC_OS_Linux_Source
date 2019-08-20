@@ -186,4 +186,4 @@ debug.${APP}.!RunImage: ${OBJSD} ${RLIB} ${CLIB}
 	${LD} -o $@ -debug ${OBJSD} ${RLIB} ${CLIB}
 
 #---------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

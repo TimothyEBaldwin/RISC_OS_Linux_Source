@@ -41,4 +41,4 @@ include CModule
 CFLAGS     += -We
 CDFLAGS    += -DDEBUGLIB
 
-# Dynamic dependencies:
+include Depends

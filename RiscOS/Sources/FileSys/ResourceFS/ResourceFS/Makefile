@@ -31,4 +31,4 @@ HEADER1=ResourceFS
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

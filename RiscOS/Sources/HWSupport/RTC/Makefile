@@ -39,4 +39,4 @@ LIBS        = ${ASMUTILS}
 
 include CModule
 
-# Dynamic dependencies:
+include Depends

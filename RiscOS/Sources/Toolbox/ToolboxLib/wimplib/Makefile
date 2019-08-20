@@ -197,4 +197,4 @@ ${EXP_HDR}.${COMPONENT}: hdr.${COMPONENT}
 
 
 # ------------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

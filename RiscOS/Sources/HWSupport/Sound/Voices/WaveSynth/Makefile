@@ -29,4 +29,4 @@ COMPONENT = WaveSynth
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

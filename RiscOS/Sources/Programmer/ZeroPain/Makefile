@@ -43,4 +43,4 @@ CUSTOMRES       = no
 include CModule
 ROM_SYMS       += ${PVLIBS}
 
-# Dynamic dependencies:
+include Depends

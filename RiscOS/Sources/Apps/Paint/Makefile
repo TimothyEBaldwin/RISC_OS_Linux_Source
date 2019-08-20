@@ -251,4 +251,4 @@ debug.${APP}.Templates: ${LDIR}.Templates
 	${CP} ${LDIR}.Templates $@ ${CPFLAGS}
 
 #---------------------------------------------------------------------------
-# Dynamic dependencies:
+include Depends

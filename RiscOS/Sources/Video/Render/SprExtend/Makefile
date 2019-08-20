@@ -168,4 +168,4 @@ asmcore.o:
         ${MKDIR} o
         ${CC} ${CFLAGS} $*.c
 
-# Dynamic dependencies:
+include Depends

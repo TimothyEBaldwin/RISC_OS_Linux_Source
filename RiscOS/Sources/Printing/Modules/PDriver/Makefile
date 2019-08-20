@@ -22,4 +22,4 @@ HEADER1    = PDriver
 include StdTools
 include AAsmModule
 
-# Dynamic dependencies:
+include Depends

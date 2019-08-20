@@ -101,4 +101,4 @@ crunched.!RunImage: bas.!RunImage
 ${LDIR}.!RunLink: bas.!RunLink
 	${SQUISH} ${SQUISHFLAGS} -from bas.!RunLink -to $@
 
-# Dynamic dependencies:
+include Depends
