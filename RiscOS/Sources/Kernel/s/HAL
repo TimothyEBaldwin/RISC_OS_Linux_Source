@@ -1836,7 +1836,8 @@ AllocateL2PT ROUT
         MOVEQ   a1, #L1_B                       ; if so, map in v4
         MOVEQ   a2, v4
         SUBEQ   sp, sp, #4
-        MOVEQ   a3, sp
+        MOVEQ   a3, #0
+        MOVEQ   a4, sp
         BLEQ    RISCOS_AccessPhysicalAddress
 
         MOV     a2, #0
@@ -1872,7 +1873,52 @@ AllocateL2PT ROUT
         EXIT
 
 
-; void *RISCOS_AccessPhysicalAddress(unsigned int flags, void *addr, void **oldp)
+        ; in:  ip = ZeroPage
+        ; out: v3 = PhysIllegalMask
+DeterminePhysIllegalMask
+        Push    "lr"
+        MOV     v3, #&FFFFFFFF         ; By default any upper bits are illegal
+        ARM_read_ID lr
+        AND     lr, lr, #&F :SHL: 16
+        CMP     lr, #ARMvF :SHL: 16    ; Check that feature registers are implemented
+        BNE     %FT01                  ; Some ARMv5 chips supported supersections, but let's not worry about them
+        MRC     p15, 0, lr, c0, c1, 7  ; ID_MMFR3
+        TST     lr, #&F :SHL: 28
+        MOVEQ   v3, #&FFFFFF00
+01      STR     v3, [ip, #PhysIllegalMask]
+        Pull    "pc"
+
+        MACRO
+$lab    ConstructIOPTE $pte, $phys_mb, $flags, $tmp
+        ; $pte (output)                L1 page table entry word
+        ; $phys_mb (input, preserved)  physical address, in megabytes
+        ;   for vanilla sections:
+        ;     bits 0..11 go in bits 20..31
+        ;   for supersections:
+        ;     bits 0..3 assumed zero
+        ;     bits 4..11 go in bits 24..31
+        ;     bits 12..15 go in bits 20..23
+        ;     bits 16..20 go in bits 5..8
+        ; $flags (input, preserved)    page table attribute bits
+        ;
+        ; UBFXNE should be safe pre v6T2, since we won't attempt to use
+        ; supersections on such CPUs and they won't trap untaken undefined instructions
+        ASSERT  $pte <> $phys_mb
+        ASSERT  $pte <> $flags
+        ASSERT  $pte <> $tmp
+        ASSERT  $tmp <> $phys_mb
+        ASSERT  $tmp <> $flags
+$lab    ANDS    $tmp, $flags, #L1_SS
+        UBFXNE  $tmp, $phys_mb, #32-20, #L1_SSb32Width
+        ORR     $pte, $phys_mb, $tmp
+        UBFXNE  $tmp, $phys_mb, #36-20, #L1_SSb36Width
+        ASSERT  L1_SSb32Shift = 20
+        ORR     $pte, $flags, $pte, LSL #L1_SSb32Shift
+        ORRNE   $pte, $pte, $tmp, LSL #L1_SSb36Shift
+        MEND
+
+
+; void *RISCOS_AccessPhysicalAddress(unsigned int flags, uint64_t addr, void **oldp)
 RISCOS_AccessPhysicalAddress ROUT
         ; Only flag user can ask for is bufferable
         ; Convert to appropriate DA flags
@@ -1881,30 +1927,62 @@ RISCOS_AccessPhysicalAddress ROUT
         LDR     a1, =OSAP_None + DynAreaFlags_NotCacheable ; SVC RW, USR none
         ORREQ   a1, a1, #DynAreaFlags_NotBufferable
 RISCOS_AccessPhysicalAddressUnchecked                   ; well OK then, I trust you know what you're doing
-        LDR     ip, =L1PT + (PhysicalAccess:SHR:18)     ; ip -> L1PT entry
-        MOV     a4, a2, LSR #20                         ; rounded to section
-        MOV     a4, a4, LSL #20
-        GetPTE  a1, 1M, a4, a1                          ; a1 = complete descriptor
- [ MEMM_Type = "VMSAv6"
-        ORR     a1, a1, #L1_XN                          ; force non-executable to prevent speculative instruction fetches
- ]
+        ; Check physical address is valid on current CPU
+        LDR     ip, =ZeroPage
+        Push    "a1,v3,lr"
+        LDR     v3, [ip, #PhysIllegalMask]
+        TEQ     v3, #0
+        BLEQ    DeterminePhysIllegalMask
+        TST     a3, v3
+        BNE     %FT90
+        ; Use Get1MPTE to convert DA flags into L1PT section-mapping flags
+        MOV     ip, #0
+        GetPTE  a1, 1M, ip, a1
+        ; Mapping size (section or supersection) depends on address
+        MOV     lr, a2, LSR #20
+        ORR     lr, lr, a3, LSL #12                     ; lr = physical megabyte number
         TEQ     a3, #0
-        LDRNE   a4, [ip]                                ; read old value (if necessary)
-        STR     a1, [ip]                                ; store new one
-        STRNE   a4, [a3]                                ; put old one in [oldp]
+        ORRNE   a1, a1, #L1_SS                          ; need to use supersection for such addresses
+        BIC     a2, a2, #&FF000000                      ; at most, bits 0-23 are used as offsets into section/supersection
+        BICNE   lr, lr, #&F                             ; if address >4GB, round mapped address to 16MB (supersection)
+        BICEQ   a2, a2, #&00F00000                      ; else no further rounding needed (section) and bits 20-23 are not used as an offset either
+        ConstructIOPTE v3, lr, a1, ip
+        LDR     ip, =L1PT + (PhysicalAccess:SHR:18)     ; ip -> L1PT entry
+ [ MEMM_Type = "VMSAv6"
+        ORR     v3, v3, #L1_XN                          ; force non-executable to prevent speculative instruction fetches
+ ]
+        TEQ     a4, #0
+        LDRNE   lr, [ip]                                ; read old value (if necessary)
+        STRNE   lr, [a4]                                ; put old one in [oldp]
+        MOV     a4, #15
+        STR     v3, [ip], #4                            ; store first of 16 new L1PT entries
+        TST     v3, #L1_SS
+        MOVEQ   v3, #0                                  ; if supersection mapped then use 16 duplicate entries, else remaining entries unmapped
+10      SUBS    a4, a4, #1
+        STR     v3, [ip], #4
+        BNE     %BT10
 
         LDR     a1, =PhysicalAccess
-        MOV     a3, a2, LSL #12                         ; take bottom 20 bits of address
-        ORR     a3, a1, a3, LSR #12                     ; and make an offset within PhysicalAccess
-        Push    "a3,lr"
+        ORR     a1, a1, a2
+        STR     a1, [sp]
         ARMop   MMU_ChangingUncached                    ; sufficient, cause not cacheable
-        Pull    "a1,pc"
+        Pull    "a1,v3,pc"
+
+90      ; Invalid physical address
+        ADD     sp, sp, #1*4
+        MOV     a1, #0
+        Pull    "v3,pc"
 
 ; void RISCOS_ReleasePhysicalAddress(void *old)
 RISCOS_ReleasePhysicalAddress
         LDR     ip, =L1PT + (PhysicalAccess:SHR:18)     ; ip -> L1PT entry
-        STR     a1, [ip]
-        LDR     a1, =PhysicalAccess
+        MOV     a4, #15
+        STR     a1, [ip], #4                            ; restore first of 16 L1PT entries
+        TST     a1, #L1_SS
+        MOVEQ   a1, #0                                  ; if supersection mapped then use 16 duplicate entries, else remaining entries unmapped
+10      SUBS    a4, a4, #1
+        STR     a1, [ip], #4
+        BNE     %BT10
         ARMop   MMU_ChangingUncached,,tailcall          ; sufficient, cause not cacheable
 
 
@@ -2097,6 +2175,7 @@ ClearFreePoolSection ROUT
       ]
         MOV     a2, r5
         MOV     a3, #0
+        MOV     a4, #0
         BL      RISCOS_AccessPhysicalAddressUnchecked
 
         MOV     r4, #0                                  ; clear to this value
@@ -2166,6 +2245,7 @@ ClearFreePoolSection ROUT
         MOV     r0, #L1_B
         MOV     r1, r10
         MOV     r2, #0
+        MOV     r3, #0
         BL      RISCOS_AccessPhysicalAddress
 
         MOV     r0, r4
@@ -2218,6 +2298,20 @@ InitProcVecsEnd
 ;      a3 = size
 ; Out: a1 = assigned logical address, or 0 if failed (no room)
 ;
+RISCOS_MapInIO ROUT
+        MOV     a4, a3
+        MOV     a3, #0
+        ; drop through...
+;
+; In:  a1 = flags  (L1_B,L1_C,L1_TEX)
+;           bit 20 set if doubly mapped
+;           bit 21 set if L1_AP specified (else default to AP_None)
+;      a2,a3 = physical address
+;      a4 = size
+; Out: a1 = assigned logical address, or 0 if failed (no room)
+;
+RISCOS_MapInIO64 ROUT
+
 ; Will detect and return I/O space already mapped appropriately, or map and return new space
 ; For simplicity and speed of search, works on a section (1Mb) granularity
 ;
@@ -2234,7 +2328,6 @@ InitProcVecsEnd
 MapInFlag_DoublyMapped * 1:SHL:20
 MapInFlag_APSpecified * 1:SHL:21
 
-RISCOS_MapInIO ROUT
         TST     a1, #MapInFlag_APSpecified
         BICEQ   a1, a1, #L1_AP
         ; For VMSAv6, assume HAL knows what it's doing and requests correct settings for AP_ROM
@@ -2246,114 +2339,111 @@ RISCOS_MapInIO ROUT
         ORR     a1, a1, #L1_Section
  ]
 RISCOS_MapInIO_PTE ; a1 bits 0-19 = L1 section entry flags, bits 20+ = our extra flags
-        Entry   "v1-v5,v7"
-        LDR     v7, =(1:SHL:20)-1
-        AND     v4, a2, v7                              ; v4 = offset of original within section-aligned area
-        ADD     a3, a2, a3                              ; a3 -> end (exclusive)
-        BIC     a2, a2, v7                              ; round a2 down to a section boundary
-        ADD     a3, a3, v7
-        BIC     a3, a3, v7                              ; round a3 up to a section boundary
-
-        ANDS    v5, a1, #MapInFlag_DoublyMapped
-        SUBNE   v5, a3, a2                              ; v5 = offset of second mapping or 0
-
+        Entry   "a2,v1-v8"
         LDR     ip, =ZeroPage
-        LDR     a4, =L1PT
-        AND     a1, a1, v7                              ; mask out our extra flags
-        LDR     v2, =IO                                 ; logical end (exclusive) of currently mapped IO
-        LDR     v1, [ip, #IOAllocPtr]                   ; logical start (inclusive)
+        SUB     a4, a4, #1                              ; reduce by 1 so end physical address is inclusive
+        ADDS    v1, a2, a4
+        ADC     v2, a3, #0                              ; v1,v2 = end physical address
+        LDR     v3, [ip, #PhysIllegalMask]
+        TEQ     v3, #0
+        BLEQ    DeterminePhysIllegalMask
+        TST     v2, v3
+        MOVNE   a1, #0
+        BNE     %FT90                                   ; can't map in physical addresses in this range
 
-        SUB     v1, v1, #&100000
+        MOVS    v3, v2
+        MOVNE   v3, #&F                                 ; v3 = number of MB to use in rounding (0 for sections, 15 for supersections)
+        MOV     v4, a2, LSR #20
+        ORR     v4, v4, a3, LSL #12
+        BIC     v4, v4, v3                              ; v4 = physical start MB to map
+        MOV     v5, v1, LSR #20
+        ORR     v5, v5, v2, LSL #12
+        ADD     v5, v5, #1                              ; make exclusive
+        ADD     v5, v5, v3
+        BIC     v5, v5, v3                              ; v5 = physical end MB to map
+        ANDS    a2, a1, #MapInFlag_DoublyMapped
+        SUBNE   a2, v5, v4                              ; a2 = offset of second mapping (in MB) or 0
+        LDR     v6, =&FFFFF
+        AND     a1, a1, v6                              ; mask out our extra flags
+        CMP     v5, #&1000
+        ORRHI   a1, a1, #L1_SS                          ; set supersection flag if necessary
+        LDR     a3, [ip, #IOAllocPtr]
+        MOV     a3, a3, LSR #20
+        ADD     a3, a3, v3
+        BIC     a3, a3, v3                              ; a3 = logical MB that we're checking for a match
+        ConstructIOPTE a4, v4, a1, lr                   ; a4 = first PT entry to match
+        ADD     v3, v3, #1                              ; v3 = number of MB to step between sections or supersections
+        LDR     v1, =L1PT
+        LDR     v2, =IO :SHR: 20                        ; v2 = last logical MB to check (exclusive)
+        SUB     a3, a3, v3                              ; no increment on first iteration
 10
-        ADD     v1, v1, #&100000                        ; next mapped IO section
-        CMP     v1, v2
-        BHS     %FT32                                   ; no more currently mapped IO
-        LDR     v3, [a4, v1, LSR #(20-2)]               ; L1PT entry (must be for mapped IO)
-        MOV     lr, v3, LSR #20                         ; physical address bits
-        CMP     lr, a2, LSR #20
-        BNE     %BT10                                   ; no address match
-        AND     lr, v3, v7
-        TEQ     lr, a1
-        BNE     %BT10                                   ; no flags match
+        ADD     a3, a3, v3                              ; next logical MB to check
+        ADD     ip, a3, a2                              ; logical MB of base mapping or second mapping if there is one
+        CMP     ip, v2
+        BHS     %FT50                                   ; run out of logical addresses to check
+        LDR     lr, [v1, a3, LSL #2]                    ; check only or first entry
+        TEQ     lr, a4
+        LDREQ   lr, [v1, ip, LSL #2]                    ; check only or second entry
+        TEQEQ   lr, a4
+        BNE     %BT10
 
-        TEQ     v5, #0                                  ; doubly mapped?
-        BEQ     %FT19
-
-        ADD     lr, v1, v5                              ; address of second copy
-        CMP     lr, v2
-        BHS     %FT32
-        LDR     v3, [a4, lr, LSR #(20-2)]
-        MOV     lr, v3, LSR #20                         ; physical address bits
-        CMP     lr, a2, LSR #20
-        BNE     %BT10                                   ; no address match
-        AND     lr, v3, v7
-        TEQ     lr, a1
-        BNE     %BT10                                   ; no flags match
-
-19
-;
-; alright, found start of requested IO already mapped, and with required flags
-;
-        Push    "a2, v1"
+        ; Found start of requested IO already mapped, and with required flags
+        ; Now check that the remaining secions are all there too
+        MOV     v6, v4                                  ; v6 = expected physical MB
+        MOV     v7, a3                                  ; v7 = logical MB we expect to find it at
 20
-        ADD     a2, a2, #&100000
-        CMP     a2, a3
-        Pull    "a2, v1", HS
-        BHS     %FT40                                  ; its all there already!
-        ADD     v1, v1, #&100000                       ; next mapped IO section
-        CMP     v1, v2
-        BHS     %FT30                                  ; no more currently mapped IO
-        LDR     v3, [a4, v1, LSR #(20-2)]              ; L1PT entry
-        MOV     lr, v3, LSR #20                        ; physical address bits
-        CMP     lr, a2, LSR #20
-        BNE     %FT29                                  ; address match failed
-        AND     lr, v3, v7
-        TEQ     lr, a1
-        TEQEQ   v5, #0                                 ; doubly mapped?
-        BEQ     %BT20                                  ; address and flags match so far
-        ADD     lr, v1, v5                             ; where duplicate should be
-        CMP     lr, v2
-        BHS     %FT30                                  ; no more currently mapped IO
-        LDR     v3, [a4, lr, LSR #(20-2)]
-        MOV     lr, v3, LSR #20                        ; physical address bits
-        CMP     lr, a2, LSR #20
-        BNE     %FT29                                  ; address match failed
-        AND     lr, v3, v7
-        TEQ     lr, a1
-        BEQ     %BT20
-29
-        Pull    "a2, v1"
-        B       %BT10
-30
-        Pull    "a2, v1"
-;
-; request not currently mapped, only partially mapped, or mapped with wrong flags
-;
-32
+        ADD     v6, v6, v3                              ; next physical MB
+        ADD     v7, v7, v3                              ; next logical MB
+        ADD     ip, v7, a2                              ; logical MB of base mapping or second mapping if there is one
+        CMP     v6, v5
+        MOVHS   a4, a3, LSL #20
+        BHS     %FT80                                   ; reached end and everything matched
+        CMP     ip, v2
+        BHS     %FT50                                   ; run out of logical addresses to check
+        ConstructIOPTE v8, v6, a1, lr
+        LDR     lr, [v1, v7, LSL #2]                    ; check only or first entry
+        TEQ     lr, v8
+        LDREQ   lr, [v1, ip, LSL #2]                    ; check only or second entry
+        TEQEQ   lr, v8
+        BEQ     %BT20                                   ; good so far, try next entry
+        B       %BT10                                   ; mismatch, continue outer loop
+
+50      ; Request not currently mapped, only partially mapped, or mapped with wrong flags
         LDR     ip, =ZeroPage
-        LDR     v2, [ip, #IOAllocPtr]
-        ADD     v1, v2, a2
-        SUB     v1, v1, a3                              ; attempt to allocate size of a3-a2
-        SUB     v1, v1, v5                              ; double if necessary
-        LDR     v3, [ip, #IOAllocLimit]                 ; can't extend down below limit
-        CMP     v1, v3
-        MOVLS   a1, #0
+        ADD     v8, v3, #1                              ; v8 = number of MB to use in rounding (0 for sections, 15 for supersections)
+        LDR     a3, [ip, #IOAllocPtr]
+        MOV     a3, a3, LSR #20
+        BIC     a3, a3, v8                              ; round down to 1MB or 16MB boundary (some memory may remain unmapped above when we map in a supersection)
+        SUB     a4, v5, v4
+        ADD     a4, a4, a2                              ; a4 = number of MB required
+        SUB     a3, a3, a4
+        MOV     a4, a3, LSL #20
+        LDR     v6, [ip, #IOAllocLimit]
+        CMP     a4, v6                                  ; run out of room to allocate IO?
+        MOVLS   a1, #0                                  ; LS is to match previous version of the code - perhaps should be LO?
         BLS     %FT90
-        STR     v1, [ip, #IOAllocPtr]
-        ORR     a2, a2, a1                              ; first L1PT value
-34
-        STR     a2, [a4, v1, LSR #(20-2)]
-        TEQ     v5, #0
-        ADDNE   v2, v1, v5
-        STRNE   a2, [a4, v2, LSR #(20-2)]
-        ADD     a2, a2, #&100000
-        ADD     v1, v1, #&100000                        ; next section
-        CMP     a2, a3
-        BLO     %BT34
+        STR     a4, [ip, #IOAllocPtr]
+60
+        ConstructIOPTE v8, v4, a1, lr                   ; v8 = page table entry for this (super)section
+        MOV     v7, v3                                  ; number of consecutive entries to program the same
+70
+        ADD     v6, a3, a2
+        STR     v8, [v1, a3, LSL #2]                    ; write only or first entry
+        ADD     a3, a3, #1
+        STR     v8, [v1, v6, LSL #2]                    ; write only or second entry
+        SUBS    v7, v7, #1
+        BNE     %BT70
+        ADD     v4, v4, v3
+        CMP     v4, v5
+        BLO     %BT60
+
         PageTableSync
-        LDR     v1, [ip, #IOAllocPtr]
-40
-        ADD     a1, v1, v4                              ; logical address for request
+80
+        LDR     a2, [sp]                                ; retrieve original physical address from stack
+        BIC     a2, a2, #&FF000000                      ; distance from 16MB boundary for supersections
+        TST     a1, #L1_SS
+        BICEQ   a2, a2, #&00F00000                      ; distance from 1MB boundary for sections
+        ADD     a1, a4, a2
 90
         EXIT
 
@@ -2365,12 +2455,13 @@ RISCOS_AddDevice
         B       HardwareDeviceAdd_Common
 
  [ PagedMemory
-; uint32_t RISCOS_LogToPhys(const void *log)
+; uint64_t RISCOS_LogToPhys(const void *log)
 RISCOS_LogToPhys ROUT
         Push    "r4,r5,r8,r9,lr"
         MOV     r4, a1
         LDR     r8, =L2PT
         BL      logical_to_physical
+        MOVCC   a2, #0 ; assume L2 page tables only used for bottom 4GB for now
         MOVCC   a1, r5
         BCC     %FT10
         ; Try checking L1PT for any section mappings (logical_to_physical only
@@ -2382,8 +2473,13 @@ RISCOS_LogToPhys ROUT
         ASSERT  L1_Section = 2
         EOR     a1, a1, #2
         TST     a1, #3
+        MOVNE   a2, #-1
         MOVNE   a1, #-1
         BNE     %FT10
+        ; Check if it's a supersection
+        TST     a1, #L1_SS
+        BNE     %FT20
+        MOV     a2, #0 ; vanilla sections only map bottom 4GB of physical space
         ; Apply offset from bits 0-19 of logical addr
       [ NoARMT2
         MOV     a1, a1, LSR #20
@@ -2393,6 +2489,13 @@ RISCOS_LogToPhys ROUT
         BFI     a1, r4, #0, #20
       ]
 10
+        Pull    "r4,r5,r8,r9,pc"
+
+20      MOV     a3, a1, LSR #L1_SSb36Shift
+        UBFX    a2, a1, #L1_SSb32Shift, #L1_SSb32Width
+        BFI     a2, a3, #36-32, #L1_SSb36Width
+        ; Apply offset from bits 0-23 of logical addr
+        BFI     a1, r4, #0, #24
         Pull    "r4,r5,r8,r9,pc"
  ] ; PagedMemory
 
