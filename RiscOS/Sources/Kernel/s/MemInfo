@@ -89,13 +89,16 @@ MemReturn
         B       FindAccessPrivilege             ; 18
  [ PagedMemory
         B       DMAPrep                         ; 19
+        B       ChangeCompatibility             ; 20
+        B       MapIO64permanent                ; 21
+        B       AccessPhysAddr64                ; 22
  |
         B       %BT20                           ; 19
- ]
         B       ChangeCompatibility             ; 20
-        B       %BT20                           ; 21 |
-        B       %BT20                           ; 22 | Reserved for us
-        B       %BT20                           ; 23 |
+        B       %BT20                           ; 21
+        B       %BT20                           ; 22
+ ]
+        B       %BT20                           ; 23 reserved for us
         B       CheckMemoryAccess               ; 24
                                                 ; 25+ reserved for ROL
 40
@@ -959,7 +962,33 @@ RP_failed
 ;
 MapIOpermanent ROUT
         Entry   "r0-r2,r12"
-        ; Convert the input flags to some DA flags
+        MOV     r3, r2
+        MOV     r2, #0
+        B       %FT10
+
+;----------------------------------------------------------------------------------------
+;MapIO64permanent - map IO space (if not already mapped) from 64-bit physical space
+;and return logical address
+;
+;       In:     r0 bits 0..7  = 21 (reason code 21)
+;               r0 bit  8     = 1 to map bufferable space (0 is normal, non-bufferable)
+;               r0 bit  9     = 1 to map cacheable space (0 is normal, non-cacheable)
+;               r0 bits 10..12 = cache policy
+;               r0 bits 13..15 = 0 (reserved flags)
+;               r0 bit  16    = 1 to doubly map
+;               r0 bit  17    = 1 if access privileges specified
+;               r0 bits 18..23 = 0 (reserved flags)
+;               r0 bits 24..27 = access privileges (if bit 17 set)
+;               r0 bits 28..31 = 0 (reserved flags)
+;               r1,r2 = physical address of base of IO space required
+;               r3 = size of IO space required (bytes)
+;
+;       Out:    r3 = logical address of base of IO space
+;        - or error if not possible (no room)
+;
+MapIO64permanent
+        ALTENTRY
+10      ; Convert the input flags to some DA flags
         TST     r0, #1:SHL:17
         MOVEQ   r12, #2                 ; Default AP: SVC RW, USR none
         MOVNE   r12, r0, LSR #24        ; Else use given AP
@@ -1014,16 +1043,49 @@ MapIOpermanent ROUT
 ; access calls can be ignored.)
 ;
 AccessPhysAddr ROUT
-        Push    "r0,r1,r12,lr"
-        TST     r0, #&100           ;test bufferable bit
+        Push    "r0-r3,r12,lr"
+        MOV     r2, #0
+        B       %FT10
+
+;----------------------------------------------------------------------------------------
+;AccessPhysAddr64 - claim temporary access to given 64-bit physical address (in fact,
+;                 controls access to the 1-16Mb aligned space containing the address)
+;                 The access remains until the next AccessPhysAddr or until a
+;                 ReleasePhysAddr (although interrupts or subroutines may temporarily
+;                 make their own claims, but restore on Release before returning)
+;
+;       In:     r0 bits 0..7  = 22 (reason code 22)
+;               r0 bit  8     = 1 to map bufferable space, 0 for unbufferable
+;               r0 bits 9..31 = 0 (reserved flags)
+;               r1,r2 = physical address
+;
+;       Out:    r2 = logical address corresponding to phys address r1
+;               r3 = old state (for ReleasePhysAddr)
+;
+; Use of multiple accesses: it is fine to make several Access calls, and
+; clean up with a single Release at the end. In this case, it is the old state
+; (r3) of the *first* Access call that should be passed to Release in order to
+; restore the state before any of your accesses. (The r3 values of the other
+; access calls can be ignored.)
+;
+AccessPhysAddr64
+        Push    "r0-r3,r12,lr"
+10      TST     r0, #&100           ;test bufferable bit
         MOVNE   r0, #L1_B
         MOVEQ   r0, #0
         SUB     sp, sp, #4          ; word for old state
-        MOV     r2, sp              ; pointer to word
+        MOV     r3, sp              ; pointer to word
         BL      RISCOS_AccessPhysicalAddress
-        MOV     r2, r0
-        Pull    r3                  ; old state
-        Pull    "r0,r1,r12,pc"
+        MOVS    r2, r0              ; null pointer means invalid physical address
+        LDMIB   sp, {r0,r1}
+        BEQ     %FT90
+        LDR     r3, [sp], #5*4      ; load old state, and skip stacked r0-r3
+        Pull    "r12,pc"
+
+90      ADRL    r0, ErrorBlock_CantGetPhysMem
+        SETV
+        ADD     sp, sp, #2*4
+        Pull    "r1-r3,r12,pc"
 
 ;----------------------------------------------------------------------------------------
 ;ReleasePhysAddr - release temporary access that was claimed by AccessPhysAddr
@@ -2022,13 +2084,13 @@ CheckMemoryAccess ROUT
         LDR     r7, =L1PT
         MOVLO   r3, r4 ; Skip all the unallocated regions
 31
-        Push    "r0,r1"
+        Push    "r0-r3"
         LDR     r0, [r7, r3, LSR #20-2]
         BL      DecodeL1Entry           ; TODO bit wasteful. We only care about access privileges, but this call gives us cache info too.
         LDR     r5, [r10, #MMU_PPLAccess]
-        AND     lr, r1, #DynAreaFlags_APBits
+        AND     lr, r2, #DynAreaFlags_APBits
         LDR     r5, [r5, lr, LSL #2]
-        Pull    "r0,r1"
+        Pull    "r0-r3"
         ADD     r4, r3, #1<<20
         ORR     r5, r5, #CMA_Partially_Phys
         BL      CMA_AddRange2
@@ -2036,8 +2098,25 @@ CheckMemoryAccess ROUT
         MOV     r3, r4
         BNE     %BT31
 40
-  ]
         ; Everything else!
+        LDR     r3, =L1PT + (PhysicalAccess:SHR:18)
+        LDR     r3, [r3]
+        TEQ     r3, #0
+        BEQ     %FT50
+        TST     r3, #L1_SS
+        LDR     r3, =PhysicalAccess
+        LDREQ   r4, =&100000  ; section mapped
+        LDRNE   r4, =&1000000 ; supersection mapped
+        ; Assume IO memory mapped there
+      [ MEMM_Type = "VMSAv6"
+        LDR     r5, =CMA_Partially_PrivR+CMA_Partially_PrivW+CMA_Partially_Phys
+      |
+        LDR     r5, =CMA_Partially_PrivR+CMA_Partially_PrivW+CMA_Partially_PrivXN+CMA_Partially_Phys
+      ]
+        BL      CMA_AddRange
+50
+        ASSERT  HALWorkspace > PhysicalAccess
+  ]
         LDR     r3, =HALWorkspace
         LDR     r4, [r10, #HAL_WsSize]
         LDR     r5, =CMA_HALWorkspace
@@ -2062,23 +2141,8 @@ CheckMemoryAccess ROUT
         LDR     r4, =UNDStackSize
         LDR     r5, =CMA_UNDStack
         BL      CMA_AddRange
-    [ PagedMemory
-        ASSERT  PhysicalAccess > UNDStackAddress
-        LDR     r3, =L1PT + (PhysicalAccess:SHR:18)
-        LDR     r3, [r3]
-        TEQ     r3, #0
-        BEQ     %FT50
-        LDR     r3, =PhysicalAccess
-        LDR     r4, =&100000
-        ; Assume IO memory mapped there
-      [ MEMM_Type = "VMSAv6"
-        LDR     r5, =CMA_Partially_PrivR+CMA_Partially_PrivW+CMA_Partially_Phys
-      |
-        LDR     r5, =CMA_Partially_PrivR+CMA_Partially_PrivW+CMA_Partially_PrivXN+CMA_Partially_Phys
-      ]
-        BL      CMA_AddRange
-50
-        ASSERT  DCacheCleanAddress > PhysicalAccess
+  [ :LNOT: Linux
+        ASSERT  DCacheCleanAddress > UNDStackAddress
         LDR     r4, =DCacheCleanAddress+DCacheCleanSize
         CMP     r1, r4
         BHS     %FT60
@@ -2096,7 +2160,7 @@ CheckMemoryAccess ROUT
         LDR     r5, =CMA_DCacheClean+CMA_Partially_Phys
         BL      CMA_AddRange
         ASSERT  KbuffsBaseAddress > DCacheCleanAddress
-    ]
+  ]
 60
         ASSERT  KbuffsBaseAddress > UNDStackAddress
         LDR     r3, =KbuffsBaseAddress
@@ -2131,7 +2195,7 @@ CheckMemoryAccess ROUT
         MOV     r4, #32*1024
         LDR     r5, =CMA_CursorChunk
         BL      CMA_AddRange
-      [ :LNOT: Linux
+  [ :LNOT: Linux
         ASSERT  CAM > CursorChunkAddress
         LDR     r3, =CAM
         LDR     r4, [r10, #SoftCamMapSize]
@@ -2143,7 +2207,7 @@ CheckMemoryAccess ROUT
         LDR     r5, =CMA_ROM
         BL      CMA_AddRange
         ASSERT  ZeroPage > ROM :LOR: ZeroPage = 0
-      ]
+  ]
         ; Finally, high processor vectors/relocated zero page
         ASSERT  ProcVecs = ZeroPage
       [ ZeroPage > 0
@@ -2152,7 +2216,7 @@ CheckMemoryAccess ROUT
         LDR     r5, =CMA_ZeroPage
         BL      CMA_AddRange
       ]
-      [ Linux
+  [ Linux
         ASSERT  ROM > ZeroPage
         LDR     r3, =ROM
         LDR     r4, =OSROM_ImageSize*1024
@@ -2161,7 +2225,7 @@ CheckMemoryAccess ROUT
 
         ; Finally Dynamic areas
         CheckMemoryAccess_DynamicAreas
-      ]
+  ]
 90
         ; If there's anything else, we've wandered off into unallocated memory
         LDR     r3, =&0F0F0F0F
@@ -2264,16 +2328,16 @@ CMA_Done
         BICCS   r0, r0, r10 ; Not fully mapped, clear completion flags
         BCS     %FT45
         ; Get the L2PT entry and decode the flags
-        Push    "r0-r2"
+        Push    "r0-r3"
         LDR     r0, [r8, r4, LSR #10]
         BL      DecodeL2Entry           ; TODO bit wasteful. We only care about access privileges, but this call gives us cache info too. Also, if we know the L2PT backing exists (it should do) we could skip the logical_to_physical call
-        ; r1 = DA flags
+        ; r2 = DA flags
         ; Extract and decode AP
         LDR     r0, =ZeroPage
         LDR     r5, [r0, #MMU_PPLAccess]
-        AND     lr, r1, #DynAreaFlags_APBits
+        AND     lr, r2, #DynAreaFlags_APBits
         LDR     r5, [r5, lr, LSL #2]
-        Pull    "r0-r2"
+        Pull    "r0-r3"
         ORR     r10, r5, r10
         ORR     r0, r0, r5 ; Set new partial flags
         AND     r0, r0, r10, ROR #4 ; Discard completion flags which aren't for this range

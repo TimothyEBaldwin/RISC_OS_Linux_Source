@@ -1,5 +1,5 @@
 # Common setup for build environment
-# Include from an Env file, with "RiscOS" as the current directory
+# Include from an Env file
 #
 
 [ "$MACHINE" != "" ] || { echo "No build selected - Run an Env file"; exit 1; }
@@ -10,7 +10,8 @@ export ROOL_BIN=/opt/rool/bin
 [ "$GCCSDK_INSTALL_CROSSBIN" != "" ] || export GCCSDK_INSTALL_CROSSBIN=/opt/gccsdk/cross/bin
 
 # Replace existing entries on PATH to prevent it growing indefinitely
-export PATH=$TOOLSDIR/Build:$TOOLSDIR/Misc:$ROOL_BIN:$GCCSDK_INSTALL_CROSSBIN:`echo -n $PATH | awk 'BEGIN{P="('$TOOLSDIR'|'$ROOL_BIN'|'$GCCSDK_INSTALL_CROSSBIN')";RS=":";ORS=":"}$0!~P' | sed 's/:$//'`
+PATH=$TOOLSDIR/Build:$TOOLSDIR/Misc:$ROOL_BIN:$GCCSDK_INSTALL_CROSSBIN:$(printf "%s" "$PATH" | awk 'BEGIN{P="('"$TOOLSDIR"'|'"$ROOL_BIN"'|'"$GCCSDK_INSTALL_CROSSBIN"')";RS=":";ORS=":"}$0!~P' | sed 's/:$//')
+export PATH
 
 export APPDIR=$BUILDDIR/Apps
 export MAKEFILEDIR=$BUILDDIR/BuildSys/GNUmakefiles
@@ -91,7 +92,7 @@ export CEXPORTDIR=$APCSEXPORTDIR/C
 export LIBDIR=$APCSEXPORTDIR/Lib
 
 # This enables you to simply type "make all" from the command line
-alias make="make -I$MAKEFILEDIR --no-print-directory"
+alias make="make -I\"\$MAKEFILEDIR\" --no-print-directory"
 
 # This is similar, but infers COMPONENT, TARGET and INSTDIR from the ModuleDB
 # if possible. Where a source directory occurs multiple times within the
@@ -102,38 +103,38 @@ alias make="make -I$MAKEFILEDIR --no-print-directory"
 # with make. Any additional arguments (make targets etc) are passed to make.
 mk ()
 {(
-    COMPONENTDIR=`pwd`
+    COMPONENTDIR=$(pwd)
     if [ "$1" = "-C" ]; then
-        COMPONENTDIR="$(cd $2 && pwd)"
+        COMPONENTDIR="$(cd "$2" && pwd)"
         shift
         shift
     fi
-    RELPATH=`echo ${COMPONENTDIR#*$BUILDDIR/} | tr / .`
+    RELPATH=$(echo "${COMPONENTDIR#*$BUILDDIR/}" | tr / .)
     MYTMP=$(mktemp)
     
     if [ -n "$COMPONENT" ]; then
-        grep "^$COMPONENT " $BUILDDIR/BuildSys/ModuleDB > $MYTMP
+        grep "^$COMPONENT " "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
     else
-        grep "$RELPATH" $BUILDDIR/BuildSys/ModuleDB | grep -v "$RELPATH\." > $MYTMP
+        grep "$RELPATH\( \|$\)" "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
     fi
     
     if [ $? -ne 0 ]; then
         # Component not found in ModuleDB - can't infer anything
-        make -C $COMPONENTDIR $@
+        make -C "$COMPONENTDIR" "$@"
     else
         while read -r DB_COMPONENT _ _ DB_INSTDIR DB_TARGET; do
             ARGS=""
             if [ -z "$COMPONENT" ]; then
                 ARGS="$ARGS COMPONENT=$DB_COMPONENT"
             fi
-            if [ -z "$TARGET" ]; then
+            if [ -z "$TARGET" ] && [ -n "$DB_TARGET" ]; then
                 ARGS="$ARGS TARGET=$DB_TARGET"
             fi
-            if [ -z "$INSTDIR" ]; then
-                ARGS="$ARGS INSTDIR=$INSTALLDIR/$DB_INSTDIR"
+            if [ -z "$INSTDIR" ] && [ -n "$DB_INSTDIR" ]; then
+                ARGS="$ARGS INSTDIR=\"$INSTALLDIR/$DB_INSTDIR\""
             fi
-            make -C $COMPONENTDIR $ARGS $@
-        done < $MYTMP
+            make -C "$COMPONENTDIR" $ARGS "$@"
+        done < "$MYTMP"
     fi
-    rm $MYTMP
+    rm "$MYTMP"
 )}
