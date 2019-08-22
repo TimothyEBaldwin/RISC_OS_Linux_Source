@@ -27,6 +27,7 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
+#include <atomic>
 
 using std::cerr;
 using std::endl;
@@ -36,6 +37,7 @@ namespace {
 const int refresh_period = 50;
 const int mode_change = 5555;
 const int screen_update = 5554;
+std::atomic<int> updates_pending;
 bool use_close_message;
 int log2bpp = 3;
 int height = 480;
@@ -46,6 +48,12 @@ SDL_Surface *screen;
 int client_version;
 
 void update_screen() {
+  if (no_updates >= 0) {
+    no_updates -= refresh_period * updates_pending.exchange(0);
+  } else {
+    updates_pending = 0;
+  }
+
   if (no_updates <= 0 && get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
     SDL_BlitSurface(screen, nullptr, SDL_GetWindowSurface(window), nullptr);
     SDL_UpdateWindowSurface(window);
@@ -70,7 +78,7 @@ void refresh() {
   SDL_Event e;
   e.type = screen_update;
   while (true) {
-    SDL_PushEvent(&e);
+    if (!updates_pending++) SDL_PushEvent(&e);
     SDL_Delay(refresh_period);
   }
 }
@@ -218,7 +226,6 @@ int main(int argc, char **argv) {
       case mode_change:
         break;
       case screen_update:
-        if (no_updates >= 0) no_updates -= refresh_period;
         update_screen();
         break;
       case SDL_WINDOWEVENT:
