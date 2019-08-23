@@ -1,0 +1,2301 @@
+; Copyright 2019 RISC OS Open Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > Wimp.s.CBTask
+
+ [ CnP
+; Clipboard Task
+; In order to participate in Clipboard messaging and such we run a Wimp Task
+; The pollword is used to signal things that need attention from the Wimp if necessary
+; It also keeps a chunk of things running in User mode rather than SVC mode
+
+                       ^ 0
+clipboard_pw_clear     # 1 ; placeholder so 0 isn't used
+clipboard_pw_copydata  # 1 ; copy data to clipboard from icon
+clipboard_pw_pastedata # 1 ; paste data from clipboard to icon
+clipboard_pw_cutdata   # 1 ; cut data from icon to clipboard
+clipboard_pw_dragstart # 1 ; start dragging text from an icon to elsewhere
+clipboard_pw_dragabort # 1 ; Escape pressed: abort drag
+clipboard_pw_maxval    # 0
+
+clipboard_pw_dataload_flag * 256 ; set if there's also a message_dataload to handle
+
+; state flags
+
+CNPTRUE         * 1
+CNPFALSE        * 0
+rTRUE           RN 9
+rFALSE          RN 8
+
+        LTORG
+
+cbtask_messagelist
+        DCD     Message_DataSave
+        DCD     Message_DataSaveAck
+        DCD     Message_DataLoad
+        DCD     Message_DataLoadAck
+        DCD     Message_RAMFetch
+        DCD     Message_RAMTransmit
+        DCD     Message_ClaimEntity
+        DCD     Message_DataRequest
+        DCD     Message_Dragging
+        DCD     Message_DragClaim
+        DCD     0
+
+cbtask_wimpver DCD 310
+cbtask_TASK    DCB "TASK"
+cbtask_token   DCB "ClipMgr:Clipboard Manager", 0
+        ALIGN
+
+; Start of main Clipboard Task code
+; need to set up workspace and bits
+cbtask_start
+        SWI     XWimp_CloseDown
+
+        LDR     R11,clipboard_spritearea_addr
+        TEQ     R11,#0
+        MOVEQ   R14,#0
+        MOVNE   R14,#2
+        STR     R14,[R6]                ; adjust clipboard_taskhandle so we don't get stuck in a loop if there's an issue
+        SWIEQ   OS_Exit                 ; no workspace, so exit early
+
+        ADD     R13,R11,#cbtask_stacklimit ; give ourselves a wee stack
+        BL      GetMessages             ; ensure messagetrans set up
+
+        ; initialise task
+        ADRL    R0,message_block
+        ADR     R1,cbtask_token         ; task name
+        MOV     R2,#0
+        SWI     MessageTrans_Lookup
+        LDR     R0,cbtask_wimpver
+        LDR     R1,cbtask_TASK
+        ADR     R3,cbtask_messagelist
+        SWI     Wimp_Initialise
+        ADRL    R2,clipboard_taskhandle
+        STR     R1,[R2]
+
+        ; initialise variables
+        ADD     R13,R11,#cbtask_stacklimit ; give ourselves a wee stack
+
+        MOV     R2,#CNPFALSE
+        STRB    R2,[R11,#cbtask_var_claiming]
+        STRB    R2,[R11,#cbtask_var_dragging]
+        ADRL    R3,clipboard_pollword
+        STR     R2,[R3]
+
+        ; main loop
+
+cbtask_poll
+        ADD     R1,R11,#cbtask_pollblock
+        ADRL    R3,clipboard_pollword
+
+        LDRB    R14,[R11,#cbtask_var_dragging]
+        CMP     R14,#0                  ; are we dragging?
+        BNE     %FT01
+
+        LDR     R0,=flag_pollword :OR: flag_pollfast :OR: null_bit ; we want poll word & no null events
+        SWI     Wimp_Poll
+        B       %FT02
+01
+        SWI     XOS_ReadMonotonicTime
+        ADD     R2,R0,#25
+        LDR     R0,=flag_pollword :OR: flag_pollfast ; we want poll word & null events
+        SWI     Wimp_PollIdle
+02
+        TEQ     R0,#No_Reason
+        BEQ     cbtask_idle
+
+        TEQ     R0,#User_Dragbox
+        BEQ     cbtask_drag_end
+
+        TEQ     R0,#PollWord_NonZero
+        BEQ     cbtask_pollword_nonzero
+
+        TEQ     R0,#User_Message
+        TEQNE   R0,#User_Message_Recorded
+        BEQ     cbtask_message
+
+        TEQ     R0,#User_Message_Acknowledge
+        BEQ     cbtask_message_bounced
+
+        B       cbtask_poll
+
+cbtask_pollword_nonzero
+        ADRL    R0,clipboard_pollword
+        LDR     R1,[R0]
+
+        TST     R1,#clipboard_pw_dataload_flag
+        BNE     cbtask_pw_dataload
+
+        CMP     R1,#clipboard_pw_maxval
+        MOV     R9,#0
+        STR     R9,[R0]
+        ADDLT   PC,PC,R1,LSL #2
+        B       cbtask_poll
+
+        B       cbtask_poll             ; zero entry if already handled
+        B       cbtask_copydata
+        B       cbtask_pastedata
+        B       cbtask_cutdata
+        B       cbtask_startdrag
+        B       cbtask_abortdrag
+
+cbtask_pw_dataload
+        ; message_dataload needs to be intercepted as it wasn't handled by the client task
+        BIC     R1,R1,#clipboard_pw_dataload_flag
+        STR     R1,[R0]                 ; clear our bit, but leave any other reason code for further processing
+
+        ; shunt the message from the store to our poll block
+        ADD     R0,R11,#cnp_message_dataload_park
+        LDR     R1,[R0]
+        TEQ     R1,#0
+        BEQ     cbtask_poll             ; shouldn't be called with no queued messsage, but just in case
+
+        ADD     R2,R11,#cbtask_pollblock
+00
+        LDR     R3,[R0],#4
+        STR     R3,[R2],#4
+        SUBS    R1,R1,#4
+        BNE     %BT00
+
+        ; and handle the dataload
+        B       cbtask_dataload_rx
+
+cbtask_copydata
+        ; data has been copied already
+        BL      cbtask_claim_clipboard
+        B       cbtask_poll
+
+cbtask_claim_clipboard
+        ; claim the clipboard
+        MOV     R0,#24
+        MOV     R1,#0
+        MOV     R2,#0
+        MOV     R3,#0
+        MOV     R4,#Message_ClaimEntity
+        MOV     R5,#4
+        ADD     R9,R11,#cbtask_pollblock
+        STMIA   R9,{R0-R5}
+
+        MOV     R0,#User_Message
+        MOV     R1,R9
+        MOV     R2,#0
+        SWI     XWimp_SendMessage
+        BVS     cbtask_report_error
+        MOV     PC,R14
+cbtask_cutdata
+        ; data has already been cut and transferred to clipboard store
+        BL      cbtask_claim_clipboard
+        B       cbtask_poll
+
+cbtask_message
+        LDR     R0,[R1,#ms_action]
+
+        TEQ     R0,#Message_Quit
+        BEQ     cbtask_messagequit_rx
+
+        TEQ     R0,#Message_DataSave
+        BEQ     cbtask_datasave_rx
+
+        TEQ     R0,#Message_ClaimEntity
+        BEQ     cbtask_claimentity_rx
+
+        TEQ     R0,#Message_DataRequest
+        BEQ     cbtask_datarequest_rx
+
+        TEQ     R0,#Message_DataLoad
+        BEQ     cbtask_dataload_rx
+
+        TEQ     R0,#Message_Dragging
+        BEQ     cbtask_message_dragging_rx
+
+        TEQ     R0,#Message_DragClaim
+        BEQ     cbtask_message_dragclaim_rx
+
+        B       cbtask_poll
+
+; ---------------------------------------------------------------------------------------
+; Message_Quit received
+
+cbtask_messagequit_rx
+        ; close existing instance
+        ADRL    R5,clipboard_taskhandle
+        LDR     R0,[R5]
+        LDR     R1,cbtask_TASK
+        SWI     XWimp_CloseDown
+
+        MOV     R0,#0
+        STR     R0,[R5]
+        SWI     OS_Exit
+        ; STOP
+
+; ---------------------------------------------------------------------------------------
+; Message_ClaimEntity received
+; Free data if someone else has the clipboard now
+
+cbtask_claimentity_rx
+        ; was it us?
+        LDR     R0,[R1,#ms_taskhandle]  ; task handle of sender
+        ADRL    R2,clipboard_taskhandle
+        LDR     R2,[R2]
+        TEQ     R0,R2
+        BEQ     cbtask_poll             ; it was us, so ignore
+        ; release our claim
+        MOV     R0,#clipboard_flexblock_clipdata
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+        B       cbtask_poll
+
+; ---------------------------------------------------------------------------------------
+; Message_DataRequest received
+; Someone wants some data from us
+; Do we have any to offer?
+
+FileSe
+        DCB     "FileSe:Selection",0    ; messagetrans token & default text
+        ALIGN
+
+cbtask_datarequest_rx
+        MOV     R0,#clipboard_flexblock_clipdata
+        BL      clipboard_flex_get_block_size
+        CMP     R0,#0
+        BEQ     cbtask_poll             ; nothing to see here
+
+        MOV     R8,R0
+
+        ; is the clipboard being sent?
+        LDR     R0,[R1,#msDataRequest_flags]
+        TEQ     R0,#4
+        BNE     cbtask_poll             ; no, ignore
+
+        ; can we service this request?  We only export text (&FFF)
+        ADD     R0,R1,#msDataRequest_filetypes
+        ADD     R2,R1,#256
+        LDR     R4,=FileType_Text
+01
+        LDR     R3,[R0],#4
+        TEQ     R3,R4
+        BEQ     %FT02
+        TEQ     R0,R2
+        CMPNE   R3,#msDataRequest_filetypes_end
+        BEQ     cbtask_poll             ; reached end of the list, so abort
+
+        B       %BT01                   ; look at the next entry
+02
+        ; requesting task can handle text files
+        ; set up datarequest reply
+        LDR     R0,[R1,#ms_myref]
+        STR     R0,[R1,#ms_yourref]
+
+        MOV     R10,#clipboard_flexblock_clipdata
+
+; Run a datasave
+; On entry, r1 -> message block with ms_taskhandle and your_ref set up
+;           r3  = filetype
+;           r8  = size of data to export
+;           r10 = flexblock to use for data source
+cbtask_run_datasave
+        MOV     R0,#Message_DataSave
+        STR     R0,[R1,#ms_action]
+        STR     R8,[R1,#msDataTransfer_filesize]
+        STR     R3,[R1,#msDataTransfer_filetype]
+
+        MOV     R9,R1
+        ADRL    R0,message_block
+        ADD     R2,R1,#msDataTransfer_filename
+        ADR     R1,FileSe
+        MOV     R3,#(256-msDataTransfer_filename)
+        MOV     R4,#0
+        MOV     R5,#0
+        MOV     R6,#0
+        MOV     R7,#0
+        SWI     XMessageTrans_Lookup
+        BVS     cbtask_export_finished
+
+        ADD     R3,R3,#1+msDataTransfer_filename+3 ; includes terminator
+        BIC     R3,R3,#3
+        STR     R3,[R9,#ms_size]        ; message size
+
+        MOV     R0,#User_Message_Recorded
+        MOV     R1,R9
+        LDR     R2,[R1,#ms_taskhandle]
+
+        SWI     XWimp_SendMessage
+        BVS     cbtask_export_finished
+
+        ; we've sent the message.  However, if the source window has mysteriously disappeared then we need to back out.
+        ; if we back out after the datasave, the recipient should have cleared ghost carets etc.
+        TEQ     R10,#clipboard_flexblock_clipdata     ; if it's from the clipboard then there's no source window
+        LDRNE   R0,[R11,#cbtask_var_source_window]
+        SUBNE   R1,R13,#36
+        STRNE   R0,[R1]
+        SWINE   XWimp_GetWindowState
+        BVS     cbtask_export_finished   ; bail out if can't get window state (ie bad window handle now)
+
+        ; poll wimp for replies to this
+01
+        MOV     R0,#null_bit
+        MOV     R1,R9
+        SWI     XWimp_Poll
+        BVS     cbtask_export_finished
+
+        TEQ     R0,#User_Message_Acknowledge
+        MOVEQ   R9,#CNPFALSE
+        BEQ     cbtask_export_finished  ; message bounced, so abort
+02
+        TEQ     R0,#User_Message
+        TEQNE   R0,#User_Message_Recorded
+        BNE     %BT01
+
+        ; which message did we get?
+        LDR     R0,[R1,#ms_action]
+        TEQ     R0,#Message_RAMFetch
+        BEQ     cbtask_paste_ramxfer
+
+        TEQ     R0,#Message_DataSaveAck
+        BEQ     cbtask_paste_filexfer
+
+        ; all done.  Back to the normal loop.
+        MOV     R9,#CNPTRUE
+        B       cbtask_export_finished
+
+; On entry, R1 -> message block containing DataSaveAck detail
+;           R10 = flex block to export
+cbtask_paste_filexfer
+        ; write data to file
+        MOV     R7,R1
+
+        MOV     R0,R10
+        BL      clipboard_flex_get_block_addr_size
+        MOV     R8,R0
+        MOV     R9,R1
+
+        MOV     R0,#OSFile_SaveStamp
+        ADD     R1,R7,#msDataTransfer_filename
+        LDR     R2,=FileType_Text
+        MOV     R4,R8
+        ADD     R5,R4,R9
+        SWI     XOS_File
+        BVS     cbtask_export_finished
+
+        ; now inform recipient of what we've done
+        MOV     R0,#User_Message_Recorded
+        LDR     R1,[R7,#ms_myref]
+        STR     R1,[R7,#ms_yourref]
+        STR     R9,[R7,#msDataTransfer_filesize]
+        MOV     R1,R7
+        LDR     R2,[R1,#ms_taskhandle]
+        SWI     Wimp_SendMessage
+
+        ; all done
+        MOV     R9,#CNPTRUE
+        B       cbtask_export_finished
+
+cbtask_paste_ramxfer
+; On entry, R1 -> message block containing RAMFetch detail
+;           r10 = flex block containing data
+        MOV     R7,R1
+
+        ; start a loop of data copy bits
+        MOV     R0,R10
+        BL      clipboard_flex_get_block_addr_size
+        MOV     R8,R0
+        MOV     R9,R1
+
+        ; now r7 = pollblock / message
+        ;     r8 = pointer to base of remaining data
+        ;     r9 = amount of data remaining to copy
+01
+        ; send requested amount of data (up to the amount of data remaining)
+        LDR     R0,[R7,#msRAMFetch_length]
+        CMP     R0,R9                   ; how much can the client receive?
+        MOVLE   R4,R0
+        MOVGT   R4,R9
+
+        TEQ     R4,#0
+        MOVNE   R1,R8
+        LDRNE   R2,[R7,#ms_taskhandle]
+        LDRNE   R3,[R7,#msRAMFetch_buffer]
+        ADRNEL  R0,clipboard_taskhandle
+        LDRNE   R0,[R0]
+        SWINE   XWimp_TransferBlock     ; move data if anything to move (length non-0)
+        BVS     cbtask_export_finished
+
+        ; send message to recipient
+        MOV     R0,#Message_RAMTransmit
+        STR     R0,[R7,#ms_action]
+        MOV     R0,#28
+        STR     R0,[R7,#ms_size]
+        LDR     R0,[R7,#ms_myref]
+        STR     R0,[R7,#ms_yourref]
+        STR     R4,[R7,#msRAMTransmit_length]
+        ADD     R8,R8,R4
+        SUB     R9,R9,R4                ; move pointer and adjust remaining data
+
+        TEQ     R4,#0
+        MOVEQ   R0,#User_Message
+        MOVNE   R0,#User_Message_Recorded
+        MOV     R1,R7
+        LDR     R2,[R7,#ms_taskhandle]
+        SWI     XWimp_SendMessage       ; inform recipient
+        BVS     cbtask_export_finished
+        TEQ     R4,#0
+        MOVEQ   R9,#CNPTRUE
+        BEQ     cbtask_export_finished  ; nothing to do now, so exit
+
+02
+        MOV     R0,#null_bit
+        MOV     R1,R7
+        SWI     Wimp_Poll
+
+        TEQ     R0,#User_Message_Acknowledge ; bounced message -> abort
+        MOVEQ   R9,#CNPTRUE
+        BEQ     cbtask_export_finished
+
+        TEQ     R0,#User_Message
+        TEQNE   R0,#User_Message_Recorded
+        BNE     %BT02
+
+        LDR     R0,[R1,#ms_action]
+        TEQ     R0,#Message_RAMFetch
+        MOVNE   R9,#CNPFALSE
+        BNE     cbtask_export_finished  ; wrong message, abort
+        B       %BT01                   ; go round for another transmission
+
+        LTORG
+
+; Request data from external clipboard to copy to the current icon
+
+cbtask_pastedata
+        ; send message_datarequest to see who has any data for us
+        ADD     R9,R11,#cbtask_pollblock
+
+        MOV     R0,#44
+        MOV     R1,#0
+        MOV     R2,#0
+        MOV     R3,#0
+        MOV     R4,#Message_DataRequest
+        STMIA   R9!,{R0-R4}
+        LDR     R0,caretdata            ; window
+        LDR     R1,caretdata+careticon  ; icon
+        MOV     R2,#0
+        MOV     R3,#0
+        MOV     R4,#4                   ; send data from clipboard
+        LDR     R5,=FileType_Text
+        MOV     R6,#msDataRequest_filetypes_end
+        STMIA   R9,{R0-R6}
+
+        MOV     R0,#User_Message_Recorded
+        ADD     R1,R11,#cbtask_pollblock
+        MOV     R2,#0
+        SWI     XWimp_SendMessage
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+
+        ; now await a return.  It will be either bounced or a message_Datasave
+        ; note that datasave to an icon is intercepted and redirected to us
+
+01
+        ; first poll loop to get the bounce/datasave
+        MOV     R0,#null_bit
+        ADD     R1,R11,#cbtask_pollblock
+        SWI     XWimp_Poll
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+
+        TEQ     R0,#User_Message_Acknowledge ; bounced message -> abort
+        BEQ     cbtask_poll
+
+        TEQ     R0,#User_Message
+        TEQNE   R0,#User_Message_Recorded
+        BNE     %BT01
+
+        LDR     R0,[R1,#ms_action]
+        TEQ     R0,#Message_DataSave
+        BNE     %BT01                   ; wrong message -> try again
+
+cbtask_pastedata_perform
+        BL      cbtask_datasave_transfer_perform
+
+cbtask_pastedata_perform_noxfer
+        ; transfer all done
+        ; r6 is amount of data received
+        ; r8,r9=window, icon handle to receive the data
+        MOV     R0,#clipboard_flexblock_pastedata
+        BL      cbtask_insert_text_into_icon
+        MOV     R0,#clipboard_flexblock_pastedata
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+
+        B       cbtask_poll
+
+cbtask_insert_text_into_icon
+        Push    "R0,R14"
+        ; flexblock handle in R0 contains the data to paste
+        ; r8,r9=window, icon handle to receive the data
+        ; we need to do validation checks and things now.
+
+        ; get validation string
+        MOV     R0,#WimpExtend_GetValidationString
+        MOV     R1,R8
+        MOV     R2,R9
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XWimp_Extend
+        BVS     %FT89
+
+        ; R4 is -ve buffer size or 0 if no validation string
+        TEQ     R4,#0
+        MOVEQ   R3,#0
+        BEQ     %FT70
+        RSB     R1,R4,#0
+        MOV     R0,#clipboard_flexblock_validation
+        BL      clipboard_flex_set_block_size
+        BVS     %FT88
+
+        ; get the validation info
+        MOV     R0,#clipboard_flexblock_validation
+        BL      clipboard_flex_get_block_addr
+        MOV     R3,R0
+        MOV     R0,#WimpExtend_GetValidationString
+        MOV     R1,R8
+        MOV     R2,R9
+        RSB     R4,R4,#0
+        SWI     XWimp_Extend
+        BVS     %FT89
+
+        ; now we can test the validation string against the text to be pasted
+        ; r3->validation string
+70
+        LDR     R0,[sp]                 ; flexblock handle
+        BL      clipboard_flex_get_block_addr_size
+        BL      clipboard_paste_clamp_length       ; adjust for any terminator in the buffer
+        MOV     R10,R0
+
+        BL      clipboard_paste_check_validation   ; ensure validation OK
+        TEQ     R0,#0
+        BNE     %FT71
+
+        ; invalid paste
+        SWI     XOS_WriteI+7
+        B       %FT89
+71
+        MOV     R0,R10
+        Abs     R10,R8
+        MOV     R6,R9
+
+        ; get a copy of the icon text to play with
+        MOV     R7,#clipboard_flexblock_icontext
+        BL      cbtask_get_icon_text
+        BVS     %FT88
+
+        ; returns r2->icon text, r7->max buffer size
+
+      [ UTF8
+        ; get max UTF8 length if applicable
+        Push    "R8"
+        AcceptLoosePointer_NegOrZero r3,-1
+        CMP     R3,R3,ASR #31
+        MOVEQ   R8,#bignum
+        BEQ     %FT21                   ; no validation string present
+
+        Push    "R0-R3"
+        MOV     R2, #WimpValidation_CharLimit  ; find "U" command, if any
+        BL      findcommand
+        MOVNE   R8,#bignum
+        BNE     %FT20
+        MOV     R0,#10
+        MOV     R1,R3
+        SWI     XOS_ReadUnsigned
+        MOVVS   R8,#bignum
+        MOVVC   R8,R2
+20
+        Pull    "R0-R3"                 ; leave r8 for later
+21
+        ; R8 now contains max UTF8 length.  Can be huge in which case
+        ; buffer length is used instead (R7)
+      ]
+
+        ; make a hole to receive the data
+        BL      clipboard_paste_move_data
+        ; returns r1 as the size of the hole made
+
+        TEQ     R1,#0
+        BEQ     %FT22
+
+        ; copy data into the icon
+      [ UTF8
+        LDR     R0,[sp,#4]              ; get flexblock handle of clipboard data
+      |
+        LDR     R0,[sp]
+      ]
+        BL      clipboard_flex_get_block_addr
+        BL      clipboard_paste_copy_data
+
+        ; return icon text to original place
+        BL      cbtask_put_icon_text
+
+        ; set the selection to the inserted text
+        LDR     R14,[R10,#w_seldata]
+        TEQ     R14,R6
+        LDREQ   R5,[R10,#w_seldata+wsellowindex]
+        LDRNE   R5,caretdata+caretindex ; get start point
+        MOV     R2,R6
+        ADD     R6,R5,R1                ; set end point
+        MOV     R4,#crf_selection
+        Rel     R0,R10
+        MOV     R1,R2
+        MOV     R2,#0
+        MOV     R3,#0
+        SWI     XWimp_SetCaretPosition
+
+        MOV     R4,#-1
+        MOV     R5,R6
+        SWI     XWimp_SetCaretPosition  ; for later, main caret is at RHS of selection
+
+      [ UTF8
+        Pull    "R8"
+      ]
+        B       %FT89                   ; free up resources
+22
+        ; no insert performed (no room)
+        ; reset caret
+        Rel     R0,R10
+        MOV     R1,R9
+        MOV     R2,#0
+        MOV     R3,#0
+        MOV     R4,#-1
+        LDR     R5,caretdata+caretindex
+        SWI     XWimp_SetCaretPosition
+
+      [ UTF8
+        Pull    "R8"
+      ]
+        B       %FT89                   ; free up resources
+88
+        ; report error
+        BL      cbtask_report_error
+89
+        SavePSR R2                      ; preserve V if we hit this due to an error
+        ; tidy up and return
+        ; offload store from top to bottom (reduces data copying)
+        MOV     R0,#clipboard_flexblock_icontext
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+
+        MOV     R0,#clipboard_flexblock_validation
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+        RestPSR R2,,f
+
+        Pull    "R0,PC"
+
+cbtask_datasave_transfer_perform
+        Push    "R14"
+        LDR     R0,[R1,#msDataTransfer_filetype]
+        LDR     R2,=FileType_Text
+
+        TEQ     R0,R2
+        Pull    "R14",NE
+        BNE     cbtask_poll             ; we can only do text
+
+        ; request storage space for estimated data size
+        MOV     R0,#clipboard_flexblock_pastedata ; is empty else we'd have the clipboard ourselves
+        LDR     R1,[R1,#msDataTransfer_filesize]
+        ADD     R1,R1,#8                ; allow padding
+        BL      clipboard_flex_set_block_size
+        ADRVSL  R0,ErrorBlock_WimpNoClaim
+        BLVS    cbtask_report_error_msgtrans
+        Pull    "R14",VS
+        BVS     cbtask_poll
+
+        ; start up data transfer protocol
+        MOV     R7,R1                   ; keep buffer size for later
+
+        ; preserve window/icon handles as we'll need later on
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R8,[R1,#msDataTransfer_window]
+        LDR     R9,[R1,#msDataTransfer_icon]
+
+        ; send Message_RAMFetch first
+
+        MOV     R6,#0                   ; number of bytes we have received so far
+
+20
+        SUB     R0,R7,R6                ; number of bytes free
+        CMP     R0,#0                   ; out of store!  estimate was wrong, allocate more storage
+        BNE     %FT21
+
+        MOV     R0,#clipboard_flexblock_pastedata
+        ADD     R1,R7,#256              ; ask for 256 bytes more (icons aren't huge, so should be plenty.  Get more if need to.)
+        BL      clipboard_flex_set_block_size
+        ADRVSL  R0,ErrorBlock_WimpNoClaim
+        BLVS    cbtask_report_error_msgtrans
+        Pull    "R14",VS
+        BVS     cbtask_poll
+
+        ADD     R7,R7,#256              ; we have more buffer now
+        SUB     R0,R7,R6
+21
+        ADD     R1,R11,#cbtask_pollblock
+        STR     R0,[R1,#msRAMTransmit_length]
+
+        MOV     R0,#clipboard_flexblock_pastedata
+        BL      clipboard_flex_get_block_addr
+        ADD     R0,R0,R6
+        STR     R0,[R1,#msRAMFetch_buffer]
+
+        MOV     R0,#Message_RAMFetch
+        STR     R0,[R1,#ms_action]
+        MOV     R0,#28
+        STR     R0,[R1,#ms_size]
+        LDR     R0,[R1,#ms_myref]
+        STR     R0,[R1,#ms_yourref]
+
+        MOV     R0,#User_Message_Recorded
+        LDR     R2,[R1,#ms_taskhandle]
+        SWI     XWimp_SendMessage
+        BLVS    cbtask_report_error
+        Pull    "R14",VS
+        BVS     cbtask_poll
+        ; poll wimp for the reply.  It should be a RAMTransmit or a bounce
+22
+        MOV     R0,#null_bit
+        ADD     R1,R11,#cbtask_pollblock
+        SWI     Wimp_Poll
+
+        TEQ     R0,#User_Message_Acknowledge
+        BEQ     %FT50                   ; bounced message, so try file transfer protocol instead
+
+        TEQ     R0,#User_Message
+        TEQNE   R0,#User_Message_Recorded
+        BNE     %BT22
+
+        LDR     R0,[R1,#ms_action]
+        TEQ     R0,#Message_RAMTransmit
+        Pull    "R14",NE
+        BNE     cbtask_poll             ; out of sequence, so bail out
+
+        ; did we get enough data?
+        SUB     R0,R7,R6                ; amount we asked for
+        LDR     R2,[R1,#msRAMTransmit_length]
+        ADD     R6,R6,R2
+        CMP     R2,R0
+        BGE     %BT20                   ; request the next chunk
+
+        ; buffer underfilled, so we've finished the transfer
+        ; adjust the block size to reflect the correct data length
+        MOV     R0,#clipboard_flexblock_pastedata
+        MOV     R1,R6                   ; bytes received
+        BL      clipboard_flex_set_block_size
+        Pull    "PC"
+
+50
+        ; start file transfer protocol as RAM one wasn't completed
+
+        ; free clipboard block
+        ; send datasaveack
+        STR     R8,[R1,#msDataTransfer_window]
+        STR     R9,[R1,#msDataTransfer_icon]
+        MOV     R0,#-1
+        STR     R0,[R1,#msDataTransfer_filesize] ; mark as 'unsafe'
+        ADD     R0,R1,#msDataTransfer_filename
+        ADRL    R1,cbtask_datafilename
+        ADRL    R2,cbtask_datafilename_end
+        BL      cbtask_copy
+
+        MOV     R0,#User_Message
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R2,[R1,#ms_taskhandle]
+        SWI     Wimp_SendMessage
+
+        MOV     R0,#clipboard_flexblock_pastedata
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size ; free up for now; if we get no reply then we'd have a leak
+        Pull    "R14"
+        B       cbtask_poll             ; may not get a dataload, leave hanging....
+
+cbtask_get_icon_text
+        ; retrieve icon text from a task so we can play with it
+        ; entry: r10->window data
+        ;        r6=icon handle
+        ;        r7=flex block to use
+        ; exit:  r2->icon text
+        ;        r7:max buffer size
+
+        Push    "R0,R1,R3-R5,R14"
+        MOV     R5,R7
+        LDR     R0,[R10,#w_icons]
+        ADD     R0,R0,R6,LSL #i_shift   ; r0->icon definition
+        LDR     R1,[R0,#i_flags]
+        TST     R1,#if_indirected       ; indirected data?
+        ADDEQ   R2,R0,#i_data
+        MOVEQ   R7,#12
+        Pull    "R0,R1,R3-R5,PC",EQ     ; no, use in situ
+
+        LDR     R2,[R0,#i_data]         ; buffer pointer
+        LDR     R7,[R0,#i_data+8]       ; buffer length
+        MOV     R0,R5
+        MOV     R1,R7
+        BL      clipboard_flex_set_block_size
+        ADDVS   sp,sp,#4
+        Pull    "R1,R3-R5,PC",VS
+
+        ; copy the data
+        MOV     R0,R5
+        BL      clipboard_flex_get_block_addr
+        MOV     R3,R0                   ; destination buffer
+        MOV     R4,R7                   ; buffer length
+        MOV     R1,R2                   ; source pointer
+        ADRL    R2,clipboard_taskhandle
+        LDR     R2,[R2]                 ; destination task (us)
+        LDR     R0,[R10,#w_taskhandle]
+        LDR     R14,[wsptr,R0]
+        LDR     R14,[R14,#task_flagword]
+        MOV     R14,R14,LSR #flag_versionbit
+        ORR     R0,R0,R14,LSL #flag_versionbit ; generate task handle for source task
+        SWI     XWimp_TransferBlock
+        ADDVS   sp,sp,#4
+        Pull    "R1,R3-R5,PC",VS
+
+        MOV     R2,R3
+        Pull    "R0,R1,R3-R5,PC"
+
+cbtask_put_icon_text
+        ; entry: r10->window data
+        ;        r2->icon text
+        ;        r6->icon handle
+        Push    "R0-R6,R14"
+        LDR     R0,[R10,#w_icons]
+        ADD     R0,R0,R6,LSL #i_shift   ; r0->icon definition
+        LDR     R1,[R0,#i_flags]
+        TST     R1,#if_indirected       ; indirected data?
+        Pull    "R0-R6,PC",EQ           ; if not, return as modified in situ
+
+        LDR     R3,[R0,#i_data]         ; buffer pointer
+        LDR     R4,[R0,#i_data+8]       ; buffer length
+        MOV     R0,#clipboard_flexblock_icontext
+        BL      clipboard_flex_get_block_addr
+        MOV     R1,R0
+        ADRL    R0,clipboard_taskhandle
+        LDR     R0,[R0]
+
+        LDR     R2,[R10,#w_taskhandle]
+        LDR     R14,[wsptr,R2]
+        LDR     R14,[R14,#task_flagword]
+        MOV     R14,R14,LSR #flag_versionbit
+        ORR     R2,R2,R14,LSL #flag_versionbit ; generate task handle for dest task
+        SWI     XWimp_TransferBlock
+        STRVS   r0,[sp]
+        Pull    "R0-R6,PC"
+
+; ---------------------------------------------------------------------------------------
+; Message_DataLoad received
+
+cbtask_dataload_rx
+        ; we have a dataload for an icon
+        ; get size of file
+        MOV     R0,#OSFile_ReadInfo
+        ADD     R1,R11,#cbtask_pollblock
+        ADD     R1,R1,#msDataTransfer_filename
+        MOV     R8,R1
+        SWI     XOS_File
+        BLVS    cbtask_bounce_message
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+
+        ; allocate store
+        MOV     R0,#clipboard_flexblock_pastedata
+        MOV     R1,R4
+        BL      clipboard_flex_set_block_size
+        BLVS    cbtask_bounce_message
+        ADRVSL  R0,ErrorBlock_WimpNoClaim
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+        ; load file
+        MOV     R0,#clipboard_flexblock_pastedata
+        BL      clipboard_flex_get_block_addr
+        MOV     R2,R0
+        MOV     R3,#0
+        MOV     R0,#OSFile_Load
+        MOV     R1,R8                   ; name again
+        SWI     XOS_File
+        BLVS    cbtask_bounce_message
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+        MOV     R6,R4                   ; file length
+
+        ; delete file if applicable
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R0,[R1,#ms_yourref]
+        TEQ     R0,#0
+        MOVNE   R0,#OSFile_Delete
+        MOVNE   R1,R8
+        SWINE   XOS_File
+
+        ; send Ack
+        ADD     R1,R11,#cbtask_pollblock
+        MOV     R0,#Message_DataLoadAck
+        STR     R0,[R1,#ms_action]
+        LDR     R0,[R1,#ms_myref]
+        STR     R0,[R1,#ms_yourref]
+        MOV     R0,#User_Message
+        LDR     R2,[R1,#ms_taskhandle]
+        SWI     XWimp_SendMessage
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+
+        ; clear stored message buffer if need be
+        ADD     R1,R11,#cnp_message_dataload_park
+        MOV     R8,#0
+        STR     R8,[R1]
+
+        ; paste into icon
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R8,[R1,#msDataTransfer_window]
+        LDR     R9,[R1,#msDataTransfer_icon]
+
+        ; does this icon actually have the caret?
+        ; if not, we need to set it
+        LDR     R0,caretdata+caretwindow
+        TEQ     R8,R0
+        BNE     %FT01
+        LDR     R0,caretdata+careticon
+        TEQ     R9,R0
+        BEQ     %FT02
+01
+        ; move caret ready for the paste op
+        ; see if we can set it to the drag coords
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R2,[R1,#msDataTransfer_x]   ; screen coord
+        LDR     R3,[R1,#msDataTransfer_y]   ; screen coord
+
+        MOV     R0,R8
+        BL      cbtask_dragging_x_to_work_x
+
+        MOV     R4,#0
+        MOV     R5,#-1
+        MOV     R1,R9
+        SWI     XWimp_SetCaretPosition
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+02
+        ; do we have a selection?
+        ; if so, are we landing inside the selection or not?
+        Abs     R10,R8
+        LDR     R14,[R10,#w_seldata+wselicon]
+        TEQ     R14,R9
+        BNE     cbtask_pastedata_perform_noxfer ; no selection, carry on
+
+        ; are we inside?
+        LDR     R5,caretdata+caretindex
+        LDR     R14,[R10,#w_seldata+wsellowindex] ; low bound
+        CMP     R5,R14
+        BLT     %FT03                   ; outside selection, so clear
+        LDR     R14,[R10,#w_seldata+wselhighindex] ; high bound
+        CMP     R5,R14
+        BLE     cbtask_pastedata_perform_noxfer ; and carry on with the pasting
+03
+        ; clear selection
+        MOV     R0,R8
+        MOV     R1,R9
+        MOV     R4,#crf_selection
+        MOV     R6,R5
+        SWI     XWimp_SetCaretPosition
+        B       cbtask_pastedata_perform_noxfer
+
+cbtask_datafilename
+        DCB     "<Wimp$Scrap>",0
+cbtask_datafilename_end
+        ALIGN
+
+cbtask_bounce_message
+        ; if we've handled an intercept message we need to fake a bounce
+        ADD     R1,R11,#cnp_message_dataload_park
+        LDR     R2,[R1]
+        TEQ     R2,#0
+        MOVEQ   PC,R14               ; there wasn't anything stored
+
+        MOV     R9,R0                ; store for later
+        MOV     R0,#User_Message_Acknowledge
+        LDR     R2,[R1,#ms_taskhandle]
+        SWI     XWimp_SendMessage    ; send the bounce
+
+        MOV     R0,#0
+        ADD     R1,R11,#cnp_message_dataload_park
+        STR     R0,[R1]              ; clear the stored message
+
+        MOV     R9,R0
+        SETV                         ; return the error from before
+        MOV     PC,R14
+
+cbtask_copy
+; On entry r0 -> dest
+;          r1 -> src
+;          r2 -> end
+        Push    "R0-R2,R14"
+01
+        LDRB    R14,[R1],#1
+        STRB    R14,[R0],#1
+        TEQ     R1,R2
+        BNE     %BT01
+        Pull    "R0-R2,PC"
+
+cbtask_report_error_msgtrans
+        ; R0->error block
+        ADRL    R1,message_block
+        MOV     R2,#0
+        MOV     R3,#0
+        SWI     XMessageTrans_ErrorLookup
+cbtask_report_error
+        ; R0->error block
+        Push    "R0"
+        ADRL    R0,message_block
+        ADRL    R1,cbtask_token         ; Nice "Message from..."
+        MOV     R2,#0
+        SWI     XMessageTrans_Lookup
+        Pull    "R0"
+        MOV     R1,#2
+        SWI     XWimp_ReportError
+        SETV
+        MOV     PC,R14
+
+; ---------------------------------------------------------------------------------------
+; Message_Dragging received
+
+cbtask_message_dragging_rx
+; initially, it will have been redirected to our task by the Wimp
+; the destination has already been confirmed to be a valid writable icon
+; and the filetype list is confirmed to contain FileType_Text
+;
+; for subsequent calls, they may be directed straight to the task so
+; we still need to check for changes in window handle and icon handle
+; (although the filetype list should be constant)
+
+        ADD     R1,R11,#cbtask_pollblock
+
+        MOV     rFALSE,#CNPFALSE
+        MOV     rTRUE,#CNPTRUE
+
+        ; if claiming is 'false',
+        LDRB    R0,[R11,#cbtask_var_claiming]
+        TEQ     R0,#CNPFALSE
+        BNE     %FT50
+        ; if flags bit 4 is clear,
+        LDR     R0,[R1,#msDragging_flags]
+        TST     R0,#msDragging_flags_dragaborting
+        BNE     cbtask_poll
+        ; start claim
+        ; set claiming to 'true'
+        STRB    rTRUE,[R11,#cbtask_var_claiming]
+
+        ADD     R7,R1,#msDragging_windowhandle ; need this just below...
+        ; start autoscrolling
+        MOV     R0,#af_scrollicon :OR: af_horizontal
+        ADD     R1,R1,#msDragging_windowhandle
+        SWI     XWimp_AutoScroll
+        LDMIA   R7,{R0,R1,R2,R3}        ; gets window handle,icon handle,x,y
+        STR     R0,[R11,#cbtask_var_claimed_windowhandle]
+        STR     R1,[R11,#cbtask_var_claimed_iconhandle]
+        BL      cbtask_dragging_x_to_work_x
+        STR     R2,[R11,#cbtask_var_last_x]
+        LDR     R3,ghostcaretscrollxoverride ; use last scroll position
+        STR     R3,[R11,#cbtask_var_last_scrollx]
+        MOV     R4,#crf_ghostcaret :OR: crf_nocentre
+        MOV     R5,#-2
+        SWI     XWimp_SetCaretPosition
+        STRB    rTRUE,[R11,#cbtask_var_ghostcaret]
+
+        ADD     R1,R11,#cbtask_pollblock
+        ; reply with Message_DragClaim (message type 17), using pointer_altered and ghost_caret to determine the flags.
+        MOV     R0,#Message_DragClaim
+        STR     R0,[R1,#ms_action]
+
+        MOV     R0,#msDragClaim_filetypes+8
+        STR     R0,[R1,#ms_size]
+
+        ; do we remove dragbox?
+        LDR     R0,ghostcaretdata+ghostcaretflags
+        TST     R0,#crf_invisible
+        MOVEQ   R0,#msDragClaim_flags_removedragbox
+        MOVNE   R0,#0
+        STR     R0,[R1,#msDragClaim_flags]
+
+        LDR     R0,=FileType_Text
+        STR     R0,[R1,#msDragClaim_filetypes]
+        MOV     R0,#msDragClaim_filetypes_end
+        STR     R0,[R1,#msDragClaim_filetypes+4]
+
+        LDR     R0,[R1,#ms_myref]
+        STR     R0,[R1,#ms_yourref]
+
+        MOV     R0,#User_Message
+        LDR     R2,[R1,#ms_taskhandle]
+        ; was the originator us?
+        ADRL    R14,clipboard_taskhandle
+        LDR     R14,[R14]
+        TEQ     R2,R14
+        BEQ     cbtask_message_dragclaim_rx
+        SWINE   XWimp_SendMessage
+        BLVS    cbtask_report_error
+        B       cbtask_poll
+50
+       ; else,
+       ; if flags bit 4 is clear AND (claiming task owns the window/icon handle in Message_Dragging OR autoscrolling is 'true'),
+        LDR     R0,[R1,#msDragging_flags]
+        TST     R0,#msDragging_flags_dragaborting
+        BNE     %FT80                   ; bit 4 set, so release claim
+
+        ; do we 'own' the window/icon?
+        LDR     R0,[R1,#msDragging_windowhandle]
+        LDR     R2,[R11,#cbtask_var_claimed_windowhandle]
+        CMP     R0,R2
+        LDREQ   R0,[R1,#msDragging_iconhandle]
+        LDREQ   R2,[R11,#cbtask_var_claimed_iconhandle]
+        CMPEQ   R0,R2
+        BNE     %FT80                   ; no, so release the claim
+        ; update claim
+        ; set ghost caret
+        ADD     R7,R1,#msDragging_windowhandle
+        LDMIA   R7,{R0,R1,R2,R3}        ; gets window handle,icon handle,x,y
+        STR     R0,[R11,#cbtask_var_claimed_windowhandle]
+        STR     R1,[R11,#cbtask_var_claimed_iconhandle]
+        BL      cbtask_dragging_x_to_work_x
+        LDR     R4,[R11,#cbtask_var_last_x]
+        CMP     R4,R2                   ; same position as last time?
+        LDR     R3,ghostcaretscrollxoverride
+        LDREQ   R5,[R11,#cbtask_var_last_scrollx]
+        CMPEQ   R3,R5                   ; scroll pos moved?
+        STRNE   R2,[R11,#cbtask_var_last_x] ; if moved position or mouse pointer, redraw the ghost caret
+        STRNE   R3,[R11,#cbtask_var_last_scrollx]
+        MOVNE   R4,#crf_ghostcaret :OR: crf_nocentre
+        MOVNE   R5,#-2
+        SWINE   XWimp_SetCaretPosition
+        STRB    rTRUE,[R11,#cbtask_var_ghostcaret]
+
+        ADD     R1,R11,#cbtask_pollblock
+        ; reply with Message_DragClaim (message type 17), using pointer_altered and ghost_caret to determine the flags.
+        MOV     R0,#Message_DragClaim
+        STR     R0,[R1,#ms_action]
+
+        MOV     R0,#msDragClaim_filetypes+8
+        STR     R0,[R1,#ms_size]
+
+        ; do we remove dragbox?
+        LDR     R0,ghostcaretdata+ghostcaretflags
+        TST     R0,#crf_invisible
+        MOVEQ   R0,#msDragClaim_flags_removedragbox
+        MOVNE   R0,#0
+        STR     R0,[R1,#msDragClaim_flags]
+
+        LDR     R0,=FileType_Text
+        STR     R0,[R1,#msDragClaim_filetypes]
+        MOV     R0,#msDragClaim_filetypes_end
+        STR     R0,[R1,#msDragClaim_filetypes+4]
+
+        LDR     R0,[R1,#ms_myref]
+        STR     R0,[R1,#ms_yourref]
+
+        MOV     R0,#User_Message
+        LDR     R2,[R1,#ms_taskhandle]
+
+        ; was the originator us?
+        ADRL    R14,clipboard_taskhandle
+        LDR     R14,[R14]
+        TEQ     R2,R14
+        BEQ     cbtask_message_dragclaim_rx
+
+        SWINE   XWimp_SendMessage
+        BLVS    cbtask_report_error
+        B       cbtask_poll
+80
+        ; release claim
+        ; set claiming to 'false';
+        STRB    rFALSE,[R11,#cbtask_var_claiming]
+        ; stop autoscroll
+        MOV     R0,#af_scrollicon
+        SWI     XWimp_AutoScroll
+        ;       if ghost_caret is 'true', undraw the old ghost caret;
+        LDRB    R0,[R11,#cbtask_var_ghostcaret]
+        CMP     R0,#CNPTRUE
+        MOVEQ   R0,#-1
+        LDREQ   R2,cbtask_TASK3
+        MOVEQ   R4,#crf_ghostcaret
+        SWIEQ   XWimp_SetCaretPosition
+        STRB    rFALSE,[R11,#cbtask_var_ghostcaret]
+        ;       let Message_Dragging bounce (i.e. don't reply to it).
+
+        ; if we originated it, we'll need to let ourself know manually
+        ADRL    R14,clipboard_taskhandle
+        LDR     R14,[R14]
+        LDR     R2,[R1,#ms_taskhandle]
+        TEQ     R2,R14
+        BNE     cbtask_poll
+        B       cbtask_message_dragging_bounced_int
+
+        LTORG
+
+cbtask_dragging_x_to_work_x
+; convert screen x to work area x
+; On entry r0 = window handle
+;          r2 = X coord to change
+        Push    "R0-R1,R14"
+
+        Abs     R1,R0
+        LDR     R0,[R1,#w_scx]
+        ADD     R2,R2,R0
+        LDR     R0,[R1,#w_wax0]
+        SUB     R2,R2,R0
+        Pull    "R0-R1,PC"
+
+; ---------------------------------------------------------------------------------------
+; Message_DataSave received
+
+cbtask_datasave_rx
+        ; we have received a datasave.  We need to see if it's an enhanced one or not.
+        LDR     R0,[R1,#ms_yourref]
+        TEQ     R0,#0
+        LDRNEB  R0,[R11,#cbtask_var_claiming]
+        TEQNE   R0,#CNPFALSE
+        BEQ     %FT50                   ; simple drop, not enhanced one
+
+        ; enhanced drag/drop
+        ; clear states
+        MOV     R0,#CNPFALSE
+        STRB    R0,[R11,#cbtask_var_claiming]
+
+        ; if ghost_caret is 'true', undraw the old ghost caret;
+        LDRB    R1,[R11,#cbtask_var_ghostcaret]
+        TEQ     R1,#CNPTRUE
+        BNE     %FT50                   ; if no caret, make up an insert point from the x/y coords of the datasave message
+
+        STRB    R0,[R11,#cbtask_var_ghostcaret] ; =FALSE
+        MOV     R0,#af_scrollicon
+        SWI     XWimp_AutoScroll
+        ; need to know where we're inserting...
+        LDR     R5,ghostcaretdata+ghostcaretindex    ; string index for caret
+49
+        MOV     R0,#-1
+        LDR     R2,cbtask_TASK3
+        MOV     R4,#crf_ghostcaret
+        SWI     XWimp_SetCaretPosition
+
+        ; prepare for wimp_setcaretposition...
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R0,[R1,#msDataTransfer_window]
+        LDR     R1,[R1,#msDataTransfer_icon]
+        MOV     R4,#-1
+        B       %FT51
+50
+        ; simple drop : import data to position if possible
+        ; determine data insert point from message x/y coords
+        LDR     R0,[R1,#msDataTransfer_window]
+        LDR     R2,[R1,#msDataTransfer_x]
+        LDR     R3,[R1,#msDataTransfer_y]
+        LDR     R1,[R1,#msDataTransfer_icon]
+        MOV     R5,#-1
+51
+        ; set caret position ready to receive data
+        MOV     R9,R1                   ; window/icon handles for pastedata_perform below
+        MOV     R8,R0                   ; ditto
+        SWI     XWimp_SetCaretPosition
+
+        ; see where we ended up indexwise
+        LDR     R5,caretdata+caretindex
+
+        ; is there a selection?
+        ; if so, is the caret now within it?
+        Abs     R1,R8
+        LDR     R0,[R1,#w_seldata+wselicon]
+        CMP     R0,#0
+        BLT     %FT52                   ; no icon, so no selection to worry about
+
+        LDR     R0,[R1,#w_seldata+wselhighindex]   ; high bound
+        CMP     R5,R0
+        BGT     %FT52
+
+        LDR     R0,[R1,#w_seldata+wsellowindex]   ; low bound
+        CMP     R0,R5
+        BLE     %FT54
+52
+        ; remove selection
+        MOV     R0,R8
+        MOV     R1,R9
+        MOV     R4,#crf_selection
+        MOV     R6,R5
+        SWI     XWimp_SetCaretPosition  ; clear it...
+54
+        ADD     R1,R11,#cbtask_pollblock
+        ; get data and paste to caret position
+
+        B       cbtask_pastedata_perform
+
+cbtask_TASK3
+        DCB     "TASK"
+        ALIGN
+
+; ----------------------------------------------------------------------
+; Drag and Drop: Drag end for sending data
+cbtask_startdrag
+
+        ; At drag start,
+        ;    enable null events every 0.25 seconds;
+        MOV     R14,#1
+        STRB    R14,[R11,#cbtask_var_dragging]
+
+        ; mark the window we're dragging from
+
+        ; call Wimp_DragBox (with a drag type of 5), DragASprite_Start or DragAnObject_Start as appropriate
+        ; (remember to use the dragbox if CMOS states that dragged sprites/objects must not be used);
+        BL      cbtask_drag_setupbox    ; set up the drag box and screen coords
+
+        ; returns also mouse coords in r7,r8 (x,y)
+        ADD     R1,R11,#cbtask_pollblock
+        MOV     R0,#0
+        STR     R0,[R1,#dr_handle]
+
+        MOV     R0,#drag_user
+        STR     R0,[R1,#dr_type]
+
+        ADD     R0,R11,#cbtask_var_dragbox_box_os
+        LDMIA   R0,{R2,R3,R4,R5}
+        ADD     R2,R2,R7
+        ADD     R4,R4,R7
+        ADD     R3,R3,R8
+        ADD     R5,R5,R8
+        ADD     R0,R1,#dr_initbox
+        STMIA   R0,{R2,R3,R4,R5}
+
+        ADD     R0,R11,#cbtask_var_dragbox_parent
+        LDMIA   R0,{R2,R3,R4,R5}
+        ADD     R0,R1,#dr_parentbox
+        STMIA   R0,{R2,R3,R4,R5}
+
+        SWI     XWimp_DragBox
+
+        ; program pointer shape to ptr_drop;
+        BL      cbtask_set_ptr_drop
+        ; set shift_pressed to indicate current status of the Shift keys;
+        MOV     R0,#OsByte_INKEY
+        MOV     R1,#255
+        MOV     R2,#255
+        SWI     XOS_Byte
+        ASSERT  CNPTRUE = 1
+        MOV     R1,R1,LSR #7            ; make true/false
+        STRB    R1,[R11,#cbtask_var_shift_pressed]
+        ; set claimant to 'none' (-1 is a suitable invalid task handle for this purpose);
+        MOV     R14,#-1
+        STR     R14,[R11,#cbtask_var_claimant]
+        ; set drag_finished to 'false';
+        MOV     R14,#CNPFALSE
+        STRB    R14,[R11,#cbtask_var_drag_finished]
+
+        ; set drag_aborted to 'false';
+        STRB    R14,[R11,#cbtask_var_drag_aborted]
+        ; set lastref to 'none' (0 is suitable for this purpose).
+        MOV     R14,#0
+        STR     R14,[R11,#cbtask_var_lastref]
+
+        B       cbtask_poll
+
+cbtask_drag_setupbox
+        Push    "R14"
+        SUB     R1,R13,#20
+        SWI     XWimp_GetPointerInfo
+        LDR     R7,[R1,#0]              ; pointer x
+        LDR     R8,[R1,#4]              ; pointer y
+        LDR     R10,[R1,#12]            ; window handle
+        STR     R10,[R11,#cbtask_var_source_window] ; keep this for later
+        Abs     R10,R10
+        LDR     R9,[R10,#w_seldata+wselicon]   ; icon handle of selected text
+        STR     R9,[R11,#cbtask_var_source_icon] ; keep this for later, too
+        LDR     R4,[R10,#w_seldata+wsellowindex]  ; low bound of selected text
+        STR     R4,[R11,#cbtask_var_source_low_bound]
+        LDR     R4,[R10,#w_seldata+wselhighindex]  ; high bound
+        STR     R4,[R11,#cbtask_var_source_high_bound]
+        LDR     R0,[R10,#w_icons]
+        ADD     R9,R0,R9,LSL #i_shift
+
+        ; work out drag box coords for icon text
+        ; get icon bounding box
+        LDMIA   R9,{R3,R4,R5,R6}
+
+        ; adjust y coords to selection
+        ADD     R4,R4,#4
+        SUB     R6,R6,#4
+
+        ; work out text origin/offset
+        ;w_seldata+wselxoff = caretx
+        ;w_seldata+wselwidth=selection width
+        ADRL    R0,selection_text_origin
+        LDR     R0,[R0]
+        LDR     R1,[R10,#w_seldata+wselxoff]
+        ADD     R0,R0,R1                ; origin + left offset of selection
+        ADD     R3,R3,R0
+        LDR     R0,[R10,#w_seldata+wselwidth]
+        ADD     R5,R3,R0
+
+        ; convert to screen coords
+        ;work area x - scroll_offset_x+vis_min_x = screen_x
+        ;work area y - scroll_offset_y+vis_max_y = screen_y
+        LDR     R0,[R10,#w_scx]         ; scroll x
+        LDR     R1,[R10,#w_wax0]
+        SUB     R0,R1,R0
+        SUB     R0,R0,R7                ; adjust for mouse X
+        ADD     R3,R3,R0
+        ADD     R5,R5,R0
+        STR     R3,[R11,#cbtask_var_dragbox_parent]
+
+        LDR     R0,scrx1
+        LDR     R1,scrx0
+        SUB     R0,R0,R1                ; screen width
+        ADD     R0,R0,R5
+        STR     R0,[R11,#cbtask_var_dragbox_parent+8]
+        LDR     R0,[R10,#w_scy]
+        LDR     R1,[R10,#w_way1]
+        SUB     R0,R1,R0
+        SUB     R0,R0,R8                ; adjust for mouse y
+        ADD     R4,R4,R0
+        ADD     R6,R6,R0
+        STR     R4,[R11,#cbtask_var_dragbox_parent+4]
+
+        LDR     R0,scry1
+        LDR     R1,scry0
+        SUB     R0,R0,R1
+        ADD     R0,R0,R6
+        STR     R0,[R11,#cbtask_var_dragbox_parent+12]
+
+        ADD     R0,R11,#cbtask_var_dragbox_box_os
+        STMIA   R0,{R3-R6}              ; store our box info
+
+        ; sort out millipoint versions
+        MOV     R0,#400
+        MUL     R3,R0,R3
+        MUL     R4,R0,R4
+        MUL     R5,R0,R5
+        MUL     R6,R0,R6
+        ADD     R0,R11,#cbtask_var_dragbox_box_mpt
+        STMIA   R0,{R3-R6}
+        Pull    "PC"
+
+cbtask_set_ptr_drop
+        ; if OS doesn't support mask indicating active point, make sure it's at bottom left
+        MOV     R0,#SpriteReason_ReadSpriteSize
+        ADR     R2,cbtask_ptr_drop_name
+        SWI     XWimp_SpriteOp
+
+        MOV     R5,R4                   ; bottom
+        MOV     R0,#SpriteReason_SetPointerShape
+        ADR     R2,cbtask_ptr_drop_name
+        MOV     R3,#2
+        MOV     R4,#0                   ; left
+        MOV     R6,#0
+        MOV     R7,#0
+        SWI     XWimp_SpriteOp
+
+        MOVVC   R0,#OsByte_SelectPointer
+        MOVVC   R1,#2
+        SWIVC   XOS_Byte
+        MOV     PC,R14
+
+cbtask_reset_ptr_drop
+        MOV     R0,#OsByte_SelectPointer
+        MOV     R1,#1
+        SWI     XOS_Byte
+        MOV     PC,R14
+
+cbtask_ptr_drop_name
+        DCB     "ptr_drop",0
+        ALIGN
+
+; At drag abort (when Escape pressed during a drag),
+
+cbtask_abortdrag
+        ; disable null events;
+        MOV     R14,#CNPFALSE
+        STRB    R14,[R11,#cbtask_var_dragging]
+
+        ; call Wimp_DragBox -1, DragASprite_Stop or DragAnObject_Stop as appropriate
+        ; (or Wimp_DragBox -1 if old_dragclaim_flags has bit 1 set)
+        MOV     R1,#-1
+        SWI     XWimp_DragBox
+        ; program pointer shape to ptr_default
+        BL      cbtask_reset_ptr_drop
+        ; set drag_finished and drag_aborted to 'true'
+        MOV     R14,#CNPTRUE
+        STRB    R14,[R11,#cbtask_var_drag_finished]
+        STRB    R14,[R11,#cbtask_var_drag_aborted]
+
+        MOV     R14,#0
+        STR     R14,[R11,#cbtask_var_source_window]
+
+        ; proceed as for a null event...
+        B       cbtask_idle
+
+; At drag end (when User_Drag_Box event is received), drag operation has ended
+
+cbtask_drag_end
+        ; disable null events;
+        MOV     R14,#CNPFALSE
+        STRB    R14,[R11,#cbtask_var_dragging]
+        ; if necessary, call DragASprite_Stop or DragAnObject_Stop
+        ; program pointer shape to ptr_default
+        BL      cbtask_reset_ptr_drop
+        ; set drag_finished to 'true'
+        MOV     R14,#CNPTRUE
+        STRB    R14,[R11,#cbtask_var_drag_finished]
+
+        ; if drag ended in the same window, then reverse the effect of Shift (ie move is preferred rather than copy)
+        ADD     R1,R11,#cbtask_pollblock+64
+        SWI     XWimp_GetPointerInfo
+        LDR     R14,[R11,#cbtask_pollblock+64+12] ; get window handle
+        LDR     R1,[R11,#cbtask_var_source_window]
+        TEQ     R14,R1
+        LDREQB  R9,[R11,#cbtask_var_shift_pressed]
+        EOREQ   R9,R9,#1
+        STREQB  R9,[R11,#cbtask_var_shift_pressed]
+
+        ; proceed as for a null event...
+
+
+cbtask_idle
+        ; Wimp_Poll returns idle when we're dragging so we can update things
+        ; At null events,
+        ;    construct Message_Dragging using data from Wimp_GetPointerInfo and the value of drag_aborted;
+        ADD     R1,R11,#cbtask_pollblock+64
+        SWI     XWimp_GetPointerInfo
+
+        ADD     R1,R11,#cbtask_pollblock
+        MOV     R14,#64
+        STR     R14,[R1,#ms_size]
+        LDR     R2,[R1,#12+64]          ; window handle
+        LDR     R3,[R1,#16+64]          ; icon handle
+        LDR     R4,[R1,#0+64]           ; X
+        LDR     R5,[R1,#4+64]           ; Y
+        ADD     R0,R1,#msDragging_windowhandle
+        STMIA   R0!,{R2-R5}
+
+        ; flags
+        MOV     R2,#msDragging_flags_fromselection
+        LDRB    R6,[R11,#cbtask_var_shift_pressed]
+        TEQ     R6,#CNPFALSE
+        ORRNE   R2,R2,#msDragging_flags_deletesource
+        LDRB    R6,[R11,#cbtask_var_drag_aborted]
+        TEQ     R6,#CNPFALSE
+        ORRNE   R2,R2,#msDragging_flags_dragaborting
+
+        ; bounding box
+        ADD     R14,R11,#cbtask_var_dragbox_box_mpt
+        LDMIA   R14,{R3-R6}
+
+        ; filetypes
+        LDR     R7,=FileType_Text
+        MOV     R8,#-1
+        STMIA   R0!,{R2-R8}
+        ; if claimant is 'none', send message type 17/18 to window owner with your_ref = 0;
+        LDR     R2,[R11,#cbtask_var_claimant]
+        CMP     R2,#-1
+        MOVNE   R0,#User_Message_Recorded
+        LDRNE   R14,[R11,#cbtask_var_lastref]
+        BNE     %FT10
+        LDR     R2,[R11,#cbtask_pollblock+64+12] ; window handle
+        CMP     R2,#0
+        BLT     cbtask_poll             ; no valid window handle
+
+        ; are we about to send to a writable icon?  If so, we can do things internally instead
+        LDR     R3,[R11,#cbtask_pollblock+64+16] ; icon handle
+        CMP     R3,#0
+        BLT     %FT09                   ; not a valid icon, so continue
+        Abs     R10,R2
+        LDR     R14,[R10,#w_nicons]
+        CMP     R3,R14
+        BGE     %FT09                   ; not a valid icon, so continue
+        LDR     R10,[R10,#w_icons]
+        ADD     R10,R10,R3,LSL #i_shift
+        LDR     R14,[R10,#i_flags]
+        AND     R14,R14,#if_buttontype
+        CMP     R14,#ibt_writeable :SHL: ib_buttontype
+        CMPNE   R14,#ibt_dwritable :SHL: ib_buttontype
+        BNE     %FT09                   ; not a writable icon, so continue as normal
+
+        ; we are sending to a writeable icon, so bypass the sending stuff
+        ADRL    R14,clipboard_taskhandle
+        LDR     R2,[R14]                ; redirect to us
+
+09
+        MOV     R0,#User_Message
+        LDRB    R14,[R11,#cbtask_var_drag_finished] ; make it User_Message_Recorded if drag finished
+        ADD     R0,R0,R14
+        MOV     R14,#0                  ; your_ref
+        ; else, send message type 18 to claimant with your_ref = lastref.
+10
+        STR     R14,[R1,#ms_yourref]
+
+        MOV     R14,#Message_Dragging
+        STR     R14,[R1,#ms_action]
+        ; if claimant is 'us' then we can move directly to processing the message block
+        ADRL    R14,clipboard_taskhandle
+        LDR     R14,[R14]
+        TEQ     R2,R14
+        STREQ   R2,[R1,#ms_taskhandle]  ; update message block as Wimp won't get a chance to do it
+        BEQ     cbtask_message_dragging_rx ; internal redirection
+
+        SWINE   XWimp_SendMessage        ; send to the external task
+        BVS     cbtask_report_error
+        B       cbtask_poll
+
+cbtask_message_bounced
+        ; which message has bounced?
+        LDR     R0,[R1,#ms_action]
+        TEQ     R0,#Message_Dragging
+        BNE     cbtask_poll
+
+        ; Message_Dragging has bounced....
+
+cbtask_message_dragging_bounced_int
+        ADD     R1,R11,#cbtask_pollblock+64
+        SWI     XWimp_GetPointerInfo
+
+        ; When Message_Dragging bounces,
+        ;     if claimant is not 'none',
+        LDR     R14,[R11,#cbtask_var_claimant]
+        CMP     R14,#-1
+        BEQ     %FT50
+        ;        claimant is releasing claim (including when claimant doesn't reply because the drag is aborting)
+        ;        if drag_finished is 'false',
+        LDRB    R14,[R11,#cbtask_var_drag_finished]
+        TEQ     R14,#CNPFALSE
+        BNE     %FT30
+        ;            if old_dragclaim_flags bit 0 is set, program the pointer shape to ptr_drop;
+        LDR     R9,[R11,#cbtask_var_old_dragclaim_flags]
+        TST     R9,#msDragClaim_flags_otherptrshape
+        BLNE    cbtask_set_ptr_drop
+        ;            if old_dragclaim_flags bit 1 is set, call Wimp_DragBox (with a
+        ;            drag type of 5), DragASprite_Start or DragAnObject_Start as appropriate.
+        TST     R9,#msDragClaim_flags_removedragbox
+        BEQ     %FT30
+
+        ; set up dragbox
+        MOV     R0,#5
+        BL      cbtask_redo_dragbox
+30
+        ;        set claimant to 'none';
+        MOV     R9,#-1
+        STR     R9,[R11,#cbtask_var_claimant]
+        ;        set lastref to 'none';
+        MOV     R9,#0
+        STR     R9,[R11,#cbtask_var_lastref]
+        ;        resend Message_Dragging as message type 17/18 to the window
+        ;        owner (preserving the flags, and with your_ref = 0).
+        LDR     R2,[R11,#cbtask_pollblock+64+12] ; window handle from earlier getpointerinfo call
+        ADD     R1,R11,#cbtask_pollblock
+        STR     R9,[R1,#ms_yourref]
+        MOV     R0,#User_Message
+        LDRB    R14,[R11,#cbtask_var_drag_finished]
+        ADD     R0,R0,R14               ; make it User_Message_Recorded if drag finished
+        ; redirect internally if we're going to a writable icon?
+        CMP     R2,#0
+        BLT     cbtask_poll             ; no window
+        LDR     R3,[R11,#cbtask_pollblock+64+16] ; icon handle
+        CMP     R3,#0
+        BLT     %FT09                   ; not a valid icon, so continue
+        Abs     R10,R2
+        LDR     R14,[R10,#w_nicons]
+        CMP     R3,R14
+        BGE     %FT09                   ; not a valid icon, so continue
+        LDR     R10,[R10,#w_icons]
+        ADD     R10,R10,R3,LSL #i_shift
+        LDR     R14,[R10,#i_flags]
+        AND     R14,R14,#if_buttontype
+        CMP     R14,#ibt_writeable :SHL: ib_buttontype
+        CMPNE   R14,#ibt_dwritable :SHL: ib_buttontype
+        BNE     %FT09                   ; not a writable icon, so continue as normal
+
+        ; we are sending to a writeable icon, so bypass the sending stuff
+        ADRL    R14,clipboard_taskhandle
+        LDR     R2,[R14]                ; redirect to us
+        STR     R2,[R1,#ms_taskhandle]
+        B       cbtask_message_dragging_rx
+09
+        SWI     XWimp_SendMessage
+        B       cbtask_poll
+        ;    else,
+50
+        ;        (no claimant is in effect AND drag has finished) OR the drag is aborting
+        ;        if drag_finished is 'true' (this comparison is not strictly necessary, since
+        ;        drag_aborted also implies drag_finished),
+        ;            if drag_aborted is 'false',
+        LDRB    R14,[R11,#cbtask_var_drag_aborted]
+        TEQ     R14,#CNPFALSE
+        BNE     cbtask_poll
+        ;                initiate simple drop operation (send Message_DataSave to window owner,
+        ;                using native data type and your_ref = 0).
+        LDR     R2,[R11,#cbtask_pollblock+64+12] ; window handle from earlier getpointerinfo call
+        MOV     R3,#0                   ; your_ref
+        MOV     R14,#0
+        STRB    R14,[R11,#cbtask_var_delete_source]
+        B       cbtask_send_message_datasave ; shouldn't require internal checks as we would have a valid claimant if it were us
+
+; ---------------------------------------------------------------------------------------
+; Message_DragClaim received
+
+cbtask_message_dragclaim_rx
+        ;    if drag_finished is 'true',
+        LDRB    R14,[R11,#cbtask_var_drag_finished]
+        TEQ     R14,#CNPTRUE
+        BNE     %FT50
+        ;        drag has ended successfully while a claim is in force
+        ;        if drag_aborted is 'false' (this comparison is not strictly necessary,
+        ;        since the claiming task is not supposed to reply when the drag is being aborted),
+        LDRB    R14,[R11,#cbtask_var_drag_aborted]
+        TEQ     R14,#CNPFALSE
+        BNE     cbtask_poll
+        ;            initiate enhanced drop operation (send Message_DataSave to claimant, using
+        ;            first possible data type in the list, or the native data type if none are possible,
+        ;            and using your_ref = my_ref of the Message_DragClaim, then delete the source data
+        ;            if shift_pressed and the new window/icon handles (or the trashcan flag bit
+        ;            in Message_DragClaim) indicate as such.
+        LDR     R2,[R11,#cbtask_var_claimant]
+        LDR     R3,[R1,#ms_myref]
+        LDR     R14,[R1,#msDragClaim_flags]
+        TST     R14,#msDragClaim_flags_trashcan
+        MOVNE   R14,#CNPTRUE
+        MOVEQ   R14,#CNPFALSE
+        STRB    R14,[R11,#cbtask_var_delete_source] ; do we need to delete source when successful?
+        ; are we the claimant?
+        ADRL    R14,clipboard_taskhandle
+        LDR     R14,[R14]
+        TEQ     R2,R14
+        BNE     cbtask_send_message_datasave
+        BEQ     cbtask_dragdrop_internal_xfer
+        ;    else,
+50
+        ADD     R1,R11,#cbtask_pollblock+64
+        SWI     XWimp_GetPointerInfo
+        ADD     R1,R11,#cbtask_pollblock
+        ;        drag is continuing AND (a claim is in force, or a claim is starting)
+        ;        if lastref != 'none',
+        LDR     R14,[R11,#cbtask_var_lastref]
+        TEQ     R14,#0
+        BEQ     %FT70
+        ;            claim is continuing, not just starting
+        ;            if old_dragclaim_flags bit 0 is set, but the new Message_DragClaim flags bit 0
+        ;            is clear, program the pointer shape to ptr_drop;
+        LDR     R8,[R11,#cbtask_var_old_dragclaim_flags]
+        LDR     R9,[R1,#msDragClaim_flags]
+        TST     R8,#msDragClaim_flags_otherptrshape
+        BEQ     %FT51
+        TST     R9,#msDragClaim_flags_otherptrshape
+        BLEQ    cbtask_set_ptr_drop
+51
+        ;            if old_dragclaim_flags bit 1 is set, but the new Message_DragClaim flags
+        ;            bit 1 is clear, call Wimp_DragBox (with a drag type of 5), DragASprite_Start
+        ;            or DragAnObject_Start as appropriate.
+        TST     R8,#msDragClaim_flags_removedragbox
+        BEQ     %FT70
+        TST     R9,#msDragClaim_flags_removedragbox
+        MOVEQ   R0,#5                   ; dragbox type 5
+        BLEQ    cbtask_redo_dragbox
+        B       %FT90
+70
+        ;            if old_dragclaim_flags bit 1 is clear, but the new Message_DragClaim flags
+        ;            bit 1 is set, call DragASprite_Stop or DragAnObject_Stop if necessary,
+        ;            then call Wimp_DragBox with a drag type of 7.
+        TST     R9,#msDragClaim_flags_removedragbox
+        MOVNE   R0,#7
+        BLNE    cbtask_redo_dragbox
+        ;        else,
+        ;            claim is just starting
+        ;            if Message_DragClaim flags bit 1 is set, call DragASprite_Stop or
+        ;            DragAnObject_Stop if necessary, then call Wimp_DragBox with a drag type of 7.
+        ; [already done just above in %70]
+
+90
+        ADD     R1,R11,#cbtask_pollblock
+        ;        set claimant to task handle in Message_DragClaim;
+        LDR     R14,[R1,#ms_taskhandle]
+        STR     R14,[R11,#cbtask_var_claimant]
+        ;        set lastref to my_ref of Message_DragClaim;
+        LDR     R14,[R1,#ms_myref]
+        STR     R14,[R11,#cbtask_var_lastref]
+        ;        set old_dragclaim_flags to flags word from Message_DragClaim.
+        LDR     R14,[R1,#msDragClaim_flags]
+        STR     R14,[R11,#cbtask_var_old_dragclaim_flags]
+
+        B       cbtask_poll
+
+cbtask_redo_dragbox
+; on entry,r0=drag type
+;          cbtask_pollblock+64 has a reply from wimp_getpointerinfo
+        Push    "R0-R8,R14"
+        ADD     R1,R11,#cbtask_pollblock+64+32
+        STR     R0,[R1,#dr_type]
+        MOV     R0,#0
+        STR     R0,[R1,#dr_handle]
+
+        ADD     R0,R11,#cbtask_var_dragbox_box_os
+        LDMIA   R0,{R2,R3,R4,R5}
+        LDR     R7,[R11,#cbtask_pollblock+64+0] ; mouse X from above getpointerinfo call
+        LDR     R8,[R11,#cbtask_pollblock+64+4] ; mouse Y from above getpointerinfo call
+        ADD     R2,R2,R7
+        ADD     R4,R4,R7
+        ADD     R3,R3,R8
+        ADD     R5,R5,R8
+        ADD     R0,R1,#dr_initbox
+        STMIA   R0,{R2,R3,R4,R5}
+
+        ADD     R0,R11,#cbtask_var_dragbox_parent
+        LDMIA   R0,{R2,R3,R4,R5}
+        ADD     R0,R1,#dr_parentbox
+        STMIA   R0,{R2,R3,R4,R5}
+        SWI     XWimp_DragBox
+        Pull    "R0-R8,PC"
+
+cbtask_send_message_datasave
+        ADD     R7,R11,#cbtask_pollblock
+        ; r2=destination window handle or task handle
+        ; r3=your_ref to use in the message
+        STR     R2,[R7,#ms_taskhandle]
+        STR     R3,[R7,#ms_yourref]
+
+        ; fill in the mouse details for the destination
+        ADD     R1,R11,#cbtask_pollblock+64
+        SWI     XWimp_GetPointerInfo
+
+        LDMIA   R1!,{R2,R3,R4,R5,R6}    ; get x/y/buttons/window/icon/
+        ADD     R7,R7,#msDataTransfer_window
+        STMIA   R7!,{R5,R6}             ; store window/icon only
+        STMIA   R7,{R2,R3}              ; store x/y only
+
+        BL      cbtask_get_selected_text ; transfers text to clipboard_flexblock_dragdata
+        BVS     cbtask_poll
+        ; do the datasave stuff
+        ADD     R1,R11,#cbtask_pollblock
+        LDR     R3,=FileType_Text
+        MOV     R10,#clipboard_flexblock_dragdata
+        B       cbtask_run_datasave
+
+cbtask_get_selected_text
+        Push    "R14"
+        ; obtain the data we want to send so we can work out length etc
+        ; get pointer to icon data
+        LDR     R10,selectionwindow     ; selection window handle
+        Abs     R10,R10
+        LDR     R6,[R10,#w_seldata+wselicon]   ; icon handle of selected text
+        MOV     R7,#clipboard_flexblock_dragdata
+        BL      cbtask_get_icon_text
+        BVS     cbtask_poll
+
+        ; we have the icon text.  Now adjust so we just have the selected text.
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_get_block_addr
+        LDR     R6,[R10,#w_seldata+wsellowindex]  ; start index of selection
+        LDR     R7,[R10,#w_seldata+wselhighindex]  ; end index of selection
+
+        ADD     R6,R6,R0                ; now pointer in icon text
+        ADD     R7,R7,R0                ; ditto
+
+        CMP     R6,R0                   ; does selection start at the beginning anyway?
+        BNE     %FT20
+
+        ; no need to move anything.
+        ; shrink the block
+        MOV     R0,#clipboard_flexblock_dragdata
+        SUB     R1,R7,R6
+        BL      clipboard_flex_set_block_size
+
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_get_block_addr_size
+
+        Pull    "PC"
+20
+        ; move data down to the start of the flexblock
+        ; r0=dest pointer (ie start of block)
+        ; r6=source ptr
+        ; r7=end ptr
+        MOV     R5,R0
+21
+        LDRB    R14,[R6],#1
+        STRB    R14,[R0],#1
+        TEQ     R6,R7
+        BNE     %BT21
+        ; resize
+        SUB     R1,R0,R5                ; r1 now is block length
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_set_block_size
+
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_get_block_addr_size
+
+        Pull    "PC"
+
+cbtask_export_finished
+        ; we have completed (or aborted) a data export
+        ; if V set, then an error has happened and needs to be reported; r0-> error block
+        ; R9=TRUE if all was OK
+        ; tidy up if need be
+        MOVVS   R9,#CNPFALSE            ; definitely an abort in this case
+        BLVS    cbtask_report_error
+        CMP     R10,#clipboard_flexblock_dragdata
+        BNE     cbtask_poll
+
+        MOV     R0,#clipboard_flexblock_dragdata
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+
+        TEQ     R9,#CNPTRUE             ; did we exit on completion, or was it an abort?
+        BNE     cbtask_poll
+
+        ; do we need to delete the source data?
+        LDRB    R9,[R11,#cbtask_var_shift_pressed]
+        LDRB    R8,[R11,#cbtask_var_delete_source]
+
+        TEQ     R9,#CNPFALSE
+        TEQEQ   R8,#CNPFALSE
+        BEQ     cbtask_poll             ; no, so continue with main loop
+
+        ; cut the data from the source icon
+        LDR     R10,[R11,#cbtask_var_source_window] ; window handle that had the original selection
+        Abs     R10,R10
+        LDR     R6,[R11,#cbtask_var_source_icon] ; icon handle that had the original selection
+        MOV     R7,#clipboard_flexblock_icontext
+        BL      cbtask_get_icon_text
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+
+        ; r2->icon text
+        ; r7=max buffer size
+        LDR     R8,[R11,#cbtask_var_source_low_bound]
+        LDR     R9,[R11,#cbtask_var_source_high_bound] ; get selection bound
+
+        ; we now have the icon data.  Adjust it.
+        ADD     R8,R8,R2
+        ADD     R9,R9,R2
+        ADD     R7,R2,R7                ; max offset
+        ; cut out the selection
+31
+        LDRB    R0,[R9],#1
+        STRB    R0,[R8],#1
+        CMP     R0,#32
+        BLT     %FT32
+        TEQ     R9,R7
+        BNE     %BT31
+32
+        ; send it back whence it came
+
+        BL      cbtask_put_icon_text
+        BLVS    cbtask_report_error
+        BVS     cbtask_poll
+        ; do we need to move the caret?
+        ; is the main caret in this icon still?
+        LDR     R0,caretdata+caretwindow
+        Abs     R1,R0
+        TEQ     R1,R10
+        LDREQ   R1,caretdata+careticon
+        TEQEQ   R1,R6
+        BNE     %FT39                   ; different icon/window
+        MOV     R4,#-1
+        LDR     R5,[R10,#w_seldata+wsellowindex]
+        SWI     XWimp_SetCaretPosition
+
+        ; the selection will vanish as the buffer has changed
+39
+        ; redraw the icon
+        ADD     R1,R11,#cbtask_pollblock
+        Rel     R2,R10
+        MOV     R3,R6
+        MOV     R4,#0
+        MOV     R5,#0
+        STMIA   R1,{R2-R5}
+        SWI     XWimp_SetIconState
+
+        ; tidy up
+        MOV     R0,#clipboard_flexblock_icontext
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+        B       cbtask_poll
+
+        LTORG
+
+cbtask_dragdrop_internal_xfer
+        ; we've completed a drag from a writeable icon to a writeable icon
+        MOV     R0,#CNPFALSE
+        STRB    R0,[R11,#cbtask_var_claiming]
+        STRB    R0,[R11,#cbtask_var_ghostcaret]
+        MOV     R0,#af_scrollicon
+        SWI     XWimp_AutoScroll        ; stop autoscroll
+
+        BL      cbtask_get_selected_text ; transfers text to clipboard_flexblock_dragdata
+        MOVVS   R9,#CNPFALSE
+        BVS     cbtask_export_finished
+
+        LDR     R7,ghostcaretdata+ghostcaretindex    ; text insert position
+        LDR     R8,ghostcaretdata+ghostcaretwindow   ; window
+        LDR     R9,ghostcaretdata+ghostcareticon     ; icon
+        ; remove ghost caret
+        MOV     R0,#-1
+        LDR     R2,=cbtask_TASK3
+        MOV     R4,#crf_ghostcaret
+        SWI     XWimp_SetCaretPosition
+
+        ; is the source window still valid?
+        LDR     R0,[R11,#cbtask_var_source_window]
+        SUB     R1,R13,#36
+        STR     R0,[R1]
+        SWI     XWimp_GetWindowState
+        BVS     cbtask_export_finished
+
+        ; did we land in the original icon?
+        LDR     R0,[R11,#cbtask_var_source_window]
+        TEQ     R0,R8
+        LDREQ   R0,[R11,#cbtask_var_source_icon]
+        TEQEQ   R0,R9
+        BEQ     %FT70                   ; source and destination are the same, so do things a little differently
+
+        ; is there a selection?
+        ; if so, have we landed inside it or not?
+        ; if not, we need to remove the selection
+        Abs     R0,R8
+        LDR     R1,[R0,#w_seldata+wselicon]
+
+        TEQ     R1,R9
+        BNE     %FT54                   ; doesn't match the ghost icon
+
+        LDR     R1,[R0,#w_seldata+wselhighindex]   ; high bound
+        CMP     R7,R1
+        BGT     %FT52
+
+        LDR     R1,[R0,#w_seldata+wsellowindex]   ; low bound
+        CMP     R1,R7
+        BLE     %FT54
+52
+        ; remove selection
+        MOV     R0,R8
+        MOV     R1,R9
+        MOV     R4,#crf_selection
+        MOV     R5,#0
+        MOV     R6,#0
+        SWI     XWimp_SetCaretPosition  ; clear it
+54
+        ; we need to set a caret to our insert point
+        MOV     R0,R8
+        MOV     R1,R9
+        MOV     R4,#-1
+        MOV     R5,R7
+        SWI     XWimp_SetCaretPosition
+        ; put text to dest icon
+        MOV     R10,#clipboard_flexblock_dragdata ; source flexblock
+        MOVVC   R0,#clipboard_flexblock_dragdata
+        BLVC    cbtask_insert_text_into_icon
+        MOVVS   R9,#CNPFALSE
+
+        ; delete selection from source icon if necessary,  tidy up
+        MOVVC   R9,#CNPTRUE
+
+        MOV     R10,#clipboard_flexblock_dragdata
+        B       cbtask_export_finished
+70
+        ; source and destination icons are the same
+        ; invert the copy/move option (shift)
+        LDRB    R10,[R11,#cbtask_var_shift_pressed]
+        EOR     R10,R10,#1
+        STRB    R10,[R11,#cbtask_var_shift_pressed]
+
+        ; no need to check validation string as the data source has already been checked
+        ; only need to check length if copying as the buffer size is constant otherwise
+        ; did we end up inside the original selection?
+        ; R7 = destination index
+        Abs     R10,R8
+        LDR     R3,[R10,#w_seldata+wselhighindex]
+        CMP     R7,R3
+        BGT     %FT80
+
+        LDR     R1,[R10,#w_seldata+wsellowindex]
+        CMP     R7,R1
+        MOVGE   R9,#CNPFALSE
+        MOVGE   R10,#clipboard_flexblock_dragdata
+        BGE     cbtask_export_finished  ; we're inside the selection, so just carry on unchanged
+
+        ; destination lower than source
+
+        ; get icon text
+        ; R10->window data
+        ; R1=selection low index
+        ; R3=selection high index
+        LDRB    R5,[R11,#cbtask_var_shift_pressed]
+        TEQ     R5,#CNPTRUE
+        BEQ     %FT90
+
+        MOV     R8,R7
+        MOV     R7,#clipboard_flexblock_icontext
+        MOV     R6,R9
+        BL      cbtask_get_icon_text
+        BVS     cbtask_export_finished
+        ; R2->icontext now
+
+        ; move text upwards to fit
+        ADD     R5,R2,R3 ; R5-> end of selection, ie place to start copying as we go backwards
+        SUB     R4,R3,R1 ; R4=selection size, ie number of bytes to shift by
+        SUB     R6,R5,R4 ; R6-> source to copy
+        ; bytes to copy=low dest - insert index
+        SUB     R7,R1,R8 ; bytes to copy = low sel extent - insert index
+
+        SUB     R6,R6,#1
+        SUB     R5,R5,#1
+71
+        LDRB    R0,[R6],#-1
+        STRB    R0,[R5],#-1
+        SUBS    R7,R7,#1
+        BNE     %BT71
+
+        ; now copy the selection back in again
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_get_block_addr_size
+
+        ADD     R3,R2,R8
+72
+        LDRB    R4,[R0],#1
+        STRB    R4,[R3],#1
+        SUBS    R1,R1,#1
+        BNE     %BT72
+
+        ; send the updated piece back
+        MOV     R6,R9
+        BL      cbtask_put_icon_text
+78
+        ; set caret position
+        MOV     R5,R8
+        Rel     R0,R10
+        MOV     R1,R9
+        MOV     R4,#-1
+        SWI     XWimp_SetCaretPosition
+
+        ; redraw the icon
+        ADD     R1,R11,#cbtask_pollblock
+        Rel     R2,R10
+        MOV     R3,R6
+        MOV     R4,#0
+        MOV     R5,#0
+        STMIA   R1,{R2-R5}
+        SWI     XWimp_SetIconState
+
+        MOV     R0,#clipboard_flexblock_icontext
+        MOV     R1,#0
+        BL      clipboard_flex_set_block_size
+
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_set_block_size
+        B       cbtask_poll
+80
+        ; destination higher than source
+        LDRB    R5,[R11,#cbtask_var_shift_pressed]
+        TEQ     R5,#CNPTRUE
+        BEQ     %FT90
+
+        LDR     R1,[R10,#w_seldata+wsellowindex]
+
+        ; get icon text
+        ; R10->window data
+        ; R1=selection low index
+        ; R3=selection high index
+        MOV     R8,R7
+        MOV     R7,#clipboard_flexblock_icontext
+        MOV     R6,R9
+        BL      cbtask_get_icon_text
+
+        ADD     R5,R2,R3 ; R5 -> end of selection, source of the data to copy
+        ADD     R6,R2,R1 ; R6 -> start of selection, destination of the data to copy
+        SUB     R7,R8,R3 ; bytes to copy = insert index - selection end
+81
+        LDRB    R0,[R5],#1
+        STRB    R0,[R6],#1
+        SUBS    R7,R7,#1
+        BNE     %BT81
+
+        ; now copy the selection back in again
+        MOV     R0,#clipboard_flexblock_dragdata
+        BL      clipboard_flex_get_block_addr_size
+82
+        LDRB    R4,[R0],#1
+        STRB    R4,[R6],#1
+        SUBS    R1,R1,#1
+        BNE     %BT82
+
+        MOV     R6,R9
+        BL      cbtask_put_icon_text
+
+        ; continue by setting caret, etc, shared with the other copy code
+        B       %BT78
+90
+        ; shift pressed, so we copy the data
+        ; R7=insert index
+        ; R8=window
+        ; R9=icon
+
+        ; clear the selection
+        MOV     R0,R8
+        MOV     R1,R9
+        MOV     R4,#crf_selection
+        MOV     R5,R6
+        SWI     XWimp_SetCaretPosition
+
+        ; set main caret to the target position
+        MOVVC     R0,R8
+        MOVVC     R1,R9
+        MOVVC     R4,#-1
+        MOVVC     R5,R7
+        SWIVC     XWimp_SetCaretPosition
+
+        MOV     R10,#clipboard_flexblock_dragdata
+        MOVVC   R0,#clipboard_flexblock_dragdata
+        BLVC    cbtask_insert_text_into_icon
+        MOVVS   R9,#CNPFALSE
+        MOVVC   R9,#CNPTRUE
+        B       cbtask_export_finished
+
+; ---------------------------------------------------------------------------------------
+; allow abort of a drag if the source window/icon is about to vanish
+; (ie Wimp_DeleteIcon or Wimp_DeleteWindow)
+
+cbtask_check_abort_drag
+; On entry, handle=window handle (internal); R2=icon that is going or -1 if window is being deleted
+        Push    "R0,lr"
+        ; is there a clipboard available?
+        LDR     R14,clipboard_spritearea_addr
+        TEQ     R14,#0
+        Pull    "R0,PC",EQ
+
+        ; are we dragging anything at the moment?
+        LDRB    R0,[R14,#cbtask_var_dragging]
+        TEQ     R0,#1
+        Pull    "R0,PC",NE
+
+        ; same window?
+        LDR     R0,[R14,#cbtask_var_source_window]
+        Abs     R0,R0
+        TEQ     R0,handle
+        Pull    "R0,PC",NE
+
+        ; if the icon isn't -1, check it too
+        CMP     R2,#-1
+        LDRNE   R0,[R14,#cbtask_var_source_icon]
+        TEQNE   R0,R2
+        Pull    "R0,PC",NE
+
+        ; stop the drag
+        MOV     R0,#clipboard_pw_dragabort
+        ADRL    R14,clipboard_pollword
+        STR     R0,[R14]
+        Pull    "R0,PC"
+ ]
