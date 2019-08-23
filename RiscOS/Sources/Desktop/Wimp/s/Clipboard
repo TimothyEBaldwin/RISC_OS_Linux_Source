@@ -1,0 +1,1089 @@
+; Copyright 2019 RISC OS Open Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; > Wimp.s.Clipboard
+
+ [ CnP
+;  Clipboard
+;  Implement writable icons with clipboard support
+
+; sprite buffer area for redraws
+; we buffer the redraw in a sprite, then write this to the screen
+; it will hopefully reduce flicker
+
+; get current sprite area
+; if none defined, then create one based on the current mode
+; need to make sure it's big enough for the largest writable (may need to scale it up)
+; keep the pool in a DA as may fragment if keeps increasing size...?
+
+; area size is width x height x BPP + header
+
+; area data format
+                                ^   0
+clipboard_area_status           #   4   ; 0 if not set up, 1 if OK to go
+clipboard_mode_word             #   4   ; mode word for creating sprites in current screen mode
+
+clipboard_save_area_offset      #   4   ; offset in workspace of the VDU save area
+clipboard_save_area_size        #   4   ; size needed for VDU vars save when switching to sprite output
+clipboard_prev_status           # 4*4   ; previous save status (R0-R3)
+
+clipboard_selection_font_ctrl   #   0   ; block for font control sequences
+        ; we need enough space for two sequences:
+        ; * start of highlight and end of highlight
+clipboard_font_ctrl_start_index #   4   ; byte index into string of highlight start
+clipboard_font_ctrl_start_len   #   4   ; length of the control sequence (should be 8 bytes)
+clipboard_font_ctrl_start_codes #   8   ; byte sequence 19,bg_r,bg_g,bg_b,fg_r,fg_g,fg_b,offset
+clipboard_font_ctrl_end_index   #   4   ; byte index into string of highlight end
+clipboard_font_ctrl_end_len     #   4   ; length of the control sequence (should be 8 bytes)
+clipboard_font_ctrl_end_codes   #   8   ; byte sequence 19,bg_r,bg_g,bg_b,fg_r,fg_g,fg_b,offset
+clipboard_font_ctrl_terminator  #   4   ; terminator should be -1
+
+cnp_message_dataload_park       # 256   ; holding pen for Message_DataLoads that we may need to intercept
+
+; the task workspace bits follow
+; variables.  These are basically as per the drag and drop protocol
+; Drag receiver
+cbtask_var_claiming             #   1
+cbtask_var_pointer_altered      #   1
+cbtask_var_pausing              #   1
+cbtask_var_ghostcaret           #   1
+cbtask_var_last_x               #   4
+cbtask_var_claimed_windowhandle #   4
+cbtask_var_claimed_iconhandle   #   4
+cbtask_var_last_scrollx         #   4
+
+; Drag sender
+cbtask_var_dragging             #   1
+cbtask_var_drag_finished        #   1
+cbtask_var_drag_aborted         #   1
+cbtask_var_shift_pressed        #   1
+cbtask_var_delete_source        #   1
+cbtask_var_padding              #   3
+cbtask_var_claimant             #   4
+cbtask_var_lastref              #   4
+cbtask_var_old_dragclaim_flags  #   4
+cbtask_var_dragbox_parent       #   16
+cbtask_var_dragbox_box_os       #   16
+cbtask_var_dragbox_box_mpt      #   16
+cbtask_var_source_window        #   4
+cbtask_var_source_icon          #   4
+cbtask_var_source_low_bound     #   4   ; original selection low bound
+cbtask_var_source_high_bound    #   4   ; original selection high bound
+
+; task workspace
+cbtask_pollblock                # 256   ; Wimp_Poll data block
+cbtask_stack                    # 256
+cbtask_stacklimit               #   0
+
+; flexible storage area fills rest of the DA workspace
+clipboard_flex_base             #   4   ; base of the clipboard heap
+
+clipboard_da_minsize            #   0   ; minimum DA size
+
+                                ^   0
+clipboard_flexblock_sprite      #   1   ; sprite area
+clipboard_flexblock_savearea    #   1   ; VDU save area
+clipboard_flexblock_clipdata    #   1   ; clipboard data
+clipboard_flexblock_pastedata   #   1   ; data that's come from outside to be pasted
+clipboard_flexblock_validation  #   1   ; validation string (if any)
+clipboard_flexblock_icontext    #   1   ; imported icon text from another task
+clipboard_flexblock_dragdata    #   1   ; text from an icon that is being dragged
+clipboard_flexblock_total       #   0   ; total number of blocks we're using.  The block order is significant.
+
+; amount of data to allocate to the area
+; this amount gets added to the sprite size to give the area size
+clipboard_sprite_area_spritepad *  SpriteAreaCBsize + SpriteCBsize
+
+; colour definitions
+colour_white                     * &FFFFFF00
+colour_shaded                    * &80808000
+colour_ghostcaret                * &80808000
+
+clipboard_draw_selection_block_vdu5
+; draw the filled area that goes behind the selection for a vdu5 icon
+; r10 is icon block
+        Push    "R0-R9,R14"
+
+        LDR     R8,selectionwindowaddr
+        LDR     R6,[R8,#w_seldata+wsellowindex]
+        LDR     R5,[R8,#w_seldata+wselhighindex]
+        CMP     R5,R6
+        Pull    "R0-R9,PC",EQ           ; no selection block, really - zero width
+
+        ; check colour - faded or not?
+        LDR     R7,selectionwindow
+        Abs     R7,R7
+        LDR     R8,selectionwindowaddr
+        EORS    R8,R8,R7                ; if r8=0 then it's the selection window
+        BEQ     %FT01
+
+        ; shaded selection
+        LDR     R0,=colour_shaded
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XColourTrans_SetGCOL
+01
+        ; cursor is currently at start of the text paint zone
+
+        ; get icon height
+        LDR     R0,[R10,#i_bby0]
+        LDR     R1,[R10,#i_bby1]
+        SUB     R7,R1,R0
+        SUB     R7,R7,#6
+
+        LDR     R9,writeabledir
+        TEQ     R9,#0
+
+        ; get current cursor posn
+        MOV     R0,#138
+        MOV     R1,#139
+        MOV     R2,#-1
+        Push    "R0-R2"
+        MOV     R0,sp
+        MOV     R1,sp
+        SWI     XOS_ReadVduVariables
+
+        ; move to start of selection
+        MOV     R0,#0                   ; move relative
+        MOV     R1,R5,LSL #4
+        MVNNE   R1,R1                   ; reverse direction if we're doing RTL printing
+        ADDNE   R1,R1,#16
+        MVN     R4,R1                   ; store offset for later
+        MOV     R2,R7,LSR #1
+        SUB     R2,R2,#16
+        SWI     XOS_Plot
+
+        ; plot rectangle to end of selection
+        MOV     R0,#97                  ; plot rectangle relative
+        SUB     R1,R6,R5                ; width of selection block
+        MOV     R1,R1,LSL #4
+        TEQ     R9,#0
+        MVNNE   R1,R1
+        SUB     R4,R4,R1                ; store offset for later
+        MVN     R2,R7                   ; height of the rectangle
+        ADD     R2,R2,#4
+        SWI     XOS_Plot
+        ; reset cursor position as we leave
+        MOV     R0,#4
+        Pull    "R1,R2,R3"              ; get stored vars off stack; r3 is the list terminator so ignore
+        SWI     XOS_Plot
+
+        TEQ     R8,#0                   ; do we need to reset colours?
+        Pull    "R0-R9,PC",EQ           ; no - leave
+
+        ; reset to previous colour settings
+        LDR     R0,truefgcolour
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XColourTrans_SetGCOL
+        Pull    "R0-R9,PC"
+
+clipboard_draw_selection_block_font
+; draw the filled area that goes behind the selection
+; r1 points to string
+; r10 is icon block
+        Push    "R0-R9,R14"
+
+        LDRB    R9,cnp_buffered
+        TEQ     R9,#1
+        Pull    "R0-R9,PC",NE
+
+        LDR     R8,selectionwindowaddr
+        LDR     R6,[R8,#w_seldata+wsellowindex]
+        LDR     R5,[R8,#w_seldata+wselhighindex]
+        CMP     R5,R6
+        Pull    "R0-R9,PC",EQ           ; no selection block, really - zero width
+
+        ; get base X coord of the string to be painted from stack
+        ADD     R9,sp,#11*4+cx1*4
+        ADD     R9,R9,R7
+        LDR     R6,[R9]
+
+        ; find out where the first edge of the selection block should be
+        MOV     R0,#0
+        MOV     R2,#1 :SHL: 7           ; r7 is string length
+        MOV     R3,#bignum
+        MOV     R4,#bignum
+        LDR     R7,[R8,#w_seldata+wsellowindex]            ; start index of selection
+        ADD     R7,R7,#2                ; take into account the font selection bytes
+        SWI     XFont_ScanString
+        ADDVS   SP,SP,#4
+        Pull    "R1-R9,PC",VS
+
+        ; we want OS units, not millipoints :(
+        DivRem  R0,R3,#400,R2,norem
+
+        LDR     R14,writeabledir
+        TEQ     R14,#0
+        RSBNE   R0,R0,#12               ; we end up in the wrong place else?
+
+        ; R0 now has the X coord to start the selection.  Want offset from R6 (original paint coord)
+        LDR     R6,[R9]
+        ADD     R1,R0,R6
+
+        Plot    4,R1,#4                 ; move to (r3,#4)
+
+        ; get offset to end of selection block
+        MOV     R0,#0
+        LDR     R1,[sp,#4]              ; was changed by last call to scanstring
+        MOV     R2,#1 :SHL: 7           ; r7 is string length
+        MOV     R3,#bignum
+        MOV     R4,#bignum
+        LDR     R7,[R8,#w_seldata+wselhighindex]            ; end index of selection
+        ADD     R7,R7,#10               ; take into account the font selection bytes and colour change for start selection
+        SWI     XFont_ScanString
+        ADDVS   SP,SP,#4
+        Pull    "R1-R9,PC",VS
+
+        ; convert to OS
+        DivRem  R0,R3,#400,R2,norem
+        LDR     R14,writeabledir
+        TEQ     R14,#0
+        RSBNE   R0,R0,#12
+
+        LDR     R6,[R9]
+        ADD     R1,R0,R6
+
+        ; work out height of selection block (icon height -8); we start at +4
+        LDR     R4,[R10,#i_bby0]
+        LDR     R5,[R10,#i_bby1]
+        SUB     R2,R5,R4
+        SUB     R2,R2,#6
+
+        ; check colour - faded or not?
+        LDR     R14,selectionwindow
+        Abs     R14,R14
+        LDR     R0,selectionwindowaddr
+        CMP     R0,R14
+        BEQ     %FT01
+
+        ; we need to sort out a faded colour setting
+        Push    "R1,R2"
+        LDR     R0,=colour_shaded
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XColourTrans_SetGCOL
+        Pull    "R1,R2"
+        Plot    101,R1,R2
+
+        ; reset to previous colour settings
+        LDR     R0,truefgcolour
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XColourTrans_SetGCOL
+        Pull    "R0-R9,PC"
+01
+        ; continue with simple colour settings
+        Plot    101,R1,R2               ; rectangle to (R1,R2)
+
+        Pull    "R0-R9,PC"
+
+clipboard_set_font_colour_codes
+; set up colour codes for a selection font
+; exit, r7=pointer to the selection codes
+        Push    "R0-R4,R14"
+
+        LDRB    R14,cnp_buffered
+        CMP     R14,#1
+        MOVNE   R7,#nullptr
+        Pull    "R0-R4,PC",NE
+
+        LDR     R4,clipboard_spritearea_addr
+        CMP     R4,#0
+        MOVEQ   R7,#nullptr
+        Pull    "R0-R4,PC",EQ           ; no area available
+
+        ; get start and end index of the selection
+        LDR     R3,selectionwindowaddr  ; window block has selection info
+        LDR     R14,[R3,#w_seldata+wsellowindex]            ; start index of selection
+        LDR     R0,[R3,#w_seldata+wselhighindex]                ; end index
+        CMP     R0,R14
+        MOVEQ   R7,#nullptr
+        Pull    "R0-R4,PC",EQ           ; no block to draw
+
+        STR     R14,[R4,#clipboard_font_ctrl_start_index]
+        STR     R0,[R4,#clipboard_font_ctrl_end_index]
+
+        MOV     R14,#8
+        STR     R14,[R4,#clipboard_font_ctrl_start_len] ; code sequence length
+        STR     R14,[R4,#clipboard_font_ctrl_end_len]   ; ditto
+
+        ; new foreground colour.  If we are the active (unshaded) selection, use the background, else use &80808000
+        ; stored as BBGGRR00 by the looks of things
+        ; see if it's an active selection
+
+        LDR     R14,selectionwindow
+        Abs     R14,R14
+        LDR     R0,selectionwindowaddr
+        CMP     R0,R14
+
+        LDREQ   R0,truefgcolour         ; we are flipping foreground/background
+        LDREQ   R1,truebgcolour
+        LDRNE   R1,=colour_white        ; shaded, so use white FG
+        LDRNE   R0,=colour_shaded       ; and mid grey BG
+
+        ; r0 has desired fg, r1 has desired bg for the selection
+        ORR     R0,R0,#19               ; code to change font colour
+        STR     R0,[R4,#clipboard_font_ctrl_start_codes]
+
+        MOV     R1,R1,LSR #8
+        ORR     R1,R1,#&0e000000        ; set offset colour code
+        STR     R1,[R4,#clipboard_font_ctrl_start_codes+4]
+
+        ; at end of selection, reset to existing colours in similar fashion
+        LDR     R0,truebgcolour
+        ORR     R0,R0,#19
+        STR     R0,[R4,#clipboard_font_ctrl_end_codes]
+
+        LDR     R1,truefgcolour
+        MOV     R1,R1,LSR #8
+        ORR     R1,R1,#&0e000000
+        STR     R1,[R4,#clipboard_font_ctrl_end_codes+4]
+        MOV     R14,#-1
+        STR     R14,[R4,#clipboard_font_ctrl_terminator]
+
+        ADD     R7,R4,#clipboard_selection_font_ctrl
+
+        Pull    "R0-R4,PC"
+
+        LTORG
+
+clipboard_sprite_name
+        = "0",0       ; only used internally in a private area, so short and sweet
+clipboard_area_token
+        = "WCS:Clipboard Workspace",0 ; messagetrans token
+        ALIGN
+
+; initial allocation settings
+; when we first set up the area, we use this for a basic sprite as it should cover a number of use cases
+; anything larger will be requested subsequently
+clipboard_sprite_initial_x    * 256
+clipboard_sprite_initial_y    * 26
+
+clipboard_create_sprite_area
+        ; create dynamic area for the writable icon pixmap store
+        ; In: Nothing
+        ; Out: V and R0 set if error; R0=0 otherwise
+        ;      Rest preserved
+        Push    "R0-R8,R14"
+
+      [ UseDynamicArea
+        ADRL    R0,message_block
+        ADR     R1,clipboard_area_token
+        MOV     R2,#0
+        SWI     XMessageTrans_Lookup
+        MOVVC   R8,R2
+        MOVVC   R0,#DAReason_Create
+        MOVVC   R1,#-1
+        MOVVC   R2,#clipboard_da_minsize
+        MOVVC   R3,#-1
+        MOVVC   R4,#128
+        MOVVC   R5,#8*1024*1024         ; allow up to 8MB size
+        MOVVC   R6,#0
+        MOVVC   R7,#-1
+        SWIVC   XOS_DynamicArea
+      |
+        ; use RMA instead
+        ; we need enough space for the base workspace and a list of areas
+        ; area list is (ptr,length) array, so 8 bytes per area
+        MOV     R0,#ModHandReason_Claim
+        MOV     R3,#clipboard_da_minsize+8*clipboard_flexblock_total
+        SWI     XOS_Module
+        MOVVC   R1,#-1
+        MOVVC   R3,R2
+      ]
+        ; no hope
+        ADDVS   SP,SP,#4
+        MOVVS   R14,#0
+        STRVS   R14,clipboard_spritearea_addr
+        Pull    "R1-R8,PC",VS           ; failed to create dynamic area or claim RMA - a bad thing
+
+        ; store details for use
+        STR     R1,clipboard_spritearea_num  ; in R12 store
+        STR     R3,clipboard_spritearea_addr ; in R12 store
+
+        ; initialise area with any key values
+        MOV     R0,#0
+        STR     R0,[R3,#clipboard_flex_base] ; heap is empty to start with
+        STR     R0,[R3,#cnp_message_dataload_park] ; no stored messages
+
+        ; create empty flex areas for sprite, save area, clipboard data, paste data etc
+        MOV     R8,#clipboard_flexblock_total
+01
+        BL      clipboard_flex_create_block
+        SUBS    R8,R8,#1
+        BNE     %BT01
+        Pull    "R0-R8,PC"
+
+clipboard_calc_spritearea_size
+; determine required size to hold the sprite area
+; In:  R4,R5 - width, height of sprite in pixels
+; Out: R1 - sprite area size needed
+        Push    "R0,R2-R3,R14"
+        ; get mode bpp
+        LDR     R2,log2bpp              ; wimp holds this
+        ; adjust cols to a round number
+        ADD     R14,R4,#8
+        BIC     R14,R14,#7
+
+        ; calculate desired allocation
+        MUL     R0,R14,R5
+        ADD     R0,R0,R14
+        SUBS    R2,R2,#3                ; adjust log2bpp
+        MOVMI   R2,#0
+        MOV     R1,R0,LSL R2            ; sprite size needed
+        ADD     R1,R1,#clipboard_sprite_area_spritepad ; actual sprite area size needed (with sprite/file headers)
+        Pull    "R0,R2-R3,PC"
+
+clipboard_mode_changed
+        ; reinitialise sprite area after a mode change (or init after start up)
+        ; start with a basic initial sprite size
+        ; In: Nothing
+        ; Out: V and R0 set on error, otherwise all preserved
+        Push    "R0-R9,R14"
+        LDR     R8,clipboard_spritearea_addr
+        CMP     R8,#0
+        Pull    "R0-R9,PC",EQ           ; no area available
+
+clipboard_mode_changed_int
+        MOV     R4,#clipboard_sprite_initial_x
+        MOV     R5,#clipboard_sprite_initial_y
+        BL      clipboard_calc_spritearea_size
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_set_block_size
+        BVS     %FT60                     ; failed to set area size
+
+        BL      clipboard_sprite_area_init
+
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_get_block_addr
+        MOV     R9,R0
+
+        ; create initial sprite
+        ; base on current screen mode by grabbing chunk of screen
+        ; we can then use the generated mode word in future
+        LDR     R0,=SpriteReason_GetSpriteUserCoords+256 ; user sprite area
+        MOV     R1,R9
+        ADRL    R2,clipboard_sprite_name
+        MOV     R3,#0
+        ; r4, r5 have the x,y size in pixels; adjust to screen coords for the grab:
+        LDR     R14,log2py
+        SUB     R5,R5,#1
+        MOV     R7,R5,LSL R14
+        LDR     R14,log2px
+        SUB     R4,R4,#1
+        MOV     R6,R4,LSL R14
+        MOV     R5,#0
+        MOV     R4,#0
+        SWI     XOS_SpriteOp
+        BVS     %FT60
+
+        ; get the mode word for this one
+        LDR     R0,=SpriteReason_ReadSpriteSize+512
+        ADD     R2,R9,#16
+        SWI     XOS_SpriteOp
+        BVS     %FT60
+
+        ; mode word is in R6
+        STR     R6,[R8,#clipboard_mode_word]
+
+        BL      clipboard_setup_save_area
+
+        MOVVC   R14,#1
+60
+; finished
+        MOVVS   R14,#0
+        STR     R14,[R8,#clipboard_area_status]
+        STRVS   R0,[sp]
+        Pull    "R0-R9,PC"
+
+clipboard_setup_save_area
+        ; ensure enough space for a VDU save area and init the offsets
+        ; entry: r8=pointer to DA base
+        ;        r9=pointer to sprite area
+        ; exit: preserved, or R0+V on error
+
+        Push    "R0-R3,R14"
+        ; now we need to find out the save area size for this screen mode
+        LDR     R0,=SpriteReason_ReadSaveAreaSize+512
+        MOV     R1,R9
+        LDR     R2,[R1,#saFirst]
+        ADD     R2,R2,R9
+        SWI     XOS_SpriteOp
+        Pull    "R0-R3,PC",VS
+
+        MOV     R0,#clipboard_flexblock_savearea
+        MOV     R1,R3
+        BL      clipboard_flex_set_block_size
+        ; and we're all done
+        Pull    "R0-R3,PC"
+
+clipboard_sprite_area_init
+; initialise a sprite area
+; In: R1 = sprite area size
+;
+; Out: all preserved
+        Push    "R0-R1,R14"
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_get_block_addr
+        STR     R1,[R0,#saEnd]
+
+        MOV     R14,#16
+        STR     R14,[R0,#saFirst]
+
+        MOV     R1,R0
+        LDR     R0,=SpriteReason_ClearSprites+256
+        SWI     XOS_SpriteOp
+        Pull    "R0-R1,PC"
+
+clipboard_ensure_sprite_area
+; ensure that the sprite area has a sprite big enough for the current writable icon
+; In: r4/5 are desired width/height
+; Out: V+R0 set if error; r0 corrupt otherwise
+        Push    "R0-R9,R14"
+        LDR     R8,clipboard_spritearea_addr
+        CMP     R8,#0                   ; area set up?
+        BNE     %FT01
+        BL      clipboard_create_sprite_area ; make a new one
+        ADDVS   SP,SP,#4
+        Pull    "R1-R9,PC",VS           ; fail on error
+01
+        ; check block status - if status is 0 we need to sort.
+        LDR     R14,[R8,#clipboard_area_status]
+        TEQ     R14,#0
+        BNE     %FT02
+
+        ; we need to make a new sprite if possible
+        BL      clipboard_mode_changed
+        ADDVS   SP,SP,#4
+        Pull    "R1-R9,PC",VS           ; bail out if we couldn't
+02
+        ; check current width/height of the sprite in the area
+        Push    "R4,R5"                 ; desired width, height - preserve
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_get_block_addr
+        MOV     R9,R0
+        LDR     R0,=SpriteReason_ReadSpriteSize+512 ; direct pointer to sprite
+        MOV     R1,R9
+        LDR     R2,[R9,#saFirst]
+        ADD     R2,R2,R9
+        SWI     XOS_SpriteOp
+
+        Pull    "R6,R7"                 ; recall desired width/height
+        ADDVS   SP,SP,#4
+        Pull    "R1-R9,PC",VS           ; fail if error getting sprite info
+
+        CMP     R3,R6                   ; widths
+        BLT     %FT03                   ; too narrow - need to make a new one
+        CMP     R4,R7                   ; heights
+        Pull    "R0-R9,PC",GE           ; all good, returns
+03
+        ; make sure we've enough DA space to do this
+        MOV     R4,R6
+        MOV     R5,R7
+        BL      clipboard_calc_spritearea_size
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_set_block_size
+        BVS     %FT60
+        BL      clipboard_sprite_area_init ; ensure area reflects new size allocation
+
+        ; recreate the sprite in the desired size, using the saved mode word
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_get_block_addr
+        MOV     R9,R0
+        LDR     R0,=SpriteReason_CreateSprite+256
+        MOV     R1,R9
+        ADRL    R2,clipboard_sprite_name
+        MOV     R3,#0                   ; no palette
+        LDR     R8,clipboard_spritearea_addr
+        LDR     R6,[R8,#clipboard_mode_word]
+        SWI     XOS_SpriteOp
+        BVS     %FT60
+
+        BL      clipboard_setup_save_area
+        MOVVC   R14,#1                  ; mark as good area
+60
+        ; exit
+        MOVVS   R14,#0
+        STR     R14,[R8,#clipboard_area_status]
+        STRVS   R0,[sp]
+        Pull    "R0-R9,PC"
+
+clipboard_delete_sprite_area
+        ; tidy up - delete dynamic area
+        ; In: nothing
+        ; Out: V+R0 set if error.
+        Push    "R0,R1,R14"
+        MOV     R0,#DAReason_Remove
+        LDR     R1,clipboard_spritearea_num
+        SWI     XOS_DynamicArea
+        MOVVC   R0,#0
+        STRVC   R0,clipboard_spritearea_num
+        STRVC   R0,clipboard_spritearea_addr
+        STRVS   R0,[sp]
+        Pull    "R0,R1,PC"
+
+clipboard_ensure_icon_space
+; ensure enough buffer space for a writable icon, or disable render extension if not possible
+; entry: r10=pointer to icon data
+; exit:  all preserved
+        Push    "R0-R5,R14"
+
+        LDMIA   R10,{R0-R3}             ; read icon bounding box
+        SUB     R4,R2,R0
+        SUB     R5,R3,R1
+
+        ; gives the result in OS units
+        ; convert to pixels...
+
+        LDR     R0,log2px
+        MOV     R4,R4,LSR R0
+        LDR     R0,log2py
+        MOV     R5,R5,LSR R0
+
+        BL      clipboard_ensure_sprite_area
+        STRVS   R0,[sp]
+        Pull    "R0-R5,PC"
+
+clipboard_output_to_sprite
+        Push    "R0-R3,R14"
+        LDRB    R14,cnp_buffered
+        CMP     R14,#0
+        Pull    "R0-R3,PC",NE           ; not needed here
+
+        MOV     R0,#clipboard_flexblock_savearea
+        BL      clipboard_flex_get_block_addr
+        MOV     R3,R0
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_get_block_addr
+        MOV     R1,R0
+        LDR     R0,=SpriteReason_SwitchOutputToSprite+512 ; direct sprite pointer
+        LDR     R2,[R1,#saFirst]
+        ADD     R2,R2,R1
+        ; r3 is save area
+        MOV     R14,#0
+        STR     R14,[R3]                ; reset save area
+        SWI     XOS_SpriteOp
+        ADDVS   SP,SP,#4
+        Pull    "R1-R3,PC",VS
+
+        LDR     R14,clipboard_spritearea_addr
+        ADD     R14,R14,#clipboard_prev_status
+        STMIA   R14,{R0-R3}
+        MOV     R14,#1
+        STRB    R14,cnp_buffered
+        Pull    "R0-R3,PC"
+
+clipboard_output_restore
+        ; restore state
+        Push    "R0-R3,R14"
+        LDRB    R14,cnp_buffered
+        CMP     R14,#0
+        Pull    "R0-R3,PC",EQ           ; nothing to do here, move along
+        ; set ptr to the space we created in the stack
+        LDR     R14,clipboard_spritearea_addr
+        ADD     R14,R14,#clipboard_prev_status
+
+        LDMIA   R14,{R0-R3}
+        SWI     XOS_SpriteOp
+
+        MOV     R14,#0
+        STRB    R14,cnp_buffered
+
+        Pull    "R0-R3,PC"
+
+clipboard_plot_sprite
+        ; if there's a sprite, render it to the coords at x0,y0
+        Push    "R0-R6,R14"
+
+        ; ensure correct clipping
+        Push    "cx0-y1"
+        ADR     R14,clipx0
+        LDMIA   R14,{cx0,cy0,cx1,cy1}
+        ADR     R14,oldclipx0
+        STMIA   R14,{cx0,cy0,cx1,cy1}
+        max     x0,cx0                  ; NB must result in non-null window
+        max     y0,cy0                  ; since the rectangles intersect
+        min     x1,cx1
+        min     y1,cy1
+        BL      graphicswindow
+        Pull    "cx0-y1"
+
+        MOV     R4,y0
+        MOV     R3,x0
+        MOV     R5,#0
+        MOV     R0,#clipboard_flexblock_sprite
+        BL      clipboard_flex_get_block_addr
+        MOV     R1,R0
+        LDR     R0,=SpriteReason_PutSpriteUserCoords+512 ; direct sprite pointer
+        LDR     R2,[R1,#saFirst]
+        ADD     R2,R2,R1
+        SWI     XOS_SpriteOp
+        ADDVS   SP,SP,#4
+        Pull    "R1-R6,PC",VS
+
+        ; restore clip rectangle
+        ADR     R14,oldclipx0
+        LDMIA   R14,{x0,y0,x1,y1}
+        BL      graphicswindow
+        Pull    "R0-R6,PC"
+
+; memory management calls
+; we use a shifting heap in a dynamic area (unless not supported, in
+; which case it's in the RMA instead and not a shfiting heap)
+
+                              ^ 0
+clipboard_flex_block_rma_addr # 0       ; if it's an RMA block, address of the block
+clipboard_flex_next_offset    # 4       ; if it's a DA, offset to next block
+clipboard_flex_block_length   # 4       ; size of this block
+clipboard_flex_header_size    # 0
+
+clipboard_flex_create_block
+; add block to the heap
+; returns block number in R0
+; if doing RMA, then R8 is 1+block to reset
+
+        Push    "R1-R3,R14"
+
+      [ UseDynamicArea
+        ; find the end of the heap
+        MOV     R3,#0
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+01
+        LDR     R2,[R1,#clipboard_flex_next_offset]
+        TEQ     R2,#0                   ; end of the heap?
+        ADDNE   R1,R1,R2                ; if not, keep looking
+        ADDNE   R3,R3,#1
+        BNE     %BT01
+
+        ; we now point to the terminator of the heap
+        ; extend to give us an empty block
+        BL      clipboard_flex_get_alloc_size
+        ADD     R0,R0,#clipboard_flex_header_size
+        BL      clipboard_flex_set_da_size
+
+        ; create a new block
+        MOVVC   R0,#clipboard_flex_header_size
+        STRVC   R0,[R1,#clipboard_flex_next_offset]
+        MOVVC   R0,#0
+        STRVC   R0,[R1,#clipboard_flex_block_length]
+        STRVC   R0,[R1,#clipboard_flex_header_size]  ; set a terminator at the end of the block
+
+        MOVVC   R0,R3
+        Pull    "R1-R3,PC"
+      |
+        ; RMA version
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+        SUB     R3,R8,#1
+        ADD     R1,R1,R3,LSL #3
+        MOV     R14,#0
+        STR     R14,[R1,#clipboard_flex_block_rma_addr]
+        STR     R14,[R1,#clipboard_flex_block_length] ; length
+        MOV     R0,R8
+        Pull    "R1-R3,PC"
+      ]
+
+clipboard_flex_get_block_addr
+; In: R0=block number
+; Out: R0=block address or 0 if not found
+        Push    "R1,R2,R14"
+
+      [ UseDynamicArea
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+
+        TEQ     R0,#0
+        BEQ     %FT02
+01
+        LDR     R2,[R1,#clipboard_flex_next_offset]
+        TEQ     R2,#0                   ; no more blocks
+        MOVEQ   R0,#0
+        Pull    "R1,R2,PC",EQ
+
+        SUBS    R0,R0,#1
+        ADDGE   R1,R1,R2                ; keep trying
+        BGE     %BT01
+02
+        ADD     R0,R1,#clipboard_flex_header_size ; we've found our block
+
+        Pull    "R1,R2,PC"              ; return data address
+      |
+        ; RMA version
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+        LDR     R0,[R1,R0,LSL #3]            ; get RMA block address
+
+        Pull    "R1,R2,PC"              ; return data address
+      ]
+
+clipboard_flex_get_block_size
+; In: R0=block number
+; Out: R0=block size or 0 if not found
+        Push    "R1,R2,R14"
+
+      [ UseDynamicArea
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+
+        TEQ     R0,#0
+        BEQ     %FT02
+01
+        LDR     R2,[R1,#clipboard_flex_next_offset]
+        TEQ     R2,#0                   ; no more blocks
+        MOVEQ   R0,#0
+        Pull    "R1,R2,PC",EQ
+
+        SUBS    R0,R0,#1
+        ADDGE   R1,R1,R2                ; keep trying
+        BGE     %BT01
+02
+        LDR     R0,[R1,#clipboard_flex_block_length]
+
+        Pull    "R1,R2,PC"              ; return data address
+      |
+        ; RMA version
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+        ADD     R1,R1,R0,LSL #3
+        LDR     R0,[R1,#clipboard_flex_block_length]            ; get RMA block address
+
+        Pull    "R1,R2,PC"              ; return data address
+      ]
+
+        LTORG
+
+clipboard_flex_get_block_addr_size
+; In: R0=block number
+; Out: R0=block addr or 0 if not found
+;      R1=block length
+
+        Push    "R2,R14"
+
+      [ UseDynamicArea
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+
+        TEQ     R0,#0
+        BEQ     %FT02
+01
+        LDR     R2,[R1,#clipboard_flex_next_offset]
+        TEQ     R2,#0                   ; no more blocks
+        MOVEQ   R0,#0
+        MOVEQ   R1,#0
+        Pull    "R2,PC",EQ
+
+        SUBS    R0,R0,#1
+        ADDGE   R1,R1,R2                ; keep trying
+        BGE     %BT01
+02
+        ADD     R0,R1,#clipboard_flex_header_size
+        LDR     R1,[R1,#clipboard_flex_block_length]
+
+        Pull    "R2,PC"
+      |
+        ; RMA version
+        LDR     R1,clipboard_spritearea_addr
+        ADD     R1,R1,clipboard_flex_base
+        ADD     R2,R1,R0,LSL #3
+        LDMIA   R2,{R0,R1} ; get addr, length
+
+        Pull "R2,PC"
+      ]
+
+clipboard_flex_set_block_size
+; In: R0=block number
+;     R1=desired block size
+; Out: R0=0 if block not found
+;      V set on error
+
+        Push    "R1-R3,R8-R11,R14"
+
+      [ UseDynamicArea
+        ADD     R11,R1,#3
+        BIC     R11,R11,#3              ; copy the desired size; also make it word aligned
+
+        BL      clipboard_flex_get_block_addr
+        TEQ     R0,#0
+        Pull    "R1-R3,R8-R11,PC",EQ
+        SUB     R10,R0,#clipboard_flex_header_size ; keep block base address
+
+        ; we have the address of the block data
+        SUB     R0,R0,#clipboard_flex_header_size ; find the actual header of the block
+        LDR     R1,[R0,#clipboard_flex_block_length]
+        ADD     R1,R1,#3
+        BIC     R1,R1,#3                ; make the current size word aligned
+        SUBS    R9,R11,R1               ; r9=change in block size
+
+        LDREQ   R1,[sp]
+        STREQ   R1,[R0,#clipboard_flex_block_length] ; length may be different even if size not
+        Pull    "R1-R3,R8-R11,PC",EQ    ; block size unchanged, so just quit
+        BLT     %FT50                   ; current block size is larger, so we are shrinking
+
+        ; increasing the block size
+
+        ; extend the DA first to make sure there's enough space
+        BL      clipboard_flex_get_alloc_size
+        ADD     R0,R0,R9                ; new size is old size + our adjustment from above
+        BL      clipboard_flex_set_da_size
+        Pull    "R1-R3,R8-R11,PC",VS    ; can't extend DA so abort
+
+        ; need to move the data above our block upwards
+        ; r10 is our current block
+        ; we need to find the end of the heap
+        LDR     R0,[R10,#clipboard_flex_next_offset]
+        ADD     R1,R10,R0               ; r1 points to the new block
+        MOV     R8,R1                   ; keep this in r8
+41
+        LDR     R0,[R1,#clipboard_flex_next_offset]
+        TEQ     R0,#0
+        ADDNE   R1,R0,R1
+        BNE     %BT41
+        ADD     R1,R1,#4                ; allow terminator
+
+        ; move data upwards.  Move data from r8->r1 by r9 bytes
+
+        ADD     R9,R1,R9                ; new top of heap
+42
+        LDR     R2,[R1,#-4]!
+        STR     R2,[R9,#-4]!
+        CMP     R8,R1
+        BLE     %BT42
+
+        ; adjust the offset pointer for our current block
+        LDR     R1,[sp]                 ; get original length
+        STR     R1,[R10,#clipboard_flex_block_length]
+        ADD     R11,R11,#clipboard_flex_header_size
+        STR     R11,[R10,#clipboard_flex_next_offset]
+
+        MOV     R0,#1
+
+        Pull    "R1-R3,R8-R11,PC"
+50
+        ; shrink the block
+        ; move the higher data downwards first
+
+        ; r10 is our current block
+        ; we need to find the end of the heap
+        LDR     R0,[R10,#clipboard_flex_next_offset]
+        ADD     R1,R10,R0               ; r1 points to the new block
+        MOV     R8,R1                   ; keep this in r8
+51
+        LDR     R0,[R1,#clipboard_flex_next_offset]
+        TEQ     R0,#0
+        ADDNE   R1,R0,R1
+        BNE     %BT51
+        ADD     R1,R1,#4                ; allow terminator
+
+        ; move data downwards.  Move data from r8->r1 by r9 bytes
+        ADD     R9,R8,R9                ; destination pointer in r9; r9 is lower than r8
+52
+        LDR     R2,[R8],#4
+        STR     R2,[R9],#4
+        CMP     R8,R1
+        BNE     %BT52
+
+        ; adjust the offset pointer for our current block
+        LDR     R1,[sp]                 ; get original block length
+        STR     R1,[R10,#clipboard_flex_block_length]
+        ADD     R11,R11,#clipboard_flex_header_size
+        STR     R11,[R10,#clipboard_flex_next_offset]
+
+        ; shrink the DA if possible
+        BL      clipboard_flex_get_alloc_size
+        BL      clipboard_flex_set_da_size
+
+        MOVVC   R0,#1
+
+        Pull    "R1-R3,R8-R11,PC"
+      |
+        ; RMA version
+        LDR     R11,clipboard_spritearea_addr
+        ADD     R11,R11,clipboard_flex_base
+        ADD     R11,R11,R0,LSL #3
+
+        LDMIA   R11,{R8,R9} ; get current addr,length
+
+        TEQ     R1,R9
+        Pull    "R1-R3,R8-R11,PC",EQ ; nothing to do - no change in size
+
+        TEQ     R8,#0 ; no current addr
+        BEQ     %FT50
+
+        ; we have a block already
+        ; realloc or free?
+        MOV     R10,R1
+        TEQ     R1,#0
+        MOVEQ   R0,#ModHandReason_Free
+        MOVNE   R0,#ModHandReason_ExtendBlock
+        MOV     R2,R8
+        SUBNE   R3,R1,R9
+        SWI     XOS_Module
+        Pull    "R1-R3,R8-R11,PC",VS
+
+        TEQ     R10,#0
+        STRNE   R2,[R11,#clipboard_flex_block_rma_addr]
+        STREQ   R10,[R11,#clipboard_flex_block_rma_addr]
+        STR     R10,[R11,#clipboard_flex_block_length]
+
+        Pull    "R1-R3,R8-R11,PC"
+50
+        ; no current block, so claim one if we can
+        TEQ     R1,#0
+        Pull    "R1-R3,R8-R11,PC",EQ ; nothing to do if there's no size
+        MOV     R3,R1
+        MOV     R0,#ModHandReason_Claim
+        SWI     XOS_Module
+        STMVCIA R11,{R2,R3} ; addr, length
+
+        Pull    "R1-R3,R8-R11,PC"
+      ]
+
+      [ UseDynamicArea
+clipboard_flex_get_alloc_size
+; Out: R0=current required size of the DA
+        Push    "R1-R3,R14"
+        LDR     R1,clipboard_spritearea_addr
+        MOV     R3,R1                   ; keep base address for later
+        ADD     R1,R1,#clipboard_flex_base
+01
+        LDR     R2,[R1,#clipboard_flex_next_offset]
+        TEQ     R2,#0                   ; any more blocks?
+        ADDNE   R1,R1,R2
+        BNE     %BT01                   ; still going
+        SUB     R0,R1,R3                ; make a length
+        ADD     R0,R0,#4                ; add length of terminator
+
+        Pull    "R1-R3,PC"
+
+clipboard_flex_set_da_size
+; In: R0 = desired size
+; Out: If error, R0 and V set
+        Push    "R0-R4,R14"
+        MOV     R3,R0
+        LDR     R4,clipboard_spritearea_num
+        MOV     R0,R4
+        SWI     XOS_ReadDynamicArea     ; get current size
+        ADDVS   SP,SP,#4
+        Pull    "R1-R4,PC",VS
+
+        MOV     R0,R4
+        SUB     R1,R3,R1
+        SWI     XOS_ChangeDynamicArea   ; request the new size - may result in area shrinkage
+        STRVS   R0,[SP]
+        Pull    "R0-R4,PC"
+      ]
+ ]
+        END
