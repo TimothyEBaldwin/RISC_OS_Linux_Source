@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 #
-# Copyright (c) 2013-2018, Timothy Baldwin
+# Copyright (c) 2013-2019, Timothy Baldwin
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -85,16 +85,15 @@ Built/seccomp%: Built/gen_seccomp
 Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
 	rm -rf Built/rpcemu*
 	mkdir -p Built/rpcemu_files
-	cp --reflink=auto '$(RPCEMU)' Built/rpcemu_files/rpcemu.tar.gz
 	unpack() {
-	  echo "3f092e6000b5d50984e63768a74cdc9a40284d55c984e26df44c7d5875ced6e9 rpcemu.tar.gz" | sha256sum -c
-	  tar -zxf rpcemu.tar.gz
+	  echo "3f092e6000b5d50984e63768a74cdc9a40284d55c984e26df44c7d5875ced6e9 /rpcemu.tar.gz" | sha256sum -c
+	  tar -zxf /rpcemu.tar.gz
 	  cd rpcemu-0.8.15
-	  patch -p1
+	  patch -p1 < /d
 	  touch stamp
 	}
 	export -f unpack
-	cat Support/rpcemu_exit.diff | $(sandbox_base) $(sandbox_misc) --bind Built/rpcemu_files /r --chdir /r $(BASH) -e -c unpack
+	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Support/rpcemu_exit.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASH) -e -c unpack </dev/null |& cat
 	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
 
 Built/rpcemu/src/Makefile: Built/rpcemu/stamp
@@ -107,7 +106,7 @@ Built/rpcemu/src/Makefile: Built/rpcemu/stamp
 	  touch Makefile
 	}
 	export -f configure
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASH) -e -c configure
+	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASH) -e -c configure </dev/null |& cat
 
 Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	+cp Support/rpcemu.cfg Built/rpcemu/rpc.cfg
@@ -120,29 +119,28 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	  touch rpcemu
 	}
 	export -f build
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASH) -e -c build
+	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASH) -e -c build </dev/null |& cat
 
 Built/qemu_stamp-v4.0.0: ${QEMU_SRC} | Built/gen_seccomp
 	rm -rf Built/qemu*
 	mkdir -p Built/qemu_files
-	cp --reflink=auto '${QEMU_SRC}' Built/qemu_files/qemu.tar.xz
 	unpack() {
-	  echo "13a93dfe75b86734326f8d5b475fde82ec692d5b5a338b4262aeeb6b0fa4e469 qemu.tar.xz" | sha256sum -c
-	  tar -Jxf qemu.tar.xz
+	  echo "13a93dfe75b86734326f8d5b475fde82ec692d5b5a338b4262aeeb6b0fa4e469 /qemu.tar.xz" | sha256sum -c
+	  tar -Jxf /qemu.tar.xz
 	  cd qemu-4.0.0
-	  patch -p1
+	  patch -p1 < /d
 	}
 	export -f unpack
-	cat Support/qemu_swi.diff | $(call sandbox_base,-s) $(sandbox_misc) --bind Built/qemu_files /q --chdir /q $(BASH) -e -c unpack
+	$(call sandbox_base,-s) $(sandbox_misc) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Support/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASH) -e -c unpack </dev/null |& cat
 	mv Built/qemu_files/qemu-4.0.0 Built/qemu
 	touch Built/qemu_stamp-v4.0.0
 
 Built/qemu_Makefile_stamp: Built/qemu_stamp-v4.0.0
-	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror
+	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
 
 Built/qemu-arm: Built/qemu_Makefile_stamp
-	+$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q $(MAKE)
+	+$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
 	test ! -L Built/qemu/arm-linux-user
 	test ! -L Built/qemu/arm-linux-user/qemu-arm
 	ln -f Built/qemu/arm-linux-user/qemu-arm Built/qemu-arm
@@ -211,7 +209,7 @@ endif
 
 Built/boot_iomd_rom: $(IOMD) | Built
 	echo 'a9eb33be72f0ead8c6263dd15da5648639094e6b34001739363571fe08fc9d91 *$(IOMD)' | sha256sum -c
-	unzip -p '$(IOMD)' "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
+	$(sandbox_base) $(sandbox_misc) --ro-bind '$(IOMD)' /iomd.zip unzip -p iomd.zip "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
 	echo '8d51bc41f479ebdaa2ceb2a2ba3bab59473dced135881685a0ae0b5ea89f1491 *$@' | sha256sum -c
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 
