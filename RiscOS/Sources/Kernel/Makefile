@@ -107,8 +107,8 @@ GetAll.o:  ${TOKHELPSRC}
 o.LinuxC: h.Kernel
 
 h.Kernel: o.GenHeader
-        ${LD} -bin -o $@ o.GenHeader
-        SetType $@ FFF
+	${LD} -bin -o $@ o.GenHeader
+	SetType $@ FFF
 
 #
 # Custom exports:
