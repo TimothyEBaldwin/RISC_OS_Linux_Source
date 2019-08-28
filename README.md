@@ -79,6 +79,7 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 | ---              | ---                                             |
 | --abort-on-input | Abort on debug terminal input                   |
 | --help           | Display help message                            |
+| --highmem        | Allow use of virtual memory addresses above 2GB |
 | --isreboot       | Indicate hard reset to RISC OS (not power on)   |
 | --nvram FILE     | Filename for nvram                              |
 | --noaborts       | Disable aborts - RISC OS will die with SIGSEGV  |
