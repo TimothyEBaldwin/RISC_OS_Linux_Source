@@ -95,7 +95,6 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 |     102     | Unrecognised command line option |
 |     103     | Unable to open NVRAM file. |
 |     104     | Permission denied when attempting to open NVRAM file. |
-|     105     | Read only filesystem when attempting to open NVRAM file. |
 |     106     | Unable to read size of NVRAM file. |
 |     107     | Unable to enlarge NVRAM file. |
 |     108     | Failed to reserve address space. |
