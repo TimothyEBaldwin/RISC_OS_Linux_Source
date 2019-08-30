@@ -121,7 +121,7 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	export -f build
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASH) -e -c build </dev/null |& cat
 
-Built/qemu_stamp-v4.0.0: ${QEMU_SRC} | Built/gen_seccomp
+Built/qemu_stamp-v4.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
 	rm -rf Built/qemu*
 	mkdir -p Built/qemu_files
 	unpack() {
