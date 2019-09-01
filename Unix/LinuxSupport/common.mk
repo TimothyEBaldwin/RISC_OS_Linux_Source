@@ -21,6 +21,7 @@ RPCEMU=$(HOME)/Downloads/rpcemu-0.8.15.tar.gz
 IOMD=$(HOME)/Downloads/IOMD-Soft.5.24.zip
 
 LINUX_ROM=./RISC_OS
+VERBOSE=
 
 # From: https://www.gnu.org/software/make/manual/html_node/Call-Function.html#Call-Function
 pathsearch = $(firstword $(wildcard $(addsuffix /$(1),$(subst :, ,$(PATH)))))
@@ -36,7 +37,8 @@ JOBS:=$(shell getconf _NPROCESSORS_ONLN)
 export JOBS
 
 SHELL=$(warning Building $@)$(BASH)
-.SHELLFLAGS=-e -c
+.SHELLFLAGS:=-e -c $(if $(VERBOSE), -x)
+BASHF:=$(BASH) $(.SHELLFLAGS)
 .ONESHELL:
 .SILENT:
 
@@ -93,7 +95,7 @@ Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
 	  touch stamp
 	}
 	export -f unpack
-	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Support/rpcemu_exit.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASH) -e -c unpack </dev/null |& cat
+	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Support/rpcemu_exit.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
 	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
 
 Built/rpcemu/src/Makefile: Built/rpcemu/stamp
@@ -106,7 +108,7 @@ Built/rpcemu/src/Makefile: Built/rpcemu/stamp
 	  touch Makefile
 	}
 	export -f configure
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASH) -e -c configure </dev/null |& cat
+	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASHF) configure </dev/null |& cat
 
 Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	+cp Support/rpcemu.cfg Built/rpcemu/rpc.cfg
@@ -119,7 +121,7 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	  touch rpcemu
 	}
 	export -f build
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASH) -e -c build </dev/null |& cat
+	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASHF) build </dev/null |& cat
 
 Built/qemu_stamp-v4.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
 	rm -rf Built/qemu*
@@ -131,7 +133,7 @@ Built/qemu_stamp-v4.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen
 	  patch -p1 < /d
 	}
 	export -f unpack
-	$(call sandbox_base,-s) $(sandbox_misc) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Support/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASH) -e -c unpack </dev/null |& cat
+	$(call sandbox_base,-s) $(sandbox_misc) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Support/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASHF) unpack </dev/null |& cat
 	mv Built/qemu_files/qemu-4.0.0 Built/qemu
 	touch Built/qemu_stamp-v4.0.0
 

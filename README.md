@@ -40,6 +40,7 @@ The following variables are accepted by the Makefiles:
 | QEMU       | Location of qemu-arm executable. |
 | PHASES     | Space separated list of build phases to run. |
 | INSECURE   | Set to YES to enable insecure mode. |
+| VERBOSE    | Set to 1 to make build more verbose. |
 
 The following targets are provided by the Makefiles:
 
