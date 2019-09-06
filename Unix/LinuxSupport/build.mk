@@ -122,7 +122,7 @@ endif
 	true
 
 Build/IOMD32/RiscOS/Images/rom_check: Build/IOMD32/RiscOS/Images/rom Built/rpcemu/rpcemu
-	mixed/Linux/Tests/runner_rpcemu.sh Build/IOMD32/RiscOS/Images/rom
+	Unix/LinuxSupport/test_runner_rpcemu.sh Build/IOMD32/RiscOS/Images/rom
 	touch Build/IOMD32/RiscOS/Images/rom_check
 
 ifeq ($(INSECURE), YES)
@@ -132,7 +132,7 @@ Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom
 else
 Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom Built/sandbox_config_sh
 	chmod +x Build/Linux/RiscOS/Images/rom
-	mixed/Linux/Tests/runner.sh Build/Linux/RiscOS/Images/rom
+	Unix/LinuxSupport/test_runner_linux.sh Build/Linux/RiscOS/Images/rom
 	touch Build/Linux/RiscOS/Images/rom_check
 endif
 
