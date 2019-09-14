@@ -98,7 +98,7 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 |     104     | Permission denied when attempting to open NVRAM file. |
 |     106     | Unable to read size of NVRAM file. |
 |     107     | Unable to enlarge NVRAM file. |
-|     108     | Failed to reserve address space. |
+|     108     | Failed to reserve address space, try running "sudo sysctl vm.mmap_min_addr=12288." |
 |     109     | Unable to fork |
 |     110     | Parent process exited (no message) |
 |     111     | Cloning ptrace thread failed |
@@ -108,6 +108,7 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 |     115     | Interrupt test failed |
 |     116     | Exec failed |
 |     117     | HAL_DebugRX called and --abort-on-input given. |
+|     118     | Failed to reserve address space for system heap. |
 
 
 ## To do List
