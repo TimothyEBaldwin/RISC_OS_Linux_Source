@@ -83,15 +83,14 @@ DFILES = \
  debug.${APP}.Sprites\
  debug.${APP}.Templates
 
-OBJS      = o.colours o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow \
+OBJS      = o.colourpanel o.colours o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow \
             o.AltRename o.PaintLib o.CnPDrag o.Clipboard o.Drawfile
-OBJSZ     = oz.colours oz.main oz.menus oz.psprite oz.sprwindow\
+OBJSZ     = oz.colourpanel oz.colours oz.main oz.menus oz.psprite oz.sprwindow\
             oz.tools oz.toolwindow oz.AltRename oz.PaintLib oz.CnPDrag oz.Clipboard oz.Drawfile
-OBJSD     = od.colours od.ftrace od.guard od.main od.menus\
+OBJSD     = od.colourpanel od.colours od.ftrace od.guard od.main od.menus\
             od.psprite od.sprwindow od.tools od.toolwindow o.m\
             od.AltRename od.PaintLib od.CnPDrag od.Clipboard od.Drawfile
-ASMS      = s.colours s.main s.menus s.psprite s.sprwindow s.tools s.toolwindow
-INCS      = i.colours i.main i.menus i.psprite i.sprwindow i.tools i.toolwindow
+ASMS      = s.colourpanel s.colours s.main s.menus s.psprite s.sprwindow s.tools s.toolwindow
 
 #
 # Rule patterns
