@@ -176,13 +176,12 @@ endif
 	  git checkout master
 	)
 	rm -rf Unix/RISC_OS/*
-	mkdir -p Unix/RISC_OS/Support
-	cp -v --reflink=auto --preserve=mode,xattr Support/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Support/
+	mkdir -p Unix/RISC_OS/Unix/LinuxSupport
+	cp -v --reflink=auto --preserve=mode,xattr Support/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Unix/LinuxSupport/
 	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Unix/RISC_OS/
 	#
-	mkdir -p Unix/RISC_OS/Unix
 	cp -vrL Unix/SocketKVMFrontends Unix/RISC_OS/Unix/SocketKVMFrontends
-	ln -sf ../Support Unix/RISC_OS/Unix/LinuxSupport
+	ln -sf 'Unix/LinuxSupport' 'Unix/RISC_OS/Support'
 	ln -sf 'Unix/LinuxSupport/Start_RISC_OS.desktop' 'Unix/RISC_OS/Start_RISC_OS.desktop'
 	ln -sf 'Unix/LinuxSupport/run_RISC_OS' 'Unix/RISC_OS/run_RISC_OS'
 	#
@@ -192,7 +191,7 @@ ifneq ($(METHOD), rpcemu)
 	BINARY=$$BINARY
 endif
 	LINUX='$$(uname -a)'
-	" > Unix/RISC_OS/Support/source
+	" > Unix/RISC_OS/Unix/LinuxSupport/source
 	#
 	(
 	  cd Unix/RISC_OS
