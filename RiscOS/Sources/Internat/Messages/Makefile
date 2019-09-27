@@ -107,6 +107,11 @@ clean_all:
 	${RM} s.LocaleList
 	${XWIPE} Resources.* ${WFLAGS}
 	${XWIPE} Processed.* ${WFLAGS}
+	Dir ${UTILS}
+	EnsureDepends Depends
+	${MAKE} clean_all
+	${RM} Depends
+	Up
 	@echo ${COMPONENT}: all cleaned
 
 resources:
@@ -131,7 +136,8 @@ ${BUILTDIR}.MessData: ${DATA}.Tokenised ${DIRS}
 
 force:; @|
 
-s.LocaleList:; Utils.LocaleChk
+s.LocaleList:
+	${LOCALECHK}
 
 #
 # Binary Build Environment rules
@@ -203,8 +209,9 @@ ${DICTIONARY}:
 	${MSGEXT2} ${DICTMESS} ${DICTTAGS}
 	${TOKGEN2} ${DICTMESS} ${DICTTOKENS} ${DICTIONARY}
 
-${TAGEXT}:
+${LOCALECHK} ${TAGEXT}:
 	Dir ${UTILS}
+	EnsureDepends Depends
 	${MAKE}
 	Up
 

@@ -27,6 +27,7 @@ CUSTOMLINK = custom
 COMPONENT = Messages utilities
 TARGET = _dummy_
 
+include HostTools
 include CApp
 
 all: ${TARGETS} ${DIRS}
@@ -76,4 +77,4 @@ ResCommon: o.ResCommon ${DIRS}
 LocaleChk: o.LocaleChk ${DIRS}
 	${LD} ${LDFLAGS} -o $@ o.LocaleChk ${CLIB}
 
-# Dynamic dependencies:
+include Depends
