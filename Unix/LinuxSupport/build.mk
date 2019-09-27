@@ -64,6 +64,9 @@ endif
 	  # Remove old output
 	  ! rm RiscOS/Images/rom*
 	  #
+	  # Remove symbolic broken links
+	  find . -xtype l -delete
+	  #
 	  # Create needed directories
 	  mkdir -p "$${dirs[@]}"
 	  #
