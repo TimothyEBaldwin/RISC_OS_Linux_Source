@@ -14,12 +14,6 @@
 #
 # Makefile for PCI
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 06-Jun-00  SNB          Recreated using makefile fragments
 
 COMPONENT = PCI
 
@@ -38,12 +32,5 @@ ASFLAGS    = ${OPTIONS}
 
 include StdTools
 include AAsmModule
-
-#
-# Generic rules:
-#
-clean::
-	${WIPE} rm ${WFLAGS}
-	@@echo ${COMPONENT}: cleaned 
 
 include Depends
