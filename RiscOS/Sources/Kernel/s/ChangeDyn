@@ -591,9 +591,10 @@ SetMemMapEntries_Code  ROUT
         MOVHS   r11, #AreaFlags_Duff
         ; Ensure PMP membership flag is retained - just in case caller doesn't
         ; know what he's doing
+        LDR     r6, =StickyPageFlags+DynAreaFlags_PMP
         LDR     r0, [r9, r2, LSL #CAM_EntrySizeLog2]
-        AND     r0, r0, #DynAreaFlags_PMP
-        BIC     r11, r11, #DynAreaFlags_PMP
+        AND     r0, r0, r6
+        BIC     r11, r11, r6
         ORR     r11, r11, r0
         BL      BangCamUpdate
         B       %BT01
@@ -640,6 +641,15 @@ DynAreaFlags_PMPLogOpAccessMask * (DynAreaFlags_AccessMask :OR: PageFlags_Unavai
 ; PMP PhysOp can specify these flags
 DynAreaFlags_PMPPhysOpAccessMask * PageFlags_Unavailable
 
+; Sticky page flags - they're preserved over most operations, including changes
+; in ownership
+StickyPageFlags * PageFlags_Reserved
+
+; Ensure user can't specify any sticky flags for the main calls
+; If this changes, lots of code will need checking/updating!
+        ASSERT  (DynAreaFlags_AccessMask :AND: StickyPageFlags) = 0
+        ASSERT  (DynAreaFlags_PMPLogOpAccessMask :AND: StickyPageFlags) = 0
+        ASSERT  (DynAreaFlags_PMPPhysOpAccessMask :AND: StickyPageFlags) = 0
 
 DynamicAreaSWI Entry
         BL      DynAreaSub
@@ -2337,7 +2347,11 @@ DynArea_Locate Entry "r2-r5"
 ;            phys page index -1 to release
 ;            phys page index -2 to let kernel pick page
 ;            otherwise page number to use
-;            page flags are defined by DynAreaFlags_PMPPhysOpAccessMask
+;
+;            page flags are defined by DynAreaFlags_PMPPhysOpAccessMask, and
+;            PageFlags_Reserved to allow claiming of pages previously reserved
+;            via OS_Memory 23
+;
 ;       r3 = number of entries
 ;
 ; out:  r0-r1 preserved (error if not all of region successfully updated)
@@ -2373,7 +2387,7 @@ DynArea_PMP_PhysOp ROUT
         LDR     r0, [r7, #FreePoolDANode+DANode_PMPSize]
         LDR     r7, [r7, #CamEntriesPointer]
         CMP     r0, r3
-        BHS     %FT45
+        BHS     %FT30
         ; Free pool may be too small - scan the page list and the PMP to work out exactly how many pages are required
         ; If there aren't enough, try growing the free pool (shrink app space, shrink shrinkables, etc.)
         MOV     r12, #0
@@ -2421,7 +2435,7 @@ DynArea_PMP_PhysOp ROUT
         FRAMLDR r2
         FRAMLDR r3
 
-45
+30
         LDR     r12, [r10, #DANode_PMPSize]
         ; Usage in main loop:
         ; r2 -> input page list
@@ -2436,7 +2450,7 @@ DynArea_PMP_PhysOp ROUT
         ; r11 = MaxCamEntry
         ; r12 = current PMPSize
         ; r0, r1 temp
-50
+40
         SUBS    r3, r3, #1
         BLO     %FT80
         LDMIA   r2!, {r4-r6}
@@ -2447,25 +2461,49 @@ DynArea_PMP_PhysOp ROUT
         CMP     r5, #-3
         CMPLS   r11, r5
         BLS     %FT93
+42
         AND     r6, r6, #DynAreaFlags_PMPPhysOpAccessMask
         ; Look up the page that's currently in the PMP
         LDR     r0, [r8, r4, LSL #2]
         TEQ     r0, r5
-        BNE     %FT52
+        BNE     %FT50
+        CMP     r0, #-1
+        BEQ     %BT40
+45
         ; Page is there - check/update flags
         ADD     r0, r7, r0, LSL #CAM_EntrySizeLog2
         LDR     r1, [r0, #CAM_PageFlags]
         BIC     lr, r1, #DynAreaFlags_PMPPhysOpAccessMask
         ORR     lr, lr, r6
         TEQ     r1, lr
-        STRNE   lr, [r0, #CAM_PageFlags]
-        B       %BT50
-52
+        BEQ     %BT40
+        ; Only allow Reserved pages to become Unavailable if we're given the magic password
+        TST     r6, #PageFlags_Unavailable ; Unavailable requested?
+        TSTNE   r1, #PageFlags_Reserved    ; And currently Reserved?
+        BEQ     %FT49
+        TST     r1, #PageFlags_Unavailable ; Was it already Unavailable?
+        LDREQ   r6, [r2, #-4]
+        TSTEQ   r6, #PageFlags_Reserved    ; Or was Reserved specified in the page list?
+        BNE     %FT49                      ; Then we're fine
+        ; Attempting to claim a Reserved page without the proper permission.
+        ; If we're allowed to kernel-pick a page, swap in a replacement. Else
+        ; raise an error.
+        CMP     r5, #-2
+        BNE     %FT96
+        LDR     r0, [r8, r4, LSL #2]
+        BL      GetNonReservedPage
+        BVS     %FT96
+        ; Success, retry this page modification
+        B       %BT42
+49
+        STR     lr, [r0, #CAM_PageFlags]
+        B       %BT40
+50
         ; Do we need to release the existing page?
         CMP     r0, #-1
         BEQ     %FT55
         CMP     r5, #-2
-        BEQ     %BT50                   ; Page is currently there, and we want a kernel picked page -> no action required
+        BEQ     %BT45                   ; Page is currently there, and we want a kernel picked page
         ; A page is currently there, but we either want to release it or to swap in a different page. Start by releasing the existing page.
         ; TODO - if we're swapping with another page we'll probably want to preserve the contents (have a flag to control behaviour)
         ; Check page isn't mapped in
@@ -2488,6 +2526,9 @@ DynArea_PMP_PhysOp ROUT
         LDR     r3, [r4, #DANode_Flags]
         LDR     lr, =DynAreaFlags_AccessMask
         AND     r3, r3, lr
+        LDR     lr, [r2, #CAM_PageFlags]
+        AND     lr, lr, #StickyPageFlags
+        ORR     r3, r3, lr
         ASSERT  CAM_PageFlags=4
         ASSERT  CAM_PMP=8
         ASSERT  CAM_PMPIndex=12
@@ -2502,36 +2543,63 @@ DynArea_PMP_PhysOp ROUT
 55
         ; Map in new page if required
         CMP     r5, #-2
-        BHI     %BT50 ; i.e. -1
-        BLO     %FT60
+        BHI     %BT40 ; i.e. -1
+        BLO     %FT60 ; specific page
       [ PMPDebug
         DebugTX "Kernel-picking page"
       ]
-        ; Kernel-picked page required. Pick the last page from the free pool.
+        ; Kernel-picked page required. Find a suitable page in the free pool.
         LDR     r0, =ZeroPage+FreePoolDANode
         LDR     r1, [r0, #DANode_PMP]
-        LDR     r5, [r0, #DANode_PMPSize]
-        SUBS    r5, r5, #1
-        BLO     %FT95                   ; Shouldn't happen
-        STR     r5, [r0, #DANode_PMPSize]
-        LDR     r5, [r1, r5, LSL #2]!
+        LDR     lr, [r0, #DANode_PMPSize]
+        Push    "r4,r8"
+56
+        SUBS    lr, lr, #1
+        Pull    "r4,r8",LO
+        BLO     %FT95
+        LDR     r5, [r1, lr, LSL #2]
+        TST     r6, #PageFlags_Unavailable
+        BEQ     %FT57
+        ; Caller is requesting exclusive use of the page, so avoid picking a
+        ; reserved page.
+        ; Note: For this case, we don't allow the caller to specify
+        ; PageFlags_Reserved to allow use of reserved pages, because we have no
+        ; way of knowing whether a particular page was reserved by them or by
+        ; someone else.
+        ADD     r4, r7, r5, LSL #CAM_EntrySizeLog2
+        LDR     r4, [r4, #CAM_PageFlags]
+        TST     r4, #PageFlags_Reserved
+        BNE     %BT56
+57
+        LDR     r4, [r0, #DANode_PMPSize]
+        SUB     r4, r4, #1
+        STR     r4, [r0, #DANode_PMPSize]
+        CMP     r4, lr
+        LDRNE   r8, [r1, r4, LSL #2] ; Within the PMP, shuffle last free pool page down to replace the page we're taking
+        STRNE   r8, [r1, lr, LSL #2]
+        ADDNE   r8, r7, r8, LSL #CAM_EntrySizeLog2
+        STRNE   lr, [r8, #CAM_PMPIndex] ; And update the CAM
         MOV     r0, #-1
-        STR     r0, [r1]
-        ; Add to our PMP
+        STR     r0, [r1, r4, LSL #2]
+        Pull    "r4,r8"
+        ; Add page r5 to our PMP
 59
         STR     r5, [r8, r4, LSL #2]
         ADD     r5, r7, r5, LSL #CAM_EntrySizeLog2
         LDR     r0, [r10, #DANode_Flags] ; Use default DA flags, modified by flags given in page list
         LDR     r1, =DynAreaFlags_AccessMask :AND: :NOT: DynAreaFlags_PMPPhysOpAccessMask
-        MOV     lr, r4
         AND     r0, r0, r1
         ORR     r0, r0, r6
+        LDR     lr, [r5, #CAM_PageFlags]
+        AND     lr, lr, #StickyPageFlags
+        ORR     r0, r0, lr
+        MOV     lr, r4
         ASSERT  CAM_PageFlags=4
         ASSERT  CAM_PMP=8
         ASSERT  CAM_PMPIndex=12
         STMIB   r5, {r0,r10,lr}
         ADD     r12, r12, #1
-        B       %BT50
+        B       %BT40
 60
         ; Check that the requested page isn't locked
         ADD     r0, r7, r5, LSL #CAM_EntrySizeLog2
@@ -2545,6 +2613,14 @@ DynArea_PMP_PhysOp ROUT
       ]
         TST     r1, #PageFlags_Unavailable
         BNE     %FT95
+        ; Only allow Reserved pages to become Unavailable if we're given the magic password
+        TST     r6, #PageFlags_Unavailable ; Unavailable requested?
+        TSTNE   r1, #PageFlags_Reserved    ; And currently Reserved?
+        BEQ     %FT605
+        LDR     lr, [r2, #-4]
+        TST     lr, #PageFlags_Reserved
+        BEQ     %FT96
+605
         ; Construct a dummy DANode on the stack so we can use a Batcall to map
         ; in the page
         SUB     sp, sp, #DANode_NodeSize
@@ -2582,7 +2658,7 @@ DynArea_PMP_PhysOp ROUT
     ]
         ; Replace handler routine with our own
         STR     r5, [sp, #DANode_Workspace] ; Required page number is handler param
-        ADR     r0, PMPGrowHandler
+        ADR     r0, PMPGrowHandlerReserved ; If we're dealing with a reserved page, we must specify "RESV", otherwise OS_ChangeDynamicArea won't let us move it
         STR     r0, [sp, #DANode_Handler]
         ; Make the call
         Push    "r2"
@@ -2655,6 +2731,13 @@ DynArea_PMP_PhysOp ROUT
         ADRL    r0, ErrorBlock_ChDynamNotAllMoved
         B       %FT98
 
+96
+      [ PMPDebug
+        DebugTX "-> physop can't use page"
+      ]
+        ADRL    r0, ErrorBlock_CantGetPhysMem
+        B       %FT98
+
 98
  [ International
         BL      TranslateError
@@ -2708,11 +2791,131 @@ PMPMemoryMoved ROUT
       ]
         EXITS
 
+PMPGrowHandlerReserved ROUT
+        TEQ     r0, #DAHandler_PreGrow
+        LDREQ   r0, =DAHandler_RESV
+        STREQ   r12, [r1]
+        MOV     pc, lr
 
 PMPGrowHandler ROUT
         TEQ     r0, #DAHandler_PreGrow
         STREQ   r12, [r1]
         MOV     pc, lr
+
+;
+; In:  R0 = page number to replace
+; Out: Page (& contents) replaced with a non-Reserved page, or R0=error
+;
+GetNonReservedPage ROUT
+        Entry   "r0-r5", DANode_NodeSize
+      [ PMPDebug
+        DebugReg r0, "GetNonReservedPage for "
+      ]
+        STR     r0, [sp, #DANode_Workspace]
+        ; The page we're looking for a replacement for isn't Unavailable, so we
+        ; can cheat and construct a temp DANode on the stack, allowing us to
+        ; use a RESV Batcall to handle finding the replacement (and then push
+        ; the replaced page into the free pool)
+        ;
+        ; However, because we want the replacement to be non-Reserved, we must
+        ; set up the free pool so that a suitable page is the last page in the
+        ; pool (since page replacement code doesn't care about Reserved status
+        ; of the replacement). TODO: Find a more robust way of doing this.
+        LDR     r0, =ZeroPage
+        LDR     r1, [r0, #FreePoolDANode+DANode_PMP]
+        LDR     r2, [r0, #FreePoolDANode+DANode_PMPSize]
+        SUB     r3, r2, #1
+        LDR     r4, [r0, #CamEntriesPointer]
+        ADD     r4, r4, #CAM_PageFlags
+10
+        CMP     r2, #0
+        BEQ     %FT90
+        SUB     r2, r2, #1
+        LDR     r5, [r1, r2, LSL #2]
+        LDR     lr, [r4, r5, LSL #CAM_EntrySizeLog2]
+        TST     lr, #PageFlags_Reserved
+        BNE     %BT10
+        ; Replacement found, swap it with the last page
+        LDR     lr, [r1, r3, LSL #2]
+        STR     r5, [r1, r3, LSL #2] ; Update PMP
+        STR     lr, [r1, r2, LSL #2]
+        ADD     r5, r4, r5, LSL #CAM_EntrySizeLog2
+        ADD     lr, r4, lr, LSL #CAM_EntrySizeLog2
+        STR     r3, [r5, #CAM_PMPIndex-CAM_PageFlags] ; Update CAM
+        STR     r2, [lr, #CAM_PMPIndex-CAM_PageFlags]
+        ; Now construct the DANode and make the Batcall
+        MOV     r2, sp
+        MOV     r1, #0
+        LDR     lr, =ZeroPage
+        STR     r1, [lr, #CDASemaphore] ; Temporarily release so batcall will work
+        STR     r1, [r2, #DANode_Link]
+        STR     r1, [r2, #DANode_Size]
+        STR     r1, [r2, #DANode_Title]
+        STR     r1, [r2, #DANode_SubLink]
+        STR     r1, [r2, #DANode_SparseHWM]
+        STR     r1, [r2, #DANode_SortLink]
+        STR     r1, [r2, #DANode_PMP]
+        STR     r1, [r2, #DANode_PMPSize]
+        STR     r1, [r2, #DANode_PMPMaxSize]
+        MOV     r1, #DynArea_NewAreas ; A generic non-special DA number
+        STR     r1, [r2, #DANode_Number]
+        LDR     r1, =Nowhere
+        STR     r1, [r2, #DANode_Base]
+        LDR     r1, =(AreaFlags_FreePool :AND: :NOT: DynAreaFlags_PMP) :OR: DynAreaFlags_NeedsSpecificPages
+        STR     r1, [r2, #DANode_Flags]
+        ADR     r1, PMPGrowHandlerReserved
+        STR     r1, [r2, #DANode_Handler]
+        MOV     r1, #4096
+        STR     r1, [r2, #DANode_MaxSize]
+        MOV     r0, #ChangeDyn_Batcall
+        SWI     XOS_ChangeDynamicArea ; Grow, moving R0 into our fake DA
+        FRAMSTR r0, VS
+        BVS     %FT80
+        ; Because we used Nowhere as the dest addr, the Reserved page won't
+        ; have been mapped in anywhere, and won't be part of any PMP. This means
+        ; we can't add it back to the free pool by shrinking our fake DA - but
+        ; we can just add it in manually.
+        LDR     r0, [sp, #DANode_Workspace]
+        LDR     r2, =ZeroPage+FreePoolDANode
+        LDR     r1, [r2, #DANode_PMP]
+        LDR     lr, [r2, #DANode_PMPSize]
+        STR     r0, [r1, lr, LSL #2]
+        LDR     r1, [r2, #CamEntriesPointer-FreePoolDANode]
+        ADD     r1, r1, r0, LSL #CAM_EntrySizeLog2
+        STR     r2, [r1, #CAM_PMP]
+        STR     lr, [r1, #CAM_PMPIndex]
+        ADD     lr, lr, #1
+        STR     lr, [r2, #DANode_PMPSize]
+        LDR     lr, =AreaFlags_FreePool :AND: DynAreaFlags_AccessMask
+        LDR     r2, [r1, #CAM_PageFlags]
+        AND     r2, r2, #StickyPageFlags
+        ORR     r2, r2, lr
+        STR     r2, [r1, #CAM_PageFlags]
+80
+      [ PMPDebug
+        BVC     %FT81
+        DebugTX "-> Failed"
+        SETV
+        B       %FT82
+81
+        DebugTX "-> Success"
+82
+      ]
+        LDR     r2, =ZeroPage
+        STR     sp, [r2, #CDASemaphore]
+        EXIT
+90
+      [ PMPDebug
+        DebugTX "-> No free non-reserved pages"
+      ]
+        ADRL    r0, ErrorBlock_CantGetPhysMem
+ [ International
+        BL      TranslateError
+ |
+        SETV
+ ]
+        FRAMSTR r0
+        EXIT        
 
 ;**************************************************************************
 ;
@@ -2736,8 +2939,8 @@ PMPLogOp_ChunkSize * 384 ; 384 pages = 1.5K stack, or 1.5MB of memory (larger th
 
                               ^ 0, sp
 PMPLogOp_PageList             # PMPLogOp_ChunkSize*4 ; List of pages to map out
-PMPLogOp_UnsafeMapIn          # 4 ; Nonzero if we've done an 'unsafe' map in
-PMPLogOp_GlobalTLBFlushNeeded # 4 ; Nonzero if a global TLB flush needed on exit
+PMPLogOp_UnsafeMapIn          # 4 ; Nonzero if we've done an 'unsafe' map in (-> PageTableSync required for pages to become visible)
+PMPLogOp_GlobalTLBFlushNeeded # 4 ; Nonzero if a global TLB flush needed on exit (large number of pages have been unmapped)
                               # 8 ; Padding!
 PMPLogOp_FrameSize            # 0
 
@@ -2795,7 +2998,7 @@ DynArea_PMP_LogOp ROUT
         CMP     r4, r11, LSR #12
         BHS     %FT95
         CMP     r5, #-1
-        BNE     %FT50
+        BNE     %FT20
         ; Map out request - get current page
       [ PMPDebug
         DebugTX "-> Map out"
@@ -2835,10 +3038,9 @@ DynArea_PMP_LogOp ROUT
         MOV     r1, #0
         B       %BT05
 
-50
+20
         CMP     r1, #0
         BLNE    LogOp_MapOut
-55
         ; Request to map in - examine CAM to see if the page is already at the
         ; requested location (with requested flags)
         CMP     r5, r9
@@ -2852,7 +3054,6 @@ DynArea_PMP_LogOp ROUT
         ASSERT  CAM_PageFlags=4
         ADD     r0, r0, r5, LSL #CAM_EntrySizeLog2
         LDMIA   r0, {r0, r1}
-        LDR     lr, =DynAreaFlags_PMPLogOpAccessMask
       [ PMPDebug
         DebugTX "-> Map in "
       ]
@@ -2864,6 +3065,7 @@ DynArea_PMP_LogOp ROUT
         DebugReg r0, "Page currently at "
         DebugReg r1, "With flags "
       ]
+        LDR     lr, =DynAreaFlags_PMPLogOpAccessMask
         AND     r6, r6, lr
         BIC     lr, r1, lr
         ORR     r6, r6, lr ; Preserve special flags (e.g. temp uncacheability, PMP membership)
@@ -2871,6 +3073,22 @@ DynArea_PMP_LogOp ROUT
         CMPEQ   r6, r1
         BEQ     %FT65
         ; Page needs to be mapped/moved/updated
+        ; Only allow Reserved pages to become Unavailable if we're given the magic password
+        TST     r6, #PageFlags_Unavailable ; Unavailable requested?
+        TSTNE   r1, #PageFlags_Reserved    ; And currently Reserved?
+        BEQ     %FT55
+        TST     r1, #PageFlags_Unavailable ; Was it already Unavailable?
+        LDREQ   lr, [r2, #8]
+        TSTEQ   lr, #PageFlags_Reserved    ; Or was Reserved specified in the page list?
+        BNE     %FT55                      ; Then we're fine
+        ; Attempting to claim a Reserved pag without the proper permission.
+        ; Try and swap in a replacement page.
+        MOV     r0, r5
+        BL      GetNonReservedPage
+        MOV     r1, #0
+        BVC     %BT06
+        B       %FT96
+55
         Push    "r2-r4,r6,r9,r11"
         MOV     r2, r5
         ; Update our logical size if the page isn't already in position
@@ -2888,11 +3106,11 @@ DynArea_PMP_LogOp ROUT
         ADDCS   r1, r1, #4096
         BICCC   r6, r6, #PageFlags_Unsafe
         STR     r1, [r10, #DANode_Size]
-        ; Also update HWM
         BCC     %FT57
       [ PMPDebug
         DebugTX "Nothing at dest addr"
       ]
+        ; Also update HWM
         LDR     r1, [r10, #DANode_SparseHWM]
         ADD     lr, r4, #4096
         CMP     r1, r4
@@ -3015,6 +3233,12 @@ DynArea_PMP_LogOp ROUT
         DebugTX "-> bad logop page number"
       ]
         ADRL    r4, ErrorBlock_BadPageNumber
+        B       %BT71
+96
+      [ PMPDebug
+        DebugTX "-> can't use page"
+      ]
+        ADRL    r4, ErrorBlock_CantGetPhysMem
         B       %BT71
 
 ; r10 -> DANode
@@ -5523,12 +5747,26 @@ DoTheGrowPageUnavailable ROUT
 
         MakeErrorBlock  CantGetPhysMem
 
+; r0 = 0 or DAHandler_RESV
+; r1 -> page block
+; r2 = number of pages in block
+; r3 -> CAM
+; r5 = PageSize
+; r11 -> source DANode
+; r12 -> dest DANode
 DoTheGrowPagesSpecified ROUT
 
 ; First check if any of the pages requested are unavailable
 ; At the same time as we're doing this, we fill in the log. and phys. addresses in the block
 
-        FastCDA_ProfStart MarkRequired, r0, r6, lr
+        FastCDA_ProfStart MarkRequired, r4, r6, lr
+
+        ; Set up r6 to be the mask of page flags not allowed
+        LDR     lr, =DAHandler_RESV
+        EORS    r6, r0, lr
+        MOVNE   r6, #PageFlags_Reserved
+        ORR     r6, r6, #PageFlags_Unavailable :OR: PageFlags_Required
+
         LDR     r0, =ZeroPage
         LDR     r0, [r0, #CamEntriesPointer]
 05
@@ -5540,7 +5778,7 @@ DoTheGrowPagesSpecified ROUT
         STR     r8, [r1, #4-12]                 ; store log. addr in page block
         STR     r8, [r1, #PageBlockSize+4-12]   ; and in 2nd page block
 
-        TST     lr, #PageFlags_Unavailable :OR: PageFlags_Required ; if page in use by someone else, or by us, then return error
+        TST     lr, r6                          ; if page in use by someone else, or by us, then return error
         BNE     DoTheGrowPageUnavailable
         ORR     lr, lr, #PageFlags_Required     ; set bit in flags to say page will be needed
         STR     lr, [r4, #CAM_PageFlags]        ; and store back
@@ -6238,9 +6476,8 @@ CallPostShrink Entry "r0,r3,r4, r12"
 ;
 ;       CallPreGrow - Call pre-grow routine
 ;
-; in:   Eventually r1 -> page block (on stack)
-;                  r2 = number of entries in block
-;       but for now these are both undefined
+; in:   r1 -> page block (on stack) if DynAreaFlags_NeedsSpecificPages, else 0
+;       r2 = number of pages for this call (i.e. number of entries in block)
 ;       r3 = amount area is growing by
 ;       r5 = page size
 ;       r12 -> node for area being grown
@@ -6249,14 +6486,15 @@ CallPostShrink Entry "r0,r3,r4, r12"
 ;         r0 -> error
 ;         V=1
 ;       else
-;         page block may be updated with page numbers (but not yet!)
-;         All registers preserved
+;         page block may be updated with page numbers
+;         r0 = 0, or "RESV" (&56534552) if reserved pages are allowed
+;         All other registers preserved
 ;         V=0
 ;       endif
 ;
 
 CallPreGrow ROUT
-        Entry   "r0,r4, r12"
+        Entry   "r4, r12"
         LDR     r0, [r12, #DANode_Flags]
         TST     r0, #DynAreaFlags_NeedsDMA              ; if DMA needed
         BNE     %FT10                                   ; use special PreGrow
@@ -6267,11 +6505,13 @@ CallPreGrow ROUT
 
         FastCDA_ProfStart CallPreGrow, r0, r4, lr
         MOV     r0, #DAHandler_PreGrow                  ; r0 = reason code
+        ASSERT  DAHandler_PreGrow = 0                   ; By default, r0 is preserved by PreGrow handlers. Make sure it has the value we expect.
         LDR     r4, [r12, #DANode_Size]                 ; r4 = current size
         ASSERT  DANode_Handler = DANode_Workspace +4
         ADD     r12, r12, #DANode_Workspace
         MOV     lr, pc
         LDMIA   r12, {r12, pc}                          ; load workspace pointer and jump to handler
+        ; Handler should return with R0=DAHandler_RESV if it wants to use reserved pages
         FastCDA_ProfEnd CallPreGrow, r12, r4, lr
         EXIT    VC                                      ; if no error then exit
 
@@ -6281,7 +6521,6 @@ CallPreGrow ROUT
  [ International
         BLEQ    TranslateError
  ]
-        STR     r0, [sp]
         EXIT
 
 10
@@ -6309,6 +6548,7 @@ CallPreGrow ROUT
 30
         LDR     lr,[r4,r2,LSL #CAM_EntrySizeLog2]
         TST     lr,#PageFlags_Unavailable :OR: PageFlags_Required
+        TSTEQ   lr,#PageFlags_Reserved
         STREQ   r2,[r1],#12
         SUBEQS  r3,r3,#4096
         BEQ     %FT80
@@ -6320,6 +6560,7 @@ CallPreGrow ROUT
         ; Success
         CLRV
         Pull    "r1-r3"
+        MOV     r0,#0
         EXIT
 90
         ; Failure
