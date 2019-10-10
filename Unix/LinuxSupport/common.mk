@@ -84,7 +84,7 @@ Built/gen_seccomp: Unix/LinuxSupport/gen_seccomp.c $(lib_depends) | Built
 Built/seccomp%: Built/gen_seccomp
 	Built/gen_seccomp $* > $@
 
-Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
+Built/rpcemu/stamp2: $(RPCEMU) Unix/LinuxSupport/rpcemu_exit.diff | Built/gen_seccomp
 	rm -rf Built/rpcemu*
 	mkdir -p Built/rpcemu_files
 	unpack() {
@@ -92,13 +92,13 @@ Built/rpcemu/stamp: $(RPCEMU) | Built/gen_seccomp
 	  tar -zxf /rpcemu.tar.gz
 	  cd rpcemu-0.8.15
 	  patch -p1 < /d
-	  touch stamp
+	  touch stamp2
 	}
 	export -f unpack
 	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Unix/LinuxSupport/rpcemu_exit.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
 	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
 
-Built/rpcemu/src/Makefile: Built/rpcemu/stamp
+Built/rpcemu/src/Makefile: Built/rpcemu/stamp2
 	configure() {
 	  if uname -m | grep -E -q 'x86|i386'; then
 	    ./configure --enable-dynarec CFLAGS="-no-pie -fno-pie"
