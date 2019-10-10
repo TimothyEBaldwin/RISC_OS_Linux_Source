@@ -11,7 +11,7 @@ export RISC_OS_Test_NetOK=YES
 export risc_os="$1"
 
 # cat is needed here as stdout is reopened, which would reset the pointer of regular files.
-exec </dev/null 3>/dev/null 2>&1 > >(cat)
+exec </dev/null 3>/dev/null > >(cat) 2>&1
 
 . Built/sandbox_config_sh
 
