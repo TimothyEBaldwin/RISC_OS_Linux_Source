@@ -436,8 +436,8 @@ int main(void) {
 
 #include "syscall_list.h"
 
-  swi("IXSupport_LinuxSyscall", 0xC0200);
-  swi("IXSupport_ConvertError", 0xC0204);
+  swi("IXSupport_LinuxSyscall", 0x59EC0);
+  swi("IXSupport_ConvertError", 0x59EC1);
 
   fputs("\n END\n", ass);
 
