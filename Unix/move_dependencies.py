@@ -15,11 +15,14 @@
 # limitations under the License.
 #
 
+# Runs on Python 3 on unix or possibly Windows.
+# Run with path to "RiscOS" directory as first argument
 
 import os
+import sys
 import glob
 
-os.chdir("RiscOS")
+os.chdir(sys.argv[1])
 
 def paths():
     with open("BuildSys/ModuleDB") as components:
@@ -29,10 +32,6 @@ def paths():
                 continue
             component = component.split()
             yield component[2].replace(".", "/").replace("^", "..")
-
-#    for path in glob.iglob("Sources/SystemRes/InetRes/Sources/*/"):
-#        yield path
-
 
 for path in paths():
     try:
@@ -51,7 +50,7 @@ for path in paths():
 
                 # Record location to truncate to
                 # But not for blank lines the follow lanes that begin with "include"
-                if not include_last or line == b"\n":
+                if not include_last or line != b"\n":
                     p = mf.tell()
                     include_last = line.startswith(b"include")
 
