@@ -26,5 +26,4 @@ COMPONENT   ?= Obey
 
 include StdTools
 include AAsmModule
-
 include Depends

@@ -32,5 +32,4 @@ ASFLAGS    = ${OPTIONS}
 
 include StdTools
 include AAsmModule
-
 include Depends

@@ -27,5 +27,4 @@ ROM_SOURCE = GetAll.s
 
 include StdTools
 include AAsmModule
-
 include Depends

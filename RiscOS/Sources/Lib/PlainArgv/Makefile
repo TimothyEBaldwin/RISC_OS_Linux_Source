@@ -20,5 +20,4 @@ OBJS      = ToBuffer StrTok Get Find CopyPArgv CFilename
 HDRS      = PlainArgv StrTok
 
 include CLibrary
-
 include Depends

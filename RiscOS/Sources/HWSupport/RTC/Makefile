@@ -38,5 +38,4 @@ CMHGAUTOHDR = RTC
 LIBS        = ${ASMUTILS}
 
 include CModule
-
 include Depends

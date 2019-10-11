@@ -23,5 +23,4 @@ OBJS        = compress comp_ass cssr debug \
               zcat_ass12 zssr
 
 include CModule
-
 include Depends

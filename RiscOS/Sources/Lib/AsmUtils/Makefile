@@ -22,5 +22,4 @@ HDRS      = callbacks clz escape fpsr heapswis irqs\
             modulefp muldiv osvarlen rminfo sixtyfour
 
 include CLibrary
-
 include Depends

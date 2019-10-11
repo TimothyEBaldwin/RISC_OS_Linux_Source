@@ -26,5 +26,4 @@ TARGET    = ResFiler
 
 include StdTools
 include AAsmModule
-
 include Depends

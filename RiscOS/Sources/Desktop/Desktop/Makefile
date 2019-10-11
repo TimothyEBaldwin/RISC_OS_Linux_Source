@@ -35,5 +35,4 @@ clean::
 
 include StdTools
 include AAsmModule
-
 include Depends

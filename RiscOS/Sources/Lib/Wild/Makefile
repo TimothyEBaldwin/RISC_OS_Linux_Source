@@ -24,5 +24,4 @@ HDRS      = Replace Wild
 CDEFINES  = -DNDEBUG
 
 include CLibrary
-
 include Depends

@@ -29,5 +29,4 @@ endif
 
 include StdTools
 include AAsmModule
-
 include Depends

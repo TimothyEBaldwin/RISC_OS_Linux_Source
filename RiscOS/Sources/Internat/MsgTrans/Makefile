@@ -34,5 +34,4 @@ ASDFLAGS  =\
 
 include StdTools
 include AAsmModule
-
 include Depends

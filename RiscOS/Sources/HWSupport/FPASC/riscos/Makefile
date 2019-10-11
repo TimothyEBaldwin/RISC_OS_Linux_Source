@@ -66,5 +66,4 @@ symlink_extra:
 endif
 
 include AAsmModule
-
 include Depends

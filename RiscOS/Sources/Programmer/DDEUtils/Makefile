@@ -21,5 +21,4 @@ HEADER1   = DDEUtils
 
 include StdTools
 include AAsmModule
-
 include Depends

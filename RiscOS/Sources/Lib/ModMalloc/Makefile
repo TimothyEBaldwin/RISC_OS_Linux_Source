@@ -20,5 +20,4 @@ OBJS      = modm
 HDRS      = ModMalloc
 
 include CLibrary
-
 include Depends

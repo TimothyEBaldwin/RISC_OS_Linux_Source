@@ -29,5 +29,4 @@ TARGET    = SystemDevs
 
 include StdTools
 include AAsmModule
-
 include Depends

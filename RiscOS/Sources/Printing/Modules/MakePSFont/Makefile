@@ -27,5 +27,4 @@ HDRS        =
 ASMHDRS     = MakePSFont
 
 include CModule
-
 include Depends

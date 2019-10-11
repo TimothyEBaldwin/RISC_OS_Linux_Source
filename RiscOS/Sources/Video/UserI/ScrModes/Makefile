@@ -26,5 +26,4 @@ CMHGDEPENDS   = ScrModes
 RESFSDIR      = ${RESDIR}.ScreenMode
 
 include CModule
-
 include Depends

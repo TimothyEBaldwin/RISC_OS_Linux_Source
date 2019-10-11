@@ -26,5 +26,4 @@ CINCLUDES     = -IC:tboxlibint,tbox:,C:
 LIBS          = ${TBOXINTLIB} ${WIMPLIB}
 
 include CModule
-
 include Depends
