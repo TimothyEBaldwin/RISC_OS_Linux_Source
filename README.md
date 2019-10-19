@@ -119,11 +119,11 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 - [x] Support writing timestamps in IXFS.
 - [x] Support reading timestamps in IXFS to centisecond resolution.
 - [x] Test timestamps.
-- [ ] Add sound modules.
+- [x] Add sound modules.
 - [ ] Add sound output.
-- [ ] Officially allocate names and SWI numbers etc.
+- [x] Officially allocate names and SWI numbers etc.
 - [x] Fix failure to truncate of unbuffered files when opened for output, and associated race condition.
-- [ ] Fix spurious calls of FSEntry_Args 6 (flush file to disc) when files are closed.
+- [x] Fix spurious calls of FSEntry_Args 6 (flush file to disc) when files are closed.
 - [ ] Perform proper error handling in IXFS.
 - [x] Split video keyboard and mouse driver into separate module.
 - [ ] Detect screen updates to avoid copying full screen 20 times a second.
