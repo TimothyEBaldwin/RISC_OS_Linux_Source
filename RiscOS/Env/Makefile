@@ -29,3 +29,8 @@ bbe-env: bbe-generic-resources-get-alias
 FIXED = no
 find-amu-version:
 	@set BuildSys$AMU$Fixed ${FIXED}
+	@amu -help { > <Wimp$ScrapDir>.amu }
+	@GNU.gawk "NR==2 { print \"Set AMU$Version \"  $3*100 }" { < <Wimp$ScrapDir>.amu > Pipe:$.amu }
+	@remove <Wimp$ScrapDir>.amu
+	@obey Pipe:$.amu
+	@set AMU$HasWorkingWildcard <AMU$Version> > 532
