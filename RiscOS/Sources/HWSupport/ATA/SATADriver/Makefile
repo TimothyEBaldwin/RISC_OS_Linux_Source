@@ -34,4 +34,4 @@ expasmc.AHCIDevice: hdr.AHCIDevice h.AHCIDevice
 	${HDR2H} hdr.AHCIDevice ${C_EXP_HDR}.AHCIDevice
 	FAppend ${C_EXP_HDR}.AHCIDevice h.AHCIDevice ${C_EXP_HDR}.AHCIDevice
 
-include Depends
+# Dynamic dependencies:

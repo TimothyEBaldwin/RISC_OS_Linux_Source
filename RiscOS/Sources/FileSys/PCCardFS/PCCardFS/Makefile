@@ -42,4 +42,5 @@ OBJS       = \
  Variables   \
 
 include CModule
-include Depends
+
+# Dynamic dependencies:

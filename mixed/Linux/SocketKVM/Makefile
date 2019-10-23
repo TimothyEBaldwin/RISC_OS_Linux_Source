@@ -30,5 +30,3 @@ CFLAGS += -Wpn -IOSLib:
 
 ${DIRS} ::
 	${MKDIR} h
-
-include Depends

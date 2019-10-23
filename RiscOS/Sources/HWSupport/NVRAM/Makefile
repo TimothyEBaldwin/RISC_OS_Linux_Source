@@ -132,4 +132,4 @@ ${EXP_H}.${COMPONENT}: export.h.${COMPONENT}
 ${EXP_HDR}.${COMPONENT}: export.hdr.${COMPONENT}
 	${CP} export.hdr.${COMPONENT} $@ ${CPFLAGS}
 
-include Depends
+# Dynamic dependencies:

@@ -74,4 +74,4 @@ main.o:     icons/dialogue_i.h icons/cmyk_i.h icons/hsv_i.h icons/rgb_i.h
 model.o:    icons/dialogue_i.h
 rgb.o:      icons/dialogue_i.h icons/rgb_i.h
 
-include Depends
+# Dynamic dependencies:

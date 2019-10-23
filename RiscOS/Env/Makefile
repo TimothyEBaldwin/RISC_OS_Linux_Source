@@ -14,6 +14,8 @@
 #
 # Makefile for the Build System Binary Build Environment
 #
+# $Id$
+#
 
 BBETYPE = env
 bbe-env: bbe-generic-resources-get-alias
@@ -21,9 +23,3 @@ bbe-env: bbe-generic-resources-get-alias
 	BBE_Export_File !Common
 	${CP} MakefileBBE ${BBEDIR}.Makefile ${CPFLAGS}
 	BBE_Export_File VersionNum
-
-
-# Determine whether the macro processor in amu works or not
-FIXED = no
-find-amu-version:
-	@set BuildSys$AMU$Fixed ${FIXED}

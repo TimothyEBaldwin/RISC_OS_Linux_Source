@@ -63,19 +63,17 @@ clean::
 	${WIPE} s ${WFLAGS}
 	${RM} keygen
 	${RM} keyconvert
-	${RM} keygenDepends
+	${STRIPDEPEND} keygen_mk
 	@echo ${COMPONENT}: cleaned
 
 keygen: keygen.c throwback.c unicdata.c
-	EnsureDepends keygenDepends
 	${MKDIR} s
-	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
+	${MAKE_SEP_DEPS} keygen_mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 keyconvert: keyconvert.c unicdata.c
-	EnsureDepends keygenDepends
 	${MKDIR} s
-	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
+	${MAKE} -f keygen_mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 install: ${LAYOUTS}
 
-include Depends
+# Dynamic dependencies:

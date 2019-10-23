@@ -21,4 +21,5 @@ RESOURCES  = no
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

@@ -41,4 +41,5 @@ CMHGDEFINES += -DNO_INTERNATIONAL_HELP
 endif
 
 include CModule
-include Depends
+
+# Dynamic dependencies:

@@ -41,4 +41,4 @@ resources-special:
 	@echo ${COMPONENT}: resource files copied
 
 
-include Depends
+# Dynamic dependencies:

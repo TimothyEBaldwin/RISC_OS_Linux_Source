@@ -138,4 +138,4 @@ dirs:
 	${MKDIR} ${EXPORTS}.h
 	${MKDIR} ${EXPORTS}.o
 #
-include Depends
+# Dynamic dependencies:

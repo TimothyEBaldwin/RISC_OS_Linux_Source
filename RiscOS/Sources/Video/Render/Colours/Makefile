@@ -38,16 +38,18 @@ include StdTools
 include AAsmModule
 
 clean::
-	${XWIPE} Tables.* ${WFLAGS}
-	${XWIPE} Palettes.* ${WFLAGS}
-	${XWIPE} MkTables.o.* ${WFLAGS}
+	${XWIPE} Tables ${WFLAGS}
+	${XWIPE} Palettes ${WFLAGS}
+	${XWIPE} MkTables.o ${WFLAGS}
 	${RM} MkTables.maketables
-	${RM} MkTables.Depends
+	${STRIPDEPEND} maketables_mk
 
 #
 # Static dependencies:
 #
 MakeTables: MkTables.maketables
+	${MKDIR} Palettes
+	${MKDIR} Tables
 	${XWIPE} Tables.* ${WFLAGS}
 	${RUN}MkTables.maketables @
 	${SQUASH} Tables.4greys
@@ -56,8 +58,7 @@ MakeTables: MkTables.maketables
 
 MkTables.maketables: MkTables.c.maketables
 	${CD} MkTables
-	EnsureDepends Depends
-	${MAKE} -f maketables/mk COMPONENT=maketables THROWBACK=${THROWBACK}
+	${MAKE_SEP_DEPS} maketables_mk COMPONENT=maketables THROWBACK=${THROWBACK}
 	${CD} ^
 
-include Depends
+# Dynamic dependencies:

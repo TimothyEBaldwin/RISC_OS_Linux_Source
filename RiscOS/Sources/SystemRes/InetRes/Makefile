@@ -269,35 +269,30 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
 
 ${SDIR}.arp.ARP: ${SDIR}.arp.c.ARP
         dir ${SDIR}.arp
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.ifconfig.IfConfig: ${SDIR}.ifconfig.c.IfConfig
         dir ${SDIR}.ifconfig
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.ifrconfig.IfRConfig: ${SDIR}.ifrconfig.c.IfRConfig
         dir ${SDIR}.ifrconfig
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.gethost.GetHost: ${SDIR}.gethost.c.gethost
         dir ${SDIR}.gethost
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.ipvars.IPVars: ${SDIR}.ipvars.c.ipvars
         dir ${SDIR}.ipvars
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
@@ -308,7 +303,6 @@ ${SDIR}.inetstat.InetStat: ${SDIR}.inetstat.c.main \
         ${SDIR}.inetstat.c.route\
         ${SDIR}.inetstat.c.mroute
         dir ${SDIR}.inetstat
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
@@ -318,7 +312,6 @@ ${SDIR}.map-mbone.Map-MBone: ${SDIR}.map-mbone.c.Map-MBone \
         ${SDIR}.map-mbone.c.inet \
         ${SDIR}.map-mbone.c.kern
         dir ${SDIR}.map-mbone
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
@@ -336,49 +329,42 @@ ${SDIR}.mrinfo.MRInfo: ${SDIR}.mrinfo.c.MRInfo \
         ${SDIR}.mrinfo.c.inet \
         ${SDIR}.mrinfo.c.kern
         dir ${SDIR}.mrinfo
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.mtrace.MTrace: ${SDIR}.mtrace.c.MTrace
         dir ${SDIR}.mtrace
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.ping.Ping: ${SDIR}.ping.c.Ping
         dir ${SDIR}.ping
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.pong.Pong: ${SDIR}.pong.c.Pong
         dir ${SDIR}.pong
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.route.Route: ${SDIR}.route.c.Route
         dir ${SDIR}.route
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.showstat.ShowStat:
         dir ${SDIR}.showstat
-        EnsureDepends Depends
         @amu_machine 
         @up
         @up
 
 ${SDIR}.sysctl.SysCtl: ${SDIR}.sysctl.c.SysCtl
         dir ${SDIR}.sysctl
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
@@ -393,51 +379,44 @@ ${SDIR}.tftp.Tftp: ${SDIR}.tftp.c.main \
 
 ${SDIR}.traceroute.TraceRoute: ${SDIR}.traceroute.c.TraceRoute
         dir ${SDIR}.traceroute
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.newfiler.NewFiler: ${SDIR}.newfiler.c.NewFiler
         dir ${SDIR}.newfiler
-        EnsureDepends Depends
         @amu_machine
         @up
         @up
 
 ${SDIR}.utils.utl.CheckMem: ${SDIR}.utils.s.CheckMem
         dir ${SDIR}.utils
-        EnsureDepends Depends
         @amu_machine utl.CheckMem
         @up
         @up
 
 ${SDIR}.utils.utl.ReadCMOSIP: ${SDIR}.utils.s.ReadCMOSIP
         dir ${SDIR}.utils
-        EnsureDepends Depends
         @amu_machine utl.ReadCMOSIP
         @up
         @up
 
 ${SDIR}.utils.utl.RMFind: ${SDIR}.utils.s.RMFind
         dir ${SDIR}.utils
-        EnsureDepends Depends
         @amu_machine utl.RMFind
         @up
         @up
 
 ${SDIR}.utils.utl.TriggerCBs: ${SDIR}.utils.s.TriggerCBs
         dir ${SDIR}.utils
-        EnsureDepends Depends
         @amu_machine utl.TriggerCBs
         @up
         @up
 
 ${SDIR}.utils.utl.X: ${SDIR}.utils.s.X
         dir ${SDIR}.utils
-        EnsureDepends Depends
         @amu_machine utl.X
         @up
         @up
 
-include Depends
+# Dynamic dependencies:

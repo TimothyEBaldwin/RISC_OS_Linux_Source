@@ -32,4 +32,5 @@ LIBS      = ${CLXLIB}
 
 include HostTools
 include CApp
-include Depends
+
+# Dynamic dependencies:

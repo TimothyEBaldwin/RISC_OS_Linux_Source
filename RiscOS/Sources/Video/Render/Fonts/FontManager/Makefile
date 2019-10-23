@@ -28,4 +28,5 @@ HEADER1   = Font
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

@@ -108,9 +108,8 @@ clean_all:
 	${XWIPE} Resources.* ${WFLAGS}
 	${XWIPE} Processed.* ${WFLAGS}
 	Dir ${UTILS}
-	EnsureDepends Depends
 	${MAKE} clean_all
-	${RM} Depends
+	${STRIPDEPEND} Makefile
 	Up
 	@echo ${COMPONENT}: all cleaned
 
@@ -119,6 +118,10 @@ resources:
 	SetMacro LocalGlobal$Path Global.<Locale>.,Global.UK.
 	${CP} LocalGlobal:Messages ${RESDIR}.<Locale>.Resources.Global.Messages ${CPFLAGS}
 	Unset LocalGlobal$Path
+	# Build utilites here, so they are ready for rom phase.
+	Dir ${UTILS}
+	amu_machine
+	Up
 	@echo ${COMPONENT}: resource files copied
 
 ${BUILTDIR}.Messages: s.LocaleList ${SOURCE} ${DATA}.Tokenised ${DIRS} force
@@ -209,12 +212,6 @@ ${DICTIONARY}:
 	${MSGEXT2} ${DICTMESS} ${DICTTAGS}
 	${TOKGEN2} ${DICTMESS} ${DICTTOKENS} ${DICTIONARY}
 
-${LOCALECHK} ${TAGEXT}:
-	Dir ${UTILS}
-	EnsureDepends Depends
-	${MAKE}
-	Up
-
 ${DIRS}:
 	${MKDIR} Data.${LOCALE}
 	${MKDIR} ${DATA}
@@ -223,4 +220,4 @@ ${DIRS}:
 	${MKDIR} rm.${BUILD}.<Build$LocaleListNumeric>
 	${TOUCH} ${DIRS}
 	
-include Depends
+# Dynamic dependencies:

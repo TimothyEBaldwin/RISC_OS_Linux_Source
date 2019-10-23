@@ -37,7 +37,6 @@ CP		= copy
 RM		= remove
 WIPE		= x wipe
 MAKE		= amu_machine
-ENSURE_DEPENDS	= EnsureDepends Depends
 
 CPFLAGS		= ~CLFNR~V
 WFLAGS		= ~CFR~V
@@ -50,29 +49,19 @@ COMPONENT	= tboxlibs
 
 clean:
 	${CD}   toolboxlib
-	${ENSURE_DEPENDS}
 	${MAKE} clean
-	${RM}   Depends
 	${CD}   ^
 	${CD}   wimplib
-	${ENSURE_DEPENDS}
 	${MAKE} clean
-	${RM}   Depends
 	${CD}   ^
 	${CD}   flexlib
-	${ENSURE_DEPENDS}
 	${MAKE} clean
-	${RM}   Depends
 	${CD}   ^
 	${CD}   eventlib
-	${ENSURE_DEPENDS}
 	${MAKE} clean
-	${RM}   Depends
 	${CD}   ^
 	${CD}   renderlib
-	${ENSURE_DEPENDS}
 	${MAKE} clean
-	${RM}   Depends
 	${CD}   ^
 	@echo	Library $(COMPONENT): clean complete.
 
@@ -81,23 +70,18 @@ export:	export_$(PHASE)
 
 export_hdrs:
 	${CD}   toolboxlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=hdrs
 	${CD}   ^
 	${CD}   wimplib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=hdrs
 	${CD}   ^
 	${CD}   flexlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=hdrs
 	${CD}   ^
 	${CD}   eventlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=hdrs
 	${CD}   ^
 	${CD}   renderlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=hdrs
 	${CD}   ^
 	${CP}   VersionNum ${LIBDIR}.tboxlibs.LibVersion ${CPFLAGS}
@@ -106,23 +90,18 @@ export_hdrs:
 
 export_libs:
 	${CD}   toolboxlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=libs
 	${CD}   ^
 	${CD}   wimplib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=libs
 	${CD}   ^
 	${CD}   flexlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=libs
 	${CD}   ^
 	${CD}   eventlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=libs
 	${CD}   ^
 	${CD}   renderlib
-	${ENSURE_DEPENDS}
 	${MAKE} export PHASE=libs
 	${CD}   ^
 	@echo	Library $(COMPONENT): export libraries complete.
@@ -134,4 +113,4 @@ install:
 	@echo ${COMPONENT}: installed
 
 
-include Depends
+# Dynamic dependencies:

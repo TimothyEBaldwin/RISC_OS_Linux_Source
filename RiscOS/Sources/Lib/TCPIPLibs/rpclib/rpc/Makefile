@@ -116,4 +116,4 @@ clean:
         ${RM}   rpclib
         ${RM}   rpclibzm
 
-include Depends
+# Dynamic dependencies:

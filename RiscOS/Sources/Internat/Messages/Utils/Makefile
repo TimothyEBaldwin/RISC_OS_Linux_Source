@@ -76,5 +76,3 @@ ResCommon: o.ResCommon ${DIRS}
 
 LocaleChk: o.LocaleChk ${DIRS}
 	${LD} ${LDFLAGS} -o $@ o.LocaleChk ${CLIB}
-
-include Depends

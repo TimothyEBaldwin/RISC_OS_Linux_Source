@@ -138,4 +138,4 @@ bbe-help2: bbe-generic
 
 
 #---------------------------------------------------------------------------
-include Depends
+# Dynamic dependencies:

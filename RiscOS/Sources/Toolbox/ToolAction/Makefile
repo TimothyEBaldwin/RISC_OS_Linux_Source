@@ -53,4 +53,4 @@ o.ToolAction: Documents.def.ToolAction
 	${RM} viafile
 	${XWIPE} Defmod ${WFLAGS}
 
-include Depends
+# Dynamic dependencies:

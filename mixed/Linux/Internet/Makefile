@@ -29,5 +29,3 @@ ${DIRS} ::
 	${MKDIR} h
 
 CFLAGS += -Wpn -ITCPIPLibs:
-
-include Depends

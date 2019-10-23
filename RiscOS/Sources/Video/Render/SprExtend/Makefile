@@ -99,7 +99,6 @@ export: hdr.SprExtend
 	@${ECHO} ${COMPONENT}: export complete
 
 clean:
-	${RM} utilDepends
 	${RM} ${ROM_TARGET}
 	${RM} ${RAM_TARGET}
 	${RM} ${GENPALETTE}
@@ -109,6 +108,7 @@ clean:
 	${XWIPE} oh ${WFLAGS}
 	${XWIPE} od ${WFLAGS}
 	${XWIPE} s.* ${WFLAGS}
+	${STRIPDEPEND} util_mk
 	@${ECHO} ${COMPONENT}: cleaned
 
 resources:
@@ -130,16 +130,13 @@ jhdr.s: ${GENJHDR}
 	${RUN}${GENJHDR} > $@
 
 ${GENPALETTE}: genpalette.c
-	EnsureDepends utilDepends
-	${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
+	${MAKE_SEP_DEPS} util_mk COMPONENT=genpalette THROWBACK=${THROWBACK}
 
 ${GENYUVTABS}: genyuvtabs.c
-	EnsureDepends utilDepends
-	${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
+	${MAKE_SEP_DEPS} util_mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
 ${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
-	EnsureDepends utilDepends
-	${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
+	${MAKE_SEP_DEPS} util_mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
 # Static dependencies:
@@ -168,4 +165,4 @@ asmcore.o:
 	${MKDIR} o
 	${CC} ${CFLAGS} $*.c
 
-include Depends
+# Dynamic dependencies:

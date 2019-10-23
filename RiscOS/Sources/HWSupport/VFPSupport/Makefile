@@ -96,4 +96,4 @@ clean::
 	${RM} c.classify
 	${RM} h.shared
 
-include Depends
+# Dynamic dependencies:

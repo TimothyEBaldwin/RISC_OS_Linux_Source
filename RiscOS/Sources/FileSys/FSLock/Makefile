@@ -36,10 +36,9 @@ install_rom: rom_common
 clean::
 	${XWIPE} od ${WFLAGS}
 	${RM} scrambler
-	${RM} scramblerDepends
+	${STRIPDEPEND} scrambler_mk
 
 scrambler: scrambler.c
-	EnsureDepends scramblerDepends
-	${MAKE} -f scrambler/mk THROWBACK=${THROWBACK}
+	${MAKE_SEP_DEPS} scrambler_mk THROWBACK=${THROWBACK}
 
-include Depends
+# Dynamic dependencies:

@@ -33,4 +33,4 @@ include CModule
 CFLAGS      += -wp -DAUTH32 -DCOMPAT_INET4
 CDFLAGS     += -DDEBUG -DDEBUGSER
 
-include Depends
+# Dynamic dependencies:

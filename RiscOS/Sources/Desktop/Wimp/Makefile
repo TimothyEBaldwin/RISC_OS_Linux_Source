@@ -90,4 +90,4 @@ bbe-wimp: bbe-generic-resources-get-alias
 	BBE_Export_Dir Resources.${LOCALE}.${USERIF}
 	BBE_Export_File VersionNum
 
-include Depends
+# Dynamic dependencies:

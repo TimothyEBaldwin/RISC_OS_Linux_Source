@@ -60,4 +60,4 @@ ${AIFDBG}: ${ROM_OBJS_} ${ROM_LIBS}
 ${GPADBG}: ${AIFDBG}
 	ToGPA -s ${AIFDBG} ${GPADBG}
 
-include Depends
+# Dynamic dependencies:

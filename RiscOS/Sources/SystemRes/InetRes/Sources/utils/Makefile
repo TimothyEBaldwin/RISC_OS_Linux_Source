@@ -93,4 +93,4 @@ utl.ReadCMOSIP: o.ReadCMOSIP
 
 
 #---------------------------------------------------------------------------
-include Depends
+# Dynamic dependencies:

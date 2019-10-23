@@ -25,4 +25,5 @@ COMPONENT = RAMFSFiler
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

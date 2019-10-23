@@ -47,4 +47,4 @@ ${AUN_MODULE}: ${FILELIST} VersionNum
 	${GETVERSION} AUNMsgs$BuildV AUNMsgs$FullV AUNMsgs$Date
 	${DO} ${MODGEN} -date "<AUNMsgs$Date>" $@ ${COMPONENT} ${MODULE_HELP} <AUNMsgs$BuildV> -via ${FILELIST}
 
-include Depends
+# Dynamic dependencies:

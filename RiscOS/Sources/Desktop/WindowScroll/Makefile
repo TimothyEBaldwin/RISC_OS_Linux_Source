@@ -51,4 +51,4 @@ include CModule
 ROM_SYMS        = ${ABSSYM}
 SA_LIBS         += ${RLIB}
 
-include Depends
+# Dynamic dependencies:

@@ -49,4 +49,4 @@ swis_e.o:
 io_e.o:
 	${CC} -DEDDS ${CFLAGS} -o $@ io.c
 
-include Depends
+# Dynamic dependencies:

@@ -37,4 +37,4 @@ export_hdrs:: ^.hdr.PDumper
 	${CP} ^.hdr.PDumper ${EXP_HDR}.PDumper ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: header export complete
 
-include Depends
+# Dynamic dependencies:

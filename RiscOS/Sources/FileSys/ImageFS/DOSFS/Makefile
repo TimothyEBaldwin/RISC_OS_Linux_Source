@@ -35,4 +35,4 @@ DBG_LIBS    += ${NET5LIBS}
 CFLAGS      += -DNONFLOPPIES
 CDFLAGS     += -DDEBUGLIB
 
-include Depends
+# Dynamic dependencies:

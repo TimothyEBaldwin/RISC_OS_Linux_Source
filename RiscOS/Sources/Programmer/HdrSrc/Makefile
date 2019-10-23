@@ -332,4 +332,4 @@ ${HDRDIR}.Symbols:           hdr.Symbols;           ${CP} hdr.Symbols           
 ${HDRDIR}.System:            hdr.System;            ${CP} hdr.System               $@ ${CPFLAGS}
 ${HDRDIR}.Tokens:            hdr.Tokens;            ${CP} hdr.Tokens               $@ ${CPFLAGS}
 
-include Depends
+# Dynamic dependencies:

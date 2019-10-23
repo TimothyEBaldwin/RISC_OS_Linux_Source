@@ -890,4 +890,4 @@ m_o_rl.trace: rlib.c.trace
 rm_o_rl.trace: rlib.c.trace
 	${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${STK_EXTN} ${OPTIONS} -DTRACE -o rm_o_rl.trace rlib.c.trace
 
-include Depends
+# Dynamic dependencies:

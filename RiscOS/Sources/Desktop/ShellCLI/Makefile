@@ -30,4 +30,5 @@ HEADER1   = Shell
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

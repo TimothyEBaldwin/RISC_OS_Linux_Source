@@ -26,4 +26,5 @@ CDEFINES   = -DNDEBUG
 ASMDEFINES = -pd "Desk_AS_EMBED_FNNAMES SETA 0"
 
 include CLibrary
-include Depends
+
+# Dynamic dependencies:

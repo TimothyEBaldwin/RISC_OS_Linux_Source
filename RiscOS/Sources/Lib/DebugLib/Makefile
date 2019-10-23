@@ -22,4 +22,5 @@ OBJS      = debug serial_lib buffering misc options debugit file \
 HDRS      = DebugLib
 
 include CLibrary
-include Depends
+
+# Dynamic dependencies:

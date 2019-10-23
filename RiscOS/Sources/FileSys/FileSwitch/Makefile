@@ -37,4 +37,5 @@ HELPSRC     = HelpSrc
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

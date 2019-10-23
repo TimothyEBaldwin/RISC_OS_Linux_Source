@@ -40,4 +40,4 @@ export_libs:
 ${EXPORTDIR}${SEP}DDT: hdr${SEP}DDT
 	${CP} hdr${SEP}DDT $@ ${CPFLAGS}
 
-include Depends
+# Dynamic dependencies:

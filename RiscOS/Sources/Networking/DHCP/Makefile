@@ -41,4 +41,4 @@ include CModule
 
 CFLAGS      += -wp
 
-include Depends
+# Dynamic dependencies:

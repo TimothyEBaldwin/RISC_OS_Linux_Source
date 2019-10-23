@@ -78,4 +78,4 @@ GetHost: ${OBJS} ${NET5LIBS} ${CLIB} ${DIRS}
         ${SQUEEZE} $@
 
 
-include Depends
+# Dynamic dependencies:

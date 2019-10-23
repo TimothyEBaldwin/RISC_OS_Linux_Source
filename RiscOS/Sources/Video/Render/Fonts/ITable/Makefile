@@ -23,4 +23,5 @@ ROM_LIBS  = ${ASMUTILS}
 include StdTools
 include ModuleLibs
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

@@ -28,4 +28,5 @@ ROM_SOURCE = Front.s
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:

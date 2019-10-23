@@ -24,33 +24,33 @@ PHASES=export_hdrs export_libs resources rom install_rom join
 
 .PHONY: update-binary build check fast
 
-all check: Build/$(TARGET)/RiscOS/Images/rom_check
-build: Build/$(TARGET)/RiscOS/Images/rom
+all check: Build2/$(TARGET)/RiscOS/Images/rom_check
+build: Build2/$(TARGET)/RiscOS/Images/rom
 
 ifeq ($(TARGET), Linux)
 all check: RISC_OS
 endif
 
-build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build/$* /dev/fd/5/Build/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
+build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build2/$* /dev/fd/5/Build2/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
-Build/src-stamp: $(shell find Unix RiscOS mixed)
+Build2/src-stamp: $(shell find Unix RiscOS mixed)
 	ln -sfn . lock_source_1510718522
-	mkdir -p Build
-	touch Build/src-stamp
+	mkdir -p Build2
+	touch Build2/src-stamp
 
 ifeq ($(METHOD), rpcemu)
-Build/%/RiscOS/Images/rom: Build/src-stamp | Built/rpcemu/rpcemu Built/boot_iomd_rom
+Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/rpcemu/rpcemu Built/boot_iomd_rom
 else ifeq ($(INSECURE), YES)
-Build/%/RiscOS/Images/rom: Build/src-stamp | ${LINUX_ROM}
+Build2/%/RiscOS/Images/rom: Build2/src-stamp | ${LINUX_ROM}
 else
-Build/%/RiscOS/Images/rom: Build/src-stamp | Built/sandbox_config_sh ${LINUX_ROM}
+Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/sandbox_config_sh ${LINUX_ROM}
 endif
 	set -o pipefail
 	uname -a
 	export COMMIT="$$(git rev-parse HEAD)"
 	echo Building GIT commit: $$COMMIT
 	#
-	mkdir -p Build/$*
+	mkdir -p Build2/$*
 	setup_build() {
 	  #
 	  # Find directories and files
@@ -59,7 +59,7 @@ endif
 	  dirs=({Unix,RiscOS,mixed}/**/)
 	  files=({Unix,RiscOS,mixed}/**)
 	  #
-	  cd Build/$*
+	  cd Build2/$*
 	  #
 	  # Remove old output
 	  ! rm RiscOS/Images/rom*
@@ -119,28 +119,28 @@ else
 	. Built/sandbox_config_sh
 	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
 endif
-	find Build/$*/RiscOS/Images -type l -delete
-	! mv 'Build/$*/RiscOS/Images/rom',??? 'Build/$*/RiscOS/Images/rom'
-	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build/$*/RiscOS/Images/rom'
+	find Build2/$*/RiscOS/Images -type l -delete
+	! mv 'Build2/$*/RiscOS/Images/rom',??? 'Build2/$*/RiscOS/Images/rom'
+	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build2/$*/RiscOS/Images/rom'
 	true
 
-Build/IOMD32/RiscOS/Images/rom_check: Build/IOMD32/RiscOS/Images/rom Built/rpcemu/rpcemu
-	Unix/LinuxSupport/test_runner_rpcemu.sh Build/IOMD32/RiscOS/Images/rom
-	touch Build/IOMD32/RiscOS/Images/rom_check
+Build2/IOMD32/RiscOS/Images/rom_check: Build2/IOMD32/RiscOS/Images/rom Built/rpcemu/rpcemu
+	Unix/LinuxSupport/test_runner_rpcemu.sh Build2/IOMD32/RiscOS/Images/rom
+	touch Build2/IOMD32/RiscOS/Images/rom_check
 
 ifeq ($(INSECURE), YES)
-Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom
-	chmod +x Build/Linux/RiscOS/Images/rom
-	touch Build/Linux/RiscOS/Images/rom_check
+Build2/Linux/RiscOS/Images/rom_check: Build2/Linux/RiscOS/Images/rom
+	chmod +x Build2/Linux/RiscOS/Images/rom
+	touch Build2/Linux/RiscOS/Images/rom_check
 else
-Build/Linux/RiscOS/Images/rom_check: Build/Linux/RiscOS/Images/rom Built/sandbox_config_sh
-	chmod +x Build/Linux/RiscOS/Images/rom
-	Unix/LinuxSupport/test_runner_linux.sh Build/Linux/RiscOS/Images/rom
-	touch Build/Linux/RiscOS/Images/rom_check
+Build2/Linux/RiscOS/Images/rom_check: Build2/Linux/RiscOS/Images/rom Built/sandbox_config_sh
+	chmod +x Build2/Linux/RiscOS/Images/rom
+	Unix/LinuxSupport/test_runner_linux.sh Build2/Linux/RiscOS/Images/rom
+	touch Build2/Linux/RiscOS/Images/rom_check
 endif
 
-RISC_OS: Build/Linux/RiscOS/Images/rom_check
-	cp --remove-destination --preserve=mode,xattr --reflink=auto Build/Linux/RiscOS/Images/rom Built/RISC_OS
+RISC_OS: Build2/Linux/RiscOS/Images/rom_check
+	cp --remove-destination --preserve=mode,xattr --reflink=auto Build2/Linux/RiscOS/Images/rom Built/RISC_OS
 	ln -sf Built/RISC_OS RISC_OS
 
 fast: PHASES=install_rom join

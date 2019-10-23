@@ -251,4 +251,4 @@ export_hdrs: ${EXPORTING_HDRS} create_exp_hdr_dirs
 export_libs: ${EXPORTING_LIBS} ${TARGET_LIBS} ${TARGET_LIBS}32 create_exp_lib_dir
         @${ECHO} ${COMPONENT}: library export complete
 
-include Depends
+# Dynamic dependencies:

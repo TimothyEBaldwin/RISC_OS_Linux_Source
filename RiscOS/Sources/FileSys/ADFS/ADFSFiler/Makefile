@@ -89,4 +89,4 @@ resources_SCSIFiler: ${WANTTEMPLATES}
 resources_SDFSFiler: ${WANTTEMPLATES}
 	${CP} Resources.SDFS.${USERIF} ${RESFSDIR}.Sprites ${CPFLAGS}
 
-include Depends
+# Dynamic dependencies:

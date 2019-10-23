@@ -49,5 +49,3 @@ rom_link: ${ROM_OBJS_} ${ROM_LIBS} ${ROMCSTUBS} ${FORCEROMLINK} ${DIRS} ${ROM_DE
 clean::
 	${RM} s.errors
 	${RM} mkerrors
-
-include Depends

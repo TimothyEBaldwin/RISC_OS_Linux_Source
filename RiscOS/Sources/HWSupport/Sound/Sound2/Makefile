@@ -30,4 +30,5 @@ RESFSDIR  = ${RESDIR}.SoundSched
 
 include StdTools
 include AAsmModule
-include Depends
+
+# Dynamic dependencies:
