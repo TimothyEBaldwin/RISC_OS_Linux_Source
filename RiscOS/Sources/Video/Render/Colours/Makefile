@@ -38,15 +38,18 @@ include StdTools
 include AAsmModule
 
 clean::
-	${XWIPE} Tables.* ${WFLAGS}
-	${XWIPE} Palettes.* ${WFLAGS}
-	${XWIPE} MkTables.o.* ${WFLAGS}
+	${XWIPE} Tables ${WFLAGS}
+	${XWIPE} Palettes ${WFLAGS}
+	${XWIPE} MkTables.o ${WFLAGS}
 	${RM} MkTables.maketables
+	${STRIPDEPEND} maketables/mk
 
 #
 # Static dependencies:
 #
 MakeTables: MkTables.maketables
+	${MKDIR} Palettes
+	${MKDIR} Tables
 	${XWIPE} Tables.* ${WFLAGS}
 	${RUN}MkTables.maketables @
 	${SQUASH} Tables.4greys
