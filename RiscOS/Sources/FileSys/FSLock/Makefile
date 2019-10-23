@@ -36,6 +36,7 @@ install_rom: rom_common
 clean::
 	${XWIPE} od ${WFLAGS}
 	${RM} scrambler
+	${STRIPDEPEND} scrambler/mk
 
 scrambler: scrambler.c
 	${MAKE} -f scrambler/mk THROWBACK=${THROWBACK}
