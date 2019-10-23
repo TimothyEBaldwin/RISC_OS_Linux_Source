@@ -40,6 +40,7 @@ clean::
 	${RM} Matrix2
 	@${RM} s.Matrix1
 	@${RM} s.Matrix2
+	${STRIPDEPEND} matrix/mk
 
 ${ROM_OBJECT} ${SA_OBJECT} ${DBG_OBJECT}: ${MATRIX1} ${MATRIX2}
 
