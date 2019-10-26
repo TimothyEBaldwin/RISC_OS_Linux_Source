@@ -79,93 +79,93 @@ GENYUVTABS = utils.genyuvtabs
 install: install_${TARGET}; @
 
 install_SprExtend: ${RAM_TARGET}
-        ${MKDIR} ${INSTDIR}
-        ${CP} ${RAM_TARGET} ${INSTDIR}.SprExtend ${CPFLAGS}
-        @${ECHO} ${COMPONENT}: ram module installed
+	${MKDIR} ${INSTDIR}
+	${CP} ${RAM_TARGET} ${INSTDIR}.SprExtend ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: ram module installed
 
 install_rom: ${ROM_TARGET}
-        ${MKDIR} ${INSTDIR}
-        ${CP} ${ROM_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
-        @${ECHO} ${COMPONENT}: rom module installed
+	${MKDIR} ${INSTDIR}
+	${CP} ${ROM_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: rom module installed
 
 rom: ${ROM_TARGET}
-        @${ECHO} ${COMPONENT}: rom module built
+	@${ECHO} ${COMPONENT}: rom module built
 
 standalone: ${RAM_TARGET}
-        @${ECHO} ${COMPONENT}: ram module built
+	@${ECHO} ${COMPONENT}: ram module built
 
 export: hdr.SprExtend
-        ${CP} hdr.SprExtend ${EXP_HDR}.SprExtend ${CPFLAGS}
-        @${ECHO} ${COMPONENT}: export complete
+	${CP} hdr.SprExtend ${EXP_HDR}.SprExtend ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: export complete
 
 clean:
-        ${RM} utilDepends
-        ${RM} ${ROM_TARGET}
-        ${RM} ${RAM_TARGET}
-        ${RM} ${GENPALETTE}
-        ${RM} ${GENYUVTABS}
-        ${RM} ${GENJHDR}
-        ${XWIPE} o ${WFLAGS}
-        ${XWIPE} oh ${WFLAGS}
-        ${XWIPE} od ${WFLAGS}
-        ${XWIPE} s.* ${WFLAGS}
-        @${ECHO} ${COMPONENT}: cleaned
+	${RM} utilDepends
+	${RM} ${ROM_TARGET}
+	${RM} ${RAM_TARGET}
+	${RM} ${GENPALETTE}
+	${RM} ${GENYUVTABS}
+	${RM} ${GENJHDR}
+	${XWIPE} o ${WFLAGS}
+	${XWIPE} oh ${WFLAGS}
+	${XWIPE} od ${WFLAGS}
+	${XWIPE} s.* ${WFLAGS}
+	@${ECHO} ${COMPONENT}: cleaned
 
 resources:
-        ${MKDIR} ${RESDIR}.${TARGET}
-        ${TOKENCHECK} LocalRes:Messages
-        ${CP} LocalRes:Messages  ${RESDIR}.${TARGET}.Messages  ${CPFLAGS}
-        @${ECHO} ${COMPONENT}: resource files copied
+	${MKDIR} ${RESDIR}.${TARGET}
+	${TOKENCHECK} LocalRes:Messages
+	${CP} LocalRes:Messages  ${RESDIR}.${TARGET}.Messages  ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: resource files copied
 
 #
 # Generate the SFILES:
 #
 yuvtabs.s: ${GENYUVTABS}
-        ${RUN}${GENYUVTABS} > $@
+	${RUN}${GENYUVTABS} > $@
 
 stdpalette.s: ${GENPALETTE}
-        ${RUN}${GENPALETTE} > $@
+	${RUN}${GENPALETTE} > $@
 
 jhdr.s: ${GENJHDR}
-        ${RUN}${GENJHDR} > $@
+	${RUN}${GENJHDR} > $@
 
 ${GENPALETTE}: genpalette.c
 	EnsureDepends utilDepends
-        ${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
+	${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
 
 ${GENYUVTABS}: genyuvtabs.c
 	EnsureDepends utilDepends
-        ${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
+	${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
 ${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
 	EnsureDepends utilDepends
-        ${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
+	${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
 # Static dependencies:
 #
 ${ROM_OBJECT}: ${OBJS} ${SFILES}
-        ${MKDIR} o
-        ${AS} ${ASFLAGS} -o $@ ${OBJS}
+	${MKDIR} o
+	${AS} ${ASFLAGS} -o $@ ${OBJS}
 
 ${ROM_TARGET}: ${ROM_OBJECT} ${IJGFILES} asmcore.o
-        ${LD} -o $@ -rmf ${ROM_OBJECT} ${IJGFILES} asmcore.o
+	${LD} -o $@ -rmf ${ROM_OBJECT} ${IJGFILES} asmcore.o
 
 ${RAM_OBJECT}: ${OBJS} ${SFILES}
-        ${MKDIR} o
-        ${AS} ${ASFLAGS} -PD "standalone SETL {TRUE}" -o $@ ${OBJS}
+	${MKDIR} o
+	${AS} ${ASFLAGS} -PD "standalone SETL {TRUE}" -o $@ ${OBJS}
 
 ${RAM_TARGET}: ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o 
-        ${LD} -o $@ -rmf ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o 
-        ${MODSQZ} $@
+	${LD} -o $@ -rmf ${RAM_OBJECT} ${IJGFILES} asmcore.o resmsg.o
+	${MODSQZ} $@
 
 resmsg.o: LocalRes:Messages
-        ${TOKENCHECK} LocalRes:Messages
-        ${MKDIR} o
-        ${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
+	${TOKENCHECK} LocalRes:Messages
+	${MKDIR} o
+	${RESGEN} resfsarea o.resmsg LocalRes:Messages Resources.SprExtend.Messages
 
 asmcore.o:
-        ${MKDIR} o
-        ${CC} ${CFLAGS} $*.c
+	${MKDIR} o
+	${CC} ${CFLAGS} $*.c
 
 include Depends
