@@ -28,7 +28,7 @@ COMPONENT    ?= Debugger
 
 ifeq ("${COMPONENT}","Debugger")
 HELPSRC       = HelpSrc
-TOKENSOURCE   = TokHelpSrc
+TOKENSOURCE   = s.TokHelpSrc
 TOKHELPSRC    = ${TOKENSOURCE}
 ASMHDRS       = Debugger
 OBJS          = Debugger util dis2_vfp support exc
@@ -137,6 +137,6 @@ TOKENS     ?= Hdr:Tokens
 ${TOKENSOURCE}: ${HELPSRC} ${TOKENS}
 	${TOKENISE} ${TOKENS} ${HELPSRC} $@
 
-Debugger.s: ${TOKENSOURCE}
+Debugger.o: ${TOKENSOURCE}
 
 # Dynamic dependencies:
