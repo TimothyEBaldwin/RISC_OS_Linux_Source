@@ -33,4 +33,4 @@ find-amu-version:
 	@GNU.gawk "NR==2 { print \"Set AMU$Version \"  $3*100 }" { < <Wimp$ScrapDir>.amu > Pipe:$.amu }
 	@remove <Wimp$ScrapDir>.amu
 	@obey Pipe:$.amu
-	@set AMU$HasWorkingWildcard <AMU$Version> > 532
+	@seteval AMU$HasWorkingWildcard <AMU$Version> > 532
