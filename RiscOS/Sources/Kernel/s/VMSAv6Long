@@ -1,0 +1,507 @@
+; Copyright 2009 Castle Technology Ltd
+; Copyright 2021 RISC OS Open Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; VMSAv6+ "long descriptor" page table support
+
+        ; Convert given page flags to the equivalent temp uncacheable L3PT flags
+        MACRO
+        GetTempUncache $out, $pageflags, $pcbtrans, $temp
+        ASSERT  $out <> $pageflags
+        ASSERT  $out <> $pcbtrans
+        ASSERT  $out <> $temp
+        ASSERT  $temp <> $pcbtrans
+        ASSERT  DynAreaFlags_CPBits = 7*XCB_P :SHL: 10
+        ASSERT  DynAreaFlags_NotCacheable = XCB_NC :SHL: 4
+        ASSERT  DynAreaFlags_NotBufferable = XCB_NB :SHL: 4
+        AND     $out, $pageflags, #DynAreaFlags_NotCacheable + DynAreaFlags_NotBufferable
+        AND     $temp, $pageflags, #DynAreaFlags_CPBits
+        ORR     $out, $out, #XCB_TU<<4                      ; treat as temp uncacheable
+        ORR     $out, $out, $temp, LSR #10-4
+        LDRB    $out, [$pcbtrans, $out, LSR #4]             ; convert to AttrIndx
+        MEND
+
+TempUncache_L3PTMask * 7*LL_Page_LowAttr_AttrIndx0
+
+; **************** CAM manipulation utility routines ***********************************
+
+; **************************************************************************************
+;
+;       BangCamUpdate - Update CAM, MMU for page move, coping with page currently mapped in
+;
+; mjs Oct 2000
+; reworked to use generic ARM ops (vectored to appropriate routines during boot)
+;
+; First look in the CamEntries table to find the logical address L this physical page is
+; currently allocated to. Then check in the Level 3 page tables to see if page L is currently
+; at page R2. If it is, then map page L to be inaccessible, otherwise leave page L alone.
+; Then map logical page R3 to physical page R2.
+;
+; in:   r2 = physical page number
+;       r3 = logical address (2nd copy if doubly mapped area)
+;       r9 = offset from 1st to 2nd copy of doubly mapped area (either source or dest, but not both)
+;       r11 = PPL + CB bits
+;
+; out:  r0, r1, r4, r6 corrupted
+;       r2, r3, r5, r7-r12 preserved
+;
+
+BangCamUpdate ROUT
+        Entry   "r7,r8"
+        TST     r11, #DynAreaFlags_DoublyMapped ; if moving page to doubly mapped area
+        SUBNE   r3, r3, r9                      ; then CAM soft copy holds ptr to 1st copy
+
+        LDR     r8, =LL3PT                      ; point to level 3 page tables
+
+        LDR     r1, =ZeroPage
+        LDR     r1, [r1, #CamEntriesPointer]
+        ADD     r1, r1, r2, LSL #CAM_EntrySizeLog2 ; point at cam entry (logaddr, PPL)
+        ASSERT  CAM_LogAddr=0
+        ASSERT  CAM_PageFlags=4
+        LDMIA   r1, {r0, r6}                    ; r0 = current logaddress, r6 = current PPL
+        Push    "r0, r6"                        ; save old logical address, PPL
+        BIC     r4, r11, #PageFlags_Unsafe
+        BIC     r4, r4, #StickyPageFlags
+        AND     r6, r6, #StickyPageFlags
+        ORR     r4, r4, r6
+        STMIA   r1, {r3, r4}                    ; store new address, PPL
+
+        LDR     r1, =ZeroPage+PhysRamTable      ; go through phys RAM table
+        MOV     r6, r2                          ; make copy of r2 (since that must be preserved)
+10
+        LDMIA   r1!, {r0, r4}                   ; load next address, size
+        SUBS    r6, r6, r4, LSR #12             ; subtract off that many pages
+        BCS     %BT10                           ; if more than that, go onto next bank
+
+        ADD     r6, r6, r4, LSR #12             ; put back the ones which were too many
+        ADD     r0, r0, r6, LSL #12             ; move on address by the number of pages left
+        LDR     r6, [sp]                        ; reload old logical address
+
+; now we have r6 = old logical address, r2 = physical page number, r0 = physical address
+
+        TEQ     r6, r3                          ; TMD 19-Jan-94: if old logaddr = new logaddr, then
+        BEQ     %FT20                           ; don't remove page from where it is, to avoid window
+                                                ; where page is nowhere.
+        ADD     r1, r8, r6, LSR #9              ; r6 -> L3PT entry for old log.addr
+        MOV     r4, r1, LSR #12                 ; r4 = entry offset into L3 for address r6
+        ADD     r6, r8, r4, LSL #3
+        LDRD    r6, [r6]                        ; r6,r7 = L3PT entry for L3PT entry for old log.addr
+        TST     r6, #LL_TypeMask                ; if page not there
+        BEQ     %FT20                           ; then no point in trying to remove it
+
+        LDRD    r6, [r1]                        ; r6,r7 = L3PT entry for old log.addr
+        ASSERT  LL_HighAddr_Start = 0
+        ASSERT  LL_HighAddr_Start+LL_HighAddr_Size <= LL_LowAddr_Start
+        BFI     r6, r7, #0, #LL_HighAddr_Size
+        BIC     r6, r6, #&FFFFFFFF - (LL_LowAddr+LL_HighAddr) ; r6 = packed phys addr
+        TEQ     r6, r0                          ; if equal to physical address of page being moved
+        BNE     %FT20                           ; if not there, then just put in new page
+
+        AND     r4, r11, #PageFlags_Unsafe
+        Push    "r0, r3, r11"                   ; save phys.addr, new log.addr, new PPL
+        ADD     r3, sp, #3*4
+        LDMIA   r3, {r3, r11}                   ; reload old logical address, old PPL
+        LDR     lr, =DuffEntry                  ; Nothing to do if wasn't mapped in
+        TEQ     r3, lr
+        BEQ     %FT19
+        ORR     r11, r11, r4
+        MOV     r6, #0                          ; cause translation fault
+        MOV     r7, #0
+        BL      BangL3PT                        ; map page out
+        LDR     r8, =LL3PT                      ; restore, ready for 2nd BangL3PT
+19
+        Pull    "r0, r3, r11"
+20
+        ADD     sp, sp, #8                      ; junk old logical address, PPL
+        LDR     r4, =DuffEntry          ; check for requests to map a page to nowhere
+        TEQ     r4, r3                  ; don't actually map anything to nowhere
+        EXIT    EQ
+        GetPTE  r6, 4K, r0, r11
+
+        BL      BangL3PT
+        EXIT
+
+;internal entry point for updating L3PT entry
+;
+; entry: r3 = logical address (4k aligned)
+;        r6,r7 = new L3PT entry
+;        r8 -> L3PT
+;        r9 = offset if doubly-mapped
+;        r11 = PPL
+;
+; exit: r0,r1,r4,r8 corrupted
+;
+BangL3PT                                        ; internal entry point used only by BangCamUpdate
+        Push    "lr"
+
+        TST     r11, #PageFlags_Unsafe
+        ADD     r8, r8, r3, LSR #9              ; point to L3PT entry
+        BNE     BangL3PT_unsafe
+
+        ;In order to safely map out a cacheable page and remove it from the
+        ;cache, we need to perform the following process:
+        ;* Make the page uncacheable
+        ;* Flush TLB
+        ;* Clean+invalidate cache
+        ;* Write new mapping (r6)
+        ;* Flush TLB
+        ;For uncacheable pages we can just do the last two steps
+        ;
+        TEQ     r6, #0                          ;EQ if mapping out
+        TSTEQ   r11, #DynAreaFlags_NotCacheable ;EQ if also cacheable (overcautious for temp uncache+illegal PCB combos)
+        LDR     r4, =ZeroPage
+        BNE     %FT20
+        ; Potentially we could just map as strongly-ordered + XN here
+        ; But for safety just go for temp uncacheable (will retain memory type + shareability)
+        LDR     lr, [r4, #MMU_PCBTrans]
+        GetTempUncache r4, r11, lr, r0
+        LDRD    r0, [r8]                        ;get current L3PT entry
+        BIC     r0, r0, #TempUncache_L3PTMask   ;remove current attributes
+        ORR     r0, r0, r4
+        STRD    r0, [r8]                        ;Make uncacheable
+        TST     r11, #DynAreaFlags_DoublyMapped
+        LDR     r4, =ZeroPage
+        BEQ     %FT19
+        ADD     lr, r8, r9, LSR #9
+        STRD    r0, [lr]                        ;Update 2nd mapping too if required
+        ADD     r0, r3, r9
+        ARMop   MMU_ChangingEntry,,, r4
+19
+        MOV     r0, r3
+        ARMop   MMU_ChangingEntry,,, r4
+20
+        STRD    r6, [r8]                        ;update L3PT entry
+        TST     r11, #DynAreaFlags_DoublyMapped
+        BEQ     %FT21
+        ADD     lr, r8, r9, LSR #9
+        STRD    r6, [lr]                        ;Update 2nd mapping
+        MOV     r0, r3
+        ARMop   MMU_ChangingUncachedEntry,,, r4 ; TLB flush for 1st mapping
+        ADD     r3, r3, r9                      ;restore r3 back to 2nd copy
+21
+        Pull    "lr"
+        MOV     r0, r3
+        ARMop   MMU_ChangingUncachedEntry,,tailcall,r4
+
+BangL3PT_unsafe
+        STRD    r6, [r8]                        ; update level 3 page table (and update pointer so we can use bank-to-bank offset
+        TST     r11, #DynAreaFlags_DoublyMapped ; if area doubly mapped
+        ADDNE   lr, r8, r9, LSR #9
+        STRNED  r6, [lr]                        ; then store entry for 2nd copy as well
+        ADDNE   r3, r3, r9                      ; and point logical address back at 2nd copy
+        Pull    "pc"
+
+; The description of the MAIR "Attr" fields in the ARMv7 ARM isn't very easy to
+; read, so here's an easier description:
+;
+; * For Normal memory, bits 0-3 indicate the inner cache policy, and 4-7 indicate the outer cache policy
+;   * 0100 = non-cacheable
+;   * 10RW = write-through, non-transient
+;   * 11RW = write-back, non-transient
+;   * R = read-allocate, W = write-allocate (00=no allocate)
+;   * There's also implementation-defined support for 00RW and 01RW as write-through transient and write-back transient, respectively
+; * 0000 0000 is used for strongly-ordered memory
+; * 0000 0100 is used for device memory
+;
+; We can only have eight mappings active at once, which gives us the following
+; set of Attr values:
+;
+; 0000 0000   Strongly-ordered (RISC OS NCNB)
+; 0000 0100   Device memory (RISC OS NCB non-merging write buffer)
+; 0100 0100   Normal, inner + outer non-cacheable (e.g. NCB default/idempotent, temporary uncacheable)
+; 1111 1111   Write-back read+write-allocate (C+B default)
+; 1010 1010   Write-through read-allocate (C+B alt 1)
+; 1110 1110   Write-back read-allocate (C+B alt 2)
+
+MAIRAttr_Nrm_NC   * 2_01000100
+MAIRAttr_Nrm_WBWA * 2_11111111
+MAIRAttr_Nrm_WBRA * 2_11101110
+MAIRAttr_Nrm_WT   * 2_10101010
+MAIRAttr_SO       * 2_00000000
+MAIRAttr_Dev      * 2_00000100
+
+        ALIGN
+MAIRValues
+        ; MAIR 0
+        ASSERT  LLAttr_Nrm_NC = 0:SHL:LL_Page_LowAttr_AttrIndx0_bit
+        DCB     MAIRAttr_Nrm_NC
+        ASSERT  LLAttr_Nrm_WBWA = 1:SHL:LL_Page_LowAttr_AttrIndx0_bit
+        DCB     MAIRAttr_Nrm_WBWA
+        ASSERT  LLAttr_Nrm_WBRA = 2:SHL:LL_Page_LowAttr_AttrIndx0_bit
+        DCB     MAIRAttr_Nrm_WBRA
+        ASSERT  LLAttr_Nrm_WT = 3:SHL:LL_Page_LowAttr_AttrIndx0_bit
+        DCB     MAIRAttr_Nrm_WT
+        ; MAIR 1
+        ASSERT  LLAttr_SO = 4:SHL:LL_Page_LowAttr_AttrIndx0_bit
+        DCB     MAIRAttr_SO
+        ASSERT  LLAttr_Dev = 5:SHL:LL_Page_LowAttr_AttrIndx0_bit
+        DCB     MAIRAttr_Dev
+        DCB     0
+        DCB     0
+
+; Map 4 bits of a MAIR Attr value to the corresponding 2 bit TTBCR IRGN/ORGN
+; value. Note: This will need updating if we add support for transient
+; cacheable (00xx, 01xx)
+        ALIGN
+TTBRCacheMunge
+        DCB     2_00000000 ; 00xx: Strongly-ordered -> non-cacheable
+        DCB     2_00000000 ; 01xx: Device memory, or non-cacheable -> non-cacheable
+        DCB     2_10101010 ; 10xx: Write-through
+        DCB     2_01110111 ; 11xx: Write-back
+
+; XN, PXN, AP2, AP1 mean we theoretically have 16 permission levels. However
+; some are redundant (e.g. setting both XN+PXN)
+
+        ; Encode both high and low attributes in one word
+        ASSERT  LL_HighAttr_Start >= LL_LowAttr_Start+LL_LowAttr_Size
+        MACRO
+        LongPPL  $XN, $PXN, $AP2, $AP1
+        DCD     ($XN * LL_Page_HighAttr_XN) + ($PXN * LL_Page_HighAttr_PXN) + ($AP2 * LL_Page_LowAttr_AP2) + ($AP1 * LL_Page_LowAttr_AP1) + LL_Page_LowAttr_SH1 + LL_Page_LowAttr_SH0
+        MEND
+
+; AP2 = read-only
+; AP1 = enable unprivileged access
+PPLTrans ;      XN  PXN AP2 AP1   EL1 EL0
+        LongPPL 0,  0,  0,  1   ; RWX RWX
+        ! 0, "LongDescTODO Implement solution for PPL 1"
+        LongPPL 0,  0,  0,  1   ; RWX RWX *** downgraded from RWX R X
+        LongPPL 0,  0,  0,  0   ; RWX
+        LongPPL 0,  0,  1,  1   ; R X R X
+        LongPPL 0,  0,  1,  0   ; R X
+
+        LongPPL 1,  0,  0,  0   ; RW 
+        LongPPL 1,  0,  0,  1   ; RW  RW 
+        LongPPL 1,  0,  1,  0   ; R  
+        LongPPL 1,  0,  1,  1   ; R   R  
+
+        LongPPL 0,  1,  0,  1   ; RW  RWX 
+        LongPPL 0,  1,  1,  1   ; R   R X 
+
+PPLAccess            ; EL1EL0
+                     ; RWXRWX
+        GenPPLAccess 2_111111
+        GenPPLAccess 2_111111 ; *** downgraded from RWX R X
+        GenPPLAccess 2_111000
+        GenPPLAccess 2_101101
+        GenPPLAccess 2_101000
+
+        GenPPLAccess 2_110000
+        GenPPLAccess 2_110110
+        GenPPLAccess 2_100000
+        GenPPLAccess 2_100100
+
+        GenPPLAccess 2_110111
+        GenPPLAccess 2_100101
+        DCD     -1
+
+        LTORG
+
+; PPLTrans should contain XN + PXN + AP2 + AP1 + SH1 + SH0
+; PCBTrans should contain AttrIndx
+
+LL_HighPPLBits * LL_Page_HighAttr_XN + LL_Page_HighAttr_PXN
+LL_LowPPLBits * LL_Page_LowAttr_SH1 + LL_Page_LowAttr_SH0 + LL_Page_LowAttr_AP2 + LL_Page_LowAttr_AP1
+
+; In:
+; r0 = phys addr (aligned), with bits 0-7 containing bits 32-39 of PA
+; r1 = page flags:
+;      APBits
+;      NotBufferable
+;      NotCacheable
+;      CPBits
+;      PageFlags_TempUncacheableBits
+; r2 -> PPLTrans
+; r3 -> PCBTrans
+; Out:
+; r0,r1 = PTE for 4K page ("small page")
+Get4KPTE ROUT
+        Entry   "r4"
+        ; Get CB+TEX bits
+        ASSERT  DynAreaFlags_CPBits = 7*XCB_P :SHL: 10
+        ASSERT  DynAreaFlags_NotCacheable = XCB_NC :SHL: 4
+        ASSERT  DynAreaFlags_NotBufferable = XCB_NB :SHL: 4
+        TST     r1, #PageFlags_TempUncacheableBits
+        AND     r4, r1, #DynAreaFlags_NotCacheable + DynAreaFlags_NotBufferable
+        AND     lr, r1, #DynAreaFlags_CPBits
+        ORRNE   r4, r4, #XCB_TU<<4                      ; if temp uncache, set TU bit
+        ORR     r4, r4, lr, LSR #10-4
+        LDRB    r4, [r3, r4, LSR #4]                    ; convert to AttrIndx
+        ; Get AP bits
+        AND     lr, r1, #DynAreaFlags_APBits
+        LDR     lr, [r2, lr, LSL #2]
+        ORR     r4, r4, lr                              ; R4 contains all attributes, LR only (fully) contains high attributes
+        BFI     lr, r0, #0, #12                         ; Insert high address bits
+        BIC     r1, lr, #&FFFFFFFF - (LL_HighAttr + &FFF) ; Clear any low attributes inherited from LR
+        BFI     r0, r4, #0, #12                         ; Insert low attributes into R0, overwriting the high address bits
+        ORR     r0, r0, #LL3_Page                       ; Flag as L3 page entry
+        ORR     r0, r0, #LL_Page_LowAttr_AF             ; Access flag must be set to avoid an Access Fault
+        EXIT
+
+; In:
+; As per Get4KPTE
+; Out:
+; r0,r1 = PTE for 64K page ("large page")
+Get64KPTE ROUT
+        Entry
+        BL      Get4KPTE
+        ORR     r1, r1, #LL_Page_HighAttr_Contig ; 16 contiguous pages
+        EXIT 
+
+; In:
+; As per Get2MPTE
+; Out:
+; r0,r1 = PTE for 2M page ("block")
+Get2MPTE
+        Entry
+        BL      Get4KPTE
+        EOR     r0, r0, #LL12_Block :EOR: LL3_Page      ; Convert from page to block (because in ARM's infinite wisdom, they decided to make their new orthogonal page table format non-orthogonal in one key area)
+        EXIT
+
+; In:
+; r0 = page-aligned logical addr
+; Out:
+; r0,r1 = phys addr
+; r2 = page flags
+;      or -1 if fault
+; r3 = page size (bytes)
+LoadAndDecodeL2Entry   ROUT
+        LDR     r1, =LL3PT
+        ADD     r0, r1, r0, LSR #9
+        LDRD    r0, [r0]
+        ASSERT  LL_Fault = 0
+        TST     r0, #LL_TypeMask
+        MOVEQ   r2, #-1
+        MOVEQ   pc, lr
+        MOV     r3, #4096
+05      ; Arrive here from LoadAndDecodeL1Entry
+        Entry   "r4-r5"
+        LDR     lr, =ZeroPage
+        ; Extract AttrIndx so we can look up the PCB bits
+        AND     r2, r0, #LL_Page_LowAttr_AttrIndx0+LL_Page_LowAttr_AttrIndx1+LL_Page_LowAttr_AttrIndx2
+        LDR     r5, [lr, #MMU_PCBTrans]
+        SUB     r5, r5, #8*4
+        ASSERT  LL_Page_LowAttr_AttrIndx0_bit = 2 ; i.e. r2 is word aligned offset
+        LDR     r2, [r5, r2]
+        ; Find PPL
+        LDR     r5, [lr, #MMU_PPLTrans]
+        LDR     lr, =LL_LowPPLBits
+        AND     r4, r1, #LL_HighPPLBits
+        AND     lr, lr, r0
+        ORR     r4, r4, lr
+10
+        LDR     lr, [r5], #4
+        CMP     lr, r4
+        ADDNE   r2, r2, #1
+        BNE     %BT10
+        ; Determine physical address
+        TST     r1, #LL_Page_HighAttr_Contig
+        AND     r1, r1, #LL_HighAddr
+        MOVNE   r3, r3, LSL #4
+        SUB     r4, r3, #1
+        BIC     r0, r0, r4
+        EXIT
+
+; In:
+; r0 = MB-aligned logical addr
+; Out:
+; r0,r1 = phys addr of section or L2PT entry
+; r2 = page flags if 1MB page
+;      or -1 if fault
+;      or -2 if page table ptr
+; r3 = section size (bytes) if section-mapped
+LoadAndDecodeL1Entry
+        ; Note that currently this really is only aligned to 1MB, not 2MB (and
+        ; returned page size should be 1MB). TODO: Try and tidy this up (always
+        ; returning the mapping size might help?)
+        ! 0, "LongDescTODO Remove LoadAndDecodeL1Entry 1MB bodge"
+        LDR     r1, =LL2PT
+        AND     r2, r0, #1:SHL:20
+        ADD     r0, r1, r0, LSR #18
+        BIC     r0, r0, #7              ; Input is only 1MB aligned
+        LDRD    r0, [r0]
+        ANDS    r3, r0, #LL_TypeMask
+        MOVEQ   r2, #-1
+        MOVEQ   pc, lr
+        CMP     r3, #LL12_Block
+        ORREQ   r0, r0, r2              ; Add in the megabyte offset 
+        MOVEQ   r3, #1:SHL:20           ; And pretend it's a megabyte page size
+        BEQ     %BT05                   ; Branch to common decode code
+        ; Table pointer
+        MOV     r2, #-2
+        BFC     r0, #0, #LL_LowAddr_Start
+        AND     r1, r1, #LL_HighAddr
+        MOV     pc, lr
+
+; In:
+; r0 = phys addr (aligned)
+; r1 -> ZeroPage
+; Out:
+; TTBR0 and any other related registers updated
+; If MMU is currently on, it's assumed the mapping of ROM+stack will not be
+; affected by this change
+SetTTBR ROUT
+        Entry   "r2-r3"
+        ; Update TTBCR
+        ; First we need to determine the IRGN+ORGN settings
+        LDR     lr, [r1, #PageTable_PageFlags]
+        ASSERT  DynAreaFlags_CPBits = 7*XCB_P :SHL: 10
+        ASSERT  DynAreaFlags_NotCacheable = XCB_NC :SHL: 4
+        ASSERT  DynAreaFlags_NotBufferable = XCB_NB :SHL: 4
+        AND     r2, lr, #DynAreaFlags_NotCacheable + DynAreaFlags_NotBufferable
+        AND     lr, lr, #DynAreaFlags_CPBits
+        LDR     r3, [r1, #MMU_PCBTrans]
+        ORR     r2, r2, lr, LSR #10-4
+        LDRB    r2, [r3, r2, LSR #4]           ; Get AttrIndx value
+        ADR     r3, MAIRValues
+        LDRB    r2, [r3, r2, LSR #LL_Page_LowAttr_AttrIndx0_bit] ; Get corresponding hardware flags
+        LDR     r3, TTBRCacheMunge
+        MOV     r4, r2, LSR #4                 ; Outer attributes
+        AND     r2, r2, #&F                    ; Inner attributes
+        MOV     r4, r4, LSL #1
+        MOV     r2, r2, LSL #1
+        MOV     r4, r3, LSR r4
+        MOV     r2, r3, LSR r2
+        MOV     r3, #&80000000                 ; TTBCR: Long-descriptor format enabled, using TTBR0 only
+        BFI     r3, r4, #10, #2                ; ORGN
+        BFI     r3, r2, #8, #2                 ; IRGN
+        ; Determine shareability (assume same for all PPLs)
+        LDR     r2, PPLTrans
+        AND     r2, r2, #LL_Page_LowAttr_SH0+LL_Page_LowAttr_SH1
+        ORR     r3, r3, r2, LSL #12-LL_Page_LowAttr_SH0_bit
+        MCR     p15, 0, r3, c2, c0, 2          ; Write TTBCR
+
+        ; Check if security extensions are supported
+        ARM_read_ID r2
+        AND     r2, r2, #&F<<16
+        CMP     r2, #ARMvF<<16
+        BNE     %FT01
+        MRC     p15, 0, r2, c0, c1, 1           ; ID_PFR1
+        TST     r2, #15<<4
+        BEQ     %FT01
+        MCR     p15, 0, lr, c12, c0, 0          ; VBAR: Ensure exception vector base is 0 (security extensions)
+01
+
+        ; Set MAIRs
+        LDR     r2, MAIRValues
+        MCR     p15, 0, r2, c10, c2, 0          ; MAIR0
+        LDR     r2, MAIRValues+4
+        MCR     p15, 0, r2, c10, c2, 1          ; MAIR1
+
+        ; Now update TTBR0
+        MOV     r2, #0
+        MCRR    p15, 0, r0, r2, c2              ; Write full 64bit value (page tables assumed to always lie in low RAM)
+        EXIT
+
+        END
