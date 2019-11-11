@@ -23,14 +23,3 @@ bbe-env: bbe-generic-resources-get-alias
 	BBE_Export_File !Common
 	${CP} MakefileBBE ${BBEDIR}.Makefile ${CPFLAGS}
 	BBE_Export_File VersionNum
-
-
-# Determine whether the macro processor in amu works or not
-FIXED = no
-find-amu-version:
-	@set BuildSys$AMU$Fixed ${FIXED}
-	@amu -help { > <Wimp$ScrapDir>.amu }
-	@GNU.gawk "NR==2 { print \"Set AMU$Version \"  $3*100 }" { < <Wimp$ScrapDir>.amu > Pipe:$.amu }
-	@remove <Wimp$ScrapDir>.amu
-	@obey Pipe:$.amu
-	@seteval AMU$HasWorkingWildcard <AMU$Version> > 532
