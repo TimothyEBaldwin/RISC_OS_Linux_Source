@@ -15,7 +15,6 @@ export PATH
 
 export APPDIR=$BUILDDIR/Apps
 export MAKEFILEDIR=$BUILDDIR/BuildSys/GNUmakefiles
-#export SRCDIR=$BUILDDIR/Sources
 export INSTALLDIR=$BUILDDIR/Install
 
 if [ "$APCS" = "APCS-R" ]; then
