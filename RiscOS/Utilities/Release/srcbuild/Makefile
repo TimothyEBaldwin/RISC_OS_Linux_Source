@@ -26,66 +26,10 @@
 #                          directory
 #
 
-#
-# Generic options:
-#
-CINCLUDES = -IC:CLX -IC:
-CDEFINES  = -DRISCOS
-CFLAGS    = -Wc
+COMPONENT ?= srcbuild
+OBJS      = srcbuild riscos build parse
+LIBS      = ${CLXLIB}
 
 include HostTools
-
-#
-# Libraries
-#
-include AppLibs
-
-# Program specific options:
-#
-COMPONENT = srcbuild
-TARGET    = ${COMPONENT}
-
-OBJS =\
- srcbuild.o\
- riscos.o\
- build.o\
- parse.o
-
-LIBS = ${CLXLIB} ${CLIB}
-
-DIRS      =o._dirs
-
-#
-# Rule patterns
-#
-include Makefiles:StdRules
-
-#
-# Build
-#
-all: ${TARGET}
-	@echo ${COMPONENT}: all complete
-
-clean:
-	${XWIPE} o ${WFLAGS}
-	${XWIPE} ${TARGET} ${WFLAGS}
-	@echo ${COMPONENT}: cleaned
-
-install: ${TARGET}
-	${MKDIR} ${INSTDIR}
-	${CP} ${TARGET} ${INSTDIR}.${COMPONENT} ${CPFLAGS}
-	@echo ${COMPONENT}: installed
-
-${DIRS}:
-	${MKDIR} o
-	${TOUCH} $@
-
-#
-# Target
-#
-${TARGET}: ${OBJS} ${DIRS}
-	${LD} -o $@ ${OBJS} ${LIBS}
-	${CHMOD} a+rx $@
-
-#
+include CApp
 include Depends
