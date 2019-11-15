@@ -18,10 +18,6 @@
 frontend_depends := Unix/SocketKVMFrontends/Keyboard.h Unix/SocketKVMFrontends/frontend_common.h Unix/SocketKVMFrontends/SocketKVM_Protocol.h $(lib_depends)
 
 all: sdl
-script-all: Built/sdl
-
-Built:
-	mkdir Built
 
 sdl: Built/sdl
 	ln -sf Built/sdl sdl

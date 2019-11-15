@@ -177,13 +177,13 @@ endif
 	)
 	rm -rf Unix/RISC_OS/*
 	mkdir -p Unix/RISC_OS/Unix/LinuxSupport
-	cp -v --reflink=auto --preserve=mode,xattr Support/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Unix/LinuxSupport/
+	cp -v --reflink=auto --preserve=mode,xattr Unix/LinuxSupport/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Unix/LinuxSupport/
 	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Unix/RISC_OS/
 	#
 	cp -vrL Unix/SocketKVMFrontends Unix/RISC_OS/Unix/SocketKVMFrontends
-	ln -sf 'Unix/LinuxSupport' 'Unix/RISC_OS/Support'
 	ln -sf 'Unix/LinuxSupport/Start_RISC_OS.desktop' 'Unix/RISC_OS/Start_RISC_OS.desktop'
 	ln -sf 'Unix/LinuxSupport/run_RISC_OS' 'Unix/RISC_OS/run_RISC_OS'
+	ln -sf 'Unix/LinuxSupport/common.mk' 'Unix/RISC_OS/Makefile'
 	#
 	echo "# Source and build GIT commits
 	SOURCE=$$SOURCE

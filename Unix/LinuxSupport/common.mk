@@ -64,10 +64,14 @@ ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /ex
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Unix/LinuxSupport/*.mk)
 
 include $(wildcard Unix/LinuxSupport/build.mk)
+include $(wildcard Unix/SocketKVMFrontends/build.mk)
 
 script-all: RISC_OS HardDisc4 Built/wrapper
 
 RISC_OS:
+
+Built:
+	mkdir Built
 
 comma2attr: Built/comma2attr
 	ln -sf Built/comma2attr comma2attr
