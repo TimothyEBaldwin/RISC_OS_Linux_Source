@@ -140,39 +140,57 @@ RISCOS_InitARM
         MOVNE   pc, a4
         BICEQ   pc, a4, #ARM_CC_Mask
 
-
-; void *RISCOS_AddRAM(unsigned int flags, void *start, void *end, uintptr_t sigbits, void *ref)
+; void *RISCOS_AddRAM(unsigned int flags, uintptr_t start, uintptr_t end, uintptr_t sigbits, void *ref)
 ;   Entry:
 ;     flags   bit 0: video memory (currently only one block permitted)
 ;             bit 1: video memory is not suitable for general use
 ;             bit 2: memory can't be used for DMA (sound, video, or other)
 ;             bits 8-11: speed indicator (arbitrary, higher => faster)
+;             bit 12: start, end, sigbits are shifted right 12 bits (for supporting large physical addresses)
 ;             other bits reserved (SBZ)
 ;     start   = start address of RAM (inclusive) (no alignment requirements)
 ;     end     = end address of RAM (exclusive) (no alignment requirements, but must be >= start)
 ;     sigbits = significant address bit mask (1 => this bit of addr decoded, 0 => this bit ignored)
 ;     ref     = reference handle (NULL for first call)
+;
+; The first registered block must be in the low 4GB, and blocks must not cross
+; 4GB thresholds.
+; The (unshifted) sigbits is assumed to be the same across all calls.
 
 ; A table is built up at the head of the first block of memory.
-; The table consists of (addr, len, flags) pairs, terminated by a count of those pairs; ref points to that
-; counter.
+; The table consists of (addr, len, flags) pairs, terminated by a count of
+; those pairs; ref points to that counter.
+; The table stores addresses are in terms of 4K pages, allowing us to
+; theoretically support a 44 bit physical space.
 ; Twelve bits of flags are stored at the bottom of the length word.
+; The 22 length bits are the length of the block in 4K pages, minus one (so a
+; full 4GB region will have length &FFFFF)
 
         ROUT
 RISCOS_AddRAM
-        Push    "v1,v2,v3,v4,lr"
+        Entry   "v1-v4"
         LDR     v4, [sp, #5*4]          ; Get ref
 
         ; Round to pages. If we were extra sneaky we could not do this and chuck out incomplete
         ; pages after concatanation, but it would be a weird HAL that gave us pages split across
         ; calls.
         ;
-        ADD     a2, a2, #4096           ; round start address up
-        SUB     a2, a2, #1
-        MOV     a2, a2, LSR #12
-        MOV     a2, a2, LSL #12
-        MOV     a3, a3, LSR #12         ; round end address down
-        MOV     a3, a3, LSL #12
+        TST     a1, #OSAddRAM_LargeAddresses
+        ADDEQ   a2, a2, #4096           ; round start address up
+        SUBEQ   a2, a2, #1
+        MOVEQ   a2, a2, LSR #12
+        MOVEQ   a3, a3, LSR #12         ; round end address down
+        MOVEQ   a4, a4, LSR #12
+        ORREQ   a4, a4, #&FF000000
+        ORREQ   a4, a4, #&00F00000
+        BIC     a1, a1, #OSAddRAM_LargeAddresses ; Flag no longer relevant
+
+      [ :LNOT: LongDesc
+        ; Ignore any RAM above the 32bit barrier if we've been built with
+        ; long-descriptor support disabled (HAL may not know our build settings)
+        CMP     a2, #1:SHL:20
+        BHS     %FT90
+      ]
 
         CMP     a3, a2
         BLS     %FT90                   ; check we aren't now null
@@ -180,12 +198,17 @@ RISCOS_AddRAM
         CMP     v4, #0
         BEQ     %FT20
 
+
         ; We are not dealing with the first block since v4 != 0.  Make an attempt to merge this block
         ; with the previous block.
         LDMDB   v4, {v1, v2}            ; Get details of the previous block
+        EOR     ip, v1, a2
+        CMP     ip, #1:SHL:20
+        BHS     %FT20                   ; Don't merge if they're in different 4GB blocks
         MOV     v3, v2, LSL #20         ; Isolate flags
-        BIC     v2, v2, v3, LSR #20     ; And strip from length
+        MOV     v2, v2, LSR #12         ; And get length in pages
         ADD     v2, v1, v2              ; Get the end address
+        ADD     v2, v2, #1
         EOR     v2, v2, a2              ; Compare with the current block start address...
         TST     v2, a4                  ; ... but only check the decoded bits.
         EOR     v2, v2, a2              ; Restore the previous block end address.
@@ -196,19 +219,18 @@ RISCOS_AddRAM
         ; v2 = previous end
         ; The block is just after the previous block.  That means the start address is unchanged, but
         ; the length is increased.
-        SUB     v2, v2, v1              ; Calculate the previous block length.
+        LDR     v2, [v4, #-4]           ; Reload length+flags
         SUB     a3, a3, a2              ; Find the length of the new block.
         ; a3 = length of block
-        ADD     v2, v2, a3              ; Add it to the previous length.
-        ORR     v2, v2, v3, LSR #20     ; And put the flags back in.
+        ADD     v2, v2, a3, LSL #12     ; Add it to the previous length.
         STR     v2, [v4, #-4]           ; Update the block size in memory.
         MOV     a1,v4
-        Pull    "v1,v2,v3,v4,pc"
+        EXIT
 
         ; The block is not just after the previous block, but it may be just before.  This may be the
         ; case if we are softloaded.
 10      SUB     v1, v1, #1              ; Compare the address before the previous block start ...
-        SUB     a3, a3, #1              ; ... with the address of the last byte in this block ...
+        SUB     a3, a3, #1              ; ... with the address of the last page in this block ...
         EOR     v1, v1, a3
         TST     v1, a4                  ; ... but check only the decoded bits.
         ADD     a3, a3, #1              ; Restore the end address.
@@ -216,26 +238,25 @@ RISCOS_AddRAM
         BNE     %FT20                   ; Skip if we cannot merge the block.
 
         ; The block is just before the previous block.  The start address and length both change.
-        LDR     v1, [v4, #-8]           ; Get the previous block start again.
-
+        LDMDB   v4, {v1, v2}            ; Get the previous block again
         SUB     a3, a3, a2              ; Calculate the current block size.
         SUB     v1, v1, a3              ; Subtract from the previous block start address.
-        SUB     v2, v2, v1              ; Calculate the new length=end-start
-        ORR     v2, v2, v3, LSR #20     ; And put the flags back in.
+        ADD     v2, v2, a3, LSL #12     ; Calculate the new length+flags
         STMDB   v4, {v1, v2}            ; Update the block info in memory.
         MOV     a1,v4
-        Pull    "v1,v2,v3,v4,pc"
+        EXIT
 
         ; We now have a region which does not merge with a previous region.  We move it up to the
         ; highest address we can in the hope that this block will merge with the next block.
 20      SUB     a3, a3, a2              ; Calculate the block size
-        MOV     a1, a1, LSL #20
-        ORR     a3, a3, a1, LSR #20     ; Put the flags at the bottom
+        SUB     a3, a3, #1
+        ORR     a3, a3, a1, LSL #20     ; Put the flags in
+        MOV     a3, a3, ROR #20         ; And rotate so they're at the bottom
         MVN     v1, a4                  ; Get the non-decoded address lines.
         ORR     a2, v1, a2              ; Set the non-decoded address bit in the start address.
 
 30      CMP     v4, #0                  ; If the workspace has not been allocated...
-        MOVEQ   v4, a2                  ; ... use this block.
+        MOVEQ   v4, a2, LSL #12         ; ... use this block.
         MOVEQ   v1, #0                  ; Initialise the counter.
 
         ; The block/fragment to be added is between a2 and a2+a3.
@@ -245,7 +266,7 @@ RISCOS_AddRAM
         STR     v1, [v4]                ; Store the counter.
 
 90      MOV     a1,v4
-        Pull    "v1,v2,v3,v4,pc"        ; We've done with this block now.
+        EXIT                            ; We've done with this block now.
 
 
 
@@ -260,20 +281,18 @@ RISCOS_AddRAM
 ;           other registers corrupted
 Subtractv1v2fromRAMtable
         ADD     v2, v1, v2              ; v2 = end address
-        MOV     v1, v1, LSR #12
-        MOV     v1, v1, LSL #12         ; round base down
+        MOV     v1, v1, LSR #12         ; round base down
         ADD     v2, v2, #4096
         SUB     v2, v2, #1
-        MOV     v2, v2, LSR #12
-        MOV     v2, v2, LSL #12         ; round end up
+        MOV     v2, v2, LSR #12         ; round end up
 
         LDR     v5, [a4]
         SUB     v8, a4, v5, LSL #3
 10      TEQ     v8, a4
         MOVEQ   pc, lr
         LDMIA   v8!, {v3, v4}
-        MOV     v6, v4, LSR #12
-        ADD     v6, v3, v6, LSL #12     ; v6 = end of RAM block
+        ADD     v6, v3, v4, LSR #12
+        ADD     v6, v6, #1              ; v6 = end of RAM block
         CMP     v2, v3                  ; if our end <= RAM block start
         CMPHI   v6, v1                  ; or RAM block end <= our start
         BLS     %BT10                   ; then no intersection
@@ -288,6 +307,8 @@ Subtractv1v2fromRAMtable
         BHS     remove_block
 
         SUB     v6, v6, v2              ; v6 = new size
+        SUB     v6, v6, #1
+        MOV     v6, v6, LSL #12
         ORR     v6, v6, v4, LSR #20     ; + flags
         STMDB   v8, {v2, v6}            ; store new base (= our end) and size
         B       %BT10
@@ -313,6 +334,8 @@ not_bottom
 
         ; our area is at the top
         SUB     v6, v1, v3              ; v6 = new size
+        SUB     v6, v6, #1
+        MOV     v6, v6, LSL #12
         ORR     v6, v6, v4, LSR #20     ; + flags
         STMDB   v8, {v3, v6}            ; store original base and new size
         B       %BT10
@@ -332,6 +355,10 @@ split_block
 
         SUB     v7, v1, v3              ; v7 = size of first half
         SUB     v6, v6, v2              ; v6 = size of second half
+        SUB     v7, v7, #1
+        SUB     v6, v6, #1
+        MOV     v7, v7, LSL #12
+        MOV     v6, v6, LSL #12
         ORR     v7, v7, v4, LSR #20
         ORR     v6, v6, v4, LSR #20     ; + flags
         STMDB   v8, {v3, v7}
@@ -378,7 +405,7 @@ RISCOS_Start
         TSTNE   v2, #OSAddRAM_NoDMA             ; DMA capable?
         BNE     %BT06
         MOV     v2, v2, LSR #12                 ; Remove flags
-        MOV     v2, v2, LSL #12
+        ADD     v2, v2, #1
         ; Is this the only DMA-capable block?
         MOV     v4, v8
         MOV     v6, #OSAddRAM_NoDMA
@@ -394,26 +421,31 @@ RISCOS_Start
         MOV     v4, v1                          ; Allocate block as video memory
         MOV     v6, v2
         BEQ     %FT09
-        SUBS    v6, v6, #16*1024*1024           ; Leave 16M if it was the only DMA-capable block
+        SUBS    v6, v6, #(16*1024*1024):SHR:12  ; Leave 16M if it was the only DMA-capable block
         MOVLS   v6, v2, LSR #1                  ; If that overflowed, take half the bank.
 09
-        CMP     v6, #32*1024*1024
-        MOVHS   v6, #32*1024*1024               ; Limit allocation to 32M (arbitrary)
+        CMP     v6, #(32*1024*1024):SHR:12
+        MOVHS   v6, #(32*1024*1024):SHR:12      ; Limit allocation to 32M (arbitrary)
 
         ADD     v1, v1, v6                      ; Adjust the RAM block base...
         SUBS    v2, v2, v6                      ; ... and the size
-        BEQ     %FT22                           ; pack array tighter if this block is all gone
+        LDREQ   v6, [v8, #-4]
+        BEQ     %FT21                           ; pack array tighter if this block is all gone
         STR     v1, [v8, #-8]                   ; update base
         LDR     v1, [v8, #-4]
-        MOV     v1, v1, LSL #20
-        ORR     v1, v1, v2, LSR #12
-        MOV     v1, v1, ROR #20                 ; merge flags back into size
+        MOV     v1, v1, LSL #20                 ; original flags
+        ORR     v6, v6, v1                      ; merged into VRAM size
+        ORR     v1, v1, v2                      ; and into new size
+        MOV     v1, v1, ROR #20
+        MOV     v6, v6, ROR #20
+        SUB     v1, v1, #4096
         STR     v1, [v8, #-4]                   ; update size
         B       %FT30
 
         ; Note real VRAM parameters
-20      MOV     v6, v2                          ; Remember the size and address
-        MOV     v4, v1                          ; of the VRAM
+20      MOV     v6, v2                          ; Remember the size+flags and
+        MOV     v4, v1                          ; address of the VRAM
+21      ADD     v6, v6, #4096                   ; Assume <4GB of VRAM!
 22      TEQ     v8, a4                          ; if not at the end of the array
         LDMNEIA v8, {v1, v2}                    ; pack the array tighter
         STMNEDB v8, {v1, v2}
@@ -424,13 +456,17 @@ RISCOS_Start
 
 30      SUB     v8, a4, v5, LSL #3              ; Rewind to start of list
 
-        ; Scan forwards to find the fastest block of non-DMAable memory which is at least DRAMOffset_LastFixed size
+        ; Scan forwards to find the fastest block of non-DMAable memory which is at least DRAMOffset_LastFixed size, at least 16KB aligned, and located in the first 4GB
         LDMIA   v8!, {v1, v2}
 31
         TEQ     v8, a4
+        MOVEQ   v1, v1, LSL #12
         BEQ     %FT32
         LDMIA   v8!, {v7, ip}
-        CMP     ip, #DRAMOffset_LastFixed
+        MOV     sp, v7, ROR #2                  ; Bottom two bits (for 16KB alignment) rotated high
+        CMP     sp, #1:SHL:18                   ; Ignore if not aligned, or base address >= 4GB
+        BHS     %BT31
+        CMP     ip, #DRAMOffset_LastFixed-4096
         ANDHS   sp, ip, #&F*OSAddRAM_Speed+OSAddRAM_NoDMA
         ANDHS   lr, v2, #&F*OSAddRAM_Speed+OSAddRAM_NoDMA
         ASSERT  OSAddRAM_Speed = 1:SHL:8
@@ -441,9 +477,11 @@ RISCOS_Start
         MOVHI   v2, ip
         B       %BT31
 32
+
         ; Fill in the Kernel's permanent memory table, sorting by speed and DMA ability
         ; Non-DMAable RAM is preferred over DMAable, as the kernel requires very little DMAable RAM, and we don't want to permanently claim DMAable RAM if we're not actually using it for DMA (in case machine only has a tiny amount available)
         ADD     ip, v1, #DRAMOffset_PageZero
+        ASSERT  DRAMOffset_PageZero > 0         ; If the workspace block is the block containing the OS_AddRAM list, make sure the two don't overlap otherwise we might corrupt it while we copy it
 
         ADD     sp, v1, #DRAMOffset_ScratchSpace + ScratchSpaceSize
 
@@ -455,23 +493,35 @@ RISCOS_Start
 
         ; First put the VRAM information in to free up some regs
         ADD     v7, ip, #VideoPhysAddr
+        MOV     v4, v4, LSL #12                 ; 32bit only for now
+        ! 0, "LongDescTODO VRAM selection doesn't guarantee 32bit address"
         STMIA   v7!, {v4, v6}
 
         ; Now fill in the rest
         ASSERT  DRAMPhysAddrA = VideoPhysAddr+8
+        ADDS    v2, v2, #4096                   ; Store true length
+        ADDCS   v2, v2, #1:SHL:31               ; If it overflowed, must have been 4GB block, so clamp at 2GB (loop below will add the second 2GB)
         STMIA   v7!, {v1, v2}                   ; workspace block must be first
 33
         TEQ     v8, a4
         BEQ     %FT39
         LDMIA   v8!, {v1, v2}
-        CMP     v2, #4096                       ; skip zero-length sections
-        BLO     %BT33
-        ; Perform insertion sort
-        ; a1-a3, v3-v6, ip, lr free
+        CMP     v1, #1:SHL:20
+        BHS     %BT33                           ; skip >4GB addresses for now
+        MOV     v1, v1, LSL #12
+        ADDS    v2, v2, #4096                   ; Get true length
+        ADDCS   v2, v2, #1:SHL:31               ; If it overflowed, must have been 4GB block, so split into two 2GB blocks
+        SUBCS   v2, v2, #4096
+        ADDCS   v1, v1, #1:SHL:31
+        STMCSDB v8!, {v1, v2}
+        ADDCS   v2, v2, #4096
+        SUBCS   v1, v1, #1:SHL:31
         ADD     a1, ip, #DRAMPhysAddrA
         LDMIA   a1!, {a2, a3}
         TEQ     v1, a2
         BEQ     %BT33                           ; don't duplicate the initial block
+        ; Perform insertion sort
+        ; a1-a3, v3-v6, ip, lr free
         AND     v3, v2, #&F*OSAddRAM_Speed+OSAddRAM_NoDMA
         ASSERT  OSAddRAM_Speed = 1:SHL:8
         ASSERT  OSAddRAM_NoDMA < OSAddRAM_Speed
