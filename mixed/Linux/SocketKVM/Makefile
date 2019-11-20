@@ -28,4 +28,7 @@ include CModule
 ROM_SYMS += ${PVLIBS}
 CFLAGS += -Wpn -IOSLib:
 
+${DIRS} ::
+	${MKDIR} h
+
 include Depends
