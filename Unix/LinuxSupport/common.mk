@@ -16,7 +16,7 @@
 #
 
 HARDDISC4=$(HOME)/Downloads/HardDisc4.5.24.util
-QEMU_SRC=$(HOME)/Downloads/qemu-4.0.0.tar.xz
+QEMU_SRC=$(HOME)/Downloads/qemu-4.1.1.tar.xz
 RPCEMU=$(HOME)/Downloads/rpcemu-0.8.15.tar.gz
 IOMD=$(HOME)/Downloads/IOMD-Soft.5.24.zip
 
@@ -130,22 +130,22 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	export -f build
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASHF) build </dev/null |& cat
 
-Built/qemu_stamp-v4.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
+Built/qemu_stamp-v4.1.1: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
 	set -o pipefail
 	rm -rf Built/qemu*
 	mkdir -p Built/qemu_files
 	unpack() {
-	  echo "13a93dfe75b86734326f8d5b475fde82ec692d5b5a338b4262aeeb6b0fa4e469 /qemu.tar.xz" | sha256sum -c
+	  echo "ed6fdbbdd272611446ff8036991e9b9f04a2ab2e3ffa9e79f3bab0eb9a95a1d2 /qemu.tar.xz" | sha256sum -c
 	  tar -Jxf /qemu.tar.xz
-	  cd qemu-4.0.0
+	  cd qemu-4.1.1
 	  patch -p1 < /d
 	}
 	export -f unpack
 	$(call sandbox_base,-s) $(sandbox_misc) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Unix/LinuxSupport/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASHF) unpack </dev/null |& cat
-	mv Built/qemu_files/qemu-4.0.0 Built/qemu
-	touch Built/qemu_stamp-v4.0.0
+	mv Built/qemu_files/qemu-4.1.1 Built/qemu
+	touch Built/qemu_stamp-v4.1.1
 
-Built/qemu_Makefile_stamp: Built/qemu_stamp-v4.0.0
+Built/qemu_Makefile_stamp: Built/qemu_stamp-v4.1.1
 	set -o pipefail
 	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
@@ -234,7 +234,7 @@ $(IOMD):
 	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${QEMU_SRC}:
-	sh Unix/LinuxSupport/download.sh '${QEMU_SRC}' "https://download.qemu.org/qemu-4.0.0.tar.xz" "13a93dfe75b86734326f8d5b475fde82ec692d5b5a338b4262aeeb6b0fa4e469"
+	sh Unix/LinuxSupport/download.sh '${QEMU_SRC}' "https://download.qemu.org/qemu-4.1.1.tar.xz" "ed6fdbbdd272611446ff8036991e9b9f04a2ab2e3ffa9e79f3bab0eb9a95a1d2"
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 $@ || true
 
 $(RPCEMU):

@@ -54,7 +54,7 @@ This following items will be download to ~/Downloads if needed:
 * RISC OS 5.22 Disc Archive
 * RISC OS 5.22 IOMD ROM Image
 * RPCEmu 0.8.15
-* QEMU 3.0.0
+* QEMU 4.1.1
 
 ## IXFS
 
