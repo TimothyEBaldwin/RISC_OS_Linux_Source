@@ -89,6 +89,7 @@ Built/seccomp%: Built/gen_seccomp
 	Built/gen_seccomp $* > $@
 
 Built/rpcemu/stamp2: $(RPCEMU) Unix/LinuxSupport/rpcemu_exit.diff | Built/gen_seccomp
+	set -o pipefail
 	rm -rf Built/rpcemu*
 	mkdir -p Built/rpcemu_files
 	unpack() {
@@ -103,6 +104,7 @@ Built/rpcemu/stamp2: $(RPCEMU) Unix/LinuxSupport/rpcemu_exit.diff | Built/gen_se
 	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
 
 Built/rpcemu/src/Makefile: Built/rpcemu/stamp2
+	set -o pipefail
 	configure() {
 	  if uname -m | grep -E -q 'x86|i386'; then
 	    ./configure --enable-dynarec CFLAGS="-no-pie -fno-pie"
@@ -115,6 +117,7 @@ Built/rpcemu/src/Makefile: Built/rpcemu/stamp2
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASHF) configure </dev/null |& cat
 
 Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
+	set -o pipefail
 	+cp Unix/LinuxSupport/rpcemu.cfg Built/rpcemu/rpc.cfg
 	build() {
 	  touch hd4.hdf roms/ROM
@@ -128,6 +131,7 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASHF) build </dev/null |& cat
 
 Built/qemu_stamp-v4.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
+	set -o pipefail
 	rm -rf Built/qemu*
 	mkdir -p Built/qemu_files
 	unpack() {
@@ -142,10 +146,12 @@ Built/qemu_stamp-v4.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen
 	touch Built/qemu_stamp-v4.0.0
 
 Built/qemu_Makefile_stamp: Built/qemu_stamp-v4.0.0
+	set -o pipefail
 	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
 
 Built/qemu-arm: Built/qemu_Makefile_stamp
+	set -o pipefail
 	+$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
 	test ! -L Built/qemu/arm-linux-user
 	test ! -L Built/qemu/arm-linux-user/qemu-arm
