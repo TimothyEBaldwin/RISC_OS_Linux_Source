@@ -1,9 +1,6 @@
-/* Created by Hdr2H.  Do not edit.*/
-#ifndef IXFS___DEV_FD_5_BUILD_LINUX_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
-#define IXFS___DEV_FD_5_BUILD_LINUX_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
-
-#pragma force_top_level
-#pragma include_only_once
+/* Created by Hdr2H.  Pragmas removed manually. */
+#ifndef IXFS___DEV_FD_5_BUILD_LINUX_RISCOS_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
+#define IXFS___DEV_FD_5_BUILD_LINUX_RISCOS_EXPORT_APCS_32_C_GLOBAL_KEYBOARD_H
 
 #define KeyboardID_A500                          (0)
 #define KeyboardID_Archimedes                    (1)
