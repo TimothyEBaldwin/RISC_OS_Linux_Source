@@ -29,6 +29,8 @@
 MemorySWI       ROUT
         Push    lr                              ; Save real return address.
         AND     lr, r0, #&FF                    ; Get reason code.
+        CMP     lr, #OSMemReason_Convert64
+        BHS     %FT50
         CMP     lr, #(%40-%30):SHR:2            ; If valid reason code then
         ADDCC   lr, lr, #(%30-%10):SHR:2        ;   determine where to jump to in branch table,
         ADDCC   lr, pc, lr, LSL #2
@@ -102,7 +104,26 @@ MemReturn
  ]
         B       CheckMemoryAccess               ; 24
                                                 ; 25+ reserved for ROL
-40
+40      ; End of list
+
+50
+        SUB     lr, lr, #OSMemReason_Convert64
+        CMP     lr, #(%90-%80):SHR:2            ; If valid reason code then
+        ADDCC   lr, lr, #(%80-%60):SHR:2        ;   determine where to jump to in branch table,
+        ADDCC   lr, pc, lr, LSL #2
+        Push    lr, CC                          ;   save address so we can
+60
+        ADRCC   lr, MemReturn                   ;   set up default return address for handler routines
+        Pull    pc, CC                          ;   and jump into branch table.
+        B       %BT20                           ; Otherwise, unknown reason code.
+
+80
+ [ PagedMemory
+        B       MemoryConvert64                 ; 64
+ |
+        B       %BT20                           ; 64
+ ]
+90      ; End of list
 
 
  [ PagedMemory
@@ -111,7 +132,8 @@ MemReturn
 ;
 ;       In:     r0 = flags
 ;                       bit     meaning
-;                       0-7     0 (reason code)
+;                       0-7     0 (reason code, page list uses 32bit addrs)
+;                               or 64 (reason code, list uses 64bit addrs)
 ;                       8       page number provided when set
 ;                       9       logical address provided when set
 ;                       10      physical address provided when set
@@ -122,8 +144,9 @@ MemReturn
 ;                               2=disable caching on these pages
 ;                               3=enable caching on these pages
 ;                       16-31   reserved (set to 0)
-;               r1 -> page block
-;               r2 = number of 3 word entries in page block
+;               r1 -> page block. 3 words per entry (OS_Memory 0) or 5 words
+;                     per entry (OS_Memory 64).
+;               r2 = number of entries in page block
 ;
 ;       Out:    r1 -> updated page block
 ;
@@ -146,6 +169,15 @@ logical_bits    *       ((logical :SHL: 4) :OR: logical)
 physical_bits   *       ((physical :SHL: 4) :OR: physical)
 cacheable_bit   *       1:SHL:15
 alter_cacheable *       1:SHL:16
+mem0_64         *       OSMemReason_Convert64
+
+MemoryConvert64 ROUT
+        ; Wrapper which checks for unsupported flags in R0
+        CMP     r0, #1:SHL:16
+        BLO     MemoryConvertFIQCheck
+        ADRL    r0, ErrorBlock_BadParameters
+        SETV
+        MOV     pc, lr
 
 ; Small wrapper to make sure FIQs are disabled if we're making pages uncacheable
 ; (Modern ARMs ignore unexpected cache hits, so big coherency issues if we make
@@ -174,9 +206,9 @@ MemoryConvertNoFIQCheck   ROUT
 ;        ORR     lr, lr, #I32_bit+F32_bit
 ;        pvMSR   CPSR_c, lr
 
-        BIC     lr, r0, #all,given      ; Need to munge r0 to get rotates to work (must be even).
-        AND     r0, r0, #all,given
-        ORR     r0, r0, lr, LSL #1      ; Move bits 11-30 to 12-31.
+        MOV     lr, r0, LSR #11         ; Need to munge r0 to get rotates to work (must be even)
+        BIC     r0, r0, lr, LSL #11
+        ORR     r0, r0, lr, LSL #12     ; Move bits 11-30 to 12-31. Bits 7 & 11 are clear, so the rotate will always clear C
 
         TST     r0, #all,given          ; Check for invalid argument (no fields provided)
         TEQNE   r2, #0                  ;   (no entries in table).
@@ -191,17 +223,35 @@ MemoryConvertNoFIQCheck   ROUT
         LDR     r6, =ZeroPage
         LDR     r7, [r6, #MaxCamEntry]
         LDR     r6, [r6, #CamEntriesPointer]
+
+        TST     r0, #mem0_64                 ; Step back one entry (main loop
+        SUBEQ   r1, r1, #MemPageBlock32_Size ; increments ptr at the start of
+        SUBNE   r1, r1, #MemPageBlock64_Size ; the loop)
 10
         SUBS    r2, r2, #1
         BCC     %FT70
 
+        TST     r0, #mem0_64
+        ADDEQ   r1, r1, #MemPageBlock32_Size
+        ADDNE   r1, r1, #MemPageBlock64_Size
+
         ASSERT  MemPageBlock32_PageNum=0
         ASSERT  MemPageBlock32_LogAddr=4
         ASSERT  MemPageBlock32_PhysAddr=8
-        ASSERT  MemPageBlock32_Size=12
-        LDMIA   r1!, {r3-r4,r8}         ; Get next three word entry (PN,LA,PA) and move on pointer.
-        ! 0, "LongDescTODO 4GB"
-        MOV     r9, #0                  ; Top half of PA is zero
+        LDMIA   r1, {r3-r4,r8}          ; Get next three words (PN,LA,PA)
+        MOVEQ   r9, #0                  ; High word of phys addr
+        LDRNE   r9, [r1, #MemPageBlock64_PhysHigh]
+
+        ; If we're using the 64bit API, the LDM will have actually loaded these
+        ASSERT  MemPageBlock64_PageNum=0
+        ASSERT  MemPageBlock64_LogLow=4
+        ASSERT  MemPageBlock64_LogHigh=8
+        ; Load the correct low phys addr, and if log addr given, check high word is zero
+        MOVNE   lr, r8
+        LDRNE   r8, [r1, #MemPageBlock64_PhysLow]
+        TSTNE   r0, #logical,given
+        CMPNE   lr, #0
+        BNE     %FT80
 
    [ AMB_LazyMapIn
         BL      handle_AMBHonesty       ; may need to make page honest (as if not lazily mapped)
@@ -215,12 +265,25 @@ MemoryConvertNoFIQCheck   ROUT
         BL      ppn_to_logical          ; Else get LA from PN (PA wanted (not given) & LA not given => PN given).
         BLCC    ppn_to_physical         ; And get PA from PN (more accurate than getting PA from LA - page may be mapped out)
 15
-        ! 0, "LongDescTODO 4GB"
-        CMPCC   r9, #1
         BCS     %FT80
+        MVN     lr, r0
+        CMP     r9, #0                  ; If high phys addr non-zero
+        TSTNE   lr, #mem0_64            ; And not using 64bit API
+        BNE     %FT80                   ; Throw error
+
+        ; Store phys addr
+        TST     r0, #mem0_64
+        STREQ   r8, [r1, #MemPageBlock32_PhysAddr]
+        STRNE   r8, [r1, #MemPageBlock64_PhysLow]
+        STRNE   r9, [r1, #MemPageBlock64_PhysHigh]
+
+        ; Store log addr, if wanted
         TST     r0, #logical,wanted
-        STRNE   r4, [r1, #MemPageBlock32_LogAddr-MemPageBlock32_Size] ; Store back LA if wanted.
-        STR     r8, [r1, #MemPageBlock32_PhysAddr-MemPageBlock32_Size] ; Store back PA.
+        ASSERT  MemPageBlock64_LogLow = MemPageBlock32_LogAddr
+        STRNE   r4, [r1, #MemPageBlock32_LogAddr]
+        TSTNE   r0, #mem0_64
+        MOVNE   lr, #0
+        STRNE   lr, [r1, #MemPageBlock64_LogHigh]
 20
         TST     r0, #alter_cacheable    ; If altering cacheability
         EORNE   lr, r0, #ppn,given      ;   and PN not given
@@ -232,7 +295,8 @@ MemoryConvertNoFIQCheck   ROUT
         BLCC    physical_to_ppn         ; Get PN from PA.
         BCS     %FT80
         TST     r0, #ppn,wanted
-        STRNE   r3, [r1, #MemPageBlock32_PageNum-MemPageBlock32_Size] ; Store back PN if wanted.
+        ASSERT  MemPageBlock64_PageNum = MemPageBlock32_PageNum
+        STRNE   r3, [r1, #MemPageBlock32_PageNum] ; Store back PN if wanted.
 30
         TST     r0, #logical,wanted     ; If LA wanted
         EORNE   lr, r0, #physical,wanted
@@ -243,7 +307,12 @@ MemoryConvertNoFIQCheck   ROUT
         BLEQ    physical_to_ppn         ;   get it from PA (LA wanted (not given) & PN not given => PA given).
         BLCC    ppn_to_logical          ; Get LA from PN.
         BCS     %FT80
-        STR     r4, [r1, #MemPageBlock32_LogAddr-MemPageBlock32_Size] ; Store back LA.
+        ; Store back log addr
+        ASSERT  MemPageBlock64_LogLow = MemPageBlock32_LogAddr
+        STR     r4, [r1, #MemPageBlock32_LogAddr]
+        TST     r0, #mem0_64
+        MOVNE   lr, #0
+        STRNE   lr, [r1, #MemPageBlock64_LogHigh]
 40
         TST     r0, #alter_cacheable
         BEQ     %BT10
