@@ -28,6 +28,7 @@ install_DDE: install_Dir
 	${CP} Build.FAppend    ${INSTDIR}.FAppend         ${CPFLAGS}
 	${CP} Build.InstRes    ${INSTDIR}.Build.InstRes   ${CPFLAGS}
 	${CP} Build.InstViaRG  ${INSTDIR}.Build.InstViaRG ${CPFLAGS}
+	${CP} Build.Touch      ${INSTDIR}.Build.Touch     ${CPFLAGS}
 
 install_STB: install_Dir
 	${CP} Unix.chmod ${INSTDIR}.chmod ${CPFLAGS}
