@@ -29,6 +29,9 @@ if [[ $QEMU = "" ]]; then
   RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run -p --abort-on-input --noaborts
 fi
 
+# Test C swi handler
+RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run '' --cswi --abort-on-input --noaborts
+
 # Various tests that shouldn't cause data aborts
 RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run '' --abort-on-input --noaborts
 
