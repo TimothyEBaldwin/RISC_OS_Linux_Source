@@ -1590,32 +1590,58 @@ FindAccessPrivilege ROUT
 ;                       8       Input function provides physical addresses
 ;                       9       DMA is writing to RAM
 ;                       10      DMA is complete, perform any post-op cache maintenance
-;                       11-31   reserved (set to 0)
+;                       11      Physical addresses are 64bit
+;                       12-31   reserved (set to 0)
 ;               r1 = R12 value to provide to called functions
 ;               r2 = Initial R9 value to provide to input function
-;               r3 -> Input function:
-;                      in:  r9 = r2 from SWI / value from previous call
-;                           r12 = r1 from SWI
-;                      out: r0 = start address of region
-;                           r1 = length of region (0 if end of transfer)
-;                           r2 = flags:
-;                                bit 0: Bounce buffer will be used
-;                           r9 = new r9 for next input call
-;                           r12 corrupt
+;               r3 -> Input function
 ;               r4 = Initial R9 value to provide to output function
-;               r5 -> Output function (if bit 10 of R0 clear):
-;                      in: r0 = logical address of start of region
-;                          r1 = physical address of start of region
-;                          r2 = length of region
-;                          r3 = flags:
-;                               bit 0: Bounce buffer must be used
-;                          r9 = r4 from SWI / value from previous call
-;                          r12 = r1 from SWI
-;                      out: r9 = new r9 value for next output call
-;                           r0-r3, r12 corrupt
+;               r5 -> Output function (if bit 10 of R0 clear)
 ;
 ;       Out:    r2, r4 updated to match values returned by input/output calls
 ;               All other regs preserved
+;
+; Input function, 32bit version:
+;  in:  r9 = r2 from SWI / value from previous call
+;       r12 = r1 from SWI
+;  out: r0 = start address of region
+;       r1 = length of region (0 if end of transfer)
+;       r2 = flags:
+;            bit 0: Bounce buffer will be used
+;       r9 = new r9 for next input call
+;       r12 corrupt
+;
+; Output function, 32bit version:
+;   in: r0 = logical address of start of region
+;       r1 = physical address of start of region
+;       r2 = length of region
+;       r3 = flags:
+;            bit 0: Bounce buffer must be used
+;       r9 = r4 from SWI / value from previous call
+;       r12 = r1 from SWI
+;   out: r9 = new r9 value for next output call
+;        r0-r3, r12 corrupt
+;
+; Input function, 64bit version:
+;  in:  r9 = r2 from SWI / value from previous call
+;       r12 = r1 from SWI
+;  out: r0,r1 = start address of region
+;       r2 = flags:
+;            bit 0: Bounce buffer will be used
+;       r3 = length of region (0 if end of transfer)
+;       r9 = new r9 for next input call
+;       r12 corrupt
+;
+; Output function, 64bit version:
+;   in: r0 = logical address of start of region
+;       r1,r2 = physical address of start of region
+;       r3 = flags:
+;            bit 0: Bounce buffer must be used
+;       r4 = length of region
+;       r9 = r4 from SWI / value from previous call
+;       r12 = r1 from SWI
+;   out: r9 = new r9 value for next output call
+;        r0-r4, r12 corrupt
 ;
 ; Performs address translation and cache maintenance necessary to allow for DMA
 ; to be performed to/from cacheable memory.
@@ -1646,7 +1672,12 @@ FindAccessPrivilege ROUT
 ;
 ; This minimises the number of registers needed to hold a block, and simplifies
 ; the merge calculation (blocks can be merged if words 2 + 1 of first block
-; match words 0 + 1 of second block)
+; match words 0 + 1 of second block).
+;
+; Note: InChunk uses a slightly different format, which essentially assumes a
+; flat 1:1 logical to physical mapping. I.e. start & end addresses are in
+; whatever unit the input function provided, and only the upper 8 bits of the
+; log -> phys offset are used (storing the high bits of large phys addresses)
 
 ; Workspace struct that's stored on the stack
                     ^ 0
@@ -1656,6 +1687,7 @@ DMAPrepW_PhyChunk   # 12
 DMAPrepW_CacheMask  # 4 ; Cache line length - 1
 DMAPrepW_ARMop      # 4 ; Cache maintenenace ARMop to use
 DMAPrepW_CamEntriesPointer # 4 ; CamEntriesPointer copy
+DMAPrepW_MaxCamEntry # 4 ; MaxCamEntry copy
 DMAPrepW_Size       # 0
                         ; These next few correspond directly to the input registers in the stack frame
 DMAPrepW_Flags      # 4
@@ -1665,11 +1697,11 @@ DMAPrepW_InFunc     # 4
 DMAPrepW_OutR9      # 4
 DMAPrepW_OutFunc    # 4
 
-DMAPrep_FlagOffset * 20
-DMAPrep_NonCacheable * 1:SHL:21 ; Internal flag used for tracking non-cacheable pages
+DMAPrep_FlagOffset * 28 ; We need 28 address bits for 40 bit physical addresses (dropping the lower 12 bits which provide the page offset)
+DMAPrep_NonCacheable * 1:SHL:29 ; Internal flag used for tracking non-cacheable pages
 
 DMAPrep ROUT
-        CMP     r0, #1<<11
+        CMP     r0, #1<<12
         BHS     MemoryBadParameters
         ; The end of a read from RAM is a no-op (no cache maintenance required)
         AND     r11, r0, #DMAPrep_Write :OR: DMAPrep_End
@@ -1688,6 +1720,7 @@ DMAPrep ROUT
         LDR     r7, [r10, #MaxCamEntry]
         ; Init workspace
         STR     r6, [sp, #DMAPrepW_CamEntriesPointer]
+        STR     r7, [sp, #DMAPrepW_MaxCamEntry]
         ; Get the cache line mask value
       [ MEMM_Type == "ARM600"
         LDRB    r1, [r10, #DCache_LineLen]
@@ -1710,12 +1743,23 @@ DMAPrep ROUT
         CMP     r0, r3
         BEQ     %FT90
 05
-        STMIA   lr, {r0, r2, r3}
+        ; r0 > r3 implies the input crosses a 4G barrier. Barriers are annoying
+        ; for us to deal with using this 3-word chunk format, so split things
+        ; up.
+        STMLOIA lr, {r0, r2, r3}
+        BLO     %FT10
+        MOV     r4, #0
+        STMIA   lr, {r0, r2, r4}        ; First part
+        CMP     r0, #0
+        ADDNE   r2, r2, #1:SHL:20
+        MOVNE   r0, #0                  ; Second part
+        BLEQ    DMAPrep_CallInputFunc   ; Or, (non-merged) next chunk if we ended on a 4G barrier
+        B       %FT19
 10
         ; Get another input region, see if we can merge it with InChunk
         BL      DMAPrep_CallInputFunc
         CMP     r0, r3
-        BEQ     %FT19
+        BHS     %FT19                   ; Zero-length (end of input), or 4G crossing
         LDMIB   lr, {r4, r5}
         CMP     r4, r2
         CMPEQ   r5, r0
@@ -1727,70 +1771,70 @@ DMAPrep ROUT
         STMDB   lr, {r0, r2, r3}
 20
         ; Perform address translation for the start of InChunk
-        LDR     r4, [sp, #DMAPrepW_InChunk]
+        LDR     r5, [sp, #DMAPrepW_InChunk]
         BL      DMAPrep_Translate
         ; Store in PhyChunk
         ADD     lr, sp, #DMAPrepW_PhyChunk
-        STMIA   lr, {r4-r6}
+        STMIA   lr, {r5-r7}
         ; Align start to cache boundary
-        TST     r5, #DMAPrep_NonCacheable+(DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset)
+        TST     r6, #DMAPrep_NonCacheable+(DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset)
         BNE     %FT25
         LDR     lr, [sp, #DMAPrepW_Flags]
         LDR     r10, [sp, #DMAPrepW_CacheMask]
         TST     lr, #DMAPrep_Write
-        TSTNE   r4, r10
+        TSTNE   r5, r10
         BEQ     %FT25
         ; Unaligned write to cacheable memory -> bounce required
-        ADD     r1, r4, r10
+        ADD     r1, r5, r10
         BIC     r1, r1, r10 ; End of current cache line
         ; Only round down to end of current cache line if the end of the chunk
         ; is at or beyond the end of the next cache line
         ADD     r2, r1, r10 ; Last byte we can accept without needing to truncate
-        CMP     r6, r2
-        MOVHI   r6, r1 ; Truncate!
-        ORR     r5, r5, #DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset
+        CMP     r7, r2
+        MOVHI   r7, r1 ; Truncate! N.B. this compare may break if we map memory at &FFFFF000
+        ORR     r6, r6, #DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset
         B       %FT40
 25
         ; Start doesn't need splitting, so translate + append more pages
         ADD     lr, sp, #DMAPrepW_InChunk
         ASSERT  DMAPrepW_PhyChunk = DMAPrepW_InChunk + 12
-        LDMIA   lr, {r0-r2, r4-r6}
-        SUB     r3, r6, r4 ; Length of translated region
+        LDMIA   lr, {r0-r2, r5-r7}
+        SUB     r3, r7, r5 ; Length of translated region
         SUB     r2, r2, r0 ; Length of input region
         CMP     r3, r2
         BEQ     %FT30
-        ADD     r4, r0, r3 ; Translate next address in input address space
+        ADD     r5, r0, r3 ; Translate next address in input address space
         BL      DMAPrep_Translate
         ; Try and merge with PhyChunk
         ADD     lr, sp, #DMAPrepW_PhyChunk
         LDMIB   lr, {r0, r1}
-        CMP     r0, r5
-        CMPEQ   r1, r4
-        STREQ   r6, [sp, #DMAPrepW_PhyChunk + 8]
+        CMP     r0, r6
+        CMPEQ   r1, r5
+        STREQ   r7, [sp, #DMAPrepW_PhyChunk + 8]
         BEQ     %BT25
-        LDMIA   lr, {r4-r6}
+        LDMIA   lr, {r5-r7}
 30
-        ; Can't merge any more pages into this chunk {r4-r6}
+        ; Can't merge any more pages into this chunk {r5-r7}
         ; Truncate / bounce the end if necessary
-        TST     r5, #DMAPrep_NonCacheable+(DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset)
+        TST     r6, #DMAPrep_NonCacheable+(DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset)
         BNE     %FT50
         LDR     lr, [sp, #DMAPrepW_Flags]
         LDR     r10, [sp, #DMAPrepW_CacheMask]
         TST     lr, #DMAPrep_Write
-        TSTNE   r6, r10
+        TSTNE   r7, r10
         BEQ     %FT40
         ; Unaligned write to cacheable memory -> bounce required
-        BIC     r3, r6, r10
-        CMP     r3, r4
-        ORREQ   r5, r5, #DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset ; Bounce
-        MOVNE   r6, r3 ; Truncate
+        BIC     r3, r7, r10
+        CMP     r3, r5
+        ORREQ   r6, r6, #DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset ; Bounce
+        MOVNE   r7, r3 ; Truncate
 40
         ; Perform cache maintenance if necessary
         ; For safety we always perform this before calling the output function, rather than caching and attempting to merge the regions (output function may alter cacheability of pages?)
-        TST     r5, #DMAPrep_NonCacheable+(DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset)
+        TST     r6, #DMAPrep_NonCacheable+(DMAPrep_UseBounceBuffer :SHL: DMAPrep_FlagOffset)
         BNE     %FT50
-        ADD     r1, r6, r10
-        BIC     r0, r4, r10
+        ADD     r1, r7, r10
+        BIC     r0, r5, r10
         BIC     r1, r1, r10
         MOV     lr, pc
         LDR     pc, [sp, #DMAPrepW_ARMop]
@@ -1799,12 +1843,17 @@ DMAPrep ROUT
         LDR     lr, [sp, #DMAPrepW_Flags]
         TST     lr, #DMAPrep_End
         BNE     %FT60 ; No output func for end-of-op
-        MOV     r0, r4
-        ADD     r1, r4, r5, LSL #12
-        SUB     r2, r6, r4
-        MOV     r3, r5, LSR #DMAPrep_FlagOffset
+        MOV     r0, r5
+        ADDS    r1, r5, r6, LSL #12
+        MOV     r2, r6, LSR #20
+        ADC     r2, r2, #0              ; Yuck, need to deal with carry propagation
+        AND     r2, r2, #255            ; ... and keep modulo 2^40
+        SUB     r4, r7, r5
+        MOV     r3, r6, LSR #DMAPrep_FlagOffset
         LDR     r12, [sp, #DMAPrepW_R12]
         AND     r3, r3, #DMAPrep_UseBounceBuffer ; Mask out internal flags
+        TST     lr, #DMAPrep_Phys64
+        MOVEQ   r2, r4                  ; For the 32bit API, this will drop the high physical address bits. But that should be safe, since we force high addresses to use a bounce buffer (in which case the physical address *should* be completely ignored)
         ADD     r9, sp, #DMAPrepW_OutR9
         CLRV    ; Ensure V is clear on entry so simple functions don't confuse us
         MOV     lr, pc
@@ -1813,11 +1862,11 @@ DMAPrep ROUT
         STR     r9, [sp, #DMAPrepW_OutR9] ; Always write back updated R9
         BVS     %FT90
 60
-        ; Advance InChunk by the length of {r4-r6}
+        ; Advance InChunk by the length of {r5-r7}
         LDR     r0, [sp, #DMAPrepW_InChunk]
-        ADD     r0, r0, r6
+        ADD     r0, r0, r7
         LDR     r1, [sp, #DMAPrepW_InChunk+8]
-        SUB     r0, r0, r4
+        SUB     r0, r0, r5
         STR     r0, [sp, #DMAPrepW_InChunk]
         CMP     r0, r1
         BNE     %BT20
@@ -1845,42 +1894,63 @@ DMAPrep ROUT
 ;      LR -> InChunk
 ;      R1, R4, R9, R12 corrupt
 DMAPrep_CallInputFunc
-        MOV     r4, lr ; Avoid pushing onto stack, to simplify workspace indexing and error handling
         LDR     r12, [sp, #DMAPrepW_R12]
         ADD     r9, sp, #DMAPrepW_InR9
+        Push    "lr"
         CLRV    ; Ensure V is clear on entry so simple functions don't confuse us
         MOV     lr, pc
         ASSERT  DMAPrepW_InFunc = DMAPrepW_InR9 + 4
         LDMIA   r9, {r9, pc}            ; Call the input function
+        Pull    "r12"
         STR     r9, [sp, #DMAPrepW_InR9] ; Always write back updated R9
         BVS     %BT90
+        ; Shuffle registers if we're using the 32bit API
+        LDR     r9, [sp, #DMAPrepW_Flags]
+        TST     r9, #DMAPrep_Phys64
+        MOVEQ   r3, r1
+        MOVEQ   r1, #0
+        CMP     r3, #0
+        BEQ     %FT50
         CMP     r2, #DMAPrep_UseBounceBuffer
         BHI     %BT96
+        CMP     r1, #255                ; Max 40 bit phys addr
+        BHI     %BT95
         ; Pack into InChunk
         MOV     r2, r2, LSL #DMAPrep_FlagOffset
+        ORR     r2, r2, r1, LSL #20
         ADD     lr, sp, #DMAPrepW_InChunk
-        ADD     r3, r0, r1
-        MOV     pc, r4
+        ADD     r3, r0, r3
+        MOV     pc, r12
+50
+        ; End of input - just set everything to zero
+        MOV     r0, #0
+        MOV     r2, #0
+        ADD     lr, sp, #DMAPrepW_InChunk
+        MOV     pc, r12
 
 ; Translate the start of InChunk into a block
-; In: r4 = Address to translate
-;     r7 = MaxCamEntry
-; Out: r4, r5, r6 = block
-;      r1, r3, r8-r12 corrupt
+; In: r5 = Address to translate
+; Out: r5-r7 = block
+;      r1, r3, r4, r8-r12 corrupt
 DMAPrep_Translate
         MOV     r1, lr
         LDR     r12, [sp, #DMAPrepW_InChunk+8]
-        SUB     r12, r12, r4            ; Length of input region
+        SUB     r12, r12, r5            ; Length of input region (guaranteed 32bit)
         LDR     lr, [sp, #DMAPrepW_Flags]
         LDR     r6, [sp, #DMAPrepW_CamEntriesPointer]
+        LDR     r7, [sp, #DMAPrepW_MaxCamEntry]
+        LDR     r9, [sp, #DMAPrepW_InChunk+4]
         TST     lr, #DMAPrep_PhysProvided
         BNE     %FT20
+        TST     r9, #255:SHL:20         ; Logical addresses must be 32bit!
+        BNE     %BT95
       [ AMB_LazyMapIn
         MOV     r9, r0
-        MOV     r0, r4
+        MOV     r0, r5
         BL      AMB_MakeHonestLA
         MOV     r0, r9
       ]
+        MOV     r4, r5
         BL      logical_to_physical     ; r4 -> r8, r9
         BLCC    physical_to_ppn         ; r7, r8, r9 -> r3
         BCS     %BT95
@@ -1890,9 +1960,13 @@ DMAPrep_Translate
         LDR     lr, [lr, #CAM_PageFlags]
         B       %FT30
 20
-        MOV     r8, r4
-        ! 0, "LongDescTODO 4GB"
-        MOV     r9, #0
+        MOV     r8, r5
+      [ NoARMT2
+        MOV     r9, r9, LSR #20
+        AND     r9, r9, #255
+      |
+        UBFX    r9, r9, #20, #8
+      ]
         BL      physical_to_ppn         ; r7, r8, r9 -> r3
         BCS     %BT95
         ; r5, r10-r11 corrupt
@@ -1911,28 +1985,46 @@ DMAPrep_Translate
         ; Merge in the offset within the page
       [ NoARMT2
         MOV     r3, r3, LSR #12
-        ORR     r4, r3, r4, LSL #20
+        ORR     r4, r3, r8, LSL #20
         MOV     r4, r4, ROR #20
       |
-        BFI     r3, r4, #0, #12
+        BFI     r3, r8, #0, #12
         MOV     r4, r3
       ]
 30
+        ; We now have r4 = log addr, r8,r9 = phys addr, lr = page flags
         LDR     r3, [sp, #DMAPrepW_InChunk+4]
-        ; Combine the cacheability + phys offset into r5
-        SUB     r5, r8, r4              ; r5 = phys-log
+        ; Combine the cacheability + phys offset into r6
+        SUBS    r6, r8, r4              ; r6 = phys-log
+        AND     r3, r3, #&FFFFFFFF:SHL:DMAPrep_FlagOffset ; Get the chunk flags
+        ORR     r6, r3, r6, LSR #12
+        SBC     r7, r9, #0
+      [ NoARMT2
+        AND     r7, r7, #255
+        ORR     r6, r6, r7, LSL #20
+      |
+        BFI     r6, r7, #20, #8
+      ]
         TST     lr, #DynAreaFlags_NotCacheable
-        ORR     r5, r3, r5, LSR #12
-        ORRNE   r5, r5, #DMAPrep_NonCacheable
+        ORRNE   r6, r6, #DMAPrep_NonCacheable
+        ; For the 32bit API, any large phys addresses get forced to use bounce
+        ; buffers. Force it here, so that the main logic will know not to bother
+        ; with cache maintenance for the region.
+        CMP     r9, #0
+        LDRNE   lr, [sp, #DMAPrepW_Flags]
+        EORNE   lr, lr, #DMAPrep_Phys64
+        TSTNE   lr, #DMAPrep_Phys64
+        ORRNE   r6, r6, #DMAPrep_UseBounceBuffer:SHL:DMAPrep_FlagOffset
         ; Work out how much of r12 fits into this page
         ; This is done by comparing against the length of the input region,
         ; since the input could be logical or physical
-        ADD     r6, r4, #4096
-        MOV     r6, r6, LSR #12
-        RSB     r6, r4, r6, LSL #12
-        CMP     r6, r12
-        MOVHI   r6, r12
-        ADD     r6, r4, r6
+        ADD     r7, r4, #4096
+        MOV     r7, r7, LSR #12
+        RSB     r7, r4, r7, LSL #12
+        CMP     r7, r12
+        MOVHI   r7, r12
+        ADD     r7, r4, r7
+        MOV     r5, r4
         MOV     pc, r1
  ] ; PagedMemory
 
