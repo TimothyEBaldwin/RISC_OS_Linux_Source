@@ -126,12 +126,11 @@ VPATH = @ kernel clib rlib
 #
 # Rule patterns
 #
-# Note
 .c.o:;        ${CC} ${CFLAGS} -fah ${CLFLAGS} -o $@ $<
 .c.m_o:;      ${CC} ${CFLAGS} -ffah -zM ${CLFLAGS} -o $@ $<
+.c.rm_o:;     ${CC} ${CFLAGS} -ffah -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
 .c.o_rl:;     ${CC} ${CFLAGS} -fah ${DFLAGS} -o $@ $<
 .c.m_o_rl:;   ${CC} ${CFLAGS} -ffah ${DFLAGS} -zM -o $@ $<
-.c.rm_o:;     ${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
 .c.rm_o_rl:;  ${CC} ${CFLAGS} -ffah ${DFLAGS} -zm1 ${CSFLAGS} ${OPTIONS} -o $@ $<
 .s.o:;        ${AS} ${AFLAGS} ${ALFLAGS} $< $@
 .s.m_o:;      ${AS} ${AFLAGS} ${ALFLAGS} $< $@
