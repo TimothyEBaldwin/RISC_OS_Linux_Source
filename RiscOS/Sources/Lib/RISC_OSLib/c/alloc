@@ -106,6 +106,7 @@
 #include <string.h>             /* for memset(...), memcpy(...) */
 #include <setjmp.h>
 #include <signal.h>
+#include <stdint.h>
 
 #include "hostsys.h"
 #include "alloc.h"
@@ -178,7 +179,8 @@ static BlockP heapHigh; /* address of heap hole guard at the top of heap */
 static BlockP sys_heap_top; /* address of top of system heap, should = heapLow
                                after _init_user_alloc is called          */
 static void *RMABase;   /* base address of RMA */
-static void *RMAEnd;      /* end address of RMA */
+static void *RMAEnd;    /* end address of RMA */
+static int OSMAligns;   /* OS_Module supports aligned RMA requests */
 /*
  * amount of heap that user can actually write to, does not include bitmaps
  * and block overheads
@@ -499,6 +501,20 @@ static void ShowStats(void)
        statsP->eventInfo.bytesDeallocated, statsP->eventInfo.deallocates);
     statsP->eventNo--;
   }
+}
+
+static void init_stats(void)
+{
+  /* grab stats record from heap */
+  statsP = (StatsPtr) _primitive_alloc(BYTESTOWORDS(sizeof(StatsRec)));
+  statsP->stats.coalesces = 0; statsP->stats.heapExtensions = 0;
+  statsP->stats.heapHigh = heapHigh; statsP->stats.heapLow = heapLow;
+  statsP->stats.userHeap = userHeap; statsP->stats.maxHeapRequirement = 0;
+  statsP->stats.blocksAllocated = 0; statsP->stats.bytesAllocated = 0;
+  statsP->stats.blocksDeallocated = 0; statsP->stats.bytesDeallocated = 0;
+  statsP->events[0].allocates = 0; statsP->events[0].deallocates = 0;
+  statsP->events[0].bytesAllocated = 0; statsP->events[0].bytesDeallocated = 0;
+  statsP->nextEvent = 1;
 }
 #endif
 
@@ -830,7 +846,7 @@ static int _primitive_alloc(size_t size/*words*/)
 #ifdef BLOCKS_GUARDED
   if (check.allocates && check_heap() != OK) RELEASEANDRETURN(CORRUPT)
 #endif
-  /* convert size from words to addresss units */
+  /* convert size from words to address units */
   size *= BYTESPERWORD;
   F0("!!primitive_alloc: size ")
   FD(size, 10)
@@ -1067,9 +1083,19 @@ extern size_t _byte_size(void *p)
 
 extern void *malloc(size_t size)
 { void *ptr;
-  if (_kernel_processor_mode() & 0xF) /* not USR26 or USR32 */
+  if (_kernel_processor_mode() & 0xF) { /* not USR26 or USR32 */
+    if (OSMAligns) { /* no need to track aligned requests */
       return _kernel_RMAalloc(size);
-
+    } else { /* prefix a header for free() to cope with aligned allocations too */
+      ptr = _kernel_RMAalloc(size + sizeof(RMABlock));
+      if (ptr != NULL) {
+        RMABlock *bp = (RMABlock *)ptr;
+        bp->real = ptr; /* remember where it came from */
+        ptr = (void *)(bp + 1);
+      }
+      return ptr;
+    }
+  }
   ENTRYTOALLOC(ptr);
   ptr = (void *)_primitive_alloc(BYTESTOWORDS(size));
   if ((unsigned)ptr >= MINHEAPERROR) {
@@ -1086,7 +1112,12 @@ extern void *malloc(size_t size)
 extern void free(void *p)
 { int rc;
   if (p >= RMABase && p < RMAEnd) {
-    _kernel_RMAfree(p); return;
+    if (!OSMAligns) { /* recover the original RMA pointer the kernel expects */
+      RMABlock *bp = ((RMABlock *)p) - 1;
+      p = bp->real;
+    }
+    _kernel_RMAfree(p);
+    return;
   }
   rc = _primitive_dealloc((BlockP)p);
   /* following line may not be correct ANSI - but for the moment we
@@ -1127,22 +1158,6 @@ extern int __coalesce(void)
   return rc;
 }
 
-#ifdef STATS
-static void init_stats(void)
-{
-  /* grab stats record from heap */
-  statsP = (StatsPtr) _primitive_alloc(BYTESTOWORDS(sizeof(StatsRec)));
-  statsP->stats.coalesces = 0; statsP->stats.heapExtensions = 0;
-  statsP->stats.heapHigh = heapHigh; statsP->stats.heapLow = heapLow;
-  statsP->stats.userHeap = userHeap; statsP->stats.maxHeapRequirement = 0;
-  statsP->stats.blocksAllocated = 0; statsP->stats.bytesAllocated = 0;
-  statsP->stats.blocksDeallocated = 0; statsP->stats.bytesDeallocated = 0;
-  statsP->events[0].allocates = 0; statsP->events[0].deallocates = 0;
-  statsP->events[0].bytesAllocated = 0; statsP->events[0].bytesDeallocated = 0;
-  statsP->nextEvent = 1;
-}
-#endif
-
 extern void _terminate_user_alloc(void)
 {
   heapLow = sys_heap_top;
@@ -1171,6 +1186,7 @@ static int arm2_swp(int newValue, int *location)
 extern void _init_alloc(void)
 { int j;
   _kernel_swi_regs r;
+  _kernel_oserror *e;
   INITMUTEX;
   lastFreeBlockOnHeap = NULL;
   mapForExistingHeap = NULL;
@@ -1197,6 +1213,16 @@ extern void _init_alloc(void)
     RMABase = (void *) 0x01800000;
     RMAEnd = (void *) 0x01C00000;
   }
+  /* query OS_Module aligned claim */
+  r.r[0] = 24;
+  r.r[3] = 128;
+  r.r[4] = 0; /* expect 'Bad alignment' not 'Unknown subreason' */
+  e = _kernel_swi(OS_Module,&r,&r);
+  OSMAligns = !(e && e->errnum == 0x105);
+  if (!e) { /* succeeded? then free */
+    r.r[0] = 7;
+    _kernel_swi(OS_Module,&r,&r);
+  }
 #ifdef STATS
   statsP = NULL;
   init_stats();
@@ -1209,9 +1235,24 @@ void *realloc(void *p, size_t size)
 { int rc;
   size_t oldsize;
   void *newb = NULL;
-  if (_kernel_processor_mode() & 0xF) /* not USR26 or USR32? */
+  if (_kernel_processor_mode() & 0xF) { /* not USR26 or USR32 */
+    if (OSMAligns) { /* allowed to return differently aligned block */
       return _kernel_RMAextend(p, size);
-
+    } else {
+      RMABlock *bp;
+      if (p != NULL) {
+        bp = ((RMABlock *)p) - 1;
+        newb = _kernel_RMAextend(bp->real, size + sizeof(RMABlock));
+      } else
+        newb = _kernel_RMAalloc(size + sizeof(RMABlock));
+      if (newb != NULL) {
+        bp = (RMABlock *)newb;
+        bp->real = newb; /* remember where it came from */
+        newb = (void *)(bp + 1);
+      }
+      return newb;
+    }
+  }
   F0("!!realloc\n");
   size = BYTESTOWORDS(size)*BYTESPERWORD;
   if (p == NULL) return malloc(size);
@@ -1263,22 +1304,81 @@ extern void *calloc(size_t count, size_t size)
  * just so that it can verify that the said product really is in range
  * for handing to malloc.
  */
-  unsigned h = (count>>16)*(size>>16);
-  unsigned m1 = (count>>16)*(size&0xffff);
-  unsigned m2 = (count&0xffff)*(size>>16);
-  unsigned l = (count&0xffff)*(size&0xffff);
-  h += (m1>>16) + (m2>>16);
-  m1 = (m1&0xffff) + (m2&0xffff) + (l>>16);
-  l = (l&0xffff) | (m1<<16);
-  h += m1>>16;
-  if (h) l = (unsigned)(-1);
-  if (l >= MAXBYTES) bad_size(l);
-  r = malloc(l);
+  unsigned long long l = count * (unsigned long long)size;
+  if (l >= MAXBYTES) bad_size((size_t)l);
+  r = malloc((size_t)l);
 #ifdef GC
   /* if garbage collecting, the block will already have been zeroed */
-  if ((r != NULL) && (!garbageCollecting)) memset(r, 0, l);
+  if ((r != NULL) && !garbageCollecting) memset(r, 0, (size_t)l);
 #else
-  if (r != NULL) memset(r, 0, l);
+  if (r != NULL) memset(r, 0, (size_t)l);
 #endif
   return r;
+}
+
+extern void *aligned_alloc(size_t align, size_t size)
+{ void *ptr;
+  size_t oversize, excess;
+  if (!align || (align & (align - 1))) /* ensure power of 2 */
+    return NULL;
+  if (_kernel_processor_mode() & 0xF) { /* not USR26 or USR32 */
+    if (OSMAligns) { /* let the kernel do the hard work */
+      _kernel_oserror *e;
+      e = _swix(OS_Module, _IN(0)|_INR(3,4)|_OUT(2), 24, size, align, &ptr);
+      return (e != NULL) ? NULL : ptr;
+    } else { /* overallocate to ensure alignment, then return the subset */
+      if (align < sizeof(RMABlock)) align = sizeof(RMABlock);
+      oversize = size + align - 1 + sizeof(RMABlock); 
+      ptr = _kernel_RMAalloc(oversize);
+      if (ptr != NULL) {
+        RMABlock *bp;
+        uintptr_t user = (uintptr_t)ptr;
+        user = (user + (align - 1)) & ~(align - 1); /* aligned as the user wished */
+        bp = ((RMABlock *)user) - 1;
+        bp->real = ptr; /* remember where it came from */
+        ptr = (void *)user;
+      }
+      return ptr;
+    }
+  }
+  /* otherwise from the heap */
+  if (align < OVERHEAD) align = OVERHEAD;
+  if (size < BYTESPERWORD) size = BYTESPERWORD;
+  excess = 0;
+  while (1) {
+    ENTRYTOALLOC(ptr);
+    oversize = size + align - 1 + OVERHEAD + excess;
+    ptr = (void *)_primitive_alloc(BYTESTOWORDS(oversize));
+    if ((unsigned)ptr >= MINHEAPERROR) {
+#ifdef STATS
+      ShowStats();
+#endif
+      if ((int)ptr == CORRUPT)
+        _alloc_die(_kernel_getmessage("malloc failed", "C12"), CORRUPT);
+      else return NULL;
+    } else {
+      BlockP keepBlock, tempBlock; 
+      uintptr_t user = (uintptr_t)ptr;
+      user  = (user + (align - 1)) & ~(align - 1); /* aligned as the user wished */
+      user += excess; /* doubly aligned to ensure excess */
+      if (user != (uintptr_t)ptr) {
+        /* define a new block at the split point */
+        tempBlock = ADDBYTES(ptr, -OVERHEAD);
+        keepBlock = ADDBYTES(user, -OVERHEAD);
+        oversize = (uintptr_t)keepBlock - (uintptr_t)ptr;
+        if ((int)oversize <= 0) { /* bad: after OVERHEADs it's an empty block */
+          _primitive_dealloc((BlockP)ptr);
+          excess += align;
+          continue; /* go again but double up alignment */
+        }
+        keepBlock->size = SIZE(tempBlock) - oversize - OVERHEAD;
+#ifdef BLOCKS_GUARDED
+        keepBlock->guard = GUARDCONSTANT;
+#endif
+        tempBlock->size = oversize;
+        _primitive_dealloc((BlockP)ptr); /* aka tempBlock, now adjusted */
+      }
+      return (void *)user;
+    }
+  }
 }
