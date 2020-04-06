@@ -91,26 +91,30 @@ OBJS =\
  o.Draw o.DrawAction o.DrawCheck o.DrawDispl o.DrawDXF\
  o.DrawEdit o.DrawEnter o.DrawFileIO o.DrawGrid o.DrawHelp\
  o.DrawMenu o.DrawObject o.DrawPrint o.DrawScan o.DrawSelect\
- o.DrawTextC o.DrawTrans o.DrawUndo o.bezierarc o.DrawClipb o.DrawDrag
+ o.DrawTextC o.DrawTrans o.DrawUndo o.bezierarc o.DrawClipb\
+ o.DrawDrag o.DrawChoice
 
 OBJSZ =\
  oz.Draw oz.DrawAction oz.DrawCheck oz.DrawDispl oz.DrawDXF\
  oz.DrawEdit oz.DrawEnter oz.DrawFileIO oz.DrawGrid oz.DrawHelp\
  oz.DrawMenu oz.DrawObject oz.DrawPrint oz.DrawScan oz.DrawSelect\
- oz.DrawTextC oz.DrawTrans oz.DrawUndo oz.bezierarc oz.DrawClipb oz.DrawDrag
+ oz.DrawTextC oz.DrawTrans oz.DrawUndo oz.bezierarc oz.DrawClipb\
+ oz.DrawDrag oz.DrawChoice
 
 OBJSD =\
  od.Draw od.DrawAction od.DrawCheck od.DrawDispl\
  od.DrawDXF od.DrawEdit od.DrawEnter od.DrawFileIO od.DrawGrid\
  od.DrawHelp od.DrawMenu od.DrawObject od.DrawPrint od.DrawScan\
  od.DrawSelect od.DrawTextC od.DrawTrans od.DrawUndo\
- od.bezierarc od.ftrace od.guard od.flex od.DrawClipb od.DrawDrag
+ od.bezierarc od.ftrace od.guard od.flex od.DrawClipb\
+ od.DrawDrag od.DrawChoice
 
 ASMS =\
  s.Draw s.DrawAction s.DrawCheck s.DrawDispl s.DrawDXF\
  s.DrawEdit s.DrawEnter s.DrawFileIO s.DrawGrid s.DrawHelp\
  s.DrawMenu s.DrawObject s.DrawPrint s.DrawScan s.DrawSelect\
- s.DrawTextC s.DrawTrans s.DrawUndo s.bezierarc s.DrawClipb s.DrawDrag
+ s.DrawTextC s.DrawTrans s.DrawUndo s.bezierarc s.DrawClipb\
+ s.DrawDrag s.DrawChoice
 
 #
 # Rule patterns

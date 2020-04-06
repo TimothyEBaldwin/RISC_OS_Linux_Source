@@ -1,0 +1,608 @@
+/* Copyright 2020 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -> DrawChoice.c
+ *
+ * Choices dialogue, loading and saving
+ */
+
+#include <string.h>
+#include <stdio.h>
+#include <ctype.h>
+#include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
+
+#include "msgs.h"
+#include "os.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "help.h"
+#include "werr.h"
+#include "drawmod.h"
+#include "jpeg.h"
+#include "xferrecv.h"
+
+#include "ftrace.h"
+#include "guard.h"
+
+#include "Draw.h"
+#include "DrawMenu.h"
+#include "DrawMenuD.h"
+#include "DrawChoice.h"
+#include "DrawFileIO.h"
+
+static dbox choicedb;
+static draw_gridmenustr gridmenu_data;
+static menu modepop, paperpop, gridpop;
+static menu lastpop;            /*Last shown of the above 3 popups*/
+static draw_options opt, opt2;  /*Options, and backup set*/
+static viewrec vuue, vuue2;     /*Grid uses a viewrec to cover fields missing from opt*/
+
+#define choicedb_undosize     10
+#define choicedb_undoup       3
+#define choicedb_undodown     2
+#define choicedb_set          0
+#define choicedb_cancel       16
+#define choicedb_showtbox     18
+#define choicedb_zoomlock     4
+#define choicedb_zoomden      9
+#define choicedb_zoomdenup    23
+#define choicedb_zoomdendown  22
+#define choicedb_zoomnum      8
+#define choicedb_zoomnumup    25
+#define choicedb_zoomnumdown  24
+#define choicedb_modepop      14
+#define choicedb_modedisplay  13
+#define choicedb_paperpop     5
+#define choicedb_paperdisplay 27
+#define choicedb_gridpop      7
+#define choicedb_griddisplay  6
+
+#define s_Mode_Lines          1
+#define s_Mode_CLines         2
+#define s_Mode_Curves         3
+#define s_Mode_CCurves        4
+#define s_Mode_Rect           5
+#define s_Mode_Ellipse        6
+#define s_Mode_Text           7
+#define s_Mode_Select         8
+#define s_Mode_MAX            8
+
+#define s_Paper_Show          1
+#define s_Paper_Portrait      2
+#define s_Paper_Landscape     3
+#define s_Paper_A0            4
+#define s_Paper_A1            5
+#define s_Paper_A2            6
+#define s_Paper_A3            7
+#define s_Paper_A4            8
+#define s_Paper_A5            9
+
+static const papersize_typ asizes[] = { Paper_A0, Paper_A1, Paper_A2,
+                                        Paper_A3, Paper_A4, Paper_A5
+                                      };
+
+static int draw_choice_papermenuitem (papersize_typ size)
+
+{ switch (size)
+  { case Paper_A0: return s_Paper_A0;
+    case Paper_A1: return s_Paper_A1;
+    case Paper_A2: return s_Paper_A2;
+    case Paper_A3: return s_Paper_A3;
+    default:
+    case Paper_A4: return s_Paper_A4;
+    case Paper_A5: return s_Paper_A5;
+  }
+}
+
+static const char *draw_choice_describeitem (char *token, char *buffer, int item)
+
+{ char *comma;
+
+  strcpy (buffer, msgs_lookup (token));
+  /*Now step through item-1 commas*/
+  do
+  { comma = strchr (buffer, ',');
+    if (comma)
+    { *comma = '\0';
+      if (item > 0) buffer = comma + 1;
+    }
+    item--;
+  } while (item >= 0);
+  return buffer;
+}
+
+static void draw_choice_menufillin (void)
+
+{ BOOL landscape, show;
+  int i, size, mode;
+  char desc[50], item[100];
+
+  /*Ticks in the paper menu*/
+  show = (opt.paper.o & Paper_Show) != 0;
+  menu_setflags (paperpop, s_Paper_Show, show, FALSE);
+  landscape = (opt.paper.o & Paper_Landscape) != 0;
+  menu_setflags (paperpop, s_Paper_Portrait, !landscape, FALSE);
+  menu_setflags (paperpop, s_Paper_Landscape, landscape, FALSE);
+  size = draw_choice_papermenuitem (opt.paper.size);
+  for (i = s_Paper_A0; i <= s_Paper_A5; i++)
+    menu_setflags (paperpop, i, i == size, FALSE);
+  /*Paper display field*/
+  sprintf (desc, "%s, A%d", draw_choice_describeitem ("DrawOr", item, landscape ? 0 : 1),
+                            size - s_Paper_A0);
+  dbox_setfield (choicedb, choicedb_paperdisplay, desc);
+
+  /*Ticks in the mode menu*/
+  mode = opt.mode.line   ? s_Mode_Lines :
+         opt.mode.cline  ? s_Mode_CLines :
+         opt.mode.curve  ? s_Mode_Curves :
+         opt.mode.ccurve ? s_Mode_CCurves :
+         opt.mode.rect   ? s_Mode_Rect :
+         opt.mode.elli   ? s_Mode_Ellipse :
+         opt.mode.text   ? s_Mode_Text :
+                           s_Mode_Select;
+  for (i = s_Mode_Lines; i <= s_Mode_Select; i++)
+    menu_setflags (modepop, i, i == mode, FALSE);
+  /*Mode display field*/
+  strcpy (desc, draw_choice_describeitem ("MenuMo1", item, mode - 1));
+  dbox_setfield (choicedb, choicedb_modedisplay, desc);
+
+  /*Ticks in the grid menu*/
+  draw_menu_setgridmenu (gridpop, &vuue, &gridmenu_data);
+  /*Grid display field*/
+  strcpy (desc, draw_choice_describeitem ("DrawGr", item, vuue.flags.iso ? 1 : 0));
+  dbox_setfield (choicedb, choicedb_griddisplay, desc);
+}
+
+static int draw_choice_sat (int value, int low, int high)
+
+{ if (value < low) return low;
+  if (value > high) return high;
+  return value;
+}
+
+static void draw_choice_fillin (void)
+
+{ /*Fill current values*/
+  dbox_setnumeric (choicedb, choicedb_zoomnum, opt.zoom.mul);
+  dbox_setnumeric (choicedb, choicedb_zoomden, opt.zoom.div);
+  dbox_setnumeric (choicedb, choicedb_zoomlock, opt.zoom.lock);
+  dbox_setnumeric (choicedb, choicedb_showtbox, opt.toolbox);
+  dbox_setnumeric (choicedb, choicedb_undosize, opt.undo_size >> 10 /*kB*/);
+  draw_choice_menufillin ();
+}
+
+static menu draw_choice_popup (void *handle)
+
+{ int x, y;
+  wimp_wstate state;
+  wimp_icon icon;
+  wimp_w w = dbox_syshandle (choicedb);
+  wimp_eventstr *e = wimpt_last_event ();
+  dbox_field f;
+  wimp_mousestr m;
+
+  if (handle == NULL)
+  {  /*Came here from the menumaker, need to figure out which icon it was*/
+     if (event_is_menu_being_recreated ())
+       return lastpop;
+     wimp_get_point_info (&m);
+     f = (dbox_field) m.i;
+  }
+  else
+  {  /*Came here from clicking on the popup icon*/
+     f = (dbox_field) handle;
+  }
+  switch (f)
+  { case choicedb_modepop:
+      lastpop = modepop;
+      help_register_handler (&help_simplehandler, (void *) "CHM");
+    break;
+    case choicedb_paperpop:
+      lastpop = paperpop;
+      help_register_handler (&help_simplehandler, (void *) "CHP");
+    break;
+    case choicedb_gridpop:
+      lastpop = gridpop;
+      help_register_handler (&help_simplehandler, (void *) "CHG");
+    break;
+    default:
+      return NULL;
+  }
+  /*Find where the popup icon is*/
+  wimpt_complain (wimp_get_icon_info (w, f, &icon));
+  /*Find where the window is*/
+  wimp_get_wind_state (w, &state);
+  /*Offset the menu to open popup per Style Guide*/
+  x =  state.o.x + state.o.box.x0 + icon.box.x1 + 64;
+  y = -state.o.y + state.o.box.y1 + icon.box.y1 - 4;
+  if (e->data.but.m.x != x || e->data.but.m.y != y)
+  { wimp_eventstr fake;
+    /*Force it to be on point, we'll back back in a moment to do it again with x/y correct*/
+    fake.e = wimp_EBUT;
+    fake.data.but.m.bbits = wimp_BMID;
+    fake.data.but.m.w = w;
+    fake.data.but.m.i = (wimp_i)f;
+    fake.data.but.m.x = x;
+    fake.data.but.m.y = y;
+    wimpt_fake_event (&fake);
+  }
+  return lastpop;
+}
+
+static void draw_choice_menuhit (void *handle, char *hit)
+
+{ handle = handle;
+
+  if (lastpop == modepop)
+  { *(unsigned int *)&opt.mode = 0; /*No mode*/
+    switch (hit[0])
+    { case s_Mode_Lines:   opt.mode.line = 1;   break;
+      case s_Mode_CLines:  opt.mode.cline = 1;  break;
+      case s_Mode_Curves:  opt.mode.curve = 1;  break;
+      case s_Mode_CCurves: opt.mode.ccurve = 1; break;
+      case s_Mode_Rect:    opt.mode.rect = 1;   break;
+      case s_Mode_Ellipse: opt.mode.elli = 1;   break;
+      case s_Mode_Text:    opt.mode.text = 1;   break;
+      case s_Mode_Select:  opt.mode.select = 1; break;
+    }
+  }
+  if (lastpop == paperpop)
+  { switch (hit[0])
+    { case s_Paper_Show:
+      { BOOL showing = (opt.paper.o & Paper_Show) == 0; /*Toggle*/
+        opt.paper.o = (paperoptions_typ) ((opt.paper.o & ~Paper_Show) |
+                                          (showing ? Paper_Show : 0));
+      }
+      break;
+
+      case s_Paper_Portrait:
+      case s_Paper_Landscape:
+      { BOOL landscape = hit[0] == s_Paper_Landscape; /*Radio*/
+        opt.paper.o = (paperoptions_typ) ((opt.paper.o & ~Paper_Landscape) |
+                                          (landscape ? Paper_Landscape : 0));
+      }
+      break;
+
+      default: /*s_Paper_An*/
+        opt.paper.size = asizes[hit[0] - s_Paper_A0]; /*Store it*/
+      break;
+    }
+  }
+  if (lastpop == gridpop)
+  { switch (hit[0])
+    { case s_Grid_Show:
+        vuue.flags.show = !vuue.flags.show; /*Toggle*/
+      break;
+
+      case s_Grid_Lock:
+        vuue.flags.lock = !vuue.flags.lock; /*Toggle*/
+      break;
+
+      case s_Grid_Auto:
+        vuue.flags.autoadj = !vuue.flags.autoadj; /*Toggle*/
+      break;
+
+      case s_Grid_Iso:
+      case s_Grid_Rect:
+        vuue.flags.iso = (hit[0] == s_Grid_Iso); /*Radio*/
+        vuue.flags.rect = !vuue.flags.iso;
+      break;
+
+      case s_Grid_Colour:
+        if (hit[1]) vuue.gridcolour = hit[1] - 1; /*Store it*/
+      break;
+
+      case s_Grid_Inch:
+      case s_Grid_InchY:
+      case s_Grid_Cm:
+      case s_Grid_CmY:
+        draw_menu_setgridunits (hit, &vuue, &gridmenu_data);
+      break;
+    }
+  }
+  /*Reflect with appropriate ticks*/
+  draw_choice_menufillin ();
+}
+
+static void draw_choice_events (dbox d, void *handle)
+
+{ dbox_field nd, field = dbox_get (d);
+  BOOL adjust = dbox_persist ();
+  int value, dir = 0;
+
+  switch (field)
+  { case choicedb_set:
+    { os_filestr osf;
+      int len, y;
+      char buffer[256];
+      double x;
+
+      /*Get the non menu driven values*/
+      opt.toolbox = dbox_getnumeric (choicedb, choicedb_showtbox);
+      opt.zoom.lock = dbox_getnumeric (choicedb, choicedb_zoomlock);
+      value = dbox_getnumeric (choicedb, choicedb_undosize);
+      opt.undo_size = draw_choice_sat (value, 1, 9999) << 10; /*Bytes*/
+      value = dbox_getnumeric (choicedb, choicedb_zoomnum);
+      opt.zoom.mul = draw_choice_sat (value, 1, MAXZOOMFACTOR);
+      value = dbox_getnumeric (choicedb, choicedb_zoomden);
+      opt.zoom.div = draw_choice_sat (value, 1, MAXZOOMFACTOR);
+      /*Ensure the dir exists, try to create the choices*/
+      osf.action = OSFile_CreateDir;
+      osf.name = "<Choices$Write>.Draw";
+      osf.start = 0; /*Default entries*/
+      os_file (&osf);
+      x = vuue.gridunit[vuue.flags.xcm ? grid_Cm : grid_Inch].space[grid_X];
+      y = vuue.gridunit[vuue.flags.xcm ? grid_Cm : grid_Inch].divide[grid_X];
+      len = sprintf(buffer, "| Choices file for Draw\n"
+                            "Mode:%d\n"
+                            "ShowToolbox:%s\n"
+                            "Paper:A%d\n"
+                            "ShowLimits:%s\n"
+                            "Orientation:%c\n"
+                            "Grid:%lfx%d\n"
+                            "GridOptions:%c%c%c%c%c\n"
+                            "GridColour:%d\n"
+                            "Zoom:%d:%d\n"
+                            "ZoomLock:%s\n"
+                            "UndoSize:%d\n", *(unsigned int *)&opt.mode, opt.toolbox ? "Yes" : "No",
+                                             draw_choice_papermenuitem (opt.paper.size) - s_Paper_A0,
+                                             opt.paper.o & Paper_Show ? "Yes" : "No",
+                                             opt.paper.o & Paper_Landscape ? 'L' : 'P', x, y,
+                                             vuue.flags.iso ? 'I' : 'i', vuue.flags.autoadj ? 'A' : 'a',
+                                             vuue.flags.show ? 'S' : 's', vuue.flags.lock ? 'L' : 'l',
+                                             vuue.flags.xcm ? 'C' : 'c', vuue.gridcolour,
+                                             opt.zoom.mul, opt.zoom.div, opt.zoom.lock ? "Yes" : "No",
+                                             opt.undo_size);
+      osf.action = OSFile_SaveStamp;
+      osf.name = "<Choices$Write>.Draw.Choices";
+      osf.loadaddr = FileType_Data;
+      osf.start = (int) buffer;
+      osf.end = (int) &buffer[len];
+      if (os_file (&osf))
+      { Error (FALSE, "FileC1"); /*Can't save choices, write protected?*/
+        return;
+      }
+      /*Now confirmed, use them and update the backup set*/
+      draw_choice_read();
+      if (!adjust)
+      { dbox_dispose (&choicedb);
+        choicedb = 0;
+      }
+    }
+    break;
+
+    case dbox_CLOSE:
+    case choicedb_cancel:
+      if (!adjust)
+      { dbox_dispose (&choicedb);
+        choicedb = 0;
+      }
+      else
+      { /*Cancel edits by reverting to the backup*/
+        opt = opt2;
+        vuue = vuue2;
+        draw_choice_fillin (); /*Leave it open*/
+      }
+    break;
+
+    case choicedb_modepop:
+    case choicedb_paperpop:
+    case choicedb_gridpop:
+      draw_choice_popup ((void *) field);
+    break;
+
+    case choicedb_zoomdendown:
+    case choicedb_zoomnumdown:
+      dir = 2;
+    case choicedb_zoomdenup:
+    case choicedb_zoomnumup:
+      dir = 1 - dir;
+      nd = ((field == choicedb_zoomdendown) || (field == choicedb_zoomdenup)) ? choicedb_zoomden
+                                                                              : choicedb_zoomnum;
+      value = dbox_getnumeric (choicedb, nd);
+      value = adjust ? (value - dir) : (value + dir);
+      dbox_setnumeric (choicedb, nd, draw_choice_sat (value, 1, MAXZOOMFACTOR));
+    break;
+
+    case choicedb_undodown:
+      dir = 2;
+    case choicedb_undoup:
+      dir = 1 - dir;
+      value = dbox_getnumeric (choicedb, choicedb_undosize);
+      value = adjust ? (value - dir) : (value + dir);
+      dbox_setnumeric (choicedb, choicedb_undosize, draw_choice_sat (value, 1, 9999));
+    break;
+  }
+  handle = handle;
+}
+
+void draw_choice_display (void)
+
+{ if (choicedb == 0)
+  { choicedb = dbox_new ("choices");
+    if (choicedb)
+    { wimp_w w = dbox_syshandle (choicedb);
+      /*Associate menus*/
+      modepop = menu_new (msgs_lookup ("MenuMo0"), msgs_lookup ("MenuMo1"));
+      paperpop = menu_new (msgs_lookup ("MenuP0"), msgs_lookup ("MenuP2"));
+      gridpop = draw_menu_makegridmenu ("MenuGD2", &gridmenu_data);
+      event_attachmenumaker (w, draw_choice_popup, draw_choice_menuhit, NULL);
+      /*Attach handlers*/
+      dbox_raw_eventhandler (choicedb, &help_dboxrawevents, (void *) "CHOY");
+      dbox_eventhandler (choicedb, &draw_choice_events, NULL);
+      /*Populate*/
+      draw_choice_fillin ();
+      dbox_showstatic (choicedb);
+    }
+  }
+  else
+  { wimp_w w = dbox_syshandle (choicedb);
+    wimp_wstate state;
+    /*Already exists, ensure on top*/
+    wimpt_complain (wimp_get_wind_state (w, &state));
+    state.o.behind = (wimp_w)-1;
+    wimpt_complain (wimp_open_wind (&state.o));
+  }
+}
+
+typedef enum
+{ TAG_MODE,
+  TAG_SHOWTOOLBOX,
+  TAG_PAPER,
+  TAG_SHOWLIMITS,
+  TAG_ORIENTATION,
+  TAG_GRID,
+  TAG_GRIDOPTIONS,
+  TAG_GRIDCOLOUR,
+  TAG_ZOOM,
+  TAG_ZOOMLOCK,
+  TAG_UNDOSIZE,
+
+  TAG_MAX
+} choice_tag;
+
+static choice_tag draw_choice_tag (const char *tag)
+{ int i;
+  static const char *tags[TAG_MAX] = { "mode", "showtoolbox", "paper", "showlimits", "orientation", "grid",
+                                       "gridoptions", "gridcolour", "zoom", "zoomlock", "undosize"
+                                     };
+  for (i = 0; i < TAG_MAX; i++)
+    if (draw_file_matches (tag, tags[i]))
+      return (choice_tag) i;
+  return TAG_MAX;
+}
+
+void draw_choice_read (void)
+
+{ FILE *f;
+  char line[64];
+  char *value, *tag;
+  int numeric, xy;
+  BOOL yes;
+  static const draw_options initial_options = { {Paper_A4, (paperoptions_typ) 0},
+                                                {1.0, 2, {0, 0, 0, 0, 1}},
+                                                {1, 1, 0},
+                                                TRUE,
+                                                {0, 1, 0, 0, 0, 0, 0, 0},
+                                                8192
+                                              };
+  /*Set defaults*/
+  opt = initial_options;
+  /*Parse overrides*/
+  f = fopen ("Choices:Draw.Choices", "r");
+  if (f != NULL)
+  { while (fgets (line, sizeof (line), f) != NULL)
+    { tag = line;
+      while (*tag == ' ') tag++; /*Left trim*/
+      if (*tag == '|') continue; /*Comment*/
+      value = strchr (tag, ':');
+      if (value == NULL) continue; /*Tag but no value*/
+      *value = '\0'; value++;
+      /*Evaluate common ones*/
+      yes = toupper (*value) == 'Y';
+      numeric = atoi (value);
+      switch (draw_choice_tag (tag))
+      { case TAG_MODE:
+          if (numeric != 0 /*Non zero*/ &&
+              (numeric & (numeric - 1)) == 0 /*Single bit*/ &&
+              numeric < (1 << s_Mode_MAX) /*In range*/)
+            *(unsigned int*)&opt.mode = (unsigned int)numeric;
+          break;
+        case TAG_SHOWTOOLBOX:
+          opt.toolbox = yes;
+          break;
+        case TAG_SHOWLIMITS:
+          opt.paper.o = yes ? (opt.paper.o | Paper_Show)
+                            : (opt.paper.o & ~Paper_Show);
+          break;
+        case TAG_ZOOMLOCK:
+          opt.zoom.lock = yes;
+          break;
+        case TAG_ORIENTATION:
+          if (toupper (*value) == 'L')
+            opt.paper.o |= Paper_Landscape;
+          else if (toupper (*value) == 'P')
+            opt.paper.o &= ~Paper_Landscape;
+          break;
+        case TAG_UNDOSIZE:
+          numeric = (numeric + 1023) >> 10; /*Round up to nearest kB*/
+          if (numeric >= 1 && numeric <= 9999)
+            opt.undo_size = numeric << 10; /*Bytes*/
+          break;
+        case TAG_GRIDCOLOUR:
+          if ((unsigned int)numeric < 16)
+            draw_colours.grid = numeric;
+          break;
+        case TAG_PAPER:
+          if (toupper (*value) == 'A')
+          { int size = atoi (value + 1);
+            if (size >= 0 && size < (sizeof (asizes) / sizeof (asizes[0])))
+              opt.paper.size = asizes[size];
+          }
+          break;
+        case TAG_ZOOM:
+          if (numeric >= 1 && numeric <= MAXZOOMFACTOR)
+          { const char *tail = strchr (value, ':');
+            if (tail)
+            { int div = atoi (tail + 1);
+              if (div >= 1 && div <= MAXZOOMFACTOR)
+                opt.zoom.mul = numeric, opt.zoom.div = div;
+            }
+          }
+          break;
+        case TAG_GRID:
+        { double space;
+          int divide;
+          if (sscanf (value, "%lfx%d", &space, &divide) == 2)
+            opt.grid.space = space, opt.grid.divide = divide;
+          break;
+        }
+        case TAG_GRIDOPTIONS:
+          while (*value)
+          { switch (toupper (*value))
+            { case 'I': opt.grid.o[0] = *value == 'I'; break;
+              case 'A': opt.grid.o[1] = *value == 'A'; break;
+              case 'S': opt.grid.o[2] = *value == 'S'; break;
+              case 'L': opt.grid.o[3] = *value == 'L'; break;
+              case 'C': opt.grid.o[4] = *value == 'C'; break;
+            }
+            value++;
+          }
+          break;
+      }
+    }
+    fclose (f);
+  }
+  /*Map subset grid options to superset viewrec options*/
+  vuue.gridcolour    = draw_colours.grid;
+  vuue.flags.rect    =!opt.grid.o[0];
+  vuue.flags.iso     = opt.grid.o[0];
+  vuue.flags.autoadj = opt.grid.o[1];
+  vuue.flags.show    = opt.grid.o[2];
+  vuue.flags.lock    = opt.grid.o[3];
+  vuue.flags.xinch   = vuue.flags.yinch =!opt.grid.o[4];
+  vuue.flags.xcm     = vuue.flags.ycm   = opt.grid.o[4];
+  for (xy = 0; xy < 2; xy++)
+  { vuue.gridunit [grid_Inch].space [xy]  = vuue.flags.xinch ? opt.grid.space : 1.0;
+    vuue.gridunit [grid_Inch].divide [xy] = vuue.flags.xinch ? opt.grid.divide : 4;
+    vuue.gridunit [grid_Cm].space [xy] =    vuue.flags.xcm ? opt.grid.space : 1.0;
+    vuue.gridunit [grid_Cm].divide [xy] =   vuue.flags.xcm ? opt.grid.divide : 2;
+  }
+  /*Keep a backup copy for restoring*/
+  opt2 = opt;
+  vuue2 = vuue;
+  /*Publish for the main menus*/
+  draw_current_options = opt;
+}
