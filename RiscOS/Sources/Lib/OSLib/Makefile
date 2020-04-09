@@ -1,4 +1,4 @@
-# Makefile for shared-source RISC OS variant of OSLib library
+# Makefile for RISC OS Open hosted variant of OSLib library
 #
 
 COMPONENT   = OSLib
@@ -113,6 +113,8 @@ HDRS_TYPES = \
         types                \
         coltrans32           \
         devicefs32           \
+        dosfs32              \
+        filecore32           \
         fileswch32           \
         osargs32             \
         oscore32             \
