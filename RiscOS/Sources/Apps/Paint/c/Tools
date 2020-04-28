@@ -95,6 +95,7 @@ main_sprite *tools_brushsprite_ptr = NULL;
 BOOL tools_flood_local      = TRUE;
 BOOL tools_brush_use_gcol   = TRUE;
 BOOL tools_exporting_sprite = FALSE;
+BOOL tools_grabber_wrap = FALSE;
 
 static wimp_box Marked_Extent;
 
@@ -1510,6 +1511,108 @@ static void floodfillpaint_click (main_window *window,
   }
 }
 
+/*****************************************
+ * Helpers to make temporary sprite copy *
+ * for use by scissor export and wrap    *
+ * option of Move Whole Sprite           *
+ *****************************************/
+
+static void copy_to_temporary_sprite (main_window *window, wimp_box region,
+    main_sprite *tempspriteptr, main_file *fileptr, char *spritename)
+
+{ main_sprite *sprite = window->data->sprite.sprite;
+  int width, height, smode, dx, x0;
+
+  smode = psprite_address (sprite)->mode;
+  dx = bbc_modevar (smode, bbc_XEigFactor);
+  x0 = region.x0 &
+      ~(((32 >> bbc_modevar (smode, bbc_Log2BPC)) << dx) - 1);
+                        /* round down to word boundary */
+  width = ((region.x1 - x0) >> dx) + 2;
+  /* For height, we need to convert from OS units back to pixels */
+  height = (region.y1 - region.y0) / sprite->mode.scale_ymul;
+  if (height < 0)
+        height = -height;
+  height += 2;
+
+  ftracef1 ("need %d bytes\n", psprite_size (width, height, smode,
+      psprite_hasmask (sprite), !psprite_haspal (sprite)? 0:
+      !psprite_hastruecolpal (sprite)? 1: 2));
+  flex_alloc ((flex_ptr) &fileptr->spritearea,
+      psprite_size (width, height, smode, psprite_hasmask (sprite),
+      !psprite_haspal (sprite)? 0: !psprite_hastruecolpal (sprite)? 1:
+      2) + sizeof (sprite_area) + 256);
+
+  if (fileptr->spritearea != 0)
+  { sprite_id sid;
+    os_error *error;
+
+    sprite_area_initialise (fileptr->spritearea,
+        flex_size ((flex_ptr) &fileptr->spritearea));
+
+    sprwindow_swap_output_to_sprite (sprite);
+    error = sprite_get_given (fileptr->spritearea, spritename,
+        psprite_haspal (sprite),
+        region.x0,
+        region.y0,
+        region.x1,
+        region.y1);
+    sprwindow_swap_output_to_screen ();
+    wimpt_noerr (error);
+    sid.tag = sprite_id_name;
+    sid.s.name = spritename;
+    wimpt_noerr (sprite_select_rp (fileptr->spritearea, &sid, &sid.s.addr));
+
+    /*fake main_sprite*/
+    tempspriteptr->file = fileptr;
+    tempspriteptr->offset = (int) sid.s.addr - (int) fileptr->spritearea;
+    ftracef1 ("offset = %d\n", tempspriteptr->offset);
+    sid.tag = sprite_id_addr;
+
+    if (psprite_hasmask (sprite))
+    { sprite_id ssid;
+
+      ftracef0 ("Creating mask\n");
+
+      wimpt_noerr (sprite_create_mask (fileptr->spritearea, &sid));
+      ssid.tag = sprite_id_addr;
+      ssid.s.addr = psprite_address (sprite);
+
+      sprwindow_swap_output_to_mask (tempspriteptr, 0);
+      os_swi2 (OS_SetColour, 1 << 4, 0);  /* set empty gcol */
+      bbc_clg ();                         /* clear it all out */
+      os_swi2 (OS_SetColour, 1 << 4, -1); /* set solid gcol */
+      error = sprite_put_mask_scaled (sprite->file->spritearea,
+          &ssid, -region.x0,
+                 -region.y0, 0);
+      sprwindow_swap_output_to_screen ();
+      wimpt_noerr (error);
+    }
+
+    if (psprite_haspal (sprite))
+    { int *s, *d, *e;
+      sprite_header *saddr = psprite_address (sprite);
+
+      s = &saddr->mode + 1;
+      e = (int *) ((char *)saddr + saddr->image);
+      d = &psprite_address (tempspriteptr)->mode + 1;
+      for (; s < e; *d++ = *s++);
+    }
+  }
+  else
+    main_NO_ROOM ("Temporary sprite buffer");
+
+  return;
+}
+
+static void delete_temporary_sprite (main_sprite *tempspriteptr, main_file *fileptr)
+{ ftracef0 ("delete_temporary_sprite\n");
+  sprite_id sid;
+  sid.s.addr = psprite_address (tempspriteptr);
+  sprite_delete (fileptr->spritearea, &sid);
+  flex_free ((flex_ptr) &fileptr->spritearea);
+}
+
 /********************
  * Scissor tool     *
  ********************/
@@ -1621,98 +1724,31 @@ static void scissorpaint_null (main_window *window, wimp_mousestr *mpos)
 
     if (tools_exporting_sprite)
     { main_sprite tempsprite;
-      int width, height, smode, dx, x0;
       main_file file;
+      wimp_box region;
 
       order_rect (&sprite->toolspace [1]);
       sprite->toolspace [0] = -1;
       ftracef2 ("0x%X->toolspace [0]: 0x%X\n",
           sprite, sprite->toolspace [0]);
 
-      smode = psprite_address (sprite)->mode;
-      dx = bbc_modevar (smode, bbc_XEigFactor);
-      x0 = tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [1]) &
-          ~(((32 >> bbc_modevar (smode, bbc_Log2BPC)) << dx) - 1);
-                            /* round down to word boundary */
-      width = ((tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [3]) - x0) >> dx) + 2;
-      if ((height = sprite->toolspace [4]-sprite->toolspace [2]) < 0)
-           height = -height;
-      height += 2;
+      region.x0 = tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [1]);
+      region.y0 = tools_pixel_to_point_y(&window->data->sprite, sprite->toolspace [2]);
+      region.x1 = tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [3]);
+      region.y1 = tools_pixel_to_point_y(&window->data->sprite, sprite->toolspace [4]);
 
-      ftracef1 ("need %d bytes\n", psprite_size (width, height, smode,
-          psprite_hasmask (sprite), !psprite_haspal (sprite)? 0:
-          !psprite_hastruecolpal (sprite)? 1: 2));
-      flex_alloc ((flex_ptr) &file.spritearea,
-          psprite_size (width, height, smode, psprite_hasmask (sprite),
-          !psprite_haspal (sprite)? 0: !psprite_hastruecolpal (sprite)? 1:
-          2) + sizeof (sprite_area) + 256);
+      copy_to_temporary_sprite (window, region, &tempsprite, &file, "Export");
 
       if (file.spritearea != 0)
       { sprite_id sid;
-        os_error *error;
-
-        sprite_area_initialise (file.spritearea,
-            flex_size ((flex_ptr) &file.spritearea));
-
-        sprwindow_swap_output_to_sprite (sprite);
-        error = sprite_get_given (file.spritearea, "Export",
-            psprite_haspal (sprite),
-            tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [1]),
-            tools_pixel_to_point_y(&window->data->sprite, sprite->toolspace [2]),
-            tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [3]),
-            tools_pixel_to_point_y(&window->data->sprite, sprite->toolspace [4]));
-        sprwindow_swap_output_to_screen ();
-        wimpt_noerr (error);
         sid.tag = sprite_id_name;
         sid.s.name = "Export";
-        wimpt_noerr (sprite_select_rp (file.spritearea, &sid, &sid.s.addr));
-
-        /*fake main_sprite*/
-        tempsprite.file = &file;
-        tempsprite.offset = (int) sid.s.addr - (int) file.spritearea;
-        ftracef1 ("offset = %d\n", tempsprite.offset);
-        sid.tag = sprite_id_addr;
-
-        if (psprite_hasmask (sprite))
-        { sprite_id ssid;
-
-          ftracef0 ("Creating mask\n");
-
-          wimpt_noerr (sprite_create_mask (file.spritearea, &sid));
-          ssid.tag = sprite_id_addr;
-          ssid.s.addr = psprite_address (sprite);
-
-          sprwindow_swap_output_to_mask (&tempsprite, 0);
-          os_swi2 (OS_SetColour, 1 << 4, 0);  /* set empty gcol */
-          bbc_clg ();                         /* clear it all out */
-          os_swi2 (OS_SetColour, 1 << 4, -1); /* set solid gcol */
-          error = sprite_put_mask_scaled (sprite->file->spritearea,
-              &ssid, -tools_pixel_to_point_x(&window->data->sprite, sprite->toolspace [1]),
-                     -tools_pixel_to_point_y(&window->data->sprite, sprite->toolspace [2]), 0);
-          sprwindow_swap_output_to_screen ();
-          wimpt_noerr (error);
-        }
-
-        if (psprite_haspal (sprite))
-        { int *s, *d, *e;
-          sprite_header *saddr = psprite_address (sprite);
-
-          s = &saddr->mode + 1;
-          e = (int *) ((char *)saddr + saddr->image);
-          d = &psprite_address (&tempsprite)->mode + 1;
-          for (; s < e; *d++ = *s++);
-        }
-
         ftracef3 ("export sprite @ %x (%x, size %d)\n",
            sid.s.addr, psprite_address (sprite),
            ((sprite_header *) sid.s.addr)->next);
         menus_save_sprite (&tempsprite); /* save via xfersend */
-        sid.s.addr = psprite_address (&tempsprite);
-        sprite_delete (file.spritearea, &sid);
-        flex_free ((flex_ptr) &file.spritearea);
+        delete_temporary_sprite (&tempsprite, &file);
       }
-      else
-        main_NO_ROOM ("Export buffer");
 
       sprwindow_release_idle_events (sprite);
       rectangleEOR (sprite, 1);
@@ -1948,13 +1984,201 @@ static void grabberpaint_click (main_window *window, wimp_mousestr *mpos)
 static void grabberpaint_null (main_window *window, wimp_mousestr *mpos)
 
 { ftracef0 ("grabberpaint_null\n");
+  main_sprite tempsprite;
+  main_sprite *sprite = window->data->sprite.sprite;
+  main_file file;
+  os_error *err = NULL;
+  sprite_area *sarea = NULL;
+
+  if (tools_grabber_wrap && ((mpos->bbits & 4) == 0))
+  { wimp_box region;
+    region.x0 = 0;
+    region.y0 = 0;
+    region.x1 = tools_pixel_to_point_x (&window->data->sprite,
+        sprite->toolspace [3]);
+    region.y1 = tools_pixel_to_point_y (&window->data->sprite,
+        sprite->toolspace [4]);
+
+    copy_to_temporary_sprite (window, region, &tempsprite, &file, "Grabber");
+    sarea = file.spritearea;
+
+    if (sarea != NULL)
+    { sprite_id sid;
+      sid.tag = sprite_id_name;
+      sid.s.name = "Grabber";
+      ftracef3 ("grabber temp sprite @ %x (%x, size %d)\n",
+        sid.s.addr, psprite_address (sprite),
+        ((sprite_header *) sid.s.addr)->next);
+    }
+  }
+
   scissorpaint_null (window, mpos);
 
   if ((mpos->bbits & 4) == 0)           /* if button gone up do move */
-  { main_sprite *sprite = window->data->sprite.sprite;
+  { int x = 0, y = 0, dx = 0, dy = 0;
+
     sprite->toolspace [1] = 0;
     sprite->toolspace [2] = 0;
-    copymovepaint_click (window, mpos, 2);
+    copymovepaint_click (window, mpos, ((tools_grabber_wrap)?3 : 2));
+
+    if (tools_grabber_wrap && sarea != NULL)
+    { int x0 = tools_pixel_to_point_x (&window->data->sprite,
+          sprite->toolspace [5]);
+      int y0 = tools_pixel_to_point_y (&window->data->sprite,
+          sprite->toolspace [6]);
+      /* We need x1 and y1 to be points just outside the centre sprite, so
+         add one pixel to each */
+      int x1 = tools_pixel_to_point_x (&window->data->sprite,
+          sprite->toolspace [7] + 1);
+      int y1 = tools_pixel_to_point_y (&window->data->sprite,
+          sprite->toolspace [8] + 1);
+      /* whereas the dimensions for bbc_rectanglefill() are one less */
+      int bbc_width = tools_pixel_to_point_x (&window->data->sprite,
+          sprite->toolspace [7]) - x0;
+      int bbc_height = tools_pixel_to_point_y (&window->data->sprite,
+          sprite->toolspace [8]) - y0;
+      int width = x1 - x0;
+      int height = y1 - y0;
+      dx = x0;
+      dy = y0;
+      sprite_id sid;
+      sid.tag    = sprite_id_addr;
+      sid.s.addr = psprite_address (&tempsprite);
+
+      /* Wrap the sprite */
+      sprwindow_swap_output_to_sprite (sprite);
+
+      if (dx < 0)
+      { /* Plot to the right */
+        err = sprite_put_given (sarea, &sid, 0, x1, y0);
+        if (err != NULL)
+          goto finish;
+
+        if (dy > 0)
+        { /* Plot on bottom right corner */
+          err = sprite_put_given (sarea, &sid, 0, x1, y0 - height);
+          if (err != NULL)
+            goto finish;
+        }
+        else if (dy < 0)
+        { /* Plot on top right corner */
+          err = sprite_put_given (sarea, &sid, 0, x1, y1);
+          if (err != NULL)
+            goto finish;
+        }
+      }
+      else if (dx > 0)
+      { /* Plot to the left */
+        err = sprite_put_given (sarea, &sid, 0, x0 - width, y0);
+        if (err != NULL)
+          goto finish;
+
+        if (dy > 0)
+        { /* Plot on bottom left corner */
+          err = sprite_put_given (sarea, &sid, 0, x0 - width, y0 - height);
+          if (err != NULL)
+            goto finish;
+        }
+        else if (dy < 0)
+        { /* Plot on top left corner */
+          err = sprite_put_given (sarea, &sid, 0, x0 - width, y1);
+          if (err != NULL)
+            goto finish;
+        }
+      }
+
+      if (dy > 0)
+      { /* Plot to the bottom */
+        err = sprite_put_given (sarea, &sid, 0, x0, y0 - height);
+        if (err != NULL)
+          goto finish;
+      }
+      else if (dy < 0)
+      { /* Plot to the top */
+        err = sprite_put_given (sarea, &sid, 0, x0, y1);
+        if (err != NULL)
+          goto finish;
+      }
+
+      Set_Marked_Extent (sprite);
+
+      /* Wrap the mask */
+      if (sprwindow_swap_output_to_mask (sprite, 1))
+      { os_swi2 (OS_SetColour, 0, 0); /* set transparent foreground */
+        os_swi2 (OS_SetColour, 1 << 4, -1); /* set solid background */
+
+        /* For each block we need to plot the mask into, we'll first fill a
+          rectangle in the foreground colour, to clear it to transparent */
+        if (dx < 0)
+        { /* Plot to the right */
+          bbc_rectanglefill (x1, y0, bbc_width, bbc_height);
+          err = sprite_put_mask_scaled (sarea, &sid, x1, y0, 0);
+          if (err != NULL)
+            goto finish;
+
+          if (dy > 0)
+          { /* Plot on bottom right corner */
+            bbc_rectanglefill (x1, y0 - height, bbc_width, bbc_height);
+            err = sprite_put_mask_scaled (sarea, &sid, x1, y0 - height, 0);
+            if (err != NULL)
+              goto finish;
+          }
+          else if (dy < 0)
+          { /* Plot on top right corner */
+            bbc_rectanglefill (x1, y1, bbc_width, bbc_height);
+            err = sprite_put_mask_scaled (sarea, &sid, x1, y1, 0);
+            if (err != NULL)
+              goto finish;
+          }
+        }
+        else if (dx > 0)
+        { /* Plot to the left */
+          bbc_rectanglefill (x0 - width, y0, bbc_width, bbc_height);
+          err = sprite_put_mask_scaled (sarea, &sid, x0 - width, y0, 0);
+          if (err != NULL)
+            goto finish;
+
+          if (dy > 0)
+          { /* Plot on bottom left corner */
+            bbc_rectanglefill (x0 - width, y0 - height, bbc_width, bbc_height);
+            err = sprite_put_mask_scaled (sarea, &sid, x0 - width, y0 - height, 0);
+            if (err != NULL)
+              goto finish;
+          }
+          else if (dy < 0)
+          { /* Plot on top left corner */
+            bbc_rectanglefill (x0 - width, y1, bbc_width, bbc_height);
+            err = sprite_put_mask_scaled (sarea, &sid, x0 - width, y1, 0);
+            if (err != NULL)
+              goto finish;
+          }
+        }
+
+        if (dy > 0)
+        { /* Plot to the bottom */
+          bbc_rectanglefill (x0, y0 - height, bbc_width, bbc_height);
+          err = sprite_put_mask_scaled (sarea, &sid, x0, y0 - height, 0);
+          if (err != NULL)
+            goto finish;
+        }
+        else if (dy < 0)
+        { /* Plot to the top */
+          bbc_rectanglefill (x0, y1, bbc_width, bbc_height);
+          err = sprite_put_mask_scaled (sarea, &sid, x0, y1, 0);
+          if (err != NULL)
+            goto finish;
+        }
+      }
+
+finish:
+        sprwindow_swap_output_to_screen ();
+        psprite_recalculate_offsets (sprite->file);
+        sprwindow_redisplay (sprite, &Marked_Extent);
+        delete_temporary_sprite (&tempsprite, &file);
+
+        if (err != NULL)
+          werr (FALSE, err->errmess);
+    }
   }
 }
 
