@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #include <attr/xattr.h>
 #include <errno.h>
@@ -50,32 +51,47 @@
 
 #define SA_RESTORER  0x04000000
 
-#define DEF2(name, value) \
-  fprintf(ass, "ix_%s * 0x%x\n", name, (unsigned)value); \
-  fprintf(c, "#define ix_%s 0x%x\n", name, (unsigned)value);
-#define DEF(x) DEF2(#x, x)
+static FILE *ass, *c, *basic;
 
-#define SYSDEF(x) \
-  fprintf(ass, "%s * %i\n", #x, x); \
-  fprintf(c, "#define %s %i\n", #x, x);
-
-#define EDEF(x) \
-  fprintf(ass, "ix_%s * %i\n", #x, x); \
-  fprintf(c, "#define ix_%s %i\n", #x, x);
-
-static FILE *ass, *c;
-
-void swi(const char *name, unsigned n) {
-  fprintf(ass, "%s * 0x%06x\n", name, n);
-  fprintf(c, "#define %s 0x%06x\n", name, n);
-  fprintf(ass, "X%s * 0x%06x\n", name, 0x20000 | n);
-  fprintf(c, "#define X%s 0x%06x\n", name, 0x20000 | n);
+static void basic_line(const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  char line[256];
+  int len = vsnprintf(line + 4, sizeof(line) - 4, format, ap) + 4;
+  va_end(ap);
+  line[0] = 13;
+  line[1] = 0;
+  line[2] = 0;
+  line[3] = len;
+  fwrite(line, 1, len, basic);
 }
+
+static void define_hex(const char *name, unsigned value) {
+  fprintf(ass, "%s * 0x%x\n", name, value);
+  fprintf(c, "#define %s 0x%x\n", name, value);
+  basic_line("%s%%=&%x", name, value);
+}
+
+static void define_decimal(const char *name, int value) {
+  fprintf(ass, "%s * %i\n", name, value);
+  fprintf(c, "#define %s %i\n", name, value);
+  basic_line("%s%%=%i", name, value);
+}
+
+#define DEF(x) define_hex("ix_" #x, x);
+#define SYSDEF(x) define_decimal(#x, x);
+#define EDEF(x) define_decimal("ix_" #x, x);
+#define SWI(name, n) \
+  fputs("#undef " name "\n#undef X" name "\n", c); \
+  define_hex(name, n); \
+  define_hex("X" name, 0x20000 | n);
 
 int main(void) {
 
   ass = fopen("LinuxSyscalls", "w");
   c = fopen("h/syscall_defs", "w");
+  basic = fopen("LinuxLib,ffb", "w");
+  basic_line("\xDD\xF2LinuxInit");
 
   EDEF(EPERM)
   EDEF(ENOENT)
@@ -431,15 +447,17 @@ int main(void) {
   DEF(XATTR_CREATE)
   DEF(__WALL)
 
-  DEF2("struct_ucontext_mcontext", offsetof(struct ucontext_t, uc_mcontext))
-  DEF2("struct_ucontext_registers", offsetof(struct ucontext_t, uc_mcontext.arm_r0))
+  define_hex("ix_struct_ucontext_mcontext", offsetof(struct ucontext_t, uc_mcontext));
+  define_hex("ix_struct_ucontext_registers", offsetof(struct ucontext_t, uc_mcontext.arm_r0));
 
 #include "syscall_list.h"
 
-  swi("IXSupport_LinuxSyscall", 0x59EC0);
-  swi("IXSupport_ConvertError", 0x59EC1);
+  SWI("IXSupport_LinuxSyscall", 0x59EC0)
+  SWI("IXSupport_ConvertError", 0x59EC1)
 
   fputs("\n END\n", ass);
+  basic_line("\xE1");
+  fputs("\x0D\xFF", basic);
 
   return 0;
 }
