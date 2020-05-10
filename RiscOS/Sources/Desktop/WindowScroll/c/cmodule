@@ -1,0 +1,314 @@
+/*
+ * Copyright (c) 2020, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALDevice.h"
+#include "Global/HALEntries.h"
+#include "Global/OsBytes.h"
+#include "Global/Pointer.h"
+#include "Global/NewErrors.h"
+
+#include "AsmUtils/rminfo.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+
+#pragma no_check_stack
+
+void *private_word;
+msgtrans_control_block messages;
+
+settings_t settings = {
+	.type = st_Pointer,
+	.linescroll = false,
+	.speed = 40,
+};
+
+typedef struct {
+	int num;
+	const char token[8];
+} msgerr;
+
+/* As per scroll_type enum */
+static const char* scroll_types[] = {
+	"Pointer",
+	"Focus",
+	"FocusOrPointer",
+	"FavourHigher",
+};
+
+static const msgerr msgerr_badparams = { ErrorNumber_BadParameters, "BadP" };
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+static _kernel_oserror *error_badparams(void)
+{
+	return _swix(MessageTrans_ErrorLookup,_INR(0,2),&msgerr_badparams,&messages,0);
+}
+
+static _kernel_oserror *toggle_events(bool enable)
+{
+	_kernel_oserror *e = _swix((enable ? OS_Claim : OS_Release),_INR(0,2),EventV,eventv_handler_entry,private_word);
+	if (enable && e)
+	{
+		return e;
+	}
+	_swix(OS_Byte,_INR(0,1),(enable ? OsByte_EnableEvent : OsByte_DisableEvent),Event_Mouse);
+	_swix(OS_Byte,_INR(0,1),(enable ? OsByte_EnableEvent : OsByte_DisableEvent),Event_Keyboard);
+	_swix(OS_Byte,_INR(0,1),(enable ? OsByte_EnableEvent : OsByte_DisableEvent),Event_Expansion);
+	return NULL;
+}
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) podule_base;
+	(void) cmd_tail;
+
+	private_word = pw;
+
+	_kernel_oserror *e;
+
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(REPORTER_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+	debug_set_stamp_debug(TRUE);
+
+	/* Check that we can actually read the scroll wheel position */
+	e = _swix(OS_Pointer,_IN(0)|_OUTR(0,1),OSPointer_ReadAltPosition,&last_x,&last_y);
+	if (e)
+		goto error1;
+
+
+#ifdef STANDALONE
+	/* Register resources */
+	e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+	if(e)
+		goto error1;
+#endif
+
+	/* Open messages */
+	e = msgtrans_open_file(&messages,"Resources:$.Resources.WindowScroll.Messages",0);
+	if(e)
+		goto error2;
+
+	/* Enable the events we're interested in */
+	e = toggle_events(true);
+	if (e)
+		goto error3;
+
+	return NULL;
+
+error3:
+	msgtrans_close_file(&messages);
+error2:
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+error1:
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) pw;
+	(void) podule;
+	(void) fatal;
+
+	_kernel_oserror* e = NULL;
+
+	if((taskhandle != TASKHANDLE_NONE) && (taskhandle != TASKHANDLE_STARTING))
+	{
+		e = (_kernel_oserror *) wimp_taskclose(taskhandle);
+		if(e)
+			return e;
+	}
+
+	toggle_events(false);
+
+	/* Close messages */
+	msgtrans_close_file(&messages);
+
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+
+	return NULL;
+}
+
+static _kernel_oserror *set_type(const char *type)
+{
+	for(int i=0;i<sizeof(scroll_types)/sizeof(scroll_types[0]);i++)
+	{
+		if (!strcmp(type,scroll_types[i]))
+		{
+			settings.type = (scroll_type) i;
+			return NULL;
+		}
+	}
+	return error_badparams();
+}
+
+static _kernel_oserror *report_settings(void)
+{
+	const char *linescroll;
+	_kernel_oserror *e = _swix(MessageTrans_Lookup,_INR(0,2)|_OUT(2),&messages,(settings.linescroll ? "ON" : "OFF"),NULL,&linescroll);
+
+	char speed[12];
+	sprintf(speed,"%d",settings.speed);
+
+	char buf[256];
+	if (!e)
+	{
+		e = _swix(MessageTrans_GSLookup,_INR(0,6),&messages,"CSET",buf,sizeof(buf),scroll_types[settings.type],linescroll,speed);
+	}
+
+	if (!e)
+	{
+		puts(buf);
+	}
+	return e;
+}
+
+static _kernel_oserror *cmd_wimpscroll(const char *arg_string)
+{
+	void *buf[64];
+	_kernel_oserror *e = _swix(OS_ReadArgs,_INR(0,3),"Type,LineScroll/S,Speed/E",arg_string,buf,sizeof(buf));
+
+	if (!e && buf[0])
+	{
+		e = set_type((const char *) buf[0]);
+	}
+	if (!e)
+	{
+		settings.linescroll = (buf[1] != NULL);
+	}
+	if (!e && buf[2])
+	{
+		const char *speed = (const char *) buf[2];
+		if (*speed == 0)
+		{
+			settings.speed = speed[1] + (speed[2]<<8) + (speed[3]<<16) + (speed[4]<<24);
+		}
+		else
+		{
+			return error_badparams();
+		}
+	}
+	return e;
+}
+
+_kernel_oserror *module_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	(void)argc;
+	(void)pw;
+	(void)arg_string;
+
+	switch (cmd_no) {
+	case CMD_Desktop_WindowScroll:
+		if((taskhandle != TASKHANDLE_NONE) && (taskhandle != TASKHANDLE_STARTING))
+		{
+			_kernel_oserror e;
+			e.errnum = 0;
+			strcpy(e.errmess,"RUNI");
+			return _swix(MessageTrans_ErrorLookup,_INR(0,2),&e,&messages,NULL);
+		}
+		_swix(Wimp_SlotSize,_INR(0,1),8*1024,-1);
+		return _swix(OS_Module,_INR(0,2),2,Module_Title,NULL);
+	case CMD_WimpScroll:
+		if (argc == 0)
+		{
+			return report_settings();
+		}
+		else
+		{
+			return cmd_wimpscroll(arg_string);
+		}
+	}
+
+	return NULL;
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+
+	switch(service_number)
+	{
+	case Service_Memory:
+		/* Don't let the Wimp take back our wimp slot */
+		if(r->r[2] == (int)Image_RO_Base)
+			r->r[1] = 0;
+		break;
+	case Service_StartWimp:
+		if(taskhandle == TASKHANDLE_NONE)
+		{
+			taskhandle = TASKHANDLE_STARTING;
+			r->r[1] = 0;
+			r->r[0] = (int) "Desktop_WindowScroll";
+		}
+		break;
+	case Service_StartedWimp:
+		if(taskhandle == TASKHANDLE_STARTING) /* For some reason, our command wasn't called */
+			taskhandle = TASKHANDLE_NONE;
+		break;
+	}
+}
+
+int eventv_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	switch (r->r[0])
+	{
+	case Event_Mouse:
+	case Event_Keyboard:
+		/* Mouse button or key press - abort scroll */
+		abort_scroll = true;
+		pollword = 1;
+		break;
+	case Event_Expansion:
+		if (r->r[1] == Event_Expansion_PointerScroll)
+		{
+			/* Wake up and check the wheel position */
+			pollword = 1;
+		}
+		break;
+	}
+	return 1;
+}

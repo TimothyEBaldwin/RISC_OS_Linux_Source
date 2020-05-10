@@ -1,0 +1,541 @@
+/*
+ * Copyright (c) 2020, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Pointer.h"
+
+#include "wimp.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "utils.h"
+
+#define SIGN(x) ((x) ? ((x)>>30)|1 : 0)
+
+typedef struct {
+	wimp_openstr w;
+	int dx,dy;
+	wimp_i i;
+} wimp_msgscroll;
+
+typedef struct {
+	int ticks_to_apply; /* Number of wheel ticks to apply */
+	int osunits_to_apply; /* Number of OS units to apply */
+	int last_ticks; /* Number of wheel ticks applied in the last update */
+	int scroll_offset; /* Scroll position before last_ticks was applied */
+	int osunits_per_tick; /* How many OS units we think one tick is (calculated by watching how far the target window scrolls) */
+} scroll_vals;
+
+wimp_t taskhandle = TASKHANDLE_NONE;
+int pollword;
+bool abort_scroll;
+int last_x,last_y; /* Last known wheel positions */
+
+/* The thing we're scrolling */
+static scroll_target target = {
+	.w = NO_WINDOW,
+	.i = NO_ICON,
+};
+static bool target_is_menu;
+static scroll_vals scroll_x,scroll_y;
+
+static const wimp_msgaction all_messages[] = {
+	wimp_MCLOSEDOWN,
+};
+
+static void quit(os_error *e)
+{
+	if(e)
+	{
+		wimp_reporterror(e,wimp_EOK,Module_Title);
+		exit(EXIT_FAILURE);
+	}
+	exit(EXIT_SUCCESS);
+}
+
+static void not_running(void)
+{
+	taskhandle = TASKHANDLE_NONE;
+	utils_free();
+}
+
+static int diff(int old,int new)
+{
+	int new_delta = ((new-old)<<1)>>1; /* Noddy way of dealing with wrap-to-zero behaviour */
+	return new_delta;
+}
+
+static void stop_scroll(void)
+{
+	memset(&scroll_x,0,sizeof(scroll_x));
+	memset(&scroll_y,0,sizeof(scroll_y));
+	target.w = NO_WINDOW;
+	abort_scroll = false;
+}
+
+static scroll_target select_scroll_target(void)
+{
+	scroll_target ct = {
+		.w = NO_WINDOW,
+		.i = NO_ICON,
+	};
+	scroll_target mt = {
+		.w = NO_WINDOW,
+		.i = NO_ICON,
+	};
+
+	/* Check caret first (FocusOrPointer priority) */
+	if (settings.type != st_Pointer)
+	{
+		wimp_caretstr c;
+		if (!wimp_get_caret_pos(&c))
+		{
+			ct = find_scrollable_window(c.w,c.i);
+		}
+		if ((settings.type == st_Focus) || ((settings.type == st_FocusOrPointer) && (ct.w != NO_WINDOW)))
+		{
+			return ct;
+		}
+	}
+
+	/* Check mouse */
+	{
+		wimp_mousestr m;
+		if (!wimp_get_point_info(&m))
+		{
+			mt = find_scrollable_window(m.w,m.i);
+		}
+	}
+
+	if ((settings.type != st_FavourHigher) || (ct.w == NO_WINDOW))
+	{
+		return mt;
+	}
+	if (mt.w == NO_WINDOW)
+	{
+		return ct;
+	}
+
+	/* Work out which window is highest */
+	if (ct.w == mt.w)
+	{
+		/* Different icons within the same window */
+		if (ct.i > mt.i)
+		{
+			return ct;
+		}
+		return mt;
+	}
+
+	int highest = topmost_window(ct.w,mt.w);
+	if (highest == 1)
+	{
+		return mt;
+	}
+	return ct;
+}
+
+#ifdef DEBUGLIB
+static const char *scroll_modes[] = {"Extended scroll", "Normal scroll", "OpenWindow"};
+#endif
+
+static inline bool measure_distance(void)
+{
+	/* For "normal" scrolling (i.e. wimp_ESCROLL messages), we don't really
+	   know how far the target window is going to scroll in response to
+	   our request. This makes the scroll speed setting a bit useless.
+	   To counter this, each time we send a scroll request, we'll wait
+	   until the task has been able to react to it (wait for next null poll)
+	   and then check to see how far the window has scrolled. We can then
+	   use that value to gauge how many extra scroll requests we should
+	   send in order to apply the speed setting.
+
+	   Extended scroll requests face a similar problem, but because they
+	   could be used for literally anything (e.g. zoom in/out) we currently
+	   don't attempt to apply any scaling for them.
+	 */
+	return target.mode == SCROLL_NORMAL;
+}
+
+static int scroll_vals_update(scroll_vals *vals,int delta,bool enable,int new_scroll_offset,int delta_time)
+{
+	/* Only scroll in this direction if the window allows it */
+	if (!enable)
+	{
+		memset(vals,0,sizeof(scroll_vals));
+		return 0;
+	}
+	bool measure = measure_distance();
+	if (vals->last_ticks && measure)
+	{
+		int win_delta = new_scroll_offset - vals->scroll_offset;
+		/* Update osunits_per_tick */
+		vals->osunits_per_tick = win_delta / vals->last_ticks;
+		/* If the window scrolled in the expected manner, reduce the
+		   number of OS units we need to scroll by */
+		bool valid_delta = false;
+		if (vals->osunits_per_tick > 0)
+		{
+			if (((win_delta > 0) && (vals->osunits_to_apply >= win_delta))
+			 || ((win_delta < 0) && (vals->osunits_to_apply <= win_delta)))
+			{
+				vals->osunits_to_apply -= win_delta;
+				valid_delta = true;
+			}
+		}
+		else
+		{
+			/* Window scrolled in the wrong direction (or not at all) */
+			vals->osunits_per_tick = 0;
+		}
+		if (!valid_delta)
+		{
+			/* The window scrolled in an unexpected manner, or
+			   scrolled too far - reset osunits_to_apply */
+			vals->osunits_to_apply = 0;
+		}
+	}
+	/* Update values
+	   Note that settings.speed is in units of 4 OS units, to ensure that
+	   we don't attempt to perform sub-pixel scrolling
+	 */
+	vals->ticks_to_apply += delta;
+	vals->osunits_to_apply += delta*(settings.speed<<2);
+	vals->scroll_offset = new_scroll_offset;
+	vals->last_ticks = 0;
+	if ((target.mode != SCROLL_MANUAL) && (vals->ticks_to_apply != 0) && (SIGN(vals->ticks_to_apply) != SIGN(vals->osunits_to_apply)))
+	{
+		/* Somehow our OS unit counter has gone out of sync with the
+		   scroll wheel ticks - reset it so that the wheel ticks take
+		   priority */
+		vals->osunits_to_apply = 0;
+	}
+
+	if (!delta_time)
+	{
+		return 0;
+	}
+	int return_val = 0;
+	do
+	{
+		/* Calculate return value (how far to scroll this update)
+		   For SCROLL_MANUAL, this is in OS units
+		   For other types, this is a tick count
+		 */
+		if (target.mode == SCROLL_MANUAL)
+		{
+			/* Smooth(ish) scrolling: Scroll by half the desired amount */
+			delta = (vals->osunits_to_apply/2) & ~3;
+			if (!delta)
+			{
+				delta = vals->osunits_to_apply;
+			}
+			vals->osunits_to_apply -= delta;
+		}
+		else
+		{
+			delta = vals->ticks_to_apply / 2;
+			if (!delta)
+			{
+				delta = vals->ticks_to_apply;
+			}
+
+			/* If we have an osunits_to_ticks value, use that to
+			   calculate how many ticks to apply */
+			if (vals->osunits_per_tick)
+			{
+				int delta2 = (vals->osunits_to_apply / vals->osunits_per_tick) - return_val;
+				/* Again, aim to scroll by half */
+				if ((delta2 > 1) || (delta2 < -1))
+				{
+					delta2 /= 2;
+				}
+				/* Scroll by the max of the two values */
+				if (((delta2 > delta) && (delta >= 0))
+				 || ((delta2 < delta) && (delta <= 0)))
+				{
+					delta = delta2;
+				}
+			}
+
+			vals->ticks_to_apply -= delta;
+			/* Don't allow OS unit scrolling to cause the tick
+			   counter to overshoot */
+			if (vals->ticks_to_apply && (SIGN(vals->ticks_to_apply) != SIGN(delta)))
+			{
+				vals->ticks_to_apply = 0;
+			}
+
+		}
+
+		return_val += delta;
+	} while (--delta_time && delta);
+
+	if (measure)
+	{
+		vals->last_ticks = return_val;
+	}
+	return return_val;
+}
+
+static void scroll_update(int delta_time)
+{
+	int x,y;
+	wimp_msgscroll msg;
+	_swix(OS_Pointer,_IN(0)|_OUTR(0,1),OSPointer_ReadAltPosition,&x,&y);
+	if ((x != last_x) || (y != last_y))
+	{
+		dprintf(("","New scroll pos %d,%d\n",x,y));
+	}
+
+	int dx = diff(last_x,x);
+	int dy = diff(last_y,y);
+	last_x = x;
+	last_y = y;
+
+	if (abort_scroll)
+	{
+		stop_scroll();
+		return;
+	}
+
+	scroll_target t2;
+	if ((target.w == NO_WINDOW) || dx || dy)
+	{
+		/* Start of a scroll operation, or we've received new wheel
+		   input - find a target */
+		t2 = select_scroll_target();
+	}
+	else
+	{
+		/* Continuing a scroll - check the target hasn't changed state */
+		t2 = examine_window(target.w,target.i,NULL);
+	}
+
+	if (t2.w == NO_WINDOW)
+	{
+		/* No target (or old target is now invalid) -> stop */
+		stop_scroll();
+		return;
+	}
+
+	if (target.w == NO_WINDOW)
+	{
+		/* Start of a scroll operation. Use t2 as the target
+		   (guaranteed to be good at this point) */
+		target = t2;
+		target_is_menu = false;
+		if (target.mode == SCROLL_MANUAL)
+		{
+			/* Menus are special, the Wimp will ignore any
+			   OpenWindow requests we try sending. However
+			   we can use Wimp_OpenWindow instead. But
+			   using Wimp_OpenWindow for other windows is
+			   probably a bit rude, so first we need to
+			   work out whether this is a menu or not.
+			   Send a null message to the window, and check
+			   if the returned task handle is the magic
+			   menu owner task handle. */
+			int handle=0;
+			_swix(Wimp_SendMessage,_INR(0,3)|_OUT(2),wimp_ENULL, (wimp_msgstr*) &msg /* Non-null to avoid any traps */, target.w, target.i, &handle);
+			target_is_menu = (handle == 0x706d6957); /* "Wimp" */
+		}
+	}
+	else
+	{
+		/* Continuing a scroll - check the target is the same as before */
+		if (memcmp(&target,&t2,sizeof(scroll_target)))
+		{
+			dprintf(("","Stop: Target changed state\n"));
+			stop_scroll();
+			/* Ignore the new delta (if any) - if things have
+			   become invalid because the mouse moved, then we
+			   don't really know whether the wheel change occurred
+			   at the old location or the new one
+			 */
+			return;
+		}
+	}
+
+	dprintf(("","Scroll target %x %x\n",target.w,target.i));
+
+	if (wimp_get_wind_state(target.w,(wimp_wstate*) &msg))
+	{
+		dprintf(("","Stop: Couldn't get state\n"));
+		stop_scroll();
+		return;
+	}
+
+	dx = scroll_vals_update(&scroll_x,dx,target.x,msg.w.x,delta_time);
+	dy = scroll_vals_update(&scroll_y,dy,target.y,msg.w.y,delta_time);
+
+	if (!delta_time)
+	{
+		/* If we don't want to scroll yet (we're just measuring how far
+		   the target scrolled in response to our request), exit */
+		return;
+	}
+
+	dprintf(("","New scroll delta %d,%d ticks (%d,%d units) %dcs\n", scroll_x.ticks_to_apply, scroll_y.ticks_to_apply, scroll_x.osunits_to_apply, scroll_y.osunits_to_apply, delta_time));
+
+	if (!dx && !dy)
+	{
+		/* Finished scrolling */
+		stop_scroll();
+		return;
+	}
+
+	dprintf(("","Scroll by %d,%d (%s)\n",dx,dy,scroll_modes[target.mode]));
+
+	switch(target.mode)
+	{
+	case SCROLL_EXTENDED:
+		msg.i = target.i;
+		msg.dx = dx<<2;
+		msg.dy = dy<<2;
+		wimp_sendwmessage(wimp_ESCROLL, (wimp_msgstr*) &msg, target.w, target.i);
+		break;
+	case SCROLL_NORMAL:
+		while(dx | dy)
+		{
+			msg.dx = SIGN(dx);
+			msg.dy = SIGN(dy);
+			dx -= msg.dx;
+			dy -= msg.dy;
+			wimp_sendwmessage(wimp_ESCROLL, (wimp_msgstr*) &msg, target.w, target.i);
+		}
+		break;
+	case SCROLL_MANUAL:
+		/* TODO need to clamp within work area bounds? */
+		msg.w.x += dx;
+		msg.w.y += dy;
+		if (target_is_menu)
+		{
+			wimp_open_wind(&msg.w);
+		}
+		else
+		{
+			wimp_sendwmessage(wimp_EOPEN, (wimp_msgstr*) &msg, target.w, target.i);
+		}
+		break;
+	default:
+		dprintf(("","Stop: Bad scroll mode %d\n",target.mode));
+		return;
+	}
+}
+
+int main(int argc,char **argv)
+{
+	(void) argc;
+	(void) argv;
+
+	os_error *e;
+
+	atexit(not_running);
+
+	e = (os_error *) _swix(Wimp_Initialise,_INR(0,3)|_OUT(1),380,0x4b534154,Module_Title,all_messages,&taskhandle);
+
+	if(e)
+		quit(e);
+
+	/* Poll */
+	int last_idle_time = 0,delta_time;
+	do {
+		wimp_eventstr event;
+		pollword = 0;
+		bool scrolling = (target.w != NO_WINDOW);
+		bool measuring = scrolling && measure_distance() && (scroll_x.last_ticks || scroll_y.last_ticks);
+		/* scrolling = false:
+		     We're idle, so just wait for pollword non-zero.
+		   scrolling = true, measuring = false:
+		     We're scrolling, use PollIdle to rate limit ourselves.
+		   scrolling = true, measuring = true:
+		     We're scrolling, and we've just sent a scroll request
+		     where we want to measure how far the target window
+		     scrolls. Come back as soon as possible.
+		 */
+		bool pollidle = scrolling && !measuring;
+		if (!scrolling)
+		{
+			/* Not scrolling, can forget old timestamp */
+			last_idle_time = 0;
+		}
+		else if (!last_idle_time && pollidle)
+		{
+			/* We care about the time, and we don't have it yet */
+			last_idle_time = _swi(OS_ReadMonotonicTime,_RETURN(0));
+		}
+		e = (os_error *) _swix(pollidle ? Wimp_PollIdle : Wimp_Poll,_INR(0,3)|_OUT(0),
+			(scrolling ? 0 : wimp_EMNULL)|wimp_EMREDRAW|wimp_EMPTRLEAVE|wimp_EMPTRENTER|wimp_EMBUT|wimp_EMKEY|wimp_EMLOSECARET|wimp_EMGAINCARET|wimp_EMACK|(1<<22)|(1<<24),
+			&event.data,
+			last_idle_time + 1,
+			&pollword,
+			&event.e);
+		if(e)
+			quit(e);
+		switch(event.e)
+		{
+		case wimp_ENULL:
+		case 13: /* Pollword non-zero */
+			delta_time = last_idle_time;
+			last_idle_time = _swi(OS_ReadMonotonicTime,_RETURN(0));
+			if (!scrolling)
+			{
+				/* Force to 1 tick if this is the start of a scroll operation */
+				delta_time = 1;
+			}
+			else if (pollidle && (event.e == wimp_ENULL))
+			{
+				/* Wimp_PollIdle has called us back, calculate the real delta time */
+				delta_time = last_idle_time - delta_time;
+			}
+			else
+			{
+				/* Null event when measuring, or pollword non-zero
+				   Update our state but don't perform any new scroll action */
+				delta_time = 0;
+			}
+			scroll_update(delta_time);
+			break;
+		case wimp_ESEND:
+		case wimp_ESENDWANTACK:
+			if(event.data.msg.hdr.action == wimp_MCLOSEDOWN)
+				quit(NULL);
+			break;
+		}
+	} while(1);
+
+	return 0;
+}
