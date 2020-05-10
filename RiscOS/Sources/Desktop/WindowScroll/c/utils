@@ -1,0 +1,527 @@
+/*
+ * Copyright (c) 2020, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "utils.h"
+
+#include <stdlib.h>
+#include <stdint.h>
+#include "swis.h"
+
+#include "globals.h"
+
+#include "Global/ModHand.h"
+
+#include "DebugLib/DebugLib.h"
+
+/* malloc/free functions which maintain a list of blocks to free */
+static void *chunk_alloc(size_t len,uintptr_t **list)
+{
+	uintptr_t *chunk = (uintptr_t *) malloc(len+sizeof(uintptr_t));
+	if (!chunk)
+	{
+		return NULL;
+	}
+	*chunk = (uintptr_t) *list;
+	*list = chunk;
+	return (void *) (chunk+1);
+}
+
+static void free_chunks(uintptr_t *list)
+{
+	while (list)
+	{
+		uintptr_t *next = (uintptr_t *) *list;
+		free(list);
+		list = next;
+	}
+}
+
+static char *temp_rma;
+static int temp_rma_size;
+
+void utils_free(void)
+{
+	if (temp_rma)
+	{
+		_swix(OS_Module,_IN(0)|_IN(2),ModHandReason_Free,temp_rma);
+	}
+	temp_rma = NULL;
+	temp_rma_size = 0;
+}
+
+static char *temp_rma_get(int size)
+{
+	if (size <= temp_rma_size)
+	{
+		return temp_rma;
+	}
+	if (!temp_rma)
+	{
+		if (!_swix(OS_Module,_IN(0)|_IN(3)|_OUT(2),ModHandReason_Claim,size,&temp_rma))
+		{
+			temp_rma_size = size;
+		}
+		return temp_rma;
+	}
+	else
+	{
+		/* Resize. We don't really care about the contents being preserved, but for the sizes we're likely to deal with it's probably quicker to risk a pointless copy of the contents versus the time spent walking the heap looking for space */
+		if (!_swix(OS_Module,_IN(0)|_INR(2,3)|_OUT(2),ModHandReason_ExtendBlock,temp_rma,size,&temp_rma))
+		{
+			temp_rma_size = size;
+			return temp_rma;
+		}
+		return NULL;
+	}
+}
+
+bool does_icon_support_scrolling(wimp_w w,wimp_i i,const wimp_icon *icon)
+{
+	if (((icon->flags & (wimp_ITEXT|wimp_INDIRECT)) != (wimp_ITEXT|wimp_INDIRECT)))
+	{
+		return false;
+	}
+	if (!icon->data.indirecttext.validstring)
+	{
+		return false;
+	}
+
+	/* See if we can grab the validation string */
+	for(int try=0;try<2;try++)
+	{
+		int spare;
+		if (_swix(Wimp_Extend,_INR(0,4)|_OUT(4),
+			14 /* Get validation string */,
+			w,
+			i,
+			temp_rma,
+			temp_rma_size,
+			&spare))
+		{
+			return false;
+		}
+		if (spare == temp_rma_size)
+		{
+			/* No string? */
+			return false;
+		}
+		if (spare >= 0)
+		{
+			/* Got the string OK */
+			break;
+		}
+		if (try)
+		{
+			/* Funny icon which keeps changing size! Give up */
+			return false;
+		}
+		/* Resize buffer and try again */
+		if (!temp_rma_get(temp_rma_size - spare))
+		{
+			return false;
+		}
+	}
+
+	/* Look for 'Y' command with 'S' flag */
+	char *str = temp_rma;
+	char c;
+	char cmd = 0;
+	while ((c = *str++) != 0)
+	{
+		if (cmd == 0)
+		{
+			cmd = c;
+		}
+		else if (c == ';')
+		{
+			cmd = 0;
+		}
+		else if ((c == 'S') && (cmd == 'Y'))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+scroll_target examine_window(wimp_w w,wimp_i i,bool *is_pane)
+{
+	/* Examine the given window / icon to determine whether it's scrollable
+	   On failure, can set *is_pane if the window is a pane (i.e. we should check its parent next) */
+	scroll_target ret = {
+		.w = NO_WINDOW,
+		.i = NO_ICON,
+	};
+	os_error *e;
+
+	if (is_pane)
+	{
+		*is_pane = false;
+	}
+
+	if (w == NO_WINDOW)
+	{
+		return ret;
+	}
+
+	if (i != NO_ICON)
+	{
+		/* Icon specified: Check if we can scroll it */
+		wimp_icon icon;
+		e = wimp_get_icon_info(w,i,&icon);
+		if (e)
+		{
+			dprintf(("","examine_window: Icon error %x %s\n",e->errnum,e->errmess));
+			return ret;
+		}
+		if (does_icon_support_scrolling(w,i,&icon))
+		{
+			ret.w = w;
+			ret.i = i;
+			ret.mode = SCROLL_EXTENDED;
+			ret.x = ret.y = true;
+			return ret;
+		}
+	}
+
+	/* Get window state */
+	wimp_winfo wind;
+	wind.w = w;
+	e = wimp_get_wind_info((wimp_winfo*) (((char *)&wind)+1)); /* No icons please */
+	if (e)
+	{
+		return ret;
+	}
+
+	/* Check the window itself */
+	if (wind.info.colours[7] & 2)
+	{
+		/* Extended requests supported */
+		ret.w = w;
+		ret.mode = SCROLL_EXTENDED;
+		ret.x = ret.y = true;
+		return ret;
+	}
+
+	/* Any scrollbars? */
+	if (wind.info.flags & wimp_WNEW)
+	{
+		ret.x = (wind.info.flags & wimp_WHSCR);
+		ret.y = (wind.info.flags & wimp_WVSCR);
+	}
+	else
+	{
+		ret.x = (wind.info.flags & 8);
+		ret.y = (wind.info.flags & 4);
+	}
+	if (!ret.x && !ret.y)
+	{
+		dprintf(("","flags %08x\n",wind.info.flags));
+		/* No scrolling */
+		if (is_pane)
+		{
+			*is_pane = wind.info.flags & wimp_WPANE;
+		}
+		return ret;
+	}
+	ret.w = w;
+	ret.mode = (settings.linescroll && (wind.info.flags & (wimp_WSCROLL_R1|wimp_SCROLL_R2))) ? SCROLL_NORMAL : SCROLL_MANUAL;
+	return ret;
+}
+
+static wimp_w parent_window(wimp_w w)
+{
+	wimp_w w2;
+	/* This might be a non-nested pane */
+	if (_swix(Wimp_Extend,_INR(0,1)|_OUT(1),9,w,&w2))
+	{
+		return NO_WINDOW;
+	}
+	if (w == w2)
+	{
+		/* No nested wimp? */
+		return NO_WINDOW;
+	}
+	if (w2 != NO_WINDOW)
+	{
+		return w2;
+	}
+	/* Or maybe it's a nested pane */
+	if (_swix(Wimp_Extend,_INR(0,1)|_OUT(1),6,w,&w2))
+	{
+		return NO_WINDOW;
+	}
+	if (w == w2)
+	{
+		/* No nested wimp? */
+		return NO_WINDOW;
+	}
+	return w2;
+}
+
+scroll_target find_scrollable_window(wimp_w w,wimp_i i)
+{
+	/* Starting from the given window & icon, find a scrollable window */
+	scroll_target ret;
+	bool pane;
+	dprintf(("","start %08x\n",w));
+	while (true)
+	{
+		ret = examine_window(w,i,&pane);
+		if (!pane || (ret.w != NO_WINDOW))
+		{
+			return ret;
+		}
+		/* Check parent */
+		i = NO_ICON;
+		w = parent_window(w);
+		if (w == NO_WINDOW)
+		{
+			return ret;
+		}
+		dprintf(("","parent %08x\n",w));
+	}
+}
+
+/* Routines for a basic chunked stack data type
+   For each stack chunk:
+    Word 0 = Link to next chunk, or NULL
+    Words [1,N] = Data
+    Word N+1 = Value N (# entries currently in stack)
+    Word [N+2,limit) = Free space
+   stack_ptr_t instances always point at Word N+1
+ */
+#define STACK_CHUNK 256
+
+typedef struct {
+	uintptr_t *chunk_list;
+	uintptr_t *base;
+	uintptr_t *limit;
+	uintptr_t initial[64];
+} stack_holder_t;
+
+typedef uintptr_t *stack_ptr_t;
+
+/* Prepare a stack_holder_t for use; must be called once before any other stack functions */
+static void stack_holder_init(stack_holder_t *holder)
+{
+	holder->chunk_list = NULL;
+	holder->base = holder->initial;
+	holder->limit = holder->initial+sizeof(holder->initial)/sizeof(uintptr_t);
+}
+
+/* Free the given stack holder */
+static inline void stack_holder_free(stack_holder_t *holder)
+{
+	free_chunks(holder->chunk_list);
+}
+
+/* Creates a new stack ptr, which is required for pushing & popping elements.
+   stack_break must be called before calling stack_new again. */
+static stack_ptr_t stack_new(stack_holder_t *holder)
+{
+	/* Minimum (useful) stack chunk size is 3 words:
+	   - Link to next chunk (which will be NULL)
+	   - One data item
+	   - Number of data items (one)
+	 */
+	if (holder->limit-holder->base < 3)
+	{
+		uintptr_t *p = (uintptr_t *) chunk_alloc(STACK_CHUNK*sizeof(uintptr_t),&holder->chunk_list);
+		if (!p)
+		{
+			return NULL;
+		}
+		holder->base = p;
+		holder->limit = holder->base+STACK_CHUNK;
+	}
+	holder->base[0] = (uintptr_t) NULL;
+	holder->base[1] = 0;
+	return holder->base+1;
+}
+
+/* Record the position of the given stack ptr, to allow a new stack to be
+   created via stack_new. It's illegal to push more items onto this stack, but
+   items can be removed. */
+static inline void stack_break(stack_holder_t *holder,stack_ptr_t *head)
+{
+	holder->base = (*head)+1;
+}
+
+/* Push an item onto the given stack ptr.
+   Must only be used with the ptr most recently created by stack_new.
+ */
+static bool stack_push(stack_holder_t *holder,stack_ptr_t *head,uintptr_t value)
+{
+	stack_ptr_t h = *head;
+	if (h+1 == holder->limit)
+	{
+		h = (uintptr_t *) chunk_alloc(STACK_CHUNK*sizeof(uintptr_t),&holder->chunk_list);
+		if (!h)
+		{
+			return false;
+		}
+		h[0] = (uintptr_t) (holder->limit-1);
+		h[1] = 0;
+		holder->limit = h+STACK_CHUNK;
+		h++;
+	}
+	h[1] = h[0]+1;
+	h[0] = value;
+	*head = h+1;
+	return true;
+}
+
+/* Returns the head item on the stack; returns NULL if the stack is empty */
+static inline uintptr_t stack_head(stack_ptr_t *head)
+{
+	stack_ptr_t h = *head;
+	return (h ? h[-1] : (uintptr_t) NULL);
+}
+
+/* Pop an item from the given stack. Must be non-empty.
+   Don't push new data onto a stack once you've started popping from it. */
+static void stack_pop(stack_ptr_t *head)
+{
+	stack_ptr_t h = *head;
+	if (h[0] > 1)
+	{
+		h[-1] = h[0]-1;
+		h--;
+	}
+	else
+	{
+		h = (uintptr_t *) h[-2];
+	}
+	*head = h;
+}
+
+typedef struct {
+	wimp_w w;
+	stack_ptr_t stack;
+} window_list_entry_t;
+
+int topmost_window(wimp_w caret,wimp_w mouse)
+{
+	stack_holder_t stack_holder;
+	const int count = 2;
+	window_list_entry_t list[2] = {
+		{ caret, NULL },
+		{ mouse, NULL },
+	};
+	stack_holder_init(&stack_holder);
+	/* For each window in the list, build a stack of its parent windows
+	   The head entry in each stack will be the backmost real window
+	   The tail entry will be the topmost window (i.e. a or b) */
+	for(int i=0;i<count;i++)
+	{
+		stack_ptr_t parents;
+		parents = stack_new(&stack_holder);
+		if (!parents)
+		{
+			stack_holder_free(&stack_holder);
+			dprintf(("","topmost_window: out of memory\n"));
+			return -1;
+		}
+		wimp_w win = list[i].w;
+		do
+		{
+			if (!stack_push(&stack_holder,&parents,win))
+			{
+				stack_holder_free(&stack_holder);
+				dprintf(("","topmost_window: out of memory\n"));
+				return -1;
+			}
+			if (_swix(Wimp_Extend,_INR(0,1)|_OUT(1),6,win,&win))
+			{
+				stack_holder_free(&stack_holder);
+				dprintf(("","topmost_window: parent error\n"));
+				return -1;
+			}
+			if ((win == caret) || (win == mouse))
+			{
+				/* One is a child of the other: caret wins */
+				stack_holder_free(&stack_holder);
+				return 0;
+			}
+		} while (win != -1);
+		list[i].stack = parents;
+		stack_break(&stack_holder,&parents);
+	}
+
+	/* Check if the windows are in different window stacks */
+	if(stack_head(&list[0].stack) != stack_head(&list[1].stack))
+	{
+		wimp_winfo wc,wm;
+		wc.w = stack_head(&list[0].stack);
+		wm.w = stack_head(&list[1].stack);
+		if (wimp_get_wind_info(&wc) || wimp_get_wind_info(&wm))
+		{
+			stack_holder_free(&stack_holder);
+			dprintf(("","topmost_window: stack error\n"));
+			return -1;
+		}
+		int oc = (wc.info.flags & (wimp_BACK_WINDOW | (1<<23))) ^ wimp_BACK_WINDOW;
+		int om = (wm.info.flags & (wimp_BACK_WINDOW | (1<<23))) ^ wimp_BACK_WINDOW;
+		if (oc != om)
+		{
+			stack_holder_free(&stack_holder);
+			return (oc > om) ? 0 : 1;
+		}
+	}
+
+	/* Pop the common parent windows from the stacks */
+	while (stack_head(&list[0].stack) == stack_head(&list[1].stack))
+	{
+		stack_pop(&list[0].stack);
+		stack_pop(&list[1].stack);
+	}
+
+	/* Starting from the caret window, walk through its siblings and see
+	   if the mouse window is ontop of it. I'm assuming that the caret
+	   window will generally be closest to the top, so starting from there
+	   will be quickest. */
+	caret = stack_head(&list[0].stack);
+	mouse = stack_head(&list[1].stack);
+	stack_holder_free(&stack_holder);
+
+	wimp_w child = caret;
+	do
+	{
+		if (_swix(Wimp_Extend,_INR(0,1)|_OUT(1),10,child,&child))
+		{
+			dprintf(("","topmost_window: child error\n"));
+			return -1;
+		}
+		if (child == mouse)
+		{
+			return 1;
+		}
+	}
+	while (child != -1);
+	return 0;
+}

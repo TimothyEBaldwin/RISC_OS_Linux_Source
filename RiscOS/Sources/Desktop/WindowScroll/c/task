@@ -1,0 +1,306 @@
+/*
+ * Copyright (c) 2020, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Pointer.h"
+
+#include "wimp.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "utils.h"
+
+#define SIGN(x) ((x) ? ((x)>>30)|1 : 0)
+
+typedef struct {
+	wimp_openstr w;
+	int dx,dy;
+	wimp_i i;
+} wimp_msgscroll;
+
+wimp_t taskhandle = TASKHANDLE_NONE;
+int pollword;
+bool abort_scroll;
+int last_x,last_y;
+
+static const wimp_msgaction all_messages[] = {
+	wimp_MCLOSEDOWN,
+};
+
+static void quit(os_error *e)
+{
+	if(e)
+	{
+		wimp_reporterror(e,wimp_EOK,Module_Title);
+		exit(EXIT_FAILURE);
+	}
+	exit(EXIT_SUCCESS);
+}
+
+static void not_running(void)
+{
+	taskhandle = TASKHANDLE_NONE;
+	utils_free();
+}
+
+static int diff(int old,int new)
+{
+	int new_delta = ((new-old)<<1)>>1; /* Noddy way of dealing with wrap-to-zero behaviour */
+	return new_delta;
+}
+
+static scroll_target select_scroll_target(void)
+{
+	scroll_target ct = {
+		.w = NO_WINDOW,
+		.i = NO_ICON,
+	};
+	scroll_target mt = {
+		.w = NO_WINDOW,
+		.i = NO_ICON,
+	};
+
+	/* Check caret first (FocusOrPointer priority) */
+	if (settings.type != st_Pointer)
+	{
+		wimp_caretstr c;
+		if (!wimp_get_caret_pos(&c))
+		{
+			ct = find_scrollable_window(c.w,c.i);
+		}
+		if ((settings.type == st_Focus) || ((settings.type == st_FocusOrPointer) && (ct.w != NO_WINDOW)))
+		{
+			return ct;
+		}
+	}
+
+	/* Check mouse */
+	{
+		wimp_mousestr m;
+		if (!wimp_get_point_info(&m))
+		{
+			mt = find_scrollable_window(m.w,m.i);
+		}
+	}
+
+	if ((settings.type != st_FavourHigher) || (ct.w == NO_WINDOW))
+	{
+		return mt;
+	}
+	if (mt.w == NO_WINDOW)
+	{
+		return ct;
+	}
+
+	/* Work out which window is highest */
+	if (ct.w == mt.w)
+	{
+		/* Different icons within the same window */
+		if (ct.i > mt.i)
+		{
+			return ct;
+		}
+		return mt;
+	}
+
+	int highest = topmost_window(ct.w,mt.w);
+	if (highest == 1)
+	{
+		return mt;
+	}
+	return ct;
+}
+
+static void scroll_update(void)
+{
+	int x,y;
+	wimp_msgscroll msg;
+	_swix(OS_Pointer,_IN(0)|_OUTR(0,1),OSPointer_ReadAltPosition,&x,&y);
+	if ((x != last_x) || (y != last_y))
+	{
+		dprintf(("","New scroll pos %d,%d\n",x,y));
+	}
+
+	int dx = 0, dy = 0;
+	if (!abort_scroll)
+	{
+		dx = diff(last_x,x);
+		dy = diff(last_y,y);
+		dprintf(("","New scroll delta %d,%d\n",dx,dy));
+	}
+	last_x = x;
+	last_y = y;
+	abort_scroll = false;
+	if ((dx | dy) == 0)
+	{
+		return;
+	}
+
+	scroll_target target = select_scroll_target();
+	bool target_is_menu = false;
+	dprintf(("","Scroll target %x %x, mode %d\n",target.w,target.i,target.mode));
+	if ((target.w != NO_WINDOW) && (target.mode == SCROLL_MANUAL))
+	{
+		/* Menus are special, the Wimp will ignore any
+		   OpenWindow requests we try sending. However
+		   we can use Wimp_OpenWindow instead. But
+		   using Wimp_OpenWindow for other windows is
+		   probably a bit rude, so first we need to
+		   work out whether this is a menu or not.
+		   Send a null message to the window, and check
+		   if the returned task handle is the magic
+		   menu owner task handle. */
+		int handle=0;
+		_swix(Wimp_SendMessage,_INR(0,3)|_OUT(2),wimp_ENULL, (wimp_msgstr*) &msg /* Non-null to avoid any traps */, target.w, target.i, &handle);
+		target_is_menu = (handle == 0x706d6957); /* "Wimp" */
+	}
+
+	if (target.w == NO_WINDOW)
+	{
+		dprintf(("","Stop: No target\n"));
+		return;
+	}
+
+	if (wimp_get_wind_state(target.w,(wimp_wstate*) &msg))
+	{
+		dprintf(("","Stop: Couldn't get state\n"));
+		return;
+	}
+
+	if (!target.x)
+	{
+		dx = 0;
+	}
+	if (!target.y)
+	{
+		dy = 0;
+	}
+	if (!dx && !dy)
+	{
+		return;
+	}
+
+	dprintf(("","Scroll by %d,%d\n",dx,dy));
+
+	switch(target.mode)
+	{
+	case SCROLL_EXTENDED:
+		msg.i = target.i;
+		msg.dx = dx<<2;
+		msg.dy = dy<<2;
+		wimp_sendwmessage(wimp_ESCROLL, (wimp_msgstr*) &msg, target.w, target.i);
+		break;
+	case SCROLL_NORMAL:
+		while(dx | dy)
+		{
+			msg.dx = SIGN(dx);
+			msg.dy = SIGN(dy);
+			dx -= msg.dx;
+			dy -= msg.dy;
+			wimp_sendwmessage(wimp_ESCROLL, (wimp_msgstr*) &msg, target.w, target.i);
+		}
+		break;
+	case SCROLL_MANUAL:
+		/* TODO need to clamp within work area bounds? */
+		/* Apply speed multiplier for manual scrolling
+		   For the other modes, speed multipliers are dangerous, since
+		   we don't really know how much they consider to be one scroll
+		   tick (e.g. NetSurf scrolls by half the window size)
+		 */
+		dx *= settings.speed;
+		dy *= settings.speed;
+		/* We want scroll speeds to remain consistent regardless of
+		   screen DPI. We also want to avoid scrolling by sub-pixel
+		   amounts, because that generally doesn't work. So apply a
+		   scale factor here to ensure pixel multiples are used
+		   (assuming a maximum eigen value of 2!). This means the
+		   user-configurable speed value is in units of 4 OS untis. */
+		msg.w.x += dx<<2;
+		msg.w.y += dy<<2;
+		if (target_is_menu)
+		{
+			wimp_open_wind(&msg.w);
+		}
+		else
+		{
+			wimp_sendwmessage(wimp_EOPEN, (wimp_msgstr*) &msg, target.w, target.i);
+		}
+		break;
+	default:
+		dprintf(("","Stop: Bad scroll mode %d\n",target.mode));
+		return;
+	}
+}
+
+int main(int argc,char **argv)
+{
+	(void) argc;
+	(void) argv;
+
+	os_error *e;
+
+	atexit(not_running);
+
+	e = (os_error *) _swix(Wimp_Initialise,_INR(0,3)|_OUT(1),380,0x4b534154,Module_Title,all_messages,&taskhandle);
+
+	if(e)
+		quit(e);
+
+	/* Poll */
+	do {
+		wimp_eventstr event;
+		pollword = 0;
+		e = (os_error *) _swix(Wimp_Poll,_INR(0,1)|_IN(3)|_OUT(0),
+			wimp_EMNULL|wimp_EMREDRAW|wimp_EMPTRLEAVE|wimp_EMPTRENTER|wimp_EMBUT|wimp_EMKEY|wimp_EMLOSECARET|wimp_EMGAINCARET|wimp_EMACK|(1<<22)|(1<<24),
+			&event.data,
+			&pollword,
+			&event.e);
+		if(e)
+			quit(e);
+		switch(event.e)
+		{
+		case 13: /* Pollword non-zero */
+			scroll_update();
+			break;
+		case wimp_ESEND:
+		case wimp_ESENDWANTACK:
+			if(event.data.msg.hdr.action == wimp_MCLOSEDOWN)
+				quit(NULL);
+			break;
+		}
+	} while(1);
+
+	return 0;
+}
