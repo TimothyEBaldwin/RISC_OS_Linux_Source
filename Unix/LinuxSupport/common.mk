@@ -220,7 +220,7 @@ endif
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built
-	echo 'a9eb33be72f0ead8c6263dd15da5648639094e6b34001739363571fe08fc9d91 *$(IOMD)' | sha256sum -c
+	echo '47ddb509efb49aa7196cfe20e9a6d2ce10d4439ded879f04c866bc56da51d97f *$(IOMD)' | sha256sum -c
 	$(sandbox_base) $(sandbox_misc) --ro-bind '$(IOMD)' /iomd.zip unzip -p iomd.zip "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
 	echo '8d51bc41f479ebdaa2ceb2a2ba3bab59473dced135881685a0ae0b5ea89f1491 *$@' | sha256sum -c
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
@@ -230,7 +230,7 @@ $(HARDDISC4):
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fcffff00000000 $@ || true
 
 $(IOMD):
-	sh Unix/LinuxSupport/download.sh '$(IOMD)' "https://www.riscosopen.org/zipfiles/platform/riscpc/IOMD-Soft.5.24.zip" "a9eb33be72f0ead8c6263dd15da5648639094e6b34001739363571fe08fc9d91"
+	sh Unix/LinuxSupport/download.sh '$(IOMD)' "https://www.riscosopen.org/zipfiles/platform/riscpc/IOMD-Soft.5.24.zip" "47ddb509efb49aa7196cfe20e9a6d2ce10d4439ded879f04c866bc56da51d97f"
 	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${QEMU_SRC}:
