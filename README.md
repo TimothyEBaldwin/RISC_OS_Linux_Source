@@ -51,10 +51,10 @@ The following targets are provided by the Makefiles:
 | fast   | Runs only rom_install and join phases and tests. |
 
 This following items will be download to ~/Downloads if needed:
-* RISC OS 5.22 Disc Archive
-* RISC OS 5.22 IOMD ROM Image
+* RISC OS 5.24 Disc Archive
+* RISC OS 5.24 IOMD ROM Image
 * RPCEmu 0.8.15
-* QEMU 4.1.1
+* QEMU 5.0.0
 
 ## IXFS
 
