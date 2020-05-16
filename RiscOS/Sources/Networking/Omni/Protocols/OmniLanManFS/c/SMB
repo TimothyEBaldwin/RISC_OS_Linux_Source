@@ -95,6 +95,7 @@
 #include "Attr.h"   /* For InvalidateDrive */
 #include "Xlate.h"  /* For string functions */
 #include "Auth.h"
+#include "SMBFind.h"
 
 /* Definitions ===================================================== */
 
@@ -3268,4 +3269,171 @@ void SMB_AntiIdle ( void )
       }
     }
   }
+}
+
+#define SMBFind_GetOffsetHi(offset)          (((DWORD)(offset)) >> 16)
+#define SMBFind_GetOffsetLow(offset)         ((offset) & 0xffff)
+#define SMBFind_SetOffset(offset)            (((offset) << 16) | ((offset) & 0xffff))
+
+static err_t SMBFind_Close(SMBFind_t *fnd)
+{
+  if (fnd == NULL) return OK;
+  if (fnd->hS != NULL && fnd->SID != 0)
+  {
+    SMB_AbandonFind2( fnd->hS, fnd->SID);
+    fnd->hS = NULL;
+    fnd->SID = 0;
+  }
+  return OK;
+}
+
+err_t SMBFind_EnumDir(SMBFind_t *fnd, int dir_offset, const char *ro_path, int count,
+                                  ENUM_DIR_FN dirfn, void *dirfn_handle,
+                                  int *dir_offset_out)
+{
+  static char DOSnamebuf[512];
+  err_t err = OK;
+  BYTE *p;
+  int SearchCount = 0;
+  int EndOfSearch;
+  int length, i;
+
+  struct TransactParms tp;
+
+  if (dir_offset < 0)
+  {
+    *dir_offset_out = -1;
+    return OK;
+  }
+
+  /*
+   *  Wipe and FilerAct reduce dir_offset by 1 for every file deleted during
+   *  enumeration.
+   *
+   *  dir_offset is set to the offset into the directory of the next entry in the
+   *  low 2 bytes (low_offset) and a copy of this in the high 2 bytes (hi_offset).
+   *
+   *  The directory enumeration can continue with the existing FIND_FIRST SID if:
+   *     1) hi_offset is the same as the stored offset - ResumeKey is valid.
+   *     2) hi_offset = low_offset - if they are different deletions have occurred.
+   *     3) directory paths are the same.
+   *
+   *  Otherwise the find is restarted and files are skipped until the offset
+   *  is low_offset.
+   */
+
+  if (dir_offset == 0 ||
+      (dir_offset != 0 &&
+       (SMBFind_GetOffsetHi(dir_offset) != fnd->Offset ||
+        SMBFind_GetOffsetHi(dir_offset) != SMBFind_GetOffsetLow(dir_offset) ||
+        strcmp(fnd->ROPath, ro_path) != 0)))
+  {
+    SMBFind_Close(fnd);
+
+    err = Xlt_ConvertPath( (char*)ro_path, DOSnamebuf );
+    if ( err != OK ) return err;
+    if ( DOSnamebuf[strlen( DOSnamebuf ) - 1] != '\\' )
+      strcat( DOSnamebuf, "\\");
+    strcat( DOSnamebuf, "*" );
+
+    hSHARE hS = GetShare(DOSnamebuf, &err);
+    if (err) return err;
+
+    fnd->hS = hS;
+
+    strcpy(fnd->ROPath, ro_path);
+
+    count += 2;	          /* include . and .. */
+
+    /* Initial search - note we accept SIX return parameters - contrary to
+     * Microsoft's own document - because it doesn't work if you only pass 5. Grr.
+     */
+    Transact_init(&tp, 6 * 2);                /* sizeof response Trans2_Parameters - 6 WORDs */
+    Transact_addsetupword(&tp, TRANSACT2_FINDFIRST);
+    /* Trans2_Parameters */
+    if (LM_Vars.namemode & NM_INTERNAL)
+    {
+      Transact_addword(&tp, ATTR_DIR | ATTR_SYS | ATTR_HID); /* SearchAttributes */
+    }
+    else
+    {
+      Transact_addword(&tp, ATTR_DIR);        /* SearchAttributes */
+    }
+    Transact_addword(&tp, count);             /* SearchCount */
+    Transact_addword(&tp, ffirst_RETURN_KEYS);/* Flags */
+    Transact_addword(&tp, 1);                 /* InformationLevel  */
+    Transact_addlong(&tp, 0L);                /* SearchStorageType -MBZ */
+    Transact_addstring(&tp, DOSnamebuf + 2);  /* FileName[] */
+    err = SMB_Transact2(hS, &tp);
+    if (err != OK) return err;
+    p = tp.parms_out_buf;
+
+    fnd->SID = Transact_getword(p); p += 2;
+
+    fnd->Resume = dir_offset != 0 ? fnd->Resume = SMBFind_GetOffsetLow(dir_offset) : 0;
+
+    fnd->Offset = 0;
+  }
+  else
+  {
+    /* Continuation */
+    Transact_init(&tp, 4 * 2);                /* sizeof response Trans2_Parameters 4 Words */
+    Transact_addsetupword(&tp, TRANSACT2_FINDNEXT);
+    Transact_addword(&tp, fnd->SID);          /* SID */
+    Transact_addword(&tp, count);             /* SearchCount */
+    Transact_addword(&tp, 1);                 /* InformationLevel */
+    Transact_addlong(&tp, fnd->ResumeKey);    /* ResumeKey*/
+    Transact_addword(&tp, ffirst_RETURN_KEYS);/* Flags */
+    Transact_addstring(&tp, fnd->FileName);
+    err = SMB_Transact2(fnd->hS, &tp);
+    if (err != OK) return err;
+    p = tp.parms_out_buf;
+  }
+
+  SearchCount = Transact_getword(p); p += 2;
+  EndOfSearch = Transact_getword(p); p += 2;
+
+  if (EndOfSearch)
+    debug0(">> Server said it was the end of the search operation\n");
+
+  for (i = 0, p = tp.data_out_buf; i < SearchCount; i++, p += 27 + length + 1)
+  {
+    BYTE *fname = p + 27;
+    bool taken;
+
+    length = p[26];
+
+    if ( ((length == 1) && (fname[0] == '.') && (fname[1] == 0)) ||
+         ((length == 2) && (fname[0] == '.') && (fname[1] == '.') && (fname[2] == 0)) )
+    {
+      continue;
+    }
+
+    taken = true; /* Store resume info if skipping files */
+    if (fnd->Offset >= fnd->Resume)
+    {
+      err = dirfn(p + 4, 1, &taken, dirfn_handle);
+      if (err != OK)
+      {
+        /* Entry expander must have run out of space! */
+        return EOUTOFMEM;
+      }
+    }
+
+    if (taken)
+    {
+      fnd->Offset++;
+      *dir_offset_out = SMBFind_SetOffset(fnd->Offset);
+      fnd->ResumeKey = Transact_getlong(p);
+      strncpy(fnd->FileName, (char*)fname, sizeof(fnd->FileName));
+    }
+  }
+
+  if (EndOfSearch || SearchCount == 0)
+  {
+    SMBFind_Close(fnd);
+    return ENOMOREFILES;
+  }
+
+  return OK;
 }
