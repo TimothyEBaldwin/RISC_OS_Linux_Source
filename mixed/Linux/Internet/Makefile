@@ -14,7 +14,7 @@
 #
 
 COMPONENT = InternetL
-OBJS = main
+OBJS = main asm
 LIBS = TCPIPLibs:o.inetlibzm
 CUSTOMEXP=no
 CUSTOMRES=no
