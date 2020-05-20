@@ -33,7 +33,8 @@ CFLAGS          = -Wpn -APCS 3/32bit/nofp/noswst -IC:
 CUSTOMROM       = custom
 CUSTOMEXP       = custom
 CUSTOMSA        = custom
-EXPORTS         = ${EXP_HDR}.DBellDevice \
+EXPORTS         = ${EXP_HDR}.AMBControl \
+                  ${EXP_HDR}.DBellDevice \
                   ${EXP_HDR}.EnvNumbers \
                   ${EXP_HDR}.HALDevice \
                   ${EXP_HDR}.HALEntries \
@@ -115,6 +116,9 @@ h.Kernel: o.GenHeader
 #
 export: ${EXPORTS}
 	@${ECHO} ${COMPONENT}: export complete
+
+${EXP_HDR}.AMBControl: hdr.AMBControl
+	${CP} hdr.AMBControl $@ ${CPFLAGS}
 
 ${EXP_HDR}.EnvNumbers: hdr.EnvNumbers
 	${CP} hdr.EnvNumbers $@ ${CPFLAGS}
