@@ -21,7 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include "swis.h"
+#include <swis.h>
+#include <kernel.h>
 
 #include "InternetLHdr.h"
 
@@ -34,14 +35,25 @@
 #include "arpa/inet.h"
 
 #include "Global/HALEntries.h"
+#include "Global/Upcall.h"
 
 #define ix_SYSCALL_branch 1
 #include "ix/syscalls.h"
 
 static int socket_server = -1;
 
+typedef union {
+  volatile uint32_t word;
+  struct {
+    volatile char data, timeout;
+  } s;
+} pollword_t;
+
 static struct socket {
+  pollword_t pollword[2];
   bool async;
+  bool nonblocking;
+  bool sleeptw;
 } sockets[512];
 
 static void eprintf(const char *fmt, ...) {
@@ -61,6 +73,26 @@ struct ix_sockaddr_in {
   struct in_addr sin_addr;
   char sin_zero[8];
 };
+
+typedef unsigned (__kuser_cmpxchg_t)(unsigned oldval, unsigned newval, volatile unsigned *ptr);
+#define __kuser_cmpxchg (*(__kuser_cmpxchg_t *)0xffff0fc0)
+void __PVirt_WFI(void);
+
+static void pollword_sleep(bool tw, const pollword_t *pollword) {
+  if (pollword->word) return;
+  if (tw) {
+    int r;
+    _swix(OS_UpCall, _INR(0, 1) | _OUT(0), UpCall_Sleep, pollword, &r);
+    if (!r) return;
+  }
+  _kernel_irqs_off();
+  if (!pollword->word) __PVirt_WFI();
+  _kernel_irqs_on();
+}
+
+static void socket_sleep(int fd, unsigned p) {
+  pollword_sleep(sockets[fd].sleeptw, &sockets[fd].pollword[p]);
+}
 
 static int convert_sockopt(int level, int optname) {
   switch(level) {
@@ -124,8 +156,30 @@ static inline void addr2riscos(void *a, unsigned len) {
   if (result >= 0) addr2riscos(addr, *len); \
 }
 
-static ssize_t do_recvmsg(int fd, struct ix_msghdr *m, int flags) {
-  return ix_recvmsg(fd, m, flags);
+static ssize_t do_msg(int fd, struct ix_msghdr *m, int flags, int syscall) {
+  pollword_t *pollword = &sockets[fd].pollword[syscall & 1];
+  while(true) {
+    pollword->s.data = 0;
+    int result;
+    __asm {
+        MOV     R0, fd
+        MOV     R1, m
+        MOV     R2, flags | ix_MSG_DONTWAIT
+        MOV     R7, syscall
+        ix_SYSCALL(R7, R0, R1, R2)
+        MOV     result, R0
+    }
+    if (result != -ix_EAGAIN) {
+      pollword->s.data = 1;
+      return result;
+    }
+    if (sockets[fd].nonblocking || (flags & ix_MSG_DONTWAIT)) return result;
+    pollword_sleep(sockets[fd].sleeptw, pollword);
+  }
+}
+
+static inline ssize_t do_recvmsg(int fd, struct ix_msghdr *m, int flags) {
+  return do_msg(fd, m, flags, __NR_recvmsg);
 }
 
 #define SET_ADDRESS(ADDR, CALL) {                                                       \
@@ -156,7 +210,7 @@ static ssize_t do_sendmsg(int fd, const struct msghdr *m, int flags) {
   }
   // FIXME: Control message data
 
-  return ix_sendmsg(fd, &msg, flags);
+  return do_msg(fd, &msg, flags, __NR_sendmsg);
 }
 
 static inline ssize_t do_sendto(int fd, const void *buf, size_t len, int flags, void *addr_ro) {
@@ -169,6 +223,31 @@ static inline ssize_t do_sendto(int fd, const void *buf, size_t len, int flags, 
   return do_sendmsg(fd, &msg, flags);
 }
 
+static int do_accept(int fd, void *addr, ix_socklen_t *addrlen, void *pw) {
+  int result;
+  while (true) {
+    eprintf(" Accepting...\n");
+    result = ix_accept4(fd, addr, addrlen, ix_SOCK_NONBLOCK);
+    if (result != -ix_EAGAIN || sockets[fd].nonblocking)
+      break;
+    socket_sleep(result, __NR_recvmsg & 1);
+  }
+
+  sockets[fd].pollword[__NR_recvmsg & 1].s.data = 0;
+  struct ix_pollfd pollfd = {fd, ix_POLLIN, 0};
+  ix_poll(&pollfd, 1, 0);
+  if (pollfd.revents & ix_POLLIN)
+    sockets[fd].pollword[__NR_recvmsg & 1].s.data = 1;
+
+  if (result >= 0) {
+    memset(&sockets[result], 0, sizeof(sockets[result]));
+    _swix(OS_ClaimDeviceVector, _INR(0, 2), result, sigio, pw);
+    _swix(OS_Hardware, _IN(0) | _INR(8, 9), result, 0, EntryNo_HAL_IRQEnable);
+  }
+  return result;
+}
+
+
 _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
   (void)pw;
   int result = -ix_EPROTONOSUPPORT;
@@ -176,7 +255,8 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
     case Socket_Creat - Socket_00:
       if (r->r[0] == AF_INET && (r->r[1] == SOCK_DGRAM || r->r[1] == SOCK_STREAM)) {
         if (socket_server != -1) {
-          ix_write(socket_server, &r->r[0], sizeof(int) * 3);
+          int so[3] = {r->r[0], r->r[1] | ix_SOCK_NONBLOCK , r->r[2]};
+          ix_write(socket_server, so, sizeof(so));
           struct ix_iovec iov = {&result, sizeof(result)};
           struct ix_cmsghdr_fd cmsg;
           struct ix_msghdr msg = {
@@ -190,9 +270,10 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
             result = cmsg.fd;
           }
         } else {
-          result = ix_socket(r->r[0], r->r[1], r->r[2]);
+          result = ix_socket(r->r[0], r->r[1] | ix_SOCK_NONBLOCK , r->r[2]);
         }
         if (result >= 0) {
+          memset(&sockets[result], 0, sizeof(sockets[result]));
           _swix(OS_ClaimDeviceVector, _INR(0, 2), result, sigio, pw);
           _swix(OS_Hardware, _IN(0) | _INR(8, 9), result, 0, EntryNo_HAL_IRQEnable);
         }
@@ -286,20 +367,23 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
       break;
 
     case Socket_Connect - Socket_00:
+      sockets[r->r[0]].pollword[__NR_sendmsg & 1].s.data = 0;
       SET_ADDRESS(r->r[1], ix_connect(r->r[0], &addr_linux, sizeof(addr_linux)))
+      if (result == -ix_EINPROGRESS) {
+        socket_sleep(r->r[0], __NR_sendmsg & 1);
+        ix_socklen_t optlen = sizeof(result);
+        ix_getsockopt(r->r[0], ix_SOL_SOCKET, ix_SO_ERROR, &result, &optlen);
+        result = 0;
+      }
       break;
     case Socket_Bind - Socket_00:
       SET_ADDRESS(r->r[1], ix_bind(r->r[0], &addr_linux, sizeof(addr_linux)))
       break;
     case Socket_Accept - Socket_00:
-      result = ix_accept(r->r[0], (void*)r->r[1], (ix_socklen_t *)r->r[2]);
-      if (result >= 0) {
-        _swix(OS_ClaimDeviceVector, _INR(0, 2), result, sigio, pw);
-        _swix(OS_Hardware, _IN(0) | _INR(8, 9), result, 0, EntryNo_HAL_IRQEnable);
-      }
+      result = do_accept(r->r[0], (void*)r->r[1], (ix_socklen_t *)r->r[2], pw);
       break;
     case Socket_Accept_1 - Socket_00:
-      GET_ADDRESS_1(r->r[1], r->r[2], ix_accept(r->r[0], addr, len))
+      GET_ADDRESS_1(r->r[1], r->r[2], do_accept(r->r[0], addr, len, pw))
       break;
     case Socket_Getpeername - Socket_00:
       result = ix_getpeername(r->r[0], (void*)r->r[1], (ix_socklen_t *)r->r[2]);
@@ -339,6 +423,7 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
       if (result >= 0 && level == ix_SOL_SOCKET) {
         switch (r->r[2]) {
           case SO_ERROR:
+            // FIXME What is optlen is too small?
             if (*(int*)r->r[3]) *(int*)r->r[3] = _swix(IXSupport_ConvertError, _IN(0), *(int*)r->r[3])->errnum - 0x20E00;
             break;
         }
@@ -347,14 +432,18 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
     }
     case Socket_Ioctl - Socket_00:
       switch ((uint32_t)r->r[1]) {
-
         case FIOASYNC:
           sockets[r->r[0]].async = !!*(int *)r->r[2];
           ix_MESSAGE(2, "Handling FIOASYNC\n");
           result = 0;
           break;
         case FIONBIO:
-          result = ix_ioctl(r->r[0], ix_FIONBIO, (int *)r->r[2]);
+          sockets[r->r[0]].nonblocking = !!*(int *)r->r[2];
+          result = 0;
+          break;
+        case FIOSLEEPTW:
+          sockets[r->r[0]].sleeptw = !!*(int *)r->r[2];
+          result = 0;
           break;
         case FIONREAD:
           result = ix_ioctl(r->r[0], ix_FIONREAD, (int *)r->r[2]);
@@ -383,6 +472,12 @@ int sigio_handler(_kernel_swi_regs *regs, void *pw) {
   eprintf("sigio %i\n", s);
   ix_siginfo_t *info = (void *)regs->r[1];
   int band = info->u.sigpoll.band;
+
+  if (band & (ix_POLLIN | ix_POLLERR))
+    sockets[s].pollword[__NR_recvmsg & 1].s.data = 1;
+
+  if (band & (ix_POLLOUT))
+    sockets[s].pollword[__NR_sendmsg & 1].s.data = 1;
 
   if (sockets[s].async && (band & ix_POLLIN)) {
     eprintf("Sending Internet Event for socket %i\n", s);
