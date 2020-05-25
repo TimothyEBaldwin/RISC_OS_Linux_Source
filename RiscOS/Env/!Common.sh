@@ -110,16 +110,16 @@ mk ()
     fi
     RELPATH=$(echo "${COMPONENTDIR#*$BUILDDIR/}" | tr / .)
     MYTMP=$(mktemp)
-    
+
     if [ -n "$COMPONENT" ]; then
         grep "^$COMPONENT " "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
     else
         grep "$RELPATH\( \|$\)" "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
     fi
-    
+
     if [ $? -ne 0 ]; then
         # Component not found in ModuleDB - can't infer anything
-        make -C "$COMPONENTDIR" "$@"
+        make -C "$COMPONENTDIR" "$@" || { rm "$MYTMP"; exit 1; }
     else
         while read -r DB_COMPONENT _ _ DB_INSTDIR DB_TARGET; do
             ARGS=""
@@ -132,7 +132,7 @@ mk ()
             if [ -z "$INSTDIR" ] && [ -n "$DB_INSTDIR" ]; then
                 ARGS="$ARGS INSTDIR=\"$INSTALLDIR/$DB_INSTDIR\""
             fi
-            make -C "$COMPONENTDIR" $ARGS "$@"
+            make -C "$COMPONENTDIR" $ARGS "$@" || { rm "$MYTMP"; exit 1; }
         done < "$MYTMP"
     fi
     rm "$MYTMP"
