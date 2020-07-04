@@ -16,8 +16,8 @@
 #
 
 COMPONENT  = UnicodeLib
-TARGET    ?= ucode
-EXPDIR     = ${LIBDIR}${SEP}Unicode
+TARGET    ?= Unicode
+LIBRARY    = ucode
 LIBRARIES  = ${LIBRARY} ${LIBRARYZM} ${LIBRARYD}
 LIBDEPENDS = unictype
 CDFLAGS    = -DDEBUG=1
