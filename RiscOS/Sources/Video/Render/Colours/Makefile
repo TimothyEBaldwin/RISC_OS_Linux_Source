@@ -42,7 +42,7 @@ clean::
 	${XWIPE} Palettes ${WFLAGS}
 	${XWIPE} MkTables.o ${WFLAGS}
 	${RM} MkTables.maketables
-	${STRIPDEPEND} maketables_mk
+	${STRIPDEPEND} maketables/mk
 
 #
 # Static dependencies:
@@ -58,7 +58,7 @@ MakeTables: MkTables.maketables
 
 MkTables.maketables: MkTables.c.maketables
 	${CD} MkTables
-	${MAKE_SEP_DEPS} maketables_mk COMPONENT=maketables THROWBACK=${THROWBACK}
+	${MAKE} -f maketables/mk COMPONENT=maketables THROWBACK=${THROWBACK}
 	${CD} ^
 
 # Dynamic dependencies:

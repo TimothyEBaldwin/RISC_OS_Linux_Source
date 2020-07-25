@@ -108,7 +108,6 @@ clean:
 	${XWIPE} oh ${WFLAGS}
 	${XWIPE} od ${WFLAGS}
 	${XWIPE} s.* ${WFLAGS}
-	${STRIPDEPEND} util_mk
 	@${ECHO} ${COMPONENT}: cleaned
 
 resources:
@@ -130,13 +129,13 @@ jhdr.s: ${GENJHDR}
 	${RUN}${GENJHDR} > $@
 
 ${GENPALETTE}: genpalette.c
-	${MAKE_SEP_DEPS} util_mk COMPONENT=genpalette THROWBACK=${THROWBACK}
+	${MAKE} -f util/mk COMPONENT=genpalette THROWBACK=${THROWBACK}
 
 ${GENYUVTABS}: genyuvtabs.c
-	${MAKE_SEP_DEPS} util_mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
+	${MAKE} -f util/mk COMPONENT=genyuvtabs THROWBACK=${THROWBACK}
 
 ${GENJHDR}: genjhdr.c jpeglib.h jconfig.h jmorecfg.h
-	${MAKE_SEP_DEPS} util_mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
+	${MAKE} -f util/mk COMPONENT=genjhdr THROWBACK=${THROWBACK}
 
 #
 # Static dependencies:

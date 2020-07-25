@@ -1,4 +1,4 @@
-# Copyright 2009 Castle Technology Ltd
+# Copyright 2014 Castle Technology Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for Matrix1 and Matrix2
+# Makefile for scrambler
+#
 
-include CApp
+COMPONENT = scrambler
+
 include HostTools
 include AppLibs
+include CApp
+
+# Dynamic dependencies:

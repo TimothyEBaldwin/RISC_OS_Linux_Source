@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile for genpalette, genyuvtabs and genjhdr
+# Makefile for Matrix1 and Matrix2
 
-TARGET   = utils.${COMPONENT}
-OBJS     = ${COMPONENT}
-CDEFINES = -DRISCOS -DASMHUFF
-
-include HostTools
 include CApp
+include HostTools
+include AppLibs
+
+# Dynamic dependencies:

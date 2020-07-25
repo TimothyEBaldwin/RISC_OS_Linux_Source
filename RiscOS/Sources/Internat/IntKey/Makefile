@@ -63,16 +63,16 @@ clean::
 	${WIPE} s ${WFLAGS}
 	${RM} keygen
 	${RM} keyconvert
-	${STRIPDEPEND} keygen_mk
+	${STRIPDEPEND} keygen/mk
 	@echo ${COMPONENT}: cleaned
 
 keygen: keygen.c throwback.c unicdata.c
 	${MKDIR} s
-	${MAKE_SEP_DEPS} keygen_mk COMPONENT=keygen THROWBACK=${THROWBACK}
+	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 keyconvert: keyconvert.c unicdata.c
 	${MKDIR} s
-	${MAKE} -f keygen_mk COMPONENT=keygen THROWBACK=${THROWBACK}
+	${MAKE} -f keygen/mk COMPONENT=keygen THROWBACK=${THROWBACK}
 
 install: ${LAYOUTS}
 
