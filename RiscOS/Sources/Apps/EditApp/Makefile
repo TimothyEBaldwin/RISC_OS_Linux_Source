@@ -42,7 +42,11 @@ RESDIR = <resource$dir>.Resources.${COMPONENT}
 RESAPP = <resource$dir>.Apps.${APP}
 
 include StdTools
+ifeq ($(filter rom%,${MAKECMDGOALS}),)
+include AppLibs
+else
 include ModuleLibs
+endif
 
 SQZFLAGS  = -f
 CINCLUDES = -IC:
@@ -78,7 +82,7 @@ OBJSD = od.edit od.editv od.message od.slist
 #
 .SUFFIXES: .oz .od
 .c.o:;    ${CC} ${CFLAGS} -c ${C_NO_FNAMES} $<
-.c.oz:;   ${CC} ${CFLAGS} -c ${C_NO_FNAMES} ${C_MODULE} ${C_NO_STKCHK} -o $@ $<
+.c.oz:;   ${CC} ${CFLAGS} -c ${C_NO_FNAMES} ${C_MODULE} -o $@ $<
 .c.od:;   ${CC} ${CFLAGS} -c -DTRACE=1 -g -o $@ $<
 .s.o:;    ${AS} ${ASFLAGS} $< $@
 
