@@ -31,18 +31,35 @@
 #include <termios.h>
 #include <unistd.h>
 
-struct termios oldTioIn, newTioIn;
+struct termios newTioIn;
+
+struct terminal {
+  struct termios tio;
+  bool is_term;
+} terminals[3];
+
+volatile pid_t child;
+
+static void restore_terminal(void) {
+  for(int i = 0; i != 3; ++i)
+    if (terminals[i].is_term)
+      tcsetattr(i, TCSANOW, &terminals[i].tio);
+}
 
 static void stop_handler(int s) {
-  tcsetattr(0, TCSANOW, &oldTioIn);
+  restore_terminal();
   raise(SIGSTOP);
-  tcsetattr(0, TCSANOW, &newTioIn);
+  if (terminals[0].is_term)
+    tcsetattr(0, TCSANOW, &newTioIn);
 }
 
 static void fatal_handler(int s) {
-  tcsetattr(0, TCSANOW, &oldTioIn);
-  signal(s, SIG_DFL);
-  raise(s);
+  pid_t child2 = child;
+  if (child2) kill(child2, s);
+}
+
+static void child_handler(int s) {
+  child = 0;
 }
 
 int main(int argc, char **argv) {
@@ -69,8 +86,16 @@ int main(int argc, char **argv) {
   // Die if parent dies
   prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
 
-  // Get terminal status, if successful reopen terminal for input.
-  if (!tcgetattr(0, &oldTioIn)) {
+  bool have_terminal = false;
+  for(int i = 0; i != 3; ++i) {
+    if (!tcgetattr(0, &terminals[i].tio)) {
+      terminals[i].is_term = true;
+      have_terminal = true;
+    }
+  }
+
+  // Is standard input a terminal?
+  if (terminals[0].is_term) {
 
     // Standard input is a terminal, so reopen to it avoid
     // other programs having to cope with non-blocking etc.
@@ -81,20 +106,32 @@ int main(int argc, char **argv) {
     }
 
     // Disable terminal echo.
-    newTioIn = oldTioIn;
+    newTioIn = terminals[0].tio;
     newTioIn.c_iflag &= ~IGNCR & ~INLCR;
     newTioIn.c_cc[VMIN] = 1;
     newTioIn.c_cc[VTIME] = 0;
     newTioIn.c_lflag &= ~ICANON & ~ECHO;
+  }
 
-    // Install cleanup signal handlers
-    signal(SIGTSTP, &stop_handler);
-    signal(SIGTTIN, &stop_handler);
-    signal(SIGTTOU, &stop_handler);
-    signal(SIGINT,  &fatal_handler);
-    signal(SIGHUP,  &fatal_handler);
-    signal(SIGTERM, &fatal_handler);
+  // Install cleanup signal handlers
+  struct sigaction sigact = {};
+  sigfillset(&sigact.sa_mask);
+  sigact.sa_flags =  SA_RESTART | SA_NOCLDSTOP;
+  sigact.sa_handler = &child_handler;
+  sigaction(SIGCHLD, &sigact, 0);
 
+  sigdelset(&sigact.sa_mask, SIGCHLD);
+  sigact.sa_handler = &stop_handler;
+  sigaction(SIGTSTP, &sigact, 0);
+  sigaction(SIGTTIN, &sigact, 0);
+  sigaction(SIGTTOU, &sigact, 0);
+
+  sigact.sa_handler = &fatal_handler;
+  sigaction(SIGINT,  &sigact, 0);
+  sigaction(SIGHUP,  &sigact, 0);
+  sigaction(SIGTERM, &sigact, 0);
+
+  if (terminals[0].is_term) {
     // Set new termnal state
     tcsetattr(0, TCSANOW, &newTioIn);
   }
@@ -106,10 +143,16 @@ int main(int argc, char **argv) {
     if (socket_server)
       socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
 
+    // Block signals
+    sigset_t sigset;
+    sigfillset(&sigset);
+    sigprocmask(SIG_BLOCK, &sigset, 0);
+
+    // Do the fork!
     pid_t self = getpid();
     pid_t pid = fork();
     if (pid < 0) {
-      tcsetattr(0, TCSANOW, &oldTioIn);
+      restore_terminal();
       return 109;
     }
     if (!pid) {
@@ -124,10 +167,15 @@ int main(int argc, char **argv) {
       }
 
       lseek(9, SEEK_SET, 0);
+      sigprocmask(SIG_UNBLOCK, &sigset, 0);
 
       execvp(argv[optind], argv + optind);
       _exit(116);
     }
+    child = pid;
+    sigprocmask(SIG_UNBLOCK, &sigset, 0);
+
+
     if (socket_server) {
       close(sockets[1]);
 
@@ -183,6 +231,7 @@ int main(int argc, char **argv) {
   } while(status == 100);
 
   // Restore terminal
-  tcsetattr(0, TCSANOW, &oldTioIn);
+  restore_terminal();
+  return status;
 
 }
