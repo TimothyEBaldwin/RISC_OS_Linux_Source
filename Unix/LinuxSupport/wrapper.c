@@ -18,10 +18,11 @@
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
@@ -45,6 +46,25 @@ static void fatal_handler(int s) {
 }
 
 int main(int argc, char **argv) {
+
+  bool socket_server = false;
+
+  static const struct option opts[] = {
+    {"network", no_argument, NULL, 'n'},
+    {NULL, 0, NULL, 0}
+  };
+
+  int opt;
+  while ((opt = getopt_long(argc, argv, "nr", opts, NULL)) != -1) {
+    switch (opt) {
+      case 'n':
+        socket_server = true;
+        break;
+      default:
+        fprintf(stderr, "usage\n");
+        return 1;
+    }
+  }
 
   // Die if parent dies
   prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
@@ -83,7 +103,8 @@ int main(int argc, char **argv) {
 
   do {
     int sockets[2];
-    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
+    if (socket_server)
+      socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
 
     pid_t self = getpid();
     pid_t pid = fork();
@@ -95,65 +116,70 @@ int main(int argc, char **argv) {
       prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
       if (getppid() != self) _exit(110);
 
-      int socket = fcntl(sockets[1], F_DUPFD, 32);
-      char s[48];
-      sprintf(s, "RISC_OS_Internet_SocketServer=%i", socket);
-      putenv(s);
+      if (socket_server) {
+        int socket = fcntl(sockets[1], F_DUPFD, 32);
+        char s[48];
+        sprintf(s, "RISC_OS_Internet_SocketServer=%i", socket);
+        putenv(s);
+      }
 
       lseek(9, SEEK_SET, 0);
 
-      execvp(argv[1], argv + 1);
+      execvp(argv[optind], argv + optind);
       _exit(116);
     }
-    close(sockets[1]);
+    if (socket_server) {
+      close(sockets[1]);
 
-    while(true) {
-      int32_t socket_args[3];
-      int s = read(sockets[0], socket_args, sizeof(socket_args));
-      if (s == 0) break;
+      while(true) {
+        int32_t socket_args[3];
+        int s = read(sockets[0], socket_args, sizeof(socket_args));
+        if (s == 0) break;
 
-      if (socket_args[0] == AF_INET) {
-        s = socket(socket_args[0], socket_args[1], socket_args[2]);
-      } else {
-        s = -1;
-        errno = EPERM;
+        if (socket_args[0] == AF_INET) {
+          s = socket(socket_args[0], socket_args[1], socket_args[2]);
+        } else {
+          s = -1;
+          errno = EPERM;
+        }
+
+        if (s < 0) {
+          int32_t e = -errno;
+          write(sockets[0], &e, 4);
+        } else {
+
+          union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+          } u;
+
+          struct msghdr msg = {
+            .msg_control = u.buf,
+            .msg_controllen = sizeof(u.buf)
+          };
+
+          struct cmsghdr *cmsg;
+          cmsg = CMSG_FIRSTHDR(&msg);
+          cmsg->cmsg_level = SOL_SOCKET;
+          cmsg->cmsg_type = SCM_RIGHTS;
+          cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+          memcpy(CMSG_DATA(cmsg), &s, sizeof(s));
+
+          sendmsg(sockets[0], &msg, 0);
+          close(s);
+        }
       }
 
-      if (s < 0) {
-        int32_t e = -errno;
-        write(sockets[0], &e, 4);
-      } else {
-
-        union {
-          char buf[CMSG_SPACE(sizeof(int))];
-          struct cmsghdr align;
-        } u;
-
-        struct msghdr msg = {
-          .msg_control = u.buf,
-          .msg_controllen = sizeof(u.buf)
-        };
-
-        struct cmsghdr *cmsg;
-        cmsg = CMSG_FIRSTHDR(&msg);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &s, sizeof(s));
-
-        sendmsg(sockets[0], &msg, 0);
-        close(s);
-      }
+      close(sockets[0]);
     }
-
-    close(sockets[0]);
-
-    // Write a new line to keep output tidy.
-    if (isatty(1)) write(1, "\n", 1);
 
     int wstatus;
     waitpid(pid, &wstatus, 0);
     status = WEXITSTATUS(wstatus);
+
+    // Write a new line to keep output tidy.
+    if (isatty(1)) write(1, "\n", 1);
+
   } while(status == 100);
 
   // Restore terminal
