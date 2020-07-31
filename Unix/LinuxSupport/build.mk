@@ -177,7 +177,7 @@ endif
 	)
 	rm -rf Unix/RISC_OS/*
 	mkdir -p Unix/RISC_OS/Unix/LinuxSupport
-	cp -v --reflink=auto --preserve=mode,xattr Unix/LinuxSupport/!(Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Unix/LinuxSupport/
+	cp -v --reflink=auto --preserve=mode,xattr Unix/LinuxSupport/!(arm_test.s|arm_test.sh|Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Unix/LinuxSupport/
 	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Unix/RISC_OS/
 	#
 	cp -vrL Unix/SocketKVMFrontends Unix/RISC_OS/Unix/SocketKVMFrontends

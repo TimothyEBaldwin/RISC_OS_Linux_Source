@@ -34,6 +34,7 @@ export QEMU1
 
 SHELL=$(BASH)
 JOBS:=$(shell getconf _NPROCESSORS_ONLN)
+QEMU:=$(shell . Unix/LinuxSupport/lib.sh; arm_test && echo "$$QEMU")
 export JOBS
 
 SHELL=$(warning Building $@)$(BASH)
@@ -180,23 +181,13 @@ endif
 	echo \)
 
 Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
-	set -o pipefail
-	$(BWRAP) --ro-bind / /  true
-	#
 	if $(BWRAP) --seccomp 9 9< <(Built/gen_seccomp) --ro-bind / /  true; then
 	  use_seccomp=true
-	  seccomp_bits='--seccomp 9 9< <(Built/gen_seccomp)'
+	else
+	  use_seccomp=false
 	fi
 	#
-	export RISC_OS_Alias_IXFSBoot='BASIC -quit IXFS:$$.Finish'
-	if $(sandbox_base) --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS --help </dev/null |& cat; then
-	  eval $(sandbox_base) $$seccomp_bits --ro-bind Unix/LinuxSupport/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS /RISC_OS --abort-on-input </dev/null |& cat;
-	  QEMU1=/usr/bin/env
-	elif ! eval $(sandbox_base) $$seccomp_bits  --ro-bind Unix/LinuxSupport/Finish /Finish --ro-bind '$(LINUX_ROM)' /RISC_OS $$($(call ldd2sandbox,"$$QEMU1")) --ro-bind "$$QEMU1" /qemu-arm /qemu-arm /RISC_OS --abort-on-input </dev/null |& cat; then
-	  QEMU1=Built/qemu-arm
-	fi
-	echo "use_seccomp:=$$use_seccomp
-	QEMU:=$$QEMU1" > $@
+	echo "use_seccomp:=$$use_seccomp" > $@
 
 HardDisc4: | $(HARDDISC4) Built/sandbox_config_sh $(LINUX_ROM)
 	set -o pipefail
