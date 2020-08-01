@@ -62,26 +62,46 @@ static void child_handler(int s) {
   child = 0;
 }
 
+static void __attribute__((noreturn)) do_exec(char **argv) {
+  lseek(9, SEEK_SET, 0);
+  execvp(*argv, argv);
+  _exit(116);
+}
+
 int main(int argc, char **argv) {
 
   bool socket_server = false;
+  bool handle_reboots = false;
 
   static const struct option opts[] = {
     {"network", no_argument, NULL, 'n'},
+    {"handle-reboots", no_argument, NULL, 'r'},
     {NULL, 0, NULL, 0}
   };
 
+  char *args[argc + 2];
+  char **argp = args;
+
   int opt;
-  while ((opt = getopt_long(argc, argv, "nr", opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "-nr", opts, NULL)) != -1) {
     switch (opt) {
+      case 1:
+        *argp++ = optarg;
+        break;
       case 'n':
         socket_server = true;
+        break;
+      case 'r':
+        handle_reboots = true;
         break;
       default:
         fprintf(stderr, "usage\n");
         return 1;
     }
   }
+
+  while(optind != argc) *argp++ = argv[optind++];
+  *argp = 0;
 
   // Die if parent dies
   prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
@@ -93,6 +113,9 @@ int main(int argc, char **argv) {
       have_terminal = true;
     }
   }
+
+  if (!have_terminal && !handle_reboots && !socket_server)
+    do_exec(args);
 
   // Is standard input a terminal?
   if (terminals[0].is_term) {
@@ -166,11 +189,8 @@ int main(int argc, char **argv) {
         putenv(s);
       }
 
-      lseek(9, SEEK_SET, 0);
       sigprocmask(SIG_UNBLOCK, &sigset, 0);
-
-      execvp(argv[optind], argv + optind);
-      _exit(116);
+      do_exec(args);
     }
     child = pid;
     sigprocmask(SIG_UNBLOCK, &sigset, 0);
@@ -228,7 +248,10 @@ int main(int argc, char **argv) {
     // Write a new line to keep output tidy.
     if (isatty(1)) write(1, "\n", 1);
 
-  } while(status == 100);
+    argp[0] = "--isreboot";
+    argp[1] = 0;
+
+  } while(status == 100 && handle_reboots);
 
   // Restore terminal
   restore_terminal();
