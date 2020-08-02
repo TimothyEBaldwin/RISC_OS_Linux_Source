@@ -28,7 +28,7 @@
 static scmp_filter_ctx ctx;
 
 static void ban(int syscall, const char* message) {
-  int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(syscall), 0);
+  int rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), syscall, 0);
   if (rc) error(1, -rc, "%s", message);
 }
 
@@ -80,7 +80,7 @@ int main(int argc, char **argv) {
   } else {
     BAN(seccomp);
     rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(prctl), 1, SCMP_A0(SCMP_CMP_EQ, PR_SET_SECCOMP));
-    if (rc) error(1, -rc, "Unable to prctl(PR_SET_SECCOMP...) rule");
+    if (rc) error(1, -rc, "Unable to create prctl(PR_SET_SECCOMP...) rule");
   }
 
   BAN(keyctl);
@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
   BAN(add_key);
 
   rc = seccomp_export_bpf(ctx, STDOUT_FILENO);
-  if (rc) error(1, -rc, "Unable to load seccomp rules");
+  if (rc) error(1, -rc, "Unable to export seccomp rules");
 
   return 0;
 }
