@@ -172,7 +172,7 @@ else
 	$(call ldd2sandbox,$(QEMU))
 	echo -n '--ro-bind $(QEMU) /qemu-arm '
 endif
-	for i in --die-with-parent --as-pid-1 "--cap-drop ALL"; do
+	for i in --die-with-parent "--cap-drop ALL"; do
 	  if $(BWRAP) --unshare-all $$i --dev-bind / / true; then
 	    echo -n "$$i "
 	  fi
