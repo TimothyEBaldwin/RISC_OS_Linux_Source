@@ -203,7 +203,7 @@ else
 	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
 	 --ro-bind Unix/LinuxSupport/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
-	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" \
+	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}"  --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random \
 	 $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
 endif
 	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
