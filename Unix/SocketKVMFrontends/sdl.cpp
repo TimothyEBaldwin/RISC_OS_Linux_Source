@@ -229,13 +229,19 @@ int main(int argc, char **argv) {
         update_screen();
         break;
       case SDL_WINDOWEVENT:
-        if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
-          report r;
-          r.reason = report::ev_resize;
-          r.mouse.x = e.window.data1;
-          r.mouse.y = e.window.data2;
-          send_report(r);
-          if (no_updates < 200) no_updates = 200;
+        switch(e.window.event) {
+          case SDL_WINDOWEVENT_RESIZED: {
+            report r;
+            r.reason = report::ev_resize;
+            r.mouse.x = e.window.data1;
+            r.mouse.y = e.window.data2;
+            send_report(r);
+            if (no_updates < 200) no_updates = 200;
+            break;
+          }
+          case SDL_WINDOWEVENT_EXPOSED:
+            SDL_UpdateWindowSurface(window);
+            break;
         }
         break;
       case SDL_QUIT:
