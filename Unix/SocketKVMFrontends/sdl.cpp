@@ -54,7 +54,11 @@ void update_screen() {
     updates_pending = 0;
   }
 
-  if (no_updates <= 0 && get_file_size(screen_fd) >= (height * width) << log2bpp >> 3 ) {
+  static char old[screen_size];
+
+  size_t s = (height * width) << log2bpp >> 3;
+  if (no_updates <= 0 && get_file_size(screen_fd) >= s && std::memcmp(old, pixels, s)) {
+    std::memcpy(old, pixels, s);
     SDL_BlitSurface(screen, nullptr, SDL_GetWindowSurface(window), nullptr);
     SDL_UpdateWindowSurface(window);
   }
