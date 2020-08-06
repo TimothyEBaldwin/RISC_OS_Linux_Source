@@ -62,8 +62,10 @@ static void child_handler(int s) {
   child = 0;
 }
 
+static int seccomp_file = 9;
+
 static void __attribute__((noreturn)) do_exec(char **argv) {
-  lseek(9, SEEK_SET, 0);
+  if (seccomp_file >= 0) lseek(seccomp_file, SEEK_SET, 0);
   execvp(*argv, argv);
   _exit(116);
 }
@@ -74,8 +76,10 @@ int main(int argc, char **argv) {
   bool handle_reboots = false;
 
   static const struct option opts[] = {
+    {"arg", required_argument, NULL, 'a'},
     {"network", no_argument, NULL, 'n'},
     {"handle-reboots", no_argument, NULL, 'r'},
+    {"seccomp", no_argument, NULL, 's'},
     {NULL, 0, NULL, 0}
   };
 
@@ -86,6 +90,7 @@ int main(int argc, char **argv) {
   while ((opt = getopt_long(argc, argv, "-nr", opts, NULL)) != -1) {
     switch (opt) {
       case 1:
+      case 'a':
         *argp++ = optarg;
         break;
       case 'n':
@@ -94,6 +99,18 @@ int main(int argc, char **argv) {
       case 'r':
         handle_reboots = true;
         break;
+      case 's': {
+        const char *file = getenv("RISC_OS__seccomp");
+        if (!file)
+          file = "Built/seccomp-";
+        seccomp_file = open(file, O_RDONLY);
+        if (seccomp_file < 0) error(1, errno, "Unable to open seccomp rule file '%s'", file);
+        static char s[10];
+        sprintf(s, "%i", seccomp_file);
+        *argp++ = "--seccomp";
+        *argp++ = s;
+        break;
+      }
       default:
         fprintf(stderr, "usage\n");
         return 1;
