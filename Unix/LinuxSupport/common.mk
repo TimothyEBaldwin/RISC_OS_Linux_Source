@@ -52,8 +52,7 @@ all: comma2attr
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
 sandbox_misc := $(call robind,/bin /lib* /usr/bin /usr/lib* /etc/alternatives)
 sandbox_build := $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
-sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1) --proc /proc --dir /tmp --dir /dev/shm
-ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
+sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Unix/LinuxSupport/*.mk)
 
 include $(wildcard Unix/LinuxSupport/build.mk)
@@ -151,19 +150,22 @@ Built/qemu-arm: Built/qemu_Makefile_stamp | Built/gen_seccomp
 	ln -f Built/qemu/arm-linux-user/qemu-arm Built/qemu-arm
 	touch Built/qemu-arm
 
-Built/sandbox_config_sh: $(QEMU) Built/gen_seccomp
+Built/sandbox_config_sh: $(BWRAP) $(QEMU) $(lib_depends)
 	set -o pipefail
 	exec > Built/sandbox_config_sh
 	echo BWRAP='$(BWRAP)'
 ifeq ($(QEMU),/usr/bin/env)
 	echo QEMU=
-	echo -n 'auto_bwrap_args=( '
+	echo 'qemu_libs=()'
 else
 	echo QEMU=/qemu-arm
-	echo -n 'auto_bwrap_args=( '
-	$(call ldd2sandbox,$(QEMU))
-	echo -n '--ro-bind $(QEMU) /qemu-arm '
+	echo -n 'qemu_libs=( '
+	env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(QEMU) /exe ldd /exe < /dev/null \
+	| sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  \
+	| sort -u | tr '\n' ' '
+	echo '--ro-bind $(QEMU) /qemu-arm )'
 endif
+	echo -n 'auto_bwrap_args=( '
 	for i in --die-with-parent "--cap-drop ALL"; do
 	  if $(BWRAP) --unshare-all $$i --dev-bind / / true; then
 	    echo -n "$$i "
@@ -185,7 +187,7 @@ else
 	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
 	 --ro-bind Unix/LinuxSupport/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
-	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}"  --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random \
+	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" "$${qemu_libs[@]}" --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random \
 	 $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
 endif
 	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
