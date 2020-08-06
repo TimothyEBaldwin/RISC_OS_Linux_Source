@@ -181,17 +181,22 @@ HardDisc4: | $(HARDDISC4) Built/gen_seccomp Built/sandbox_config_sh $(LINUX_ROM)
 	echo 'c6e19fcc9a9783cbb8ebf5d1c52464ca810bf94ad6509bbe4818391c6bc8d4f4 *HardDisc4_files/hd4,ffc' | sha256sum -c
 ifeq ($(INSECURE), YES)
 	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.proc.self.cwd.HardDisc4_files.hd4
-	BASIC -quit IXFS:$$.proc.self.cwd.Unix.LinuxSupport.Finish' '$(LINUX_ROM)'
+	BASIC -quit IXFS:$$.proc.self.cwd.Unix.LinuxSupport.Finish' '$(LINUX_ROM)' \
+	 --abort-on-input --nvram /HardDisc4_files/CMOS
 else
 	. Built/sandbox_config_sh
 	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
 	 --ro-bind Unix/LinuxSupport/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
-	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" "$${qemu_libs[@]}" --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random \
-	 $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
+	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" "$${qemu_libs[@]}" \
+	 --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random \
+	 $$QEMU /RISC_OS  --abort-on-input --nvram /HardDisc4_files/CMOS </dev/null |& cat
 endif
 	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
 	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
+	mkdir 'HardDisc4_files/HardDisc4/!Boot/Loader'
+	ln HardDisc4_files/CMOS 'HardDisc4_files/HardDisc4/!Boot/CMOS'
+	mv HardDisc4_files/CMOS 'HardDisc4_files/HardDisc4/!Boot/Loader/CMOS'
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built
