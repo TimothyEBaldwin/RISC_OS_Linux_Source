@@ -49,25 +49,17 @@ BASHF:=$(BASH) $(.SHELLFLAGS)
 
 all: comma2attr
 
-ifeq ($(INSECURE), YES)
-QEMU:=/usr/bin/env
-else
-include Built/sandbox_config_make
-all: Built/sandbox_config_sh
-script-all: Built/sandbox_config_sh
-endif
-
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
 sandbox_misc := $(call robind,/bin /lib* /usr/bin /usr/lib* /etc/alternatives)
 sandbox_build := $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
-sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all $(if $(use_seccomp), --seccomp 9 9< <(Built/gen_seccomp $(1)), --new-session) --proc /proc --dir /tmp --dir /dev/shm
+sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1) --proc /proc --dir /tmp --dir /dev/shm
 ldd2sandbox = env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(1) /exe ldd /exe < /dev/null | sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  | sort -u | tr '\n' ' '
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Unix/LinuxSupport/*.mk)
 
 include $(wildcard Unix/LinuxSupport/build.mk)
 include $(wildcard Unix/SocketKVMFrontends/build.mk)
 
-script-all: RISC_OS HardDisc4 Built/wrapper
+script-all: RISC_OS HardDisc4 Built/wrapper Built/sandbox_config_sh
 
 RISC_OS:
 
@@ -104,7 +96,7 @@ Built/rpcemu/stamp2: $(RPCEMU) Unix/LinuxSupport/rpcemu_exit.diff | Built/gen_se
 	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Unix/LinuxSupport/rpcemu_exit.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
 	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
 
-Built/rpcemu/src/Makefile: Built/rpcemu/stamp2
+Built/rpcemu/src/Makefile: Built/rpcemu/stamp2 | Built/gen_seccomp
 	set -o pipefail
 	configure() {
 	  if uname -m | grep -E -q 'x86|i386'; then
@@ -117,7 +109,7 @@ Built/rpcemu/src/Makefile: Built/rpcemu/stamp2
 	export -f configure
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASHF) configure </dev/null |& cat
 
-Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile
+Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile | Built/gen_seccomp
 	set -o pipefail
 	+cp Unix/LinuxSupport/rpcemu.cfg Built/rpcemu/rpc.cfg
 	build() {
@@ -146,12 +138,12 @@ Built/qemu_stamp-v5.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen
 	mv Built/qemu_files/qemu-5.0.0 Built/qemu
 	touch Built/qemu_stamp-v5.0.0
 
-Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.0.0
+Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.0.0 | Built/gen_seccomp
 	set -o pipefail
 	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
 
-Built/qemu-arm: Built/qemu_Makefile_stamp
+Built/qemu-arm: Built/qemu_Makefile_stamp | Built/gen_seccomp
 	set -o pipefail
 	+$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
 	test ! -L Built/qemu/arm-linux-user
@@ -162,10 +154,9 @@ Built/qemu-arm: Built/qemu_Makefile_stamp
 Built/sandbox_config_sh: $(QEMU) Built/gen_seccomp
 	set -o pipefail
 	exec > Built/sandbox_config_sh
-	echo use_seccomp=$(use_seccomp)
+	echo BWRAP='$(BWRAP)'
 ifeq ($(QEMU),/usr/bin/env)
 	echo QEMU=
-
 	echo -n 'auto_bwrap_args=( '
 else
 	echo QEMU=/qemu-arm
@@ -180,16 +171,7 @@ endif
 	done
 	echo \)
 
-Built/sandbox_config_make: Built/gen_seccomp $(LINUX_ROM) /bin
-	if $(BWRAP) --seccomp 9 9< <(Built/gen_seccomp) --ro-bind / /  true; then
-	  use_seccomp=true
-	else
-	  use_seccomp=false
-	fi
-	#
-	echo "use_seccomp:=$$use_seccomp" > $@
-
-HardDisc4: | $(HARDDISC4) Built/sandbox_config_sh $(LINUX_ROM)
+HardDisc4: | $(HARDDISC4) Built/gen_seccomp Built/sandbox_config_sh $(LINUX_ROM)
 	set -o pipefail
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files

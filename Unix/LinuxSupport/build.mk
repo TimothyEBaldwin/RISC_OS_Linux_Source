@@ -43,7 +43,7 @@ Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/rpcemu/rpcemu Built/boot_io
 else ifeq ($(INSECURE), YES)
 Build2/%/RiscOS/Images/rom: Build2/src-stamp | ${LINUX_ROM}
 else
-Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/sandbox_config_sh ${LINUX_ROM}
+Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/gen_seccomp Built/sandbox_config_sh ${LINUX_ROM}
 endif
 	set -o pipefail
 	uname -a

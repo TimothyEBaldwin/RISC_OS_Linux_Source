@@ -16,11 +16,8 @@ exec </dev/null 3>/dev/null > >(cat) 2>&1
 . Built/sandbox_config_sh
 
 run() {
-  if [[ $use_seccomp = "true" ]]; then
-    seccomp="--seccomp 9"
-  fi
   timeout --foreground -sKILL 60 \
-  ${BWRAP:=bwrap} --unshare-all --proc /proc --dev /dev --dir /tmp --new-session $seccomp 9< <(Built/gen_seccomp $1) \
+  "${BWRAP}" --unshare-all --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp $1) \
   --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests "${auto_bwrap_args[@]}" $QEMU \
   /RISC_OS "${@:2}"
 }
