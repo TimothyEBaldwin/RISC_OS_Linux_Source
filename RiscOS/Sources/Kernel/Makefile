@@ -89,8 +89,9 @@ install: ${EXPORTS} inst_dirs
 
 ${KERNEL_MODULE}: ${ROM_OBJECT} ${DIRS}
 	${MKDIR} bin
-	${LD} -bin -o $@ ${ROM_OBJECT}
-	${LD} -aif -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECT}
+	SetEval KernelBase "4" + STR ( 227858432 + ( HALSize LEFT ( LEN HALSize - 1 ) ) * 1024 )
+	Do ${LD} -bin -base <KernelBase> -o $@ ${ROM_OBJECT}
+	Do ${LD} -aif -base <KernelBase> -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECT}
 	${TOGPA} -s ${KERNEL_MODULE}_aif ${KERNEL_MODULE}_gpa
 
 #
