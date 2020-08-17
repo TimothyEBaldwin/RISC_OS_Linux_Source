@@ -34,8 +34,6 @@ HAL_Linux: ${OBJS} HALSyms o._dirs
 	${CP} HALSyms <Lib$Dir>.Linux.o.HALSyms F~C~N~V
 	${LD} -FIRST Top(HEAD) -o HAL_Linux -bin -base ${ADDRESS} -Symdefs <Lib$Dir>.Linux.o.HALSyms -Symbols HAL_Linux_sym ${OBJS}
 	BASIC -quit Fix_Program_Header
-	${SED} -n -e 's/\(0x........\) \(A\|D\) \(.*\)/\3 * \1/p' < <Lib$Dir>.Linux.o.HALSyms > <Hdr$Dir>.Global.CPU.PVSyms
-	echo <32>END { >> <Hdr$Dir>.Global.CPU.PVSyms }
 	@${ECHO} Linux HAL built
 
 rom: HAL_Linux

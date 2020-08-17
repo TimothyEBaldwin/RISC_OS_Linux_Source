@@ -26,7 +26,7 @@ endif
 
 TOKHELPSRC      = ${TOKENSOURCE}
 HELPSRC         = HelpStrs
-ROM_OBJECTS     = GetAll.o End.o
+ROM_OBJECTS     = GetAll.o
 KERNEL_MODULE   = bin${SEP}${COMPONENT}
 ASFLAGS        += -PD "FreezeDevRel SETL {${FREEZE_DEV_REL}}" -APCS 3/32bit/nofp/noswst
 CFLAGS          = -Wpn -APCS 3/32bit/nofp/noswst -IC:
@@ -63,7 +63,7 @@ EXPORTS         = ${EXP_HDR}.AMBControl \
                   ${C_EXP_HDR}.VIDCList
 
 ifeq (${Machine},Linux)
-ROM_OBJECTS += LinuxC.o
+ROM_OBJECTS += LinuxC.o ${PVLIBS}
 endif
 
 include StdTools
@@ -95,11 +95,16 @@ install: ${EXPORTS} inst_dirs
 
 ${KERNEL_MODULE}: ${ROM_OBJECTS} ${DIRS}
 	${MKDIR} bin
-	${LD} -bin -o $@ ${ROM_OBJECTS}
-	${LD} -aif -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECTS}
+ifeq (${Machine},Linux)
+	SetEval KernelBase &20800000 + ( HALSize LEFT ( LEN HALSize - 1 ) ) * 1024
+else
+	SetEval KernelBase "4" + STR ( 227858432 + ( HALSize LEFT ( LEN HALSize - 1 ) ) * 1024 )
+endif
+	Do ${LD} -bin -base <KernelBase> -o $@ ${ROM_OBJECTS}
+	Do ${LD} -aif -base <KernelBase> -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECTS}
 	${TOGPA} -s ${KERNEL_MODULE}_aif ${KERNEL_MODULE}_gpa
 
-GetAll.o:  ${TOKHELPSRC}
+GetAll.o: ${TOKHELPSRC}
 
 
 #
