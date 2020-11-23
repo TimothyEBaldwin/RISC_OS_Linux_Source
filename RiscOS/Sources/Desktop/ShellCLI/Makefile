@@ -13,22 +13,15 @@
 # limitations under the License.
 #
 # Makefile for ShellCLI
-#
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 06-Mar-01  SNB          Recreated.
-#
 
-#
-# Program specific options:
-#
-COMPONENT = ShellCLI
-HEADER1   = Shell
+COMPONENT       = ShellCLI
+CMHGDEPENDS     = module
+CINCLUDES       = -IOS:
+LIBS            = ${OSLIB} ${ASMUTILS}
+OBJS            = module veneer
+HDRS            =
+ASMHDRS         = Shell
 
-include StdTools
-include AAsmModule
+include CModule
 
 # Dynamic dependencies:
