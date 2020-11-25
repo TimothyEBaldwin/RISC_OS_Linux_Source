@@ -17,6 +17,8 @@ export APPDIR=$BUILDDIR/Apps
 export MAKEFILEDIR=$BUILDDIR/BuildSys/GNUmakefiles
 export INSTALLDIR=$BUILDDIR/Install
 
+export AMUMACHINE="make -I\"$MAKEFILEDIR\" --no-print-directory"
+
 if [ "$APCS" = "APCS-R" ]; then
 	TOOLOPTIONS="-26bit"
 	ASASM_TOOLOPTIONS="-apcs 3/26bit/fpe2"
