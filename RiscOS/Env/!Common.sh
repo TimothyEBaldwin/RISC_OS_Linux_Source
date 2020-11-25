@@ -19,14 +19,14 @@ export INSTALLDIR=$BUILDDIR/Install
 
 if [ "$APCS" = "APCS-R" ]; then
 	TOOLOPTIONS="-26bit"
-	ASASM_TOOLOPTIONS="-apcs26 -apcsfpv2"
+	ASASM_TOOLOPTIONS="-apcs 3/26bit/fpe2"
 	CMUNGE_TOOLOPTIONS="-26bit -apcs 3/26bit/fpe2"
 	GCC_TOOLOPTIONS="-mapcs-26 -march=armv2 -mfpu=fpe2"
 	NCC_TOOLOPTIONS="-APCS 3/26bit/fpe2"
 	OBJASM_TOOLOPTIONS="-APCS 3/26bit"
 elif [ "$APCS" = "APCS-32" ]; then
 	TOOLOPTIONS="-32bit"
-	ASASM_TOOLOPTIONS="-apcs32 -apcsfpv3"
+	ASASM_TOOLOPTIONS="-apcs 3/32bit/fpe3"
 	CMUNGE_TOOLOPTIONS="-32bit -apcs 3/32bit/fpe3"
 	case "$MACHINE" in
 	'Archimedes')
