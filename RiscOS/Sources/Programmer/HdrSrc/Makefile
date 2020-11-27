@@ -147,7 +147,7 @@ EXPORTS   = \
  ${HDIR}.Global.h.Services \
  ${HDIR}.Global.h.Sprite \
  ${HDIR}.Global.h.SWIs \
- ${HDIR}.Global.h.Upcall \
+ ${HDIR}.Global.h.UpCall \
  ${HDIR}.Global.h.Tokens \
  ${HDIR}.Global.h.IOCtl \
  ${HDIR}.Global.IO.h.GenericIO \
