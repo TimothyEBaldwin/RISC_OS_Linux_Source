@@ -91,6 +91,7 @@ export EXPORTDIR=$HDRDIR/Interface
 export GLOBALHDRDIR=$HDRDIR/Global
 export CEXPORTDIR=$APCSEXPORTDIR/C
 export LIBDIR=$APCSEXPORTDIR/Lib
+export HDR_PATH=$HDRDIR/Global:$HDRDIR/Interface
 
 # This enables you to simply type "make all" from the command line
 alias make="make -I\"\$MAKEFILEDIR\" --no-print-directory"
