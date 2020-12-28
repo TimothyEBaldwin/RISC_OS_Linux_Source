@@ -106,7 +106,6 @@ endif
 
 GetAll.o: ${TOKHELPSRC}
 
-
 #
 # Internal C header
 #
