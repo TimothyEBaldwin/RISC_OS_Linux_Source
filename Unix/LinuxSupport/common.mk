@@ -15,10 +15,10 @@
 # limitations under the License.
 #
 
-HARDDISC4=$(HOME)/Downloads/HardDisc4.5.24.util
+HARDDISC4=$(HOME)/Downloads/HardDisc4.5.28.util
 QEMU_SRC=$(HOME)/Downloads/qemu-5.0.0.tar.xz
 RPCEMU=$(HOME)/Downloads/rpcemu-0.8.15.tar.gz
-IOMD=$(HOME)/Downloads/IOMD-Soft.5.24.zip
+IOMD=$(HOME)/Downloads/IOMD-Soft.5.28.zip
 
 LINUX_ROM=./RISC_OS
 VERBOSE=
@@ -178,7 +178,7 @@ HardDisc4: | $(HARDDISC4) Built/gen_seccomp Built/sandbox_config_sh $(LINUX_ROM)
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files
 	cp --reflink=auto '$(HARDDISC4)' HardDisc4_files/hd4,ffc
-	echo 'c6e19fcc9a9783cbb8ebf5d1c52464ca810bf94ad6509bbe4818391c6bc8d4f4 *HardDisc4_files/hd4,ffc' | sha256sum -c
+	echo '64607412d987a3f974217f109128de89e1ec9a6cd3284f52b3cf9c39fa0f6b60 *HardDisc4_files/hd4,ffc' | sha256sum -c
 ifeq ($(INSECURE), YES)
 	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.proc.self.cwd.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.proc.self.cwd.Unix.LinuxSupport.Finish' '$(LINUX_ROM)' \
@@ -200,17 +200,17 @@ endif
 	mv HardDisc4_files/HardDisc4 .
 
 Built/boot_iomd_rom: $(IOMD) | Built
-	echo '47ddb509efb49aa7196cfe20e9a6d2ce10d4439ded879f04c866bc56da51d97f *$(IOMD)' | sha256sum -c
+	echo 'd1e955ff8e6dce905c455b9135391f3f1879673965fb4949c5f10716b4fe3e3e *$(IOMD)' | sha256sum -c
 	$(sandbox_base) $(sandbox_misc) --ro-bind '$(IOMD)' /iomd.zip unzip -p iomd.zip "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
-	echo '8d51bc41f479ebdaa2ceb2a2ba3bab59473dced135881685a0ae0b5ea89f1491 *$@' | sha256sum -c
+	echo '051bd488965d43dc8d74757ee29fe72927e0f018dfe45e9c88e511496f0ec316 *$@' | sha256sum -c
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 
 $(HARDDISC4):
-	sh Unix/LinuxSupport/download.sh '$(HARDDISC4)' "https://www.riscosopen.org/zipfiles/platform/common/HardDisc4.5.24.util" "c6e19fcc9a9783cbb8ebf5d1c52464ca810bf94ad6509bbe4818391c6bc8d4f4"
+	sh Unix/LinuxSupport/download.sh '$(HARDDISC4)' "https://www.riscosopen.org/zipfiles/platform/common/HardDisc4.5.28.util" "64607412d987a3f974217f109128de89e1ec9a6cd3284f52b3cf9c39fa0f6b60"
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fcffff00000000 $@ || true
 
 $(IOMD):
-	sh Unix/LinuxSupport/download.sh '$(IOMD)' "https://www.riscosopen.org/zipfiles/platform/riscpc/IOMD-Soft.5.24.zip" "47ddb509efb49aa7196cfe20e9a6d2ce10d4439ded879f04c866bc56da51d97f"
+	sh Unix/LinuxSupport/download.sh '$(IOMD)' "https://www.riscosopen.org/zipfiles/platform/riscpc/IOMD-Soft.5.28.zip" "d1e955ff8e6dce905c455b9135391f3f1879673965fb4949c5f10716b4fe3e3e"
 	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${QEMU_SRC}:
