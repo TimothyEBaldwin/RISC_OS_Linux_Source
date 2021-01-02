@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
           file = "Built/seccomp-";
         seccomp_file = open(file, O_RDONLY);
         if (seccomp_file < 0) error(1, errno, "Unable to open seccomp rule file '%s'", file);
-        static char s[10];
+        static char s[11];
         sprintf(s, "%i", seccomp_file);
         *argp++ = "--seccomp";
         *argp++ = s;
