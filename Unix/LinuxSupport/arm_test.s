@@ -21,6 +21,7 @@
 @ 4 - Fail, SIGILL from QEMU hack
 @ 5 - Fail, QEMU hack returns ENOSYS
 @ 6 - Fail, FPA instructions don't cause SIGILL
+@ 7 - Fail, Unable to map low address space, try "sudo sysctl vm.mmap_min_addr=12288"
 
         udf
 sigact:
@@ -75,6 +76,24 @@ _start:
         moveq   r9, #5
         beq     handler
 
+        @ Test for mmap low memory
+        mov     r0, #0x3000
+        mov     r1, #0x5000
+        mov     r2, #3          @ PROT_READ | PROT_WRITE
+        mov     r3, #0x32       @ MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS
+        mov     r4, #-1
+        mov     r5, #0
+        mov     r7, #192        @ mmap2
+        mov     r9, #2
+        swi     0
+        teq     r0, #0x3000
+        movne   r9, #7
+        bne     handler
+
+        @ Test mapped memory
+        str     r1, [r0]
+        ldr     r1, [r0, #4]
+
         @ Test for FPA instrction support - not wanted
         mov     r9, #0
         .long   0xEE008108      @ mvfs    f0, #1
@@ -86,4 +105,4 @@ handler:
         mov     r0, r9
         mov     r7, #1          @ exit
         swi     0x900001
-        udf
+        str     r0, [r0, -r0]   @ If exit doesn't work, try segfault

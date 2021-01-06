@@ -23,6 +23,7 @@ arm_test() {
     4 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack is EABI system call" 1>&2;;
     5 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack returns ENOSYS" 1>&2;;
     6 ) echo "Systems which implement FPA instructions currently don't work" 1>&2;;
+    7 ) echo 'Unable to map low address space, try "sudo sysctl vm.mmap_min_addr=12288"' 1>&2;;
     126 )
       if [[ "$(uname)" != Linux ]]; then
         echo "This is the Linux Port of RISC OS, not for some other operating system." 1>&2;
