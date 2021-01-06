@@ -14,25 +14,28 @@
 
 arm_test() {
   "${BASH_SOURCE%%lib.sh}arm_test"
-  case $? in
+  ret=$?
+  case $ret in
     0 ) QEMU=/usr/bin/env ;;
-    1 ) echo "This Linux is ancient, EABI system calls don't work!" 1>&2; false;;
-    2 ) echo "Bug in arm_test? - mystery SIGILL" 1>&2; false;;
-    3 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack raises SIGILL" 1>&2; false;;
-    4 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack is EABI system call" 1>&2; false;;
-    5 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack returns ENOSYS" 1>&2; false;;
-    6 ) echo "Systems which implement FPA instructions currently don't work" 1>&2; false;;
+    1 ) echo "This Linux is ancient, EABI system calls don't work!" 1>&2;;
+    2 ) echo "Bug in arm_test? - mystery SIGILL" 1>&2;;
+    3 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack raises SIGILL" 1>&2;;
+    4 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack is EABI system call" 1>&2;;
+    5 ) echo "Can't intercept SWIs, no SECCOMP, no ptrace, QEMU hack returns ENOSYS" 1>&2;;
+    6 ) echo "Systems which implement FPA instructions currently don't work" 1>&2;;
     126 )
       if [[ "$(uname)" != Linux ]]; then
-        echo "This is the Linux Port of RISC OS, not for some other operating system."
+        echo "This is the Linux Port of RISC OS, not for some other operating system." 1>&2;
         false
       elif [[ "$(uname -m)" == arm* ]]; then
-        echo "Weird or ancient ARM system can't execute ARM ELF executables"
+        echo "Weird or ancient ARM system can't execute ARM ELF executables" 1>&2;
         false
       else
         QEMU="$(command -v qemu-arm)"
         "$QEMU" "${BASH_SOURCE%%lib.sh}arm_test" || QEMU=Built/qemu-arm
-        true
-      fi
+        return 0
+      fi;;
+    * ) echo "arm_test has failed with unknown return code $ret" 1>&2;;
   esac
+  return $ret
 }

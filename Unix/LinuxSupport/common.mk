@@ -34,7 +34,7 @@ export QEMU1
 
 SHELL=$(BASH)
 JOBS:=$(shell getconf _NPROCESSORS_ONLN)
-QEMU:=$(shell . Unix/LinuxSupport/lib.sh; arm_test && echo "$$QEMU")
+QEMU:=$(shell . Unix/LinuxSupport/lib.sh; arm_test || kill $$PPID; echo "$$QEMU")
 export JOBS
 
 SHELL=$(warning Building $@)$(BASH)
