@@ -37,7 +37,6 @@ JOBS:=$(shell getconf _NPROCESSORS_ONLN)
 QEMU:=$(shell . Unix/LinuxSupport/lib.sh; arm_test || kill $$PPID; echo "$$QEMU")
 export JOBS
 
-SHELL=$(warning Building $@)$(BASH)
 .SHELLFLAGS:=-e -c $(if $(VERBOSE), -x)
 BASHF:=$(BASH) $(.SHELLFLAGS)
 .ONESHELL:
@@ -58,7 +57,9 @@ lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Unix/LinuxSupport/*.mk)
 include $(wildcard Unix/LinuxSupport/build.mk)
 include $(wildcard Unix/SocketKVMFrontends/build.mk)
 
-script-all: RISC_OS HardDisc4 Built/wrapper Built/sandbox_config_sh
+SHELL=$(warning Building $@)$(BASH)
+
+script-all: RISC_OS HardDisc4 Built/wrapper Built/sandbox_config_sh Built/wait_stdin
 
 RISC_OS:
 
@@ -70,6 +71,9 @@ comma2attr: Built/comma2attr
 
 Built/comma2attr: Unix/LinuxSupport/comma2attr.c $(lib_depends) | Built
 	gcc -std=gnu99 -Wall -g Unix/LinuxSupport/comma2attr.c -o Built/comma2attr
+
+Built/wait_stdin: Unix/LinuxSupport/wait_stdin.c $(lib_depends) | Built
+	gcc -std=c99 -Wall -Os Unix/LinuxSupport/wait_stdin.c -o Built/wait_stdin
 
 Built/wrapper: Unix/LinuxSupport/wrapper.c $(lib_depends) | Built
 	gcc -std=gnu99 -Wall -Os Unix/LinuxSupport/wrapper.c -o Built/wrapper
