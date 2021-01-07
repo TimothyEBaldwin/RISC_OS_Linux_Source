@@ -180,12 +180,14 @@ HardDisc4: | $(HARDDISC4) Built/gen_seccomp Built/sandbox_config_sh $(LINUX_ROM)
 	cp --reflink=auto '$(HARDDISC4)' HardDisc4_files/hd4,ffc
 	echo '64607412d987a3f974217f109128de89e1ec9a6cd3284f52b3cf9c39fa0f6b60 *HardDisc4_files/hd4,ffc' | sha256sum -c
 ifeq ($(INSECURE), YES)
-	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.proc.self.cwd.HardDisc4_files.hd4
+	env -i RISC_OS_Alias_IXFSBoot='Echo Extracting HardDisc4
+	/IXFS:$$.proc.self.cwd.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.proc.self.cwd.Unix.LinuxSupport.Finish' '$(LINUX_ROM)' \
 	 --abort-on-input --nvram /HardDisc4_files/CMOS
 else
 	. Built/sandbox_config_sh
-	env -i RISC_OS_Alias_IXFSBoot='/IXFS:$$.HardDisc4_files.hd4
+	env -i RISC_OS_Alias_IXFSBoot='Echo Extracting HardDisc4
+	/IXFS:$$.HardDisc4_files.hd4
 	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
 	 --ro-bind Unix/LinuxSupport/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
 	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" "$${qemu_libs[@]}" \
@@ -198,6 +200,7 @@ endif
 	ln HardDisc4_files/CMOS 'HardDisc4_files/HardDisc4/!Boot/CMOS'
 	mv HardDisc4_files/CMOS 'HardDisc4_files/HardDisc4/!Boot/Loader/CMOS'
 	mv HardDisc4_files/HardDisc4 .
+	echo Finished extracting HardDisc4
 
 Built/boot_iomd_rom: $(IOMD) | Built
 	echo 'd1e955ff8e6dce905c455b9135391f3f1879673965fb4949c5f10716b4fe3e3e *$(IOMD)' | sha256sum -c
