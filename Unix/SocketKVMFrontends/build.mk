@@ -45,7 +45,7 @@ Built/SDL_flags: Unix/SocketKVMFrontends/build.mk $(wildcard /usr/bin/sdl2-confi
 	  echo SDL_FLAGS=-Wl,-rpath,$(CURDIR)/Built/SDL/usr/lib -LBuilt/SDL/usr/lib -IBuilt/SDL/usr/include/SDL2 -D_REENTRANT -lSDL2
 	  echo SDL_DEPS=Built/SDL/stamp
 	  echo -n DEBARCH=
-	  dpkg --print-architecture || true
+	  dpkg --print-architecture || { gcc Unix/SocketKVMFrontends/identify_abi.c -o Built/idenify_abi.c; Built/idenify_abi.c; }
 	fi
 
 Built/SDL/stamp: $(HOME)/Downloads/libsdl2-dev_2.0.9+dfsg1-1_$(DEBARCH).deb $(HOME)/Downloads/libsdl2-2.0-0_2.0.9+dfsg1-1_$(DEBARCH).deb
