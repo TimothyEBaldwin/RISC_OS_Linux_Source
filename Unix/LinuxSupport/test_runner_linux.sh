@@ -24,11 +24,6 @@ run() {
 
 set -x
 
-if [[ $QEMU = "" ]]; then
-  # Test ptrace SWI implemnation
-  RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run -p --abort-on-input --noaborts
-fi
-
 # Test C swi handler
 RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run '' --cswi --abort-on-input --noaborts
 
@@ -37,3 +32,8 @@ RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run '' --abort-on-in
 
 # Various tests that require data aborts
 RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run ''
+
+if [[ $QEMU = "" ]]; then
+  # Test ptrace SWI implemnation
+  RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run -p
+fi
