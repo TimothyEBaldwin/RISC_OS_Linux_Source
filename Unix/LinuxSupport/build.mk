@@ -33,7 +33,7 @@ endif
 
 build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build2/$* /dev/fd/5/Build2/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
 
-Build2/src-stamp: $(shell find Unix/LinuxSupport/build.mk Unix/SocketKVMFrontends/SocketKVM_Protocol.h Unix/SocketKVMFrontends/Makefile,fe1 RiscOS mixed)
+Build2/src-stamp: $(shell find Unix/LinuxSupport/build.mk Unix/SocketKVMFrontends/SocketKVM_Protocol.h Unix/SocketKVMFrontends/Makefile,fe1 RiscOS mixed \! \( -name '.*' -prune \))
 	ln -sfn . lock_source_1510718522
 	mkdir -p Build2
 	touch Build2/src-stamp
