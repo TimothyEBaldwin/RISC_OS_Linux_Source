@@ -14,12 +14,6 @@
 #
 # Makefile for ColourPicker
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name         Description
-# ----       ----         -----------
-# 23-Nov-99  SNB          Created
 
 COMPONENT     ?= ColourPicker
 TARGET        ?= Picker
@@ -27,7 +21,7 @@ HDRS          =
 ASMHDRS       = ColourPick
 INSTRES_FILES = Sprites Templates CMYK.Messages:CMYK CMYK.Templates:CMYK HSV.Messages:HSV HSV.Templates:HSV RGB.Messages:RGB RGB.Templates:RGB
 VPATH         = Support011
-CINCLUDES     = -ISupport011,icons ${INCLUDE_OSLIB}
+CINCLUDES     = -ISupport011,icons ${OSINC}
 RES_AREA      = resourcefs_files
 RES_OBJ       = msgs
 CMHGFILE      = header
