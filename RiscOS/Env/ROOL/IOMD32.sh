@@ -9,7 +9,7 @@ export SYSTEM=Ursula
 export USERIF=Sovereign
 export DISPLAYTYPE=PAL
 export IMAGESIZE=4096K
-export HALSIZE=64K
+export HALSIZE=32K
 export BUILD=ROOL/IOMD32
 export APCS=APCS-32
 
