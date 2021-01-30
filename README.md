@@ -22,9 +22,9 @@ This Linux port of RISC OS can be built in similar fashion to the traditional me
 
 ## Compiling on Linux
 
-It can also be built on Linux using the Makefiles, which runs the majority of the build on RISC OS, by default using a binary of the Linux port that is automatically downloaded from [github](https://github.com/TimothyEBaldwin/RO_Linux) and RISC OS Open Limited’s DDE in ../DDE. Allegro (for RPCEmu), Bash, Bubblewrap, GCC, GNU Make, Libattr, Libseccomp and SDL 2 are also required by Makefiles and support code. Either Bubblewrap must be setuid root, or unprivileged user namespaces must be enabled, or insecure mode enabled.
+It can also be built on Linux using the Makefiles, which runs the majority of the build on RISC OS, by default using a binary of the Linux port that is automatically downloaded from [github](https://github.com/TimothyEBaldwin/RO_Linux) and RISC OS Open Limited’s DDE in ../DDE. Bash, Bubblewrap, GCC, GNU Make, Libattr, Libseccomp and SDL 2 are also required by Makefiles and support code. Either Bubblewrap must be setuid root, or unprivileged user namespaces must be enabled, or insecure mode enabled.
 
-On Debian and Ubuntu the dependencies are in the packages "bash bubblewrap gcc g++ make liballegro4-dev libattr1-dev libpixman-1-dev libseccomp-dev libsdl2-dev", on Fedora the dependencies are in the packages "allegro-dev bash gcc gcc-c++ glib2-devel libattr-devel libseccomp-devel patch pixman-devel SDL2-devel".
+On Debian and Ubuntu the dependencies are in the packages "bash bubblewrap gcc g++ make libattr1-dev libseccomp-dev libsdl2-dev", on Fedora the dependencies are in the packages "bash gcc gcc-c++ glib2-devel libattr-devel libseccomp-devel patch SDL2-devel".
 
 Additional packages are required for building QEMU.
 
