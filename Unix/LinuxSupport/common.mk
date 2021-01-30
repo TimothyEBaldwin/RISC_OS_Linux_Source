@@ -201,7 +201,7 @@ endif
 	mv HardDisc4_files/HardDisc4 .
 	echo Finished extracting HardDisc4
 
-Built/boot_iomd_rom: $(IOMD) | Built
+Built/boot_iomd_rom: $(IOMD) | Built/gen_seccomp
 	echo 'd1e955ff8e6dce905c455b9135391f3f1879673965fb4949c5f10716b4fe3e3e *$(IOMD)' | sha256sum -c
 	$(sandbox_base) $(sandbox_misc) --ro-bind '$(IOMD)' /iomd.zip unzip -p iomd.zip "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
 	echo '051bd488965d43dc8d74757ee29fe72927e0f018dfe45e9c88e511496f0ec316 *$@' | sha256sum -c
