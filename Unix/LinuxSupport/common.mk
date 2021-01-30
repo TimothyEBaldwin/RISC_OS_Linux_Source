@@ -17,7 +17,7 @@
 
 HARDDISC4=$(HOME)/Downloads/HardDisc4.5.28.util
 QEMU_SRC=$(HOME)/Downloads/qemu-5.2.0.tar.xz
-RPCEMU=$(HOME)/Downloads/rpcemu-0.8.15.tar.gz
+RPCEMU=$(HOME)/Downloads/rpcemu-0.9.3.tar.gz
 IOMD=$(HOME)/Downloads/IOMD-Soft.5.28.zip
 
 LINUX_ROM=./RISC_OS
@@ -84,41 +84,36 @@ Built/gen_seccomp: Unix/LinuxSupport/gen_seccomp.c $(lib_depends) | Built
 Built/seccomp%: Built/gen_seccomp
 	Built/gen_seccomp $* > $@
 
-Built/rpcemu/stamp2: $(RPCEMU) Unix/LinuxSupport/rpcemu_exit.diff | Built/gen_seccomp
+Built/rpcemu/stamp3: $(RPCEMU) Unix/LinuxSupport/rpcemu.diff | Built/gen_seccomp
 	set -o pipefail
 	rm -rf Built/rpcemu*
 	mkdir -p Built/rpcemu_files
 	unpack() {
-	  echo "3f092e6000b5d50984e63768a74cdc9a40284d55c984e26df44c7d5875ced6e9 /rpcemu.tar.gz" | sha256sum -c
+	  echo "33b89e02e62b5621c625aa6d388d3a357e7ee013e74a00fcf53ef68f31d19605 /rpcemu.tar.gz" | sha256sum -c
 	  tar -zxf /rpcemu.tar.gz
-	  cd rpcemu-0.8.15
+	  cd rpcemu-0.9.3
 	  patch -p1 < /d
-	  touch stamp2
+	  touch stamp3
 	}
 	export -f unpack
-	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Unix/LinuxSupport/rpcemu_exit.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
-	mv Built/rpcemu_files/rpcemu-0.8.15 Built/rpcemu
+	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Unix/LinuxSupport/rpcemu.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
+	mv Built/rpcemu_files/rpcemu-0.9.3 Built/rpcemu
 
-Built/rpcemu/src/Makefile: Built/rpcemu/stamp2 | Built/gen_seccomp
-	set -o pipefail
-	configure() {
-	  if uname -m | grep -E -q 'x86|i386'; then
-	    ./configure --enable-dynarec CFLAGS="-no-pie -fno-pie"
-	  else
-	    ./configure
-	  fi
-	  touch Makefile
-	}
-	export -f configure
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r/src $(BASHF) configure </dev/null |& cat
-
-Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile | Built/gen_seccomp
+Built/rpcemu/rpcemu: Built/rpcemu/stamp3 | Built/gen_seccomp
 	set -o pipefail
 	+cp Unix/LinuxSupport/rpcemu.cfg Built/rpcemu/rpc.cfg
 	build() {
 	  touch hd4.hdf roms/ROM
-	  $(MAKE) -C src
-	  ! rm poduleroms/SyncClock,ffa
+	  (
+	    cd src/qt5
+	    if uname -m | grep -E -q 'x86|i386'; then
+	      qtchooser -run-tool=qmake -qt=5 CONFIG+=dynarec
+	    else
+	      qtchooser -run-tool=qmake -qt=5
+	    fi
+	    $(MAKE)
+	  )
+	  rm -f poduleroms/SyncClock,ffa
 	  echo H4sIAISQCFUCA2NgYDNTuO7MAAdlTAEM+Q4MDgwaNgxoQABdgOHVGoZ/DK8ZZoJlQxQ4uHQmMDGw\
 	wWSZGWgP+EUYGJb8FXD8z5jIIAgV+0CMRm5GBgYTBgYAXYSkcwABAAA= | base64 -d | gzip -d > cmos.ram
 	  touch rpcemu
@@ -225,5 +220,5 @@ ${QEMU_SRC}:
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 $@ || true
 
 $(RPCEMU):
-	sh Unix/LinuxSupport/download.sh '$(RPCEMU)' "http://www.marutan.net/rpcemu/cgi/download.php?sFName=0.8.15/rpcemu-0.8.15.tar.gz" "3f092e6000b5d50984e63768a74cdc9a40284d55c984e26df44c7d5875ced6e9"
+	sh Unix/LinuxSupport/download.sh '$(RPCEMU)' "http://www.marutan.net/rpcemu/cgi/download.php?sFName=0.9.3/rpcemu-0.9.3.tar.gz" "33b89e02e62b5621c625aa6d388d3a357e7ee013e74a00fcf53ef68f31d19605"
 	setfattr -n user.RISC_OS.LoadExec -v 0x0089ffff00000000 $@ || true

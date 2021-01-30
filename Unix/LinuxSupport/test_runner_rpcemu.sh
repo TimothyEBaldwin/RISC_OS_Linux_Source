@@ -1,11 +1,14 @@
 #!/bin/bash
 
 binds=()
-for i in /bin /lib* /usr/bin /usr/lib*; do
+shopt -s nullglob
+for i in /bin /lib* /usr /etc/machine-id /var/lib/dbus/machine-id ; do
   binds+=(--ro-bind "$i" "$i")
 done
+shopt -u nullglob
 
 rpc_test() {
+  cd /r
   timeout --foreground -sKILL 60 /r/rpcemu
   E=$?
   tr -d '\r' < /r/hostfs/tmp/log*

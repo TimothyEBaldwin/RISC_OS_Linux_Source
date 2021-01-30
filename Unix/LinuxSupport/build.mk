@@ -31,7 +31,7 @@ ifeq ($(TARGET), Linux)
 all check: RISC_OS
 endif
 
-build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) /dev/fd/5/$(dir)) --bind Build2/$* /dev/fd/5/Build2/$* --ro-bind '${ACORN_CPP}' /dev/fd/8 --symlink . /dev/fd/5/lock_source_1510718522
+build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) $(1)/dev/fd/5/$(dir)) --bind Build2/$* $(1)/dev/fd/5/Build2/$* --ro-bind '${ACORN_CPP}' $(1)/dev/fd/8 --symlink . $(1)/dev/fd/5/lock_source_1510718522
 
 Build2/src-stamp: $(shell find Unix/LinuxSupport/build.mk Unix/SocketKVMFrontends/SocketKVM_Protocol.h Unix/SocketKVMFrontends/Makefile,fe1 RiscOS mixed \! \( -name '.*' -prune \))
 	ln -sfn . lock_source_1510718522
@@ -102,17 +102,18 @@ endif
 	#
 ifeq ($(METHOD), rpcemu)
 	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build rpcemu $* $(PHASES)' | \
-	$(BWRAP) --unshare-pid --unshare-net $(sandbox_misc) \
+	$(BWRAP) --unshare-pid --unshare-net $(sandbox_build) \
 	--ro-bind /tmp/.X11-unix /tmp/.X11-unix \
 	--proc /proc \
 	--ro-bind Built/rpcemu /r \
 	--tmpfs /r/hostfs \
 	--dev-bind /dev/null /r/hd4.hdf \
 	--ro-bind Built/boot_iomd_rom /r/roms/ROM \
-	$(build_binds) \
-	--symlink /dev/fd /r/hostfs/dev/fd \
+	$(call build_binds,/r/hostfs) \
 	--file 0 '/r/hostfs/!Boot,fea' \
-	/r/rpcemu
+	--ro-bind-try /etc/machine-id /etc/machine-id \
+	--ro-bind-try /var/lib/dbus/machine-id /var/lib/dbus/machine-id \
+	--chdir /r /r/rpcemu
 else ifeq ($(INSECURE), YES)
 	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --abort-on-input 5<. 8<'${ACORN_CPP}' </dev/null |& cat
 else
