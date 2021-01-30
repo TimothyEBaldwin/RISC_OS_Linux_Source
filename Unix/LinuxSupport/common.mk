@@ -16,7 +16,7 @@
 #
 
 HARDDISC4=$(HOME)/Downloads/HardDisc4.5.28.util
-QEMU_SRC=$(HOME)/Downloads/qemu-5.0.0.tar.xz
+QEMU_SRC=$(HOME)/Downloads/qemu-5.2.0.tar.xz
 RPCEMU=$(HOME)/Downloads/rpcemu-0.8.15.tar.gz
 IOMD=$(HOME)/Downloads/IOMD-Soft.5.28.zip
 
@@ -126,22 +126,22 @@ Built/rpcemu/rpcemu: Built/rpcemu/src/Makefile | Built/gen_seccomp
 	export -f build
 	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASHF) build </dev/null |& cat
 
-Built/qemu_stamp-v5.0.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
+Built/qemu_stamp-v5.2.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
 	set -o pipefail
 	rm -rf Built/qemu*
 	mkdir -p Built/qemu_files
 	unpack() {
-	  echo "2f13a92a0fa5c8b69ff0796b59b86b080bbb92ebad5d301a7724dd06b5e78cb6 /qemu.tar.xz" | sha256sum -c
+	  echo "cb18d889b628fbe637672b0326789d9b0e3b8027e0445b936537c78549df17bc /qemu.tar.xz" | sha256sum -c
 	  tar -Jxf /qemu.tar.xz
-	  cd qemu-5.0.0
+	  cd qemu-5.2.0
 	  patch -p1 < /d
 	}
 	export -f unpack
 	$(call sandbox_base,-s) $(sandbox_misc) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Unix/LinuxSupport/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASHF) unpack </dev/null |& cat
-	mv Built/qemu_files/qemu-5.0.0 Built/qemu
-	touch Built/qemu_stamp-v5.0.0
+	mv Built/qemu_files/qemu-5.2.0 Built/qemu
+	touch Built/qemu_stamp-v5.2.0
 
-Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.0.0 | Built/gen_seccomp
+Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.2.0 | Built/gen_seccomp
 	set -o pipefail
 	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
@@ -149,9 +149,9 @@ Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.0.0 | Built/gen_seccomp
 Built/qemu-arm: Built/qemu_Makefile_stamp | Built/gen_seccomp
 	set -o pipefail
 	+$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
-	test ! -L Built/qemu/arm-linux-user
-	test ! -L Built/qemu/arm-linux-user/qemu-arm
-	ln -f Built/qemu/arm-linux-user/qemu-arm Built/qemu-arm
+	test ! -L Built/qemu/build
+	test ! -L Built/qemu/build/qemu-arm
+	ln -f Built/qemu/build/qemu-arm Built/qemu-arm
 	touch Built/qemu-arm
 
 Built/sandbox_config_sh: $(BWRAP) $(QEMU) $(lib_depends)
@@ -221,7 +221,7 @@ $(IOMD):
 	setfattr -n user.RISC_OS.LoadExec -v 0x0091faff00000000 $@ || true
 
 ${QEMU_SRC}:
-	sh Unix/LinuxSupport/download.sh '${QEMU_SRC}' "https://download.qemu.org/qemu-5.0.0.tar.xz" "2f13a92a0fa5c8b69ff0796b59b86b080bbb92ebad5d301a7724dd06b5e78cb6"
+	sh Unix/LinuxSupport/download.sh '${QEMU_SRC}' "https://download.qemu.org/qemu-5.2.0.tar.xz" "cb18d889b628fbe637672b0326789d9b0e3b8027e0445b936537c78549df17bc"
 	setfattr -n user.RISC_OS.LoadExec -v 0x00fdffff00000000 $@ || true
 
 $(RPCEMU):
