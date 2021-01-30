@@ -20,7 +20,7 @@ LinuxSyscalls h/syscall_defs: gen_headers
 	mkdir -p h
 	./gen_headers
 
-syscall_list.h: $(wildcard /usr/include/asm/unistd.h /usr/include/asm/unistd-eabi.h /usr/include/asm/unistd-common.h /usr/include/arm-linux-gnu*/asm/unistd.h /usr/include/arm-linux-gnu*/asm/unistd-eabi.h /usr/include/arm-linux-gnu*/asm/unistd-common.h) MkHeaders
+syscall_list.h: $(wildcard /usr/include/asm/unistd.h /usr/include/asm/unistd-eabi.h /usr/include/asm/unistd-common.h /usr/include/arm-linux-gnu*/asm/unistd.h /usr/include/arm-linux-gnu*/asm/unistd-eabi.h /usr/include/arm-linux-gnu*/asm/unistd-common.h) Headers.mk
 	sort -u $^ | sed -n -e 's/^\#define \(_\(_ARM\)\?_NR_[_a-z0-9]*\)[ \t].*$$/#ifdef \1\nSYSDEF(\1)\n#endif/p' > syscall_list.h
 
 gen_headers: gen_headers.c syscall_list.h
