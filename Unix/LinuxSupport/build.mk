@@ -15,7 +15,7 @@
 #
 
 
-LINUX_ROM=Unix/RISC_OS/RISC_OS
+LINUX_ROM=Unix/RISC_OS/Unix/RISCOS.IMG
 ACORN_CPP=../DDE/AcornC.C++
 
 TARGET=Linux
@@ -26,9 +26,10 @@ PHASES=export_hdrs export_libs resources rom install_rom join
 
 all check: Build2/$(TARGET)/RiscOS/Images/rom_check
 build: Build2/$(TARGET)/RiscOS/Images/rom
+script-all: Built/RISCOS.IMG
 
 ifeq ($(TARGET), Linux)
-all check: RISC_OS
+all check: Built/RISCOS.IMG
 endif
 
 build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) $(1)/dev/fd/5/$(dir)) --bind Build2/$* $(1)/dev/fd/5/Build2/$* --ro-bind '${ACORN_CPP}' $(1)/dev/fd/8 --symlink . $(1)/dev/fd/5/lock_source_1510718522
@@ -140,15 +141,14 @@ Build2/Linux/RiscOS/Images/rom_check: Build2/Linux/RiscOS/Images/rom Built/sandb
 	touch Build2/Linux/RiscOS/Images/rom_check
 endif
 
-RISC_OS: Build2/Linux/RiscOS/Images/rom_check
-	cp --remove-destination --preserve=mode,xattr --reflink=auto Build2/Linux/RiscOS/Images/rom Built/RISC_OS
-	ln -sf Built/RISC_OS RISC_OS
+Built/RISCOS.IMG: Build2/Linux/RiscOS/Images/rom_check
+	cp --remove-destination --preserve=mode,xattr --reflink=auto Build2/Linux/RiscOS/Images/rom Built/RISCOS.IMG
 
 fast: PHASES=install_rom join
 fast: check
 check: build
 
-Unix/RISC_OS/RISC_OS:
+Unix/RISC_OS/Unix/RISCOS.IMG:
 	git submodule init
 	git submodule update
 
@@ -179,7 +179,8 @@ endif
 	rm -rf Unix/RISC_OS/*
 	mkdir -p Unix/RISC_OS/Unix/LinuxSupport
 	cp -v --reflink=auto --preserve=mode,xattr Unix/LinuxSupport/!(arm_test.s|arm_test.sh|Makefile|bin|build.mk|Build,feb|BufferWriteC) Unix/RISC_OS/Unix/LinuxSupport/
-	cp -v --reflink=auto --preserve=mode,xattr RISC_OS README.md Unix/RISC_OS/
+	cp -v --reflink=auto --preserve=mode,xattr README.md Unix/RISC_OS/
+	cp -v --reflink=auto --preserve=mode,xattr Built/RISCOS.IMG Unix/RISC_OS/Unix/
 	#
 	cp -vrL Unix/SocketKVMFrontends Unix/RISC_OS/Unix/SocketKVMFrontends
 	ln -sf 'Unix/LinuxSupport/Start_RISC_OS.desktop' 'Unix/RISC_OS/Start_RISC_OS.desktop'

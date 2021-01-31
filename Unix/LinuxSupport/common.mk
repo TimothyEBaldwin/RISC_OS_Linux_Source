@@ -20,7 +20,7 @@ QEMU_SRC=$(HOME)/Downloads/qemu-5.2.0.tar.xz
 RPCEMU=$(HOME)/Downloads/rpcemu-0.9.3.tar.gz
 IOMD=$(HOME)/Downloads/IOMD-Soft.5.28.zip
 
-LINUX_ROM=./RISC_OS
+LINUX_ROM=Unix/RISCOS.IMG
 VERBOSE=
 
 # From: https://www.gnu.org/software/make/manual/html_node/Call-Function.html#Call-Function
@@ -59,11 +59,10 @@ include $(wildcard Unix/SocketKVMFrontends/build.mk)
 
 SHELL=$(warning Building $@)$(BASH)
 
-script-all: RISC_OS HardDisc4 Built/wrapper Built/sandbox_config_sh Built/wait_stdin
-
-RISC_OS:
+script-all: HardDisc4 Built/wrapper Built/sandbox_config_sh Built/wait_stdin
 
 Built:
+	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 Unix/RISCOS.IMG
 	mkdir Built
 
 comma2attr: Built/comma2attr
@@ -196,7 +195,6 @@ endif
 	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
 	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
 	mkdir 'HardDisc4_files/HardDisc4/!Boot/Loader'
-	ln HardDisc4_files/CMOS 'HardDisc4_files/HardDisc4/!Boot/CMOS'
 	mv HardDisc4_files/CMOS 'HardDisc4_files/HardDisc4/!Boot/Loader/CMOS'
 	mv HardDisc4_files/HardDisc4 .
 	echo Finished extracting HardDisc4
