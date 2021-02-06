@@ -52,7 +52,7 @@ LAYOUTS   = UK.s Italy.s Spain.s France.s Germany.s Esperanto.s Greece.s \
             Swed-Finl.s Denmark.s Norway.s Iceland.s Turkey.s Russia.s \
             Israel.s LatinAm.s Belgium.s Netherlands.s Japan.s \
             Switzerland.s Wales.s USA.s Korea.s Korea2.s Taiwan.s \
-            DvorakUK.s DvorakUSA.s Pandora.s
+            DvorakUK.s DvorakUSA.s ColemakUK.s Pandora.s
 
 ${ROM_OBJECT}: ${LAYOUTS}
 ${LAYOUTS}: keygen
