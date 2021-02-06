@@ -181,7 +181,7 @@ int main(int argc, char **argv) {
   do {
     int sockets[2];
     if (socket_server)
-      socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets);
+      socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sockets);
 
     // Block signals
     sigset_t sigset;
@@ -200,9 +200,9 @@ int main(int argc, char **argv) {
       if (getppid() != self) _exit(110);
 
       if (socket_server) {
-        int socket = fcntl(sockets[1], F_DUPFD, 32);
+        close(sockets[0]);
         char s[48];
-        sprintf(s, "RISC_OS_Internet_SocketServer=%i", socket);
+        sprintf(s, "RISC_OS_Internet_SocketServer=%i", sockets[1]);
         putenv(s);
       }
 
