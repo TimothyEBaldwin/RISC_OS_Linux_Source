@@ -37,14 +37,10 @@ static void ban(int syscall, const char* message) {
 int main(int argc, char **argv) {
 
   int opt, rc;
-  bool allow_unix_socket = false;
   bool allow_symlinks = false;
   bool allow_ptrace = false;
 
   while ((opt = getopt(argc, argv, "+usp")) != -1) switch (opt) {
-    case 'u':
-      allow_unix_socket = true;
-      break;
     case 's':
       allow_symlinks = true;
       break;
@@ -68,11 +64,6 @@ int main(int argc, char **argv) {
   if (!allow_symlinks) {
     BAN(symlink);
     BAN(symlinkat);
-  }
-
-  if (!allow_unix_socket) {
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1, SCMP_A0(SCMP_CMP_EQ, AF_UNIX));
-    if (rc) error(1, -rc, "Unable to create UNIX socket rule");
   }
 
   if (!allow_ptrace) {
