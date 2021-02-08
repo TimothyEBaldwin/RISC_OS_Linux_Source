@@ -28,9 +28,8 @@ pathsearch = $(firstword $(wildcard $(addsuffix /$(1),$(subst :, ,$(PATH)))))
 
 QEMU1:=$(call pathsearch,qemu-arm)
 BASH:=$(call pathsearch,bash)
-BWRAP:=$(call pathsearch,bwrap)
-export BWRAP
-export QEMU1
+BWRAP=bwrap
+export BWARP
 
 SHELL=$(BASH)
 JOBS:=$(shell getconf _NPROCESSORS_ONLN)
@@ -49,9 +48,7 @@ BASHF:=$(BASH) $(.SHELLFLAGS)
 all: comma2attr
 
 robind = $(foreach dir,$(wildcard $(1)),--ro-bind $(dir) $(dir))
-sandbox_misc := $(call robind,/bin /lib* /usr/bin /usr/lib* /etc/alternatives)
-sandbox_build := $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
-sandbox_base = $(BWRAP) --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp --dir /dev/shm
+sandbox = $(BWRAP) --die-with-parent --cap-drop ALL --unsetenv TMPDIR --unshare-all --seccomp 9 9< <(Built/gen_seccomp $(1)) --proc /proc --dir /tmp $(call robind,/bin /lib* /usr /etc/alternatives) --dev /dev --tmpfs /usr/local
 lib_depends := $(wildcard /etc/alternatives /etc/ld.so.* Unix/LinuxSupport/*.mk)
 
 include $(wildcard Unix/LinuxSupport/build.mk)
@@ -59,7 +56,7 @@ include $(wildcard Unix/SocketKVMFrontends/build.mk)
 
 SHELL=$(warning Building $@)$(BASH)
 
-script-all: HardDisc4 Built/wrapper Built/sandbox_config_sh Built/wait_stdin
+script-all: HardDisc4 Built/wrapper Built/wait_stdin Built/qemu-link
 
 Built:
 	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 Unix/RISCOS.IMG
@@ -95,7 +92,7 @@ Built/rpcemu/stamp3: $(RPCEMU) Unix/LinuxSupport/rpcemu.diff | Built/gen_seccomp
 	  touch stamp3
 	}
 	export -f unpack
-	$(sandbox_base) $(sandbox_misc) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Unix/LinuxSupport/rpcemu.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
+	$(sandbox) --file 8 8<'$(RPCEMU)' /rpcemu.tar.gz --ro-bind Unix/LinuxSupport/rpcemu.diff /d --bind Built/rpcemu_files /r --chdir /r $(BASHF) unpack </dev/null |& cat
 	mv Built/rpcemu_files/rpcemu-0.9.3 Built/rpcemu
 
 Built/rpcemu/rpcemu: Built/rpcemu/stamp3 | Built/gen_seccomp
@@ -118,7 +115,7 @@ Built/rpcemu/rpcemu: Built/rpcemu/stamp3 | Built/gen_seccomp
 	  touch rpcemu
 	}
 	export -f build
-	$(sandbox_base) $(sandbox_build) --bind Built/rpcemu /r --chdir /r $(BASHF) build </dev/null |& cat
+	$(sandbox) --bind Built/rpcemu /r --chdir /r $(BASHF) build </dev/null |& cat
 
 Built/qemu_stamp-v5.2.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen_seccomp
 	set -o pipefail
@@ -131,47 +128,28 @@ Built/qemu_stamp-v5.2.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen
 	  patch -p1 < /d
 	}
 	export -f unpack
-	$(call sandbox_base,-s) $(sandbox_misc) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Unix/LinuxSupport/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASHF) unpack </dev/null |& cat
+	$(call sandbox,-s) --file 8 8<'${QEMU_SRC}' /qemu.tar.xz --ro-bind Unix/LinuxSupport/qemu_swi.diff /d --bind Built/qemu_files /q --chdir /q $(BASHF) unpack </dev/null |& cat
 	mv Built/qemu_files/qemu-5.2.0 Built/qemu
 	touch Built/qemu_stamp-v5.2.0
 
 Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.2.0 | Built/gen_seccomp
 	set -o pipefail
-	$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
+	$(call sandbox,-s) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
 
 Built/qemu-arm: Built/qemu_Makefile_stamp | Built/gen_seccomp
 	set -o pipefail
-	+$(call sandbox_base,-s) $(sandbox_build) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
+	+$(call sandbox,-s) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
 	test ! -L Built/qemu/build
 	test ! -L Built/qemu/build/qemu-arm
 	ln -f Built/qemu/build/qemu-arm Built/qemu-arm
 	touch Built/qemu-arm
 
-Built/sandbox_config_sh: $(BWRAP) $(QEMU) $(lib_depends)
-	set -o pipefail
-	exec > Built/sandbox_config_sh
-	echo BWRAP='$(BWRAP)'
-ifeq ($(QEMU),/usr/bin/env)
-	echo QEMU=
-	echo 'qemu_libs=()'
-else
-	echo QEMU=/qemu-arm
-	echo -n 'qemu_libs=( '
-	env -i $(sandbox_base) $(sandbox_misc) --ro-bind $(QEMU) /exe ldd /exe < /dev/null \
-	| sed -nr 's:^(.*[ \t])?((/usr)?/lib[-A-Za-z_0-9]*(/[-A-Za-z_0-9][-A-Za-z._0-9\+]*)+)([ \t].*)?$$:--ro-bind \2 \2:p'  \
-	| sort -u | tr '\n' ' '
-	echo '--ro-bind $(QEMU) /qemu-arm )'
-endif
-	echo -n 'auto_bwrap_args=( '
-	for i in --die-with-parent "--cap-drop ALL"; do
-	  if $(BWRAP) --unshare-all $$i --dev-bind / / true; then
-	    echo -n "$$i "
-	  fi
-	done
-	echo \)
+Built/qemu-link: $(QEMU) | Built
+	QEMU="$(QEMU)"
+	ln -sfn "$${QEMU##Built/}" Built/qemu-link
 
-HardDisc4: | $(HARDDISC4) Built/gen_seccomp Built/sandbox_config_sh $(LINUX_ROM)
+HardDisc4: | $(HARDDISC4) Built/gen_seccomp Built/qemu-link $(LINUX_ROM)
 	set -o pipefail
 	! rm -rf HardDisc4_files
 	mkdir HardDisc4_files
@@ -183,14 +161,12 @@ ifeq ($(INSECURE), YES)
 	BASIC -quit IXFS:$$.proc.self.cwd.Unix.LinuxSupport.Finish' '$(LINUX_ROM)' \
 	 --abort-on-input --nvram /HardDisc4_files/CMOS
 else
-	. Built/sandbox_config_sh
 	env -i RISC_OS_Alias_IXFSBoot='Echo Extracting HardDisc4
 	/IXFS:$$.HardDisc4_files.hd4
-	BASIC -quit IXFS:$$.Finish' $(sandbox_base) \
+	BASIC -quit IXFS:$$.Finish' $(sandbox) \
 	 --ro-bind Unix/LinuxSupport/Finish /Finish --bind HardDisc4_files /HardDisc4_files \
-	 --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" "$${qemu_libs[@]}" \
-	 --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random \
-	 $$QEMU /RISC_OS  --abort-on-input --nvram /HardDisc4_files/CMOS </dev/null |& cat
+	 --ro-bind '$(LINUX_ROM)' /RISC_OS --ro-bind Built /Built \
+	 /Built/qemu-link /RISC_OS  --abort-on-input --nvram /HardDisc4_files/CMOS </dev/null |& cat
 endif
 	cp -a --reflink=auto 'HardDisc4_files/HardDisc4/!Boot/RO520Hook/Boot' 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot'
 	printf 'X AddTinyDir IXFS:$$\nX AddTinyDir <IXFS$$HardDisc4>\n' > 'HardDisc4_files/HardDisc4/!Boot/Choices/Boot/Tasks/Pinboard,feb'
@@ -201,7 +177,7 @@ endif
 
 Built/boot_iomd_rom: $(IOMD) | Built/gen_seccomp
 	echo 'd1e955ff8e6dce905c455b9135391f3f1879673965fb4949c5f10716b4fe3e3e *$(IOMD)' | sha256sum -c
-	$(sandbox_base) $(sandbox_misc) --ro-bind '$(IOMD)' /iomd.zip unzip -p iomd.zip "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
+	$(sandbox) --ro-bind '$(IOMD)' /iomd.zip unzip -p iomd.zip "soft/!Boot/Choices/Boot/PreDesk/!!SoftLoad/riscos" > $@
 	echo '051bd488965d43dc8d74757ee29fe72927e0f018dfe45e9c88e511496f0ec316 *$@' | sha256sum -c
 	setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 $@ || true
 

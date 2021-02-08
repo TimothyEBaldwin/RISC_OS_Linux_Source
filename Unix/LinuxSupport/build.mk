@@ -32,7 +32,7 @@ ifeq ($(TARGET), Linux)
 all check: Built/RISCOS.IMG
 endif
 
-build_binds = $(foreach dir,Unix RiscOS mixed,--ro-bind $(dir) $(1)/dev/fd/5/$(dir)) --bind Build2/$* $(1)/dev/fd/5/Build2/$* --ro-bind '${ACORN_CPP}' $(1)/dev/fd/8 --symlink . $(1)/dev/fd/5/lock_source_1510718522
+build_binds = $(foreach dir,Built Unix RiscOS mixed,--ro-bind $(dir) /fd/5/$(dir)) --bind Build2/$* /fd/5/Build2/$* --ro-bind '${ACORN_CPP}' /fd/8 --symlink . /fd/5/lock_source_1510718522
 
 Build2/src-stamp: $(shell find Unix/LinuxSupport/build.mk Unix/SocketKVMFrontends/SocketKVM_Protocol.h Unix/SocketKVMFrontends/Makefile,fe1 RiscOS mixed \! \( -name '.*' -prune \))
 	ln -sfn . lock_source_1510718522
@@ -44,7 +44,7 @@ Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/rpcemu/rpcemu Built/boot_io
 else ifeq ($(INSECURE), YES)
 Build2/%/RiscOS/Images/rom: Build2/src-stamp | ${LINUX_ROM}
 else
-Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/gen_seccomp Built/sandbox_config_sh ${LINUX_ROM}
+Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/gen_seccomp $(QEMU) ${LINUX_ROM}
 endif
 	set -o pipefail
 	uname -a
@@ -98,19 +98,19 @@ ifeq ($(INSECURE), YES)
 	( setup_build )
 else
 	export -f setup_build
-	$(call sandbox_base, -s) $(sandbox_misc) $(build_binds) --dev-bind /dev/null /dev/null --chdir /dev/fd/5 $(BASHF) setup_build
+	$(call sandbox, -s) $(build_binds) --chdir /fd/5 $(BASHF) setup_build
 endif
 	#
 ifeq ($(METHOD), rpcemu)
 	echo -e '*Set IXFS$$Path HostFS:\n*Obey -v IXFS:$$.dev.fd.5.Unix.LinuxSupport.Build rpcemu $* $(PHASES)' | \
-	$(BWRAP) --unshare-pid --unshare-net $(sandbox_build) \
+	$(sandbox) \
 	--ro-bind /tmp/.X11-unix /tmp/.X11-unix \
-	--proc /proc \
 	--ro-bind Built/rpcemu /r \
 	--tmpfs /r/hostfs \
 	--dev-bind /dev/null /r/hd4.hdf \
 	--ro-bind Built/boot_iomd_rom /r/roms/ROM \
-	$(call build_binds,/r/hostfs) \
+	$(build_binds) \
+	--symlink /fd /r/hostfs/dev/fd \
 	--file 0 '/r/hostfs/!Boot,fea' \
 	--ro-bind-try /etc/machine-id /etc/machine-id \
 	--ro-bind-try /var/lib/dbus/machine-id /var/lib/dbus/machine-id \
@@ -118,8 +118,7 @@ ifeq ($(METHOD), rpcemu)
 else ifeq ($(INSECURE), YES)
 	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --abort-on-input 5<. 8<'${ACORN_CPP}' </dev/null |& cat
 else
-	. Built/sandbox_config_sh
-	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox_base) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS "$${auto_bwrap_args[@]}" "$${qemu_libs[@]}" --dev-bind /dev/zero /dev/urandom --dev-bind /dev/zero /dev/random $$QEMU /RISC_OS  --abort-on-input </dev/null |& cat
+	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS --chdir /fd/5 sh -c 'exec "$$0" "$$@" 5</fd/5 8</fd/8;' '$(QEMU)' /RISC_OS --abort-on-input </dev/null |& cat
 endif
 	find Build2/$*/RiscOS/Images -type l -delete
 	! mv 'Build2/$*/RiscOS/Images/rom',??? 'Build2/$*/RiscOS/Images/rom'
@@ -135,7 +134,7 @@ Build2/Linux/RiscOS/Images/rom_check: Build2/Linux/RiscOS/Images/rom
 	chmod +x Build2/Linux/RiscOS/Images/rom
 	touch Build2/Linux/RiscOS/Images/rom_check
 else
-Build2/Linux/RiscOS/Images/rom_check: Build2/Linux/RiscOS/Images/rom Built/sandbox_config_sh
+Build2/Linux/RiscOS/Images/rom_check: Build2/Linux/RiscOS/Images/rom Built/qemu-link
 	chmod +x Build2/Linux/RiscOS/Images/rom
 	Unix/LinuxSupport/test_runner_linux.sh Build2/Linux/RiscOS/Images/rom
 	touch Build2/Linux/RiscOS/Images/rom_check

@@ -13,13 +13,18 @@ export risc_os="$1"
 # cat is needed here as stdout is reopened, which would reset the pointer of regular files.
 exec </dev/null 3>/dev/null > >(cat) 2>&1
 
-. Built/sandbox_config_sh
+binds=()
+for i in /usr /bin /lib*; do
+  binds+=(--ro-bind "$i" "$i")
+done
+
 
 run() {
   timeout --foreground -sKILL 60 \
-  "${BWRAP}" --unshare-all --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp $1) \
-  --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests "${auto_bwrap_args[@]}" "${qemu_libs[@]}" $QEMU \
-  /RISC_OS "${@:2}"
+  bwrap --unshare-all --proc /proc --dev /dev --dir /tmp --seccomp 9 9< <(Built/gen_seccomp $1) \
+  --ro-bind "$risc_os" /RISC_OS --ro-bind mixed/Linux/Tests /Tests --die-with-parent --cap-drop ALL \
+  --ro-bind Built /Built  "${binds[@]}" \
+  /Built/qemu-link /RISC_OS "${@:2}"
 }
 
 set -x
