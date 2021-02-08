@@ -16,9 +16,9 @@
 
 #define _GNU_SOURCE
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
-#include <stdarg.h>
 
 #include <attr/xattr.h>
 #include <errno.h>
@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/auxv.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -78,7 +79,7 @@ static void define_decimal(const char *name, int value) {
   basic_line("%s%%=%i", name, value);
 }
 
-#define DEF(x) define_hex("ix_" #x, x);
+#define DEF(x) define_hex("ix_" #x, (unsigned)x);
 #define SYSDEF(x) define_decimal(#x, x);
 #define EDEF(x) define_decimal("ix_" #x, x);
 #define SWI(name, n) \
@@ -243,8 +244,16 @@ int main(void) {
   DEF(CLOCK_MONOTONIC)
   DEF(CLOCK_MONOTONIC_RAW)
   DEF(CLOCK_REALTIME)
+  DEF(CLONE_FILES)
+  DEF(CLONE_FS)
+  DEF(CLONE_SIGHAND)
+  DEF(CLONE_SYSVSEM)
+  DEF(CLONE_THREAD)
   DEF(CLONE_VM)
   DEF(ECHO)
+  DEF(EFD_CLOEXEC)
+  DEF(EFD_NONBLOCK)
+  DEF(EFD_SEMAPHORE)
   DEF(FIONBIO)
   DEF(FIONREAD)
   DEF(F_GETFL)
@@ -395,6 +404,8 @@ int main(void) {
   DEF(SIGXCPU)
   DEF(SIGXFSZ)
   DEF(SIG_BLOCK)
+  DEF(SIG_DFL)
+  DEF(SIG_IGN)
   DEF(SIG_SETMASK)
   DEF(SIG_UNBLOCK)
   DEF(SOCK_CLOEXEC)
@@ -441,13 +452,21 @@ int main(void) {
   DEF(TCP_NODELAY)
   DEF(TCSETS)
   DEF(TIMER_ABSTIME)
+  DEF(TIOCGPTN)
+  DEF(TIOCSPTLCK)
   DEF(UTIME_NOW)
   DEF(UTIME_OMIT)
   DEF(VMIN)
   DEF(VTIME)
+  DEF(WCONTINUED)
+  DEF(WEXITED)
   DEF(WNOHANG)
+  DEF(WSTOPPED)
+  DEF(WUNTRACED)
   DEF(XATTR_CREATE)
   DEF(__WALL)
+  DEF(__WCLONE)
+  DEF(__WNOTHREAD)
 
   define_hex("ix_struct_ucontext_mcontext", offsetof(struct ucontext_t, uc_mcontext));
   define_hex("ix_struct_ucontext_registers", offsetof(struct ucontext_t, uc_mcontext.arm_r0));
