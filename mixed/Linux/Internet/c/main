@@ -28,6 +28,7 @@
 
 #define iovec ix_iovec
 #include "sys/types.h"
+#include "sys/time.h"
 #include "sys/filio.h"
 #include "sys/socket.h"
 #include "netinet/in.h"
@@ -50,7 +51,7 @@ typedef union {
 } pollword_t;
 
 static struct socket {
-  pollword_t pollword[2];
+  pollword_t pollword[4];
   bool async;
   bool nonblocking;
   bool sleeptw;
@@ -79,7 +80,6 @@ typedef unsigned (__kuser_cmpxchg_t)(unsigned oldval, unsigned newval, volatile 
 void __PVirt_WFI(void);
 
 static void pollword_sleep(bool tw, const pollword_t *pollword) {
-  if (pollword->word) return;
   if (tw) {
     int r;
     _swix(OS_UpCall, _INR(0, 1) | _OUT(0), UpCall_Sleep, pollword, &r);
@@ -170,7 +170,9 @@ static ssize_t do_msg(int fd, struct ix_msghdr *m, int flags, int syscall) {
         MOV     result, R0
     }
     if (result != -ix_EAGAIN) {
-      pollword->s.data = 1;
+      char c;
+      if (syscall == __NR_sendmsg || ix_recv(fd, &c, 1, ix_MSG_DONTWAIT | ix_MSG_PEEK) > 0)
+        pollword->s.data = 1;
       return result;
     }
     if (sockets[fd].nonblocking || (flags & ix_MSG_DONTWAIT)) return result;
@@ -245,6 +247,62 @@ static int do_accept(int fd, void *addr, ix_socklen_t *addrlen, void *pw) {
     _swix(OS_Hardware, _IN(0) | _INR(8, 9), result, 0, EntryNo_HAL_IRQEnable);
   }
   return result;
+}
+
+static pollword_t select_pollwords[256];
+
+static int do_select(int *restrict r) {
+
+  // Allocate pollword from array;
+  static bool used[256];
+  int pwi = 255;
+  while (used[pwi] && pwi) --pwi;
+  used[pwi] = true;
+  if (pwi) select_pollwords[pwi].word = 0;
+
+  // Handle timeout
+  extern void select_timeout(void);
+  struct timeval *timeout1 = (void*)r[4];
+  long timeout = -1;
+  if (timeout1) {
+    timeout = timeout1->tv_sec * 100 + timeout1->tv_usec / 10000;
+    if (timeout) _swix(OS_CallAfter, _INR(0, 2), timeout, select_timeout, &select_pollwords[pwi].s.timeout);
+  }
+
+  if (timeout) while(true) {
+    if (pwi) select_pollwords[pwi].s.data = 0;
+
+    // Check if ready.
+    bool sleeptw = false;
+    char ready = 0;
+    for(int fd = 0; fd < r[0]; ++fd) {
+      for(int dir = 1; dir != 4; ++dir) {
+        if (r[dir] && FD_ISSET(fd, (fd_set *)r[dir])) {
+          ready |= sockets[fd].pollword[(dir - 1) ^ 1].s.data;
+          sleeptw |= sockets[fd].sleeptw;
+        }
+      }
+    }
+
+    if (ready) break;
+    pollword_sleep(sleeptw, &select_pollwords[pwi]);
+  }
+  if (timeout > 0) _swix(OS_RemoveTickerEvent, _INR(0, 1) , select_timeout, &select_pollwords[pwi].s.timeout);
+  used[pwi] = false;
+
+  int nfds = 0;
+  for(int fd = 0; fd < r[0]; ++fd) {
+    for(int dir = 1; dir != 4; ++dir) {
+      if (r[dir] && FD_ISSET(fd, (fd_set *)r[dir])) {
+        if (sockets[fd].pollword[(dir - 1) ^ 1].s.data) {
+          ++nfds;
+        } else {
+          FD_CLR(fd, (fd_set *)r[dir]);
+        }
+      }
+    }
+  }
+  return nfds;
 }
 
 
@@ -398,8 +456,7 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
       GET_ADDRESS_1(r->r[1], r->r[2], ix_getsockname(r->r[0], addr, len))
       break;
     case Socket_Select - Socket_00: {
-      struct ix_timeval timeout = *(const struct ix_timeval*)r->r[4];
-      result = ix_select(r->r[0], (void*)r->r[1], (void*)r->r[2], (void*)r->r[3], &timeout);
+      result = do_select(r->r);
       break;
     }
     case Socket_Shutdown - Socket_00:
@@ -483,6 +540,9 @@ int sigio_handler(_kernel_swi_regs *regs, void *pw) {
     eprintf("Sending Internet Event for socket %i\n", s);
     _swix(OS_AddCallBack, _INR(0, 1), raise_event, s);
   }
+
+  for(int i = 0; i != sizeof(select_pollwords) / sizeof(select_pollwords[0]); ++i)
+    select_pollwords[i].s.data = 1;
 
   _swi(OS_Hardware, _IN(0) | _INR(8, 9), s, 0, EntryNo_HAL_IRQClear);
   return 0;
