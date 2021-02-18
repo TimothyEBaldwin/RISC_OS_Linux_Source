@@ -119,6 +119,121 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
   return error_BAD_SWI;
 }
 
+static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
+
+  // TODO list:
+  // A proper blocking wait.
+  // Handle errors.
+  // Handle TaskWindow termination sensibly.
+  // Provide translation from RISC OS to Linux paths.
+  // Do something sensible with environment variables.
+  // Better handling of terminal / VDU codes.
+  // Better handling of Escape / SIGTERM?
+  // Deal with file descriptor leaks.
+  // Provide access to RISC OS filing systems.
+
+  char *cmd[argc + 1];
+  char *env[] = {0};
+  int pipe[2];
+
+  // Open a pipe communicate with child process
+  ix_pipe2(pipe, ix_O_CLOEXEC);
+
+  // Open pseudo-terminal master
+  int ptmx = ix_open("/dev/ptmx", ix_O_RDWR | ix_O_CLOEXEC | ix_O_NONBLOCK, 0);
+
+  // Do the fork, possibly on another thread to avoid seccomp
+  int pid = __PVirt_fork(pipe);
+
+  // Close the pipe -
+  ix_close(pipe[0]);
+  ix_close(pipe[1]);
+
+  if (pid == 0) {
+    // In child, create new session
+    ix_setsid();
+
+    // Parse command line, overwriting copy of input.
+    char *out = (char *)arg_string;
+    char **arg = cmd;
+    char c = *arg_string;
+    while(c >= ' ') {
+      while(c == ' ') c = *++arg_string; // Skip spaces
+      *arg++ = out;
+      while(c > ' ') {
+        if (c== '"' || c == '\'') {
+          char q = *++arg_string;
+          while(q != c && q  >= ' ') {
+            *out++ = q;
+            q = *++arg_string;
+          }
+          c = *++arg_string;
+        } else {
+          *out++ = c;
+          c = *++arg_string;
+        }
+      }
+      *out++ = 0;
+    }
+    *arg = 0;
+
+    // Unlock pseudo-terminal
+    int zero = 0;
+    ix_ioctl(ptmx, ix_TIOCSPTLCK, &zero);
+
+    // Get pseudo-terminal number
+    int pts_no;
+    ix_ioctl(ptmx, ix_TIOCGPTN, &pts_no);
+
+    // Open slave end
+    char ptsname[20];
+    sprintf(ptsname, "/dev/pts/%i", pts_no);
+    int pts = ix_open(ptsname, ix_O_RDWR | ix_O_CLOEXEC, 0);
+
+    // Duplicate file descriptor to stdin, stdout, and stderr
+    ix_dup2(pts, 0);
+    ix_dup2(pts, 1);
+    ix_dup2(pts, 2);
+
+    // Execute command
+    int e = ix_execve(cmd[0], cmd, 0);
+    ix_exit(-e);
+
+  } else if (pid != 0) {
+    char buff[256];
+    int c;
+    unsigned in = 0xFF00;
+    while (true) {
+
+      // Copy everything from pseudo-terminal master to RISC OS output stream.
+      while(true) {
+        c = ix_read(ptmx, &buff, sizeof(buff));
+        if (c <= 0) break;
+        _swix(OS_WriteN, _INR(0, 1), buff, c);
+      }
+
+      // Exit if error or slave end closed
+      if (c != -ix_EAGAIN) break;
+
+      // Copy character RISC OS output stream from to pseudo-terminal
+      // using "in" as a 1 byte buffer.
+      if (in > 0x2000) in = _kernel_osbyte(OsByte_INKEY, 1, 0) & 0xFFFF;
+      if ((in & 0xFF00) == 0x1B00) {
+        in = 3; // Escape becomes CTRL C
+        _kernel_osbyte(OsByte_AcknowledgeEscape, 0, 0);
+        }
+      if (in < 0x100) {
+        c = ix_write(ptmx, &in, 1);
+        if (c == 1) in = 0xFF00;
+      }
+    }
+    int wstatus;
+    ix_waitpid(pid, &wstatus, 0);
+  }
+  ix_close(ptmx);
+  return 0;
+}
+
 _kernel_oserror *command_handler(const char *arg_string, int argc, int cmd_no, void *pw) {
   (void)arg_string;
   (void)argc;
@@ -134,81 +249,8 @@ _kernel_oserror *command_handler(const char *arg_string, int argc, int cmd_no, v
       ix_dup2(a, b);
       break;
     }
-    case CMD_IXRun: {
-      char *cmd[argc + 1];
-
-      char *env[] = {0};
-      int pipes[2];
-      ix_pipe2(pipes, ix_O_CLOEXEC);
-      int ptmx = ix_open("/dev/ptmx", ix_O_RDWR | ix_O_CLOEXEC | ix_O_NONBLOCK, 0);
-      int pid = __PVirt_fork(pipes);
-      ix_close(pipes[0]);
-      ix_close(pipes[1]);
-      if (pid == 0) {
-        ix_setsid();
-
-        char *out = (char *)arg_string;
-        char **arg = cmd;
-        char c = *arg_string;
-        while(c >= ' ') {
-          while(c == ' ') c = *++arg_string; // Skip spaces
-          *arg++ = out;
-          while(c > ' ') {
-            if (c== '"' || c == '\'') {
-              char q = *++arg_string;
-              while(q != c && q  >= ' ') {
-                *out++ = q;
-                q = *++arg_string;
-              }
-              c = *++arg_string;
-            } else {
-              *out++ = c;
-              c = *++arg_string;
-            }
-          }
-          *out++ = 0;
-        }
-        *arg = 0;
-
-        int zero = 0;
-        ix_ioctl(ptmx, ix_TIOCSPTLCK, &zero);
-        int pts_no;
-        ix_ioctl(ptmx, ix_TIOCGPTN, &pts_no);
-        char ptsname[20];
-        sprintf(ptsname, "/dev/pts/%i", pts_no);
-        int pts = ix_open(ptsname, ix_O_RDWR | ix_O_CLOEXEC, 0);
-        ix_dup2(pts, 0);
-        ix_dup2(pts, 1);
-        ix_dup2(pts, 2);
-
-        int e = ix_execve(cmd[0], cmd, 0);
-        ix_exit(-e);
-      } else if (pid != 0) {
-        char buff[256];
-        int c;
-        unsigned in = 0xFF00;
-        while (true) {
-          while(true) {
-            c = ix_read(ptmx, &buff, sizeof(buff));
-            if (c <= 0) break;
-            _swix(OS_WriteN, _INR(0, 1), buff, c);
-          }
-          if (c != -ix_EAGAIN) break;
-          if (in > 0x2000) in = _kernel_osbyte(OsByte_INKEY, 1, 0) & 0xFFFF;
-          if ((in & 0xFF00) == 0x1B00) {
-            in = 3; // Escape becomes CTRL C
-            _kernel_osbyte(OsByte_AcknowledgeEscape, 0, 0);
-            }
-          if (in < 0x100) {
-            c = ix_write(ptmx, &in, 1);
-            if (c == 1) in = 0xFF00;
-          }
-        }
-        int wstatus;
-        ix_waitpid(pid, &wstatus, 0);
-      }
-      ix_close(ptmx);
-    }
+    case CMD_IXRun:
+      return do_IXRun(arg_string, argc);
   }
   return 0;
 }
