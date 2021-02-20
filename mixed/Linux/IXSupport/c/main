@@ -33,11 +33,15 @@ extern const char __module_header(void);
 extern void stdin_handler(void);
 extern char **__HAL_get_env(void);
 
+extern void set_pollword(void);
+extern void __PVirt_WFI(void);
+
+static uintptr_t HAL_IRQClear;
 
 _kernel_oserror *init(const char *cmd_tail, int podule_base, void *pw) {
 
   // Install interrupt handler for standard input.
-  uintptr_t HAL_IRQClear;
+
   HAL_IRQClear = _swi(OS_Hardware, _INR(8, 9) | _RETURN(0), 1, EntryNo_HAL_IRQClear);
   _swi(OS_ClaimDeviceVector, _INR(0, 2), 0, stdin_handler, HAL_IRQClear);
   _swi(OS_Hardware, _IN(0) | _INR(8, 9), 0, 0, EntryNo_HAL_IRQEnable);
@@ -122,7 +126,6 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
 static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
 
   // TODO list:
-  // A proper blocking wait.
   // Handle errors.
   // Provide translation from RISC OS to Linux paths.
   // Do something sensible with environment variables.
@@ -200,45 +203,68 @@ static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
     ix_exit(-e);
 
   } else if (pid != 0) {
-    char buff[256];
+    struct data {
+      volatile int pollword;
+      uintptr_t HAL_IRQClear;
+      char buffer[1024];
+    } *data = malloc(sizeof(struct data));
+    data->HAL_IRQClear = HAL_IRQClear;
+
+    _swix(OS_ClaimDeviceVector, _INR(0, 2), ptmx, set_pollword, data);
+    _swix(OS_Hardware, _IN(0) | _INR(8, 9), ptmx, 0, EntryNo_HAL_IRQEnable);
+
     int c;
     int in = -1;
     while (true) {
+      data->pollword = 0;
 
-      // Copy everything from pseudo-terminal master to RISC OS output stream.
-      while(true) {
-        c = ix_read(ptmx, buff, sizeof(buff));
-        if (c <= 0) break;
-        error = _swix(OS_WriteN, _INR(0, 1), buff, c);
+      // Copy from pseudo-terminal master to RISC OS output stream.
+      c = ix_read(ptmx, data->buffer, sizeof(data->buffer));
+      if (c > 0) {
+        data->pollword = 1;
+        error = _swix(OS_WriteN, _INR(0, 1), data->buffer, c);
         if (error) break;
+      } else {
+        if (c != -ix_EAGAIN)
+          break;
       }
-
-      // Exit if error or slave end closed
-      if (error || c != -ix_EAGAIN) break;
 
       // Copy character RISC OS output stream from to pseudo-terminal
       // using "in" as a 1 byte buffer.
+      _kernel_irqs_off();
       if (in < 0) {
         int flag;
-        error = _swix(OS_Byte, _INR(0, 2) | _OUTR(1, 2), OsByte_INKEY, 1, 0, &in, &flag);
+        error = _swix(OS_Byte, _INR(0, 2) | _OUTR(1, 2), OsByte_INKEY, 0, 0, &in, &flag);
         if (error) break;
         switch(flag) {
+          case 255:
+            in = -1;
+            break;
           case 27:
             in = 3; // Escape becomes CTRL C
             ix_MESSAGE(2,"Escape in IXRun\n");
             _kernel_osbyte(OsByte_AcknowledgeEscape, 0, 0);
-            break;
-          case 255:
-            in = -1;
-            break;
+          default:
+            data->pollword = 1;
         }
       }
       if (in >= 0) {
         c = ix_write(ptmx, &in, 1);
         if (c == 1) in = -1;
       }
+
+      if (!data->pollword) {
+        int r;
+        error = _swix(OS_UpCall, _INR(0, 1) | _OUT(0), UpCall_Sleep, &data->pollword, &r);
+        if (error) break;
+        if (r && !data->pollword) __PVirt_WFI();
+      }
+      _kernel_irqs_on();
     }
     ix_close(ptmx);
+    _kernel_irqs_on();
+    _swix(OS_ReleaseDeviceVector, _INR(0, 2), ptmx, set_pollword, data);
+    free(data);
     int wstatus;
     ix_waitpid(pid, &wstatus, 0);
   } else {
