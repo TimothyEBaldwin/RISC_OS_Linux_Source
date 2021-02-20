@@ -123,7 +123,7 @@ _kernel_oserror *swi_handler(int swi_no, _kernel_swi_regs *r, void *pw) {
 static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
 
   // TODO list:
-  // Handle errors.
+  // Handle non-zero return codes.
   // Provide translation from RISC OS to Linux paths.
   // Do something sensible with environment variables.
   // Better handling of terminal / VDU codes.
@@ -134,20 +134,39 @@ static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
   char *cmd[argc + 1];
   char *env[] = {0};
   int pipe[2];
+  int e;
   _kernel_oserror *error = 0;
 
-  // Open a pipe communicate with child process
-  ix_pipe2(pipe, ix_O_CLOEXEC);
+
+  // Allocate memory for
+  struct data {
+    volatile int pollword;
+    char buffer[1024];
+  } *data = malloc(sizeof(struct data));
+
+  if (!data) return _kernel_last_oserror();
 
   // Open pseudo-terminal master
-  int ptmx = ix_open("/dev/ptmx", ix_O_RDWR | ix_O_CLOEXEC | ix_O_NONBLOCK, 0);
+  e = ix_open("/dev/ptmx", ix_O_RDWR | ix_O_CLOEXEC | ix_O_NONBLOCK, 0);
+  if (e < 0) goto free_error;
+  int ptmx = e;
+
+  e = __PVirt_Poll_ctl(ptmx, ix_EPOLL_CTL_ADD, ix_EPOLLET | ix_EPOLLIN | ix_EPOLLOUT | ix_EPOLLHUP, &data->pollword);
+  if (e) goto close_error;
+
+  // Open a pipe communicate with child process
+  e = ix_pipe2(pipe, ix_O_CLOEXEC);
+  if (e) {
+    __PVirt_Poll_remove(ptmx);
+close_error:
+    ix_close(ptmx);
+free_error:
+    free(data);
+    return convert_error(e);
+  }
 
   // Do the fork, possibly on another thread to avoid seccomp
   int pid = __PVirt_fork(pipe);
-
-  // Close the pipe -
-  ix_close(pipe[0]);
-  ix_close(pipe[1]);
 
   if (pid == 0) {
     // In child, create new session
@@ -179,40 +198,53 @@ static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
 
     // Unlock pseudo-terminal
     int zero = 0;
-    ix_ioctl(ptmx, ix_TIOCSPTLCK, &zero);
+    e = ix_ioctl(ptmx, ix_TIOCSPTLCK, &zero);
+    if (e) goto error;
 
     // Get pseudo-terminal number
     int pts_no;
-    ix_ioctl(ptmx, ix_TIOCGPTN, &pts_no);
+    e = ix_ioctl(ptmx, ix_TIOCGPTN, &pts_no);
+    if (e) goto error;
 
     // Open slave end
     char ptsname[20];
     sprintf(ptsname, "/dev/pts/%i", pts_no);
     int pts = ix_open(ptsname, ix_O_RDWR | ix_O_CLOEXEC, 0);
+    if (pts < 0) {
+      e = pts;
+      goto error;
+    }
 
     // Duplicate file descriptor to stdin, stdout, and stderr
-    ix_dup2(pts, 0);
-    ix_dup2(pts, 1);
-    ix_dup2(pts, 2);
+    e = ix_dup2(pts, 0);
+    if (e < 0) goto error;
+    e = ix_dup2(pts, 1);
+    if (e < 0) goto error;
+    e = ix_dup2(pts, 2);
+    if (e < 0) goto error;
 
     // Execute command
-    int e = ix_execve(cmd[0], cmd, 0);
-    ix_exit(-e);
+    e = ix_execve(cmd[0], cmd, 0);
+error:
+    ix_write(pipe[1], &e, sizeof(e));
+    ix_exit(1);
+    *(int *)0 = 0;
 
   } else if (pid != 0) {
-    struct data {
-      volatile int pollword;
-      uintptr_t HAL_IRQClear;
-      char buffer[1024];
-    } *data = malloc(sizeof(struct data));
-    data->HAL_IRQClear = HAL_IRQClear;
 
-    _swix(OS_ClaimDeviceVector, _INR(0, 2), ptmx, set_pollword, data);
-    _swix(OS_Hardware, _IN(0) | _INR(8, 9), ptmx, 0, EntryNo_HAL_IRQEnable);
+    // Close write end of pipe
+    ix_close(pipe[1]);
+
+    ix_read(pipe[0], &e, sizeof(e));
+
+    // Close read end of pipe
+    ix_close(pipe[0]);
 
     int c;
     int in = -1;
-    while (true) {
+    if (e) {
+      error = convert_error(e);
+    } else while (true) {
       data->pollword = 0;
 
       // Copy from pseudo-terminal master to RISC OS output stream.
@@ -258,16 +290,20 @@ static _kernel_oserror *do_IXRun(const char *arg_string, int argc) {
       }
       _kernel_irqs_on();
     }
+    __PVirt_Poll_remove(ptmx);
     ix_close(ptmx);
     _kernel_irqs_on();
-    _swix(OS_ReleaseDeviceVector, _INR(0, 2), ptmx, set_pollword, data);
-    free(data);
     int wstatus;
     ix_waitpid(pid, &wstatus, 0);
   } else {
     // Fork failed
+    ix_close(pipe[0]);
+    ix_close(pipe[1]);
+    __PVirt_Poll_remove(ptmx);
     ix_close(ptmx);
+    error = convert_error(pid);
   }
+  free(data);
   return error;
 }
 
