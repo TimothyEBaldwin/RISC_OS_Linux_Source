@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/auxv.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -254,6 +255,19 @@ int main(void) {
   DEF(EFD_CLOEXEC)
   DEF(EFD_NONBLOCK)
   DEF(EFD_SEMAPHORE)
+  DEF(EPOLLERR)
+  DEF(EPOLLET)
+  DEF(EPOLLEXCLUSIVE)
+  DEF(EPOLLHUP)
+  DEF(EPOLLIN)
+  DEF(EPOLLONESHOT)
+  DEF(EPOLLOUT)
+  DEF(EPOLLPRI)
+  DEF(EPOLLRDHUP)
+  DEF(EPOLLWAKEUP)
+  DEF(EPOLL_CTL_ADD)
+  DEF(EPOLL_CTL_DEL)
+  DEF(EPOLL_CTL_MOD)
   DEF(FIONBIO)
   DEF(FIONREAD)
   DEF(F_GETFL)
