@@ -1,0 +1,1234 @@
+/* Copyright 2019 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <ctype.h>
+#include <string.h>
+#include "swis.h"
+#include "Global/Sprite.h"
+#include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
+
+#include "flex.h"
+#include "event.h"
+#include "werr.h"
+#include "wimpt.h"
+#include "template.h"
+#include "xfersend.h"
+#include "bbc.h"
+#include "help.h"
+#include "visdelay.h"
+
+#include "main.h"
+#include "menus.h"
+#include "psprite.h"
+#include "Export.h"
+
+/* Common icons */
+#define EXPORTI_OK               0
+#define EXPORTI_FILENAME         2
+#define EXPORTI_ICON             3
+#define EXPORTI_BASE             5
+/* PNG icons */
+#define EXPORTI_PCOMPRESSION     6
+#define EXPORTI_PCOMPRESSION_MAX 9
+#define EXPORTI_PCOMPRESSION_MIN 0
+#define EXPORTI_CUP              8
+#define EXPORTI_CDOWN            7
+#define EXPORTI_PMAX             8
+/* JPEG icons */
+#define EXPORTI_JQUALITY         6
+#define EXPORTI_JQUALITY_MAX     100
+#define EXPORTI_JQUALITY_MIN     0
+#define EXPORTI_JUP              8
+#define EXPORTI_JDOWN            7
+#define EXPORTI_JMAX             8
+
+typedef struct {
+  char red,green,blue;
+} pngcolor;
+
+typedef enum {
+  pngdata_rgb,
+  pngdata_rgba,
+  pngdata_ga,
+  pngdata_g,
+  pngdata_p,
+  pngdata_pa
+} png_data_type;
+
+typedef enum {
+  sprtype_invalid,
+  sprtype_1bpp,
+  sprtype_2bpp,
+  sprtype_4bpp,
+  sprtype_8bpp,
+  sprtype_1555_tbgr,
+  sprtype_8888_tbgr,
+  sprtype_cmyk,
+  sprtype_24bpp,
+  sprtype_jpeg,
+  sprtype_565_bgr,
+  sprtype_11,
+  sprtype_12,
+  sprtype_13,
+  sprtype_14,
+  sprtype_15,
+  sprtype_4444,
+  sprtype_420_ycc,
+  sprtype_422_ycc
+} sprtype;
+
+typedef struct {
+  main_sprite *sprite;  /* selected sprite */
+  wimp_w saveas_window; /* saveas dialogue */
+  BOOL finished;
+  int export_filetype;
+
+  /* source image info */
+  int *palette;
+  int hole_colour; /* colour index that has been replaced with a mask */
+  BOOL greyscale;
+  transparency_type masktype;
+  int width,height;
+  int xdpi;
+  int ydpi;
+  sprtype sprite_type;
+
+  /* encoding bits */
+  char *imagebuffer;
+  int imagesize;
+
+  /* encoding bits: png extra bit */
+  png_data_type rowtype;
+
+  /* sprite decode bits */
+  char *rowbuffer;
+  int sprite_lbit;
+  int sprite_rbit;
+  int sprite_bpp;    /* colour depth in the sprite */
+  int output_bpp;    /* colour depth for output - may be different for masked sprite */
+  int sprite_pixbpp; /* pixel size - 15bpp takes up 16 bits */
+  int pixwidth;
+
+  /* mask info */
+  int lbit; /* mask start/end offsets */
+  int rbit;
+  int maskstride;
+  int bpp;
+} export_info;
+
+typedef enum {
+  export_palette_png,
+  export_palette_bgr0
+} export_palette_type;
+
+static char *export_get_writeable(export_info *info, int icon)
+{ int i;
+  wimp_icon istate;
+
+  wimpt_noerr (wimp_get_icon_info (info->saveas_window, icon, &istate));
+  for (i = 0; istate.data.indirecttext.buffer[i] >= ' '; i++);
+  istate.data.indirecttext.buffer[i] = 0;
+
+  return istate.data.indirecttext.buffer;
+}
+
+static BOOL export_sprite_is_greyscale(main_sprite *sprite)
+{ sprite_header *s = psprite_address (sprite);
+  int i,
+      entries = (MIN (s->image, s->mask) - spPalette) / 8,
+     *palette;
+  /* some export formats have greyscale options.  There's no official way to determine if a source sprite */
+  /* is greyscale or not, so we inspect the palette. */
+  /* if no palette, might not be greyscale */
+  /* if has a palette, check that all entries are grey tones (R==G==B) */
+  if (entries == 0) return FALSE; /* no palette */
+
+  palette = (int *)(s + 1);
+
+  for (i = 0; i < entries; i++)
+    if ((palette[i*2] ^ palette[i*2] << 8) >> 16 != 0) return FALSE; /* not a grey shade */
+
+  return TRUE;
+}
+
+static int export_find_palette_hole(export_info *info)
+{ if (info->sprite_bpp != info->output_bpp)
+  { /* we've already been here and needed to extend the depth.
+       So we know to just return the extra colour rather than scanning the sprite again. */
+    return 1 << info->sprite_bpp;
+  }
+
+  int i, y, xsrc, pix, mask_xsrc;
+  int ncolours       = 1 << info->sprite_bpp;
+  int pixmask        = ncolours - 1;
+  int mask_piece     = (1 << info->bpp) - 1;
+  sprite_header *src = (sprite_header *) psprite_address (info->sprite);
+  char used_colours[ncolours];
+  const char *rowpixels;
+  const char *mask   = ((char *)src) + src->mask;
+  char maskdata;
+
+  /* for a paletted PNG to have a mask we have to sacrifice one of the colours */
+  /* if we can find a colour to replace, good.  If not, we will need to increase the colour depth in use */
+  /* we also need to interrogate the mask - we could use a colour that is behind it for transparency */
+  memset (used_colours, 0, ncolours);
+
+  /* run the sprite and see what we get */
+  for (y = 0; y < info->height; y++)
+  { rowpixels = ((char *)src) + src->image + y * (src->width + 1) * sizeof(int);
+    mask      = ((char *)src) + src->mask + y * info->maskstride;
+
+    for (xsrc = info->sprite_lbit, mask_xsrc = info->lbit;
+         xsrc <= info->sprite_rbit;
+         xsrc += info->sprite_pixbpp, mask_xsrc += info->bpp)
+    { maskdata = *(mask + xsrc / 8);
+      maskdata = (maskdata >> (xsrc & 7)) & mask_piece;
+
+      pix = *(rowpixels + xsrc / 8);
+      pix = (pix >> (xsrc & 7)) & pixmask;
+
+      if (info->masktype == transparency_type_alphamask)
+      { if (maskdata <= 0x80) used_colours[pix] = 1;
+      }
+      else
+      { if (maskdata != 0) used_colours[pix] = 1;
+      }
+    }
+  }
+
+  /* see if there's a hole... */
+  for (i = 0; i < ncolours; i++)
+    if (used_colours[i] == 0) return i;
+
+  /* no hole; up the colour depth and return appropriately... */
+  if (info->sprite_bpp < 8)
+  { info->output_bpp = info->output_bpp * 2; /* libpng supports powers of 2 for colour depth */
+    return 1 << info->sprite_bpp; /* return the new index */
+  }
+
+  /* for 8bpp sprite, we can only go up to true colour */
+  info->output_bpp = 32;
+  info->pixwidth = 4;
+  return -1;
+}
+
+static BOOL export_get_source_info(export_info *info)
+{ sprite_header *s = psprite_address (info->sprite);
+  sprite_id sid;
+  sprite_info sinfo;
+
+  /* determine details of source sprite */
+  info->greyscale = export_sprite_is_greyscale (info->sprite);
+
+  /* dimensions */
+  sid.tag    = sprite_id_name;
+  sid.s.name = s->name;
+
+  if (sprite_readsize (info->sprite->file->spritearea, &sid, &sinfo)) return FALSE;
+  info->width  = sinfo.width;
+  info->height = sinfo.height;
+
+  /* dpi */
+  if (s->mode >= 0 && s->mode < 256)
+  { /* BBC mode number */
+    info->xdpi = 180 / (1 << bbc_modevar (s->mode, bbc_XEigFactor));
+    info->ydpi = 180 / (1 << bbc_modevar (s->mode, bbc_YEigFactor));
+    info->sprite_type = (sprtype) (1 + bbc_modevar (s->mode, bbc_Log2BPC));
+  }
+  else
+  { if (((s->mode >> 27) & 15) == SpriteType_RISCOS5)
+    { /* RO5 mode word */
+      info->xdpi = 180 / (1 << ((s->mode >> 4) & 3));
+      info->ydpi = 180 / (1 << ((s->mode >> 6) & 3));
+      info->sprite_type = (sprtype) ((s->mode >> 20) & 0x7f);
+    }
+    else
+    { /* RO3.5 mode word */
+      info->xdpi = (s->mode >> 1) & 0x1fff;
+      info->ydpi = (s->mode >> 14) & 0x1fff;
+      info->sprite_type = (sprtype) ((s->mode >> 27) & 0xf);
+    }
+  }
+
+  /* source bpp */
+  info->sprite_bpp = 1 << bbc_modevar (s->mode, bbc_Log2BPC);
+  info->output_bpp = info->sprite_bpp;
+  if (info->sprite_bpp <= 8 && info->export_filetype == FileType_PNG)
+    info->pixwidth = 1;
+  else
+    info->pixwidth = 3;
+
+  switch (info->sprite_bpp)
+  { case 15:
+      info->sprite_pixbpp = 16;
+      break;
+
+    case 24:
+      info->sprite_pixbpp = 32;
+      break;
+
+    default:
+      info->sprite_pixbpp = info->sprite_bpp;
+      break;
+  }
+
+  /* source layout */
+  info->sprite_lbit = s->lbit;
+  info->sprite_rbit = s->rbit + 32 * s->width;
+
+  /* mask information */
+  info->masktype = psprite_transparency_type (info->sprite);
+
+  /* set up additional mask information if need be */
+  if (info->export_filetype == FileType_PNG
+      && (info->masktype == transparency_type_onoffmask ||
+          info->masktype == transparency_type_alphamask))
+  { if (s->mode >= 0 && s->mode <= 256)
+    { /* old style sprite has mask offsets */
+      info->bpp  = info->sprite_bpp;
+      info->lbit = s->lbit;
+      info->rbit = s->rbit + 32 * s->width;
+      info->maskstride = (s->width + 1) * 4;
+    }
+    else
+    { /* new style sprite always starts at 0 and is 1bpp mask or 8bpp alpha mask*/
+      info->lbit = 0;
+      info->bpp  = info->masktype == transparency_type_onoffmask ? 1 : 8;
+      info->rbit = info->width * info->bpp;
+      info->maskstride = ((info->rbit + 31) / 32) << 2; /* Bytes */
+    }
+    info->pixwidth += 1;
+  }
+
+  /* palette information - if bpp<=8 */
+  /* if we have a palette, make a copy of it.  If not, generate a default one for lookups. */
+  if (info->sprite_bpp <= 8)
+  { int entries,i;
+
+    if (!flex_alloc ((flex_ptr) &info->palette, sizeof(int) * (1 << info->sprite_bpp)))
+    { werr (FALSE, msgs_lookup ("PntEG"));
+      return FALSE;
+    }
+
+    entries = (MIN (s->image, s->mask) - spPalette) / 8;
+    if (entries)
+    { /* import palette from the sprite */
+      if (info->sprite_bpp == 8 && entries < 256)
+      { /* this one needs expanding -> 256 colours */
+        _swix (ColourTrans_ReadPalette, _INR(0,4), 0x8000, s, info->palette, 1024, 1);
+      }
+      else
+      { /* straight copy */
+        int *pal_src = (int *) (((char *)s) + spPalette);
+        for (i = 0; i < entries; i++)
+          *(info->palette + i) = *(pal_src + i * 2); /* each entry has two values, skip flash colour */
+      }
+    }
+    else
+    { /* generate a new default palette */
+      switch (1 << info->sprite_bpp)
+      { case 2:
+        { wimp_palettestr source;
+          wimpt_noerr (wimp_readpalette (&source));
+          *(info->palette + 0) = source.c[0].word;
+          *(info->palette + 1) = source.c[7].word;
+          break;
+        }
+
+        case 4:
+        { wimp_palettestr source;
+          wimpt_noerr (wimp_readpalette (&source));
+          *(info->palette + 0) = source.c[0].word;
+          *(info->palette + 1) = source.c[2].word;
+          *(info->palette + 2) = source.c[4].word;
+          *(info->palette + 3) = source.c[7].word;
+          break;
+        }
+
+        case 16:
+        { wimp_palettestr source;
+          wimpt_noerr (wimp_readpalette (&source));
+          for (i = 0; i < 16; i++)
+            *(info->palette + i) = source.c[i].word;
+          break;
+        }
+
+        case 256:
+        { int *colourtrans;
+          int size;
+          _swix (ColourTrans_ReadPalette, _INR(0,4) | _OUT(3), 28, 0, 0, 0 ,0 ,&size);
+          if (!flex_alloc ((flex_ptr) &colourtrans, size))
+          { flex_free ((flex_ptr) &info->palette);
+            werr (FALSE, msgs_lookup ("PntEG"));
+            return FALSE;
+          }
+          _swix (ColourTrans_ReadPalette, _INR(0,4), 28, 0, colourtrans, size ,0);
+
+          for (i = 0; i < 256; i++)
+            *(info->palette + i) = *(colourtrans + i);
+
+          flex_free ((flex_ptr) &colourtrans);
+        }
+      }
+    }
+  }
+  return TRUE;
+}
+
+/* obtain row data from the source sprite, optionally interleaving with a mask value */
+static void export_fill_rowbuffer(export_info *info, const int rownum)
+{ int xsrc, xdst;
+  sprite_header *src = (sprite_header *) psprite_address (info->sprite);
+  char *rowpixels    = ((char *)src) + src->image + rownum * (src->width + 1) * 4;
+  int pixmask        = (1 << info->sprite_bpp) - 1;
+
+  /* transfer image data */
+  switch (info->rowtype)
+  { case pngdata_rgba:
+    case pngdata_rgb:
+      /* source needs mapping to 24 bit RGB */
+      for (xsrc = info->sprite_lbit, xdst = 0; xsrc <= info->sprite_rbit; xsrc += info->sprite_pixbpp, xdst += info->pixwidth)
+      {
+        switch (info->sprite_type) {
+          case sprtype_8888_tbgr:
+          case sprtype_24bpp: /* straight RGB copy */
+            *(info->rowbuffer + xdst + 0) = *(rowpixels + xsrc / 8 + 0);
+            *(info->rowbuffer + xdst + 1) = *(rowpixels + xsrc / 8 + 1);
+            *(info->rowbuffer + xdst + 2) = *(rowpixels + xsrc / 8 + 2);
+            break;
+
+          case sprtype_1555_tbgr: /* expand 1:5:5:5 TRGB to RGB */
+          { int r,g,b;
+            int source = *(rowpixels + xsrc / 8 + 0) | (*(rowpixels + xsrc / 8 + 1) << 8);
+            r = source & 31;
+            g = (source >> 5) & 31;
+            b = (source >> 10) & 31;
+            *(info->rowbuffer + xdst + 0) = r << 3;
+            *(info->rowbuffer + xdst + 1) = g << 3;
+            *(info->rowbuffer + xdst + 2) = b << 3;
+            break;
+          }
+
+          case sprtype_565_bgr: /* expand 5:6:5 RGB to RGB */
+          { int r,g,b;
+            int source = *(rowpixels + xsrc / 8 + 0) | (*(rowpixels + xsrc / 8 + 1) << 8);
+            r = source & 31;
+            g = (source >> 5) & 63;
+            b = (source >> 11) & 31;
+            *(info->rowbuffer + xdst + 0) = r << 3;
+            *(info->rowbuffer + xdst + 1) = g << 2;
+            *(info->rowbuffer + xdst + 2) = b << 3;
+            break;
+          }
+
+          case sprtype_4444: /* expand 4:4:4:4 to RGB */
+          { int r,g,b;
+            int source = *(rowpixels + xsrc / 8) | (*(rowpixels + xsrc / 8 + 1) << 8);
+            r = source & 0xf;
+            g = (source >> 4) & 0xf;
+            b = (source >> 8) & 0xf;
+            *(info->rowbuffer + xdst + 0) = r << 4;
+            *(info->rowbuffer + xdst + 1) = g << 4;
+            *(info->rowbuffer + xdst + 2) = b << 4;
+            break;
+          }
+
+          case sprtype_8bpp: /* these really apply to JPEG which always takes a 24 bit input stream for colour */
+          case sprtype_4bpp:
+          case sprtype_2bpp:
+          case sprtype_1bpp: /* for these ones, we need to look up the palette entry and expand to RGB */
+          { int pix;
+            pix = *(rowpixels + xsrc / 8);
+            pix = (pix >> (xsrc & 7)) & pixmask;
+            *(info->rowbuffer + xdst + 0) = *(info->palette + pix) >> 8;
+            *(info->rowbuffer + xdst + 1) = *(info->palette + pix) >> 16;
+            *(info->rowbuffer + xdst + 2) = *(info->palette + pix) >> 24;
+            break;
+          }
+        }
+      }
+      break;
+
+    case pngdata_p:
+    case pngdata_pa:
+      /* source is <=8bpp and needs mapping to a single byte palette value */
+      for (xsrc = info->sprite_lbit, xdst = 0; xsrc <= info->sprite_rbit; xsrc += info->sprite_pixbpp, xdst += info->pixwidth)
+      { int pix;
+        pix = *(rowpixels + xsrc / 8);
+        pix = (pix >> (xsrc & 7)) & pixmask;
+        *(info->rowbuffer + xdst) = pix;
+      }
+      break;
+
+    case pngdata_g:
+    case pngdata_ga:
+      /* source is greyscaled */
+      /* look up the palette entry and output the appropriate grey level for it */
+      /* source will be <= 8bpp */
+      for (xsrc = info->sprite_lbit, xdst = 0; xsrc <= info->sprite_rbit; xsrc += info->sprite_pixbpp, xdst += info->pixwidth)
+      { int pix;
+        pix = *(rowpixels + xsrc / 8);
+        pix = (pix >> (xsrc & 7)) & pixmask;
+        *(info->rowbuffer + xdst) = (*(info->palette + pix) >> 8) &0xff;
+      }
+      break;
+  }
+
+  /* do we need to add mask data to this image? */
+  if (info->rowtype != pngdata_pa && info->rowtype != pngdata_ga && info->rowtype != pngdata_rgba)
+    return;
+
+  if (!(info->masktype == transparency_type_onoffmask || info->masktype == transparency_type_alphamask))
+    return;
+
+  char *mask         = ((char *)src) + src->mask;
+  int mask_piece     = (1 << info->bpp) - 1;
+  char data;
+  mask += info->maskstride * rownum; /* move to the current line */
+
+  for (xsrc = info->lbit, xdst = 0; xsrc <= info->rbit; xsrc += info->bpp, xdst += info->pixwidth)
+  { data = *(mask + xsrc / 8);
+    data = (data >> (xsrc & 7)) & mask_piece;
+
+    if (info->rowtype == pngdata_pa)
+    { /* swap in our hole colour */
+      if (info->masktype == transparency_type_alphamask)
+      { if (data > 0x80) *(info->rowbuffer + xdst) = info->hole_colour;
+      }
+      else
+      { if (data == 0) *(info->rowbuffer + xdst) = info->hole_colour;
+      }
+    }
+    else
+    { if (info->masktype == transparency_type_alphamask)
+        *(info->rowbuffer + xdst + info->pixwidth -1) = data;
+      else
+        *(info->rowbuffer + xdst + info->pixwidth -1) = (data == 0) ? 0 : 0xff;
+    }
+  }
+}
+
+/* JPEG compression */
+static int export_jpeg_start(export_info *info)
+{ int tag;
+  _kernel_oserror *e;
+  struct {
+    int width;
+    int height;
+    int quality;
+    int depth;
+    int xdpi;
+    int ydpi;
+  } jpegbuf; /* parameter block for CompressJPEG_Start call */
+  wimp_icon istate;
+
+  jpegbuf.width  = info->width;
+  jpegbuf.height = info->height * (info->xdpi / info->ydpi); /* double up if need to */
+  jpegbuf.depth  = info->greyscale ? 1 : 3; /* 1 byte for grey format, 3 for RGB */
+  jpegbuf.xdpi   = info->xdpi;
+  jpegbuf.ydpi   = info->ydpi;
+
+  wimpt_noerr (wimp_get_icon_info (info->saveas_window, EXPORTI_JQUALITY, &istate));
+
+  jpegbuf.quality = atoi (istate.data.indirecttext.buffer);
+  if (jpegbuf.quality < EXPORTI_JQUALITY_MIN)      jpegbuf.quality = EXPORTI_JQUALITY_MIN;
+  else if (jpegbuf.quality > EXPORTI_JQUALITY_MAX) jpegbuf.quality = EXPORTI_JQUALITY_MAX;
+
+  e = _swix (CompressJPEG_Start, _INR(0,4) | _OUT(0), info->imagebuffer, info->imagesize, &jpegbuf, 0, 0, &tag);
+  if (e)
+  { werr (FALSE, e->errmess);
+    return 0;
+  }
+
+  return tag;
+}
+
+static BOOL export_jpeg_writeline(int tag, const char *linedata)
+{
+  return _swix (CompressJPEG_WriteLine, _INR(0,1), tag, linedata) == NULL;
+}
+
+static int export_jpeg_finish(int tag)
+{ int size = -1; /* Value returned on error */
+
+  _swix (CompressJPEG_Finish, _IN(0) | _OUT(0), tag, &size);
+  return size;
+}
+
+static BOOL export_jpeg_do(export_info *info)
+{ int tag, outsize, row, dup;
+
+  tag = export_jpeg_start (info);
+  if (tag == 0) return FALSE;
+
+  visdelay_begin ();
+
+  for (row = 0; row < info->height; row++)
+  { export_fill_rowbuffer (info, row);
+    for (dup = 0; dup < (info->xdpi / info->ydpi); dup++)
+      if (!export_jpeg_writeline (tag, info->rowbuffer))
+      { export_jpeg_finish (tag);
+        visdelay_end ();
+        return FALSE;
+      }
+    visdelay_percent ((100 * row) / info->height);
+  }
+
+  visdelay_end ();
+
+  outsize = export_jpeg_finish (tag);
+  if (outsize != -1)
+  { info->imagesize = outsize;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static BOOL export_compress_jpeg(export_info *info)
+{ BOOL success   = FALSE;
+  int buffersize = 3 * info->width * info->height;
+
+  info->imagesize = buffersize;
+
+  /* create initial jpeg buffer */
+  if (!flex_alloc ((flex_ptr) &info->imagebuffer, info->imagesize))
+  { werr (FALSE, msgs_lookup ("PntEG"));
+    return FALSE;
+  }
+
+  /* grey or full colour? */
+  if (info->greyscale)
+  { info->rowtype = pngdata_g;
+    info->pixwidth = 1;
+  }
+  else info->rowtype = pngdata_rgb;
+
+  /* note that we have to have a big enough buffer for compression but we can't */
+  /* find out how big to make it with the current JCompMod module. */
+  /* So we create a decent sized buffer.  If the compression fails, we try to increase the buffer size. */
+  /* This means that we'll possibly need more than one go. */
+  do
+  { success = export_jpeg_do (info);
+    if (!success)
+    { info->imagesize += buffersize;
+      if (!flex_extend ((flex_ptr) &info->imagebuffer, info->imagesize))
+      { flex_free ((flex_ptr) &info->imagebuffer);
+        info->imagebuffer = NULL;
+        info->imagesize   = 0;
+        werr (FALSE, msgs_lookup ("PntEG"));
+        return FALSE;
+      }
+    }
+  } while (!success);
+
+  return TRUE;
+}
+
+/* PNG compression */
+#define PNG_PARAM_INTERLACE   0
+#define PNG_PARAM_AUTHOR      1
+#define PNG_PARAM_DESCRIPTION 2
+#define PNG_PARAM_COMPRESSION 3
+#define PNG_PARAM_PALETTE     4
+#define PNG_PARAM_TRNS        5
+#define PNG_PARAMCOUNT        6
+
+/* take the palette and convert it to a PNG-compatible one */
+static BOOL export_make_png_pal(int **destbuffer, export_info *info)
+{ int entries = 1 << info->output_bpp;
+  int i;
+
+  if (entries > 256) return FALSE;
+
+  if (!flex_alloc ((flex_ptr) destbuffer, entries * 4))
+  { werr (FALSE, msgs_lookup ("PntEG"));
+    return FALSE;
+  }
+
+  for (i = 0; i < 1 << info->output_bpp; i++)
+  { /* convert to PNG palette entry */
+    if (i < (1 << info->sprite_bpp))
+      *((*destbuffer) + i) = (*(info->palette + i) >> 8) &0xffffff;
+    else
+      *((*destbuffer) + i) = 0x00ff00; /* becomes transparent later, anyway */
+  }
+
+  return TRUE;
+}
+
+static int export_png_start(export_info *info)
+{ int tag;
+  wimp_icon istate;
+  compresspng_str *c;
+  _kernel_oserror *e;
+  int *palettedata = NULL;
+  char *trns_chunk = NULL;
+  char spritename[NAME_LIMIT + 1];
+
+  /* make enough space for our parameters */
+  if (!flex_alloc ((flex_ptr) &c, sizeof(compresspng_str) + sizeof(compresspng_param) * (1 + PNG_PARAMCOUNT)))
+  { werr (FALSE, msgs_lookup ("PntEG"));
+    return 0;
+  }
+
+  c->width  = info->width;
+  c->height = info->height;
+  c->x_dpi  = info->xdpi;
+  c->y_dpi  = info->ydpi;
+  c->flags  = 0;
+
+  /* we can have a palettised image if not grey and bpp = 8, or if bpp < 8,
+     and only if not having a full alpha mask */
+  if (((!info->greyscale && info->sprite_bpp == 8) || info->sprite_bpp < 8)
+      && (info->masktype != transparency_type_alphamask))
+  { if (info->masktype != transparency_type_none)
+    { /* is there a space we can use for the transparent colour? */
+      info->hole_colour = export_find_palette_hole (info);
+      if (info->hole_colour == -1)
+      { /* failed and becomes a true colour output */
+        info->rowtype = pngdata_rgba;
+        c->flags |= CompressPNG_Flags_HasAlpha;
+      }
+      else
+      { if (!flex_alloc ((flex_ptr) &trns_chunk, 1 << info->output_bpp))
+        { flex_free ((flex_ptr) &c);
+          return 0;
+        }
+
+        memset (trns_chunk, 0xff, 1 << info->output_bpp);
+        trns_chunk[info->hole_colour] = 0;
+
+        info->rowtype = pngdata_pa;
+        info->pixwidth = 1;
+
+        if (!export_make_png_pal (&palettedata, info))
+        { flex_free ((flex_ptr) &trns_chunk);
+          flex_free ((flex_ptr) &c);
+          return 0;
+        }
+        c->parameter[PNG_PARAM_PALETTE].parameter = png_param_palette;
+        c->parameter[PNG_PARAM_PALETTE].param.palette.size = 1 << info->output_bpp;
+        c->parameter[PNG_PARAM_PALETTE].param.palette.palettedata = palettedata;
+        c->parameter[PNG_PARAM_TRNS].parameter = png_param_transparency;
+        c->parameter[PNG_PARAM_TRNS].param.transparency.size = 1 << info->output_bpp;
+        c->parameter[PNG_PARAM_TRNS].param.transparency.transdata = trns_chunk;
+        c->parameter[PNG_PARAM_TRNS + 1].parameter = png_param_end_of_list;
+      }
+    }
+    else
+    { /* make a normal palette */
+      info->rowtype = pngdata_p;
+
+      if (!export_make_png_pal (&palettedata, info))
+      { flex_free ((flex_ptr) &c);
+        return 0;
+      }
+      c->parameter[PNG_PARAM_PALETTE].parameter = png_param_palette;
+      c->parameter[PNG_PARAM_PALETTE].param.palette.size = 1 << info->sprite_bpp;
+      c->parameter[PNG_PARAM_PALETTE].param.palette.palettedata = palettedata;
+      c->parameter[PNG_PARAM_PALETTE + 1].parameter = png_param_end_of_list;
+    }
+  }
+  else
+  { if (info->greyscale) c->flags |= CompressPNG_Flags_Greyscale;
+    if (info->masktype != transparency_type_none) c->flags |= CompressPNG_Flags_HasAlpha;
+
+    /* set rowtype */
+    if (c->flags & CompressPNG_Flags_Greyscale)
+      info->rowtype = info->masktype != transparency_type_none ? pngdata_ga : pngdata_g;
+    else
+      info->rowtype = info->masktype != transparency_type_none ? pngdata_rgba : pngdata_rgb;
+
+    c->parameter[PNG_PARAM_PALETTE].parameter = png_param_end_of_list;
+  }
+
+  /* set compression and metadata */
+  c->parameter[PNG_PARAM_INTERLACE].parameter     = png_param_interlace;
+  c->parameter[PNG_PARAM_INTERLACE].param.value_i = 0; /* Off */
+
+  c->parameter[PNG_PARAM_AUTHOR].parameter        = png_param_text_comment;
+  c->parameter[PNG_PARAM_AUTHOR].param.text.key   = "Author";
+  c->parameter[PNG_PARAM_AUTHOR].param.text.value = "RISC OS Paint";
+
+  c->parameter[PNG_PARAM_DESCRIPTION].parameter        = png_param_text_comment;
+  c->parameter[PNG_PARAM_DESCRIPTION].param.text.key   = "Description";
+  strncpy (spritename, psprite_address (info->sprite)->name, NAME_LIMIT);
+  c->parameter[PNG_PARAM_DESCRIPTION].param.text.value = spritename;
+
+  wimpt_noerr (wimp_get_icon_info (info->saveas_window, EXPORTI_PCOMPRESSION, &istate));
+  c->parameter[PNG_PARAM_COMPRESSION].parameter        = png_param_compression;
+  c->parameter[PNG_PARAM_COMPRESSION].param.value_i    = atoi (istate.data.indirecttext.buffer);
+
+  if (c->parameter[PNG_PARAM_COMPRESSION].param.value_i < EXPORTI_PCOMPRESSION_MIN)
+    c->parameter[PNG_PARAM_COMPRESSION].param.value_i = EXPORTI_PCOMPRESSION_MIN;
+
+  if (c->parameter[PNG_PARAM_COMPRESSION].param.value_i > EXPORTI_PCOMPRESSION_MAX)
+    c->parameter[PNG_PARAM_COMPRESSION].param.value_i = EXPORTI_PCOMPRESSION_MAX;
+
+  /* see if we can start compression on this chunk of settings */
+  e = _swix (CompressPNG_Start, _INR(0,2) | _OUT(0), info->imagebuffer, info->imagesize, c, &tag);
+
+  if (palettedata) flex_free ((flex_ptr) &palettedata);
+  if (trns_chunk) flex_free ((flex_ptr) &trns_chunk);
+  flex_free ((flex_ptr) &c);
+
+  if (e)
+  { werr (FALSE, e->errmess);
+    return 0;
+  }
+
+  return tag;
+}
+
+static BOOL export_png_writeline(const int tag, const char *linedata)
+{
+  return _swix (CompressPNG_WriteLine, _INR(0,1), tag, linedata) == NULL;
+}
+
+static int export_png_finish(const int tag)
+{
+  int size = -1; /* Value returned on error */
+  _kernel_oserror *e;
+
+  e = _swix (CompressPNG_Finish, _IN(0) | _OUT(1), tag, &size);
+  if (e) werr (FALSE, e->errmess);
+  return size;
+}
+
+static BOOL export_png_do(export_info *info)
+{ int tag, row, outsize;
+
+  tag = export_png_start (info);
+  if (tag == 0) return FALSE;
+
+  for (row = 0; row < info->height; row++)
+  { export_fill_rowbuffer (info, row);
+    if (!export_png_writeline (tag, info->rowbuffer))
+    { export_png_finish (tag);
+      return FALSE;
+    }
+    visdelay_percent ((50 * row) / info->height + (info->imagebuffer ? 50 : 0));
+  }
+
+  outsize = export_png_finish (tag);
+  if (info->imagebuffer == NULL)
+  { if (outsize != -1)
+    { info->imagesize = outsize;
+      return TRUE;
+    }
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static BOOL export_compress_png(export_info *info)
+{ BOOL success;
+
+  if (info->imagebuffer)
+  { flex_free ((flex_ptr) &info->imagebuffer);
+    info->imagebuffer = NULL;
+  }
+  info->imagesize = 0;
+
+  visdelay_begin ();
+
+  /* by compressing with no buffer we get the required size */
+  success = export_png_do (info);
+  if (success)
+  { if (!flex_alloc ((flex_ptr) &info->imagebuffer, info->imagesize))
+    { visdelay_end ();
+      werr (FALSE, msgs_lookup ("PntEG"));
+      return FALSE;
+    }
+    else
+      export_png_do(info); /* run it again, this time into a buffer */
+  }
+
+  visdelay_end();
+
+  return TRUE;
+}
+
+/* determine if the filename is OK for export */
+static BOOL export_filename_valid(export_info *info)
+{ const char *filename;
+  char c;
+
+  filename = export_get_writeable (info, EXPORTI_FILENAME);
+
+  while ((c = *(filename++)) >= ' ')
+    if (c == '.') return TRUE;
+
+  werr (FALSE, msgs_lookup ("saveas1"));
+
+  return FALSE;
+}
+
+/* return the estimated file size for the transfer */
+static int export_estsize(export_info *info)
+{ switch (info->export_filetype)
+  { case FileType_PNG:
+      if (export_compress_png (info)) return info->imagesize;
+      else return -1;
+
+    case FileType_JPEG:
+      if (info->imagebuffer)
+      { flex_free ((flex_ptr) &info->imagebuffer);
+        info->imagebuffer = NULL;
+      }
+      if (export_compress_jpeg (info)) return info->imagesize;
+      else return -1;
+  }
+
+  return -1;
+}
+
+static BOOL export_saveproc(char *filename, void *handle)
+{ export_info *info = (export_info *)handle;
+  _kernel_oserror *e;
+
+  if (info->imagebuffer == NULL)
+  { werr (FALSE, msgs_lookup ("PEX2"));
+    return FALSE;
+  }
+
+  e = _swix (OS_File, _INR(0,2) | _INR(4,5), OSFile_SaveStamp, filename,
+             info->export_filetype, info->imagebuffer, info->imagebuffer + info->imagesize);
+  if (e) werr (FALSE, e->errmess);
+  return e == NULL;
+}
+
+static BOOL export_sendproc(void *handle, int *maxbuf)
+{ export_info *info = (export_info *)handle;
+
+  if (info->imagebuffer == NULL)
+  { werr (FALSE, msgs_lookup ("PEX1"));
+    return FALSE;
+  }
+
+  return mysendbuf (&info->imagebuffer, info->imagesize, maxbuf, 0);
+}
+
+static int export_printproc(char *filename, void *handle)
+{ export_info *info = (export_info *)handle;
+  IGNORE(filename);
+  /* regardless of which option was selected, as we're doing a
+     printout it doesn't matter what the output format is
+     so we'll print a sprite using Paint's existing code. */
+  return menus_do_print (info->sprite) ? xfersend_printPrinted : xfersend_printFailed;
+}
+
+static void export_range_adjust(wimp_w window, wimp_i icon, int adjustment, int min, int max)
+{ wimp_icon istate;
+  int value, oldvalue;
+
+  /* get current value */
+  wimpt_noerr (wimp_get_icon_info (window, icon, &istate));
+
+  /* adjust and clamp */
+  oldvalue = atoi (istate.data.indirecttext.buffer);
+  value    = oldvalue + adjustment;
+
+  if (value < min) value = min;
+  else if (value > max) value = max;
+
+  if (value != oldvalue)
+  { wimp_caretstr caret;
+
+    /* update icon */
+    sprintf (istate.data.indirecttext.buffer, "%d", value);
+    wimp_set_icon_state (window, icon, (wimp_iconflags)0, (wimp_iconflags)0);
+
+    caret.w      = window;
+    caret.i      = icon;
+    caret.height = -1;
+    caret.index  = strlen (istate.data.indirecttext.buffer);
+    wimp_set_caret_pos (&caret);
+  }
+}
+
+static void export_set_icon_indir(wimp_w window, wimp_i icon, const char *text)
+{ wimp_icon istate;
+
+  if (wimp_get_icon_info (window, icon, &istate) == NULL)
+  { if (strlen (text) > istate.data.indirecttext.bufflen - 1)
+    { memcpy (istate.data.indirecttext.buffer, text, istate.data.indirecttext.bufflen - 1);
+      *(istate.data.indirecttext.buffer + istate.data.indirecttext.bufflen - 1) = 0;
+    }
+    else
+      strcpy (istate.data.indirecttext.buffer, text);
+  }
+  wimp_set_icon_state (window, icon, (wimp_iconflags)0, (wimp_iconflags)0);
+}
+
+/* if we've adjusted the size of the window, it may be necessary to nudge the options onto the screen */
+static void export_nudge_onscreen(wimp_wstate *current)
+{ int xmax   = bbc_modevar (-1, bbc_XWindLimit) << bbc_modevar (-1, bbc_XEigFactor);
+  int width  = current->o.box.x1 - current->o.box.x0;
+  int height = current->o.box.y1 - current->o.box.y0;
+
+  if (current->o.box.y0 < 0)
+  { current->o.box.y0 = 0;
+    current->o.box.y1 = height;
+  }
+
+  if (current->o.box.x1 > xmax)
+  { current->o.box.x1 = xmax;
+    current->o.box.x0 = xmax - width;
+  }
+}
+
+static BOOL export_show_saveas(export_info *info)
+{ wimp_eventstr *e = wimpt_last_event();
+
+  /* display depends on whether it was a menuwarning or not */
+  if (e->e == wimp_ESEND && e->data.msg.hdr.action == wimp_MMENUWARN)
+  { wimp_wstate winstate;
+    wimp_get_wind_state (info->saveas_window, &winstate);
+    winstate.o.box.x1 = e->data.msg.data.menuwarn.x + (winstate.o.box.x1 - winstate.o.box.x0);
+    winstate.o.box.x0 = e->data.msg.data.menuwarn.x;
+    winstate.o.box.y0 = e->data.msg.data.menuwarn.y - (winstate.o.box.y1 - winstate.o.box.y0);
+    winstate.o.box.y1 = e->data.msg.data.menuwarn.y;
+    export_nudge_onscreen (&winstate); /* for some reason this isn't happening automatically for me */
+    return wimpt_complain (wimp_create_submenu ((wimp_menustr *)info->saveas_window, winstate.o.box.x0, winstate.o.box.y1)) == NULL;
+  }
+  else
+  { wimp_mousestr mouse;
+    wimpt_noerr (wimp_get_point_info (&mouse));
+    return wimpt_complain (wimp_create_menu ((wimp_menustr *)info->saveas_window, mouse.x-48, mouse.y+48)) == NULL;
+  }
+}
+
+static wimp_w export_create_saveas(int filetype)
+{ wimp_w handle;
+  static BOOL inited_jpegq, inited_pngcomp;
+
+  /* create the export saveas window */
+  template *ptr = template_find (filetype == FileType_PNG ? "save_png" : "save_jpeg");
+  if (ptr == NULL) return -1;
+
+  if (wimpt_complain (wimp_create_wind (&ptr->window, &handle))) return -1;
+
+  /* set up the default entries for PNG or JPEG export if it's the first time, otherwise use previous value */
+  switch (filetype)
+  { case FileType_JPEG:
+      if (!inited_jpegq)
+      { export_set_icon_indir(handle, EXPORTI_JQUALITY, msgs_lookup ("PEQUAL"));
+        inited_jpegq = TRUE;
+      }
+      break;
+
+    case FileType_PNG:
+      if (!inited_pngcomp)
+      { export_set_icon_indir(handle, EXPORTI_PCOMPRESSION, msgs_lookup ("PECOMP"));
+        inited_pngcomp = TRUE;
+      }
+      break;
+  }
+  return handle;
+}
+
+static void export_saveas_event(wimp_eventstr *e, void *handle)
+{ export_info *info = (export_info *)handle;
+
+  switch (e->e)
+  { case wimp_ECLOSE:
+      /* closed externally, so kill menu too */
+      info->finished = TRUE;
+      wimp_create_menu ((wimp_menustr *)-1, 0, 0);
+      break;
+
+    case wimp_EOPEN:
+      wimpt_noerr (wimp_open_wind (&e->data.o));
+      break;
+
+    case wimp_EBUT:
+      /* check for buttons added for export options */
+      if (e->data.but.m.bbits == wimp_BMID) break;
+
+      if (e->data.but.m.i >= EXPORTI_BASE)
+      { int dir = e->data.but.m.bbits == wimp_BLEFT ? 1 : -1;
+        switch (info->export_filetype)
+        { case FileType_PNG:
+            switch (e->data.but.m.i)
+            { case EXPORTI_CDOWN: dir = -dir;
+              case EXPORTI_CUP:
+                export_range_adjust (info->saveas_window, EXPORTI_PCOMPRESSION, dir,
+                                     EXPORTI_PCOMPRESSION_MIN, EXPORTI_PCOMPRESSION_MAX);
+                break;
+            }
+            break;
+
+          case FileType_JPEG:
+            switch (e->data.but.m.i)
+            { case EXPORTI_JDOWN: dir = -dir;
+              case EXPORTI_JUP:
+                export_range_adjust (info->saveas_window, EXPORTI_JQUALITY, dir,
+                                     EXPORTI_JQUALITY_MIN, EXPORTI_JQUALITY_MAX);
+                break;
+            }
+            break;
+        }
+      }
+      else
+      { switch (e->data.but.m.i)
+        { case EXPORTI_OK:
+          if (export_filename_valid (info))
+          { /* ensure we have a compressed image to save if appropriate */
+            switch (info->export_filetype)
+            { case FileType_PNG:
+                if (!export_compress_png(info)) return;
+                break;
+
+              case FileType_JPEG:
+                if (!export_compress_jpeg(info)) return;
+                break;
+            }
+
+            if (export_saveproc (export_get_writeable (info, EXPORTI_FILENAME), info) &&
+                (e->data.but.m.bbits == wimp_BLEFT))
+            { info->finished = TRUE;
+              wimp_create_menu ((wimp_menustr *)-1, 0, 0);
+            }
+          }
+
+          break;
+
+          case EXPORTI_ICON:
+            if (e->data.but.m.bbits == wimp_BDRAGLEFT)
+            { char *filename = export_get_writeable (info, EXPORTI_FILENAME);
+              int i = strlen (filename) - 1;
+
+              /* Trim to just the leaf */
+              while (i > 0 && filename[i] != '.') i--;
+              if (i != 0) i++; /* advance past the dot */
+              filename = &filename[i];
+
+              xfersend_set_fileissafe (TRUE);
+              xfersend(info->export_filetype, filename, export_estsize(info),
+                       export_saveproc, export_sendproc,
+                       export_printproc, e, handle);
+            }
+            break;
+        }
+      }
+      break;
+
+    case wimp_EKEY:
+      wimp_processkey (e->data.key.chcode);
+      break;
+
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+      if (e->data.msg.hdr.action == wimp_MHELPREQUEST)
+      { char token[8],*message;
+        if (e->data.msg.data.helprequest.m.i < EXPORTI_BASE)
+          sprintf (token, "PEH%d", e->data.msg.data.helprequest.m.i); /* common parts of the export window */
+        else
+        { /* these icons change depending on the export format in use */
+          switch (info->export_filetype)
+          { case FileType_JPEG:
+              sprintf (token, "PEJ%d", e->data.msg.data.helprequest.m.i);
+              break;
+
+            case FileType_PNG:
+              sprintf (token, "PEP%d", e->data.msg.data.helprequest.m.i);
+              break;
+
+            default:
+              strcpy (token, "PEH-1");
+              break;
+          }
+        }
+        message = msgs_lookup (token);
+        if (strcmp (message, token) == 0) help_reply (msgs_lookup ("PEH-1"));
+        else help_reply (message);
+      }
+      break;
+  }
+}
+
+/* set up the row buffer */
+static BOOL export_init_rowbuffer(export_info *info)
+{ int size = 4 * info->width;
+
+  if (!flex_alloc ((flex_ptr) &info->rowbuffer, size))
+  { werr (FALSE, msgs_lookup ("PntEG"));
+    return FALSE;
+  }
+  return TRUE;
+}
+
+void export_start(main_sprite *sprite, int file_type)
+{ export_info info;
+  wimp_wstate wstate;
+  char init_filename[12 + 1];
+
+  /* export window for data export */
+  /* create new instance */
+  memset (&info, 0, sizeof(export_info));
+
+  info.sprite          = sprite;
+  info.export_filetype = file_type;
+
+  if (!export_get_source_info (&info)) return;
+
+  if (!export_init_rowbuffer (&info))
+  { if (info.palette) flex_free ((flex_ptr) &info.palette);
+    return;
+  }
+
+  /* create saveas dialogue */
+  info.saveas_window = export_create_saveas (file_type);
+  if (info.saveas_window == -1)
+  { if (info.palette) flex_free ((flex_ptr) &info.palette);
+    flex_free ((flex_ptr) &info.rowbuffer);
+    return;
+  }
+
+  /* initial filename */
+  strncpy (init_filename, psprite_address (sprite)->name, 12);
+  init_filename[12] = '\0';
+  export_set_icon_indir (info.saveas_window, EXPORTI_FILENAME, init_filename);
+
+  /* display saveas dialogue */
+  export_show_saveas (&info);
+
+  win_register_event_handler (info.saveas_window, export_saveas_event, &info);
+
+  xfersend_close_on_xfer (TRUE, info.saveas_window);
+
+  /* wait... */
+  info.finished = FALSE;
+  while (!info.finished)
+  { event_process ();
+    wimpt_noerr (wimp_get_wind_state (info.saveas_window, &wstate));
+    if ((wstate.flags & wimp_WOPEN) == 0) info.finished=TRUE; /* window closed! */
+  }
+
+  win_register_event_handler (info.saveas_window, NULL, &info);
+
+  xfersend_close_on_xfer (FALSE, 0);
+  xfersend_clear_unknowns ();
+
+  wimp_delete_wind (info.saveas_window);
+
+  /* tidy up any export buffer we may have */
+  flex_free ((flex_ptr) &info.rowbuffer);
+
+  if (info.palette)     flex_free ((flex_ptr) &info.palette);
+  if (info.imagebuffer) flex_free ((flex_ptr) &info.imagebuffer);
+}

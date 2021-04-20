@@ -83,11 +83,11 @@ DFILES = \
  debug.${APP}.Sprites\
  debug.${APP}.Templates
 
-OBJS      = o.colourpanel o.colours o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow \
+OBJS      = o.colourpanel o.colours o.Export o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow\
             o.AltRename o.PaintLib o.CnPDrag o.Clipboard o.Drawfile o.PaintChoice
-OBJSZ     = oz.colourpanel oz.colours oz.main oz.menus oz.psprite oz.sprwindow oz.tools\
+OBJSZ     = oz.colourpanel oz.colours oz.Export oz.main oz.menus oz.psprite oz.sprwindow oz.tools\
             oz.toolwindow oz.AltRename oz.PaintLib oz.CnPDrag oz.Clipboard oz.Drawfile oz.PaintChoice
-OBJSD     = od.colourpanel od.colours od.ftrace od.guard od.main od.menus\
+OBJSD     = od.colourpanel od.colours od.Export od.ftrace od.guard od.main od.menus\
             od.psprite od.sprwindow od.tools od.toolwindow o.m\
             od.AltRename od.PaintLib od.CnPDrag od.Clipboard od.Drawfile od.PaintChoice
 
