@@ -1,0 +1,199 @@
+/* Copyright 2019 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @brief memory handling for CompressPNG
+ *
+ * Rather than putting potentially large blocks in the RMA
+ * we use a dynamic area for the compression request store.
+ * We keep a list of dynamic areas and associated task handles so that
+ * if a task dies without tidying up, the workspace can be freed.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "swis.h"
+#include "Global/NewErrors.h"
+#include "Global/OSMem.h"
+#include "Global/Heap.h"
+
+#include "CompressPNGHdr.h"
+#include "module.h"
+#include "memory.h"
+
+static cpngmem *memlist = NULL;
+static int pagesize = 0;
+
+/* Create new dynamic area for the current task and initialise a heap */
+_kernel_oserror *cpngmem_create_area(cpngmem **newmem)
+{
+  _kernel_oserror *e;
+
+  if (pagesize == 0)
+    _swix(OS_Memory, _IN(0)|_OUT(2), OSMemReason_PhysSize, &pagesize);
+
+  *newmem = (cpngmem *) calloc (1, sizeof(cpngmem));
+  if (!*newmem) return report_error (CompressPNG_E_NoMem, "nomem", NULL);
+
+  e = _swix (OS_DynamicArea, _INR(0,8)|_OUT(1)|_OUT(3),
+             DAReason_Create,
+             -1,
+             pagesize,
+             -1,
+             DynAreaFlags_NotUserDraggable,
+             MAX_AREA_SIZE,
+             0,
+             0,
+             "CompressPNG",
+             &((*newmem)->area),
+             &((*newmem)->base));
+
+  if (e)
+    free(*newmem);
+  else
+  { _swix (Wimp_ReadSysInfo, _IN(0)|_OUT(0), 5, &(*newmem)->taskh);
+    (*newmem)->next = memlist;
+    memlist         = *newmem;
+    _swix (OS_Heap, _IN(0)|_IN(1)|_IN(3), HeapReason_Init, (*newmem)->base, pagesize);
+  }
+
+  return e;
+}
+
+/* Release stored space / area */
+_kernel_oserror *cpngmem_free_area(cpngmem *mem)
+{
+  _kernel_oserror *e = NULL;
+  cpngmem *prev      = NULL;
+
+  if (mem != memlist)
+  { for (prev = memlist; prev; prev = prev->next)
+      if (prev->next == mem) break;
+
+    if (!prev)
+      return report_error (CompressPNG_E_BadBlock, "badblock", NULL);
+  }
+
+  /* remove the block from the list */
+  if (prev) prev->next = mem->next; else memlist = mem->next;
+
+  /* remove the area */
+  e = _swix (OS_DynamicArea, _INR(0,1), DAReason_Remove, mem->area);
+
+  /* release the block */
+  free (mem);
+
+  return e;
+}
+
+/* Free all areas held by a particular task */
+void cpngmem_free_task(const int taskh)
+{
+  cpngmem *prev = NULL;
+  cpngmem *mem  = memlist;
+  while (mem)
+  { if (mem->taskh == taskh)
+    { /* free this one */
+      _swix (OS_DynamicArea, _INR(0,1), DAReason_Remove, mem->area);
+
+      /* release block */
+      if (prev) prev->next = mem->next; else memlist = mem->next;
+      free (mem);
+      if (prev) mem = prev->next; else mem = memlist;
+    }
+    else
+    { /* move on */
+      prev = mem;
+      mem  = mem->next;
+    }
+  }
+}
+
+/* Free all areas (ie on module termination) */
+void cpngmem_free_all(void)
+{
+  cpngmem *mem = memlist, *next;
+  while (mem)
+  { next = mem->next;
+    _swix (OS_DynamicArea, _INR(0,1), DAReason_Remove, mem->area);
+    free (mem);
+    mem = next;
+  }
+}
+
+/* Allocate from heap or extend then allocate from heap */
+_kernel_oserror *cpngmem_alloc(const cpngmem *mem, void *block, int length)
+{
+  int **blockaddr = (int **)block;
+  int *heapptr;
+  int size, newsize, changed;
+  _kernel_oserror *e = NULL;
+
+  /* first attempt: see if we can allocate the memory straight off */
+  e = _swix (OS_Heap, _IN(0)|_IN(1)|_IN(3)|_OUT(2), HeapReason_Get, mem->base, length, &heapptr);
+  if (!e && heapptr)
+  { *blockaddr = heapptr;
+    return NULL;
+  }
+
+  /* there was an error other than not enough space, so bail out */
+  if (e && (e->errnum != ErrorNumber_HeapFail_Alloc)) return e;
+
+  /* second attempt: see if we can stretch the heap and try again */
+
+  /* get current area size */
+  _swix (OS_DynamicArea, _INR(0,1)|_OUT(2), DAReason_GetInfo, mem->area, &size);
+
+  /* decide how much more we need */
+  newsize = size + length + 16;
+  newsize = (newsize + pagesize - 1) &~ pagesize;
+  e = _swix (OS_ChangeDynamicArea, _INR(0,1)|_OUT(1), mem->area, newsize - size, &changed);
+  if (e) return e; /* can't extend the dynamic area, bad news */
+
+  /* change the heap size */
+  e = _swix (OS_Heap, _IN(0)|_IN(1)|_IN(3), HeapReason_ExtendHeap, mem->base, changed);
+  if (e) return e; /* can't extend the heap, bad news */
+
+  e = _swix (OS_Heap, _IN(0)|_IN(1)|_IN(3)|_OUT(2), HeapReason_Get, mem->base, length, &heapptr);
+  if (!e) *blockaddr = heapptr;
+
+  return e;
+}
+
+/* Release the block */
+_kernel_oserror *cpngmem_free(const cpngmem *mem, void *block)
+{
+  /* we don't try to shrink the heap - the whole lot gets released at the end */
+  return _swix (OS_Heap, _INR(0,2), HeapReason_Free, mem->base, block);
+}
+
+png_voidp cpngmem_mymalloc(png_structp png_ptr, png_size_t size)
+{
+  _kernel_oserror *e = NULL;
+  cpngmem *mem_ptr = (cpngmem *)png_get_mem_ptr (png_ptr);
+  void *datablock;
+
+  e = cpngmem_alloc (mem_ptr, &datablock, size);
+  if (e) return NULL;
+
+  return datablock;
+}
+
+void cpngmem_myfree(png_structp png_ptr, png_voidp ptr)
+{
+  cpngmem *mem_ptr = (cpngmem *)png_get_mem_ptr (png_ptr);
+  cpngmem_free (mem_ptr, ptr);
+}

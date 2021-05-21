@@ -1,0 +1,550 @@
+/* Copyright 2019 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * @brief CompressPNG module main functions
+ *
+ * This part provides the interface between the libpng functions and the RISC OS API
+ * Note that it currently only interfaces the compression functions
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "swis.h"
+#include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
+
+#include "libpng/png.h"
+
+#include "module.h"
+#include "compresspng_int.h"
+
+/* PNG error handling bits */
+/* When libpng wants to return an error, it will call this and then aborts by longjmp back to the caller. */
+/* We need to preserve the error message so we can export it from the SWI */
+
+/* Holds a pointer to a pending error */
+static char *png_pending_error = NULL;
+
+/* Called by libpng to report an error */
+static void png_riscos_error(png_structp png_ptr, png_const_charp error_message)
+{
+  /* take a copy of the error for returning */
+  png_pending_error = (char *) error_message;
+
+  /* abort in the same way as libpng does - it isn't expecting a return from here */
+  png_longjmp (png_ptr, 1);
+}
+
+/* Called by libpng to report a warning.  Normally this would display a console message or similar; */
+/* we don't have that sort of option at present, so we quietly dispose of the message */
+static void png_riscos_warning(png_structp png_ptr, png_const_charp warning_message)
+{
+  /* quietly absorb any warnings */
+  IGNORE(png_ptr);
+  IGNORE(warning_message);
+}
+
+/* Temporary store for error message as we don't have a static stored one to refer to */
+static char png_write_error[128];
+
+/* Called by libpng to write data to a stream */
+static void png_user_write_data(png_structp png_ptr, png_bytep data, png_uint_32 length)
+{
+  png_opt *opt = (png_opt *) png_get_io_ptr (png_ptr);
+
+  switch (opt->destination)
+  { case output_to_buffer:
+      if (opt->write_offset + length > opt->dest_length)
+      {
+        /* output overflowed */
+        messagetrans_lookup ("buffer", png_write_error, 128);
+        png_error (png_ptr, png_write_error); /* exits function for us - does not return */
+      }
+      memcpy (opt->dest.dest_buffer + opt->write_offset, data, length);
+
+      /* drop through */
+
+    case calc_output_buffer_size:
+      opt->write_offset += length;
+      break;
+
+    case output_to_file:
+      if (fwrite (data, 1, length, opt->dest.handle) != length) {
+        _kernel_oserror *e = _kernel_last_oserror ();
+        if (e)
+          png_error(png_ptr, e->errmess);
+        else
+        { messagetrans_lookup ("writefail", png_write_error, 128);
+          png_error (png_ptr, png_write_error);
+        }
+      }
+      opt->write_offset += length;
+      break;
+  }
+}
+
+/* We don't need to do this, so an empty function is supplied */
+static void png_user_flush_data(png_structp png_ptr)
+{
+  IGNORE(png_ptr);
+}
+
+/* close and delete a file when the output is not valid (ie error during compression) */
+static void fclose_and_remove(png_opt *opt)
+{
+  fclose (opt->dest.handle);
+  if (opt->dest_filename) _swix(OS_File, _INR(0,1), OSFile_Delete, opt->dest_filename);
+}
+
+/* close and set the filetype of the file when all done */
+static _kernel_oserror *fclose_and_settype(png_opt *opt)
+{
+  _kernel_oserror *e;
+
+  fclose (opt->dest.handle);
+  e = _swix (OS_File, _INR(0,2), OSFile_SetType, opt->dest_filename, FileType_PNG);
+  if (e) _swix(OS_File, _INR(0,1), OSFile_Delete, opt->dest_filename);
+
+  return e;
+}
+
+/* Check to see if a tag pointer is valid */
+/* check if the data block would fall completely inside valid memory */
+/* if so, check the magic word to ensure it's OK */
+_kernel_oserror *compresspng_tag_valid(int tag)
+{
+  _kernel_swi_regs r;
+  int carry;
+
+  r.r[0] = tag;
+  r.r[1] = tag + sizeof(png_opt);
+  _kernel_swi_c (OS_ValidateAddress, &r, &r, &carry);
+
+  if (carry) return report_error (CompressPNG_E_BadTag, "badtag", NULL);
+
+  return ((png_opt *)tag)->magic == _tag_valid ? NULL : report_error (CompressPNG_E_BadTag, "badtag", NULL);
+}
+
+/* Return log2 of the number of colours, or -1 if out of range for a palette depth */
+static int bit_depth(int colours)
+{
+  switch (colours)
+  { case 2:   return 1;
+    case 4:   return 2;
+    case 16:  return 4;
+    case 256: return 8;
+    default:  return -1;
+  }
+}
+
+/* Start PNG compression.  Allocate store and prepare to receive image data */
+_kernel_oserror *compresspng_start(_kernel_swi_regs *r)
+{
+  char *dest = (char *) r->r[0];
+  int destlen = r->r[1];
+  int i;
+  int png_colour;
+  int pixel_size;
+  int png_interlace = PNG_INTERLACE_NONE;
+  compresspng_str *block = (compresspng_str *) r->r[2];
+  png_opt *opt;
+  _kernel_oserror *e = NULL;
+  cpngmem *mem;
+
+  /* we need ZLib if we're going to do any compression */
+  if (_swix (OS_SWINumberFromString, _IN(1), "ZLib_Compress"))
+  { messagetrans_lookup ("nozlib", png_write_error, 128);
+    return report_error (CompressPNG_E_InitX2, "pnginitx2", png_write_error);
+  }
+
+  /* create a dynamic area to handle the libpng workspace bits */
+  e = cpngmem_create_area (&mem);
+  if (e) return e;
+
+  e = cpngmem_alloc (mem, &opt, sizeof(png_opt));
+  if (e)
+  { cpngmem_free_area (mem);
+    return report_error (CompressPNG_E_NoMem, "nomem", NULL);
+  }
+
+  memset (opt, 0, sizeof(png_opt));
+
+  opt->magic = _tag_valid;
+
+  opt->mem = mem;
+
+  opt->png_ptr = png_create_write_struct (PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+  if (opt->png_ptr == NULL)
+  { cpngmem_free (mem, opt);
+    cpngmem_free_area (mem);
+    return report_error (CompressPNG_E_NoMem, "nomem", NULL);
+  }
+
+  /* override default libpng error handler */
+  png_set_error_fn (opt->png_ptr, NULL, png_riscos_error, png_riscos_warning);
+
+  /* override default libpng memory handler */
+  png_set_mem_fn (opt->png_ptr, mem, cpngmem_mymalloc, cpngmem_myfree);
+
+  opt->info_ptr = png_create_info_struct (opt->png_ptr);
+  if (opt->info_ptr == NULL)
+  { png_destroy_write_struct (&opt->png_ptr, (png_infopp)NULL);
+    cpngmem_free (mem, opt);
+    cpngmem_free_area (mem);
+    return report_error (CompressPNG_E_NoMem, "nomem", NULL);
+  }
+
+  /* determine output destination */
+  if (block->flags & CompressPNG_Flags_ToFile)
+  { opt->destination = output_to_file;
+    e = cpngmem_alloc(opt->mem, &opt->dest_filename, 1 + strlen(dest));
+    if (e) goto abort_png;
+
+    /* preserve the filename for later */
+    strcpy (opt->dest_filename, dest);
+
+    opt->dest.handle = fopen (dest, "wb");
+    if (opt->dest.handle == NULL)
+    { png_destroy_write_struct(&opt->png_ptr, (png_infopp)NULL);
+      cpngmem_free (mem, opt);
+      cpngmem_free_area (mem);
+      return _kernel_last_oserror();
+    }
+  }
+  else
+  { opt->dest_filename = NULL;
+    if (destlen == 0)
+      opt->destination = calc_output_buffer_size;
+    else
+    { opt->destination = output_to_buffer;
+      opt->dest.dest_buffer = dest;
+      opt->dest_length = destlen;
+    }
+  }
+
+  png_set_write_fn (opt->png_ptr, opt, png_user_write_data, png_user_flush_data);
+
+  if (setjmp (png_jmpbuf (opt->png_ptr))) {
+    goto abort_png;
+  }
+
+  /* we don't get the right effect if XDPI != YDPI, so set both to the same and duplicate rows later */
+  opt->rowdup = block->x_dpi / block->y_dpi; /* number of times to dup a row */
+  if (opt->rowdup < 1) opt->rowdup = 1;
+  opt->height = block->height * opt->rowdup;
+
+  /* determine colour types and alpha channel information */
+  if (block->flags & CompressPNG_Flags_Greyscale)
+  { if (block->flags & CompressPNG_Flags_HasAlpha)
+    { png_colour = PNG_COLOR_TYPE_GRAY_ALPHA;
+      pixel_size = 2;
+    }
+    else
+    { png_colour = PNG_COLOR_TYPE_GRAY;
+      pixel_size = 1;
+    }
+  }
+  else
+  { if (block->flags & CompressPNG_Flags_HasAlpha)
+    { png_colour = PNG_COLOR_TYPE_RGB_ALPHA;
+      pixel_size = 4;
+    }
+    else
+    { png_colour = PNG_COLOR_TYPE_RGB;
+      pixel_size = 3;
+    }
+  }
+
+  /* RGB0 or G0 input */
+  if ((block->flags & CompressPNG_Flags_SkipAlpha) && !(block->flags & CompressPNG_Flags_HasAlpha)) {
+    opt->filler = 1; /* we can't request a filler function yet, so note this for later */
+    pixel_size += 1;
+  }
+
+  opt->palette_bits = 8; /* default bit depth is 8 unless overridden by a palette */
+
+  /* look for a palette option */
+  for (i = 0; block->parameter[i].parameter != png_param_end_of_list; i++)
+  { if (block->parameter[i].parameter == png_param_palette)
+    { if ((block->flags & CompressPNG_Flags_HasAlpha) || (block->flags & CompressPNG_Flags_SkipAlpha))
+      { messagetrans_lookup ("noalfapal", png_write_error, 128); /* we don't support palettised images with an alpha channel */
+        png_pending_error = png_write_error;
+        goto abort_png;
+      }
+
+      opt->palette_bits = bit_depth(block->parameter[i].param.palette.size);
+      if (opt->palette_bits == -1)
+      { messagetrans_lookup ("badbits", png_write_error, 128); /* only 2, 4, 16, 256 colours permitted in a palette */
+        png_pending_error = png_write_error;
+        goto abort_png;
+      }
+
+      png_colour = PNG_COLOR_TYPE_PALETTE;
+      pixel_size = 1;
+
+      png_set_PLTE (opt->png_ptr, opt->info_ptr, (png_colorp)block->parameter[i].param.palette.palettedata, block->parameter[i].param.palette.size);
+    }
+  }
+
+  /* set resolution */
+  /* 3936 converts dpi to dots per metre */
+  png_set_pHYs (opt->png_ptr, opt->info_ptr, (block->x_dpi * 3936) / 100, (block->x_dpi * 3936) / 100, PNG_RESOLUTION_METER);
+
+  /* set remaining options */
+  for (i=0; block->parameter[i].parameter != png_param_end_of_list; i++)
+    switch (block->parameter[i].parameter)
+    { case png_param_text_comment:
+      { png_text comment;
+        comment.compression = PNG_TEXT_COMPRESSION_NONE;
+        comment.key         = block->parameter[i].param.text.key;
+        comment.text        = block->parameter[i].param.text.value;
+        png_set_text (opt->png_ptr, opt->info_ptr, &comment, 1);
+        break;
+      }
+
+      case png_param_gamma:
+        png_set_gAMA_fixed (opt->png_ptr, opt->info_ptr, (int)(block->parameter[i].param.value_d * 100000));
+        break;
+
+      case png_param_compression:
+        png_set_compression_level (opt->png_ptr, block->parameter[i].param.value_i);
+        break;
+
+      case png_param_interlace:
+        if (block->parameter[i].param.value_i == 1)
+        { int row;
+          opt->interlaced = 1;
+          png_interlace = PNG_INTERLACE_ADAM7;
+          opt->stride = pixel_size * block->width;
+
+          /* work out buffer size that we need to hold the whole lot */
+          e = cpngmem_alloc (mem, &opt->row_ptrs, sizeof(png_bytep) * block->height * opt->rowdup);
+          if (!e) e = cpngmem_alloc (mem, &opt->full_source, opt->stride * block->height * opt->rowdup);
+          if (e) goto abort_png;
+
+          /* initialise row pointers */
+          for (row = 0; row < block->height * opt->rowdup; row++)
+            opt->row_ptrs[row] = opt->full_source + row * opt->stride;
+        }
+        break;
+
+      case png_param_transparency:
+        if (block->parameter[i].param.transparency.size > (1 << opt->palette_bits))
+        { messagetrans_lookup ("badtrns", png_write_error, 128); /* only 2, 4, 16, 256 colours permitted in a palette */
+          png_pending_error = png_write_error;
+          goto abort_png;
+        }
+
+        png_set_tRNS (opt->png_ptr, opt->info_ptr,
+                      (png_bytep) block->parameter[i].param.transparency.transdata,
+                      block->parameter[i].param.transparency.size, NULL);
+        break;
+    }
+
+  png_set_IHDR (opt->png_ptr, opt->info_ptr, block->width, block->height * opt->rowdup,
+                opt->palette_bits, png_colour, png_interlace, PNG_COMPRESSION_TYPE_BASE, PNG_FILTER_TYPE_BASE);
+
+  opt->width = block->width;
+
+  /* returns tag address in R0 */
+  r->r[0] = (int) opt;
+
+  return NULL;
+
+abort_png:
+  if (opt->destination == output_to_file) fclose_and_remove (opt);
+  if (opt->dest_filename) cpngmem_free (mem, opt->dest_filename);
+  if (opt->info_ptr) png_free_data (opt->png_ptr, opt->info_ptr, PNG_FREE_ALL, -1);
+  if (opt->png_ptr)  png_destroy_write_struct (&opt->png_ptr, (png_infopp)NULL);
+  if (opt->row_ptrs) cpngmem_free (mem, opt->row_ptrs);
+  if (opt->full_source) cpngmem_free (mem, opt->full_source);
+  cpngmem_free (mem, opt);
+
+  if (png_pending_error)
+  { e = report_error (CompressPNG_E_InitX2, "pnginitx2", png_pending_error, NULL);
+    png_pending_error = NULL;
+  }
+  else
+    if (e == NULL) e = report_error (CompressPNG_E_InitX, "pnginitx", NULL);
+
+  cpngmem_free_area (mem);
+  return e;
+}
+
+/* Add a textual comment to a PNG image */
+_kernel_oserror *compresspng_comment(_kernel_swi_regs *r)
+{
+  png_opt *png = (png_opt *) r->r[0];
+  png_text comment;
+  _kernel_oserror *e = NULL;
+
+  if (setjmp (png_jmpbuf (png->png_ptr))) goto abort_png;
+
+  comment.compression = PNG_TEXT_COMPRESSION_NONE;
+  comment.key         = (char *) r->r[1];
+  comment.text        = (char *) r->r[2];
+  png_set_text (png->png_ptr, png->info_ptr, &comment, 1);
+
+  return NULL;
+
+abort_png:
+  if (png_pending_error)
+  { e = report_error (CompressPNG_E_CommentX2, "commentx2", png_pending_error, NULL);
+    png_pending_error = NULL;
+  }
+  else
+    e=report_error (CompressPNG_E_CommentX, "commentx", NULL);
+
+  png->error_state = 1;
+
+  return e;
+}
+
+/* Add a line of image data to the PNG */
+_kernel_oserror *compresspng_writeline(_kernel_swi_regs *r)
+{
+  png_opt *opt = (png_opt *) r->r[0];
+  int rowcount;
+  _kernel_oserror *e=NULL;
+  png_bytep rowbuffer = (png_bytep) r->r[1];
+
+  if (setjmp (png_jmpbuf (opt->png_ptr))) goto abort_png;
+
+  if (!opt->info_written)
+  { png_write_info (opt->png_ptr, opt->info_ptr);
+    opt->info_written = 1;
+    if (opt->filler) png_set_filler (opt->png_ptr, 0, PNG_FILLER_AFTER);
+  }
+
+  if (opt->palette_bits < 8)
+  { /* compact the stream by combining pixels into bytes */
+    int src, dest;
+    for (src = 0, dest = 0; src < opt->width; src += 8 / opt->palette_bits, dest += 1)
+    { switch (opt->palette_bits)
+      { case 1:
+          *(dest + rowbuffer) = (*(src + rowbuffer + 0) << 7) | (*(src + rowbuffer + 1) << 6) |
+                                (*(src + rowbuffer + 2) << 5) | (*(src + rowbuffer + 3) << 4) |
+                                (*(src + rowbuffer + 4) << 3) | (*(src + rowbuffer + 5) << 2) |
+                                (*(src + rowbuffer + 6) << 1) | (*(src + rowbuffer + 7) << 0);
+          break;
+
+        case 2:
+          *(dest + rowbuffer) = (*(src + rowbuffer + 0) << 6) | (*(src + rowbuffer + 1) << 4) |
+                                (*(src + rowbuffer + 2) << 2) | (*(src + rowbuffer + 3) << 0);
+          break;
+
+        case 4:
+          *(dest + rowbuffer) = (*(src + rowbuffer + 0) << 4) | (*(src + rowbuffer + 1) << 0);
+          break;
+      }
+    }
+  }
+
+  /* if interlaced, store for a full write later; otherwise add the row data to the PNG itself */
+  for (rowcount=0; rowcount<opt->rowdup; rowcount++)
+  { if (opt->current_row >= opt->height) return report_error (CompressPNG_E_ManyRows, "manyrows", NULL);
+    if (opt->interlaced)
+      memcpy (opt->row_ptrs[opt->current_row], rowbuffer, opt->stride);
+    else
+      png_write_row (opt->png_ptr, rowbuffer);
+
+    opt->current_row++;
+  }
+
+  return NULL;
+
+abort_png:
+  if (png_pending_error)
+  { e = report_error (CompressPNG_E_OptFail2, "optfail2", png_pending_error, NULL);
+    png_pending_error = NULL;
+  }
+  else
+    e = report_error (CompressPNG_E_OptFail, "optfail", NULL);
+
+  opt->error_state = 1;
+
+  return e;
+}
+
+/* Finalise the PNG output and then tidy up any allocated buffers etc */
+_kernel_oserror *compresspng_finish(_kernel_swi_regs *r)
+{
+  _kernel_oserror *e = NULL;
+  png_opt *opt = (png_opt *) r->r[0];
+  cpngmem *mem = opt->mem;
+
+  if (opt->current_row < opt->height)
+  { e = report_error (CompressPNG_E_FewRows, "fewrows", NULL);
+    opt->error_state = 1;
+    goto finish_png;
+  }
+
+  if (setjmp (png_jmpbuf (opt->png_ptr)))
+  { if (png_pending_error)
+    { e = report_error (CompressPNG_E_OptFail2, "optfail2", png_pending_error, NULL);
+      png_pending_error = NULL;
+    }
+    else
+      e = report_error(CompressPNG_E_OptFail, "optfail", NULL);
+
+    opt->error_state = 1;
+
+    goto finish_png;
+  }
+
+  if (opt->interlaced) png_write_image (opt->png_ptr, opt->row_ptrs); /* finally write out the interlaced image */
+
+  png_write_end (opt->png_ptr, NULL);
+
+finish_png:
+  /* close everything down */
+  switch (opt->destination)
+  { case output_to_file:
+      if (opt->dest.handle)
+      { if (opt->error_state)
+          fclose_and_remove (opt);
+        else
+          e = fclose_and_settype (opt);
+        opt->dest.handle = NULL;
+      }
+      break;
+
+    case calc_output_buffer_size:
+      r->r[0] = 0;
+      r->r[1] = opt->write_offset;
+      break;
+
+    case output_to_buffer:
+      r->r[0] = (int) opt->dest.dest_buffer;
+      r->r[1] = opt->write_offset;
+      break;
+  }
+
+  /* tidy up libpng */
+  png_free_data (opt->png_ptr, opt->info_ptr, PNG_FREE_ALL, -1);
+  png_destroy_write_struct (&opt->png_ptr, (png_infopp)NULL);
+
+  /* free our workspace bit */
+  if (opt->dest_filename) cpngmem_free (mem, opt->dest_filename);
+  if (opt->row_ptrs) cpngmem_free (mem, opt->row_ptrs);
+  if (opt->full_source) cpngmem_free (mem, opt->full_source);
+  cpngmem_free (mem, opt);
+
+  cpngmem_free_area (mem);
+
+  return e;
+}
