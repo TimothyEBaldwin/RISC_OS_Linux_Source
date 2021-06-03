@@ -88,6 +88,11 @@ install_rom: ${ROM_TARGET}
 	${CP} ${ROM_TARGET} ${INSTDIR}.${TARGET} ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: rom module installed
 
+rom_link: ${ROM_TARGET}
+	${MKDIR} ${LINKDIR}
+	${CP} ${ROM_TARGET} ${LINKDIR}.${TARGET} ${CPFLAGS}
+	@${ECHO} ${COMPONENT}: rom_link complete
+
 rom: ${ROM_TARGET}
 	@${ECHO} ${COMPONENT}: rom module built
 
