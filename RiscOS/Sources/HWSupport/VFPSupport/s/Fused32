@@ -1,0 +1,166 @@
+;
+; Copyright (c) 2005-2011 David Schultz <das@FreeBSD.ORG>
+; Copyright (c) 2021 RISC OS Open Limited
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 1. Redistributions of source code must retain the above copyright
+;    notice, this list of conditions and the following disclaimer.
+; 2. Redistributions in binary form must reproduce the above copyright
+;    notice, this list of conditions and the following disclaimer in the
+;    documentation and/or other materials provided with the distribution.
+;
+; THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+; SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:VFPSupport
+
+;
+; Constraints in this translation of the original:
+; * PRESERVE8 stack alignment
+; * Only use D0-D15 to allow for D16 VFP units
+; * Flush to zero is off
+; One day we might be able to write this in C...
+;
+
+        EXPORT  fused32_muladd
+        IMPORT  RaiseException
+
+        AREA    |fused$$Code|, CODE, READONLY, PIC
+        ARM
+
+x       DN 0
+y       DN 1
+z       DN 2
+xy      DN 0
+result  DN 3
+adjresult DN 4
+test    DN 4
+lo      RN 2
+hi      RN 3
+
+        ; float fused32_muladd(float x, float y, float z)
+        ; Compute z + (x * y) with a single rounding error.
+fused32_muladd
+        Push    "v1, lr"
+
+        VMOV    a1, s0
+        VMOV    a2, s1
+        VMOV    a4, s2
+        LDR     ip, =&FF:SHL:23         ; INF
+        MOV     v1, #0                  ; Nothing exceptional
+        BIC     a1, a1, #1:SHL:31
+        BIC     a2, a2, #1:SHL:31
+        BIC     a3, a4, #1:SHL:31
+
+        ; Handle special cases
+        CMP     a1, ip
+        CMPEQ   a2, #0
+        BEQ     %FT10
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        BNE     %FT20
+10
+        ; x = ±INF and y = ±0, or
+        ; x = ±0   and y = ±INF
+        CMP     a3, ip
+        MOVLS   v1, #FPSCR_IOC          ; z is not a NaN
+        B       %FT30
+20
+        CMP     a3, ip
+        BNE     %FT30                   ; z is not ±INF
+        VMUL.F32 s7, s0, s1
+        VMOV    a1, s7
+        EOR     a2, a1, a4
+        TEQ     a2, #1:SHL:31
+        MOVEQ   v1, #FPSCR_IOC          ; x * y is INF and z is INF, but of opposite sign
+30
+        ; A double has more than twice as much precision than a float, so
+        ; direct double-precision arithmetic suffices, except where double
+        ; rounding occurs.
+        VCVT.F64.F32 z, s2              ; z
+        VCVT.F64.F32 y, s1              ; y
+        VCVT.F64.F32 x, s0              ; x
+        ; xy = (double)x * y;
+        ; result = xy + z;
+        ; EXTRACT_WORDS(hi, lo, result);
+        VMUL.F64 xy, x, y
+        VADD.F64 result, xy, z
+        VMOV    lo, hi, result
+
+        ; Common case: The double precision result is fine.
+        ; if ((lo & 0x1fffffff) != 0x10000000 ||
+        ;     (hi & 0x7ff00000) == 0x7ff00000 ||
+        ;     result - xy == z ||
+        ;     fegetround() != FE_TONEAREST)
+        ;     return (result);
+        BIC     a1, lo, #&E0000000
+        TEQ     a1, #&10000000          ; Not a halfway case
+        BNE     %FT40
+
+      [ NoARMT2
+        MOV     a1, hi, LSL #1
+        MOV     a1, a1, ASR #21
+      |
+        SBFX    a1, hi, #20, #11
+      ]
+        CMP     a1, #-1                 ; NaN or INF
+        BEQ     %FT40
+
+        VSUB.F64 test, result, xy
+        VCMP.F64 test, z                ; Exact?
+        VMRS    APSR_nzcv, FPSCR
+        BEQ     %FT40
+
+        VMRS    a1, FPSCR
+        ASSERT  FPSCR_RMODE_NEAREST = 0
+        TST     a1, #FPSCR_RMODE_MASK   ; Non standard rounding
+        BNE     %FT40
+
+        ; If result is inexact, and exactly halfway between two float values,
+        ; we need to adjust the low-order bit in the direction of the error.
+        ASSERT  FPSCR_RMODE_ZERO = FPSCR_RMODE_MASK
+        ORR     a2, a1, #FPSCR_RMODE_ZERO
+        ; fesetround(FE_TOWARDZERO);
+        ; double adjresult = xy + z;
+        ; fesetround(FE_TONEAREST);
+        VMSR    FPSCR, a2
+        VADD.F64 adjresult, xy, z
+        VMSR    FPSCR, a1
+        ; if (result == adjusted_result)
+        ;     SET_LOW_WORD(adjusted_result, lo + 1);
+        VCMP.F64 result, adjresult
+        VMRS    APSR_nzcv, FPSCR
+        ADDEQ   lo, lo, #1
+        VMOVEQ  adjresult, lo, hi
+        ; return (adjusted_result);
+        VMOV.F64 result, adjresult
+40
+        VMRS    a1, FPSCR
+        BIC     a1, a1, #FPSCR_CUMULATIVE_FLAGS
+        VMSR    FPSCR, a1
+        VCVT.F32.F64 s0, result
+        VMRS    a1, FPSCR               ; Check on over/underflow situation
+        AND     a1, a1, #FPSCR_OFC:OR:FPSCR_UFC
+        ORRS    a1, a1, v1              ; Combine with invalid exceptions
+        BLNE    RaiseException
+        Pull    "v1, pc"
+
+        END

@@ -1,0 +1,467 @@
+/*
+ * Copyright (c) 2021 RISC OS Open Limited
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdio.h>
+#include <time.h>
+#include <float.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include "swis.h"
+
+#define TIMING      0 /* Timing mode (else accuracy mode) */
+#define TIMING_RUNS 100L*1000*1000
+
+#define NUM_S_SIGN_BITS   1
+#define NUM_S_EXPC_BITS   2
+#define NUM_S_EXPC        (1<<NUM_S_EXPC_BITS)
+#define NUM_S_EXPW_BITS   6
+#define NUM_S_FRAC_BITS   23
+#define NUM_S_SPECIALS    4 /* QNaN SNaN +INF -INF */
+#define NUM_S_TESTVECTORS ((1+NUM_S_SIGN_BITS) * NUM_S_EXPC * (1+NUM_S_EXPW_BITS) * (1+NUM_S_FRAC_BITS) + NUM_S_SPECIALS)
+
+#define NUM_D_SIGN_BITS   1
+#define NUM_D_EXPC_BITS   2
+#define NUM_D_EXPC        (1<<NUM_D_EXPC_BITS)
+#define NUM_D_EXPW_BITS   9
+#define NUM_D_FRAC_BITS   20
+#define NUM_D_SPECIALS    4 /* QNaN SNaN +INF -INF */
+#define NUM_D_TESTVECTORS ((1+NUM_D_SIGN_BITS) * NUM_D_EXPC * (1+NUM_D_EXPW_BITS) * (1+NUM_D_FRAC_BITS) + NUM_D_SPECIALS)
+
+#define VFPSupport_CreateContext  0x58EC1
+#define VFPSupport_DestroyContext 0x58EC2
+#define FPSCR_IOC                 (1 << 0)
+#define FPSCR_DZC                 (1 << 1)
+#define FPSCR_OFC                 (1 << 2)
+#define FPSCR_UFC                 (1 << 3)
+#define FPSCR_IXC                 (1 << 4)
+#define FPSCR_IDC                 (1 << 7)
+
+extern uint32_t norcroft_native_fmaf(uint32_t,uint32_t,uint32_t);
+extern uint32_t norcroft_emu_fmaf(uint32_t,uint32_t,uint32_t);
+extern uint32_t norcroft_overheadf(uint32_t,uint32_t,uint32_t);
+extern float    softfmaf(float,float,float);
+extern uint64_t norcroft_native_fma(uint64_t,uint64_t,uint64_t);
+extern uint64_t norcroft_emu_fma(uint64_t,uint64_t,uint64_t);
+extern uint64_t norcroft_overhead(uint64_t,uint64_t,uint64_t);
+extern double   softfma(double,double,double);
+
+uint8_t soft_fpscr; /* Exception simulation */
+
+typedef struct
+{
+    uint32_t f :NUM_S_FRAC_BITS;
+    uint32_t ew:NUM_S_EXPW_BITS;
+    uint32_t ec:NUM_S_EXPC_BITS;
+    uint32_t s :NUM_S_SIGN_BITS;
+} fp32_t;
+
+typedef struct
+{
+    uint32_t x, y, z;
+    uint8_t  mask, flags;
+} ex32_t;
+
+typedef struct
+{
+    uint32_t f :NUM_D_FRAC_BITS;
+    uint32_t ew:NUM_D_EXPW_BITS;
+    uint32_t ec:NUM_D_EXPC_BITS;
+    uint32_t s :NUM_D_SIGN_BITS;
+    uint32_t lo; /* FPA word order */
+} fp64_t;
+
+typedef struct
+{
+    uint64_t x, y, z;
+    uint8_t  mask, flags;
+} ex64_t;
+
+static float  *tests;
+static double *testd;
+
+/* Generate some test vectors based on a walking 1 pattern.
+ * Note the patterns include 0 and some subnormals, NaN and INF are appended later.
+ * The exponents are swept in 2 parts to get a range from small to large
+ * numbers without the total number of tests getting out of hand.
+ */
+static void testvectors(void)
+{
+    size_t s, w, f, c, i;
+    uint32_t sb, wb, fb;
+
+    /* Single precision */
+    tests = malloc(sizeof(float) * NUM_S_TESTVECTORS);
+    if (tests == NULL) exit(EXIT_FAILURE);
+    i = 0;
+    for (s = 0, sb = 1; s <= NUM_S_SIGN_BITS; s++)
+    {
+        for (c = 0; c < NUM_S_EXPC; c++)
+        {
+            for (w = 0, wb = 1; w <= NUM_S_EXPW_BITS; w++)
+            {
+                for (f = 0, fb = 1; f <= NUM_S_FRAC_BITS; f++)
+                {
+                    fp32_t value;
+
+                    value.s  = sb;
+                    value.ec = c;
+                    value.ew = wb;
+                    value.f  = fb;
+#ifdef DEBUG
+                    printf("Test vector s%i %f\n", i, *(float *)&value);
+#endif
+                    tests[i] = *(float *)&value;
+                    i++;
+                    fb <<= 1;
+                }
+                wb <<= 1;
+            }
+        }
+        sb <<= 1;
+    }
+    for (s = 0; s < NUM_S_SPECIALS; s++)
+    {
+        static const uint32_t specials[] = { 0x7F800001, /* SNaN */
+                                             0x7FC00666, /* QNaN */
+                                             0x7F800000, /* +INF */
+                                             0xFF800000  /* -INF */
+                                           };
+        tests[i + s] = *(float *)&specials[s];
+    }
+
+    /* Double precision */
+    testd = malloc(sizeof(double) * NUM_D_TESTVECTORS);
+    if (testd == NULL) exit(EXIT_FAILURE);
+    i = 0;
+    for (s = 0, sb = 1; s <= NUM_D_SIGN_BITS; s++)
+    {
+        for (c = 0; c < NUM_D_EXPC; c++)
+        {
+            for (w = 0, wb = 1; w <= NUM_D_EXPW_BITS; w++)
+            {
+                for (f = 0, fb = 1; f <= NUM_D_FRAC_BITS; f++)
+                {
+                    fp64_t value;
+
+                    value.s  = sb;
+                    value.ec = c;
+                    value.ew = wb;
+                    value.f  = fb;
+                    value.lo = 0;
+#ifdef DEBUG
+                    printf("Test vector d%i %lf\n", i, *(double *)&value);
+#endif
+                    testd[i] = *(double *)&value;
+                    i++;
+                    fb <<= 1;
+                }
+                wb <<= 1;
+            }
+        }
+        sb <<= 1;
+    }
+    for (s = 0; s < NUM_D_SPECIALS; s++)
+    {
+        static const uint64_t specials[] = { 0x7FF0000000000001LL, /* SNaN */
+                                             0x7FF8000000000666LL, /* QNaN */
+                                             0x7FF0000000000000LL, /* +INF */
+                                             0xFFF0000000000000LL  /* -INF */
+                                           };
+        testd[i + s] = *(double *)&specials[s];
+    }
+}
+
+static void test32(void)
+{
+    float    x, y, z;
+    uint32_t res1, res2; /* For tortured FPA single to integer conversions */
+#if TIMING
+    float    res3;
+    size_t   i;
+    clock_t  t1, t2, t3, t4, start;
+
+    x = 200.0f; y = 42.0f; z = 1e-5f;
+
+    /* Using the VFMA.F32 instruction */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        res1 = norcroft_native_fmaf(*(uint32_t *)&x, *(uint32_t *)&y, *(uint32_t *)&z);
+    }
+    t1 = clock() - start;
+
+    /* Using a longhand emulation FMA function */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        res2 = norcroft_emu_fmaf(*(uint32_t *)&x, *(uint32_t *)&y, *(uint32_t *)&z);
+    }
+    t2 = clock() - start;
+
+    /* Using fmaf() in the CLib */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        res3 = (fmaf)(x, y, z); /* Brackets to stop it being inlined */
+    }
+    t3 = clock() - start;
+
+    /* Using a dummy function to time loop overheads */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        norcroft_overhead(*(uint32_t *)&x, *(uint32_t *)&y, *(uint32_t *)&z);
+    }
+    t4 = clock() - start;
+
+    printf("Single precision\n");
+    printf("Native HW result    %f %dcs\n", *(float *)&res1, t1 - t4);
+    printf("Longhand VFP result %f %dcs\n", *(float *)&res2, t2 - t4);
+    printf("C library result    %f %dcs\n\n", res3, t3 - t4);
+#else
+    size_t xx, yy, zz, diffs = 0, exc = 0;
+
+    for (xx = 0; xx < NUM_S_TESTVECTORS; xx++)
+    {
+        x = tests[xx];
+        for (yy = 0; yy < NUM_S_TESTVECTORS; yy++)
+        {
+            y = tests[yy];
+            for (zz = 0; zz < NUM_S_TESTVECTORS; zz++)
+            {
+                z = tests[zz];
+                res1 = norcroft_native_fmaf(*(uint32_t *)&x, *(uint32_t *)&y, *(uint32_t *)&z);
+                res2 = norcroft_emu_fmaf(*(uint32_t *)&x, *(uint32_t *)&y, *(uint32_t *)&z);
+                if (res1 != res2)
+                {
+                    bool qnan1 = (res1 & 0x7FC00000) == 0x7FC00000,
+                         qnan2 = (res2 & 0x7FC00000) == 0x7FC00000;
+                    if (qnan1 && qnan2)
+                    {
+                        /* Just different low bits in QNaN */
+                    }
+                    else
+                    {
+                        printf("  Difference HW:%08x Emu:%08x (iteration %u.%u.%u)\n", res1, res2, xx, yy, zz);
+#ifdef DEBUG
+                        /* Careful not to print unprintable x/y/z values in case of exception */
+                        printf("             %08x * %08x + %08x\n", *(uint32_t*)&tests[xx],
+                                                                    *(uint32_t*)&tests[yy],
+                                                                    *(uint32_t*)&tests[zz]);
+#endif
+                        diffs++;
+                    }
+                }
+            }
+        }
+        printf("Done %u%% of %u, %u diffs\n", (100 * xx) / NUM_S_TESTVECTORS, NUM_S_TESTVECTORS, diffs);
+    }
+    if (diffs) printf("%u differences found\n", diffs);
+
+    /* Check exceptional values
+     * When presented with these inputs the following exceptions /shall/ be raised.
+     * The return value itself isn't checked because we already fed these numbers in earlier.
+     * Only the required exception is tested here, other exceptions such as overflow /may/ be raised too if appropriate.
+     */
+    for (xx = 0; xx < 16; xx++)
+    {
+        static ex32_t test[16] = {          /* x           y           z           mask       expect    */
+        /* +HUGE * +2    + ANY = overflow */ { 0x7F7FFFFF, 0x40000000, 0x3F800000, FPSCR_OFC, FPSCR_OFC },
+        /* -HUGE * +2    + ANY = overflow */ { 0xFF7FFFFF, 0x40000000, 0x3F800000, FPSCR_OFC, FPSCR_OFC },
+        /* +2    * +2    + 1   = OK       */ { 0x40000000, 0x40000000, 0x3F800000, FPSCR_OFC, 0         },
+        /* -2    * +2    + 1   = OK       */ { 0xC0000000, 0x40000000, 0x3F800000, FPSCR_OFC, 0         },
+
+        /* +INF  * +0    + ANY = invalid  */ { 0x7F800000, 0x00000000, 0x3F800000, FPSCR_IOC, FPSCR_IOC },
+        /* +0    * +INF  + ANY = invalid  */ { 0x00000000, 0x7F800000, 0x3F800000, FPSCR_IOC, FPSCR_IOC },
+        /* -INF  * +0    + ANY = invalid  */ { 0xFF800000, 0x00000000, 0x3F800000, FPSCR_IOC, FPSCR_IOC },
+        /* +0    * -INF  + ANY = invalid  */ { 0x00000000, 0xFF800000, 0x3F800000, FPSCR_IOC, FPSCR_IOC },
+        /* +INF  * +1    + ANY = OK       */ { 0x7F800000, 0x3F800000, 0x3F800000, FPSCR_IOC, 0         },
+        /* +1    * +INF  + ANY = OK       */ { 0x3F800000, 0x7F800000, 0x3F800000, FPSCR_IOC, 0         },
+        /* -INF  * +1    + ANY = OK       */ { 0xFF800000, 0x3F800000, 0x3F800000, FPSCR_IOC, 0         },
+        /* +1    * -INF  + ANY = OK       */ { 0x3F800000, 0xFF800000, 0x3F800000, FPSCR_IOC, 0         },
+
+        /* +(INF)        - INF = invalid  */ { 0x7F7FFFFF, 0x7F7FFFFF, 0xFF800000, FPSCR_IOC, FPSCR_IOC },
+        /* -(INF)        + INF = invalid  */ { 0xFF7FFFFF, 0x7F7FFFFF, 0x7F800000, FPSCR_IOC, FPSCR_IOC },
+        /* +(INF)        + INF = OK       */ { 0x7F7FFFFF, 0x7F7FFFFF, 0x7F800000, FPSCR_IOC, 0         },
+        /* -(INF)        - INF = OK       */ { 0xFF7FFFFF, 0x7F7FFFFF, 0xFF800000, FPSCR_IOC, 0         }
+                                };
+        soft_fpscr = 0;
+        res2 = norcroft_emu_fmaf(test[xx].x, test[xx].y, test[xx].z);
+        if ((soft_fpscr & test[xx].mask) != test[xx].flags)
+        {
+            printf("Exception flag mismatch (expected %x, got %x) on test %u\n", test[xx].flags, soft_fpscr, xx);
+            exc++;
+        }
+    }
+    if (exc) printf("%u exceptions handled wrongly\n", exc);
+#endif
+}
+
+static void test64(void)
+{
+    double   x, y, z;
+    uint64_t res1, res2; /* For tortured FPA single to integer conversions */
+#if TIMING
+    double   res3;
+    size_t   i;
+    clock_t  t1, t2, t3, t4, start;
+
+    x = 200.0; y = 42.0; z = 1e-5;
+
+    /* Using the VFMA.F64 instruction */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        res1 = norcroft_native_fma(*(uint64_t *)&x, *(uint64_t *)&y, *(uint64_t *)&z);
+    }
+    t1 = clock() - start;
+
+    /* Using a longhand emulation FMA function */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        res2 = norcroft_emu_fma(*(uint64_t *)&x, *(uint64_t *)&y, *(uint64_t *)&z);
+    }
+    t2 = clock() - start;
+
+    /* Using fmaf() in the CLib */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        res3 = (fma)(x, y, z); /* Brackets to stop it being inlined */
+    }
+    t3 = clock() - start;
+
+    /* Using a dummy function to time loop overheads */
+    start = clock();
+    for (i = 0; i < TIMING_RUNS; i++)
+    {
+        norcroft_overhead(*(uint64_t *)&x, *(uint64_t *)&y, *(uint64_t *)&z);
+    }
+    t4 = clock() - start;
+
+    printf("Double precision\n");
+    printf("Native HW result    %lf %dcs\n", *(double *)&res1, t1 - t4);
+    printf("Longhand VFP result %lf %dcs\n", *(double *)&res2, t2 - t4);
+    printf("C library result    %lf %dcs\n\n", res3, t3 - t4);
+#else
+    size_t xx, yy, zz, diffs = 0, exc = 0;
+
+    for (xx = 0; xx < NUM_D_TESTVECTORS; xx++)
+    {
+        x = testd[xx];
+        for (yy = 0; yy < NUM_D_TESTVECTORS; yy++)
+        {
+            y = testd[yy];
+            for (zz = 0; zz < NUM_D_TESTVECTORS; zz++)
+            {
+                z = testd[zz];
+                res1 = norcroft_native_fma(*(uint64_t *)&x, *(uint64_t *)&y, *(uint64_t *)&z);
+                res2 = norcroft_emu_fma(*(uint64_t *)&x, *(uint64_t *)&y, *(uint64_t *)&z);
+                if (res1 != res2)
+                {
+                    bool qnan1 = (res1 & 0x7FF8000000000000LL) == 0x7FF8000000000000LL,
+                         qnan2 = (res2 & 0x7FF8000000000000LL) == 0x7FF8000000000000LL;
+                    if (qnan1 && qnan2)
+                    {
+                        /* Just different low bits in QNaN */
+                    }
+                    else
+                    {
+                        printf("  Difference HW:%016llx Emu:%016llx (iteration %u.%u.%u)\n", res1, res2, xx, yy, zz);
+#ifdef DEBUG
+                        /* Careful not to print unprintable x/y/z values in case of exception */
+                        printf("             %016llx * %016llx + %016llx\n", *(uint64_t*)&testd[xx],
+                                                                             *(uint64_t*)&testd[yy],
+                                                                             *(uint64_t*)&testd[zz]);
+#endif
+                        diffs++;
+                    }
+                }
+            }
+        }
+        printf("Done %u%% of %u, %u diffs\n", (100 * xx) / NUM_D_TESTVECTORS, NUM_D_TESTVECTORS, diffs);
+    }
+    if (diffs) printf("%u differences found\n", diffs);
+
+    /* Check exceptional values
+     * When presented with these inputs the following exceptions /shall/ be raised.
+     * The return value itself isn't checked because we already fed these numbers in earlier.
+     * Only the required exception is tested here, other exceptions such as overflow /may/ be raised too if appropriate.
+     */
+    for (xx = 0; xx < 16; xx++)
+    {
+        static ex64_t test[16] = {          /* x       L><H           y       L><H           z       L><H           mask       expect    */
+        /* +HUGE * +2    + ANY = overflow */ { 0xFFFFFFFF7FEFFFFFuLL, 0x0000000040000000uLL, 0x000000003FF00000uLL, FPSCR_OFC, FPSCR_OFC },
+        /* -HUGE * +2    + ANY = overflow */ { 0xFFFFFFFFFFEFFFFFuLL, 0x0000000040000000uLL, 0x000000003FF00000uLL, FPSCR_OFC, FPSCR_OFC },
+        /* +2    * +2    + 1   = OK       */ { 0x0000000040000000uLL, 0x0000000040000000uLL, 0x000000003FF00000uLL, FPSCR_OFC, 0         },
+        /* -2    * +2    + 1   = OK       */ { 0x00000000C0000000uLL, 0x0000000040000000uLL, 0x000000003FF00000uLL, FPSCR_OFC, 0         },
+
+        /* +INF  * +0    + ANY = invalid  */ { 0x000000007FF00000uLL, 0x0000000000000000uLL, 0x000000003FF00000uLL, FPSCR_IOC, FPSCR_IOC },
+        /* +0    * +INF  + ANY = invalid  */ { 0x0000000000000000uLL, 0x000000007FF00000uLL, 0x000000003FF00000uLL, FPSCR_IOC, FPSCR_IOC },
+        /* -INF  * +0    + ANY = invalid  */ { 0x00000000FFF00000uLL, 0x0000000000000000uLL, 0x000000003FF00000uLL, FPSCR_IOC, FPSCR_IOC },
+        /* +0    * -INF  + ANY = invalid  */ { 0x0000000000000000uLL, 0x00000000FFF00000uLL, 0x000000003FF00000uLL, FPSCR_IOC, FPSCR_IOC },
+        /* +INF  * +1    + ANY = OK       */ { 0x000000007FF00000uLL, 0x000000003FF00000uLL, 0x000000003FF00000uLL, FPSCR_IOC, 0         },
+        /* +1    * +INF  + ANY = OK       */ { 0x000000003FF00000uLL, 0x000000007FF00000uLL, 0x000000003FF00000uLL, FPSCR_IOC, 0         },
+        /* -INF  * +1    + ANY = OK       */ { 0x00000000FFF00000uLL, 0x000000003FF00000uLL, 0x000000003FF00000uLL, FPSCR_IOC, 0         },
+        /* +1    * -INF  + ANY = OK       */ { 0x000000003FF00000uLL, 0x00000000FFF00000uLL, 0x000000003FF00000uLL, FPSCR_IOC, 0         },
+
+        /* +(INF)        - INF = invalid  */ { 0xFFFFFFFF7FEFFFFFuLL, 0xFFFFFFFF7FEFFFFFuLL, 0x00000000FFF00000uLL, FPSCR_IOC, FPSCR_IOC },
+        /* -(INF)        + INF = invalid  */ { 0xFFFFFFFFFFEFFFFFuLL, 0xFFFFFFFF7FEFFFFFuLL, 0x000000007FF00000uLL, FPSCR_IOC, FPSCR_IOC },
+        /* +(INF)        + INF = OK       */ { 0xFFFFFFFF7FEFFFFFuLL, 0xFFFFFFFF7FEFFFFFuLL, 0x000000007FF00000uLL, FPSCR_IOC, 0         },
+        /* -(INF)        - INF = OK       */ { 0xFFFFFFFFFFEFFFFFuLL, 0xFFFFFFFF7FEFFFFFuLL, 0x00000000FFF00000uLL, FPSCR_IOC, 0         }
+                                };
+        soft_fpscr = 0;
+        res2 = norcroft_emu_fma(test[xx].x, test[xx].y, test[xx].z);
+        if ((soft_fpscr & test[xx].mask) != test[xx].flags)
+        {
+            printf("Exception flag mismatch (expected %x, got %x) on test %u\n", test[xx].flags, soft_fpscr, xx);
+            exc++;
+        }
+    }
+    if (exc) printf("%u exceptions handled wrongly\n", exc);
+#endif
+}
+
+int main(void)
+{
+    void *myctx, *prevctx;
+
+    _swix(VFPSupport_CreateContext, _INR(0,3) | _OUTR(0,1), 0x80000001, 16, 0, 0,
+                                    &myctx, &prevctx);
+
+#if !TIMING
+    testvectors();
+#endif
+    test32();
+    test64();
+
+    _swix(VFPSupport_DestroyContext, _INR(0,1), myctx, prevctx);
+    return 0;
+}

@@ -1,0 +1,317 @@
+;
+; Copyright (c) 2021 RISC OS Open Limited
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 1. Redistributions of source code must retain the above copyright
+;    notice, this list of conditions and the following disclaimer.
+; 2. Redistributions in binary form must reproduce the above copyright
+;    notice, this list of conditions and the following disclaimer in the
+;    documentation and/or other materials provided with the distribution.
+;
+; THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+; SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:VFPSupport
+
+;
+; Constraints in this translation of the original:
+; * PRESERVE8 stack alignment
+; * Only use D0-D15 to allow for D16 VFP units
+; * Flush to zero is off
+; One day we might be able to write this in C...
+;
+
+        EXPORT  fp32cos
+        EXPORT  fp32sin
+        EXPORT  fp32tan
+        IMPORT  RaiseException
+        IMPORT  fused64_muladd
+
+        AREA    |trig$$Code|, CODE, READONLY, PIC
+        ARM
+
+        GET     Macros.s
+
+fone    DCD     &3F800000               ; (float)1
+d18p52  DCD     &00000000, &43380000    ; 0x1.8000000000000p52
+dminus1 DCD     &00000000, &BFF00000    ; -1
+d1uponpi DCD    &6DC9C883, &3FD45F30    ; 1/pi
+d1upon2pi DCD   &6DC9C883, &3FE45F30    ; 1/2pi
+dpiby2  DCD     &54442D18, &3FF921FB    ; pi/2
+
+        ; float fp32cos(float x)
+        ; Use the identity cos(x) = sin(x + pi/2)
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.5
+        ;       x = ±INF is an invalid operation
+fp32cos
+        ; Deal with special cases
+        VMOV    a1, s0
+        BICS    a2, a1, #1:SHL:31
+        VLDREQ  s0, fone
+        BXEQ    lr                      ; cos(±0) = 1
+        Push    "v1, lr"
+        ExpBits32 a3, a2
+        CMP     a3, #&FF
+        BNE     %FT10
+        MOVS    a3, a1, LSL #9
+        ORREQ   v1, a1, #1:SHL:22       ; ±INF => QNaN
+        MOVNE   v1, a1                  ; NaNs => propagated
+        MOV     a1, #FPSCR_IOC
+        BL      RaiseException
+        VMOV    s0, v1
+        Pull    "v1, pc"
+10
+        CMP     a2, #1:SHL:23           ; Subnormal and too small to scale
+        BCS     %FT20
+        VLDR    s0, fone
+        MOV     a1, #FPSCR_UFC
+        BL      RaiseException
+        Pull    "v1, pc"
+20
+        VCVT.F64.F32 d0, s0
+        LoadExp32 ip, 26                ; 2^26
+        CMP     a2, ip
+        BCC     %FT30                   ; Small enough to use fast route
+        IMPORT  fp64cos
+        BL      fp64cos                 ; Use doubledouble argument reduction route
+        B       %FT40
+30
+        VLDR    d1, dpiby2
+        VADD.F64 d0, d0, d1
+        VMOV    a1, s1                  ; Needed to get the sign right
+        B       %FT30
+
+        ; float fp32sin(float x)
+        ; Reduce argument x to   |x| = (N * pi) + f
+        ; where N is an integer    N = round(x / pi)
+        ;                          f = |x| - (N * pi)
+        ; then because sine is periodic sin(x) = sin((N * pi) + f)
+        ; then use the identity         sin((N * pi) + f) = (sin(N * pi) * cos(f)) + (cos(N * pi) * sin(f))
+        ;                                                 = (     0      * cos(f)) + (    ±1      * sin(f))
+        ; where f is in the range [-pi/2 +pi/2] approximated by a polynomial.
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.6
+        ;       x = ±INF is an invalid operation
+        ; Based on a translation to AArch32 of
+        ;       aocl-libm-ose/src/optmized/sinf.c
+        ;       Copyright (C) 2008-2020 Advanced Micro Devices, Inc. All rights reserved.
+        ;       SPDX-License-Identifier: BSD-3-Clause
+fp32sin
+        ; Deal with special cases
+        VMOV    a1, s0
+        BICS    a2, a1, #1:SHL:31
+        BXEQ    lr                      ; sin(±0) = ±0
+        Push    "v1, lr"
+        ExpBits32 a3, a2
+        CMP     a3, #&FF
+        BNE     %FT10
+        MOVS    a3, a1, LSL #9
+        ORREQ   v1, a1, #1:SHL:22       ; ±INF => QNaN
+        MOVNE   v1, a1                  ; NaNs => propagated
+        MOV     a1, #FPSCR_IOC
+        BL      RaiseException
+        VMOV    s0, v1
+        Pull    "v1, pc"
+10
+        CMP     a2, #1:SHL:23           ; Subnormal and too small to scale
+        BCS     %FT20
+        MOV     a1, #FPSCR_UFC
+        BL      RaiseException
+        Pull    "v1, pc"
+
+dpi1    DCD     &50000000, &400921FB    ; First 17sf of pi in machine representation
+dpi2    DCD     &611A6263, &3E6110B4    ; Next 17sf of pi in machine representation
+        ; Remez's coefficients from Sollya
+dCsin   DCD     &00000000, &3FF00000    ;  0x1.p0
+        DCD     &D018DF8B, &BFC55554    ; -0x1.55554d018df8bp-3
+        DCD     &293A5DCB, &3F8110F0    ;  0x1.110f0293a5dcbp-7
+        DCD     &A0AEBDB9, &BF29F781    ; -0x1.9f781a0aebdb9p-13
+        DCD     &E7550C85, &3EC5E2A3    ;  0x1.5e2a3e7550c85p-19
+
+20
+        VCVT.F64.F32 d0, s0
+        LoadExp32 ip, 26                ; 2^26
+        CMP     a2, ip
+        BCC     %FT30                   ; Small enough to use fast route
+        IMPORT  fp64sin
+        BL      fp64sin                 ; Use doubledouble argument reduction route
+        B       %FT40
+30
+        ; Argument reduction
+        VABS.F64 d0, d0                 ; xd = fabs((double)x)
+        VLDR    d1, d18p52
+        VLDR    d2, d1uponpi
+        VMOV.F64 d3, d1
+        VFused64 d1, d0, d2             ; dn = (xd * 1/pi) + scaler
+        VMOV    v1, s2
+        MOV     v1, v1, LSL #31         ; oddness of dn
+        AND     a1, a1, #1:SHL:31       ; sign bit of x
+        VSUB.F64 d1, d1, d3             ; dn -= scaler
+        VLDR    d3, dpi1
+        VLDR    d4, dpi2
+        VMLS.F64 d0, d1, d3             ; F = xd - (dn * pi1)
+        VMLS.F64 d0, d1, d4             ; F = F  - (dn * pi2)
+
+        ; Calculate the polynomial C1*F^1 + C3*F^3 + C5*F^5 + C7*F^7 + C9*F^9
+        ;                        = F * (C1 + C3*F^2 + C5*F^4 + C7*F^6 + C9*F^8)
+        ;                        = F * (C1 + (F^2 * (C3 + C5*F^2)) + (F^4 * (C7*F^2 + C9*F^4)))
+Fpow1   DN 0
+Fpow2   DN 1
+Fpow4   DN 2
+        ADR     a2, dCsin
+        VLDMIA  a2, { d3-d7 }
+        VMUL.F64 Fpow2, Fpow1, Fpow1
+        VMUL.F64 Fpow4, Fpow2, Fpow2
+        VMLA.F64 d4, d5, Fpow2          ; d4 :=               C3 + C5*F^2
+        VMLA.F64 d3, Fpow2, d4          ; d3 := (C1 + (F^2 * (C3 + C5*F^2))
+        VMUL.F64 d1, d6, Fpow2          ; d1 :=                                       C7*F^2
+        VMLA.F64 d1, d7, Fpow4          ; d1 :=                                       C7*F^2 + C9*F^4
+        VMUL.F64 d7, Fpow4, d1          ; d7 :=                               (F^4 * (C7*F^2 + C9*F^4))
+        VADD.F64 d2, d3, d7             ; d2 := (C1 + (F^2 * (C3 + C5*F^2)) + (F^4 * (C7*F^2 + C9*F^4)))
+        VMUL.F64 d0, d0, d2
+        ; Fixup the signs
+        VMOV    a3, a4, d0
+        EOR     a1, a1, v1
+        EOR     a4, a1, a4              ; Sign = polynomial ^ sign of x ^ oddness of dn
+        VMOV    d0, a3, a4
+40
+        VCVT.F32.F64 s0, d0
+        Pull    "v1, pc"
+
+        ; float fp32tan(float x)
+        ; Reduce argument x to   |x| = (N * pi) + f
+        ; where N is an integer    N = round(x / pi/2)
+        ;                          f = |x| - (N * pi/2)
+        ; then because tangent is periodic tan(x) = tan((N * pi/2) + f)
+        ; Using the identity tan(pi/2 - x) = cot(x)
+        ;                and       tan(-x) = -tan(x)
+        ;               tan(f - (N *pi/2)) = -cot(f) = -1/tan(f)    for N odd
+        ;                           tan(f) = tan(x)                 for N even
+        ; where f is in the range [-pi/4 +pi/4] approximated by a polynomial.
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.7
+        ;       x = ±INF is an invalid operation
+        ; Based on a translation to AArch32 of
+        ;       aocl-libm-ose/src/optmized/tanf.c
+        ;       Copyright (C) 2008-2020 Advanced Micro Devices, Inc. All rights reserved.
+        ;       SPDX-License-Identifier: BSD-3-Clause
+fp32tan
+        ; Deal with special cases
+        VMOV    a1, s0
+        BICS    a2, a1, #1:SHL:31
+        BXEQ    lr                      ; tan(±0) = ±0
+        Push    "v1, lr"
+        ExpBits32 a3, a2
+        CMP     a3, #&FF
+        BNE     %FT10
+        MOVS    a3, a1, LSL #9
+        ORREQ   v1, a1, #1:SHL:22       ; ±INF => QNaN
+        MOVNE   v1, a1                  ; NaNs => propagated
+        MOV     a1, #FPSCR_IOC
+        BL      RaiseException
+        VMOV    s0, v1
+        Pull    "v1, pc"
+10
+        CMP     a2, #1:SHL:23           ; Subnormal and too small to scale
+        BCS     %FT20
+        MOV     a1, #FPSCR_UFC
+        BL      RaiseException
+        Pull    "v1, pc"
+
+dhalfpi1 DCD    &54400000, &3FF921FB    ; First 17sf of 1/2pi in machine representation
+dhalfpi2 DCD    &1A626331, &3DD0B461    ; Next 17sf of 1/2pi in machine representation
+        ; Remez's coefficients from Sollya
+dCtan   DCD     &F99AC046, &3FEFFFFF    ;  0x1.ffffff99ac0468p-1,
+        DCD     &193ECF2B, &3FD55559    ;  0x1.55559193ecf2bp-2,
+        DCD     &F4BA8F40, &3FC1106B    ;  0x1.1106bf4ba8f408p-3,
+        DCD     &B6650308, &3FABBAFB    ;  0x1.bbafbb6650308p-5,
+        DCD     &8922DF5F, &3F956163    ;  0x1.561638922df5fp-6,
+        DCD     &33A88788, &3F87F3A0    ;  0x1.7f3a033a88788p-7,
+        DCD     &1D269620, &BF4BA0D4    ; -0x1.ba0d41d26961f8p-11,
+        DCD     &4EFF28AC, &3F73952B    ;  0x1.3952b4eff28ac8p-8,
+
+20
+        VCVT.F64.F32 d0, s0
+        LoadExp32 ip, 26                ; 2^26
+        CMP     a2, ip
+        BCC     %FT30                   ; Small enough to use fast route
+        IMPORT  fp64tan
+        BL      fp64tan                 ; Use doubledouble argument reduction route
+        B       %FT40
+30
+        ; Argument reduction
+        VABS.F64 d0, d0                 ; xd = fabs((double)x)
+        VLDR    d1, d18p52
+        VLDR    d2, d1upon2pi
+        VMOV.F64 d3, d1
+        VFused64 d1, d0, d2             ; dn = (xd * 1/2pi) + scaler
+        VMOV    v1, s2
+        MOV     v1, v1, LSL #31         ; oddness of dn
+        AND     a1, a1, #1:SHL:31       ; sign bit of x
+        VSUB.F64 d1, d1, d3             ; dn -= scaler
+        VLDR    d3, dhalfpi1
+        VLDR    d4, dhalfpi2
+        VMLS.F64 d0, d1, d3             ; F = xd - (dn * halfpi1)
+        VMLS.F64 d0, d1, d4             ; F = F  - (dn * halfpi2)
+
+        ; Calculate the polynomial C1*F^1 + C3*F^3 + C5*F^5 + C7*F^7 + C9*F^9 + C11*F^11 + C13*F^13 + C15*F^15
+        ;                        = F * (C1 + C3*F^2 + C5*F^4 + C7*F^6 + C9*F^8 + C11*F^10 + C13*F^12 + C15*F^14)
+        ;                        = F * ((C1 + C3*F^2) + (F^4 * (C5 + C7*F^2)) + (F^8 * (C9 + C11*F^2)) + (F^12 * (C13 + C15*F^2)))
+Fpow1   DN 0
+Fpow2   DN 1
+Fpow4   DN 2
+Fpow8   DN 3
+Fpow12  DN 4
+        VPUSH   { d8-d12 }
+        ADR     a2, dCtan
+        VLDMIA  a2, { d5-d12 }
+        VMUL.F64 Fpow2, Fpow1, Fpow1
+        VMUL.F64 Fpow4, Fpow2, Fpow2
+        VMUL.F64 Fpow8, Fpow4, Fpow4
+        VMUL.F64 Fpow12, Fpow8, Fpow4
+        VMLA.F64 d5, d6, Fpow2          ; d5 :=  C1 + C3*F^2
+        VMLA.F64 d7, d8, Fpow2          ; d7 :=                         C5 + C7*F^2
+        VMLA.F64 d5, Fpow4, d7          ; d5 := (C1 + C3*F^2) + (F^4 * (C5 + C7*F^2))
+        VMLA.F64 d9, d10, Fpow2         ; d9 :=         C9 + C11*F^2
+        VMLA.F64 d11, d12, Fpow2        ; d11:=                                   C13 + C15*F^2
+        VMUL.F64 d6, Fpow8, d9          ; d6 :=  F^8 * (C9 + C11*F^2)
+        VMUL.F64 d7, Fpow12, d11        ; d7 :=                           F^12 * (C13 + C15*F^2)
+        VPOP    { d8-d12 }
+        VADD.F64 d4, d6, d7             ; d4 := (F^8 * (C9 + C11*F^2)) + (F^12 * (C13 + C15*F^2))
+        VADD.F64 d2, d4, d5
+        VMUL.F64 d0, Fpow1, d2
+        ; Fixup the signs
+        VMOV    a3, a4, d0
+        EOR     a4, a1, a4              ; Sign = polynomial ^ sign of x
+        VMOV    d0, a3, a4
+        TST     v1, #1:SHL:31
+        BEQ     %FT40
+        ORRS    a1, a3, a4, LSL #1
+        MOVEQ   a1, #FPSCR_DZC
+        BLEQ    RaiseException
+        VLDR    d1, dminus1
+        VDIV.F64 d0, d1, d0             ; When odd, swap for -1.0 / tanx
+40
+        VCVT.F32.F64 s0, d0
+        Pull    "v1, pc"
+
+        END

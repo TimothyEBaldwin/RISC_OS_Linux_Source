@@ -1,0 +1,490 @@
+;
+; Copyright (c) 2021 RISC OS Open Limited
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 1. Redistributions of source code must retain the above copyright
+;    notice, this list of conditions and the following disclaimer.
+; 2. Redistributions in binary form must reproduce the above copyright
+;    notice, this list of conditions and the following disclaimer in the
+;    documentation and/or other materials provided with the distribution.
+;
+; THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+; SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:VFPSupport
+
+;
+; Constraints in this translation of the original:
+; * PRESERVE8 stack alignment
+; * Only use D0-D15 to allow for D16 VFP units
+; * Flush to zero is off
+; One day we might be able to write this in C...
+;
+
+        EXPORT  fp64acos
+        EXPORT  fp64asin
+        EXPORT  fp64atan
+        EXPORT  fp64atan2
+        IMPORT  RaiseException
+        IMPORT  fused64_muladd
+
+        AREA    |arctrig$$Code|, CODE, READONLY, PIC
+        ARM
+
+        GET     Macros.s
+
+        ; double fp64acos(double x)
+        ; Use the identity acos(x) = pi/2 - asin(x)
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.1
+        ;       |x| > 1 is an invalid operation
+fp64acos
+        ; Deal with special cases
+        VMOV    a1, a2, d0
+        Push    "v1, lr"
+        MOV     v1, a2, LSR #31         ; Sign of x
+        BIC     a2, a2, #1:SHL:31       ; |x|
+        LDRD    a3, a4, done
+        CMP     a2, a4
+        CMPEQ   a1, a3
+        BCC     %FT20
+        BHI     %FT10
+        TST     v1, #1
+        VMOVEQ  d0, a3, a3              ; acos(+1) = 0
+        ADRLNE  a3, dpi
+        VLDRNE  d0, [a3]                ; acos(-1) = pi
+        Pull    "v1, pc"
+10
+        MOV     a1, #FPSCR_IOC
+        BL      RaiseException
+        VLDR    d0, dqnan               ; |x| > 1 => QNaN
+        Pull    "v1, pc"
+20
+        ; |x| < 1
+        BL      fp64asin
+        ADRL    a1, dpiby2
+        VLDR    d1, [a1]
+        VSUB.F64 d0, d1, d0
+        Pull    "v1, pc"
+        
+done    DCD     &00000000, &3FF00000    ; (double)1
+dhalf   DCD     &00000000, &3FE00000    ; 1/2
+
+        ; double fp64asin(double x)
+        ; Split into subranges 
+        ; [0 0.5] asin = x + x * x^2 * polynomial(x^2)
+        ; [0.5 1] asin = pi/2 - 2 * asin(sqrt((1 - |x|) / 2))
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.2
+        ;       |x| > 1 is an invalid operation
+        ; Based on a translation to AArch32 of
+        ;       openlibm/src/e_asin.c
+        ;       Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+        ;       Developed at SunSoft, a Sun Microsystems, Inc. business.
+        ;       Permission to use, copy, modify, and distribute this software is
+        ;       freely granted, provided that this notice is preserved.
+fp64asin
+        ; Deal with special cases
+        VMOV    a1, a2, d0
+        ORRS    a4, a1, a2, LSL #1
+        BXEQ    lr                      ; asin(±0) = ±0
+        Push    "v1, lr"
+        MOV     v1, a2, LSR #31         ; Sign of x
+        BIC     a2, a2, #1:SHL:31       ; |x|
+        LDRD    a3, a4, done
+        CMP     a2, a4
+        CMPEQ   a1, a3
+        BCC     %FT10
+        ADRLEQ  a1, dpiby2
+        VLDREQ  d0, [a1]                ; asin(±1) = ±pi/2
+        BEQ     %FT50
+        MOV     a1, #FPSCR_IOC
+        BL      RaiseException
+        VLDR    d0, dqnan               ; |x| > 1 => QNaN
+        Pull    "v1, pc"
+10
+        LoadExp64 ip, -1                ; 2^-1
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        BCS     %FT30
+        LoadExp64 ip, -26               ; 2^-26
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        BCS     %FT20
+        MOV     a1, #FPSCR_IXC
+        Pull    "v1, lr"
+        B       RaiseException          ; Approx asin(x) = x
+20
+        ; 2^-26 <= |x| < 0.5
+        VPUSH   { d0 }
+        VMUL.F64 d0, d0, d0             ; x^2
+        BL      %FT60
+        VMOV.F64 d7, d0
+        VPOP    { d0 }
+        VMLA.F64 d0, d0, d7             ; = x + (x * p/q)
+        Pull    "v1, pc"
+30
+        ; 0.5 <= |x| < 1
+        VLDR    d2, dhalf
+        VMOV    d1, a3, a4              ; 1.0
+        VABS.F64 d3, d0
+        VSUB.F64 d3, d1, d3
+        VMUL.F64 d0, d3, d2             ; 1/2 * (1 - |x|)
+        VPUSH   { d0 }
+        Push    "a1-a2"
+        BL      %FT60          
+        Pull    "a1-a2"
+        LDR     ip, =&3FEF3333          ; Approx 0.975
+        VPOP    { d1 }         
+        ADRL    a3, dpiby2
+        VLDMIA  a3, { d3-d4 }
+        VSQRT.F64 d2, d1       
+        CMP     a2, ip
+        BCC     %FT40
+        VMLA.F64 d2, d2, d0
+        VADD.F64 d2, d2, d2
+        VSUB.F64 d5, d2, d4
+        VSUB.F64 d0, d3, d5             ; asin(x) = pi/2 - 2 * (s + (s * poly))
+        B       %FT50
+40
+        ; |x| < 0.975
+        VMOV    a3, a4, d2
+        MOV     a3, #0
+        VMOV    d5, a3, a4
+        VADD.F64 d6, d2, d5
+        VMLS.F64 d1, d5, d5
+        VDIV.F64 d1, d1, d6 
+        VLDR    d3, dpiby4
+        VADD.F64 d1, d1, d1
+        VSUB.F64 d4, d4, d1
+        VMUL.F64 d6, d2, d0             
+        VADD.F64 d6, d6, d6
+        VSUB.F64 d6, d6, d4             ; p = 2 * (s * poly)
+        VADD.F64 d5, d5, d5
+        VSUB.F64 d4, d3, d5             ; q = pi/4 - 2 * s
+        VSUB.F64 d2, d6, d4
+        VSUB.F64 d0, d3, d2             ; asin(x) = pi/4 - (p - q)
+50
+        TST     v1, #1
+        VNEGNE.F64 d0, d0               ; Fixup the sign
+        Pull    "v1, pc"
+
+dqnan   DCD     &00000000, &7FF80000    ; QNaN
+dPSin   DCD     &55555555, &3FC55555    ;  1.66666666666666657415e-01
+        DCD     &03EB6F7D, &BFD4D612    ; -3.25565818622400915405e-01
+        DCD     &0E884455, &3FC9C155    ;  2.01212532134862925881e-01
+        DCD     &B5688F3B, &BFA48228    ; -4.00555345006794114027e-02
+        DCD     &7501B288, &3F49EFE0    ;  7.91534994289814532176e-04
+        DCD     &0DFDF709, &3F023DE1    ;  3.47933107596021167570e-05
+dQSin   DCD     &1C8A2D4B, &C0033A27    ; -2.40339491173441421878e+00
+        DCD     &9C598AC8, &40002AE5    ;  2.02094576023350569471e+00
+        DCD     &1B8D0159, &BFE6066C    ; -6.88283971605453293030e-01
+        DCD     &B12E9282, &3FB3B8C5    ;  7.70381505559019352791e-02
+
+60
+        ; Polynomial
+        ADR     a3, dPSin
+        VLDMIA  a3, { d2-d7 }
+        VLDR    d1, done
+        VFused64 d6, d0, d7
+        VFused64 d5, d0, d6
+        VFused64 d4, d0, d5
+        VMLA.F64 d3, d0, d4
+        VMLA.F64 d2, d0, d3
+        VMUL.F64 d2, d0, d2             ; p
+        ADR     a3, dQSin
+        VLDMIA  a3, { d4-d7 }
+        VFused64 d6, d0, d7
+        VFused64 d5, d0, d6
+        VFused64 d4, d0, d5
+        VMLA.F64 d1, d0, d4             ; q
+        VDIV.F64 d0, d2, d1
+        BX      lr
+
+        ; double fp64atan(double x)
+        ; Use the identity atan(x) = -atan(-x) to limit to positive x
+        ; Split into subranges 
+        ; [0 7/16]      atan = polynomial
+        ; [7/16 11/16]  atan = atan(1/2) + atan((t - 0.5) / (1 + t/2))
+        ; [11/16 19/16] atan = atan( 1 ) + atan((t - 1) / (1 + t))
+        ; [19/16 39/16] atan = atan(3/2) + atan((t - 1.5) / (1 + 1.5*t))
+        ; [39/16 INF]   atan = atan(INF) + atan(-1/t)
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.3
+        ;       None
+        ; Based on a translation to AArch32 of
+        ;       openlibm/src/s_atan.c
+        ;       Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+        ;       Developed at SunPro, a Sun Microsystems, Inc. business.
+        ;       Permission to use, copy, modify, and distribute this software is
+        ;       freely granted, provided that this notice is preserved.
+fp64atan
+        ; Deal with special cases
+        VMOV    a1, a2, d0
+        Push    "v1, lr"
+        LDR     ip, =&7FF
+        MOV     v1, a2, LSR #31         ; Sign of x
+        BIC     a2, a2, #1:SHL:31       ; |x|
+        CMP     a2, ip, LSL #20
+        CMPEQ   a1, #0
+        Pull    "v1, pc",HI             ; NaNs => propagated
+        LoadExp64 ip, 66                ; 2^66
+        CMP     a2, ip
+        BCC     %FT10
+        ADR     a3, dtanid + (16 * 3)
+        VLDMIA  a3, { d6-d7 }
+        VADD.F64 d0, d6, d7
+        TST     v1, #1
+        VNEGNE.F64 d0, d0               ; Fixup the sign
+        Pull    "v1, pc"
+10
+        LoadExp64 ip, -27               ; 2^-27
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        MOVCC   a1, #FPSCR_IXC
+        Pull    "v1, lr",CC
+        BCC     RaiseException          ; Approx atan(x) = x
+
+        LDR     ip, =&3FDC0000          ; 7/16
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        MOVCC   a4, #-1                 ; id := -1
+        BCC     %FT80
+
+        VLDR    d7, done
+        VABS.F64 d0, d0
+        ; |x| >= 7/16
+        LDR     ip, =&3FF30000          ; 19/16
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        BCS     %FT30
+        ; 7/16 <= |x| < 19/16
+        LDR     ip, =&3FE60000          ; 11/16
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        BCS     %FT20
+        ; 7/16 <= |x| < 11/16
+        MOV     a4, #0                  ; id := 0
+        VADD.F64 d5, d7, d7
+        VADD.F64 d4, d5, d0
+        VMUL.F64 d5, d5, d0
+        VSUB.F64 d5, d5, d7
+        B       %FT70                   ; (t - 0.5) / (1 + t/2)
+20
+        ; 11/16 <= |x| < 19/16
+        MOV     a4, #1                  ; id := 1
+        VADD.F64 d4, d7, d0
+        VSUB.F64 d5, d0, d7
+        B       %FT70                   ; (t - 1) / (1 + t)
+30
+        ; |x| >= 19/16
+        LDR     ip, =&40038000          ; 39/16
+        CMP     a2, ip
+        CMPEQ   a1, #0
+        ; 39/16 <= |x| < 2^66
+        MOVCS   a4, #3
+        VDIVCS.F64 d0, d7, d0
+        VNEGCS.F64 d0, d0               ; -1/t
+        BCS     %FT80
+        ; 19/16 <= |x| < 39/16
+        MOV     a4, #2                  ; id := 2
+        VLDR    d6, d1point5
+        VMUL.F64 d4, d6, d0
+        VADD.F64 d4, d7, d4
+        VSUB.F64 d5, d0, d6             ; (t - 1.5) / (1 + 1.5*t)
+70
+        VDIV.F64 d0, d5, d4
+80
+        ; Polynomial
+        VPUSH   { d8 }
+        VMUL.F64 d1, d0, d0             ; t^2
+        VMUL.F64 d2, d1, d1             ; t^4
+        ADR     a3, dCatanE
+        VLDMIA  a3!, { d3-d8 }          ; Even polynomial
+        VFused64 d7, d2, d8
+        VFused64 d6, d2, d7
+        VFused64 d5, d2, d6
+        VMLA.F64 d4, d2, d5
+        VMLA.F64 d3, d2, d4
+        VMUL.F64 d3, d1, d3             ; d3 := s1
+        ASSERT  dCatanE + (3*16) = dCatanO
+        VLDMIA  a3, { d4-d8 }           ; Odd polynomial
+        VFused64 d7, d2, d8
+        VFused64 d6, d2, d7
+        VMLA.F64 d5, d2, d6
+        VMLA.F64 d4, d2, d5
+        VMUL.F64 d4, d2, d4             ; d4 := s2
+        VPOP    { d8 }
+        VADD.F64 d2, d3, d4             
+        VMUL.F64 d2, d0, d2             ; t * (s1 + s2)
+        CMP     a4, #0
+        VSUBLT.F64 d0, d0, d2
+        Pull    "v1, pc",LT
+
+        ADR     a3, dtanid
+        ADD     a3, a3, a4, LSL #4
+        VLDMIA  a3, { d6-d7 }
+        ; Do a doubledouble add of earlier selected constant 'id'
+        VSUB.F64 d3, d2, d7
+        VSUB.F64 d3, d3, d0
+        VSUB.F64 d0, d6, d3
+        TST     v1, #1
+        VNEGNE.F64 d0, d0               ; Fixup the sign
+        Pull    "v1, pc"
+        
+dpi     DCD     &54442D18, &400921FB    ; pi
+dpir    DCD     &33145C07, &3CA1A626    ; Next 17sf of pi
+dpiby4  DCD     &54442D18, &3FE921FB    ; pi/4
+d1point5 DCD    &00000000, &3FF80000    ; 1.5
+
+dtanid  DCD     &0561BB4F, &3FDDAC67    ; atan(0.5)
+        DCD     &222F65E2, &3C7A2B7F    ; Next 17sf of atan(0.5)
+        DCD     &54442D18, &3FE921FB    ; atan(1.0)
+        DCD     &33145C07, &3C81A626    ; Next 17sf of atan(1.0)
+        DCD     &D281F69B, &3FEF730B    ; atan(1.5)
+        DCD     &7AF0CBBD, &3C700788    ; Next 17sf of atan(1.5)
+dpiby2  DCD     &54442D18, &3FF921FB    ; atan(INF)
+dpiby2r DCD     &33145C07, &3C91A626    ; Next 17sf of atan(INF)
+
+dCatanE DCD     &5555550D, &3FD55555    ;  3.33333333333329318027e-01 
+        DCD     &920083FF, &3FC24924    ;  1.42857142725034663711e-01 
+        DCD     &C54C206E, &3FB745CD    ;  9.09088713343650656196e-02 
+        DCD     &A0D03D51, &3FB10D66    ;  6.66107313738753120669e-02 
+        DCD     &24760DEB, &3FA97B4B    ;  4.97687799461593236017e-02 
+        DCD     &E322DA11, &3F90AD3A    ;  1.62858201153657823623e-02 
+dCatanO DCD     &9998EBC4, &BFC99999    ; -1.99999999998764832476e-01 
+        DCD     &FE231671, &BFBC71C6    ; -1.11111104054623557880e-01 
+        DCD     &AF749A6D, &BFB3B0F2    ; -7.69187620504482999495e-02 
+        DCD     &52DEFD9A, &BFADDE2D    ; -5.83357013379057348645e-02 
+        DCD     &2C6A6C2F, &BFA2B444    ; -3.65315727442169155270e-02 
+
+        LTORG
+
+        ; double fp64atan2(double y, double x)
+        ; Pick off special cases
+        ; Otherwise, call atan(y/x) then post correct the sign
+        ;
+        ; Exceptions per ISO9899:2018 F10.1.4
+        ;       None
+        ; Based on a translation to AArch32 of
+        ;       openlibm/src/e_atan2.c
+        ;       Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+        ;       Developed at SunSoft, a Sun Microsystems, Inc. business.
+        ;       Permission to use, copy, modify, and distribute this software is
+        ;       freely granted, provided that this notice is preserved.
+fp64atan2
+        ; Deal with special cases
+        Push    "v1, lr"
+        VMOV    a1, a2, d0
+        VMOV    a3, a4, d1
+        LDR     v1, =&7FF
+        BIC     ip, a4, #1:SHL:31
+        CMP     ip, v1, LSL #20
+        CMPEQ   a3, #0
+        Pull    "v1, pc",HI             ; atan2(NaN,anything) = NaN
+        BIC     ip, a4, #1:SHL:31
+        CMP     ip, v1, LSL #20
+        CMPEQ   a3, #0
+        VMOVHI.F64 d0, d1
+        Pull    "v1, pc",HI             ; atan2(anything,NaN) = NaN
+
+        ; Now y & x are not NaN
+        ORRS    ip, a1, a2, LSL #1
+        BNE     %FT10
+        TST     a4, #1:SHL:31          
+        VABSEQ.F64 d0, d0               ; atan2(±0, +not NaN) = ±0
+        VLDRNE  d0, dpi                 ; atan2(±0, -not NaN) = ±pi
+        B       %FT50
+10
+        ; Now y & x are not NaN, y is non zero
+        ORRS    ip, a3, a4, LSL #1
+        BNE     %FT20
+        VLDR    d0, dpiby2              ; atan2(±not 0 not NaN, 0) = ±pi/2
+        B       %FT50
+20
+        ; Now y & x are not NaN, y & x are non zero
+        BIC     ip, a2, #1:SHL:31
+        CMP     ip, v1, LSL #20
+        CMPEQ   a1, #0
+        BEQ     %FT30
+        BIC     ip, a4, #1:SHL:31
+        CMP     ip, v1, LSL #20
+        CMPEQ   a3, #0
+        BNE     %FT60
+        TST     a4, #1:SHL:31
+        MOVEQ   ip, #0
+        VMOVEQ  d0, ip, ip              ; atan2(±not INF not NaN, +INF) = ±0
+        VLDRNE  d0, dpi                 ; atan2(±not INF not NaN, -INF) = ±pi
+        B       %FT50
+30
+        ; y = INF        
+        BIC     ip, a4, #1:SHL:31
+        CMP     ip, v1, LSL #20
+        CMPEQ   a3, #0
+        VLDRNE  d0, dpiby2
+        BNE     %FT50                   ; atan2(±INF, not 0 not NAN not INF) = ±pi/2
+
+        ; y & x = INF
+        TST     a4, #1:SHL:31
+        VLDR    d0, dpiby4              ; atan2(±INF, +INF) = ±pi/4
+        VLDR    d1, dpiby2
+        VADDNE.F64 d0, d0, d1           ; atan2(±INF, -INF) = ±3*pi/4
+50
+        ; Copy sign of y
+        TST     a2, #1:SHL:31
+        VNEGNE.F64 d0, d0
+        Pull    "v1, pc"
+60
+        ; Compute y/x        
+        ExpBits64 ip, a2
+        ExpBits64 lr, a4
+        SUB     ip, ip, lr              ; Exponent difference
+        MOV     v1, a2, LSR #31
+        TST     a4, #1:SHL:31
+        ORRNE   v1, v1, #2              ; Remember signs b1 = s-o-x, b0 = s-o-y
+        CMP     ip, #60
+        VLDRGT  d0, dpiby2
+        ANDGT   v1, v1, #1              ; |y/x| > 2^60
+        BGT     %FT80
+        TST     v1, #2
+        BEQ     %FT70
+        CMP     ip, #-60
+        MOVLT   ip, #0
+        VMOVLT  d0, ip, ip           
+        BLT     %FT80                   ; |y|/x < -2^-60
+70
+        ; Safe to do y/x
+        VDIV.F64 d0, d0, d1
+        VABS.F64 d0, d0
+        BL      fp64atan
+80
+        CMP     v1, #1
+        VNEGEQ.F64 d0, d0               ; atan2(-,+)
+        Pull    "v1, pc",LS             ;            and atan2(+,+)
+        VLDR    d1, dpi
+        VLDR    d2, dpir
+        CMP     v1, #3
+        VSUB.F64 d2, d0, d2
+        VSUBCC.F64 d0, d1, d2           ; atan2(+,-)
+        VSUBEQ.F64 d0, d2, d1           ;            and atan2(-,-)
+        Pull    "v1, pc"
+
+        END

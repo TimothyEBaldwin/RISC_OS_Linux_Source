@@ -1,0 +1,463 @@
+;
+; Copyright (c) 2021 RISC OS Open Limited
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 1. Redistributions of source code must retain the above copyright
+;    notice, this list of conditions and the following disclaimer.
+; 2. Redistributions in binary form must reproduce the above copyright
+;    notice, this list of conditions and the following disclaimer in the
+;    documentation and/or other materials provided with the distribution.
+;
+; THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+; SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:VFPSupport
+
+;
+; Constraints in this translation of the original:
+; * PRESERVE8 stack alignment
+; * Only use D0-D15 to allow for D16 VFP units
+; * Flush to zero is off
+; One day we might be able to write this in C...
+;
+
+        EXPORT  fp32log10
+        EXPORT  fp32log
+        EXPORT  fp32pow
+        EXPORT  fp32exp
+        IMPORT  RaiseException
+        IMPORT  fp64pow
+        IMPORT  fused32_muladd
+
+        AREA    |power$$Code|, CODE, READONLY, PIC
+        ARM
+
+        GET     Macros.s
+
+        ; float fp32log10(float x)
+        ; Find k and f, such that x = 2^k * (1 + f)
+        ; where 1 + f is in the range [2^-0.5 2^+0.5]
+        ; Approximate log(1 + f) using a polynomial, change base to 10.
+        ;
+        ; Exceptions per ISO9899:2018 F10.3.8
+        ;       x = ±0 is a divide by zero
+        ;       x < 0 is an invalid operation
+        ; Based on a translation to AArch32 of
+        ;       openlibm/src/e_log10f.c
+        ;       Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+        ;       Developed at SunPro, a Sun Microsystems, Inc. business.
+        ;       Permission to use, copy, modify, and distribute this software is
+        ;       freely granted, provided that this notice is preserved.
+fp32log10
+        ; Deal with special cases
+        VMOV    a2, s0
+        Push    "v1, lr"
+        LDR     v1, =&FF:SHL:23
+        TEQ     a2, v1                  ; log(+INF) = +INF
+        BEQ     %FT10
+        BICS    a3, a2, #1:SHL:31
+        ORREQ   v1, v1, #1:SHL:31       ; log(±0) = -INF
+        MOVEQ   a1, #FPSCR_DZC
+        BEQ     %FT15
+        CMP     a3, v1
+        Pull    "v1, pc",HI             ; Propagate NaNs
+        TST     a2, #1:SHL:31
+        ORRNE   v1, v1, #1:SHL:22       ; x < 0 => QNaN
+        BEQ     %FT20
+10
+        MOV     a1, #FPSCR_IOC
+15
+        BL      RaiseException
+        VMOV    s0, v1
+        Pull    "v1, pc"
+20
+        ; x is not 0, NaN, nor INF, and is positive
+        MOV     v1, #0                  ; k
+        VLDR    s1, fone
+        LoadExp32 ip, -126              ; 2^-126
+        CMP     a2, ip
+        VLDRCC  s2, ftwo25
+        VMULCC.F32 s0, s0, s2
+        VMOVCC  a2, s0
+        SUBCC   v1, v1, #25             ; Scale up by 2^25 to normalise
+        ExpBits32 a3, a2
+        SUB     a3, a3, #FLT_EXP_BIAS
+        ADD     v1, v1, a3              ; k += unbiased exponent
+        SUB     ip, ip, #1              ; ip := &7FFFFF
+        AND     a2, a2, ip
+        LDR     a4, =&95F64:SHL:3
+        VMOV    a3, s1
+        ADD     a4, a4, a2
+        ANDS    a4, a4, #1:SHL:23
+        EOR     a4, a4, a3
+        ORR     ip, a2, a4
+        VMOV    s0, ip
+        ADDNE   v1, v1, #1              ; Normalised to x or x/2
+        VMOV    s4, v1
+        VCVT.F32.S32 s4, s4             ; s4 = (float)k
+        VSUB.F32 s0, s0, s1             ; f
+30
+        ; Remez polynomial
+        ADR     a3, fClogO
+        ASSERT  fClogO + (2*4) = fClogE
+        VLDMIA  a3, { s12-s15 }
+        VADD.F32 s2, s1, s1             ; 2
+        VADD.F32 s3, s2, s0
+        VDIV.F32 s3, s0, s3             ; s = f / (2 + f)
+        VLDR    s2, fhalf
+        VMUL.F32 s5, s3, s3             ; s^2
+        VMUL.F32 s6, s5, s5             ; s^4
+        VFused32 s14, s6, s15
+        VMUL.F32 s14, s6, s14
+        VFused32 s12, s6, s13
+        VMUL.F32 s12, s5, s12
+        VADD.F32 s1, s12, s14           ; R = poly
+
+        VLDR    s5, flog2
+        VLDR    s6, flog2r
+        VMUL.F32 s2, s0, s2
+        VMUL.F32 s2, s0, s2             ; 1/2 * f^2
+        VADD.F32 s7, s2, s1
+        VMUL.F32 s7, s3, s7
+        VSUB.F32 s1, s0, s2             ; s1 := hi
+        VMOV    a3, s1
+        BIC     a3, a3, #&FF0
+        BIC     a3, a3, #&00F
+        VMOV    s1, a3
+        VSUB.F32 s0, s0, s1
+        VSUB.F32 s0, s0, s2
+        VLDR    s8, f1uponln10
+        VLDR    s9, f1uponln10r
+        VADD.F32 s0, s0, s7             ; s0 := lo
+
+        ; Change of base for (hi,lo) from e to 10
+        VADD.F32 s7, s0, s1
+        VMUL.F32 s2, s4, s5
+        VMLA.F32 s2, s4, s6
+        VMLA.F32 s2, s7, s9
+        VMLA.F32 s2, s0, s8
+        VMLA.F32 s2, s1, s8
+        VMOV.F32 s0, s2
+        Pull    "v1, pc"
+
+fone    DCD     &3F800000               ; (float)1
+fhalf   DCD     &3F000000               ; 1/2
+ftwo25  DCD     &4C000000               ; (float)1<<25
+fln2    DCD     &3F317180               ; 6.9313812256e-01
+fln2r   DCD     &3717F7D1               ; Next 9sf of ln(2)
+flog2   DCD     &3E9A2080               ; 3.0102920532e-01
+flog2r  DCD     &355427DB               ; Next 9sf of log(2)
+f1uponln10 DCD  &3EDE6000               ; 4.3432617188e-01
+f1uponln10r DCD &B804EAD9               ; Next 9sf of 1/ln(10)
+
+        ; float fp32log(float x)
+        ; Find k and f, such that x = 2^k * (1 + f)
+        ; where 1 + f is in the range [2^-0.5 2^+0.5]
+        ; Approximate log(1 + f) using a polynomial.
+        ;
+        ; Exceptions per ISO9899:2018 F10.3.7
+        ;       x = ±0 is a divide by zero
+        ;       x < 0 is an invalid operation
+        ; Based on a translation to AArch32 of
+        ;       openlibm/src/e_logf.c
+        ;       Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+        ;       Developed at SunPro, a Sun Microsystems, Inc. business.
+        ;       Permission to use, copy, modify, and distribute this software is
+        ;       freely granted, provided that this notice is preserved.
+fp32log
+        ; Deal with special cases
+        VMOV    a2, s0
+        Push    "v1, lr"
+        LDR     v1, =&FF:SHL:23
+        TEQ     a2, v1                  ; log(+INF) = +INF
+        BEQ     %FT10
+        BICS    a3, a2, #1:SHL:31
+        ORREQ   v1, v1, #1:SHL:31       ; log(±0) = -INF
+        MOVEQ   a1, #FPSCR_DZC
+        BEQ     %FT15
+        CMP     a3, v1
+        Pull    "v1, pc",HI             ; Propagate NaNs
+        TST     a2, #1:SHL:31
+        ORRNE   v1, v1, #1:SHL:22       ; x < 0 => QNaN
+        BEQ     %FT20
+10
+        MOV     a1, #FPSCR_IOC
+15
+        BL      RaiseException
+        VMOV    s0, v1
+        Pull    "v1, pc"
+20
+        ; x is not 0, NaN, nor INF, and is positive
+        MOV     v1, #0                  ; k
+        VLDR    s1, fone
+        LoadExp32 ip, -126              ; 2^-126
+        CMP     a2, ip
+        VLDRCC  s2, ftwo25
+        VMULCC.F32 s0, s0, s2
+        VMOVCC  a2, s0
+        SUBCC   v1, v1, #25             ; Scale up by 2^25 to normalise
+        ExpBits32 a3, a2
+        SUB     a3, a3, #FLT_EXP_BIAS
+        ADD     v1, v1, a3              ; k += unbiased exponent
+        SUB     ip, ip, #1              ; ip := &7FFFFF
+        AND     a2, a2, ip
+        LDR     a4, =&95F64:SHL:3
+        VMOV    a3, s1
+        ADD     a4, a4, a2
+        ANDS    a4, a4, #1:SHL:23
+        EOR     a4, a4, a3
+        ORR     ip, a2, a4
+        VMOV    s0, ip
+        ADDNE   v1, v1, #1              ; Normalised to x or x/2
+        VMOV    s4, v1
+        VCVT.F32.S32 s4, s4             ; s4 = (float)k
+        VSUB.F32 s0, s0, s1             ; f
+30
+        ; Remez polynomial
+        ADR     a3, fClogO
+        ASSERT  fClogO + (2*4) = fClogE
+        VLDMIA  a3, { s12-s15 }
+        VADD.F32 s2, s1, s1             ; 2
+        VADD.F32 s3, s2, s0
+        VDIV.F32 s3, s0, s3             ; s = f / (2 + f)
+        VLDR    s2, fhalf
+        VMUL.F32 s5, s3, s3             ; s^2
+        VMUL.F32 s6, s5, s5             ; s^4
+        VFused32 s14, s6, s15
+        VMUL.F32 s14, s6, s14
+        VFused32 s12, s6, s13
+        VMUL.F32 s12, s5, s12
+        VADD.F32 s1, s12, s14           ; R = poly
+
+        LDR     a3, =&6147A:SHL:3
+        LDR     a4, =&6B851:SHL:3
+        SUB     a3, a2, a3
+        SUB     a4, a4, a2
+        ORRS    a2, a3, a4
+        VLDR    s5, fln2
+        VLDR    s6, fln2r
+        BLE     %FT40
+
+        VMUL.F32 s2, s0, s2
+        VMUL.F32 s2, s0, s2             ; 1/2 * f^2
+        VADD.F32 s7, s2, s1
+        VMUL.F32 s7, s3, s7
+        VMLA.F32 s7, s4, s6
+        VSUB.F32 s1, s2, s7
+        B       %FT50
+40
+        VSUB.F32 s2, s0, s1
+        VMUL.F32 s1, s2, s3             ; s * (f - R)
+        VMLS.F32 s1, s4, s6
+50
+        VMUL.F32 s5, s5, s4
+        VSUB.F32 s1, s1, s0
+        VSUB.F32 s0, s5, s1             ; log(x) = k * log(2) - (equation - f)
+        Pull    "v1, pc"
+
+fexpmax DCD     &42b17180               ;  8.8721679688e+01
+fexpmin DCD     &c2cff1b5               ; -1.0397208405e+02
+fCexp   DCD     &3E2AAA8F               ;  1.6666625440e-1
+        DCD     &BB355215               ; -2.7667332906e-3
+f2pow127 DCD    &7F000000               ; (float)2^127
+f1uponln2 DCD   &3FB8AA3B               ;  1.4426950216e+00
+
+fClogO  DCD     &3F2AAAAA               ; 0.66666662693
+        DCD     &3E91E9EE               ; 0.28498786688
+fClogE  DCD     &3ECCCE13               ; 0.40000972152
+        DCD     &3E789E26               ; 0.24279078841
+
+        ; float fp32exp(float y)
+        ; Find r and k such that    x = k*ln(2) + r
+        ;                        |r| <= ln(2)/2
+        ; Approximate exp(r) over the range [0 ln(2)/2] then scale back
+        ; to          exp(y) = 2^k * exp(r)
+        ;
+        ; Exceptions per ISO9899:2018 F10.3.1
+        ;       None
+        ; Based on a translation to AArch32 of
+        ;       openlibm/src/e_expf.c
+        ;       Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+        ;       Developed at SunPro, a Sun Microsystems, Inc. business.
+        ;       Permission to use, copy, modify, and distribute this software is
+        ;       freely granted, provided that this notice is preserved.
+fp32exp
+        LDR     ip, =&FF:SHL:23
+        VMOV    a2, s0
+        BIC     a3, a2, #1:SHL:31
+        CMP     a3, ip
+        BXHI    lr                      ; Propagate NaNs
+        BNE     %FT10
+
+        TST     a2, #1:SHL:31
+        MOVNE   a3, #0
+        VMOVNE  s0, a3                  ; e^-INF = 0
+        BX      lr                      ; e^+INF = +INF
+10
+        VLDR    s1, fexpmax
+        VLDR    s2, fexpmin
+        VCMP.F32 s0, s1
+        VMRS    APSR_nzcv, FPSCR
+        VMOVGT  s0, ip
+        MOVGT   a1, #FPSCR_OFC
+        BGT     RaiseException          ; Will overflow
+        VCMP.F32 s0, s2
+        VMRS    APSR_nzcv, FPSCR
+        VSUBLT.F32 s0, s0, s0
+        MOVLT   a1, #FPSCR_UFC
+        BLT     RaiseException          ; Will underflow
+
+        Push    "v1, lr"
+        MOV     v1, #0                  ; k = 0
+        VMOV    s2, v1                  ; hi = 0.0
+        VMOV.F32 s1, s2                 ; lo = 0.0
+        LDR     ip, =&3EB17218          ; Approx 1/2 ln(2)
+        CMP     a3, ip
+        BLS     %FT30
+        VLDR    s5, fln2
+        VLDR    s6, fln2r
+        LDR     ip, =&3F851592          ; Approx 3/2 ln(2)
+        CMP     a3, ip
+        BCS     %FT20
+        ; 1/2 ln(2) < |y| < 3/2 ln(2)
+        TST     a2, #1:SHL:31
+        VNEGNE.F32 s5, s5
+        VNEGNE.F32 s6, s6
+        VSUB.F32 s2, s0, s5             ; hi
+        VMOV.F32 s1, s6                 ; lo
+        ADDEQ   v1, v1, #1
+        SUBNE   v1, v1, #1
+        B       %FT40
+20
+        ; |y| >= 3/2 ln(2)
+        TST     a2, #1:SHL:31
+        VLDR    s3, fhalf
+        VLDR    s4, f1uponln2
+        VNEGNE.F32 s3, s3
+        VMLA.F32 s3, s4, s0
+        VCVT.S32.F32 s3, s3             ; k = integer round towards zero
+        VMOV    v1, s3
+        VCVT.F32.S32 s3, s3
+        VMUL.F32 s5, s3, s5
+        VSUB.F32 s2, s0, s5             ; hi
+        VMUL.F32 s1, s3, s6             ; lo
+        B       %FT40
+        B       %FT40
+30
+        ; |y| <= 1/2 ln(2)
+        LoadExp32 ip, -14               ; 2^-14
+        CMP     a3, ip
+        BCS     %FT50
+        MOV     a1, #FPSCR_IXC
+        BL      RaiseException
+        VLDR    s1, fone
+        VADD.F32 s0, s1, s0
+        Pull    "v1, pc"                ; Tiny, so approximate exp(y) = 1 + y
+40
+        VSUB.F32 s0, s2, s1             ; y = hi - lo
+50
+        ; 0 <= |y| <= 1/2 ln(2)
+        VMUL.F32 s3, s0, s0             ; y^2
+        ADR     a3, fCexp
+        VLDMIA  a3, { s4-s5 }
+        VFused32 s4, s3, s5
+        VLDR    s5, fone
+        VADD.F32 s6, s5, s5             ; 2
+        VMUL.F32 s4, s4, s3
+        VSUB.F32 s3, s0, s4             ; s3 := poly
+        CMP     v1, #0
+        BNE     %FT60
+
+        VSUB.F32 s4, s3, s6             ;                          (poly - 2)
+        VMUL.F32 s7, s0, s3             ;               (y * poly)
+        VDIV.F32 s7, s7, s4
+        VSUB.F32 s7, s7, s0
+        VSUB.F32 s0, s5, s7             ; exp(y) = 1 - ((y * poly)/(poly - 2) - x)
+        Pull    "v1, pc"
+60
+        VSUB.F32 s4, s6, s3             ;                                (2 - poly)
+        VMUL.F32 s7, s0, s3             ;                     (y * poly)
+        VDIV.F32 s7, s7, s4
+        VSUB.F32 s1, s1, s7             ;                lo - (y * poly)/(2 - poly)
+        VSUB.F32 s1, s1, s2             ;              ((lo - (y * poly)/(2 - poly)) - hi)
+        VSUB.F32 s1, s5, s1             ; exp(r) = 1 - ((lo - (y * poly)/(2 - poly)) - hi)
+
+        ; k non zero, need 2^k scaler
+        CMP     v1, #128                ; Careful making an exponent look like a NaN
+        VLDREQ  s4, f2pow127
+        VMULEQ.F32 s1, s1, s6
+        VMULEQ.F32 s0, s1, s4
+        Pull    "v1, pc",EQ
+
+        LoadExp32 a4, 0                 ; 2^0
+        CMP     v1, #-125
+        ADD     a3, a4, v1, LSL #23     ; Exponent of 2^k
+        ADDLT   a3, a3, #100:SHL:23     ;             2^(k+100)
+        VMOV    s2, a3
+        VMUL.F32 s0, s1, s2
+        LoadExp32 a3, -100              ; 2^-100
+        VMOVLT  s2, a3
+        VMULLT.F32 s0, s0, s2
+        Pull    "v1, pc"
+
+        ; float fp32pow(float x, float y)
+        ; This is such a large function that there's little to gain from having an optimised
+        ; version for single precision, it'll be (approximately) as slow. Just check for unusual
+        ; values then do a widening cast to the double precision implementation.
+        ;
+        ; Exceptions per ISO9899:2018 F10.4.4
+        ;       x = ±0, y < 0 and an odd integer, is a divide by zero
+        ;       x = ±0, finite y < 0 and not an odd integer, is a divide by zero
+        ;       x = ±0, y = -INF may raise a divide by zero
+        ;       finite x < 0, finite y which is not an integer, is an invalid operation
+fp32pow
+        VMOV    a2, s0
+        VMOV    a4, s1
+        BICS    ip, a4, #1:SHL:31
+        VLDREQ  s0, fone                ; anything^0 = 1
+        BXEQ    lr
+        LoadExp32 ip, 0                 ; 2^0
+        TEQ     a2, ip
+        BXEQ    lr                      ; 1^anything = 1
+        TEQ     a4, ip
+        BXEQ    lr                      ; anything^1 = itself
+
+absa2   RN a1
+absa4   RN a3
+
+        BIC     absa2, a2, #1:SHL:31
+        BIC     absa4, a4, #1:SHL:31
+        LDR     ip, =&FF:SHL:23
+        CMP     absa2, ip
+        CMPLS   absa4, ip
+10
+        VADDHI.F32 s0, s0, s1           ; Propagate NaNs
+        BXHI    lr
+
+        ; x is not 1, y is not 0 or 1, neither are NaN
+        Push    "v1, lr"
+        VCVT.F64.F32 d1, s1
+        VCVT.F64.F32 d0, s0
+        BL      fp64pow
+        VCVT.F32.F64 s0, d0
+        Pull    "v1, pc"
+
+        END

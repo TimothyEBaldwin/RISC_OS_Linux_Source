@@ -41,7 +41,9 @@ SUPPORTCODE ?= ${DEFSUPPORTCODE}
 
 COMPONENT  = VFPSupport
 ASMHDRS    = VFPSupport
-OBJS       = GetAll
+FUSEDOBJS  = Fused32 Fused64
+TRANSOBJS  = Trig32 Trig64 ArcTrig32 ArcTrig64 Power32 Power64
+OBJS       = GetAll ${FUSEDOBJS} ${TRANSOBJS}
 HDRS       =
 CMHGFILE   =
 ASMDEFINES += -PD "SupportCode SETL {${SUPPORTCODE}}"

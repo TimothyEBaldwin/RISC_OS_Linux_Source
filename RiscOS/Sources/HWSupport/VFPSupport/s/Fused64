@@ -1,0 +1,414 @@
+;
+; Copyright (c) 2005-2011 David Schultz <das@FreeBSD.ORG>
+; Copyright (c) 2021 RISC OS Open Limited
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions
+; are met:
+; 1. Redistributions of source code must retain the above copyright
+;    notice, this list of conditions and the following disclaimer.
+; 2. Redistributions in binary form must reproduce the above copyright
+;    notice, this list of conditions and the following disclaimer in the
+;    documentation and/or other materials provided with the distribution.
+;
+; THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+; FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+; DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+; OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+; HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+; LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+; OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+; SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:VFPSupport
+
+;
+; Constraints in this translation of the original:
+; * PRESERVE8 stack alignment
+; * Only use D0-D15 to allow for D16 VFP units
+; * Flush to zero is off
+; One day we might be able to write this in C...
+;
+
+        EXPORT  fused64_muladd
+        IMPORT  RaiseException
+        IMPORT  NextAfter
+        IMPORT  FRExp
+        IMPORT  LDExp
+        IMPORT  ILogB
+
+        AREA    |fused$$Code|, CODE, READONLY, PIC
+        ARM
+
+        GET     Macros.s
+
+        ; double AddAndDenormalise(double a, double b, int scale)
+        ; Compute ldexp(a+b, scale) with a single rounding error. It is assumed
+        ; that the result will be subnormal, and care is taken to ensure that
+        ; double rounding does not occur.
+AddAndDenormalise
+        Push    "a1, lr"
+        BL      DDAdd                   ; sum = DDAdd(a, b)
+        VCMP.F64 d0, #0.0
+        VMRS    APSR_nzcv, FPSCR
+        ; if (sum.lo == 0) return ldexp(sum.hi, scale)
+        BEQ     %FT20
+        ; EXTRACT_WORD64(hibits, sum.hi)
+        VMOV    a3, a4, d1
+        ; bits_lost = -((int)(hibits >> 52) & 0x7ff) - scale + 1
+        LDR     a1, [sp]
+        ExpBits64 ip, a4
+        RSB     ip, ip, #1
+        SUB     ip, ip, a1              ; bits_lost
+        TEQ     ip, #1
+        MOVNE   ip, #0
+        AND     a1, a3, #1
+        TEQ     a1, ip                  ; De Morgan (ip EOR a1) = NOT(NOT(ip) EOR a1)
+        BNE     %FT20
+        ; if ((bits_lost != 1) ^ (int)(hibits & 1))
+        ;     EXTRACT_WORD64(lobits, sum.lo)
+        ;     hibits += 1 - (((hibits ^ lobits) >> 62) & 2)
+        ;     INSERT_WORD64(sum.hi, hibits)
+        VMOV    a1, a2, d0
+        EOR     a2, a4, a2
+        MOV     a1, a2, LSR #30
+        MOV     a2, #0
+        AND     a1, a1, #2
+        RSBS    a1, a1, #1
+        RSC     a2, a2, #0
+        ADDS    a3, a3, a1
+        ADC     a4, a4, a2
+        VMOV    d1, a3, a4
+20
+        VMOV.F64 d0, d1
+        Pull    "a1, lr"
+        B       LDExp
+
+        ; double AddAdjusted(double a, double b)
+        ; Compute a + b, with a small tweak:  The least significant bit of the
+        ; result is adjusted into a sticky bit summarizing all the bits that
+        ; were lost to rounding.  This adjustment negates the effects of double
+        ; rounding when the result is added to another number with a higher
+        ; exponent.
+AddAdjusted
+        Push    "v1, lr"
+        BL      DDAdd                   ; sum = DDAdd(a, b)
+        VCMP.F64 d0, #0.0
+        VMRS    APSR_nzcv, FPSCR
+        ; if (sum.lo == 0) return sum.hi
+        BEQ     %FT10
+        ; EXTRACT_WORD64(hibits, sum.hi)
+        VMOV    a3, a4, d1
+        TST     a3, #1
+        BNE     %FT10
+        ; if ((hibits & 1) == 0)
+        ;     EXTRACT_WORD64(lobits, sum.lo)
+        ;     hibits += 1 - ((hibits ^ lobits) >> 62)
+        ;     INSERT_WORD64(sum.hi, hibits)
+        VMOV    a1, a2, d0
+        EOR     a2, a4, a2
+        MOV     a1, a2, LSR #30
+        MOV     a2, #0
+        RSBS    a1, a1, #1
+        RSC     a2, a2, #0
+        ADDS    a3, a3, a1
+        ADC     a4, a4, a2
+        VMOV    d1, a3, a4
+10
+        VMOV.F64 d0, d1
+        Pull    "v1, pc"
+
+        ; doubledouble DDAdd(double a, double b)
+        ; Perform double double addition of (hi,lo) = a + b
+DDAdd
+        VADD.F64 d3, d0, d1             ; hi = a + b
+        VSUB.F64 d4, d3, d0             ; s = hi - a
+        VSUB.F64 d2, d3, d4             ; hi - s
+        VSUB.F64 d2, d0, d2             ; a - (hi - s)
+        VSUB.F64 d1, d1, d4             ; b - s
+        VADD.F64 d0, d2, d1             ; lo = (a - (hi - s)) + (b - s)
+        VMOV.F64 d1, d3
+        BX      lr
+
+        ; doubledouble DDMul(double a, double b)
+        ; Perform double double multiplication of (hi,lo) = a * b
+DDMul
+        VLDR.F64 d7, split
+
+        VMUL.F64 d5, d0, d7             ; p = a * split
+        VSUB.F64 d6, d0, d5             ; ha = a - p
+        VADD.F64 d6, d6, d5             ; ha += p
+        VSUB.F64 d2, d0, d6             ; la = a - ha    => (ha,la) are (D6,D2)
+
+        VMUL.F64 d5, d1, d7             ; p = b * split
+        VSUB.F64 d7, d1, d5             ; hb = b - p
+        VADD.F64 d7, d7, d5             ; hb += p
+        VSUB.F64 d3, d1, d7             ; lb = b - hb    => (hb,lb) are (D7,D3)
+
+        VMUL.F64 d4, d6, d7             ; p = ha * hb
+        VMUL.F64 d5, d6, d3             ; ha * lb
+        VMLA.F64 d5, d2, d7             ; q = (ha * lb) + (la * hb)
+
+        VADD.F64 d1, d4, d5             ; hi = p + q
+        VMLA.F64 d5, d2, d3             ; q + (la * lb)
+        VSUB.F64 d7, d4, d1
+        VADD.F64 d0, d7, d5             ; lo = p - hi + q + (la * lb)
+        BX      lr
+
+split   DCD     &02000000, &41A00000    ; 0x1p27 + 1.0
+
+        ; double fused64_muladd(double x, double y, double z)
+        ; Compute z + (x * y) with a single rounding error.
+fused64_muladd
+        ; Handle special cases
+        MOV     a4, #1
+        VCMP.F64 d0, #0.0
+        VMRS    APSR_nzcv, FPSCR
+        MOVGT   a2, #1
+        MOVLE   a2, #0
+        VCMPNE.F64 d1, #0.0
+        VMRSNE  APSR_nzcv, FPSCR
+        BEQ     %FT10                   ; (x == 0.0 || y == 0.0)
+        EORLT   a2, a2, #1
+        VCMP.F64 d2, #0.0
+        VMRS    APSR_nzcv, FPSCR
+        MOVEQ   a4, #0
+        BEQ     %FT10                   ; if (z == 0.0) return x * y
+        IsNaNorINF64 d0, a1
+        BEQ     %FT10                   ; !isfinite(x)
+        IsNaNorINF64 d1, a1
+        BEQ     %FT10                   ; !isfinite(y)
+
+        LDR     ip, dblinf + 4
+        VMOV    a3, a4, d2
+        BIC     a1, a4, #1:SHL:31
+        CMP     a1, ip
+        CMP     a3, #0
+        BNE     %FT05                   ; z is not ±INF
+        VMUL.F64 d7, d0, d1
+        VMOV    a1, a2, d7
+        EOR     a2, a2, a4
+        TEQ     a1, a3
+        TEQEQ   a2, #1:SHL:31
+        MOVEQ   a4, #1
+        BEQ     %FT10                   ; x * y is INF and z is INF, but of opposite sign
+05
+        IsNaNorINF64 d2, a1
+        VMOVEQ.F64 d0, d2               ; if (!isfinite(z)) return z
+        BXEQ    lr
+
+                ^ 0, sp                 ; frame layout
+xylo            # 0
+xs              # 8
+xyhi            # 0
+ys              # 8
+zs              # 8
+ex              # 4
+ey              # 4
+ez              # 4
+xyzsize         * :INDEX:@
+
+        Push    "v1-v5, lr"
+        VPUSH   { d8-d9 }
+        SUB     sp, sp, #xyzsize
+        MOV     v5, a2                  ; boolean (x > 0.0) ^ (y < 0.0)
+        VMOV.F64 d8, d1
+        VMOV.F64 d9, d2
+
+        ADR     a1, ex
+        BL      FRExp
+        VSTR    d0, xs                  ; xs = frexp(x, &ex)
+
+        VMOV.F64 d0, d8
+        ADR     a1, ey
+        BL      FRExp
+        VSTR    d0, ys                  ; ys = frexp(y, &ey)
+
+        VMOV.F64 d0, d9
+        ADR     a1, ez
+        BL      FRExp                   ; zs = frexp(z, &ez)
+
+        ADD     a1, sp, #3*8
+        LDMIA   a1, { v1-v3 }
+        ADD     a2, v1, v2
+        SUB     v4, a2, v3              ; spread = ex + ey - ez
+
+        ; if (spread < -DBL_MANT_DIG)
+        ;     feraiseexcept(FE_INEXACT)
+        ;     if (!isnormal(z)) feraiseexcept(FE_UNDERFLOW)
+        ;     return z
+      [ {TRUE}
+        CMP     v4, #-DBL_MANT_DIG - 1  ; Go an extra digit to match VFP FMA
+      |
+        CMP     v4, #-DBL_MANT_DIG
+      ]
+        BGE     %FT20
+        MOV     a1, #FPSCR_IXC
+        BL      RaiseException
+        IsZeroOrSubNormal64 d9, ip      ; NaN and INF removed earlier, so just need zero and subnormal
+        MOVEQ   a1, #FPSCR_UFC
+        BLEQ    RaiseException
+
+        TEQ     v5, #0
+        VLDR    d1, dblinf
+
+        VMRS    a1, FPSCR
+        AND     a1, a1, #FPSCR_RMODE_MASK
+        ADD     pc, pc, a1, LSR #FPSCR_RMODE_SHIFT - 2
+        NOP
+        ASSERT  FPSCR_RMODE_NEAREST < FPSCR_RMODE_UP
+        ASSERT  FPSCR_RMODE_UP < FPSCR_RMODE_DOWN
+        ASSERT  FPSCR_RMODE_DOWN < FPSCR_RMODE_ZERO
+        B       ufnearest
+        B       ufup
+        B       ufdown
+ufzero
+        VCMP.F64 d9, #0.0
+        VMRS    APSR_nzcv, FPSCR
+        EORLT   v5, v5, #1              ; boolean (x > 0.0) ^ (y < 0.0) ^ (z < 0.0)
+        TEQ     v5, #0
+        BNE     ufnearest
+        VMOV    d1, v5, v5
+        B       ufnext                  ; nextafter(z, 0)
+ufup
+        BEQ     ufnearest
+        B       ufnext                  ; nextafter(z, INF)
+ufdown
+        BNE     ufnearest
+        VNEG.F64 d1, d1                 ; nextafter(z, -INF)
+ufnext
+        VMOV.F64 d0, d9
+        BL      NextAfter
+        B       %FT90
+ufnearest
+        VMOV.F64 d0, d9                 ; return z
+        B       %FT90
+
+dblinf  DCD     &00000000, &7FF00000
+dblmin  DCD     &00000000, &00100000
+
+10
+        ; x is ±0 or ±INF or NaN, or
+        ; y is ±0 or ±INF or NaN, or
+        ; z = 0
+        Push    "v1, lr"
+        VMRS    a1, FPSCR
+        BIC     a1, a1, #FPSCR_CUMULATIVE_FLAGS
+        VMSR    FPSCR, a1
+        TEQ     a4, #0                  ; z = 0 discriminator
+        VMULNE.F64 d3, d0, d1
+        VADDNE.F64 d0, d3, d2           ; (x * y) + z
+        VMULEQ.F64 d0, d0, d1           ; (x * y)
+        VMRS    a1, FPSCR               ; Check on over/underflow/invalid situation
+        ANDS    a1, a1, #FPSCR_OFC:OR:FPSCR_UFC:OR:FPSCR_IOC
+        BLNE    RaiseException
+        Pull    "v1, pc"
+20
+        ; if (spread <= DBL_MANT_DIG * 2)
+        ;     zs = ldexp(zs, -spread)
+        ; else
+        ;     zs = copysign(DBL_MIN, zs)
+        CMP     v4, #DBL_MANT_DIG * 2
+        BGT     %FT30
+        RSB     a1, v4, #0
+        BL      LDExp
+        B       %FT40
+30
+        VMOV    a1, s1                  ; High word of zs
+        VLDR    d0, dblmin
+        TST     a1, #1:SHL:31
+        VNEGNE.F64 d0, d0
+40
+        VSTR    d0, zs
+
+        VMRS    a2, FPSCR
+        AND     v5, a2, #FPSCR_RMODE_MASK
+        ASSERT  FPSCR_RMODE_NEAREST = 0
+        BIC     a2, a2, #FPSCR_RMODE_MASK
+        VMSR    FPSCR, a2               ; to nearest
+
+        ; Basic approach for round-to-nearest:
+        ;     (xy.hi, xy.lo) = x * y        (exact)
+        ;     (r.hi, r.lo)   = xy.hi + z    (exact)
+        ;     adj = xy.lo + r.lo            (inexact; low bit is sticky)
+        ;     result = r.hi + adj           (correctly rounded)
+        VLDMIA  sp, { d0-d1 }
+        BL      DDMul
+        VSTMIA  sp, { d0-d1 }           ; xy as a doubledouble
+        VMOV.F64 d0, d1
+        VLDR    d1, zs
+        BL      DDAdd
+        VMOV.F64 d8, d0
+        VMOV.F64 d9, d1                 ; r as a doubledouble
+
+        ADD     v4, v1, v2              ; spread = ex + ey
+
+        VMRS    a2, FPSCR
+        BIC     a2, a2, #FPSCR_RMODE_MASK
+        ORR     a2, a2, v5
+        VMSR    FPSCR, a2               ; restore original rounding mode
+
+        VCMP.F64 d9, #0.0
+        VMRS    APSR_nzcv, FPSCR
+        BNE     %FT50
+
+        ; When the addends cancel to 0, ensure that the result has
+        ; the correct sign.
+        MOV     a1, v4
+        VLDR    d0, xylo
+        BL      LDExp
+        VLDR    d1, xyhi
+        VLDR    d2, zs
+        VADD.F64 d3, d1, d0
+        VADD.F64 d0, d2, d3             ; return (xy.hi + zs + ldexp(xy.lo, spread))
+        B       %FT90
+50
+        TEQ     v5, #FPSCR_RMODE_NEAREST
+        BEQ     %FT60
+        ; There is no need to worry about double rounding in directed
+        ; rounding modes
+        VLDR    d1, xylo
+        VADD.F64 d8, d8, d1             ; adj = r.lo + xy.lo
+        B       %FT70
+60
+        ; adj = add_adjusted(r.lo, xy.lo)
+        VMOV.F64 d0, d8
+        VLDR    d1, xylo
+        BL      AddAdjusted
+        VMOV.F64 d8, d0                 ; adj
+
+        VMOV.F64 d0, d9
+        BL      ILogB
+        ADD     a3, a1, v4
+        MOV     a2, #1024
+        RSB     a2, a2, #1
+        MOV     a1, v4
+        CMP     a3, a2
+        BGT     %FT70
+        ; if (spread + ilogb(r.hi) > -1023)
+        ;     return (ldexp(r.hi + adj, spread))
+        ; else
+        ;     return (add_and_denormalise(r.hi, adj, spread))
+        VMOV.F64 d0, d9
+        VMOV.F64 d1, d8
+        BL      AddAndDenormalise
+        B       %FT90
+70
+        VADD.F64 d0, d8, d9
+        BL      LDExp
+90
+        ADD     sp, sp, #xyzsize
+        VPOP    { d8-d9 }
+        Pull    "v1-v5, pc"
+
+        END
