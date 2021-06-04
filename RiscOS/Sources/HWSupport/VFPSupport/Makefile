@@ -30,10 +30,10 @@
 
 # Use machine type to determine whether support code is needed
 # Can also be overridden on command line by specifying SUPPORTCODE
-# Assuming we're targeting a machine capable of VFP, Cortex-A8 is currently the
-# only machine type which doesn't need any support code at all 
+# Assuming we're targeting a machine capable of VFP, Cortex-A8 and Cortex-A53 are
+# the only machine types which don't need any support code at all 
 DEFSUPPORTCODE = TRUE
-ifneq (,$(findstring ${MACHINE},CortexA8))
+ifneq (,$(findstring ${MACHINE},CortexA8 CortexA53))
 DEFSUPPORTCODE = FALSE
 endif
 
