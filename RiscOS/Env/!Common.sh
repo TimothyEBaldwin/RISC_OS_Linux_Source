@@ -51,7 +51,7 @@ elif [ "$APCS" = "APCS-32" ]; then
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 5TE -memaccess +L22+S22+L41"
 		OBJASM_TOOLOPTIONS="-APCS 3/32bit -cpu 5TE"
 		;;
-	'ARM11ZF')
+	'ARM11ZF' | 'RPi')
 		GCC_TOOLOPTIONS="-march=armv6 -mfpu=fpe3"
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 6 -memaccess +L22+S22-L41"
 		OBJASM_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 6Z --fpu VFPv2"
@@ -94,7 +94,9 @@ export LIBDIR=$APCSEXPORTDIR/Lib
 export HDR_PATH=$HDRDIR/Global:$HDRDIR/Interface
 
 # This enables you to simply type "make all" from the command line
-alias make="make -I\"\$MAKEFILEDIR\" --no-print-directory"
+make () {
+    command make -I"$MAKEFILEDIR" --no-print-directory "$@"
+}
 
 # This is similar, but infers COMPONENT, TARGET and INSTDIR from the ModuleDB
 # if possible. Where a source directory occurs multiple times within the
@@ -103,8 +105,17 @@ alias make="make -I\"\$MAKEFILEDIR\" --no-print-directory"
 # from the environment also override those from the ModuleDB. You can also
 # use the -C switch to avoid having to cd to a component first, just like
 # with make. Any additional arguments (make targets etc) are passed to make.
-mk ()
-{(
+mk () (
+    on_exit() {
+        trap - EXIT
+        rm -f "$MYTMP"
+        exit "$1"
+    }
+    MYTMP=$(mktemp)
+    trap 'on_exit $?' EXIT
+
+    set -e
+
     COMPONENTDIR=$(pwd)
     if [ "$1" = "-C" ]; then
         COMPONENTDIR="$(cd "$2" && pwd)"
@@ -112,31 +123,30 @@ mk ()
         shift
     fi
     RELPATH=$(echo "${COMPONENTDIR#*$BUILDDIR/}" | tr / .)
-    MYTMP=$(mktemp)
+    NOT_FOUND=
 
     if [ -n "$COMPONENT" ]; then
-        grep "^$COMPONENT " "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
+        grep "^$COMPONENT " "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP" || NOT_FOUND=1
     else
-        grep "$RELPATH\( \|$\)" "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP"
+        grep "$RELPATH\( \|$\)" "$BUILDDIR/BuildSys/ModuleDB" > "$MYTMP" || NOT_FOUND=1
     fi
 
-    if [ $? -ne 0 ]; then
+    if [ -n "$NOT_FOUND" ]; then
         # Component not found in ModuleDB - can't infer anything
-        make -C "$COMPONENTDIR" "$@" || { rm "$MYTMP"; exit 1; }
+        make -C "$COMPONENTDIR" "$@"
     else
         while read -r DB_COMPONENT _ _ DB_INSTDIR DB_TARGET; do
-            ARGS=""
+            ARGS=("-C" "$COMPONENTDIR")
             if [ -z "$COMPONENT" ]; then
-                ARGS="$ARGS COMPONENT=$DB_COMPONENT"
+                ARGS+=("COMPONENT=$DB_COMPONENT")
             fi
             if [ -z "$TARGET" ] && [ -n "$DB_TARGET" ]; then
-                ARGS="$ARGS TARGET=$DB_TARGET"
+                ARGS+=("TARGET=$DB_TARGET")
             fi
             if [ -z "$INSTDIR" ] && [ -n "$DB_INSTDIR" ]; then
-                ARGS="$ARGS INSTDIR=\"$INSTALLDIR/$DB_INSTDIR\""
+                ARGS+=("INSTDIR=$INSTALLDIR/$DB_INSTDIR")
             fi
-            make -C "$COMPONENTDIR" $ARGS "$@" || { rm "$MYTMP"; exit 1; }
+            make "${ARGS[@]}" "$@"
         done < "$MYTMP"
     fi
-    rm "$MYTMP"
-)}
+)
