@@ -84,12 +84,12 @@ DFILES = \
  debug.${APP}.Templates
 
 OBJS      = o.colourpanel o.colours o.Export o.main o.menus o.psprite o.sprwindow o.tools o.toolwindow\
-            o.AltRename o.PaintLib o.CnPDrag o.Clipboard o.Drawfile o.PaintChoice
+            o.AltRename o.PaintLib o.CnPDrag o.Clipboard o.Drawfile o.PaintChoice o.BrushTransFunc
 OBJSZ     = oz.colourpanel oz.colours oz.Export oz.main oz.menus oz.psprite oz.sprwindow oz.tools\
-            oz.toolwindow oz.AltRename oz.PaintLib oz.CnPDrag oz.Clipboard oz.Drawfile oz.PaintChoice
+            oz.toolwindow oz.AltRename oz.PaintLib oz.CnPDrag oz.Clipboard oz.Drawfile oz.PaintChoice oz.BrushTransFunc
 OBJSD     = od.colourpanel od.colours od.Export od.ftrace od.guard od.main od.menus\
             od.psprite od.sprwindow od.tools od.toolwindow o.m\
-            od.AltRename od.PaintLib od.CnPDrag od.Clipboard od.Drawfile od.PaintChoice
+            od.AltRename od.PaintLib od.CnPDrag od.Clipboard od.Drawfile od.PaintChoice od.BrushTransFunc
 
 #
 # Rule patterns
@@ -99,6 +99,8 @@ OBJSD     = od.colourpanel od.colours od.Export od.ftrace od.guard od.main od.me
 .c.oz:;   ${CC} ${CFLAGS} -c ${C_NO_FNAMES} ${C_MODULE} ${C_NO_STKCHK} -o $@ $<
 .c.od:;   ${CC} ${CFLAGS} -c -DTRACE=1 -g -o $@ $<
 .asm.o:;  ${AS} ${ASFLAGS} $< $@
+.asm.oz:; ${AS} ${ASFLAGS} $< $@
+.asm.od:; ${AS} ${ASFLAGS} $< $@
 .c.s:;    ${CC} ${CFLAGS} -s ${C_NO_FNAMES} $<
 
 #
