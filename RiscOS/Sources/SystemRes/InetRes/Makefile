@@ -99,7 +99,6 @@ FILES=\
         ${STBFILES}
 
 EMERGENCYUTILS = \
-        ${SDIR}.arp.ARP              \
         ${SDIR}.ifconfig.IfConfig    \
         ${SDIR}.ping.Ping            \
         ${SDIR}.utils.utl.CheckMem   \
@@ -252,7 +251,6 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${MKDIR} ${RESD}.bin
         ${MKDIR} ${RESD}.utils
         ${MKDIR} ${RESD}.files
-        ${CP} ${SDIR}.arp.ARP               ${RESD}.bin.ARP          ${CPFLAGS}
         ${CP} ${SDIR}.ifconfig.IfConfig     ${RESD}.bin.IfConfig     ${CPFLAGS}
         ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
         ${CP} ${SDIR}.utils.utl.CheckMem    ${RESD}.utils.CheckMem   ${CPFLAGS}
