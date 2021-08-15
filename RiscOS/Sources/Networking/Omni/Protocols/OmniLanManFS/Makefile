@@ -19,14 +19,14 @@ COMPONENT    = LanManFS
 OBJS         = Xlate Transact Stats SMB RPC Printers Omni NetBIOS NBIP \
                NameCache Logon LLC LanMan CoreFn buflib Attr \
                Interface Auth md5c md4c
-CINCLUDES    = -ITCPIPLibs:,C:
+CINCLUDES    = ${TCPIPINC}
 HDRS         =
-CMHGFILE     = Lanman_MH
+CMHGFILE     = LanMan_MH
 CMHGDEPENDS  = LanMan LLC Logon NBIP Omni
 LIBS         = ${NET4LIBS} ${ASMUTILS}
 RES_PATH     = ThirdParty.OmniClient
 CDEFINES     = -DCOMPAT_INET4 -DLONGNAMES ${OPTIONS}
-CFLAGS       = -Wp
+CFLAGS       = ${C_NOWARN_NON_ANSI_INCLUDES}
 CDFLAGS      = -DDEBUG -DDEBUGLIB -DTRACE -Dprintf=module_printf
 ROMCDEFINES  = -DROM
 CMHGDEFINES  = ${OPTIONS}
