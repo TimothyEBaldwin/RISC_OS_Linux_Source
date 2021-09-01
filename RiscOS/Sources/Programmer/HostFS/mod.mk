@@ -17,7 +17,6 @@
 
 HDRS      =
 ASMHDRS   = HostFS HostDebug
-OBJS      = TML_HostFS
 CMHGFILE  =
 CUSTOMRES = no
 
