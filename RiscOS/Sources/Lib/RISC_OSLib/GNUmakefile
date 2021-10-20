@@ -313,7 +313,7 @@ swi.rm_o_rl: rlib/swi.s
 	${AS} ${ASFLAGS} ${UROM_ROM_DEFS} -depend $(subst .rm_o_rl,.rm_d_rl,$@) -pd "zm1 SETL {TRUE}" -o $@ $<
 
 
-SWIHDRS = ADFS ATAPI ATA BlendTable Buffer CDROM CDFS ColourPick ColourTran DDT Debugger DeviceFS DMA DOSFS DragASprit DragAnObj Draw Econet FileCore FilerAct Filter Font FPEmulator Free Freeway FSLock Hourglass HostFS IIC ITable Joystick SprExtend MakePSFont MsgTrans RISCOS Parallel PCI PDriver PDumper Podule Portable RAMFS RemotePrin ResourceFS RTC ScrBlank ScrModes SCSI SCSIFS SDFS SDIO SharedCLib Shell Sound Squash Super Switcher TaskWindow Territory VCHIQ Wimp ZLib
+SWIHDRS = ADFS ATAPI ATA BlendTable Buffer CDROM CDFS ColourPick ColourTran DDT Debugger DeviceFS DMA DOSFS DragASprit DragAnObj Draw Econet FileCore FilerAct Filter Font FPEmulator Free Freeway FSLock Hourglass HostFS IIC ITable Joystick SprExtend MakePSFont MsgTrans RISCOS Parallel PCI PDriver PDumper Podule Portable RAMFS RemotePrin ResourceFS RTC ScrBlank ScrModes SCSI SCSIFS SDFS SDIO SharedCLib Shell Sound Squash Super Switcher TaskWindow Territory VCHIQ VFPSupport Wimp ZLib
 
 swis.h: swisheader.h makehswis.s
 	@echo \; Automatically generated file > swioptions.s
