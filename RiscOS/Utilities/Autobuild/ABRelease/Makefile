@@ -26,7 +26,9 @@ include StdTools
 COMPONENT=ABRelease
 
 clean clean_all export_hdrs export_libs rom install install_rom release_autobuild resources:
-	@Do Set ab_csd$path <FileSwitch$CurrentFilingSystem>:|<FileSwitch$$<<FileSwitch$CurrentFilingSystem>$CSD>.
+	@Set ab_csd$path    @
+	@canonical ab_csd$path
+	@Set ab_csd$path    <ab_csd$path>.
 	@Set ab_res$dir     ab_csd:Resources.<Autobuild$Build>
 	@Set ab_res$path    <ab_res$dir>.,ab_csd:Resources.<Build>.,ab_csd:Resources.Generic.
 	@Set ab_build$dir   <AutoBuild$Root>.builds.<Autobuild$Build>
