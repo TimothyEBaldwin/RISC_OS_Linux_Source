@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <swis.h>
 #include "Global/OsBytes.h"
+#include "Global/Sprite.h"
 
 #include "bbc.h"
 #include "flex.h"
@@ -94,6 +95,8 @@ main_scaling_block tools_brushscale = { 1, 1, 1, 1 };
 
 wimp_i             tools_icons [tools_bicon_Max];
 main_sprite *tools_brushsprite_ptr = NULL;
+main_sprite *tools_brushmouse_ptr = NULL;
+main_file tools_brushfile = {NULL, NULL, NULL, NULL, 0, 0, 1, 0, NULL};
 
 BOOL tools_flood_local      = TRUE;
 BOOL tools_exporting_sprite = FALSE;
@@ -1546,9 +1549,10 @@ static void make_temporary_sprite (main_window *window, wimp_box region,
   if (height < 0)
         height = -height;
   height += 2;
-  needmask = forcemask || psprite_hasmask (sprite);
-  whichpal = !psprite_haspal (sprite)? 0: !psprite_hastruecolpal (sprite)
-      ? 1: 2;
+  needmask = (forcemask || psprite_hasmask (sprite)) &&
+             !psprite_hasalphachannel (sprite);
+  whichpal = !psprite_haspal (sprite)? 0:
+             !psprite_hastruecolpal (sprite)? 1: 2;
   /* Don't try to force a palette if > 256 colours */
   if (log2bpp > 3) forcepalette = FALSE;
   if (forcepalette && whichpal == 0)
@@ -1669,6 +1673,106 @@ static void delete_temporary_sprite (main_sprite *tempspriteptr, main_file *file
   sid.s.addr = psprite_address (tempspriteptr);
   sprite_delete (fileptr->spritearea, &sid);
   flex_free ((flex_ptr) &fileptr->spritearea);
+}
+
+/* This changes the RGB colour of transparent pixels to the specified    *
+ * value. It's a workaround for the fact that translucent painting using *
+ * BlendTable / InverseTable only blends with RGB values of pixels       *
+ * regardless of whether they're transparent in the mask, which could    *
+ * make transparent regions appear the wrong colour when painting over   *
+ * them at reduced opacity. The same thing can happen with the way the   *
+ * OS currently blends alpha mask / alpha channel sprites over           *
+ * transparent pixels.                                                   */
+static void set_transparent_RGB (main_sprite *sprite, sprite_colour *scol)
+
+{ sprite_id sid;
+  sid.tag    = sprite_id_addr;
+  sid.s.addr = psprite_address (sprite);
+  sprite_area **sarea = &sprite->file->spritearea;
+  int nc = colours_count (sprite);
+  BOOL mode8bpp = nc == 256 && !psprite_hastruecolpal (sprite);
+  BOOL convertedalpha = FALSE;
+  psprite_info sinfo;
+  char *msg = NULL;
+  os_error *error = NULL;
+  ftracef0 ("set_transparent_RGB\n");
+  ftracef4 ("sarea: %x sprite: %x image: %x mask: %x\n", *sarea, sid.s.addr, psprite_address (sprite)->image, psprite_address (sprite)->mask);
+
+  visdelay_begin ();
+  if (psprite_hasalphachannel (sprite))
+  { int flags = 0x80000000;
+    int smode;
+    int size_needed, space_needed = 0;
+    psprite_read_full_info (sprite, &sinfo);
+    smode = sinfo.mode | 0x80000000;
+    ftracef4 ("Size with alpha chan: %d size with alpha mask: %d width: %d height: %d\n", sinfo.size, psprite_size (sinfo.width, sinfo.height,
+        smode, 1, !sinfo.palette? 0: !sinfo.truepalette? 1: 2), sinfo.width, sinfo.height);
+    size_needed = psprite_size (sinfo.width, sinfo.height, smode, 1, !sinfo.palette? 0: !sinfo.truepalette? 1: 2) - sinfo.size;
+    if (psprite_need_convertalpha_fix ())
+      size_needed *= 2;
+    if (!menus_ensure_size (&sprite->file->spritearea, size_needed))
+    { msg = msgs_lookup ("PntEG");
+      goto finish;
+    }
+    /* Flex may have moved the sprite */
+    psprite_recalculate_offsets (sprite->file);
+    sid.s.addr = psprite_address (sprite);
+    /* Convert temporarily to an alpha mask */
+    error = os_swix4r (OS_SpriteOp, SpriteReason_CreateRemoveAlpha | 0x200, *sarea, (int)psprite_address (sprite), flags,
+                                    NULL, NULL, NULL, &space_needed);
+    if (error != NULL)
+    { /* If r3 > 0 it will give amount of extra space needed in area */
+      if (space_needed > 0)
+        ftracef1 ("More space needed for alpha mask: %d\n", space_needed);
+      msg = error->errmess;
+      goto finish;
+    }
+    ftracef0 ("Alpha conversion succeeded.\n");
+    convertedalpha = TRUE;
+  }
+  sprwindow_swap_output_to_screen (),
+  sprwindow_swap_output_to_mask (sprite, 0);
+
+  os_swi2 (OS_SetColour, 4 | 1 << 4, 0);
+  bbc_clg (); /*invert the mask*/
+
+  sprwindow_swap_output_to_screen (),
+  sprwindow_swap_output_to_sprite (sprite);
+  if (mode8bpp)
+    bbc_gcol (0, 128 | scol->colour), bbc_tint (3, scol->tint);
+  else
+    os_swi2 (OS_SetColour, 1 << 4, scol->colour);
+  sprite_put_mask_scaled (*sarea, &sid, 0, 0, 0);
+
+  sprwindow_swap_output_to_screen (),
+  sprwindow_swap_output_to_mask (sprite, 0);
+
+  os_swi2 (OS_SetColour, 4 | 1 << 4, 0);
+  bbc_clg (); /*invert back again*/
+  sprwindow_swap_output_to_screen ();
+
+  if (convertedalpha)
+  { int flags = 0xC0000080;
+    /* Convert it back to an alpha channel */
+    int space_needed = 0;
+    error = os_swix4r (OS_SpriteOp, SpriteReason_CreateRemoveAlpha | 0x200, (int)*sarea, (int)psprite_address (sprite), flags,
+                                    NULL, NULL, NULL, &space_needed);
+    if (error != NULL)
+    { /* If r3 > 0 it will give amount of extra space needed in area */
+      if (space_needed > 0)
+        ftracef1 ("More space needed for alpha mask: %d\n", space_needed);
+      msg = error->errmess;
+      goto finish;
+    }
+    /* Now shrink sprite area back */
+    menus_ensure_size (&sprite->file->spritearea, 0);
+    /* Flex may have moved the sprite */
+    psprite_recalculate_offsets (sprite->file);
+    ftracef0 ("Alpha channel conversion succeeded.\n");
+  }
+finish:
+  visdelay_end ();
+  if (msg != NULL) werr (FALSE, msg);
 }
 
 /********************
@@ -2760,6 +2864,116 @@ main_ttab *tools_get_layer_screen_transtab (main_sprite *basesprite)
   return toolslayer.screentranstab;
 }
 
+os_error *tools_make_brushmouse_sprite (void)
+
+{ sprite_info sid;
+  os_error *error = NULL;
+  main_window dummywin;
+  main_info_block dummyblock;
+  wimp_box region;
+  int flags;
+  int space_needed = 0;
+  sprite_header *addr;
+  sprite_area *sarea;
+  main_sprite *s;
+
+  ftracef0 ("tools_make_brushmouse_sprite\n");
+  tools_get_sprite_info_pixels (tools_brushsprite_ptr, &sid);
+  region.x0 = 0;
+  region.y0 = 0;
+  region.x1 = (sid.width - 1) * tools_brushsprite_ptr->mode.scale_xmul;
+  region.y1 = (sid.height - 1) * tools_brushsprite_ptr->mode.scale_ymul;
+
+  tools_brushfile.sprites = m_ALLOC(sizeof (main_sprite));
+  if (tools_brushfile.sprites == NULL)
+  { /* Don't display error box to user here. Caller will handle this. */
+    ftracef0 ("Error: Insufficient memory to make brush sprite copy.\n");
+    error = main_error ("PntWG");
+    goto finish;
+  }
+
+  s = tools_brushfile.sprites;
+  s->link         = NULL;
+  s->file         = &tools_brushfile;
+  s->windows      = NULL;
+  s->offset       = 0;
+  s->spriteno     = 0;
+  s->transtab     = tools_brushsprite_ptr->transtab;
+  s->colourhandle = 0;
+  s->bgcolourhandle = 0;
+  s->gcol.colour  = tools_brushsprite_ptr->gcol.colour;
+  s->gcol.alpha   = 255;
+  s->gcol.ecf     = FALSE;
+  s->flags        = 0;
+  s->gcol2.colour = 0;
+  s->gcol2.alpha  = 255;
+  s->gcol2.ecf    = FALSE;
+  s->mode.scale_xmul = tools_brushsprite_ptr->mode.scale_xmul;
+  s->mode.scale_xdiv = tools_brushsprite_ptr->mode.scale_xdiv;
+  s->mode.scale_ymul = tools_brushsprite_ptr->mode.scale_ymul;
+  s->mode.scale_ydiv = tools_brushsprite_ptr->mode.scale_ydiv;
+  memset (s->toolspace, 0, sizeof (s->toolspace));
+  memset (&dummywin, 0, sizeof (dummywin));
+  memset (&dummyblock.sprite, 0, sizeof (dummyblock.sprite));
+  dummyblock.sprite.sprite = tools_brushsprite_ptr;
+  dummywin.data = &dummyblock;
+
+  make_temporary_sprite (&dummywin, region, tools_brushfile.sprites, &tools_brushfile,
+      "brushmouse", FALSE, FALSE, FALSE);
+
+  flags = 1;/* Cuttoff value of 1. Bit 30-31 are zero to convert to on-off mask */
+  ftracef0 ("About to convert to on/off mask.\n");
+  sarea = tools_brushfile.spritearea;
+  space_needed = sid.height * (sid.width + 31 >> 5 << 2);
+  if (psprite_need_convertalpha_fix ())
+    space_needed *= 2;
+  menus_ensure_size (&tools_brushfile.spritearea, space_needed);
+  addr = psprite_address (tools_brushfile.sprites);
+  error = os_swix4r (OS_SpriteOp, SpriteReason_CreateRemoveAlpha | 0x200, (int)sarea, (int)addr, flags,
+                                  NULL, NULL, NULL, &space_needed);
+  if (error != NULL)
+  { /* If r3 > 0 it will give amount of extra space needed in area */
+    if (space_needed > 0)
+      ftracef1 ("More space needed for alpha conversion: %d\n", space_needed);
+    ftracef2 ("Error %d %s\n", error->errnum, error->errmess);
+    if (error->errnum == 133)
+      wimpt_complain (main_error ("PntEG"));
+    tools_delete_brushmouse_sprite ();
+    goto finish;
+  }
+  ftracef0 ("Alpha conversion succeeded.\n");
+  tools_brushmouse_ptr = tools_brushfile.sprites;
+
+finish:
+  if (error != NULL)
+  { tools_brushmouse_ptr = NULL;
+    menus_ensure_size (&tools_brushfile.spritearea, 0);
+  }
+  return error;
+}
+
+void tools_delete_brushmouse_sprite (void)
+
+{ ftracef0 ("tools_delete_brushmouse_sprite\n");
+  if (tools_brushfile.sprites == NULL)
+  { ftracef0 ("Nothing to delete!\n");
+    return;
+  }
+
+  /* The brush transtab currently is reused from the main brush sprite
+     so doesn't need to be deleted here */
+
+  /* Note that this deletes the entire sprite area currently. */
+  delete_temporary_sprite (tools_brushfile.sprites, &tools_brushfile);
+
+  if (tools_brushfile.sprites != NULL)
+  { m_FREE(tools_brushfile.sprites, sizeof (main_sprite));
+    tools_brushfile.sprites = NULL;
+  }
+  tools_brushfile.spritearea = NULL;
+  tools_brushmouse_ptr = NULL;
+}
+
 /* Makes a sprite used as an additional layer, currently only used       *
  * internally to contain any translucent brush stroke.                   *
  * The layer's intitialised with a copy of the supplied sprite, to       *
@@ -2915,45 +3129,19 @@ void tools_merge_layer_onto (main_sprite *sprite)
     visdelay_begin ();
     ftracef0 ("About to attempt pending merge.\n");
 
-    /* First we need to work around the fact that translucent painting  *
-     * using BlendTable / InverseTable only blends with RGB values of   *
-     * pixels regardless of whether they're transparent in the mask,    *
-     * which could make transparent regions appear the wrong colour     *
-     * when painting over them at reduced opacity.                      *
+    /* First we need to work around the fact BlendTable / InverseTable  *
+     * only blends with RGB values of pixels and for transparent regions*
+     * of sprites these are very often the wrong colour.                *
      * The workaround is to change the RGB colour of transparent pixels *
      * to the currently selected colour before the merge.               */
-    if (translucency > 0 && psprite_hasmask (sprite))
+    if (translucency > 0 && psprite_hasmask (sprite) &&
+        !psprite_canalphablend(sprite))
     { /* If not using gcol or tint we should possibly use white or 50% grey */
-      sprite_area *sarea = sprite->file->spritearea;
-      sprite_id sid;
-      int nc = colours_count (sprite);
-      BOOL mode8bpp = nc == 256 && !psprite_hastruecolpal (sprite);
-      sprite_colour scol = colours_pack_colour (translucentlayer, translucentlayer->gcol);
-
-      sid.tag    = sprite_id_addr;
-      sid.s.addr = psprite_address (sprite);
-      sprwindow_swap_output_to_screen (),
-      sprwindow_swap_output_to_mask (sprite, 0);
-
-      os_swi2 (OS_SetColour, 4 | 1 << 4, 0);
-      bbc_clg (); /*invert the mask*/
-
-      sprwindow_swap_output_to_screen (),
-      sprwindow_swap_output_to_sprite (sprite);
-      if (mode8bpp)
-        bbc_gcol (0, 128 | scol.colour), bbc_tint (3, scol.tint);
-      else
-        os_swi2 (OS_SetColour, 1 << 4, scol.colour);
-      sprite_put_mask_scaled (sarea, &sid, 0, 0, 0);
-
-      sprwindow_swap_output_to_screen (),
-      sprwindow_swap_output_to_mask (sprite, 0);
-
-      os_swi2 (OS_SetColour, 4 | 1 << 4, 0);
-      bbc_clg (); /*invert back again*/
+      sprite_colour scol = colours_pack_colour (translucentlayer,
+          translucentlayer->gcol);
+      set_transparent_RGB (sprite, &scol);
     }
 
-    sprwindow_swap_output_to_screen ();
     sprwindow_swap_output_to_sprite (sprite);
 
     if (tools_brush_use_gcol)
@@ -3049,7 +3237,7 @@ static void brushpaint_splot (main_window *window, wimp_mousestr *mpos)
     div = swind->sprite->mode.scale_ymul * tools_brushscale.scale_ydiv;
     y  -= tools_pixel_to_point_y(swind, (sbi.height*mul/div) / 2);
 
-    /* Read opacity TODO: Use alpha instead of translucency if available */
+    /* Read opacity */
     translucency = 255 - (unsigned char)slider_to_opacity (tools_brush_opacity);
     if (translucency > 0)
     { int nc = colours_count (sprite);
@@ -3063,6 +3251,7 @@ static void brushpaint_splot (main_window *window, wimp_mousestr *mpos)
       if (nc < 256)
         translucency = 0;
 #endif
+      ftracef1 ("Translucency: %d\n", translucency);
     }
 
     /* Note also if we're painting in the fully transparent colour, with *
@@ -3077,7 +3266,7 @@ static void brushpaint_splot (main_window *window, wimp_mousestr *mpos)
         ftracef1 ("tools_create_layer returned: %x\n", (int)translucentlayer);
       }
       if (translucentlayer == NULL)
-      { /* Out of memory. TODO disable opacity slider */
+      { /* Out of memory. */
         ftracef0 ("Couldn't create translucent brush layer.\n");
         destsprite = sprite;
         madenewlayer = FALSE;
@@ -3171,11 +3360,17 @@ static void brush_drawEOR(main_sprite_window *swind, int *toolspace, int x0, int
   sprite_info sbi;
   sprite_id sid;
   int mul, div;
+  main_sprite *brushmouse;
 
-  sid.s.addr = psprite_address (tools_brushsprite_ptr);
+  if (tools_brushmouse_ptr != NULL)
+    brushmouse = tools_brushmouse_ptr;
+  else
+    brushmouse = tools_brushsprite_ptr;
+
+  sid.s.addr = psprite_address (brushmouse);
   sid.tag = sprite_id_addr;
 
-  sprite_readsize (tools_brushsprite_ptr->file->spritearea, &sid, &sbi);
+  sprite_readsize (brushmouse->file->spritearea, &sid, &sbi);
 
   scale.scale_xmul =
       tools_brushscale.scale_xmul*swind->blobsize.scale_xmul;
@@ -3190,17 +3385,16 @@ static void brush_drawEOR(main_sprite_window *swind, int *toolspace, int x0, int
      to pixel grid. */
 
   x = tools_pixel_to_extent_x(swind, toolspace [3]);
-  mul=tools_brushsprite_ptr->mode.scale_xmul*tools_brushscale.scale_xmul;
+  mul=brushmouse->mode.scale_xmul*tools_brushscale.scale_xmul;
   div=swind->sprite->mode.scale_xmul*tools_brushscale.scale_xdiv;
   x-=tools_pixel_to_extent_x(swind,(sbi.width*mul/div)/2);
 
   y = tools_pixel_to_extent_y(swind, toolspace [4]);
-  mul=tools_brushsprite_ptr->mode.scale_ymul*tools_brushscale.scale_ymul;
+  mul=brushmouse->mode.scale_ymul*tools_brushscale.scale_ymul;
   div=swind->sprite->mode.scale_ymul*tools_brushscale.scale_ydiv;
   y -= tools_pixel_to_extent_y(swind,(sbi.height*mul/div)/2);
 
-
-  psprite_plot_scaled (x+x0, y+y0, tools_brushsprite_ptr, &scale, 4);
+  psprite_plot_scaled (x+x0, y+y0, brushmouse, &scale, 4);
 }
 
 static void brushEOR (main_sprite *sprite)
@@ -3246,6 +3440,14 @@ static void brushpaint_click (main_window *window, wimp_mousestr *mpos)
     ftracef2 ("0x%X->toolspace [0]: 0x%X\n",
         sprite, sprite->toolspace [0]);
     sprite->toolspace [3] = sprite->toolspace [4] = -1;
+
+    if (psprite_hasalphachannel (tools_brushsprite_ptr) ||
+        psprite_hasalphamask (tools_brushsprite_ptr))
+    { /* Have to set the RGB colour of transparent regions otherwise it can
+       * look wrong when the OS blends the brush with it. */
+      sprite_colour scol = colours_pack_colour (sprite, sprite->gcol);
+      set_transparent_RGB (sprite, &scol);
+    }
     brushpaint_splot (window, mpos);
   }
 }
