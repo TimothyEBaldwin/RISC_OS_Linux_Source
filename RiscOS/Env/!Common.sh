@@ -71,6 +71,11 @@ elif [ "$APCS" = "APCS-32" ]; then
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 7 -memaccess +L22+S22-L41"
 		OBJASM_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu Cortex-A7"
 		;;
+	'CortexA53')
+		GCC_TOOLOPTIONS="-march=armv7 -mfpu=fpe3"
+		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu 8-A.32.crypto -memaccess +L22+S22-L41"
+		OBJASM_TOOLOPTIONS="-APCS 3/32bit/fpe3 -cpu Cortex-A53.crypto"
+		;;
 	*)
 		GCC_TOOLOPTIONS="-march=armv2 -mfpu=fpe3"
 		NCC_TOOLOPTIONS="-APCS 3/32bit/fpe3 -memaccess -L22-S22-L41"
