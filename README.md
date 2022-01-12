@@ -109,6 +109,7 @@ As is standard for RISC OS filing systems IXFS is case insensitive by default, i
 |     116     | Exec failed |
 |     117     | HAL_DebugRX called and --abort-on-input given. |
 |     118     | Failed to reserve address space for system heap. |
+|     119     | Problem starting fork server thread. |
 
 
 ## To do List
