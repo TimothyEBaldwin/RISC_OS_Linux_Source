@@ -29,16 +29,13 @@ run() {
 
 set -x
 
-# Test C swi handler
-RISC_OS_Alias_IXFSBoot='BASIC -quit <Test$Dir>.Finish' run '' --cswi --abort-on-input --noaborts
+for i in '"-p"' '"" --cswi' '""'
+do
 
-# Various tests that shouldn't cause data aborts
-RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' run '' --abort-on-input --noaborts
+  # Various tests that shouldn't cause data aborts
+  RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_NoAbort' eval run $i --abort-on-input --noaborts
 
-# Various tests that require data aborts
-RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run ''
+  # Various tests that require data aborts
+  RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' eval run $i
 
-if [[ $QEMU = "" ]]; then
-  # Test ptrace SWI implemnation
-  RISC_OS_Alias_IXFSBoot='Obey -v <Test$Dir>.PreDesk_Aborts' run -p
-fi
+done
