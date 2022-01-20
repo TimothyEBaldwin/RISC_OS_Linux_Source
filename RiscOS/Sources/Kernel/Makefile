@@ -104,8 +104,10 @@ endif
 	Do ${LD} -aif -base <KernelBase> -bin -d -o ${KERNEL_MODULE}_aif ${ROM_OBJECTS}
 	${TOGPA} -s ${KERNEL_MODULE}_aif ${KERNEL_MODULE}_gpa
 
-GetAll.o: ${TOKHELPSRC}
+GetAll.o: ${TOKHELPSRC} hdr.AutoVersion
 
+hdr.AutoVersion:
+	Echo <32>END { > hdr.AutoVersion }
 #
 # Internal C header
 #
@@ -229,5 +231,8 @@ clean::
 	${XWIPE} Global ${WFLAGS}
 	${XWIPE} bin    ${WFLAGS}
 	${RM} h.kernel
+
+clean_all::
+	${RM} hdr.AutoVersion
 
 # Dynamic dependencies:

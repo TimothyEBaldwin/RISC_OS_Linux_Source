@@ -59,7 +59,7 @@ endif
 	set -o pipefail
 	uname -a
 ifeq ($(COMMIT),)
-	export COMMIT="$$(git rev-parse HEAD)"
+	export COMMIT="$$(git describe --always)"
 else
 	export COMMIT=$(COMMIT)
 endif
@@ -106,7 +106,8 @@ endif
 	    echo '#define VERSION "GIT commit: '$$COMMIT'\n"' > version
 	    cmp --quiet version mixed/Linux/HAL/h/version || cp version mixed/Linux/HAL/h/version
 	  fi
-	  #cp -ru --preserve=mode,timestamps ../../apache/RiscOS/Export .
+	  echo -e 'VersionNo SETS "$$VString ($$Date) Git: '$$COMMIT'"\nUseNewFX0Error SETL {FALSE}\n END' > version
+	  cmp --quiet version RiscOS/Sources/Kernel/hdr/AutoVersion || cp version RiscOS/Sources/Kernel/hdr/AutoVersion
 	}
 ifeq ($(INSECURE), YES)
 	( setup_build )
