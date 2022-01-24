@@ -134,12 +134,13 @@ Built/qemu_stamp-v5.2.0: ${QEMU_SRC} Unix/LinuxSupport/qemu_swi.diff | Built/gen
 
 Built/qemu_Makefile_stamp: Built/qemu_stamp-v5.2.0 | Built/gen_seccomp
 	set -o pipefail
-	$(call sandbox,-s) --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
+	mkdir -p Built/cache
+	env -i HOME=/ MAKEFLAGS="$$MAKEFLAGS" CCACHE_DIR=/c PATH="/usr/lib/ccache:$$PATH" $(call sandbox,-s) --bind Built/cache /c --bind Built/qemu /q --chdir /q ./configure --enable-attr --target-list=arm-linux-user --disable-werror </dev/null |& cat
 	touch Built/qemu_Makefile_stamp
 
 Built/qemu-arm: Built/qemu_Makefile_stamp | Built/gen_seccomp
 	set -o pipefail
-	+$(call sandbox,-s) --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
+	+env -i HOME=/ MAKEFLAGS="$$MAKEFLAGS" CCACHE_DIR=/c PATH="/usr/lib/ccache:$$PATH" PATH=/usr/lib/ccache:/usr/local/bin:/usr/bin:/bin $(call sandbox,-s) --bind Built/cache /c --bind Built/qemu /q --chdir /q $(MAKE) </dev/null |& cat
 	test ! -L Built/qemu/build
 	test ! -L Built/qemu/build/qemu-arm
 	ln -f Built/qemu/build/qemu-arm Built/qemu-arm
