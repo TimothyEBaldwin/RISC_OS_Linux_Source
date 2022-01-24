@@ -32,10 +32,9 @@ ifeq ($(TARGET), Linux)
 all check: Built/RISCOS.IMG
 endif
 
-build_binds = $(foreach dir,Built Unix RiscOS mixed,--ro-bind $(dir) /fd/5/$(dir)) --bind Build2/$* /fd/5/Build2/$* --ro-bind '${ACORN_CPP}' /fd/8 --symlink . /fd/5/lock_source_1510718522
+build_binds = $(foreach dir,Built Unix RiscOS mixed,--ro-bind $(dir) /fd/5/$(dir)) --bind Build2/$* /fd/5/Build2/$* --ro-bind '${ACORN_CPP}' /fd/8 --symlink . /fd/5/lock_source_44befc1cf3
 
 Build2/src-stamp: $(shell find Unix/LinuxSupport/build.mk Unix/SocketKVMFrontends/SocketKVM_Protocol.h Unix/SocketKVMFrontends/Makefile,fe1 RiscOS mixed \! \( -name '.*' -prune \))
-	ln -sfn . lock_source_1510718522
 	mkdir -p Build2
 	touch Build2/src-stamp
 
@@ -77,11 +76,11 @@ endif
 	    foreach $$f (@ARGV) {
 	      $$t = $$f;
 	      $$t =~ s:[^/]+:..:g;
-	      symlink "$$t/../lock_source_1510718522/$$f", $$f;
+	      symlink "$$t/../lock_source_44befc1cf3/$$f", $$f;
 	    }
 	  ' "$${files[@]}" || {
 	    for i in "$${files[@]}"; do
-	      test -f "../../$$i" -a ! -L "$$i" && ln -sf "$${i//+([^\/])/..}/../lock_source_1510718522/$$i" "$$i"
+	      test -f "../../$$i" -a ! -L "$$i" && ln -sf "$${i//+([^\/])/..}/../lock_source_44befc1cf3/$$i" "$$i"
 	      echo -n .
 	    done
 	  echo
