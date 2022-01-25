@@ -38,6 +38,17 @@ Build2/src-stamp: $(shell find Unix/LinuxSupport/build.mk Unix/SocketKVMFrontend
 	mkdir -p Build2
 	touch Build2/src-stamp
 
+ifeq ($(METHOD), remote)
+Build2/%/RiscOS/Images/rom: Build2/src-stamp | ${LINUX_ROM} Built/comma2attr
+	echo -n 'Remote build from '
+	uname -a
+	rsync -rlpt --delete Unix RiscOS mixed lock_source_44befc1cf3 '$(HOST):$(DIR)/'
+	cmd=( make -C '$(DIR)' -f Unix/LinuxSupport/common.mk 'PHASES=$(PHASES)' 'ACORN_CPP=${ACORN_CPP}' COMMIT="$$(git describe --always)" 'Build2/$*/RiscOS/Images/rom_check')
+	ssh '$(HOST)' "$${cmd[@]@Q}" '-j$$(getconf _NPROCESSORS_ONLN)'
+	mkdir -p 'Build2/$*/RiscOS/Images'
+	rsync -v '$(HOST):$(DIR)/Build2/$*/RiscOS/Images/rom' 'Build2/$*/RiscOS/Images/rom'
+	touch 'Build2/$*/RiscOS/Images/rom'
+else
 ifeq ($(METHOD), rpcemu)
 Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/rpcemu/rpcemu Built/boot_iomd_rom
 else ifeq ($(INSECURE), YES)
@@ -47,7 +58,11 @@ Build2/%/RiscOS/Images/rom: Build2/src-stamp | Built/gen_seccomp $(QEMU) ${LINUX
 endif
 	set -o pipefail
 	uname -a
+ifeq ($(COMMIT),)
 	export COMMIT="$$(git rev-parse HEAD)"
+else
+	export COMMIT=$(COMMIT)
+endif
 	echo Building GIT commit: $$COMMIT
 	#
 	mkdir -p Build2/$*
@@ -121,6 +136,7 @@ else
 endif
 	find Build2/$*/RiscOS/Images -type l -delete
 	! mv 'Build2/$*/RiscOS/Images/rom',??? 'Build2/$*/RiscOS/Images/rom'
+endif
 	! setfattr -n user.RISC_OS.LoadExec -v 0x00e5ffff00000000 'Build2/$*/RiscOS/Images/rom'
 	true
 
@@ -167,7 +183,7 @@ endif
 	BINARY=$$(cd Unix/RISC_OS && git rev-parse HEAD)
 	#
 ifndef FAST
-	$(MAKE) JOBS=$(JOBS) METHOD=$(METHOD)
+	$(MAKE) 'JOBS=$(JOBS)' 'METHOD=$(METHOD)' 'HOST=$(HOST)' 'DIR=$(DIR)'
 endif
 	(
 	  cd Unix/RISC_OS
@@ -190,7 +206,6 @@ endif
 ifneq ($(METHOD), rpcemu)
 	BINARY=$$BINARY
 endif
-	LINUX='$$(uname -a)'
 	" > Unix/RISC_OS/Unix/LinuxSupport/source
 	#
 	(
