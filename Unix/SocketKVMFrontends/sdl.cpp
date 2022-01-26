@@ -42,6 +42,7 @@ bool use_close_message;
 int log2bpp = 3;
 int height = 480;
 int width = 640;
+int window_resize_delay = 2;
 int no_updates = 0;
 SDL_Window *window;
 SDL_Surface *screen;
@@ -84,6 +85,17 @@ void refresh() {
   while (true) {
     if (!updates_pending++) SDL_PushEvent(&e);
     SDL_Delay(refresh_period);
+  }
+}
+
+void set_window_size() {
+  if (!window_resize_delay) {
+    int w, h;
+    SDL_GetWindowSize(window, &w, &h);
+    if (w != width || h != height) {
+      SDL_SetWindowSize(window, width, height);
+      window_resize_delay = 500 / refresh_period;
+    }
   }
 }
 }
@@ -161,8 +173,8 @@ int main(int argc, char **argv) {
               screen = SDL_CreateRGBSurfaceFrom(pixels, width, height, 32, width * 4,  0xFF, 0xFF00, 0xFF0000, 0);
               break;
           }
-          SDL_SetWindowSize(window, width, height);
-          if (no_updates < 200) no_updates = 200;
+          set_window_size();
+          no_updates = std::max(no_updates, 200);
           r.reason = report::ev_mode_sync;
           write(sockets[0], &r.reason, sizeof(r.reason));
           break;
@@ -230,6 +242,7 @@ int main(int argc, char **argv) {
       case mode_change:
         break;
       case screen_update:
+        if (window_resize_delay && !--window_resize_delay) set_window_size();
         update_screen();
         break;
       case SDL_WINDOWEVENT:
@@ -241,6 +254,7 @@ int main(int argc, char **argv) {
             r.mouse.y = e.window.data2;
             send_report(r);
             if (no_updates < 200) no_updates = 200;
+            window_resize_delay = 1000 / refresh_period;
             break;
           }
           case SDL_WINDOWEVENT_EXPOSED:

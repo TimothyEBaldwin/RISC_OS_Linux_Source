@@ -37,9 +37,9 @@ Built/sdlkey.h: Unix/SocketKVMFrontends/sdlkey.c $(lib_depends) Unix/SocketKVMFr
 	gcc -std=gnu99 -Wall -IBuilt Unix/SocketKVMFrontends/sdlkey.c $(SDL_FLAGS) -o Built/sdlkey
 	Built/sdlkey > $@
 
-Built/SDL_flags: Unix/SocketKVMFrontends/build.mk $(wildcard /usr/bin/sdl2-config) | Built
+Built/SDL_flags: Unix/SocketKVMFrontends/build.mk $(call pathsearch sdl2-config) | Built
 	exec > $@
-	if sdl2-config --version | grep -q -E '^2\.0\.(0|1|1[06-9]|[2-9][0-9]*)$$'; then
+	if [[ "$$(sdl2-config --version)" != "2.0.12" ]]; then
 	  echo SDL_FLAGS=`sdl2-config --cflags --libs`
 	else
 	  echo SDL_FLAGS=-Wl,-rpath,$(CURDIR)/Built/SDL/usr/lib -LBuilt/SDL/usr/lib -IBuilt/SDL/usr/include/SDL2 -D_REENTRANT -lSDL2
