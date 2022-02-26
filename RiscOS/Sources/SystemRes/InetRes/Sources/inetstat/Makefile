@@ -12,32 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Makefile for InetStat
+#
 
+COMPONENT = InetStat
+OBJS      = nl_symbols route main if mroute inet
+LIBS      = ${XOLIB} ${NET5LIBS}
+CINCLUDES = ${TCPIPINC}
+CDEFINES  = -DINET -Dlint
+CFLAGS    = ${C_NOWARN_NON_ANSI_INCLUDES}
 
-TARGET=         InetStat
+include CApp
 
-
-INCLUDES=	C:,TCPIPLibs:
-CC=		cc
-RM=             remove
-WFLAGS=         fr~c~v
-WIPE=           x wipe
-
-CFLAGS=		-wp -I$(INCLUDES) -Dlint -c ${THROWBACK} -depend !Depend
-
-OBJS=		o.main o.inet o.if o.route o.mroute
-
-LIBS=		C:o.Stubs TCPIPLibs:o.Unixlib TCPIPLibs:o.Inetlib \
-		TCPIPLibs:o.Socklib5
-
-.SUFFIXES:	.c .o
-.c.o:;		$(CC) $(CFLAGS) -o $@ $<
-
-${TARGET}:	$(OBJS) $(LIBS)
-		Link -o $@ $(OBJS) $(LIBS)
-		Squeeze $@
-
-clean:;		${RM} ${TARGET}
-		IfThere o.* Then ${WIPE} o.* ${WFLAGS}
-	
 # Dynamic dependencies:

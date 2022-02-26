@@ -29,14 +29,12 @@
 #
 
 COMPONENT  = Tftp
-INSTTYPE   = app
-OBJS       = main tftp tftpsubs
+OBJS       = main tftp tftp-file tftp-options tftp-utils tftp-io tftp-transfer
 LIBS       = ${NET5LIBS}
-CINCLUDES  = -ITCPIPLibs:,C:
-CDEFINES   = -DRISCOS_TWEAK -D__P(A)=A -Dlint
+CINCLUDES  = ${TCPIPINC}
+CDEFINES   = -DRISCOS_TWEAK -Dlint
+CFLAGS     = ${C_NOWARN_NON_ANSI_INCLUDES}
 
 include CApp
-
-C_WARNINGS = -wp
 
 # Dynamic dependencies:

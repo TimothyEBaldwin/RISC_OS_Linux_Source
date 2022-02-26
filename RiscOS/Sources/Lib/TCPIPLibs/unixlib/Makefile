@@ -51,35 +51,35 @@ AFLAGSZM=	-depend !Depend -PD "module SETL {TRUE}"
 CCZM=		${CC} ${CFLAGSZM}
 ASZM=		${AS} ${AFLAGSZM}
 
-CFILES=		access.c chdir.c chmod.c close.c filestat.c flushinput.c \
+CFILES=		access.c alloc.c chdir.c chmod.c clockgtime.c close.c filestat.c flushinput.c \
 		fstat.c getdtabsiz.c getegid.c geteuid.c getgroups.c \
 		gethostnam.c getlogin.c getpass.c getpid.c getpwent.c \
 		getpwnam.c getpwuid.c getuid.c getusernam.c getwd.c \
 		gtimeofday.c herror.c index.c ioctl.c killfile.c lseek.c \
 		memops.c osreadc.c read.c readdir.c readv.c strcasecmp.c \
 		stubs.c write.c writev.c xgets.c xperror.c xputchar.c \
-		getopt.c strsep.c kvm.c err.c errlst.c xstrerror.c \
-		strdup.c sleep.c ffs.c getifaddrs.c asm.s
+		getopt.c strtonum.c strsep.c kvm.c err.c errlst.c xstrerror.c \
+		strdup.c strlcat.c strlcpy.c sleep.c trimdomain.c ffs.c asm.s
 
-OFILES=		access.o chdir.o chmod.o close.o filestat.o flushinput.o \
+OFILES=		access.o alloc.o chdir.o chmod.o clockgtime.o close.o filestat.o flushinput.o \
 		fstat.o getdtabsiz.o getegid.o geteuid.o getgroups.o \
 		gethostnam.o getlogin.o getpass.o getpid.o getpwent.o \
 		getpwnam.o getpwuid.o getuid.o getusernam.o getwd.o \
 		gtimeofday.o herror.o index.o ioctl.o killfile.o lseek.o \
 		memops.o osreadc.o read.o readdir.o readv.o strcasecmp.o \
 		stubs.o write.o writev.o xgets.o xperror.o xputchar.o \
-		getopt.o strsep.o kvm.o err.o errlst.o xstrerror.o \
-		strdup.o sleep.o ffs.o getifaddrs.o asm.o
+		getopt.o strtonum.o strsep.o kvm.o err.o errlst.o xstrerror.o \
+		strdup.o strlcat.o strlcpy.o sleep.o trimdomain.o ffs.o asm.o
 
-ZFILES=		z.access z.chdir z.chmod z.close z.filestat z.flushinput \
+ZFILES=		z.access z.alloc z.chdir z.chmod z.close z.clockgtime z.filestat z.flushinput \
 		z.fstat z.getdtabsiz z.getegid z.geteuid z.getgroups \
 		z.gethostnam z.getlogin z.getpass z.getpid z.getpwent \
 		z.getpwnam z.getpwuid z.getuid z.getusernam z.getwd \
 		z.gtimeofday z.herror z.index z.ioctl z.killfile z.lseek \
 		z.memops z.osreadc z.read z.readdir z.readv z.strcasecmp \
 		z.stubs z.write z.writev z.xgets z.xperror z.xputchar \
-		z.getopt z.strsep z.kvm z.err z.errlst z.xstrerror \
-		z.strdup z.sleep z.ffs z.getifaddrs z.asm
+		z.getopt z.strtonum z.strsep z.kvm z.err z.errlst z.xstrerror \
+		z.strdup z.strlcat z.strlcpy z.sleep z.trimdomain z.ffs z.asm
 
 .SUFFIXES:	.z .o .c .s
 

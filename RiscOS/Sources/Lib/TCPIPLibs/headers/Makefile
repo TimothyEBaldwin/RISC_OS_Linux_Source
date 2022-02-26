@@ -72,6 +72,10 @@ HDRS = \
   netinet.h.ip \
   netinet.h.ip_icmp \
   netinet.h.ip_var \
+  netinet.h.sctp \
+  netinet.h.sctp_constants \
+  netinet.h.sctp_header \
+  netinet.h.sctp_uio \
   netinet.h.tcp \
   netinet.h.tcpip \
   netinet.h.tcp_debug \
@@ -104,6 +108,7 @@ HDRS = \
   sys.h.acct \
   sys.h.buf \
   sys.h.callout \
+  sys.h.capsicum \
   sys.h.clist \
   sys.h.conf \
   sys.h.dcistructs \

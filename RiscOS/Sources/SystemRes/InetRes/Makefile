@@ -14,19 +14,7 @@
 #
 # Makefile for Internet resources
 #
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date           Name   Description
-# ----           ----   -----------
-# 03-Jul-96      KJB    Derived from Scrap makefile
-# 05-Oct-99      SNB    Updated to allow slimmed down STB !Internet to be built.
-#                       Passing OPTIONS=STB builds a cut down structure.
-#
 
-#
-# Program specific options:
-#
 COMPONENT  = Internet
 APP        = !${COMPONENT}
 RDIR       = Resources
@@ -63,7 +51,6 @@ STBFILES=\
         ${RDIR}.!Boot\
 
 DBFILES=\
-        ${RDIR}.files.AUNMap\
         ${RDIR}.files.CertData\
         ${RDIR}.files.Hosts\
         ${RDIR}.files.MimeMap\
@@ -80,17 +67,14 @@ DISCFILES=\
         ${RDIR}.!Sprites11\
         ${SDIR}.gethost.GetHost\
         ${SDIR}.ifrconfig.IfRConfig\
-        ${SDIR}.map-mbone.Map-MBone\
         ${SDIR}.md5.MD5\
-        ${SDIR}.mrinfo.MRInfo\
-        ${SDIR}.mtrace.MTrace\
         ${SDIR}.tftp.Tftp\
-        ${SDIR}.utils.utl.RMFind\
+        ${SDIR}.utils.RMFind\
         ${RDIR}.utils.BootNet\
-        ${SDIR}.utils.utl.CheckMem\
+        ${SDIR}.utils.CheckMem\
         ${SDIR}.newfiler.NewFiler\
-        ${SDIR}.utils.utl.ReadCMOSIP\
-        ${SDIR}.utils.utl.TriggerCBs
+        ${SDIR}.utils.ReadCMOSIP\
+        ${SDIR}.utils.TriggerCBs
 
 FILES=\
         ${COMMONFILES} \
@@ -101,7 +85,7 @@ FILES=\
 EMERGENCYUTILS = \
         ${SDIR}.ifconfig.IfConfig    \
         ${SDIR}.ping.Ping            \
-        ${SDIR}.utils.utl.CheckMem   \
+        ${SDIR}.utils.CheckMem       \
         ${SDIR}.newfiler.NewFiler    \
         ${SDIR}.sysctl.SysCtl        \
         ${LDIR}.!Run                 \
@@ -112,12 +96,9 @@ NETUTILS = \
         ${SDIR}.ifconfig.IfConfig    \
         ${SDIR}.inetstat.InetStat    \
         ${SDIR}.ipvars.IPVars        \
-        ${SDIR}.map-mbone.Map-MBone  \
         ${SDIR}.md5.MD5              \
-        ${SDIR}.mrinfo.MRInfo        \
-        ${SDIR}.mtrace.MTrace        \
         ${SDIR}.ping.Ping            \
-        ${SDIR}.utils.utl.RMFind     \
+        ${SDIR}.utils.RMFind         \
         ${SDIR}.route.Route          \
         ${SDIR}.showstat.ShowStat    \
         ${SDIR}.sysctl.SysCtl        \
@@ -143,7 +124,6 @@ install_common: ${COMMONFILES}
         ${RM} ${INSTAPP}.!Help
         ${RM} ${INSTAPP}.!Run
         ${RM} ${INSTAPP}.!Boot
-        ${RM} ${INSTAPP}.files.AUNMap
         ${CP} ${SDIR}.arp.ARP               ${INSTAPP}.bin.ARP          ${CPFLAGS}
         ${CP} ${SDIR}.ifconfig.IfConfig     ${INSTAPP}.bin.IfConfig     ${CPFLAGS}
         ${CP} ${SDIR}.inetstat.InetStat     ${INSTAPP}.bin.InetStat     ${CPFLAGS}
@@ -180,22 +160,17 @@ install_: ${DISCFILES} ${DBFILES}
         ${CP} ${LDIR}.Morris4    ${INSTAPP}.Themes.Morris4    ${CPFLAGS}
         |
         ${CP} ${RDIR}.files      ${INSTAPP}.files      ${CPFLAGS}
-        ${AWK} -f awk.Version ${RDIR}.files.AUNMap > ${INSTAPP}.files.AUNMap
-        SetType ${INSTAPP}.files.AUNMap Obey
         ${CP} ${RDIR}.utils      ${INSTAPP}.utils      ${CPFLAGS}
         |
         ${CP} ${SDIR}.gethost.GetHost       ${INSTAPP}.bin.GetHost      ${CPFLAGS}
         ${CP} ${SDIR}.ifrconfig.IfRConfig   ${INSTAPP}.bin.IfRConfig    ${CPFLAGS}
-        ${CP} ${SDIR}.map-mbone.Map-MBone   ${INSTAPP}.bin.Map-MBone    ${CPFLAGS}
         ${CP} ${SDIR}.md5.MD5               ${INSTAPP}.bin.MD5          ${CPFLAGS}
-        ${CP} ${SDIR}.mrinfo.MRInfo         ${INSTAPP}.bin.MRInfo       ${CPFLAGS}
-        ${CP} ${SDIR}.mtrace.MTrace         ${INSTAPP}.bin.MTrace       ${CPFLAGS}
         ${CP} ${SDIR}.tftp.Tftp             ${INSTAPP}.bin.Tftp         ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.RMFind      ${INSTAPP}.bin.RMFind       ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.CheckMem    ${INSTAPP}.utils.CheckMem   ${CPFLAGS}
+        ${CP} ${SDIR}.utils.RMFind          ${INSTAPP}.utils.RMFind     ${CPFLAGS}
+        ${CP} ${SDIR}.utils.CheckMem        ${INSTAPP}.utils.CheckMem   ${CPFLAGS}
         ${CP} ${SDIR}.newfiler.NewFiler     ${INSTAPP}.utils.NewFiler   ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.ReadCMOSIP  ${INSTAPP}.utils.ReadCMOSIP ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.TriggerCBs  ${INSTAPP}.utils.TriggerCBs ${CPFLAGS}
+        ${CP} ${SDIR}.utils.ReadCMOSIP      ${INSTAPP}.utils.ReadCMOSIP ${CPFLAGS}
+        ${CP} ${SDIR}.utils.TriggerCBs      ${INSTAPP}.utils.TriggerCBs ${CPFLAGS}
 
 dirs:
         ${MKDIR} ${INSTAPP}
@@ -222,19 +197,14 @@ resources-NetUtils: ${NETUTILS}
         ${CP} ${SDIR}.ifrconfig.IfRConfig   ${RESD}.bin.IfRConfig    ${CPFLAGS}
         ${CP} ${SDIR}.ipvars.IPVars         ${RESD}.bin.IPVars       ${CPFLAGS}
         ${CP} ${SDIR}.inetstat.InetStat     ${RESD}.bin.InetStat     ${CPFLAGS}
-        ${CP} ${SDIR}.map-mbone.Map-MBone   ${RESD}.bin.Map-MBone    ${CPFLAGS}
         ${CP} ${SDIR}.md5.MD5               ${RESD}.bin.MD5          ${CPFLAGS}
-        ${CP} ${SDIR}.mrinfo.MRInfo         ${RESD}.bin.MRInfo       ${CPFLAGS}
-        ${CP} ${SDIR}.mtrace.MTrace         ${RESD}.bin.MTrace       ${CPFLAGS}
         ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.RMFind      ${RESD}.bin.RMFind       ${CPFLAGS}
+        ${CP} ${SDIR}.utils.RMFind          ${RESD}.bin.RMFind       ${CPFLAGS}
         ${CP} ${SDIR}.route.Route           ${RESD}.bin.Route        ${CPFLAGS}
         ${CP} ${SDIR}.sysctl.SysCtl         ${RESD}.bin.SysCtl       ${CPFLAGS}
         ${CP} ${SDIR}.showstat.ShowStat     ${RESD}.bin.ShowStat     ${CPFLAGS}
         ${CP} ${SDIR}.traceroute.TraceRoute ${RESD}.bin.TraceRoute   ${CPFLAGS}
         ${CP} ${SDIR}.tftp.Tftp             ${RESD}.bin.Tftp         ${CPFLAGS}
-        ${AWK} -f awk.Version ${RDIR}.files.AUNMap > ${RESD}.files.AUNMap
-        SetType ${RESD}.files.AUNMap Obey
         ${CP} ${RDIR}.files.Hosts           ${RESD}.files.Hosts      ${CPFLAGS}
         ${CP} ${RDIR}.files.Networks        ${RESD}.files.Networks   ${CPFLAGS}
         ${CP} ${RDIR}.files.Protocols       ${RESD}.files.Protocols  ${CPFLAGS}
@@ -253,11 +223,9 @@ resources-EmergencyUtils: ${EMERGENCYUTILS}
         ${MKDIR} ${RESD}.files
         ${CP} ${SDIR}.ifconfig.IfConfig     ${RESD}.bin.IfConfig     ${CPFLAGS}
         ${CP} ${SDIR}.ping.Ping             ${RESD}.bin.Ping         ${CPFLAGS}
-        ${CP} ${SDIR}.utils.utl.CheckMem    ${RESD}.utils.CheckMem   ${CPFLAGS}
+        ${CP} ${SDIR}.utils.CheckMem        ${RESD}.utils.CheckMem   ${CPFLAGS}
         ${CP} ${SDIR}.newfiler.NewFiler     ${RESD}.utils.NewFiler   ${CPFLAGS}
         ${CP} ${SDIR}.sysctl.SysCtl         ${RESD}.bin.SysCtl       ${CPFLAGS}
-        ${AWK} -f awk.Version ${RDIR}.files.AUNMap > ${RESD}.files.AUNMap
-        SetType ${RESD}.files.AUNMap Obey
         ${CP} ${RDIR}.files.Hosts           ${RESD}.files.Hosts      ${CPFLAGS}
         ${CP} ${RDIR}.files.Networks        ${RESD}.files.Networks   ${CPFLAGS}
         ${CP} ${RDIR}.files.Protocols       ${RESD}.files.Protocols  ${CPFLAGS}
@@ -271,7 +239,9 @@ ${SDIR}.arp.ARP: ${SDIR}.arp.c.ARP
         @up
         @up
 
-${SDIR}.ifconfig.IfConfig: ${SDIR}.ifconfig.c.IfConfig
+${SDIR}.ifconfig.IfConfig: ${SDIR}.ifconfig.c.IfConfig \
+        ${SDIR}.ifconfig.c.af_inet \
+        ${SDIR}.ifconfig.c.af_link
         dir ${SDIR}.ifconfig
         @amu_machine
         @up
@@ -305,15 +275,6 @@ ${SDIR}.inetstat.InetStat: ${SDIR}.inetstat.c.main \
         @up
         @up
 
-${SDIR}.map-mbone.Map-MBone: ${SDIR}.map-mbone.c.Map-MBone \
-        ${SDIR}.map-mbone.c.igmp \
-        ${SDIR}.map-mbone.c.inet \
-        ${SDIR}.map-mbone.c.kern
-        dir ${SDIR}.map-mbone
-        @amu_machine
-        @up
-        @up
-
 ${SDIR}.md5.MD5: ${SDIR}.md5.c.md5 \
         ${SDIR}.md5.c.md5c \
         ${SDIR}.md5.c.mdXhl
@@ -322,22 +283,8 @@ ${SDIR}.md5.MD5: ${SDIR}.md5.c.md5 \
         @up
         @up
 
-${SDIR}.mrinfo.MRInfo: ${SDIR}.mrinfo.c.MRInfo \
-        ${SDIR}.mrinfo.c.igmp \
-        ${SDIR}.mrinfo.c.inet \
-        ${SDIR}.mrinfo.c.kern
-        dir ${SDIR}.mrinfo
-        @amu_machine
-        @up
-        @up
-
-${SDIR}.mtrace.MTrace: ${SDIR}.mtrace.c.MTrace
-        dir ${SDIR}.mtrace
-        @amu_machine
-        @up
-        @up
-
-${SDIR}.ping.Ping: ${SDIR}.ping.c.Ping
+${SDIR}.ping.Ping: ${SDIR}.ping.c.Ping \
+        ${SDIR}.ping.c.utils
         dir ${SDIR}.ping
         @amu_machine
         @up
@@ -355,7 +302,8 @@ ${SDIR}.route.Route: ${SDIR}.route.c.Route
         @up
         @up
 
-${SDIR}.showstat.ShowStat:
+${SDIR}.showstat.ShowStat: ${SDIR}.showstat.c.main \
+        ${SDIR}.showstat.c.msgs
         dir ${SDIR}.showstat
         @amu_machine 
         @up
@@ -369,13 +317,19 @@ ${SDIR}.sysctl.SysCtl: ${SDIR}.sysctl.c.SysCtl
 
 ${SDIR}.tftp.Tftp: ${SDIR}.tftp.c.main \
         ${SDIR}.tftp.c.tftp \
-        ${SDIR}.tftp.c.tftpsubs
+        ${SDIR}.tftp.c.tftp-file \
+        ${SDIR}.tftp.c.tftp-io \
+        ${SDIR}.tftp.c.tftp-options \
+        ${SDIR}.tftp.c.tftp-transfer \
+        ${SDIR}.tftp.c.tftp-utils
         dir ${SDIR}.tftp
         @amu_machine
         @up
         @up
 
-${SDIR}.traceroute.TraceRoute: ${SDIR}.traceroute.c.TraceRoute
+${SDIR}.traceroute.TraceRoute: ${SDIR}.traceroute.c.TraceRoute \
+        ${SDIR}.traceroute.c.findsaddr \
+        ${SDIR}.traceroute.c.ifaddrlist
         dir ${SDIR}.traceroute
         @amu_machine
         @up
@@ -387,33 +341,27 @@ ${SDIR}.newfiler.NewFiler: ${SDIR}.newfiler.c.NewFiler
         @up
         @up
 
-${SDIR}.utils.utl.CheckMem: ${SDIR}.utils.s.CheckMem
+${SDIR}.utils.CheckMem: ${SDIR}.utils.s.CheckMem
         dir ${SDIR}.utils
-        @amu_machine utl.CheckMem
+        @amu_machine standalone
         @up
         @up
 
-${SDIR}.utils.utl.ReadCMOSIP: ${SDIR}.utils.s.ReadCMOSIP
+${SDIR}.utils.ReadCMOSIP: ${SDIR}.utils.s.ReadCMOSIP
         dir ${SDIR}.utils
-        @amu_machine utl.ReadCMOSIP
+        @amu_machine standalone
         @up
         @up
 
-${SDIR}.utils.utl.RMFind: ${SDIR}.utils.s.RMFind
+${SDIR}.utils.RMFind: ${SDIR}.utils.s.RMFind
         dir ${SDIR}.utils
-        @amu_machine utl.RMFind
+        @amu_machine standalone
         @up
         @up
 
-${SDIR}.utils.utl.TriggerCBs: ${SDIR}.utils.s.TriggerCBs
+${SDIR}.utils.TriggerCBs: ${SDIR}.utils.s.TriggerCBs
         dir ${SDIR}.utils
-        @amu_machine utl.TriggerCBs
-        @up
-        @up
-
-${SDIR}.utils.utl.X: ${SDIR}.utils.s.X
-        dir ${SDIR}.utils
-        @amu_machine utl.X
+        @amu_machine standalone
         @up
         @up
 

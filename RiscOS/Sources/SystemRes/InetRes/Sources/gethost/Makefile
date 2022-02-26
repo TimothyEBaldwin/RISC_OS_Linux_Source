@@ -12,70 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Makefile for GetHost
 #
-# Generic options:
-#
-MKDIR   = mkdir -p 
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-WIPE    = x wipe
-SQUEEZE = squeeze
 
-DEFINES = -DRISCOS_TWEAK
-AFLAGS  = -depend !Depend -Stamp -quit
-CFLAGS  = -c -depend !Depend -ffah -Wp -zps1 ${INCLUDES} ${DEFINES} ${DFLAGS}
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
-
-#
-# Libraries
-#
-CLIB      = CLIB:o.stubs
-NET5LIBS  = \
-  TCPIPLibs:o.inetlib \
-  TCPIPLibs:o.unixlib \
-
-#
-# Include files
-#
-INCLUDES = -ITCPIPLibs:,C:
-
-DIRS = o._dirs
-
-#
-# Program specific options:
-#
 COMPONENT = GetHost
-TARGET    = GetHost
-OBJS =      o.GetHost
+OBJS      = gethost
+LIBS      = ${NET5LIBS}
+CDEFINES  = -DRISCOS_TWEAK
+CINCLUDES = ${TCPIPINC}
+CFLAGS    = ${C_NOWARN_NON_ANSI_INCLUDES}
 
-#
-# Rule patterns
-#
-.c.o:;      ${CC} ${CFLAGS} -o $@ $<
-.cmhg.o:;   ${CMHG} ${CMHGFLAGS} -o $@ $<
-.cmhg.h:;   ${CMHG} ${CMHGFLAGS} -d $@ $<
-.s.o:;      ${AS} ${AFLAGS} $< $@
-
-#
-# build a binary
-#
-all:    GetHost
-
-clean:  
-        IfThere o Then ${WIPE} o ${WFLAGS}
-        ${RM} GetHost
-
-${DIRS}:
-        ${MKDIR} o
-
-GetHost: ${OBJS} ${NET5LIBS} ${CLIB} ${DIRS}
-        ${LD} -o $@ ${OBJS} ${NET5LIBS} ${CLIB}
-        ${SQUEEZE} $@
-
+include CApp
 
 # Dynamic dependencies:

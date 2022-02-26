@@ -12,34 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Makefile for SysCtl
+#
 
-TARGET=         SysCtl
+COMPONENT = SysCtl
+OBJS      = SysCtl
+LIBS      = ${NET5LIBS}
+CINCLUDES = ${TCPIPINC}
+CFLAGS    = ${C_NOWARN_NON_ANSI_INCLUDES}
+CDEFINES  = -Dlint
 
+include CApp
 
-INCLUDES=	C:,TCPIPLibs:
-CC=		cc
-RM=             remove
-WFLAGS=         fr~c~v
-WIPE=           x wipe
-
-CFLAGS=		-wp -I$(INCLUDES) -Dlint -c ${THROWBACK} -depend !Depend
-
-OBJS=		o.${TARGET}
-
-LIBS=		C:o.Stubs TCPIPLibs:o.Unixlib TCPIPLibs:o.Inetlib \
-		TCPIPLibs:o.Socklib5
-
-.SUFFIXES:	.c .o
-.c.o:;		$(CC) $(CFLAGS) -o $@ $<
-
-${TARGET}:	$(OBJS) $(LIBS)
-		Link -o $@ $(OBJS) $(LIBS)
-		Squeeze $@
-
-clean:;		${RM} ${TARGET}
-		IfThere o.* Then ${WIPE} o.* ${WFLAGS}
-
-PathConf:	PathConf.o
-		Link -o $@ PathConf.o ${LIBS}
-	
 # Dynamic dependencies:

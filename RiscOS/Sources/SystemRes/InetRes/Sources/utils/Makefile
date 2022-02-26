@@ -12,85 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Makefile
-#
-# ***********************************
-# ***    C h a n g e   L i s t    ***
-# ***********************************
-# Date       Name   Description
-# ----       ----   -----------
-# 08-Oct-96  KJB    Created
+# Makefile for !Internet utilities
 #
 
-COMPONENT = !Internet
+COMPONENT = InetResUtils
+CUSTOMROM = custom
+CUSTOMSA  = custom
+CUSTOMDBG = custom
 
-#
-# Generic options:
-#
-MKDIR   = do mkdir -p
-AS      = objasm
-CC      = cc
-CMHG    = cmhg
-CP      = copy
-LD      = link
-RM      = remove
-SQUEEZE = squeeze
-WIPE    = x wipe
+include StdRules
+include AAsmModule
 
-AFLAGS  = ${THROWBACK} -depend !Depend -stamp -quit
-CPFLAGS = ~cfr~v
-WFLAGS  = ~c~v
-
-
-FILES=utl.CheckMem utl.ReadCMOSIP utl.RMFind utl.TriggerCBs utl.X
-
-#
-# Rule patterns
-#
-.SUFFIXES:  .o .s
-.s.o:;      ${AS} ${AFLAGS} -o $@ $<
-
-#
-# Main rules:
-#
-# Utilities
-#
-all: ${FILES}
-        @echo ${COMPONENT}: Utilties built (Disc)
-
-clean:
-        IfThere o.* Then ${WIPE} o.* ${WFLAGS}
-        IfThere utl.* Then ${WIPE} utl.* ${WFLAGS}
-        @echo ${COMPONENT}: cleaned
+clean::
+	${RM} CheckMem
+	${RM} ReadCMOSIP
+	${RM} RMFind
+	${RM} TriggerCBs
 
 #
 # Static dependencies:
 #
 
-utl.CheckMem: o.CheckMem
-	${LD} -bin -o $@ $?
-	SetType $@ &FFC
+standalone: CheckMem ReadCMOSIP RMFind TriggerCBs ${DIRS}
+	@${ECHO} ${COMPONENT}: utilities built
 
+CheckMem: CheckMem.o
+	${LDBIN} $@ $?
+	${SETTYPE} $@ &FFC
 
-utl.X: o.X
-	${LD} -bin -o $@ $?
-	SetType $@ &FFC
+TriggerCBs: TriggerCBs.o
+	${LDBIN} $@ $?
+	${SETTYPE} $@ &FFC
 
+ReadCMOSIP: ReadCMOSIP.o
+	${LDBIN} $@ $?
+	${SETTYPE} $@ &FFC
 
-utl.TriggerCBs: o.TriggerCBs
-	${LD} -bin -o $@ $?
-	SetType $@ &FFC
+RMFind: RMFind.o
+	${LDBIN} $@ $?
+	${SETTYPE} $@ &FFC
 
-
-utl.RMFind: o.RMFind
-	${LD} -bin -o $@ $?
-	SetType $@ &FFC
-
-
-utl.ReadCMOSIP: o.ReadCMOSIP
-	${LD} -bin -o $@ $?
-	SetType $@ &FFC
-
-
-#---------------------------------------------------------------------------
 # Dynamic dependencies:

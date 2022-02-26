@@ -1,0 +1,165 @@
+/* Copyright 2021 RISC OS Open Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "sys/time.h"
+#include "sys/types.h"
+#include "sys/errno.h"
+#include "swis.h"
+#include "Global/HALEntries.h"
+#include "unixlib.h"
+#include "asm.h"
+
+static uint32_t t0_divisor; /* Divisor to convert ticks to usecs */
+static uint32_t t0_period;  /* Timer 0 period */
+static void    *HAL_TimerReadCountdown_Ptr;
+static uint32_t HAL_TimerReadCountdown_SB;
+
+typedef enum
+{
+    timer_NOT_CHECKED,
+    timer_IOMD,
+    timer_HAL,
+    timer_NONE
+} timer_type;
+
+/**********************************************************************/
+/*
+ * Return the type of hardware timer this platform has, and perform
+ * any necessary initialisation.
+ */
+static timer_type hw_check(void)
+{
+    _kernel_oserror *e;
+    uint32_t         granularity, hardware;
+
+    /* Try to get Timer 0 granularity from HAL */
+    e = _swix(OS_Hardware, _IN(0) | _INR(8,9) | _OUT(0),
+              0, OSHW_CallHAL, EntryNo_HAL_TimerGranularity,
+              &granularity);
+
+    /*
+     * Can only use HAL if this succeeded and granularity is an even
+     * number of MHz.
+     */
+    if (e == NULL && (granularity % 1000000) == 0)
+    {
+        t0_divisor = granularity / 1000000;
+
+        /* Try to get Timer 0 period from HAL */
+        e = _swix(OS_Hardware, _IN(0) | _INR(8,9) | _OUT(0),
+                  0, OSHW_CallHAL, EntryNo_HAL_TimerPeriod,
+                  &t0_period);
+
+        if (e == NULL && t0_divisor != 0 && t0_period != 0)
+        {
+            /* HAL_TimerReadCountdown counts from (period-1) to 0 */
+            t0_period--;
+
+            /* Try to get HAL_TimerReadCountdown pointer from HAL */
+            e = _swix(OS_Hardware, _INR(8,9) | _OUTR(0,1),
+                      OSHW_LookupRoutine, EntryNo_HAL_TimerReadCountdown,
+                      &HAL_TimerReadCountdown_Ptr,
+                      &HAL_TimerReadCountdown_SB);
+
+            if (e == NULL)
+            {
+                /*
+                 * OK so far, now make sure HAL_TimerReadCountdown doesn't
+                 * always return 0.
+                 */
+
+                unsigned long count1, count2;
+
+                count1 = _get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+                _swix(OS_Hardware, _IN(0)|_INR(8,9), 2, OSHW_CallHAL, EntryNo_HAL_CounterDelay);
+                count2 = _get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+
+                if (count1 != 0 || count2 != 0)
+                {
+                    /* Everything worked - use HAL */
+                    return timer_HAL;
+                }
+            }
+        }
+    }
+
+    /* Couldn't use HAL, look for IOMD instead */
+
+    /* (OS_ReadSysInfo 2 bits 8-15 is I/O chip = 0 or 1 - IOC or IOMD) */
+    if (_swix(OS_ReadSysInfo, _IN(0)|_OUT(0), 2, &hardware))
+        return timer_NONE;
+    return (hardware & 0xFF00) <= 0x0100 ? timer_IOMD : timer_NONE;
+}
+
+int clock_gettime(clockid_t clock_id, struct timespec *ts)
+{
+    static timer_type timer_check = timer_NOT_CHECKED;
+    uint64_t t1, t2;
+    unsigned long timer_count;
+    long   usec;
+    time_t sec;
+
+    /* Minimal clock support */
+    if (clock_id != CLOCK_MONOTONIC && clock_id != CLOCK_UPTIME)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* Only poke the hardware if we're sure it's there :) */
+    if (timer_check == timer_NOT_CHECKED)
+        timer_check = hw_check();
+
+    t1 = t2 = 0;
+    if (timer_check != timer_NONE)
+    {
+        /* Check initial time */
+        _kernel_osword(1, (int *) &t1);
+        /* Read the Timer 0 value */
+        if (timer_check == timer_IOMD)
+            timer_count = _get_t0_count();
+        else
+            timer_count = _get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+    }
+    /* Check new time */
+    _kernel_osword(1, (int *) &t2);
+    sec  = (time_t)(t2 / 100);
+    usec = (long)((t2 % 100) * 10000);
+    if (timer_check != timer_NONE && t1 == t2)
+    {
+        /* Clock didn't tick - add in timer count */
+        if (timer_check == timer_IOMD)
+        {
+            /*
+             * IOMD timer counts down from 19999 to 0, the clock tick
+             * occurring as it changes from 0 to 19999.
+             */
+            usec += (19999 - timer_count) / 2;
+        }
+        else
+        {
+            usec += (t0_period - timer_count) / t0_divisor;
+        }
+    }
+    else
+    {
+        /* Clock ticked - let it rest at the cs boundary */
+    }
+    ts->tv_sec  = sec;
+    ts->tv_nsec = usec * 1000;
+
+    return 0;
+}
+
+/* EOF clockgtime.c */

@@ -12,37 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Makefile for ShowStat
+#
 
+COMPONENT = ShowStat
+OBJS      = main msgs
+LIBS      = ${NET5LIBS}
+CINCLUDES = ${TCPIPINC}
+CFLAGS    = ${C_NOWARN_NON_ANSI_INCLUDES}
 
-TARGET=         ShowStat
-DIRS=		o._dirs
+include CApp
 
-
-INCLUDES=	C:,TCPIPLibs:
-CC=		cc
-RM=             remove
-WFLAGS=         fr~c~v
-WIPE=           x wipe
-
-CFLAGS=		-I$(INCLUDES) -c ${THROWBACK} -depend !Depend -Wpan
-
-OBJS=		o.main o.msgs
-
-LIBS=		C:o.Stubs TCPIPLibs:o.Unixlib TCPIPLibs:o.Inetlib \
-		TCPIPLibs:o.Socklib5
-
-.SUFFIXES:	.c .o
-.c.o:;		$(CC) $(CFLAGS) -o $@ $<
-
-${TARGET}:	$(OBJS) $(LIBS) ${DIRS}
-		Link -o $@ $(OBJS) $(LIBS)
-		Squeeze $@
-
-clean:;		${RM} ${TARGET}
-		IfThere o Then ${WIPE} o ${WFLAGS}
-
-${DIRS}:
-		cdir o
-		create $@
-	
 # Dynamic dependencies:

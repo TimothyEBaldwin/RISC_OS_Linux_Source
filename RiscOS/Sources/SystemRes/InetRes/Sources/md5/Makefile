@@ -29,14 +29,12 @@
 #
 
 COMPONENT  = MD5
-INSTTYPE   = app
 OBJS       = md5 md5c mdXhl
 LIBS       = ${UNIXLIB}
-CINCLUDES  = -ITCPIPLibs:,C:
+CINCLUDES  = ${TCPIPINC}
 CDEFINES   = -DRISCOS_TWEAK
+CFLAGS     = ${C_NOWARN_NON_ANSI_INCLUDES}
 
 include CApp
-
-C_WARNINGS = -wp
 
 # Dynamic dependencies:

@@ -12,31 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Makefile for IfRConfig
+#
 
-TARGET=         IfRConfig
+COMPONENT = IfRConfig
+OBJS      = ifrconfig
+LIBS      = ${NET5LIBS}
+CINCLUDES = ${TCPIPINC}
+CFLAGS    = ${C_NOWARN_NON_ANSI_INCLUDES}
 
+include CApp
 
-INCLUDES=	C:,TCPIPLibs:
-CC=		cc
-RM=             remove
-WFLAGS=         fr~c~v
-WIPE=           x wipe
-
-CFLAGS=		-wp -I$(INCLUDES) -c ${THROWBACK} -depend !Depend
-
-OBJS=		o.${TARGET}
-
-LIBS=		C:o.Stubs TCPIPLibs:o.Unixlib TCPIPLibs:o.Inetlib \
-		TCPIPLibs:o.Socklib5
-
-.SUFFIXES:	.c .o
-.c.o:;		$(CC) $(CFLAGS) -o $@ $<
-
-${TARGET}:	$(OBJS) $(LIBS)
-		Link -o $@ $(OBJS) $(LIBS)
-		Squeeze $@
-
-clean:;		${RM} ${TARGET}
-		IfThere o.* Then ${WIPE} o.* ${WFLAGS}
-	
 # Dynamic dependencies:
