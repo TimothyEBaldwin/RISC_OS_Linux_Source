@@ -170,6 +170,7 @@ HEADERS =\
  CLIB:h.setjmp \
  CLIB:h.signal \
  CLIB:h.stdarg \
+ CLIB:h.stdatomic \
  CLIB:h.stdbool \
  CLIB:h.stddef \
  CLIB:h.stdint \
@@ -640,6 +641,9 @@ o.cl_stub2_r: clib.s.cl_stub2_r
 o.k_stub2_r: kernel.s.k_stub2_r
 	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub2_r -to $@
 
+o.k_stub3_r: kernel.s.k_stub3_r
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub3_r -to $@
+
 m_o.cl_stub_m: clib.s.cl_stub_m
 	${AS} ${AFLAGS} ${ALFLAGS} -from clib.s.cl_stub_m -to $@
 
@@ -655,20 +659,23 @@ rm_o.cl_stub2_rm: clib.s.cl_stub2_rm
 rm_o.k_stub2_rm: kernel.s.k_stub2_rm
 	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub2_rm -to $@
 
+rm_o.k_stub3_rm: kernel.s.k_stub3_rm
+	${AS} ${AFLAGS} ${ALFLAGS} -from kernel.s.k_stub3_rm -to $@
+
 rm_o_rl.rl_stub_rm: rlib.s.rl_stub_rm
 	${AS} ${AFLAGS} ${ALFLAGS} -from rlib.s.rl_stub_rm -to $@
 
-lib.stubs: o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
-	${AR} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
+lib.stubs: o.cl_stub_r o.k_stub2_r o.k_stub3_r o.cl_stub2_r o.mathl
+	${AR} ${LIBFLAGS} $@ o.cl_stub_r o.k_stub2_r o.k_stub3_r o.cl_stub2_r o.mathl
 
-lib.rstubs: o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
-	${AR} ${LIBFLAGS} $@ o_rl.rl_stub_r o.k_stub2_r o.cl_stub2_r o.mathl
+lib.rstubs: o_rl.rl_stub_r o.k_stub2_r o.k_stub3_r o.cl_stub2_r o.mathl
+	${AR} ${LIBFLAGS} $@ o_rl.rl_stub_r o.k_stub2_r o.k_stub3_r o.cl_stub2_r o.mathl
 
-lib.romcstubs: rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
-	${AR} ${LIBFLAGS} $@ rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
+lib.romcstubs: rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.k_stub3_rm rm_o.cl_stub2_rm o.mathl
+	${AR} ${LIBFLAGS} $@ rm_o.cl_stub_rm rm_o.k_stub2_rm rm_o.k_stub3_rm rm_o.cl_stub2_rm o.mathl
 
-lib.romstubs: rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
-	${AR} ${LIBFLAGS} $@ rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.cl_stub2_rm o.mathl
+lib.romstubs: rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.k_stub3_rm rm_o.cl_stub2_rm o.mathl
+	${AR} ${LIBFLAGS} $@ rm_o_rl.rl_stub_rm rm_o.k_stub2_rm rm_o.k_stub3_rm rm_o.cl_stub2_rm o.mathl
 
 lib.romastubs: rlib.s.rl_stub_a
 	${AS} ${AFLAGS} -from rlib.s.rl_stub_a -to $@
@@ -718,6 +725,7 @@ CLIB:h.math: clib.h.math;         ${CP} clib.h.math $@ ${CPFLAGS}
 CLIB:h.setjmp: clib.h.setjmp;     ${CP} clib.h.setjmp $@ ${CPFLAGS}
 CLIB:h.signal: clib.h.signal;     ${CP} clib.h.signal $@ ${CPFLAGS}
 CLIB:h.stdarg: clib.h.stdarg;     ${CP} clib.h.stdarg $@ ${CPFLAGS}
+CLIB:h.stdatomic: clib.h.stdatomic; ${CP} clib.h.stdatomic $@ ${CPFLAGS}
 CLIB:h.stdbool: clib.h.stdbool;   ${CP} clib.h.stdbool $@ ${CPFLAGS}
 CLIB:h.stddef: clib.h.stddef;     ${CP} clib.h.stddef $@ ${CPFLAGS}
 CLIB:h.stdint: clib.h.stdint;     ${CP} clib.h.stdint $@ ${CPFLAGS}

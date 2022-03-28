@@ -1,0 +1,371 @@
+; Copyright 2022 RISC OS Open Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; "Lowest-common denominator" code, for when nothing better is available
+
+; Assumptions:
+; * ARMv2 - no SWP!
+; * Needs to be atomic with interrupt handlers: Atomic reads & writes are fine, but non-atomic ones require IRQs disabling
+; * No halfword load/store support
+; * Single-core machine
+
+        ; Atomically load a halfword using LDR
+        MACRO
+        AtomicLDRH $reg, $addr, $temp
+        ASSERT  $reg <> $addr :LOR: "$temp" <> ""
+    [ SupportARMv6 :LOR: NoUnaligned
+        ; Rotated loads are not fine
+      [ "$temp" <> ""
+        ANDS    $temp, $addr, #2
+        LDR     $reg, [$addr, -$temp]
+      |
+        ANDS    $reg, $addr, #2
+        LDR     $reg, [$addr, -$reg]
+      ]
+        MOVEQ   $reg, $reg, LSL #16
+        MOV     $reg, $reg, LSR #16
+    |
+        ; Rotated loads are fine
+        LDR     $reg, [$addr]
+        MOV     $reg, $reg, LSL #16
+        MOV     $reg, $reg, LSR #16
+    ]
+        MEND
+
+        ; Non-atomically store a halfword using STRB
+        MACRO
+        NonAtomicSTRH $reg, $addr, $temp
+        ASSERT  $reg <> $addr
+        ASSERT  $temp <> $addr
+        STRB    $reg, [$addr]
+        MOV     $temp, $reg, LSR #8
+        STRB    $temp, [$addr, #1]
+        MEND
+
+; _Bool _kernel_atomic_is_lock_free(int type);
+      [ :DEF: Need__kernel_atomic_is_lock_free_LCD
+        EXPORT  |_kernel_atomic_is_lock_free_LCD|
+|_kernel_atomic_is_lock_free_LCD|
+        MOV     a1, #0
+        Return  ,LinkNotStacked
+      ]
+
+; It's easiest to generate most of these functions using a giant WHILE loop
+size    SETA    1
+        WHILE   size <= 8
+
+; Set $sz to the correct size suffix
+      [ size = 1
+sz      SETS    "B"
+      ELIF size = 2
+sz      SETS    "H"
+      ELIF size = 4
+sz      SETS    ""
+      |
+sz      SETS    "D"
+      ]
+
+sz2     SETS    (:STR:size) :RIGHT: 1
+
+; void _kernel_atomic_store_N(volatile void* obj, memory_order order, C desired);
+      [ :DEF: Need__kernel_atomic_store_$sz2._LCD
+        FUNC    _kernel_atomic_store,,_LCD
+      [ size == 2
+        FunctionEntry
+        SpinLock_IRQ a2, lr
+        NonAtomicSTRH a3, a1, a3
+        SpinUnlock_IRQ a2, lr
+        Return
+      ELIF size < 8
+        STR$sz  a3, [a1]
+        Return  ,LinkNotStacked
+      |
+        STMIA   a1, {a3-a4}
+        Return  ,LinkNotStacked
+      ]
+      ]
+
+; C _kernel_atomic_load_N(volatile void* obj, memory_order order);
+      [ :DEF: Need__kernel_atomic_load_$sz2._LCD
+        FUNC    _kernel_atomic_load,,_LCD
+      [ size == 2
+        AtomicLDRH a1, a1, ip
+        Return  ,LinkNotStacked
+      ELIF size < 8
+        LDR$sz  a1, [a1]
+        Return  ,LinkNotStacked
+      |
+        LDMIA   a1, {a1-a2}
+        Return  ,LinkNotStacked
+      ]
+      ]
+
+; C _kernel_atomic_exchange_N(volatile void* obj, memory_order order, C desired);
+      [ :DEF: Need__kernel_atomic_exchange_$sz2._LCD
+        FUNC    _kernel_atomic_exchange,,_LCD
+      [ size == 2
+        FunctionEntry
+        SpinLock_IRQ a2, lr
+        AtomicLDRH ip, a1
+        NonAtomicSTRH a3, a1, a3
+        SpinUnlock_IRQ a2, lr
+        MOV     a1, ip
+        Return
+      ELIF size < 8
+        FunctionEntry
+        SpinLock_IRQ a2, lr
+        LDR$sz  a4, [a1]
+        STR$sz  a3, [a1]
+        SpinUnlock_IRQ a2, lr
+        MOV     a1, a4
+        Return
+      |
+        FunctionEntry "v1"
+        MOV     ip, a1
+        SpinLock_IRQ v1, lr
+        LDMIA   ip, {a1-a2}
+        STMIA   ip, {a3-a4}
+        SpinUnlock_IRQ v1, lr
+        Return  "v1"
+      ]
+      ]
+
+; _Bool _kernel_atomic_compare_exchange_weak_N(volatile void* obj, int orders, C* expected, C desired);
+; _Bool _kernel_atomic_compare_exchange_strong_N(volatile void* obj, int orders, C* expected, C desired);
+      [ :DEF: Need__kernel_atomic_compare_exchange_weak_$sz2._LCD :LOR: :DEF: Need__kernel_atomic_compare_exchange_strong_$sz2._LCD
+        FUNC    _kernel_atomic_compare_exchange_weak,,_LCD
+        FUNC    _kernel_atomic_compare_exchange_strong,,_LCD
+        ; Optimisation: Because loads and stores are implemented atomically, we
+        ; can peek at *obj and only take the lock if it looks like the exchange
+        ; will succeed. This will help a lot for usermode code which has to use
+        ; a SWI to disable IRQs.
+      [ size == 2
+        FunctionEntry "v1"
+        AtomicLDRH v1, a3
+        AtomicLDRH ip, a1
+        TEQ     v1, ip
+        BNE     %FT50
+        SpinLock_IRQ a2, lr
+        AtomicLDRH ip, a1
+        TEQ     v1, ip
+        BNE     %FT40
+        NonAtomicSTRH a4, a1, a4
+        SpinUnlock_IRQ a2, lr
+        MOV     a1, #1
+        Return  "v1"
+40
+        SpinUnlock_IRQ a2, lr
+50
+        NonAtomicSTRH ip, a3, ip
+        MOV   a1, #0
+        Return  "v1"
+      ELIF size < 8
+        FunctionEntry "v1"
+        LDR$sz  v1, [a3]
+        LDR$sz  ip, [a1]
+        TEQ     v1, ip
+        BNE     %FT50
+        SpinLock_IRQ a2, lr
+        LDR$sz  ip, [a1]
+        TEQ     v1, ip
+        BNE     %FT40
+        STR$sz  a4, [a1]
+        SpinUnlock_IRQ a2, lr
+        MOV     a1, #1
+        Return  "v1"
+40
+        SpinUnlock_IRQ a2, lr
+50
+        STR$sz  ip, [a3]
+        MOV     a1, #0
+        Return  "v1"
+      |
+        FunctionEntry "v1-v4",makeframe
+        LDMIA   a3, {v1-v2}
+        LDMIA   a1, {v3-v4}
+        TEQ     v1, v3
+        TEQEQ   v2, v4
+        BNE     %FT50
+        SpinLock_IRQ a2, lr
+        LDMIA   a1, {v3-v4}
+        TEQ     v1, v3
+        TEQEQ   v2, v4
+        BNE     %FT40
+        LDR     ip, [fp, #4] ; Upper half of 'desired'
+        STMIA   a1, {a4,ip}
+        SpinUnlock_IRQ a2, lr
+        MOV     a1, #1
+        Return  "v1-v4",fpbased
+40
+        SpinUnlock_IRQ a2, lr
+50
+        STMIA   a3, {v3-v4}
+        MOV     a1, #0
+        Return  "v1-v4",fpbased
+      ]
+      ]
+
+; C _kernel_atomic_fetch_add_N(volatile void* obj, memory_order order, M arg);
+      [ :DEF: Need__kernel_atomic_fetch_add_$sz2._LCD
+        FUNC    _kernel_atomic_fetch_add,,_LCD
+      [ size == 2
+        FunctionEntry
+        MOV     ip, a1
+        SpinLock_IRQ a2, lr
+        AtomicLDRH a1, ip
+        ADD     a3, a1, a3
+        NonAtomicSTRH a3, ip, a3
+        SpinUnlock_IRQ a2, lr
+        Return
+      ELIF size < 8
+        FunctionEntry
+        MOV     ip, a1
+        SpinLock_IRQ a2, lr
+        LDR$sz  a1, [ip]
+        ADD     a3, a1, a3
+        STR$sz  a3, [ip]
+        SpinUnlock_IRQ a2, lr
+        Return
+      |
+        FunctionEntry "v1-v2"
+        MOV     ip, a1
+        SpinLock_IRQ v1, lr
+        LDMIA   ip, {a1-a2}
+        ADDS    v2, a1, a3
+        ADC     lr, a2, a4
+        STMIA   ip, {v2,lr}
+        SpinUnlock_IRQ v1, lr
+        Return  "v1-v2"
+      ]
+      ]
+
+; fetch_xor, fetch_or, fetch_and are implemented using a routine which performs
+; an AND & XOR pair. This helps cut down the number of routines needed, without
+; slowing things down too much.
+
+; C _kernel_atomic_fetch_xor_N(volatile void* obj, memory_order order, M arg);
+      [ :DEF: Need__kernel_atomic_fetch_xor_$sz2._LCD
+        FUNC    _kernel_atomic_fetch_xor,,_LCD
+      [ size < 8
+        FunctionEntry "v1"
+        MVN     v1, #0
+        B       andxor_LCD_$sz2
+      |
+        FunctionEntry "v1-v4"
+        MVN     v3, #0
+        MVN     v4, #0
+        B       andxor_LCD_$sz2
+      ]
+      ]
+
+; C _kernel_atomic_fetch_or_N(volatile void* obj, memory_order order, M arg);
+      [ :DEF: Need__kernel_atomic_fetch_or_$sz2._LCD
+        FUNC    _kernel_atomic_fetch_or,,_LCD
+      [ size < 8
+        FunctionEntry "v1"
+        MVN     v1, a3
+        B       andxor_LCD_$sz2
+      |
+        FunctionEntry "v1-v4"
+        MVN     v3, a3
+        MVN     v4, a4
+        B       andxor_LCD_$sz2
+      ]
+      ]
+
+; C _kernel_atomic_fetch_and_N(volatile void* obj, memory_order order, M arg);
+      [ :DEF: Need__kernel_atomic_fetch_and_$sz2._LCD
+        FUNC    _kernel_atomic_fetch_and,,_LCD
+      [ size < 8
+        FunctionEntry "v1"
+        MOV     v1, a3
+        MOV     a3, #0
+        B       andxor_LCD_$sz2
+      |
+        FunctionEntry "v1-v4"
+        MOV     v3, a3
+        MOV     v4, a4
+        MOV     a3, #0
+        MOV     a4, #0
+        B       andxor_LCD_$sz2
+      ]
+      ]
+
+      [ :DEF: Need__kernel_atomic_fetch_xor_$sz2._LCD :LOR: :DEF: Need__kernel_atomic_fetch_or_$sz2._LCD :LOR: :DEF: Need__kernel_atomic_fetch_and_$sz2._LCD
+andxor_LCD_$sz2
+      [ size == 2
+        MOV     ip, a1
+        SpinLock_IRQ a2, lr
+        AtomicLDRH a1, ip
+        AND     v1, a1, v1
+        EOR     a3, a3, v1
+        NonAtomicSTRH a3, ip, a3
+        SpinUnlock_IRQ a2, lr
+        Return  "v1"
+      ELIF size < 8
+        MOV     ip, a1
+        SpinLock_IRQ a2, lr
+        LDR$sz  a1, [ip]
+        AND     v1, a1, v1
+        EOR     a3, a3, v1
+        STR$sz  a3, [ip]
+        SpinUnlock_IRQ a2, lr
+        Return  "v1"
+      |
+        MOV     ip, a1
+        SpinLock_IRQ v1, lr
+        LDMIA   ip, {a1-a2}
+        AND     v2, a1, v3
+        AND     lr, a2, v4
+        EOR     v2, v2, a3
+        EOR     lr, lr, a4
+        STMIA   ip, {v2,lr}
+        SpinUnlock_IRQ v1, lr
+        Return  "v1-v4"
+      ]
+      ]
+
+size    SETA size*2
+        WEND
+
+; void _kernel_atomic_thread_fence(memory_order order);
+      [ :DEF: Need__kernel_atomic_thread_fence_LCD
+        EXPORT  |_kernel_atomic_thread_fence_LCD|
+|_kernel_atomic_thread_fence_LCD|
+        ; Single-core machine, nothing to do
+        Return  ,LinkNotStacked
+      ]
+
+; _Bool _kernel_atomic_flag_test_and_set_explicit(volatile atomic_flag *obj, memory_order order);
+      [ :DEF: Need__kernel_atomic_flag_test_and_set_explicit_LCD
+        EXPORT  |_kernel_atomic_flag_test_and_set_explicit_LCD|
+|_kernel_atomic_flag_test_and_set_explicit_LCD|
+        MOV     a3, #1
+        B       _kernel_atomic_exchange_4_LCD
+      ]
+
+; void _kernel_atomic_flag_clear_explicit(volatile atomic_flag *obj, memory_order order);
+      [ :DEF: Need__kernel_atomic_flag_clear_explicit_LCD
+        EXPORT  |_kernel_atomic_flag_clear_explicit_LCD|
+|_kernel_atomic_flag_clear_explicit_LCD|
+        ; We can just do a direct store here; it'll be atomic with all the non-ARMK versions of atomic_flag_test_and_set
+        MOV     a3, #0
+        STR     a3, [a1]
+        Return  ,LinkNotStacked
+      ]
+
+        LTORG
+
+        END

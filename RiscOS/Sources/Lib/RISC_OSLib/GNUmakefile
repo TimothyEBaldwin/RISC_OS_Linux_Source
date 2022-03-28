@@ -15,7 +15,7 @@ ifeq (${APCS},Host)
 # Yes, some cross-compilation components use kernel definitions even for host tools
 CLIBHDRS   = kernel
 else
-CLIBHDRS   = assert complex ctype errno fenv float inttypes iso646 kernel limits locale math setjmp signal stdarg stdbool stddef stdint stdio stdlib string swis tgmath time varargs wchar wctype
+CLIBHDRS   = assert complex ctype errno fenv float inttypes iso646 kernel limits locale math setjmp signal stdarg stdatomic stdbool stddef stdint stdio stdlib string swis tgmath time varargs wchar wctype
 RLIBHDRS   = akbd alarm baricon bbc colourmenu colourpick colourtran coords dbox dboxfile dboxquery dboxtcol dragasprit drawfdiag drawferror drawfobj drawftypes drawmod event fileicon flex font fontlist fontselect heap help jpeg magnify menu msgs msgtrans os pointer print res resspr saveas sprite template trace txt txtedit txtopt txtscrap txtwin typdat visdelay werr wimp wimpt win xferrecv xfersend
 CLIBEXPLIBS = ansilib ansilibm stubs
 RLIBEXPLIBS = risc_oslib riscoslibm rstubs romstubs romcstubs
@@ -43,10 +43,10 @@ RISCOSLIBM_OBJS    =                                   $(addsuffix .m_o_rl, ${RL
 SHAREDCLIB_OBJS    = cl_rmhdr.rm_o initmodule.o       k_modbody.rm_o cl_modbody.rm_o                    $(addsuffix .rm_o, ${CLIB_SHARED_OBJS})
 ROMSHAREDCLIB_OBJS = cl_rmhdr.rm_o initmodule.rm_o    k_modbody.rm_o cl_modbody.rm_o                    $(addsuffix .rm_o, ${CLIB_SHARED_OBJS})
 ROMSHAREDRLIB_OBJS = cl_rmhdr.rm_o initmodule.rm_o_rl k_modbody.rm_o cl_modbody.rm_o rl_modbody.rm_o_rl $(addsuffix .rm_o, ${CLIB_SHARED_OBJS}) $(addsuffix .rm_o_rl, ${RLIB_SHARED_OBJS})
-STUBS_OBJS         = cl_stub_r.o        cl_stub2_r.o     k_stub2_r.o     mathl.o
-ROMCSTUBS_OBJS     = cl_stub_rm.rm_o    cl_stub2_rm.rm_o k_stub2_rm.rm_o mathl.o
-RSTUBS_OBJS        = rl_stub_r.o_rl     cl_stub2_r.o     k_stub2_r.o     mathl.o
-ROMSTUBS_OBJS      = rl_stub_rm.rm_o_rl cl_stub2_rm.rm_o k_stub2_rm.rm_o mathl.o
+STUBS_OBJS         = cl_stub_r.o        cl_stub2_r.o     k_stub2_r.o     k_stub3_r.o     mathl.o
+ROMCSTUBS_OBJS     = cl_stub_rm.rm_o    cl_stub2_rm.rm_o k_stub2_rm.rm_o k_stub3_rm.rm_o mathl.o
+RSTUBS_OBJS        = rl_stub_r.o_rl     cl_stub2_r.o     k_stub2_r.o     k_stub3_r.o     mathl.o
+ROMSTUBS_OBJS      = rl_stub_rm.rm_o_rl cl_stub2_rm.rm_o k_stub2_rm.rm_o k_stub3_rm.rm_o mathl.o
 
 SOURCES_TO_SYMLINK = \
   $(wildcard c/*)      $(wildcard h/*)                 $(wildcard s/*)        $(wildcard hdr/*) \
@@ -262,6 +262,8 @@ initmodule.rm_o: clib/initmod_rm.s
 k_modbody.rm_o: kernel/k_mod_r.s
 	${AS} ${ASFLAGS} ${ASSFLAGS} -depend $(subst .rm_o,.rm_d,$@) -pd "zm1 SETL {TRUE}" -o $@ $<
 k_stub2_rm.rm_o: kernel/k_stub2_rm.s
+	${AS} ${ASFLAGS} ${ASLFLAGS} -depend $(subst .rm_o,.rm_d,$@) -pd "zm1 SETL {TRUE}" -o $@ $<
+k_stub3_rm.rm_o: kernel/k_stub3_rm.s
 	${AS} ${ASFLAGS} ${ASLFLAGS} -depend $(subst .rm_o,.rm_d,$@) -pd "zm1 SETL {TRUE}" -o $@ $<
 
 

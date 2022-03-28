@@ -1,0 +1,543 @@
+; Copyright 2022 RISC OS Open Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; Memory barrier flags which were encoded in the low two bits of the memory_order enum
+BARRIER_LDR_DMB * 1
+BARRIER_DMB_STR * 2
+
+; Actual memory_order enum values
+ORDER_RELAXED * 0 ; Do nothing
+ORDER_CONSUME * 1 ; Barrier after load
+ORDER_ACQUIRE * 5 ; Barrier after load
+ORDER_RELEASE * 2 ; Barrier before store
+ORDER_ACQ_REL * 3 ; Barrier after first load, barrier before first store
+ORDER_SEQ_CST * 7 ; Barrier after first load, barrier before first store
+
+; This macro is used to make many of the function definitions less verbose
+        MACRO
+        FUNC    $prefix, $private, $suffix
+        LCLS    name
+name    SETS    "$prefix" :CC: "_" :CC: ("$size":RIGHT:1) :CC: "$suffix"
+      [ "$private"=""
+        EXPORT  $name
+      ]
+$name
+        ROUT
+        MEND
+
+; Whether staticly linked code should call through to the lowest-common
+; denominator implementation, or whether it should do runtime lookup of the
+; arch-specific routine.
+; Currently all ROMs will run just fine using the lowest-common denominator, so
+; use that in order to slim the code down a bit and avoid the performance
+; overhead of the run-time switching.
+; Enabling this switch is also a convenient way of ensuring that (pre-ARMK)
+; ROM code will be using IRQ-safe routines.
+; Enabling this switch also means that we don't have to find a spare register
+; for LoadStaticBase / LoadStaticAddress to use, in order for us to load the
+; variant_flags.
+      [ :LNOT: :DEF: AtomicSimpleStatic
+        GBLL    AtomicSimpleStatic
+AtomicSimpleStatic SETL {TRUE}
+      ]
+
+; Set up our own versions of the No* and Support* flags defined by Hdr.CPU.Arch
+; We do this because we want to adjust the values for a few of them.
+        GBLL    AtomicNoARMK
+        GBLL    AtomicSupARMK
+AtomicNoARMK    SETL NoARMK
+AtomicSupARMK   SETL SupportARMK
+        GBLL    AtomicNoARMv7
+        GBLL    AtomicSupARMv7
+AtomicNoARMv7   SETL NoARMv7
+AtomicSupARMv7  SETL SupportARMv7
+        GBLL    AtomicNoARMv8
+        GBLL    AtomicSupARMv8
+AtomicNoARMv8   SETL NoARMv8
+AtomicSupARMv8  SETL SupportARMv8
+
+; We use custom ARMa flags, because ARMv8 is advertised as being non-ARMa, but our logic for selecting which variants to use/include can't cope with that
+        GBLL    AtomicNoARMa
+        GBLL    AtomicSupARMa
+AtomicNoARMa  SETL NoARMK ; The ARMa variant avoids disabling IRQs, making it unsafe for use from privileged modes. To solve this, we want module clients to use the LCD variant - so make sure it's enabled if we're also including the ARMa variant.
+AtomicSupARMa SETL {TRUE} ; Assume we're always targeting ARMv2a or above
+
+; Define an extra pair of flags for halfword support. For now, take the easy
+; route and only enable them for ARMv5+, since there aren't currently any ARMv4
+; RO 5 machines which can use halfwords
+        GBLL    AtomicNoHalfword
+        GBLL    AtomicSupHalfword
+AtomicNoHalfword SETL NoARMv5
+AtomicSupHalfword SETL SupportARMv5
+
+      [ :LNOT: AtomicSimpleStatic
+VariantFlag_ARMa * 1
+VariantFlag_Halfword * 2
+VariantFlag_ARMK * 4
+VariantFlag_ARMv7 * 8
+VariantFlag_ARMv8 * 16
+VariantFlag_UARMa * 32
+VariantFlag_UHalfword * 64
+      ]
+
+; Define suitable CPUFeature_ flags to use in the routine variant blocks
+CPUFeature_ARMa * CPUFeature_SWP_SWPB ; N.B. needs care, might not be set on ARMv7+. We avoid this problem by arranging the variant blocks correctly (so ARMK is checked first).
+CPUFeature_Halfword * CPUFeature_LDRH_LDRSH_STRH
+CPUFeature_ARMK * CPUFeature_CLREX_LDREXB_LDREXH_STREXB_STREXH
+CPUFeature_ARMv7 * CPUFeature_DMB_DSB_ISB
+CPUFeature_ARMv8 * CPUFeature_LDAx_STLx
+
+; We also define these flags for usermode-only ARMa & Halfword
+; This allows usermode-only clients to use more efficient routines which don't
+; need to disable IRQs to provide safety with IRQ handlers
+        GBLL   AtomicNoUARMa
+        GBLL   AtomicSupUARMa
+        GBLL   AtomicNoUHalfword
+        GBLL   AtomicSupUHalfword
+AtomicNoUARMa      SETL AtomicNoARMa
+AtomicSupUARMa     SETL AtomicSupARMa
+AtomicNoUHalfword  SETL AtomicNoHalfword
+AtomicSupUHalfword SETL AtomicSupHalfword
+
+; Fake CPUFeature flag that will only be set for usermode clients
+CPUFeature_UsermodeOnly * 254
+
+; Define our own versions of No26bitCode & No32bitCode, so we can support
+; 32bit-neutral builds for standalone testing
+      [ :LNOT: :DEF: AtomicNo26bitCode
+        GBLL   AtomicNo26bitCode
+        GBLL   AtomicNo32bitCode
+AtomicNo26bitCode SETL {CONFIG}<>26
+AtomicNo32bitCode SETL {CONFIG}<>32
+      ]
+
+        GBLL   Need_LCD
+        GBLL   Need_ARMa
+        GBLL   Need_Halfword
+        GBLL   Need_UARMa
+        GBLL   Need_UHalfword
+        GBLL   Need_ARMK
+        GBLL   Need_ARMv7
+        GBLL   Need_ARMv8
+
+        ! 0, "AtomicNoARMa: " :CC: :STR: AtomicNoARMa
+        ! 0, "AtomicSupARMa: " :CC: :STR: AtomicSupARMa
+        ! 0, "AtomicNoHalfword: " :CC: :STR: AtomicNoHalfword
+        ! 0, "AtomicSupHalfword: " :CC: :STR: AtomicSupHalfword
+        ! 0, "AtomicNoARMK: " :CC: :STR: AtomicNoARMK
+        ! 0, "AtomicSupARMK: " :CC: :STR: AtomicSupARMK
+        ! 0, "AtomicNoARMv7: " :CC: :STR: AtomicNoARMv7
+        ! 0, "AtomicSupARMv7: " :CC: :STR: AtomicSupARMv7
+        ! 0, "AtomicNoARMv8: " :CC: :STR: AtomicNoARMv8
+        ! 0, "AtomicSupARMv8: " :CC: :STR: AtomicSupARMv8
+        ! 0, "AtomicNo26bitCode: " :CC: :STR: AtomicNo26bitCode
+        ! 0, "AtomicNo32bitCode: " :CC: :STR: AtomicNo32bitCode
+
+        GBLS    Variant0
+        GBLS    Variant1
+        GBLS    Variant2
+        GBLS    Variant3
+        GBLS    Variant4
+        GBLS    Variant5
+        GBLS    Variant6
+        GBLS    Variant7
+        GBLA    NumVariants
+        GBLS    Variants
+
+        MACRO
+        AddVariant $sym,$variant
+        LCLS    VariantN
+VariantN SETS "Variant" :CC: ((:STR: NumVariants):RIGHT:1)
+$VariantN SETS  "$variant"
+NumVariants SETA $NumVariants + 1
+        GBLL Need_$sym._$variant
+Need_$sym._$variant SETL {TRUE}
+Need_$variant SETL {TRUE}
+Variants SETS "$Variants $variant"
+        MEND
+
+        MACRO
+        CPUFeatureFlags $variant
+      [ ("$variant" :LEFT: 1) == "U"
+        ; Usermode-only variant
+        LCLS    V
+V       SETS    "$variant" :RIGHT: ((:LEN: "$variant")-1)
+        DCB     CPUFeature_$V,CPUFeature_UsermodeOnly,255,255
+      |
+        DCB     CPUFeature_$variant,255,255,255
+      ]
+        MEND
+
+; Define these so that we can blindly check variants that don't exist:
+; AtomicNo$nothing -> True, because we support something before this
+; AtomicSup$nothing -> False, because we don't support this variant
+        GBLL    AtomicNo
+        GBLL    AtomicSup
+AtomicNo  SETL  {TRUE}
+AtomicSup SETL  {FALSE}
+
+        MACRO
+        AtomicVariant $sym,$arch0,$arch1,$arch2,$arch3,$arch4,$arch5,$arch6
+        ; Work out which variants are needed
+NumVariants SETA 0
+Variants SETS ""
+      [ AtomicNo$arch0
+        AddVariant $sym,LCD
+      ]
+      [ AtomicSup$arch0 :LAND: AtomicNo$arch1
+        AddVariant $sym,$arch0
+      ]
+      [ AtomicSup$arch1 :LAND: AtomicNo$arch2
+        AddVariant $sym,$arch1
+      ]
+      [ AtomicSup$arch2 :LAND: AtomicNo$arch3
+        AddVariant $sym,$arch2
+      ]
+      [ AtomicSup$arch3 :LAND: AtomicNo$arch4
+        AddVariant $sym,$arch3
+      ]
+      [ AtomicSup$arch4 :LAND: AtomicNo$arch5
+        AddVariant $sym,$arch4
+      ]
+      [ AtomicSup$arch5 :LAND: AtomicNo$arch6
+        AddVariant $sym,$arch5
+      ]
+      [ AtomicSup$arch6
+        AddVariant $sym,$arch6
+      ]
+        ASSERT NumVariants > 0
+ [ VariantPass == 1
+        ; Print out the mapping to make it easy to see the enabled variants for each routine
+        ! 0, "$sym ->$Variants"
+        LCLS    VariantName
+VariantName SETS VBar :CC: "$sym" :CC: :CHR:36 :CC: "variant" :CC: VBar
+    [ NumVariants == 1
+$VariantName * $sym._$Variant0
+    |
+        ALIGN
+        ; Construct routine variant block(s), as per RoutineVariant macro
+        ; If more than two variants are needed, chain the blocks
+$VariantName * . + 1
+      [ NumVariants > 7
+        CPUFeatureFlags $Variant7
+        DCD    $sym._$Variant7 - .
+        DCD    5
+      ]
+      [ NumVariants > 6
+        CPUFeatureFlags $Variant6
+        DCD    $sym._$Variant6 - .
+        DCD    5
+      ]
+      [ NumVariants > 5
+        CPUFeatureFlags $Variant5
+        DCD    $sym._$Variant5 - .
+        DCD    5
+      ]
+      [ NumVariants > 4
+        CPUFeatureFlags $Variant4
+        DCD    $sym._$Variant4 - .
+        DCD    5
+      ]
+      [ NumVariants > 3
+        CPUFeatureFlags $Variant3
+        DCD    $sym._$Variant3 - .
+        DCD    5
+      ]
+      [ NumVariants > 2
+        CPUFeatureFlags $Variant2
+        DCD    $sym._$Variant2 - .
+        DCD    5
+      ]
+        CPUFeatureFlags $Variant1
+        DCD    $sym._$Variant1 - .
+        DCD    $sym._$Variant0 - .
+    ]
+        EXPORT  $VariantName
+ ]
+
+ [ VariantPass == 2
+        ; Construct the directly callable routine which does runtime variant selection
+    [ NumVariants == 1 :LOR: AtomicSimpleStatic
+$sym    * $sym._$Variant0
+    |
+$sym
+        ; Ideally we'd check for the lowest-supported variant first, but for
+        ; halfwords that will result in the ARMa variant being used instead of
+        ; the halfword one.
+        LDR     ip, =variant_flags
+        LDRB    ip, [ip]
+      [ NumVariants > 7
+        TST     ip, #VariantFlag_$Variant7
+        BNE     $sym._$Variant7
+      ]
+      [ NumVariants > 6
+        TST     ip, #VariantFlag_$Variant6
+        BNE     $sym._$Variant6
+      ]
+      [ NumVariants > 5
+        TST     ip, #VariantFlag_$Variant5
+        BNE     $sym._$Variant5
+      ]
+      [ NumVariants > 4
+        TST     ip, #VariantFlag_$Variant4
+        BNE     $sym._$Variant4
+      ]
+      [ NumVariants > 3
+        TST     ip, #VariantFlag_$Variant3
+        BNE     $sym._$Variant3
+      ]
+      [ NumVariants > 2
+        TST     ip, #VariantFlag_$Variant2
+        BNE     $sym._$Variant2
+      ]
+        TST     ip, #VariantFlag_$Variant1
+        BNE     $sym._$Variant1
+        B       $sym._$Variant0
+    ]
+        EXPORT  $sym
+ ]
+        MEND
+
+        GBLA    size
+        GBLS    sz
+        GBLS    sz2
+
+        ; Corrupts NZCV
+        MACRO
+        SpinLock_SWP $out_ptr,$temp
+        LoadStaticAddress StaticData+O_atomic_spinlock,$out_ptr,$temp
+        MOV     $temp, #1
+01
+        SWPB    $temp, $temp, [$out_ptr]
+        TEQ     $temp, #0
+        BNE     %BT01
+        MEND
+
+        ; Preserves NZCV
+        MACRO
+        SpinUnlock_SWP $ptr, $temp
+        MOV     $temp, #0
+        STRB    $temp, [$ptr]
+        MEND
+
+        ; Corrupts NZCV
+        MACRO
+        SpinLock_IRQ $out_psr,$temp
+        ASSERT  $temp = lr
+    [ AtomicNo26bitCode
+        MRS     $out_psr, CPSR
+        TST     $out_psr, #I32_bit
+        BNE     %FT10
+        TST     $out_psr, #&F ; Privileged mode?
+        ORRNE   $temp, $out_psr, #I32_bit
+        MSRNE   CPSR_c, $temp
+      [ StrongARM_MSR_bug
+        MOV     r0, r0
+      ]
+        SWIEQ   OS_IntOff
+10
+    ELIF AtomicNo32bitCode
+        MOV     $out_psr, pc
+        AND     $out_psr, $out_psr, #I_bit :OR: M_bits
+        TST     $out_psr, #I_bit
+        BNE     %FT10
+        TST     $out_psr, #M_bits ; Privileged mode?
+        SWIEQ   OS_IntOff
+        ORRNE   $temp, $out_psr, #I_bit
+        TEQNEP  pc, $temp ; No mode change, so no ARM2 TEQP bug.
+10
+    |
+        ; Mixed 26/32bit support. Shouldn't occur within CLib, but is useful for standalone testing.
+        EOR     $out_psr, pc, pc ; Just the PSR, if in a 26bit mode (SavePSR will save the entire PC - not what we want!)
+        TST     $out_psr, #I_bit
+        MRSEQ   $out_psr, CPSR
+        ASSERT  (I32_bit :AND: ARM_CC_Mask) = 0 ; Ensure the below test won't hit any PSR bits on ARMv2
+        TSTEQ   $out_psr, #I32_bit
+        BNE     %FT10
+        ASSERT  (I_bit :AND: &FF) = 0
+        AND     $out_psr, $out_psr, #&FF ; For ARMv3+, mask the PSR down to just CPSR_c. This ensures that future tests for I_bit won't hit a random CPSR flag (Q32_bit). This will also mask off the ARMv2 NZCV & F bits, but we don't really care about those.
+        TST     $out_psr, #3 ; Privileged mode?
+        SWIEQ   OS_IntOff
+        TST     $out_psr, #3 ; just in case 32bit kernel SWI corrupted NZC
+        BEQ     %FT10
+        TST     $out_psr, #16 ; 32bit mode?
+        ORRNE   $temp, $out_psr, #I32_bit
+        MSRNE   CPSR_c, $temp
+        ORREQ   $temp, $out_psr, #I_bit ; Idempotent for StrongARM MSR bug
+        TEQEQP  pc, $temp ; No mode change, so no ARM2 TEQP bug.
+10
+    ]
+        MEND
+
+        ; Corrupts NZCV
+        MACRO
+        SpinUnlock_IRQ $psr, $temp
+        ASSERT  $temp = lr
+    [ AtomicNo26bitCode
+        TST     $psr, #I32_bit
+        BNE     %FT10
+        TST     $psr, #&F ; Privileged mode?
+        MSRNE   CPSR_c, $psr ; Restore old state
+      [ StrongARM_MSR_bug
+        MOV     r0, r0
+      ]
+        SWIEQ   OS_IntOn
+10
+    ELIF AtomicNo32bitCode
+        TST     $psr, #I_bit
+        BNE     %FT10
+        TST     $psr, #M_bits ; Privileged mode?
+        SWIEQ   OS_IntOn
+        TEQNEP  pc, $psr ; Restore old state (+NZCV). No mode change, so no ARM2 TEQP bug.
+10
+    |
+        ; Mixed 26/32bit support. Shouldn't occur within CLib, but is useful for standalone testing.
+        TST     $psr, #I32_bit
+        TSTEQ   $psr, #I_bit
+        BNE     %FT10
+        TST     $psr, #3 ; Privileged mode?
+        SWIEQ   OS_IntOn
+        TST     $psr, #3 ; just in case 32bit kernel SWI corrupted NZC
+        BEQ     %FT10
+        TST     $psr, #16 ; 32bit mode?
+        MSRNE   CPSR_c, $psr
+      [ StrongARM_MSR_bug
+        MOV     r0, r0
+      ]
+        TEQEQP  pc, $psr ; Restore old state (and corrupt NZCV). No mode change, so no ARM2 TEQP bug.
+10
+    ]
+        MEND
+
+        ; Pass 0 is deciding which variants are needed and assembling their code
+        ; Pass 1 is the RoutineVariant blocks and associated |routine$variant| symbol for the stubs
+        ; Pass 2 is the |routine| routine/alias for direct calling from within ROM/CLib
+        GBLA    VariantPass
+VariantPass SETA 0
+        WHILE   VariantPass < 3
+
+; _Bool _kernel_atomic_is_lock_free(int type);
+        AtomicVariant _kernel_atomic_is_lock_free,ARMK
+
+; void _kernel_atomic_store_N(volatile void* obj, memory_order order, C desired);
+; memory order is RELAXED, RELEASE, or SEQ_CST
+        AtomicVariant _kernel_atomic_store_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_store_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_store_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_store_8,UARMa,ARMK,ARMv7,ARMv8
+
+; C _kernel_atomic_load_N(volatile void* obj, memory_order order);
+; memory order is RELAXED, CONSUME, ACQUIRE, or SEQ_CST
+        AtomicVariant _kernel_atomic_load_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_load_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_load_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_load_8,UARMa,ARMK,ARMv7,ARMv8
+
+; C _kernel_atomic_exchange_N(volatile void* obj, memory_order order, C desired);
+        AtomicVariant _kernel_atomic_exchange_1,ARMa,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_exchange_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_exchange_4,ARMa,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_exchange_8,UARMa,ARMK,ARMv7,ARMv8
+
+; _Bool _kernel_atomic_compare_exchange_weak_N(volatile void* obj, int orders, C* expected, C desired);
+; 'orders' is the success memory order + failure memory order<<4
+        AtomicVariant _kernel_atomic_compare_exchange_weak_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_compare_exchange_weak_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_compare_exchange_weak_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_compare_exchange_weak_8,UARMa,ARMK,ARMv7,ARMv8
+
+; _Bool _kernel_atomic_compare_exchange_strong_N(volatile void* obj, int orders, C* expected, C desired);
+; Type is the success memory order + failure memory order<<4
+        AtomicVariant _kernel_atomic_compare_exchange_strong_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_compare_exchange_strong_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_compare_exchange_strong_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_compare_exchange_strong_8,UARMa,ARMK,ARMv7,ARMv8
+
+; C _kernel_atomic_fetch_add_N(volatile void* obj, memory_order order, M arg);
+        AtomicVariant _kernel_atomic_fetch_add_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_add_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_add_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_add_8,UARMa,ARMK,ARMv7,ARMv8
+
+; C _kernel_atomic_fetch_xor_N(volatile void* obj, memory_order order, M arg);
+        AtomicVariant _kernel_atomic_fetch_xor_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_xor_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_xor_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_xor_8,UARMa,ARMK,ARMv7,ARMv8
+
+; C _kernel_atomic_fetch_or_N(volatile void* obj, memory_order order, M arg);
+        AtomicVariant _kernel_atomic_fetch_or_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_or_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_or_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_or_8,UARMa,ARMK,ARMv7,ARMv8
+
+; C _kernel_atomic_fetch_and_N(volatile void* obj, memory_order order, M arg);
+        AtomicVariant _kernel_atomic_fetch_and_1,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_and_2,Halfword,UARMa,UHalfword,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_and_4,UARMa,ARMK,ARMv7,ARMv8
+        AtomicVariant _kernel_atomic_fetch_and_8,UARMa,ARMK,ARMv7,ARMv8
+
+; void _kernel_atomic_thread_fence(memory_order order);
+        AtomicVariant _kernel_atomic_thread_fence,ARMK,ARMv7
+
+; _Bool _kernel_atomic_flag_test_and_set_explicit(volatile atomic_flag *obj, memory_order order);
+        AtomicVariant _kernel_atomic_flag_test_and_set_explicit,ARMa,ARMK,ARMv7,ARMv8
+
+; void _kernel_atomic_flag_clear_explicit(volatile atomic_flag *obj, memory_order order);
+        AtomicVariant _kernel_atomic_flag_clear_explicit,ARMK,ARMv7,ARMv8
+
+    [ VariantPass == 0
+
+        LTORG
+
+        ! 0, "Need_LCD: " :CC: :STR: Need_LCD
+        ! 0, "Need_ARMa: " :CC: :STR: Need_ARMa
+        ! 0, "Need_Halfword: " :CC: :STR: Need_Halfword
+        ! 0, "Need_UARMa: " :CC: :STR: Need_UARMa
+        ! 0, "Need_UHalfword: " :CC: :STR: Need_UHalfword
+        ! 0, "Need_ARMK: " :CC: :STR: Need_ARMK
+        ! 0, "Need_ARMv7: " :CC: :STR: Need_ARMv7
+        ! 0, "Need_ARMv8: " :CC: :STR: Need_ARMv8
+
+      [ Need_LCD
+        GET     k_atomic_lcd.s
+      ]
+      [ Need_ARMa
+        GET     k_atomic_arma.s
+      ]
+      [ Need_Halfword
+        GET     k_atomic_halfword.s
+      ]
+      [ Need_UARMa
+        GET     k_atomic_uarma.s
+      ]
+      [ Need_UHalfword
+        GET     k_atomic_uhalfword.s
+      ]
+      [ Need_ARMK
+        GET     k_atomic_armk.s
+      ]
+      [ Need_ARMv7
+        GET     k_atomic_armv7.s
+      ]
+      [ Need_ARMv8
+        GET     k_atomic_armv8.s
+      ]
+    ]
+
+VariantPass SETA VariantPass+1
+        WEND
+
+        END
