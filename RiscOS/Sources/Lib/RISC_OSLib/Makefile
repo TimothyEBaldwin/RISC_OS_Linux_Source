@@ -169,6 +169,7 @@ HEADERS =\
  CLIB:h.math \
  CLIB:h.setjmp \
  CLIB:h.signal \
+ CLIB:h.stdalign \
  CLIB:h.stdarg \
  CLIB:h.stdatomic \
  CLIB:h.stdbool \
@@ -176,10 +177,12 @@ HEADERS =\
  CLIB:h.stdint \
  CLIB:h.stdio \
  CLIB:h.stdlib \
+ CLIB:h.stdnoreturn \
  CLIB:h.string \
  CLIB:h.swis \
  CLIB:h.tgmath \
  CLIB:h.time \
+ CLIB:h.uchar \
  CLIB:h.varargs \
  CLIB:h.wchar \
  CLIB:h.wctype \
@@ -724,6 +727,7 @@ CLIB:h.locale: clib.h.locale;     ${CP} clib.h.locale $@ ${CPFLAGS}
 CLIB:h.math: clib.h.math;         ${CP} clib.h.math $@ ${CPFLAGS}
 CLIB:h.setjmp: clib.h.setjmp;     ${CP} clib.h.setjmp $@ ${CPFLAGS}
 CLIB:h.signal: clib.h.signal;     ${CP} clib.h.signal $@ ${CPFLAGS}
+CLIB:h.stdalign: clib.h.stdalign; ${CP} clib.h.stdalign $@ ${CPFLAGS}
 CLIB:h.stdarg: clib.h.stdarg;     ${CP} clib.h.stdarg $@ ${CPFLAGS}
 CLIB:h.stdatomic: clib.h.stdatomic; ${CP} clib.h.stdatomic $@ ${CPFLAGS}
 CLIB:h.stdbool: clib.h.stdbool;   ${CP} clib.h.stdbool $@ ${CPFLAGS}
@@ -731,9 +735,11 @@ CLIB:h.stddef: clib.h.stddef;     ${CP} clib.h.stddef $@ ${CPFLAGS}
 CLIB:h.stdint: clib.h.stdint;     ${CP} clib.h.stdint $@ ${CPFLAGS}
 CLIB:h.stdio: clib.h.stdio;       ${CP} clib.h.stdio $@ ${CPFLAGS}
 CLIB:h.stdlib: clib.h.stdlib;     ${CP} clib.h.stdlib $@ ${CPFLAGS}
+CLIB:h.stdnoreturn: clib.h.stdnoreturn; ${CP} clib.h.stdnoreturn $@ ${CPFLAGS}
 CLIB:h.string: clib.h.string;     ${CP} clib.h.string $@ ${CPFLAGS}
 CLIB:h.tgmath: clib.h.tgmath;     ${CP} clib.h.tgmath $@ ${CPFLAGS}
 CLIB:h.time: clib.h.time;         ${CP} clib.h.time $@ ${CPFLAGS}
+CLIB:h.uchar: clib.h.uchar;       ${CP} clib.h.uchar $@ ${CPFLAGS}
 CLIB:h.varargs: clib.h.varargs;   ${CP} clib.h.varargs $@ ${CPFLAGS}
 CLIB:h.wchar: clib.h.wchar;       ${CP} clib.h.wchar $@ ${CPFLAGS}
 CLIB:h.wctype: clib.h.wctype;     ${CP} clib.h.wctype $@ ${CPFLAGS}

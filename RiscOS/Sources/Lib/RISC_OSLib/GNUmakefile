@@ -15,7 +15,7 @@ ifeq (${APCS},Host)
 # Yes, some cross-compilation components use kernel definitions even for host tools
 CLIBHDRS   = kernel
 else
-CLIBHDRS   = assert complex ctype errno fenv float inttypes iso646 kernel limits locale math setjmp signal stdarg stdatomic stdbool stddef stdint stdio stdlib string swis tgmath time varargs wchar wctype
+CLIBHDRS   = assert complex ctype errno fenv float inttypes iso646 kernel limits locale math setjmp signal stdalign stdarg stdatomic stdbool stddef stdint stdio stdlib stdnoreturn string swis tgmath time uchar varargs wchar wctype
 RLIBHDRS   = akbd alarm baricon bbc colourmenu colourpick colourtran coords dbox dboxfile dboxquery dboxtcol dragasprit drawfdiag drawferror drawfobj drawftypes drawmod event fileicon flex font fontlist fontselect heap help jpeg magnify menu msgs msgtrans os pointer print res resspr saveas sprite template trace txt txtedit txtopt txtscrap txtwin typdat visdelay werr wimp wimpt win xferrecv xfersend
 CLIBEXPLIBS = ansilib ansilibm stubs
 RLIBEXPLIBS = risc_oslib riscoslibm rstubs romstubs romcstubs
