@@ -9,12 +9,12 @@ installed into your boot sequence as follows:
 * You will need a standard layout !Boot already installed on your computer
   to try out the softload, the default HardDisc4 distribution includes one
   suitable for the major ROM releases from RISC OS 3.10, and is available from
-    http://www.riscosopen.org/content/downloads/common
+    https://www.riscosopen.org/content/downloads/common
   follow the instructions inside the archive to install this first.
 
 * Ensure you have an up to date !System containing SharedCLibrary 5.46 or
   later. An updated !System for 26 bit operating systems is available from
-    http://www.riscosopen.org/content/downloads/riscpc
+    https://www.riscosopen.org/content/downloads/riscpc
   follow the instructions inside the archive to install that too.
 
 If you are using RISC OS 3
@@ -23,7 +23,7 @@ If you are using RISC OS 3
 * Open your main hard disc (left click on the hard disc iconbar icon)
 
 * Copy the '!Boot' application from this zip file on top of your 
-  existing one, this will add the softloader to your boot time Choices
+  existing one, this will add the softloader to your boot resources
 
 * Be aware that if your boot application contains RISC OS 3 specific items
   these will probably not be compatible with RISC OS 5, so additional manual

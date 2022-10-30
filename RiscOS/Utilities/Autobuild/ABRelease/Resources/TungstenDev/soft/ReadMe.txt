@@ -9,7 +9,7 @@ installed into your boot sequence as follows:
 * You will need a standard layout !Boot already installed on your computer
   to try out the softload, the default HardDisc4 distribution includes one
   suitable for the major ROM releases from RISC OS 3.10, and is available from
-    http://www.riscosopen.org/content/downloads/common
+    https://www.riscosopen.org/content/downloads/common
   follow the instructions inside the archive to install this first.
 
 * Ensure you have an up to date !System containing SharedCLibrary 5.46 or
