@@ -28,6 +28,7 @@
 #
 COMPONENT  = Draw
 APP        = !Draw
+INSTAPP    = ${INSTDIR}.${APP}
 MODULE     = rm.!Draw
 ROM_MODULE = aof.Draw
 RDIR       = Resources
@@ -135,7 +136,7 @@ all: ${FILES}
 rom: ${ROM_MODULE}
 	@${ECHO} ${COMPONENT}: Module built (ROM)
 
-ifeq (${TARGET},ThemeDefs)
+ifeq (${INSTTYPE},themedefs)
 install:
 	${MKDIR} ${INSTDIR}.${USERIF}
 	${CP} LocalRes:DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Draw   ${CPFLAGS}
@@ -143,23 +144,15 @@ install:
 	@${ECHO} ${COMPONENT}: disc theme resources installed
 else
 install: ${FILES}
-	${MKDIR} ${INSTDIR}
-	$(CP) $(RDIR).!Boot     ${INSTDIR}.!Boot     ${CPFLAGS}
-	$(CP) $(LDIR).!Help     ${INSTDIR}.!Help     ${CPFLAGS}
-	$(CP) $(LDIR).!Run      ${INSTDIR}.!Run      ${CPFLAGS}
-	$(CP) abs.!RunImage     ${INSTDIR}.!RunImage ${CPFLAGS}
-	$(CP) $(RDIR).!Sprites  ${INSTDIR}.!Sprites  ${CPFLAGS}
-	${CP} ${MSGS}           ${INSTDIR}.Messages   ${CPFLAGS}
-	$(CP) $(RDIR).Sprites   ${INSTDIR}.Sprites   ${CPFLAGS}
-	$(CP) $(LDIR).Templates ${INSTDIR}.Templates ${CPFLAGS}
-	-Access ${INSTDIR}.!Boot     lr/r
-	-Access ${INSTDIR}.!Help     lr/r
-	-Access ${INSTDIR}.!Run      lr/r
-	-Access ${INSTDIR}.!RunImage lr/r
-	-Access ${INSTDIR}.!Sprites  lr/r
-	-Access ${INSTDIR}.Messages  lr/r
-	-Access ${INSTDIR}.Sprites   lr/r
-	-Access ${INSTDIR}.Templates lr/r
+	${MKDIR} ${INSTAPP}
+	$(CP) $(RDIR).!Boot     ${INSTAPP}.!Boot     ${CPFLAGS}
+	$(CP) $(LDIR).!Help     ${INSTAPP}.!Help     ${CPFLAGS}
+	$(CP) $(LDIR).!Run      ${INSTAPP}.!Run      ${CPFLAGS}
+	$(CP) abs.!RunImage     ${INSTAPP}.!RunImage ${CPFLAGS}
+	$(CP) $(RDIR).!Sprites  ${INSTAPP}.!Sprites  ${CPFLAGS}
+	${CP} ${MSGS}           ${INSTAPP}.Messages   ${CPFLAGS}
+	$(CP) $(RDIR).Sprites   ${INSTAPP}.Sprites   ${CPFLAGS}
+	$(CP) $(LDIR).Templates ${INSTAPP}.Templates ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: Application installed (Disc)
 endif
 
@@ -168,22 +161,14 @@ install_rom: ${ROM_MODULE}
 	@${ECHO} ${COMPONENT}: Module installed (ROM)
 
 installd: ${FILESD}
-	$(CP) $(RDIR).!Boot     ${INSTDIR}.!Boot     ${CPFLAGS}ln
-	$(CP) $(LDIR).!Help     ${INSTDIR}.!Help     ${CPFLAGS}ln
-	$(CP) $(LDIR).!Run      ${INSTDIR}.!Run      ${CPFLAGS}ln
-	$(CP) abs.!RunImageD    ${INSTDIR}.!RunImage ${CPFLAGS}ln
-	$(CP) $(RDIR).!Sprites  ${INSTDIR}.!Sprites  ${CPFLAGS}ln
-	$(CP) $(LDIR).Messages  ${INSTDIR}.Messages  ${CPFLAGS}ln
-	$(CP) $(RDIR).Sprites   ${INSTDIR}.Sprites   ${CPFLAGS}ln
-	$(CP) $(LDIR).Templates ${INSTDIR}.Templates ${CPFLAGS}ln
-	-Access ${INSTDIR}.!Boot     lr/r
-	-Access ${INSTDIR}.!Help     lr/r
-	-Access ${INSTDIR}.!Run      lr/r
-	-Access ${INSTDIR}.!RunImage lr/r
-	-Access ${INSTDIR}.!Sprites  lr/r
-	-Access ${INSTDIR}.Messages  lr/r
-	-Access ${INSTDIR}.Sprites   lr/r
-	-Access ${INSTDIR}.Templates lr/r
+	$(CP) $(RDIR).!Boot     ${INSTAPP}.!Boot     ${CPFLAGS}ln
+	$(CP) $(LDIR).!Help     ${INSTAPP}.!Help     ${CPFLAGS}ln
+	$(CP) $(LDIR).!Run      ${INSTAPP}.!Run      ${CPFLAGS}ln
+	$(CP) abs.!RunImageD    ${INSTAPP}.!RunImage ${CPFLAGS}ln
+	$(CP) $(RDIR).!Sprites  ${INSTAPP}.!Sprites  ${CPFLAGS}ln
+	$(CP) $(LDIR).Messages  ${INSTAPP}.Messages  ${CPFLAGS}ln
+	$(CP) $(RDIR).Sprites   ${INSTAPP}.Sprites   ${CPFLAGS}ln
+	$(CP) $(LDIR).Templates ${INSTAPP}.Templates ${CPFLAGS}ln
 	@${ECHO} ${COMPONENT}: Application installed (Disc)
 
 resources: ${MSGS}
@@ -205,6 +190,7 @@ clean:
 	${XWIPE} linked.* ${WFLAGS}
 	${XWIPE} map.* ${WFLAGS}
 	${RM} abs.!RunImage
+	${RM} abs.!RunImageD
 	${RM} ${ROM_MODULE}
 	${RM} ${MSGS}
 	${RM} ${MODULE}
@@ -231,19 +217,9 @@ map:
 	${LD} -map -rmf -base 0 -o null: ${OBJS} ${LIBSD} > map.base0
 
 clean_all:
-	x Access ${INSTDIR}.!Boot     rw/rw
-	x Access ${INSTDIR}.!Help     rw/rw
-	x Access ${INSTDIR}.!Run      rw/rw
-	x Access ${INSTDIR}.!RunImage rw/rw
-	x Access ${INSTDIR}.!Sprites  rw/rw
-	x Access ${INSTDIR}.Messages  rw/rw
-	x Access ${INSTDIR}.Sprites   rw/rw
-	x Access ${INSTDIR}.Templates rw/rw
 	Destroy ${OBJS} ${OBJSD} ${ASMS} ${ROM_MODULE} ${MODULE} abs.!RunImage \
-         s.AppName s.ModuleWrap s.ResFiles \
-         Debug.RM.!Draw ${INSTDIR}.!Boot ${INSTDIR}.!Help \
-         ${INSTDIR}.!Run ${INSTDIR}.!RunImage ${INSTDIR}.!Sprites \
-         ${INSTDIR}.Messages ${INSTDIR}.Sprites ${INSTDIR}.Templates
+	s.AppName s.ModuleWrap s.ResFiles Debug.RM.!Draw
+
 #
 # Static dependencies:
 #
