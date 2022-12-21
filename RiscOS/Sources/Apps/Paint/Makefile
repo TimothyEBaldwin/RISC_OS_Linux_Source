@@ -28,6 +28,7 @@
 #
 COMPONENT  = Paint
 APP        = !Paint
+INSTAPP    = ${INSTDIR}.${APP}
 MODULE     = rm.!Paint
 ROM_MODULE = aof.Paint
 RDIR       = Resources
@@ -112,7 +113,7 @@ all: ${FILES}
 rom: ${ROM_MODULE}
 	@${ECHO} ${COMPONENT}: Module built (ROM)
 
-ifeq (${TARGET},ThemeDefs)
+ifeq (${INSTTYPE},themedefs)
 install:
 	${MKDIR} ${INSTDIR}.${USERIF}
 	${CP} LocalRes:DiscSprites.Sprites   ${INSTDIR}.${USERIF}.Paint   ${CPFLAGS}
@@ -120,39 +121,25 @@ install:
 	@${ECHO} ${COMPONENT}: disc theme resources installed
 else
 install: ${FILES}
-	${MKDIR} ${INSTDIR}
-	${CP} ${RDIR}.!Boot      ${INSTDIR}.!Boot      ${CPFLAGS}
-	${CP} ${LDIR}.!Help      ${INSTDIR}.!Help      ${CPFLAGS}
-	${CP} ${LDIR}.!Run       ${INSTDIR}.!Run       ${CPFLAGS}
-	${CP} abs.!RunImage      ${INSTDIR}.!RunImage  ${CPFLAGS}
-	${CP} ${MSGS}            ${INSTDIR}.Messages   ${CPFLAGS}
-	${CP} ${LDIR}.Sprites    ${INSTDIR}.Sprites    ${CPFLAGS}
-	${CP} ${LDIR}.Templates  ${INSTDIR}.Templates  ${CPFLAGS}
-	Access ${INSTDIR}.!Boot      lr/r
-	Access ${INSTDIR}.!Help      lr/r
-	Access ${INSTDIR}.!Run       lr/r
-	Access ${INSTDIR}.!RunImage  lr/r
-	Access ${INSTDIR}.Messages   lr/r
-	Access ${INSTDIR}.Sprites    lr/r
-	Access ${INSTDIR}.Templates  lr/r
+	${MKDIR} ${INSTAPP}
+	${CP} ${RDIR}.!Boot      ${INSTAPP}.!Boot      ${CPFLAGS}
+	${CP} ${LDIR}.!Help      ${INSTAPP}.!Help      ${CPFLAGS}
+	${CP} ${LDIR}.!Run       ${INSTAPP}.!Run       ${CPFLAGS}
+	${CP} abs.!RunImage      ${INSTAPP}.!RunImage  ${CPFLAGS}
+	${CP} ${MSGS}            ${INSTAPP}.Messages   ${CPFLAGS}
+	${CP} ${LDIR}.Sprites    ${INSTAPP}.Sprites    ${CPFLAGS}
+	${CP} ${LDIR}.Templates  ${INSTAPP}.Templates  ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: Application installed (Disc)
 endif
 
 installd: ${FILESD}
-	${CP} ${RDIR}.!Boot      ${INSTDIR}.!Boot      ${CPFLAGS}
-	${CP} ${LDIR}.!Help      ${INSTDIR}.!Help      ${CPFLAGS}
-	${CP} ${LDIR}.!Run       ${INSTDIR}.!Run       ${CPFLAGS}
-	${CP} abs.!RunImageD     ${INSTDIR}.!RunImage  ${CPFLAGS}
-	${CP} ${MSGS}            ${INSTDIR}.Messages   ${CPFLAGS}
-	${CP} ${LDIR}.Sprites    ${INSTDIR}.Sprites    ${CPFLAGS}
-	${CP} ${LDIR}.Templates  ${INSTDIR}.Templates  ${CPFLAGS}
-	Access ${INSTDIR}.!Boot      lr/r
-	Access ${INSTDIR}.!Help      lr/r
-	Access ${INSTDIR}.!Run       lr/r
-	Access ${INSTDIR}.!RunImage  lr/r
-	Access ${INSTDIR}.Messages   lr/r
-	Access ${INSTDIR}.Sprites    lr/r
-	Access ${INSTDIR}.Templates  lr/r
+	${CP} ${RDIR}.!Boot      ${INSTAPP}.!Boot      ${CPFLAGS}
+	${CP} ${LDIR}.!Help      ${INSTAPP}.!Help      ${CPFLAGS}
+	${CP} ${LDIR}.!Run       ${INSTAPP}.!Run       ${CPFLAGS}
+	${CP} abs.!RunImageD     ${INSTAPP}.!RunImage  ${CPFLAGS}
+	${CP} ${MSGS}            ${INSTAPP}.Messages   ${CPFLAGS}
+	${CP} ${LDIR}.Sprites    ${INSTAPP}.Sprites    ${CPFLAGS}
+	${CP} ${LDIR}.Templates  ${INSTAPP}.Templates  ${CPFLAGS}
 	@${ECHO} ${COMPONENT}: Debug application installed (Disc)
 
 install_rom: ${ROM_MODULE}
