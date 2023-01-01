@@ -131,9 +131,9 @@ ifeq ($(METHOD), rpcemu)
 	--ro-bind-try /var/lib/dbus/machine-id /var/lib/dbus/machine-id \
 	--chdir /r /r/rpcemu
 else ifeq ($(INSECURE), YES)
-	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' --abort-on-input 5<. 8<'${ACORN_CPP}' </dev/null |& cat
+	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' '$(LINUX_ROM)' $(MUTEX) --abort-on-input 5<. 8<'${ACORN_CPP}' </dev/null |& cat
 else
-	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS --chdir /fd/5 sh -c 'exec "$$0" "$$@" 5</fd/5 8</fd/8;' '$(QEMU)' /RISC_OS --abort-on-input </dev/null |& cat
+	env -i $(if $(VERBOSE), RISC_OS_Alias_Obey='%%Obey -v %*0') JOBS='$(JOBS)' RISC_OS_Alias_IXFSBoot='Obey IXFS#S:$$.dev.fd.5.Unix.LinuxSupport.Build Linux $* $(PHASES)' $(sandbox) $(build_binds) --ro-bind '$(LINUX_ROM)' /RISC_OS --chdir /fd/5 sh -c 'exec "$$0" "$$@" 5</fd/5 8</fd/8;' '$(QEMU)' /RISC_OS $(MUTEX) --abort-on-input </dev/null |& cat
 endif
 	find Build2/$*/RiscOS/Images -type l -delete
 	! mv 'Build2/$*/RiscOS/Images/rom',??? 'Build2/$*/RiscOS/Images/rom'
